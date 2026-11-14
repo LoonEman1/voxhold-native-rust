@@ -6,6 +6,8 @@ mod attachments;
 mod auth;
 mod background;
 mod channel_settings;
+mod clipboard;
+mod draft;
 mod history;
 mod inbox;
 mod layout;

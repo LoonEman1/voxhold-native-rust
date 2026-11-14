@@ -662,3 +662,212 @@ fn history_retry_delay_matches_go() {
         Duration::from_secs(3)
     );
 }
+
+fn writable_workspace(v: &mut Voxhold) {
+    v.client = Some(Client::new("http://127.0.0.1:1").unwrap());
+    v.server = 1;
+    v.channel = 7;
+    v.channels.push(Channel {
+        id: 7,
+        kind: "text".into(),
+        permissions: 3,
+        ..Default::default()
+    });
+}
+
+fn wait_until(cx: &mut VisualTestContext, mut done: impl FnMut() -> bool) {
+    for _ in 0..600 {
+        cx.run_until_parked();
+        if done() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    panic!("the asynchronous operation did not finish");
+}
+
+#[gpui::test]
+async fn enter_sends_once_and_shift_enter_adds_a_newline(cx: &mut TestAppContext) {
+    cx.update(|cx| gpui_component::init(cx));
+    let (window, view) = add_auth_window(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
+    visual.update(|_, app| {
+        view.update(app, |v, _| writable_workspace(v));
+    });
+    visual.update(|window, app| {
+        window.draw(app).clear();
+    });
+    focus_field(&mut visual, &view, |v| v.composer.clone());
+    visual.update(|window, app| {
+        window.draw(app).clear();
+    });
+
+    visual.simulate_input("первая");
+    visual.simulate_keystrokes("shift-enter");
+    visual.simulate_input("вторая");
+    let (text, attempt) = view.read_with(&*visual, |v, cx| {
+        (v.composer.read(cx).value().to_string(), v.send_attempt)
+    });
+    assert_eq!(text, "первая\nвторая");
+    assert_eq!(attempt, 0, "Shift+Enter must not send");
+
+    visual.simulate_keystrokes("enter");
+    assert_eq!(
+        view.read_with(&*visual, |v, _| v.send_attempt),
+        1,
+        "a plain Enter submits exactly once"
+    );
+    // Nothing listens on 127.0.0.1:1: the failure keeps the text and the
+    // draft so the same key can be retried.
+    let mut settled = false;
+    for _ in 0..600 {
+        visual.run_until_parked();
+        settled = view.read_with(&*visual, |v, cx| {
+            !v.sending && v.composer.read(cx).value().as_ref() == "первая\nвторая"
+        });
+        if settled {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(settled, "the failed send must settle");
+    let error = view.read_with(&*visual, |v, _| v.composer_error.clone());
+    assert_eq!(error, "Не удалось связаться с сервером.");
+    let draft = view.read_with(&*visual, |v, _| {
+        v.drafts.borrow().text(draft::ChatKey::channel(1, 7))
+    });
+    assert_eq!(draft, "первая\nвторая");
+}
+
+#[gpui::test]
+async fn drafts_belong_to_the_chat_and_survive_switching(cx: &mut TestAppContext) {
+    cx.update(|cx| gpui_component::init(cx));
+    let (window, view) = add_auth_window(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
+    visual.update(|_, app| {
+        view.update(app, |v, _| {
+            writable_workspace(v);
+            v.channels.push(Channel {
+                id: 8,
+                kind: "text".into(),
+                permissions: 3,
+                ..Default::default()
+            });
+        });
+    });
+    visual.update(|window, app| {
+        view.update(app, |v, cx| v.select_channel(7, window, cx));
+    });
+    focus_field(&mut visual, &view, |v| v.composer.clone());
+    visual.simulate_input("черновик 7");
+
+    visual.update(|window, app| {
+        view.update(app, |v, cx| v.select_channel(8, window, cx));
+    });
+    let empty = view.read_with(&*visual, |v, cx| v.composer.read(cx).value().to_string());
+    assert!(
+        empty.is_empty(),
+        "another channel starts with its own draft"
+    );
+    focus_field(&mut visual, &view, |v| v.composer.clone());
+    visual.simulate_input("черновик 8");
+
+    visual.update(|window, app| {
+        view.update(app, |v, cx| v.select_channel(7, window, cx));
+    });
+    let restored = view.read_with(&*visual, |v, cx| v.composer.read(cx).value().to_string());
+    assert_eq!(restored, "черновик 7");
+    view.read_with(&*visual, |v, _| {
+        assert_eq!(
+            v.drafts.borrow().text(draft::ChatKey::channel(1, 7)),
+            "черновик 7"
+        );
+        assert_eq!(
+            v.drafts.borrow().text(draft::ChatKey::channel(1, 8)),
+            "черновик 8"
+        );
+    });
+}
+
+#[gpui::test]
+async fn a_late_send_keeps_the_edited_draft_and_does_not_duplicate_ws_rows(
+    cx: &mut TestAppContext,
+) {
+    cx.update(|cx| gpui_component::init(cx));
+    let (_window, view) = add_auth_window(cx);
+    cx.update(|app| {
+        view.update(app, |v, cx| {
+            v.server = 1;
+            v.channel = 7;
+            let key = draft::ChatKey::channel(1, 7);
+            v.drafts.borrow_mut().set_text(key, "текст");
+            let plan = v.drafts.borrow_mut().begin_send(key, "текст").unwrap();
+            // The server row arrives over WS before the HTTP result.
+            v.apply_realtime_event("message.created", &message_json(5, 1, "текст"));
+            // The user edits the composer during the request.
+            v.drafts.borrow_mut().set_text(key, "текст и ещё");
+            let message = serde_json::from_value::<Message>(message_json(5, 1, "текст")).unwrap();
+            let clear = v.apply_send_success(plan.clone(), message, "текст и ещё");
+            assert!(!clear, "an edited draft must not be cleared");
+            assert_eq!(v.messages.len(), 1, "WS and HTTP converge to one row");
+            assert_eq!(
+                v.drafts.borrow().text(key),
+                "текст и ещё",
+                "the edit survives the late answer"
+            );
+
+            // A non-edited draft is cleared and reuses the same key.
+            v.drafts.borrow_mut().set_text(key, "второй");
+            let plan = v.drafts.borrow_mut().begin_send(key, "второй").unwrap();
+            let message = serde_json::from_value::<Message>(message_json(6, 1, "второй")).unwrap();
+            assert!(v.apply_send_success(plan, message, "второй"));
+            assert_eq!(v.drafts.borrow().text(key), "");
+            assert_eq!(v.messages.len(), 2);
+            cx.notify();
+        });
+    });
+}
+
+#[gpui::test]
+async fn paste_and_drop_add_only_metadata_to_the_draft(cx: &mut TestAppContext) {
+    cx.update(|cx| gpui_component::init(cx));
+    let (window, view) = add_auth_window(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    let path = std::env::temp_dir().join(format!(
+        "voxhold-paste-{}-{}.bin",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::write(&path, vec![1u8; 4096]).unwrap();
+    let drafts = draft::Drafts::shared();
+    let slot = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let captured = slot.clone();
+    let key = draft::ChatKey::channel(1, 7);
+    visual.update(|window, app| {
+        view.update(app, |v, _| writable_workspace(v));
+        let (client, runtime) = view.read_with(app, |v, _| {
+            (v.client.clone().expect("test client"), v.runtime.clone())
+        });
+        let panel = app
+            .new(|cx| attachments::Attachments::new(client, runtime, drafts.clone(), window, cx));
+        panel.update(app, |panel, cx| {
+            panel.set_scope(Some(key), true, cx);
+            assert!(panel.paste(
+                crate::clipboard::Paste {
+                    paths: vec![path.clone()],
+                    image: None,
+                },
+                cx
+            ));
+        });
+        *captured.borrow_mut() = Some(panel);
+    });
+    let panel = slot.borrow().clone().expect("attachments");
+    wait_until(&mut visual, || !drafts.borrow().files(key).is_empty());
+    let files = drafts.borrow().files(key);
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].size, 4096);
+    assert_eq!(files[0].path, path);
+    assert!(!panel.read_with(&*visual, |panel, _| panel.is_reading()));
+    std::fs::remove_file(path).unwrap();
+}

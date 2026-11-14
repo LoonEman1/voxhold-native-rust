@@ -209,7 +209,7 @@ impl Voxhold {
                     effect.access = true;
                 } else if removed {
                     self.servers.retain(|item| item.id != server);
-                    self.drafts.retain(|(id, _), _| *id != server);
+                    self.drafts.borrow_mut().clear_server(server);
                 }
             }
             "presence.snapshot" => {

@@ -37,6 +37,9 @@ impl Render for Voxhold {
                     _ => {}
                 }
             }))
+            .on_drop(cx.listener(|s, paths: &gpui::ExternalPaths, _window, cx| {
+                s.drop_files(paths.paths().to_vec(), cx);
+            }))
             .on_mouse_move(cx.listener(|s, event: &gpui::MouseMoveEvent, _, cx| {
                 if let Some(drag) = s.scrollbar_drag {
                     if event.pressed_button != Some(MouseButton::Left) {
@@ -276,28 +279,108 @@ impl Render for Voxhold {
             }
         }
         if writable {
+            let text = self.composer.read(cx).value().to_string();
+            let files = self.drafts.borrow().files(self.chat_key());
+            let reading = self
+                .attachments
+                .as_ref()
+                .is_some_and(|attachments| attachments.read(cx).is_reading());
+            let attachments_ready = self.attachments.is_some() && !self.sending && !reading;
+            let valid = draft::validate_send(&text, &files).is_ok();
+            let can_send = valid && !self.sending && !reading && !self.access_pending;
+            if let Some(counter) = draft::counter(&text) {
+                chat = chat.child(
+                    div()
+                        .px(px(18.))
+                        .pb(px(2.))
+                        .text_size(px(12.))
+                        .text_color(ink(p.muted))
+                        .child(counter),
+                );
+            }
+            if !self.composer_error.is_empty() {
+                chat = chat.child(
+                    div()
+                        .px(px(18.))
+                        .pb(px(2.))
+                        .text_size(px(12.))
+                        .text_color(ink(p.danger))
+                        .child(self.composer_error.clone()),
+                );
+            }
+            let send_button = div()
+                .id("send")
+                .w(px(112.))
+                .h(px(40.))
+                .rounded(px(11.))
+                .bg(ink(if can_send { p.lime } else { p.surface }))
+                .text_color(ink(if can_send { 0x10100f } else { p.muted }))
+                .font_weight(gpui::FontWeight::BOLD)
+                .text_size(px(14.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .gap_2()
+                .when(can_send, |button| {
+                    button
+                        .cursor_pointer()
+                        .on_click(cx.listener(|s, _, w, cx| s.send(w, cx)))
+                })
+                .child(if self.sending {
+                    "Отправка…".into_any_element()
+                } else {
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(icon(
+                            "icons/send.svg",
+                            16.,
+                            ink(if can_send { 0x10100f } else { p.muted }),
+                        ))
+                        .child("Отправить")
+                        .into_any_element()
+                });
             chat = chat.child(
                 div()
-                    .px(px(16.))
+                    .px(px(18.))
                     .py(px(12.))
                     .flex()
                     .items_end()
                     .gap_2()
+                    .when(attachments_ready, |row| {
+                        row.child(
+                            div()
+                                .id("attach-files")
+                                .w(px(37.))
+                                .h(px(37.))
+                                .rounded(px(10.))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .cursor_pointer()
+                                .on_click(cx.listener(|s, _, _, cx| {
+                                    if let Some(attachments) = &s.attachments {
+                                        attachments.update(cx, |panel, cx| panel.pick(cx));
+                                    }
+                                }))
+                                .child(icon("icons/paperclip.svg", 17., ink(p.muted))),
+                        )
+                    })
                     .child(
                         div()
                             .flex_1()
                             .min_h(px(47.))
-                            .capture_key_down(cx.listener(
-                                |s, event: &gpui::KeyDownEvent, window, cx| {
-                                    let key = &event.keystroke;
-                                    if key.key == "enter"
-                                        && !key.modifiers.shift
-                                        && !key.modifiers.control
-                                        && !key.modifiers.alt
-                                        && !key.modifiers.platform
-                                    {
-                                        s.send(window, cx);
-                                        cx.stop_propagation();
+                            .key_context("Composer")
+                            .on_action(cx.listener(|s, _: &composer::ComposerSend, window, cx| {
+                                s.send(window, cx);
+                            }))
+                            .on_action(cx.listener(
+                                |s, _: &composer::ComposerPasteFiles, _window, cx| {
+                                    if !s.paste_attachments(cx) {
+                                        // The clipboard has no files: let the
+                                        // input widget paste ordinary text.
+                                        cx.dispatch_action(&gpui_component::input::Paste);
                                     }
                                 },
                             ))
@@ -308,25 +391,7 @@ impl Render for Voxhold {
                                     .h_full(),
                             ),
                     )
-                    .child(
-                        div()
-                            .id("send")
-                            .w(px(112.))
-                            .h(px(40.))
-                            .rounded(px(11.))
-                            .bg(ink(p.lime))
-                            .text_color(ink(0x10100f))
-                            .font_weight(gpui::FontWeight::BOLD)
-                            .text_size(px(14.))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .gap_2()
-                            .cursor_pointer()
-                            .on_click(cx.listener(|s, _, w, cx| s.send(w, cx)))
-                            .child(icon("icons/send.svg", 16., ink(0x10100f)))
-                            .child("Отправить"),
-                    ),
+                    .child(send_button),
             );
         }
         if self.show_search {

@@ -78,28 +78,14 @@ impl Voxhold {
                     .update(cx, |input, cx| input.set_value("", window, cx));
                 let runtime = s.runtime.clone();
                 let attachment_client = c.clone();
+                let drafts = s.drafts.clone();
                 let attachments = cx.new(|cx| {
-                    attachments::Attachments::new(attachment_client, runtime, window, cx)
+                    attachments::Attachments::new(attachment_client, runtime, drafts, window, cx)
                 });
-                cx.observe_in(&attachments, window, |s, attachments, window, cx| {
-                    let sent = attachments.update(cx, |a, _| a.take_sent());
-                    if let Some(message) = sent {
-                        if let Some((access, text)) = s.attachment_pending.take() {
-                            if access == s.access_generation
-                                && !s.access_pending
-                                && message.channel_id == s.channel
-                                && !s.deleted_ids.contains(&message.id)
-                            {
-                                if s.composer.read(cx).value().as_ref() == text {
-                                    s.composer
-                                        .update(cx, |input, cx| input.set_value("", window, cx));
-                                }
-                                s.merge_message(true, message);
-                                s.trim_history(false);
-                            }
-                        }
-                        cx.notify();
-                    }
+                // The composer's send button and file row depend on the draft
+                // owned by this child entity; a notify keeps both in step.
+                cx.observe_in(&attachments, window, |_s, _attachments, _window, cx| {
+                    cx.notify();
                 })
                 .detach();
                 s.attachments = Some(attachments);
@@ -171,8 +157,10 @@ impl Voxhold {
         self.channel = 0;
         self.reset_roster(window);
         self.error.clear();
+        self.composer_error.clear();
+        self.sending = false;
         self.busy = false;
-        self.drafts.clear();
+        self.drafts.borrow_mut().clear_all();
         self.generation = self.generation.wrapping_add(1);
         self.access_generation = self.access_generation.wrapping_add(1);
         self.request_seq = self.request_seq.wrapping_add(1);
@@ -184,7 +172,6 @@ impl Voxhold {
         self.refresh_new_ids.clear();
         self.pending_edits.clear();
         self.pending_reactions.clear();
-        self.attachment_pending = None;
         self.older_request = 0;
         self.loading_older = false;
         self.older_error.clear();

@@ -505,19 +505,26 @@ impl Voxhold {
                 let new_ids = std::mem::take(&mut s.refresh_new_ids);
                 match result {
                     Ok(page) => {
-                        let anchor = s.history_anchor();
-                        if std::mem::take(&mut s.history_reset_pending) {
+                        let return_to_latest = std::mem::take(&mut s.history_reset_pending);
+                        s.pending_anchor = if return_to_latest {
+                            None
+                        } else {
+                            s.history_anchor()
+                        };
+                        if return_to_latest {
                             s.messages.clear();
                             s.history_keys.clear();
                             s.history_list.reset(0);
                             s.before = None;
                         }
                         s.apply_history_snapshot(page, new_ids);
+                        if return_to_latest {
+                            s.pending_jump = s.messages.last().map(|message| message.id);
+                        }
                         s.sync_tools_message(cx);
                         s.older_error.clear();
                         s.older_retry_at = None;
                         s.error.clear();
-                        s.pending_anchor = anchor;
                     }
                     Err(error) => match error {
                         voxhold_api::Error::Http(403) | voxhold_api::Error::Http(404) => {

@@ -300,6 +300,49 @@ async fn painted_history_at_tail_reports_latest_row(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn news_history_starts_at_the_top_when_switching_channels(cx: &mut TestAppContext) {
+    cx.update(|cx| gpui_component::init(cx));
+    let (window, view) = add_auth_window(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.update(|window, app| {
+        view.update(app, |v, _| {
+            v.client = Some(Client::new("http://127.0.0.1:1").unwrap());
+            v.server = 1;
+            for (id, kind) in [(7, "news"), (8, "text")] {
+                v.channels.push(Channel {
+                    id,
+                    kind: kind.into(),
+                    permissions: 1,
+                    ..Default::default()
+                });
+            }
+        });
+        for (channel, count) in [(8, 50), (7, 2), (8, 50)] {
+            view.update(app, |v, cx| {
+                v.select_channel(channel, window, cx);
+                for id in (1..=count).rev() {
+                    let mut message = message_json(id, id, "row");
+                    message["channel_id"] = channel.into();
+                    v.apply_realtime_event("message.created", &message);
+                }
+            });
+            window.draw(app).clear();
+            view.read_with(app, |v, _| {
+                if channel == 7 {
+                    let first = v.history_list.bounds_for_item(0).expect("first news row");
+                    let second = v.history_list.bounds_for_item(1).expect("second news row");
+                    assert_eq!(first.top(), v.history_list.viewport_bounds().top());
+                    assert!(second.top() >= first.bottom());
+                    assert_eq!((v.messages[0].id, v.messages[1].id), (1, 2));
+                } else {
+                    assert_eq!(v.history_list.logical_scroll_top().item_ix, count as usize);
+                }
+            });
+        }
+    });
+}
+
+#[gpui::test]
 async fn presence_snapshot_and_changes_stay_in_the_current_server(cx: &mut TestAppContext) {
     cx.update(|cx| gpui_component::init(cx));
     let (_window, view) = add_auth_window(cx);

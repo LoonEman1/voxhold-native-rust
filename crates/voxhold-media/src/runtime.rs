@@ -4,7 +4,11 @@ use crate::{
     controller::{Action, Participant, Publication, VoiceController},
     stream::{StreamViewer, ViewerUpdate},
 };
-use std::{sync::{mpsc as std_mpsc, Arc, atomic::AtomicU64}, thread, time::{Duration, Instant}};
+use std::{
+    sync::{Arc, atomic::AtomicU64, mpsc as std_mpsc},
+    thread,
+    time::{Duration, Instant},
+};
 use tokio::sync::mpsc;
 
 #[derive(Clone, Debug)]
@@ -27,7 +31,11 @@ enum Request {
     LeaveStream,
     StreamMute(bool),
 }
-pub struct StreamFrame { pub width: u32, pub height: u32, pub rgba: Vec<u8> }
+pub struct StreamFrame {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
+}
 pub struct VoiceHandle {
     requests: mpsc::UnboundedSender<Request>,
     updates: std_mpsc::Receiver<VoiceUpdate>,
@@ -44,8 +52,8 @@ impl VoiceHandle {
     ) -> Result<Self, String> {
         let (tx, rx) = mpsc::unbounded_channel();
         let (updates, output) = std_mpsc::channel();
-        let frame=std::sync::Arc::new(std::sync::Mutex::new(None));
-        let worker_frame=frame.clone();
+        let frame = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let worker_frame = frame.clone();
         let worker = thread::Builder::new()
             .name("voxhold-voice-session".into())
             .spawn(move || {
@@ -59,7 +67,14 @@ impl VoiceHandle {
                     return;
                 };
                 runtime.block_on(run(
-                    client, server, channel, controls, self_muted, rx, updates, worker_frame,
+                    client,
+                    server,
+                    channel,
+                    controls,
+                    self_muted,
+                    rx,
+                    updates,
+                    worker_frame,
                 ));
             })
             .map_err(|e| e.to_string())?;
@@ -76,13 +91,27 @@ impl VoiceHandle {
     pub fn local_mute(&self, connection: String, muted: bool) {
         let _ = self.requests.send(Request::LocalMute(connection, muted));
     }
-    pub fn take_frame(&self) -> Option<StreamFrame> { self.frame.lock().ok()?.take() }
+    pub fn take_frame(&self) -> Option<StreamFrame> {
+        self.frame.lock().ok()?.take()
+    }
     pub fn try_update(&self) -> Option<VoiceUpdate> {
         self.updates.try_recv().ok()
     }
-    pub fn watch_stream(&self, publication: Publication) { if let Ok(mut slot)=self.frame.lock(){slot.take();} let _=self.requests.send(Request::Watch(publication)); }
-    pub fn leave_stream(&self) { if let Ok(mut slot)=self.frame.lock(){slot.take();} let _=self.requests.send(Request::LeaveStream); }
-    pub fn stream_mute(&self, muted: bool) { let _=self.requests.send(Request::StreamMute(muted)); }
+    pub fn watch_stream(&self, publication: Publication) {
+        if let Ok(mut slot) = self.frame.lock() {
+            slot.take();
+        }
+        let _ = self.requests.send(Request::Watch(publication));
+    }
+    pub fn leave_stream(&self) {
+        if let Ok(mut slot) = self.frame.lock() {
+            slot.take();
+        }
+        let _ = self.requests.send(Request::LeaveStream);
+    }
+    pub fn stream_mute(&self, muted: bool) {
+        let _ = self.requests.send(Request::StreamMute(muted));
+    }
     pub fn leave(&self) {
         let _ = self.requests.send(Request::Leave);
     }
@@ -114,7 +143,10 @@ async fn execute(
     Ok(true)
 }
 #[derive(Clone)]
-struct StreamIntent { publication: Publication, muted: bool }
+struct StreamIntent {
+    publication: Publication,
+    muted: bool,
+}
 async fn waiting<F: std::future::Future>(
     future: F,
     requests: &mut mpsc::UnboundedReceiver<Request>,
@@ -149,10 +181,17 @@ async fn run(
     let mut controller = VoiceController::new(server, channel, controls, self_muted);
     let mut streams: Vec<Publication> = Vec::new();
     let mut intent: Option<StreamIntent> = None;
-    let sequence=Arc::new(AtomicU64::new(0));
+    let sequence = Arc::new(AtomicU64::new(0));
     'outer: loop {
         let _ = updates.send(VoiceUpdate::Connecting);
-        let config = match waiting(client.webrtc_config(), &mut requests, &mut controller, &mut intent).await {
+        let config = match waiting(
+            client.webrtc_config(),
+            &mut requests,
+            &mut controller,
+            &mut intent,
+        )
+        .await
+        {
             Some(Ok(v)) => v,
             Some(Err(e)) => {
                 let _ = updates.send(VoiceUpdate::Error(e.to_string()));
@@ -160,15 +199,21 @@ async fn run(
             }
             None => break,
         };
-        let mut socket =
-            match waiting(client.open_voice_socket(), &mut requests, &mut controller, &mut intent).await {
-                Some(Ok(v)) => v,
-                Some(Err(e)) => {
-                    let _ = updates.send(VoiceUpdate::Error(e.to_string()));
-                    break;
-                }
-                None => break,
-            };
+        let mut socket = match waiting(
+            client.open_voice_socket(),
+            &mut requests,
+            &mut controller,
+            &mut intent,
+        )
+        .await
+        {
+            Some(Ok(v)) => v,
+            Some(Err(e)) => {
+                let _ = updates.send(VoiceUpdate::Error(e.to_string()));
+                break;
+            }
+            None => break,
+        };
         let media = match Media::new() {
             Ok(v) => v,
             Err(e) => {
@@ -284,8 +329,14 @@ async fn run(
             }
         }
         controller.joined = false;
-        if let Ok(mut slot)=frame.lock(){slot.take();}
-        if intent.is_some(){let _=updates.send(VoiceUpdate::StreamStatus("Восстанавливаем трансляцию…".into()));}
+        if let Ok(mut slot) = frame.lock() {
+            slot.take();
+        }
+        if intent.is_some() {
+            let _ = updates.send(VoiceUpdate::StreamStatus(
+                "Восстанавливаем трансляцию…".into(),
+            ));
+        }
         let _ = media.command(Command::Stop);
         drop(media);
         if !reconnect {
@@ -305,4 +356,3 @@ async fn run(
     }
     let _ = updates.send(VoiceUpdate::Left);
 }
-

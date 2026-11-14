@@ -126,7 +126,7 @@ impl MessageTools {
             Some(incoming) => {
                 let before = (current.revision, current.reactions_revision);
                 let mut merged = current.clone();
-                crate::merge_revision(&mut merged, incoming.clone());
+                crate::history::merge_revision(&mut merged, incoming.clone());
                 let changed = before != (merged.revision, merged.reactions_revision);
                 self.message = Some(merged);
                 self.sync_picker(cx);
@@ -180,7 +180,7 @@ impl MessageTools {
             return false;
         }
         let before = message.reactions_revision;
-        crate::apply_reactions(message, update);
+        crate::history::apply_reactions(message, update);
         if message.reactions_revision == before {
             return false;
         }

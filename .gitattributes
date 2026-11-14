@@ -1,0 +1,2 @@
+# The pre-commit hook is executed by Git for Windows; keep its shebang LF-only.
+.githooks/** text eol=lf

@@ -1,4 +1,4 @@
-use gpui::{div, prelude::*, px, rgb, Context, PathPromptOptions, Window};
+use gpui::{div, prelude::*, rgb, Context, PathPromptOptions, Window};
 use std::{collections::HashMap, io::Read, path::PathBuf, sync::Arc};
 use voxhold_api::{Attachment, Client, Message};
 const FILE_LIMIT: usize = 64 << 20;
@@ -80,6 +80,7 @@ impl Attachments {
             .get(&(self.server, self.channel))
             .is_some_and(|d| !d.files.is_empty())
     }
+    #[allow(dead_code)]
     pub fn revision(&self) -> u64 {
         self.revision
     }

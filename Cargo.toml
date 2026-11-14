@@ -16,10 +16,13 @@ gpui-component = "=0.3.0"
 voxhold-api = { path = "crates/voxhold-api" }
 voxhold-media = { path = "crates/voxhold-media", optional = true }
 tokio = { version = "1", features = ["rt-multi-thread"] }
-
-
-
 uuid = { version = "1", features = ["v4"] }
 serde_json = "1"
 image = "0.25"
 smallvec = "1"
+
+[target.'cfg(windows)'.dependencies]
+raw-window-handle = "0.6"
+
+[dev-dependencies]
+gpui = { version = "=0.2.2", features = ["test-support"] }

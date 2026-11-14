@@ -98,6 +98,18 @@ impl Client {
         body: Option<Value>,
         max: usize,
     ) -> Result<Vec<u8>> {
+        self.bytes_with_etag(method, path, body, max)
+            .await
+            .map(|(body, _)| body)
+    }
+
+    async fn bytes_with_etag(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<Value>,
+        max: usize,
+    ) -> Result<(Vec<u8>, Option<String>)> {
         let mut r = self.http.request(method, self.url(path)?);
         if !self.token.is_empty() {
             r = r.bearer_auth(self.token.as_ref());
@@ -109,6 +121,11 @@ impl Client {
         if !response.status().is_success() {
             return Err(Error::Http(response.status().as_u16()));
         }
+        let etag = response
+            .headers()
+            .get(reqwest::header::ETAG)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
         let mut out = Vec::new();
         while let Some(chunk) = response.chunk().await.map_err(|_| Error::Network)? {
             if out.len().saturating_add(chunk.len()) > max {
@@ -118,7 +135,7 @@ impl Client {
             }
             out.extend_from_slice(&chunk);
         }
-        Ok(out)
+        Ok((out, etag))
     }
     pub async fn request<T: DeserializeOwned>(
         &self,
@@ -165,14 +182,19 @@ impl Client {
             .await
     }
     pub async fn channel_members(&self, sid: i64, cid: i64) -> Result<Vec<i64>> {
-        let v: Value = self
+        #[derive(Deserialize)]
+        struct Members {
+            #[serde(default, deserialize_with = "null_default")]
+            user_ids: Vec<i64>,
+        }
+        let members: Members = self
             .request(
                 Method::GET,
                 &format!("{}/members", channel_path(sid, cid)),
                 None,
             )
             .await?;
-        Ok(serde_json::from_value(v["user_ids"].clone())?)
+        Ok(members.user_ids)
     }
     async fn page(&self, path: &str, before: i64) -> Result<MessagePage> {
         let path = format!(
@@ -557,11 +579,16 @@ impl Client {
                     .send(
                         "channel.subscribe",
                         json!({"server_id":sid,"channel_id":cid}),
-                        None,
+                        Some("native-channel-subscribe"),
                     )
                     .await?;
             }
             if event.kind == "error" {
+                if event.request_id == "native-channel-subscribe"
+                    && event.data["code"].as_str() == Some("forbidden")
+                {
+                    return Err(Error::Http(403));
+                }
                 return Ok(());
             }
             receive(event);
@@ -628,7 +655,11 @@ impl Client {
     }
     pub async fn image(&self, path: &str, max_edge: u32) -> Result<image::DynamicImage> {
         let bytes = self.bytes(Method::GET, path, None, 4 << 20).await?;
-        let reader = image::ImageReader::new(std::io::Cursor::new(&bytes))
+        Self::decode_image(&bytes, max_edge)
+    }
+
+    fn decode_image(bytes: &[u8], max_edge: u32) -> Result<image::DynamicImage> {
+        let reader = image::ImageReader::new(std::io::Cursor::new(bytes))
             .with_guessed_format()
             .map_err(|_| Error::InvalidResponse("invalid image"))?;
         let format = reader.format();
@@ -640,16 +671,29 @@ impl Client {
             return Err(Error::InvalidResponse("invalid image dimensions"));
         }
         image::load_from_memory_with_format(
-            &bytes,
+            bytes,
             format.ok_or(Error::InvalidResponse("invalid image"))?,
         )
         .map_err(|_| Error::InvalidResponse("invalid image"))
     }
-    pub async fn avatar(&self, id: i64) -> Result<image::DynamicImage> {
-        if id <= 0 {
-            return Err(Error::InvalidResponse("invalid avatar id"));
+    pub async fn avatar(&self, id: i64, version: &str) -> Result<image::DynamicImage> {
+        if id <= 0 || !valid_id(version, 64) {
+            return Err(Error::InvalidResponse(
+                "Некорректный ID или версия аватара.",
+            ));
         }
-        self.image(&format!("/api/v1/users/{id}/avatar"), 256).await
+        let path = format!("/api/v1/users/{id}/avatar?v={version}");
+        let (bytes, etag) = self
+            .bytes_with_etag(Method::GET, &path, None, 4 << 20)
+            .await?;
+        if etag
+            .as_deref()
+            .and_then(|tag| tag.strip_prefix('"')?.strip_suffix('"'))
+            != Some(version)
+        {
+            return Err(Error::InvalidResponse("Версия аватара изменилась."));
+        }
+        Self::decode_image(&bytes, 256)
     }
     pub async fn attachment_thumbnail(&self, id: &str) -> Result<image::DynamicImage> {
         if !valid_id(id, 32) {

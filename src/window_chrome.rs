@@ -7,29 +7,42 @@
 
 #[cfg(windows)]
 pub fn apply(window: &gpui::Window, light: bool) {
+    if let Some(hwnd) = window_hwnd(window) {
+        unsafe {
+            set_dark_titlebar(hwnd, !light);
+            set_icon(hwnd);
+        }
+    }
+}
+
+#[cfg(windows)]
+pub fn set_theme(window: &gpui::Window, light: bool) {
+    if let Some(hwnd) = window_hwnd(window) {
+        unsafe { set_dark_titlebar(hwnd, !light) }
+    }
+}
+
+#[cfg(windows)]
+fn window_hwnd(window: &gpui::Window) -> Option<*mut core::ffi::c_void> {
     use raw_window_handle::RawWindowHandle;
 
     // GPUI's test window is not backed by a platform window and its
     // `window_handle` is explicitly unimplemented.
     if cfg!(test) {
-        return;
+        return None;
     }
-    let Ok(handle) = raw_window_handle::HasWindowHandle::window_handle(window) else {
-        return;
-    };
+    let handle = raw_window_handle::HasWindowHandle::window_handle(window).ok()?;
     let RawWindowHandle::Win32(win32) = handle.as_raw() else {
-        return;
+        return None;
     };
-    let hwnd = win32.hwnd.get() as *mut core::ffi::c_void;
-
-    unsafe {
-        set_dark_titlebar(hwnd, !light);
-        set_icon(hwnd);
-    }
+    Some(win32.hwnd.get() as *mut core::ffi::c_void)
 }
 
 #[cfg(not(windows))]
 pub fn apply(_window: &gpui::Window, _light: bool) {}
+
+#[cfg(not(windows))]
+pub fn set_theme(_window: &gpui::Window, _light: bool) {}
 
 #[cfg(windows)]
 unsafe fn set_dark_titlebar(hwnd: *mut core::ffi::c_void, dark: bool) {
@@ -104,20 +117,5 @@ unsafe fn set_icon(hwnd: *mut core::ffi::c_void) {
 /// level up in a build output tree, then the current working directory.
 #[cfg(windows)]
 fn icon_path() -> Option<std::path::PathBuf> {
-    let mut candidates = Vec::new();
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            candidates.push(dir.join("assets").join("voxhold.ico"));
-            if let Some(parent) = dir.parent() {
-                candidates.push(parent.join("assets").join("voxhold.ico"));
-            }
-        }
-    }
-    candidates.push(
-        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("assets")
-            .join("voxhold.ico"),
-    );
-    candidates.push(std::path::PathBuf::from("assets").join("voxhold.ico"));
-    candidates.into_iter().find(|path| path.is_file())
+    crate::assets::Assets::discover().path("voxhold.ico")
 }

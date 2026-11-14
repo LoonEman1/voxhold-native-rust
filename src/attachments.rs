@@ -58,10 +58,15 @@ impl Attachments {
         self.channel = channel;
         self.writable = writable;
         self.message_files.clear();
+        self.sent = None;
         self.generation += 1;
         self.busy = false;
         self.error.clear();
         cx.notify();
+    }
+
+    pub fn clear_server_drafts(&mut self, server: i64) {
+        self.drafts.retain(|(id, _), _| *id != server);
     }
     pub fn set_message(&mut self, message: Option<&Message>, cx: &mut Context<Self>) {
         self.message_files = message

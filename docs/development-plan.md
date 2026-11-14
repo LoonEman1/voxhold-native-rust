@@ -897,7 +897,7 @@ http_active,thumb_bytes,link_bytes,recording_bytes,workers,peers,live_textures
 | `R01` | Первый срез и ревью в dev · PR [#3](https://github.com/LoonEman1/voxhold-native-rust/pull/3), [#6](https://github.com/LoonEman1/voxhold-native-rust/pull/6) | [`ef72a63`](https://github.com/LoonEman1/voxhold-native-rust/commit/ef72a63) (включает исправления #6 и аватары/присутствие); визуальные пары с Go не сняты | — |
 | `R01a` | В работе | Пикер и каталог эмодзи ещё не перенесены; SVG подключены, `AssetSource` есть | — |
 | `R02` | Первый срез и ревью в dev · PR [#4](https://github.com/LoonEman1/voxhold-native-rust/pull/4), [#6](https://github.com/LoonEman1/voxhold-native-rust/pull/6) | [`ef72a63`](https://github.com/LoonEman1/voxhold-native-rust/commit/ef72a63) (merge/access/read/backoff); реальный стенд и детальная вёрстка ленты впереди | — |
-| `R03` | Первый срез в PR · ветка `codex/r03-composer-media` | Композер/черновики/идемпотентная отправка, потоковая загрузка, атомарное сохранение, кеши и viewer; живой стенд, кадры и DPI не проверены | — |
+| `R03` | Первый срез в PR [#12](https://github.com/LoonEman1/voxhold-native-rust/pull/12) · ветка `codex/r03-composer-media` | Композер/черновики/идемпотентная отправка, потоковая загрузка, атомарное сохранение, кеши и viewer; живой стенд, кадры и DPI не проверены | — |
 | `R04` | К выполнению | — | — |
 | `R05` | К выполнению | — | — |
 | `R06` | К выполнению | — | — |

@@ -199,7 +199,8 @@ Alt+Tab и Tab-порядок вручную, backoff истории 20/8/3 с.
 
 ## Срез R03 (15 ноября 2026)
 
-База — `origin/dev` `82e6050`, ветка `codex/r03-composer-media`. Четыре
+База — `origin/dev` `82e6050`, ветка `codex/r03-composer-media`
+([PR #12](https://github.com/LoonEman1/voxhold-native-rust/pull/12)). Четыре
 коммита: композер и отправка, потоковая загрузка, атомарное сохранение,
 медиа и просмотрщик.
 

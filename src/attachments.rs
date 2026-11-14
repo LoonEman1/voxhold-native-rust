@@ -1,6 +1,6 @@
 //! Composer attachments: file selection, Windows clipboard/drop intake, the
 //! selected-file row and attachment saving. Metadata lives in `draft.rs`; the
-//! bytes stay on disk until the send task opens them.
+//! bytes stay on disk and are streamed by `send` in `app::composer`.
 
 use gpui::{div, prelude::*, px, rgb, Context, PathPromptOptions, Window};
 use std::{collections::HashSet, path::PathBuf, sync::Arc};
@@ -417,15 +417,15 @@ fn download_name(name: &str) -> String {
 pub async fn upload_draft(client: &Client, plan: &draft::SendPlan) -> Result<Vec<String>, String> {
     let mut ids = Vec::with_capacity(plan.files.len());
     for file in &plan.files {
-        let data = std::fs::read(&file.path)
-            .map_err(|_| "Файл вложения недоступен. Прикрепите его заново.".to_string())?;
+        let handle = file.open_verified()?;
         client
-            .upload_attachment(
+            .upload_attachment_file(
                 plan.key.attachment_kind(),
                 plan.destination(),
                 &file.id,
                 &file.name,
-                data,
+                handle,
+                file.size,
             )
             .await
             .map_err(|error| draft::describe_error(&error))?;
@@ -449,6 +449,7 @@ pub fn format_bytes(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{Reply, TestServer};
     use std::path::PathBuf;
 
     #[test]
@@ -474,6 +475,128 @@ mod tests {
         assert_eq!(files.0.len(), 1);
         assert_eq!(files.0[0].size, 4);
         assert!(files.1.starts_with("Не удалось прикрепить файл:"));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    fn upload_fixture(payload: &[u8]) -> (draft::SendPlan, PathBuf) {
+        let path = std::env::temp_dir().join(format!(
+            "voxhold-upload-{}-{}.bin",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&path, payload).unwrap();
+        let file = draft::DraftFile::from_path(path.clone()).unwrap();
+        let attachment_json = format!(
+            "{{\"id\":\"{}\",\"filename\":\"{}\",\"mime_type\":\"application/octet-stream\",\"size_bytes\":{},\"deleted\":false}}",
+            file.id, file.name, file.size
+        );
+        let plan = draft::SendPlan {
+            key: draft::ChatKey::channel(1, 7),
+            content: "файл".into(),
+            composer_text: "файл".into(),
+            reply: 0,
+            files: vec![file],
+            send_key: "0123456789abcdef0123456789abcdef".into(),
+            revision: 1,
+        };
+        let _ = attachment_json;
+        (plan, path)
+    }
+
+    #[test]
+    fn upload_streams_the_file_with_a_content_length() {
+        let payload: Vec<u8> = (0..300_000u32).map(|index| (index % 251) as u8).collect();
+        let (plan, path) = upload_fixture(&payload);
+        let attachment = format!(
+            "{{\"id\":\"{}\",\"filename\":\"{}\",\"mime_type\":\"application/octet-stream\",\"size_bytes\":{},\"deleted\":false}}",
+            plan.files[0].id, plan.files[0].name, plan.files[0].size
+        );
+        let server = TestServer::spawn(vec![Reply::new(200, &attachment)]);
+        let client = Client::new(&server.base).unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let ids = runtime
+            .block_on(upload_draft(&client, &plan))
+            .expect("upload");
+        assert_eq!(ids, vec![plan.files[0].id.clone()]);
+        let records = server.requests();
+        assert_eq!(records.len(), 1);
+        let request = &records[0];
+        assert_eq!(request.method, "PUT");
+        assert!(request.path.starts_with(&format!(
+            "/api/v1/channels/7/attachments/{}",
+            plan.files[0].id
+        )));
+        assert!(request.path.contains("filename="));
+        assert_eq!(
+            request.header("content-length"),
+            Some(payload.len().to_string().as_str())
+        );
+        assert_eq!(
+            request.header("content-type"),
+            Some("application/octet-stream")
+        );
+        assert_eq!(request.body, payload, "the body is the file, not JSON");
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn conversations_route_is_used_for_personal_messages() {
+        let (mut plan, path) = upload_fixture(b"direct");
+        plan.key = draft::ChatKey::conversation(11);
+        let attachment = format!(
+            "{{\"id\":\"{}\",\"filename\":\"{}\",\"size_bytes\":4,\"deleted\":false}}",
+            plan.files[0].id, plan.files[0].name
+        );
+        let server = TestServer::spawn(vec![Reply::new(200, &attachment)]);
+        let client = Client::new(&server.base).unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(upload_draft(&client, &plan)).unwrap();
+        assert!(server.requests()[0]
+            .path
+            .starts_with("/api/v1/conversations/11/attachments/"));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn refused_upload_keeps_the_draft_and_surfaces_the_status() {
+        let (plan, path) = upload_fixture(b"denied");
+        let server = TestServer::spawn(vec![
+            Reply::new(403, "{\"error\":\"upload unavailable\"}"),
+            Reply::new(429, "{\"error\":\"uploads busy\"}"),
+        ]);
+        let client = Client::new(&server.base).unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let error = runtime.block_on(upload_draft(&client, &plan)).unwrap_err();
+        assert_eq!(error, "Недостаточно прав доступа.");
+        // A retry repeats the same upload id; the backend answers 200 for an
+        // already completed attachment.
+        let retry = runtime.block_on(upload_draft(&client, &plan)).unwrap_err();
+        assert_eq!(retry, "Слишком много запросов. Повторите позже.");
+        let records = server.requests();
+        assert_eq!(records.len(), 2);
+        assert!(records[1].path.contains(&plan.files[0].id));
+        assert_eq!(plan.files[0].id.len(), 32);
+
+        // The draft itself still holds the file for the retry.
+        let mut drafts = draft::Drafts::default();
+        drafts.add_files(plan.key, plan.files.clone());
+        assert_eq!(drafts.files(plan.key).len(), 1);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn a_file_that_changed_is_refused_before_the_request() {
+        let (plan, path) = upload_fixture(b"original");
+        std::fs::write(&path, b"changed content").unwrap();
+        let server = TestServer::spawn(vec![]);
+        let client = Client::new(&server.base).unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let error = runtime.block_on(upload_draft(&client, &plan)).unwrap_err();
+        assert_eq!(
+            error,
+            "Файл изменился после добавления. Прикрепите его заново."
+        );
+        assert!(server.requests().is_empty(), "no request leaves the client");
         std::fs::remove_file(path).unwrap();
     }
 }

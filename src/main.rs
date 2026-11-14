@@ -17,6 +17,8 @@ mod personal_settings;
 mod reactions;
 mod search;
 mod server_settings;
+#[cfg(test)]
+mod test_support;
 mod theme;
 #[cfg(feature = "voxhold-media")]
 mod voice_panel;

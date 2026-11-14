@@ -19,7 +19,7 @@ mod voice_panel;
 mod window_chrome;
 use gpui::{
     div, list, prelude::*, px, rgba, size, AnyElement, App, Application, Bounds, Context, Entity,
-    ListAlignment, ListState, MouseButton, SharedString, Window, WindowBounds, WindowOptions,
+    ListAlignment, ListState, MouseButton, Window, WindowBounds, WindowOptions,
 };
 use gpui_component::{
     input::{InputState, TextInput},
@@ -3803,17 +3803,18 @@ impl Render for Voxhold {
             }
             if !message.reactions.is_empty() {
                 let mut reactions = div().flex().flex_wrap().gap(px(4.)).mt(px(4.)).w_full();
-                for reaction in message.reactions.clone() {
+                for (reaction_index, reaction) in message.reactions.clone().into_iter().enumerate()
+                {
                     let emoji = reaction.emoji.clone();
                     let active = reaction.me;
                     let count = history::reaction_count(&reaction);
                     let weak_reaction = weak_reaction.clone();
                     reactions = reactions.child(
                         div()
-                            .id(SharedString::from(format!(
-                                "reaction-{id}-{}",
-                                reaction.emoji
-                            )))
+                            .id((
+                                gpui::ElementId::from(("reaction", id as u64)),
+                                reaction_index.to_string(),
+                            ))
                             .h(px(22.))
                             .min_w(px(history::REACTION_PITCH - 4.))
                             .px_1()

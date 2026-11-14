@@ -529,6 +529,23 @@ pub struct RealtimeEvent {
     pub data: Value,
     pub request_id: String,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChannelSubscription {
+    pub server_id: i64,
+    pub channel_id: i64,
+    pub generation: u64,
+}
+
+impl ChannelSubscription {
+    fn payload(self) -> Value {
+        json!({"server_id":self.server_id,"channel_id":self.channel_id})
+    }
+
+    fn request_id(self) -> String {
+        format!("native-channel-{}", self.generation)
+    }
+}
 dto!(IceServer { urls:Vec<String>, username:String, credential:String });
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WebRtcConfig {
@@ -592,6 +609,78 @@ impl Client {
                 return Ok(());
             }
             receive(event);
+        }
+    }
+
+    /// Keep account events on the same socket when the selected channel changes.
+    pub async fn subscribe_channels(
+        &self,
+        mut desired: tokio::sync::watch::Receiver<Option<ChannelSubscription>>,
+        mut receive: impl FnMut(RealtimeEvent),
+    ) -> Result<()> {
+        let mut socket = self.open_voice_socket().await?;
+        let ready = tokio::time::timeout(Duration::from_secs(8), socket.read())
+            .await
+            .map_err(|_| Error::Network)??;
+        if ready.kind != "ready" {
+            return Err(Error::InvalidResponse(
+                "Сервер не подтвердил WebSocket-сессию.",
+            ));
+        }
+        receive(ready);
+
+        let mut subscribed: Option<ChannelSubscription> = None;
+        loop {
+            let next = *desired.borrow_and_update();
+            if next != subscribed {
+                if let Some(previous) = subscribed {
+                    socket
+                        .send("channel.unsubscribe", previous.payload(), None)
+                        .await?;
+                }
+                if let Some(next) = next {
+                    socket
+                        .send(
+                            "channel.subscribe",
+                            next.payload(),
+                            Some(&next.request_id()),
+                        )
+                        .await?;
+                }
+                subscribed = next;
+            }
+
+            tokio::select! {
+                changed = desired.changed() => {
+                    if changed.is_err() {
+                        return Ok(());
+                    }
+                }
+                event = socket.read() => {
+                    let mut event = event?;
+                    if event.kind == "channel.subscribed" {
+                        let Some(channel) = subscribed.filter(|channel| event.request_id == channel.request_id()) else {
+                            continue;
+                        };
+                        if event.data["server_id"].as_i64() != Some(channel.server_id)
+                            || event.data["channel_id"].as_i64() != Some(channel.channel_id)
+                        {
+                            continue;
+                        }
+                        event.data["generation"] = json!(channel.generation);
+                    }
+                    if event.kind == "error" {
+                        if let Some(channel) = subscribed.filter(|channel| event.request_id == channel.request_id()) {
+                            if event.data["code"].as_str() == Some("forbidden") {
+                                event.kind = "native.subscription_forbidden".into();
+                                event.data = channel.payload();
+                                event.data["generation"] = json!(channel.generation);
+                            }
+                        }
+                    }
+                    receive(event);
+                }
+            }
         }
     }
     pub async fn upload_attachment(
@@ -1172,6 +1261,76 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn changing_channels_reuses_the_authenticated_socket() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    let mut client = Client::new(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+                    client.set_token("fixture".into());
+                    let first = ChannelSubscription { server_id: 1, channel_id: 10, generation: 1 };
+                    let second = ChannelSubscription { server_id: 1, channel_id: 11, generation: 2 };
+                    let (target, desired) = tokio::sync::watch::channel(Some(first));
+                    let (events, mut received) = tokio::sync::mpsc::unbounded_channel();
+                    let mut worker = tokio::spawn(async move {
+                        client.subscribe_channels(desired, |event| {
+                            let _ = events.send(event);
+                        }).await
+                    });
+                    let (connection, _) = tokio::select! {
+                        connection = listener.accept() => connection.unwrap(),
+                        result = &mut worker => panic!("WebSocket client stopped before connecting: {result:?}"),
+                    };
+                    let mut peer = tokio_tungstenite::accept_async(connection).await.unwrap();
+                    async fn next(
+                        peer: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+                    ) -> RealtimeEvent {
+                        let message = peer.next().await.unwrap().unwrap();
+                        serde_json::from_str(message.to_text().unwrap()).unwrap()
+                    }
+                    async fn send(
+                        peer: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+                        event: Value,
+                    ) {
+                        peer.send(tokio_tungstenite::tungstenite::Message::Text(event.to_string().into())).await.unwrap();
+                    }
+                    assert_eq!(next(&mut peer).await.kind, "auth");
+                    send(&mut peer, json!({"type":"ready"})).await;
+                    let subscribe = next(&mut peer).await;
+                    assert_eq!(subscribe.kind, "channel.subscribe");
+                    assert_eq!(subscribe.data, first.payload());
+
+                    target.send(Some(second)).unwrap();
+                    let unsubscribe = next(&mut peer).await;
+                    assert_eq!(unsubscribe.kind, "channel.unsubscribe");
+                    assert_eq!(unsubscribe.data, first.payload());
+                    let subscribe = next(&mut peer).await;
+                    assert_eq!(subscribe.kind, "channel.subscribe");
+                    assert_eq!(subscribe.data, second.payload());
+
+                    send(&mut peer, json!({"type":"error","request_id":first.request_id(),"data":{"code":"forbidden"}})).await;
+                    send(&mut peer, json!({"type":"error","request_id":second.request_id(),"data":{"code":"forbidden"}})).await;
+                    assert_eq!(received.recv().await.unwrap().kind, "ready");
+                    assert_eq!(received.recv().await.unwrap().kind, "error");
+                    let denied = received.recv().await.unwrap();
+                    assert_eq!(denied.kind, "native.subscription_forbidden");
+                    assert_eq!(denied.data["channel_id"], 11);
+                    assert_eq!(denied.data["generation"], 2);
+
+                    target.send(None).unwrap();
+                    assert_eq!(next(&mut peer).await.kind, "channel.unsubscribe");
+                    send(&mut peer, json!({"type":"presence.updated","data":{"user_id":4,"status":"online"}})).await;
+                    assert_eq!(received.recv().await.unwrap().kind, "presence.updated");
+                    drop(target);
+                    worker.await.unwrap().unwrap();
+                }).await.unwrap();
+            });
+    }
     #[test]
     fn origin_security() {
         for bad in [

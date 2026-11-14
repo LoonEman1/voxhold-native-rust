@@ -19,7 +19,6 @@ pub struct Roster {
     pub channel_error: Option<String>,
     pub channel_pending: bool,
     pub channel_request: u64,
-    pub online: HashSet<i64>,
     pub last_seen: HashMap<i64, i64>,
     pub scroll: ScrollHandle,
     pub avatars: HashMap<(i64, String), (Arc<RenderImage>, Instant)>,
@@ -35,7 +34,6 @@ impl Default for Roster {
             channel_error: None,
             channel_pending: false,
             channel_request: 0,
-            online: HashSet::new(),
             last_seen: HashMap::new(),
             scroll: ScrollHandle::new(),
             avatars: HashMap::new(),
@@ -419,10 +417,15 @@ impl Voxhold {
                     .child("Участников пока нет."),
             );
         }
+        let online_users = self
+            .online_by_server
+            .get(&self.server)
+            .cloned()
+            .unwrap_or_default();
         for (online, label) in [(true, "В СЕТИ"), (false, "НЕ В СЕТИ")] {
             let group: Vec<_> = visible
                 .iter()
-                .filter(|member| self.roster.online.contains(&member.user_id) == online)
+                .filter(|member| online_users.contains(&member.user_id) == online)
                 .collect();
             if group.is_empty() {
                 continue;

@@ -24,7 +24,7 @@ use gpui_component::{
     Root,
 };
 use layout::{SplitterDrag, SplitterSide};
-use voxhold_api::{Channel, Client, Member, Message, Server};
+use voxhold_api::{Channel, ChannelSubscription, Client, Member, Message, Server};
 
 struct Voxhold {
     runtime: std::sync::Arc<tokio::runtime::Runtime>,
@@ -88,7 +88,9 @@ struct Voxhold {
     read_retry_at: Option<std::time::Instant>,
     painted_read: std::rc::Rc<std::cell::Cell<i64>>,
     event_task: Option<tokio::task::JoinHandle<()>>,
-    event_channel: i64,
+    realtime_generation: u64,
+    event_subscription: Option<tokio::sync::watch::Sender<Option<ChannelSubscription>>>,
+    online_by_server: std::collections::HashMap<i64, std::collections::HashSet<i64>>,
     events: Option<
         std::sync::Arc<std::sync::Mutex<std::sync::mpsc::Receiver<voxhold_api::RealtimeEvent>>>,
     >,
@@ -136,6 +138,9 @@ impl Voxhold {
             task.abort();
         }
         self.events = None;
+        self.event_subscription = None;
+        self.realtime_generation = self.realtime_generation.wrapping_add(1);
+        self.online_by_server.clear();
     }
 
     fn new(
@@ -232,7 +237,9 @@ impl Voxhold {
             read_retry_at: None,
             painted_read: Default::default(),
             event_task: None,
-            event_channel: 0,
+            realtime_generation: 0,
+            event_subscription: None,
+            online_by_server: Default::default(),
             events: None,
             events_overflow: Default::default(),
             reads: Default::default(),
@@ -397,7 +404,8 @@ impl Voxhold {
                 let inbox_client = c.clone();
                 s.inbox = Some(cx.new(|cx| inbox::Inbox::new(inbox_client, runtime, window, cx)));
                 s.self_user_id = self_user_id;
-                s.client = Some(c);
+                s.client = Some(c.clone());
+                s.start_realtime(c, window, cx);
                 s.servers = servers;
                 s.auth.status = "Choose a server".into();
                 // Go selects the first server after login; an empty list leaves
@@ -559,7 +567,6 @@ impl Voxhold {
                 cx.new(|cx| personal_settings::PersonalSettings::new(client, runtime, window, cx));
             self.settings = Some(settings);
         }
-        self.stop_realtime();
         self.channels.clear();
         self.messages.clear();
         self.before = None;
@@ -594,11 +601,11 @@ impl Voxhold {
         self.history_keys.clear();
         let generation = self.generation;
         self.error.clear();
+        self.update_channel_subscription(false);
         if id == 0 {
             cx.notify();
             return;
         }
-        self.start_channel_events(c.clone(), id, 0, window, cx);
         cx.notify();
         let rt = self.runtime.clone();
         let task = cx.background_spawn(async move {
@@ -633,7 +640,9 @@ impl Voxhold {
         if self.access_pending {
             return;
         }
-        let Some(c) = self.client.clone() else { return };
+        if self.client.is_none() {
+            return;
+        }
         let previous_channel = self.channel;
         if self.channel != 0 {
             self.drafts.insert(
@@ -648,7 +657,6 @@ impl Voxhold {
             .unwrap_or_default();
         self.composer
             .update(cx, |input, cx| input.set_value(draft, window, cx));
-        self.stop_realtime();
         self.channel = id;
         self.attachment_pending = None;
         let writable = self.channels.iter().any(|ch| ch.id == id && ch.writable());
@@ -703,20 +711,18 @@ impl Voxhold {
             });
         }
         #[cfg(feature = "voxhold-media")]
-        if self
-            .channels
-            .iter()
-            .any(|ch| ch.id == id && ch.kind == "voice" && ch.readable() && !ch.e2ee_required)
-            && self.voice_channel != id
-        {
+        if let Some(client) = self.client.clone().filter(|_| {
+            self.voice_channel != id
+                && self.channels.iter().any(|ch| {
+                    ch.id == id && ch.kind == "voice" && ch.readable() && !ch.e2ee_required
+                })
+        }) {
             if let Some(voice) = self.voice.take() {
                 voice.update(cx, |voice, cx| voice.leave_in_window(window, cx));
             }
-            let voice_client = c.clone();
             let server = self.server;
-            self.voice = Some(
-                cx.new(|cx| voice_panel::VoicePanel::new(voice_client, server, id, window, cx)),
-            );
+            self.voice =
+                Some(cx.new(|cx| voice_panel::VoicePanel::new(client, server, id, window, cx)));
             self.voice_channel = id;
         }
         if let Some(tools) = &self.message_tools {
@@ -736,27 +742,37 @@ impl Voxhold {
         self.loading_older = false;
         self.generation += 1;
         self.error.clear();
-        let sid = self.server;
         let has_history = self
             .channels
             .iter()
             .any(|ch| ch.id == id && ch.has_history());
-        self.start_channel_events(c, sid, if has_history { id } else { 0 }, window, cx);
+        self.update_channel_subscription(has_history);
         self.load_channel_members(cx);
         if has_history {
             self.refresh_history(window, cx);
         }
         cx.notify();
     }
-    fn start_channel_events(
-        &mut self,
-        client: Client,
-        server: i64,
-        channel: i64,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.event_channel = channel;
+    fn update_channel_subscription(&self, enabled: bool) {
+        if let Some(sender) = &self.event_subscription {
+            sender.send_if_modified(|current| {
+                let next = enabled.then_some(ChannelSubscription {
+                    server_id: self.server,
+                    channel_id: self.channel,
+                    generation: self.access_generation,
+                });
+                if *current == next {
+                    return false;
+                }
+                *current = next;
+                true
+            });
+        }
+    }
+
+    fn start_realtime(&mut self, client: Client, window: &mut Window, cx: &mut Context<Self>) {
+        let (subscription, desired) = tokio::sync::watch::channel(None);
+        self.event_subscription = Some(subscription);
         let (tx, rx) = std::sync::mpsc::sync_channel(128);
         let overflow = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         self.events_overflow = overflow.clone();
@@ -766,8 +782,8 @@ impl Voxhold {
             loop {
                 let sender = tx.clone();
                 let overflow = overflow.clone();
-                let result = client
-                    .subscribe(server, channel, |mut event| {
+                let _ = client
+                    .subscribe_channels(desired.clone(), |mut event| {
                         if event.kind == "ready" && std::mem::replace(&mut connected, true) {
                             event.kind = "native.reconnected".into();
                         }
@@ -776,21 +792,10 @@ impl Voxhold {
                         }
                     })
                     .await;
-                if matches!(result, Err(voxhold_api::Error::Http(403))) {
-                    if tx
-                        .try_send(voxhold_api::RealtimeEvent {
-                            kind: "native.subscription_forbidden".into(),
-                            ..Default::default()
-                        })
-                        .is_err()
-                    {
-                        overflow.store(true, std::sync::atomic::Ordering::Relaxed);
-                    }
-                }
                 tokio::time::sleep(std::time::Duration::from_secs(3)).await;
             }
         }));
-        self.schedule_events(self.generation, window, cx);
+        self.schedule_events(self.realtime_generation, window, cx);
     }
     fn schedule_events(&self, generation: u64, window: &mut Window, cx: &mut Context<Self>) {
         let timer = cx
@@ -799,7 +804,7 @@ impl Voxhold {
         cx.spawn_in(window, async move |this, cx| {
             timer.await;
             let _ = this.update_in(cx, |s, window, cx| {
-                if s.generation != generation || s.events.is_none() {
+                if s.realtime_generation != generation || s.events.is_none() {
                     return;
                 }
                 let events: Vec<_> = s
@@ -838,7 +843,7 @@ impl Voxhold {
                 if changed || resync || access {
                     cx.notify();
                 }
-                if s.generation == generation && s.events.is_some() {
+                if s.realtime_generation == generation && s.events.is_some() {
                     s.schedule_events(generation, window, cx);
                 }
             });
@@ -895,12 +900,19 @@ impl Voxhold {
         match kind {
             "channel.subscribed" | "channel.sync_required"
                 if data["server_id"].as_i64() == Some(self.server)
-                    && data["channel_id"].as_i64() == Some(self.channel) =>
+                    && data["channel_id"].as_i64() == Some(self.channel)
+                    && (kind == "channel.sync_required"
+                        || data["generation"].as_u64() == Some(self.access_generation)) =>
             {
                 effect.resync = true;
             }
-            "native.reconnected" | "native.subscription_forbidden" => {
-                effect.access = self.server != 0
+            "native.reconnected" => effect.access = self.server != 0,
+            "native.subscription_forbidden"
+                if data["server_id"].as_i64() == Some(self.server)
+                    && data["channel_id"].as_i64() == Some(self.channel)
+                    && data["generation"].as_u64() == Some(self.access_generation) =>
+            {
+                effect.access = true;
             }
             "channels.changed" | "channel.created" | "channel.updated" | "channel.deleted"
                 if data["server_id"].as_i64() == Some(self.server) =>
@@ -930,6 +942,9 @@ impl Voxhold {
                 let user_id = data["user_id"].as_i64();
                 let server = data["server_id"].as_i64().unwrap_or_default();
                 let removed = kind == "server.deleted" || user_id == Some(self.self_user_id);
+                if removed {
+                    self.online_by_server.remove(&server);
+                }
                 if server == self.server {
                     effect.server_removed = removed;
                     self.members
@@ -942,24 +957,30 @@ impl Voxhold {
             }
             "presence.snapshot" => {
                 if let Some(servers) = data["servers"].as_array() {
-                    if let Some(ids) = servers
-                        .iter()
-                        .find(|server| server["server_id"].as_i64() == Some(self.server))
-                        .and_then(|server| server["online_user_ids"].as_array())
-                    {
-                        self.roster.online =
-                            ids.iter().filter_map(serde_json::Value::as_i64).collect();
+                    for server in servers {
+                        if let (Some(id), Some(ids)) = (
+                            server["server_id"].as_i64(),
+                            server["online_user_ids"].as_array(),
+                        ) {
+                            self.online_by_server.insert(
+                                id,
+                                ids.iter().filter_map(serde_json::Value::as_i64).collect(),
+                            );
+                        }
                     }
                 }
             }
-            "presence.updated" if data["server_id"].as_i64() == Some(self.server) => {
-                if let Some(id) = data["user_id"].as_i64() {
+            "presence.updated" => {
+                if let (Some(server), Some(id)) =
+                    (data["server_id"].as_i64(), data["user_id"].as_i64())
+                {
+                    let online = self.online_by_server.entry(server).or_default();
                     match data["status"].as_str() {
                         Some("online") => {
-                            self.roster.online.insert(id);
+                            online.insert(id);
                         }
                         Some("offline") => {
-                            self.roster.online.remove(&id);
+                            online.remove(&id);
                         }
                         _ => {}
                     }
@@ -1262,13 +1283,7 @@ impl Voxhold {
                             s.deleted_ids.clear();
                             s.composer
                                 .update(cx, |input, cx| input.set_value("", window, cx));
-                            if s.event_channel != 0 {
-                                s.stop_realtime();
-                                s.generation = s.generation.wrapping_add(1);
-                                if let Some(client) = s.client.clone() {
-                                    s.start_channel_events(client, server, 0, window, cx);
-                                }
-                            }
+                            s.update_channel_subscription(false);
                         }
                     }
                     Err(voxhold_api::Error::Http(403 | 404)) => {
@@ -4077,7 +4092,8 @@ mod ui_tests {
             }));
             v.apply_realtime_event("presence.updated", &serde_json::json!({"server_id":7,"user_id":2,"status":"offline","last_seen_at":42}));
             v.apply_realtime_event("presence.updated", &serde_json::json!({"server_id":8,"user_id":5,"status":"online"}));
-            assert_eq!(v.roster.online, [3].into_iter().collect());
+            assert_eq!(v.online_by_server[&7], [3].into_iter().collect());
+            assert_eq!(v.online_by_server[&8], [4, 5].into_iter().collect());
             assert_eq!(v.roster.last_seen.get(&2), Some(&42));
         }));
     }

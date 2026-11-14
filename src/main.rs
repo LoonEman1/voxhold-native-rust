@@ -1,6 +1,7 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 mod attachments;
 mod auth;
+mod background;
 mod channel_settings;
 mod inbox;
 mod layout;
@@ -87,6 +88,8 @@ struct Voxhold {
     shell_initialized: bool,
     drag: Option<SplitterDrag>,
     viewport: (f32, f32),
+    auth_background: Option<(u32, u32, bool, std::sync::Arc<gpui::RenderImage>)>,
+    initial_focus_done: bool,
 }
 impl Voxhold {
     fn new(
@@ -180,6 +183,8 @@ impl Voxhold {
             shell_initialized: false,
             drag: None,
             viewport: (0.0, 0.0),
+            auth_background: None,
+            initial_focus_done: false,
         };
         window_chrome::apply(window, view.palette.light);
         view
@@ -190,8 +195,15 @@ impl Voxhold {
     fn submit_instance(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let raw = self.instance.read(cx).value().to_string();
         if self.auth.submit_instance(&raw).is_some() {
-            self.username
-                .update(cx, |input, cx| input.focus(window, cx));
+            let weak = cx.entity().downgrade();
+            window.on_next_frame(move |window, cx| {
+                if let Some(view) = weak.upgrade() {
+                    view.update(cx, |s, cx| {
+                        let entity = s.username.clone();
+                        entity.update(cx, |input, cx| input.focus(window, cx));
+                    });
+                }
+            });
         }
         cx.notify();
     }
@@ -350,6 +362,7 @@ impl Voxhold {
             input.set_value(self.auth.origin.clone(), window, cx);
         });
         self.shell_initialized = false;
+        self.initial_focus_done = false;
         cx.notify();
     }
     fn select_server(&mut self, id: i64, window: &mut Window, cx: &mut Context<Self>) {
@@ -1392,22 +1405,44 @@ impl Voxhold {
         preview.into_any_element()
     }
 
+    /// Cached auth backdrop keyed by client area and theme, like the Go
+    /// `pageBackground` raster. It is regenerated only when either changes.
+    fn auth_background(&mut self, w: u32, h: u32) -> std::sync::Arc<gpui::RenderImage> {
+        if let Some((cw, ch, light, image)) = &self.auth_background {
+            if *cw == w && *ch == h && *light == self.palette.light {
+                return image.clone();
+            }
+        }
+        let rgba = background::page_background(w.max(1), h.max(1), self.palette.light);
+        let image = std::sync::Arc::new(gpui::RenderImage::new(smallvec::smallvec![
+            image::Frame::new(rgba)
+        ]));
+        self.auth_background = Some((w, h, self.palette.light, image.clone()));
+        image
+    }
+
     fn render_auth(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let (vw, vh) = self.viewport;
         let p = self.palette;
         let instance = self.auth.is_instance();
         let l = auth::layout_auth(vw, vh, instance, !self.auth.status.is_empty());
         let compact = vw <= 760.0;
+        let background = self.auth_background(vw.round() as u32, vh.round() as u32);
         let mut root = div()
             .relative()
             .size_full()
             .font_family("Inter")
             .text_color(ink(p.fg))
-            .bg(gpui::linear_gradient(
-                135.0,
-                gpui::linear_color_stop(ink(p.page_base), 0.0),
-                gpui::linear_color_stop(ink(p.page_end), 1.0),
-            ));
+            .bg(ink(p.page_base))
+            .child(
+                div()
+                    .absolute()
+                    .left(px(0.))
+                    .top(px(0.))
+                    .w(px(vw))
+                    .h(px(vh))
+                    .child(gpui::img(background).size_full()),
+            );
         if l.story > 0.0 {
             let story = auth::story_layout(vw, vh);
             root = root.child(self.auth_story(story, vw, cx));
@@ -2131,6 +2166,20 @@ impl Render for Voxhold {
                 }),
             );
         if self.client.is_none() {
+            if !self.initial_focus_done {
+                self.initial_focus_done = true;
+                // Focus after the first frame so the field's focus handle is
+                // mounted, matching the Go `RequestFocus(user)` call.
+                let weak = cx.entity().downgrade();
+                window.on_next_frame(move |window, cx| {
+                    if let Some(view) = weak.upgrade() {
+                        view.update(cx, |s, cx| {
+                            let entity = s.instance.clone();
+                            entity.update(cx, |input, cx| input.focus(window, cx));
+                        });
+                    }
+                });
+            }
             return root.child(self.render_auth(cx)).into_any_element();
         }
         if !self.shell_initialized {

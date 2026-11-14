@@ -874,9 +874,9 @@ http_active,thumb_bytes,link_bytes,recording_bytes,workers,peers,live_textures
 | Задание | Статус | PR или коммит в `dev` | Выпуск в `main` |
 | --- | --- | --- | --- |
 | Начальный снимок Rust | Опубликован | [`3500e96`](https://github.com/LoonEman1/voxhold-native-rust/commit/3500e961ca5e9f05ec2b03e89084351a5902c8ac) | Тот же исходный снимок |
-| `R00` | К выполнению | — | — |
-| `R01` | К выполнению | — | — |
-| `R02` | К выполнению | — | — |
+| `R00` | В работе · PR [#2](https://github.com/LoonEman1/voxhold-native-rust/pull/2) | Ветка `codex/r00-baseline`, `7ba6521`; не закрыты стенд, release-прогон и seed | — |
+| `R01` | В работе · PR [#3](https://github.com/LoonEman1/voxhold-native-rust/pull/3) | Ветка `codex/r01-ui-shell`, `0792919`; вход/тема/раскладка/сплиттеры сделаны, визуальные пары с Go не сняты | — |
+| `R02` | В работе · PR [#4](https://github.com/LoonEman1/voxhold-native-rust/pull/4) | Ветка `codex/r02-history-realtime`, `7b9fb4a`; merge/tombstone/якорь/автодогрузка сделаны, backoff и реальный стенд не закрыты | — |
 | `R03` | К выполнению | — | — |
 | `R04` | К выполнению | — | — |
 | `R05` | К выполнению | — | — |

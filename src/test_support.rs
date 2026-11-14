@@ -29,16 +29,51 @@ impl Recorded {
 }
 
 #[derive(Clone, Debug)]
+pub enum ReplyBody {
+    Bytes(Vec<u8>),
+    /// Stream from disk in 64 KiB chunks so a large download never sits in the
+    /// test server's heap.
+    File(std::path::PathBuf),
+}
+
+#[derive(Clone, Debug)]
 pub struct Reply {
     pub status: u16,
-    pub body: String,
+    pub body: ReplyBody,
+    pub content_type: &'static str,
 }
 
 impl Reply {
     pub fn new(status: u16, body: &str) -> Self {
         Self {
             status,
-            body: body.to_string(),
+            body: ReplyBody::Bytes(body.as_bytes().to_vec()),
+            content_type: "application/json",
+        }
+    }
+
+    /// Binary response used by the picture endpoints.
+    pub fn image(status: u16, body: Vec<u8>) -> Self {
+        Self {
+            status,
+            body: ReplyBody::Bytes(body),
+            content_type: "image/png",
+        }
+    }
+
+    /// Stream a file response with the real `Content-Length`.
+    pub fn file(status: u16, path: std::path::PathBuf, content_type: &'static str) -> Self {
+        Self {
+            status,
+            body: ReplyBody::File(path),
+            content_type,
+        }
+    }
+
+    fn content_length(&self) -> u64 {
+        match &self.body {
+            ReplyBody::Bytes(bytes) => bytes.len() as u64,
+            ReplyBody::File(path) => std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0),
         }
     }
 }
@@ -77,15 +112,35 @@ impl TestServer {
                     .get(index)
                     .cloned()
                     .unwrap_or(Reply::new(500, "{\"error\":\"unexpected request\"}"));
-                let _ = stream.write_all(
-                    format!(
-                        "HTTP/1.1 {} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                        reply.status,
-                        reply.body.len(),
-                        reply.body
-                    )
-                    .as_bytes(),
-                );
+                let mut response = format!(
+                    "HTTP/1.1 {} X\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    reply.status,
+                    reply.content_type,
+                    reply.content_length()
+                )
+                .into_bytes();
+                let _ = stream.write_all(&response);
+                match &reply.body {
+                    ReplyBody::Bytes(bytes) => {
+                        let _ = stream.write_all(bytes);
+                    }
+                    ReplyBody::File(path) => {
+                        if let Ok(mut file) = std::fs::File::open(path) {
+                            let mut chunk = vec![0u8; 64 << 10];
+                            loop {
+                                use std::io::Read;
+                                match file.read(&mut chunk) {
+                                    Ok(0) | Err(_) => break,
+                                    Ok(read) => {
+                                        if stream.write_all(&chunk[..read]).is_err() {
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
         });
         Self {
@@ -149,13 +204,28 @@ fn read_request(stream: &mut std::net::TcpStream) -> Option<Recorded> {
         .find(|(key, _)| key.eq_ignore_ascii_case("content-length"))
         .and_then(|(_, value)| value.parse().ok())
         .unwrap_or(0);
+    // Keep the memory measurement honest: a large upload is drained in 8 KiB
+    // chunks and only the first 4 KiB are recorded for assertions.
+    const CAPTURE: usize = 1 << 20;
     let mut body = buffer[header_end + 4..].to_vec();
-    while body.len() < expected {
-        let read = stream.read(&mut chunk).ok()?;
-        if read == 0 {
-            break;
+    if expected <= CAPTURE {
+        while body.len() < expected {
+            let read = stream.read(&mut chunk).ok()?;
+            if read == 0 {
+                break;
+            }
+            body.extend_from_slice(&chunk[..read]);
         }
-        body.extend_from_slice(&chunk[..read]);
+    } else {
+        body.truncate(4096);
+        let mut seen = buffer.len() - header_end - 4;
+        while seen < expected {
+            let read = stream.read(&mut chunk).ok()?;
+            if read == 0 {
+                break;
+            }
+            seen += read;
+        }
     }
     Some(Recorded {
         method,
@@ -163,4 +233,51 @@ fn read_request(stream: &mut std::net::TcpStream) -> Option<Recorded> {
         headers,
         body,
     })
+}
+
+/// Private bytes of the current process (Windows `PROCESS_MEMORY_COUNTERS`).
+/// The memory-measurement test uses it before, during and after a transfer.
+#[cfg(windows)]
+pub fn private_bytes() -> u64 {
+    #[repr(C)]
+    #[derive(Default)]
+    struct Counters {
+        cb: u32,
+        page_fault_count: u32,
+        peak_working_set_size: usize,
+        working_set_size: usize,
+        quota_peak_paged_pool_usage: usize,
+        quota_paged_pool_usage: usize,
+        quota_peak_non_paged_pool_usage: usize,
+        quota_non_paged_pool_usage: usize,
+        pagefile_usage: usize,
+        peak_pagefile_usage: usize,
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetCurrentProcess() -> *mut core::ffi::c_void;
+    }
+    #[link(name = "psapi")]
+    unsafe extern "system" {
+        fn GetProcessMemoryInfo(
+            process: *mut core::ffi::c_void,
+            counters: *mut Counters,
+            size: u32,
+        ) -> i32;
+    }
+
+    let mut counters = Counters::default();
+    let size = std::mem::size_of::<Counters>() as u32;
+    let ok = unsafe { GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, size) };
+    if ok == 0 {
+        0
+    } else {
+        counters.pagefile_usage as u64
+    }
+}
+
+#[cfg(not(windows))]
+pub fn private_bytes() -> u64 {
+    0
 }

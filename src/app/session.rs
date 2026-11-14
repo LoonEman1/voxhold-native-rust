@@ -160,6 +160,7 @@ impl Voxhold {
         self.composer_error.clear();
         self.sending = false;
         self.busy = false;
+        self.clear_media(window);
         self.drafts.borrow_mut().clear_all();
         self.generation = self.generation.wrapping_add(1);
         self.access_generation = self.access_generation.wrapping_add(1);

@@ -6940,6 +6940,7 @@ dependencies = [
  "serde_json",
  "smallvec",
  "tokio",
+ "url",
  "uuid",
  "voxhold-api",
  "voxhold-media",

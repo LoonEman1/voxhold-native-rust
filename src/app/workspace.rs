@@ -21,6 +21,7 @@ impl Voxhold {
         self.server = id;
         self.sending = false;
         self.composer_error.clear();
+        self.clear_media(window);
         if let Some(attachments) = &self.attachments {
             attachments.update(cx, |a, cx| a.set_scope(None, false, cx));
         }
@@ -174,6 +175,7 @@ impl Voxhold {
         self.channel = id;
         self.sending = false;
         self.composer_error.clear();
+        self.close_viewer(window);
         let writable = self.channels.iter().any(|ch| ch.id == id && ch.writable());
         if let Some(attachments) = &self.attachments {
             attachments.update(cx, |a, cx| {
@@ -347,6 +349,7 @@ impl Voxhold {
         self.busy = false;
         self.sending = false;
         self.composer_error.clear();
+        self.clear_media(window);
         self.roster.reset_channel();
         self.roster.loading.clear();
         for (_, (image, _)) in self.roster.avatars.drain() {

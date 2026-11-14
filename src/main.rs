@@ -12,6 +12,8 @@ mod file_io;
 mod history;
 mod inbox;
 mod layout;
+mod links;
+mod media;
 mod members;
 mod message_tools;
 mod personal_settings;

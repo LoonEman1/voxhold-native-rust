@@ -15,6 +15,12 @@ impl Render for Voxhold {
             .capture_key_down(cx.listener(|s, event: &gpui::KeyDownEvent, window, cx| {
                 match event.keystroke.key.as_str() {
                     "escape" => {
+                        if s.media.viewer.is_some() {
+                            s.close_viewer(window);
+                            cx.notify();
+                            cx.stop_propagation();
+                            return;
+                        }
                         s.show_search = false;
                         s.show_tools = false;
                         s.show_settings = false;
@@ -662,6 +668,10 @@ impl Render for Voxhold {
         }
         if !mobile && self.show_servers {
             root = root.child(self.server_picker(cx));
+        }
+        self.ensure_viewer_scale(window, cx);
+        if let Some(layer) = self.viewer_layer(window, cx) {
+            root = root.child(layer);
         }
         root.into_any_element()
     }

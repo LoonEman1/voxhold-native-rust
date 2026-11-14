@@ -871,3 +871,5 @@ async fn paste_and_drop_add_only_metadata_to_the_draft(cx: &mut TestAppContext) 
     assert!(!panel.read_with(&*visual, |panel, _| panel.is_reading()));
     std::fs::remove_file(path).unwrap();
 }
+
+mod media;

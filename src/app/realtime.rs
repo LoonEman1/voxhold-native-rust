@@ -92,6 +92,15 @@ impl Voxhold {
                 }
                 if changed {
                     s.sync_tools_message(cx);
+                    // Deleting (or dropping from the window) the viewed message
+                    // closes the viewer before a late content answer arrives.
+                    let stale_viewer = s.media.viewer.as_ref().is_some_and(|viewer| {
+                        s.deleted_ids.contains(&viewer.key.message_id)
+                            || !s.messages.iter().any(|row| row.id == viewer.key.message_id)
+                    });
+                    if stale_viewer {
+                        s.close_viewer(window);
+                    }
                 }
                 if changed || resync || access {
                     cx.notify();

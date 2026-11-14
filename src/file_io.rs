@@ -128,7 +128,20 @@ fn replace_file(part: &Path, target: &Path) -> std::io::Result<()> {
         .collect();
     let moved = unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), MOVEFILE_REPLACE_EXISTING) };
     if moved == 0 {
-        Err(std::io::Error::last_os_error())
+        let error = std::io::Error::last_os_error();
+        if matches!(error.raw_os_error(), Some(5 | 32)) {
+            // Two saves of one target can race on the replace; Windows reports
+            // a transient sharing violation for the losing attempt.
+            for _ in 0..5 {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                if unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), MOVEFILE_REPLACE_EXISTING) }
+                    != 0
+                {
+                    return Ok(());
+                }
+            }
+        }
+        Err(error)
     } else {
         Ok(())
     }

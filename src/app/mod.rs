@@ -2,6 +2,7 @@ mod auth_view;
 mod composer;
 mod history_ops;
 mod history_view;
+mod media_ops;
 mod members_view;
 mod navigation_view;
 mod realtime;
@@ -24,8 +25,8 @@ use voxhold_api::{Channel, ChannelSubscription, Client, Member, Message, Server}
 #[cfg(feature = "voxhold-media")]
 use crate::voice_panel;
 use crate::{
-    attachments, auth, background, channel_settings, draft, inbox, layout, members, message_tools,
-    personal_settings, reactions, search, server_settings, theme, window_chrome,
+    attachments, auth, background, channel_settings, draft, inbox, layout, links, media, members,
+    message_tools, personal_settings, reactions, search, server_settings, theme, window_chrome,
 };
 use ui::{icon, ink};
 
@@ -121,6 +122,8 @@ pub(crate) struct Voxhold {
     /// Used by "К последним" after a quote opened a bounded context page.
     history_reset_pending: bool,
     hovered_message: i64,
+    /// Bounded thumbnails, link previews and the single image viewer.
+    media: media::Media,
     event_task: Option<tokio::task::JoinHandle<()>>,
     realtime_generation: u64,
     event_subscription: Option<tokio::sync::watch::Sender<Option<ChannelSubscription>>>,
@@ -288,6 +291,7 @@ impl Voxhold {
             pending_jump: None,
             history_reset_pending: false,
             hovered_message: 0,
+            media: media::Media::default(),
             event_task: None,
             realtime_generation: 0,
             event_subscription: None,

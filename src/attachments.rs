@@ -583,4 +583,130 @@ mod tests {
         assert!(server.requests().is_empty(), "no request leaves the client");
         std::fs::remove_file(path).unwrap();
     }
+
+    /// Write a file without holding it in memory.
+    fn large_file(name: &str, size: usize) -> PathBuf {
+        use std::io::Write;
+        let path = std::env::temp_dir().join(format!(
+            "voxhold-measure-{}-{}-{name}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let mut file = std::fs::File::create(&path).unwrap();
+        let chunk = vec![0x5a_u8; 64 << 10];
+        let mut left = size;
+        while left > 0 {
+            let take = left.min(chunk.len());
+            file.write_all(&chunk[..take]).unwrap();
+            left -= take;
+        }
+        file.sync_all().unwrap();
+        path
+    }
+
+    fn plan_for(path: &std::path::Path) -> draft::SendPlan {
+        let file = draft::DraftFile::from_path(path.to_path_buf()).unwrap();
+        draft::SendPlan {
+            key: draft::ChatKey::channel(1, 7),
+            content: "большой файл".into(),
+            composer_text: "большой файл".into(),
+            reply: 0,
+            files: vec![file],
+            send_key: "0123456789abcdef0123456789abcdef".into(),
+            revision: 1,
+        }
+    }
+
+    /// R03 acceptance measurement: private bytes of the whole process before,
+    /// during and after an 8 MiB and a 60 MiB upload and save. Run with
+    /// `cargo test --release -p voxhold-native-rust measure_attachment_transfer_memory
+    /// -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "memory measurement; run explicitly in release"]
+    fn measure_attachment_transfer_memory() {
+        use crate::test_support::{private_bytes, Reply, TestServer};
+        use std::sync::{
+            atomic::{AtomicBool, AtomicU64, Ordering},
+            Arc,
+        };
+
+        struct Sampler {
+            stop: Arc<AtomicBool>,
+            peak: Arc<AtomicU64>,
+            handle: Option<std::thread::JoinHandle<()>>,
+        }
+        impl Sampler {
+            fn start() -> Self {
+                let stop = Arc::new(AtomicBool::new(false));
+                let peak = Arc::new(AtomicU64::new(private_bytes()));
+                let running = stop.clone();
+                let sampled = peak.clone();
+                let handle = std::thread::spawn(move || {
+                    while !running.load(Ordering::Relaxed) {
+                        let value = private_bytes();
+                        sampled.fetch_max(value, Ordering::Relaxed);
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                });
+                Self {
+                    stop,
+                    peak,
+                    handle: Some(handle),
+                }
+            }
+            fn stop(mut self) -> u64 {
+                self.stop.store(true, Ordering::Relaxed);
+                if let Some(handle) = self.handle.take() {
+                    let _ = handle.join();
+                }
+                self.peak.load(Ordering::Relaxed)
+            }
+        }
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        for (mib, size) in [(8usize, 8usize << 20), (60, 60usize << 20)] {
+            let source = large_file(&format!("{mib}mib.bin"), size);
+            let plan = plan_for(&source);
+            let attachment = format!(
+                "{{\"id\":\"{}\",\"filename\":\"{}\",\"mime_type\":\"application/octet-stream\",\"size_bytes\":{},\"deleted\":false}}",
+                plan.files[0].id, plan.files[0].name, size
+            );
+            let server = TestServer::spawn(vec![Reply::new(200, &attachment)]);
+            let client = Client::new(&server.base).unwrap();
+            let base = private_bytes();
+            let sampler = Sampler::start();
+            runtime.block_on(upload_draft(&client, &plan)).unwrap();
+            let upload_peak = sampler.stop();
+            let after_upload = private_bytes();
+
+            let target = std::env::temp_dir().join(format!(
+                "voxhold-measure-target-{}-{mib}mib.bin",
+                std::process::id()
+            ));
+            let server = TestServer::spawn(vec![Reply::file(
+                200,
+                source.clone(),
+                "application/octet-stream",
+            )]);
+            let client = Client::new(&server.base).unwrap();
+            let sampler = Sampler::start();
+            let mut save = crate::file_io::PartFile::create(&target).unwrap();
+            let written = runtime
+                .block_on(
+                    client
+                        .download_attachment_to(&plan.files[0].id, &mut |chunk| save.write(chunk)),
+                )
+                .unwrap();
+            save.finish(Some(written)).unwrap();
+            let save_peak = sampler.stop();
+            let after_save = private_bytes();
+            println!(
+                "size_mib={mib} baseline={base} upload_peak={upload_peak} after_upload={after_upload} save_peak={save_peak} after_save={after_save} bytes={written}"
+            );
+            assert_eq!(written, size as u64);
+            assert_eq!(std::fs::metadata(&target).unwrap().len(), size as u64);
+            std::fs::remove_file(source).unwrap();
+            std::fs::remove_file(target).unwrap();
+        }
+    }
 }

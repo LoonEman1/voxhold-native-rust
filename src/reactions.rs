@@ -178,6 +178,11 @@ impl ReactionPicker {
         cx.notify();
     }
 
+    pub fn set_mine(&mut self, mine: impl IntoIterator<Item = String>, cx: &mut Context<Self>) {
+        self.mine = mine.into_iter().collect();
+        cx.notify();
+    }
+
     fn pick(&mut self, value: &str, cx: &mut gpui::App) {
         if let Some(handler) = &self.on_pick {
             handler(value, cx);

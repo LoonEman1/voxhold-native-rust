@@ -894,6 +894,9 @@ impl Voxhold {
                 } else if resync {
                     s.refresh_history(window, cx);
                 }
+                if changed {
+                    s.sync_tools_message(cx);
+                }
                 if changed || resync || access {
                     cx.notify();
                 }
@@ -1528,6 +1531,7 @@ impl Voxhold {
                             if !active {
                                 reactions::touch_recent(&mut recent.borrow_mut(), &key.1);
                             }
+                            s.sync_tools_message(cx);
                             s.error.clear();
                         }
                         Err(error) => s.error = error.to_string(),
@@ -1589,16 +1593,12 @@ impl Voxhold {
                     s.context_request = None;
                     match result {
                         Ok(context) => {
-                            s.messages = context.messages;
-                            s.messages.sort_by_key(|message| message.id);
-                            s.history_keys.clear();
-                            s.history_list.reset(0);
-                            s.before = s.messages.first().map(|message| message.id);
-                            s.has_more = s.before.is_some();
-                            s.history_has_newer = true;
-                            s.pending_anchor = None;
-                            s.pending_jump = Some(context.target_message_id);
-                            s.error.clear();
+                            if s.apply_context_snapshot(context) {
+                                s.sync_tools_message(cx);
+                            }
+                        }
+                        Err(voxhold_api::Error::Http(404)) => {
+                            s.error = "Сообщение недоступно".into();
                         }
                         Err(error) => s.error = error.to_string(),
                     }
@@ -1608,6 +1608,113 @@ impl Voxhold {
             }
         })
         .detach();
+    }
+
+    /// Merge a bounded context page into the current window with the same
+    /// revision/tombstone rules as history and realtime events. `false` means
+    /// the target was deleted while the request was in flight; the old window
+    /// is kept and an unavailable message is shown.
+    fn apply_context_snapshot(&mut self, context: voxhold_api::MessageContext) -> bool {
+        let target = context.target_message_id;
+        if self.deleted_ids.contains(&target) {
+            self.error = "Сообщение недоступно".into();
+            return false;
+        }
+        let context_len = context.messages.len();
+        let target_index = context.target_index;
+        let current: std::collections::HashMap<i64, Message> = self
+            .messages
+            .iter()
+            .cloned()
+            .map(|message| (message.id, message))
+            .collect();
+        let mut merged = Vec::with_capacity(context_len);
+        let mut applied = Vec::new();
+        for mut message in context.messages {
+            if message.channel_id != self.channel
+                || (message.thread_root_id.is_some() && message.id != target)
+                || self.deleted_ids.contains(&message.id)
+            {
+                continue;
+            }
+            if let Some(existing) = current.get(&message.id).cloned() {
+                let mut existing = existing;
+                merge_revision(&mut existing, message);
+                message = existing;
+            }
+            if let Some(edit) = self.pending_edits.get(&message.id).cloned() {
+                merge_revision(&mut message, edit);
+            }
+            if let Some(update) = self.pending_reactions.get(&message.id).cloned() {
+                apply_reactions(&mut message, update);
+            }
+            applied.push(message.id);
+            merged.push(message);
+        }
+        if !applied.contains(&target) {
+            self.error = "Сообщение недоступно".into();
+            return false;
+        }
+        merged.sort_by_key(|message| message.id);
+        for id in &applied {
+            self.pending_edits.remove(id);
+            self.pending_reactions.remove(id);
+        }
+        self.messages = merged;
+        self.history_keys.clear();
+        self.history_list.reset(0);
+        self.before = self.messages.first().map(|message| message.id);
+        self.has_more = target_index >= 25;
+        self.history_has_newer = context_len.saturating_sub(target_index + 1) >= 25;
+        self.pending_anchor = None;
+        self.pending_jump = Some(target);
+        // The old page belongs to the replaced window; invalidate its pending
+        // cursor and its retry state before the next `load_older`.
+        self.older_request = 0;
+        self.loading_older = false;
+        self.older_error.clear();
+        self.older_retry_at = None;
+        self.older_scheduled = false;
+        self.error.clear();
+        true
+    }
+
+    /// The guard applied to a `messages_page` answer. Extracted so a context
+    /// replacement can be tested against a late older-page response.
+    fn accepts_older_reply(
+        &self,
+        request: u64,
+        before: i64,
+        server: i64,
+        channel: i64,
+        generation: u64,
+        access: u64,
+    ) -> bool {
+        self.generation == generation
+            && self.access_generation == access
+            && self.older_request == request
+            && self.before == Some(before)
+            && self.server == server
+            && self.channel == channel
+    }
+
+    /// Push the confirmed row into an open action panel so its reaction state
+    /// follows history/WS changes even when the panel was opened earlier.
+    fn sync_tools_message(&mut self, cx: &mut Context<Self>) {
+        let Some(tools) = self.message_tools.clone() else {
+            return;
+        };
+        let Some(id) = tools.read(cx).selected_id() else {
+            return;
+        };
+        let message = self
+            .messages
+            .iter()
+            .find(|message| message.id == id)
+            .cloned();
+        tools.update(cx, |tools, cx| {
+            tools.sync_message(message.as_ref(), cx);
+        });
     }
 
     fn history_anchor(&self) -> Option<(i64, gpui::Pixels)> {
@@ -1710,6 +1817,7 @@ impl Voxhold {
                             s.before = None;
                         }
                         s.apply_history_snapshot(page, new_ids);
+                        s.sync_tools_message(cx);
                         s.older_error.clear();
                         s.older_retry_at = None;
                         s.error.clear();
@@ -1817,13 +1925,7 @@ impl Voxhold {
         cx.spawn_in(window, async move |this, window| {
             let result = task.await;
             let _ = this.update_in(window, |s, window, cx| {
-                if s.generation != generation
-                    || s.access_generation != access
-                    || s.older_request != request
-                    || s.before != Some(before)
-                    || s.server != server
-                    || s.channel != channel
-                {
+                if !s.accepts_older_reply(request, before, server, channel, generation, access) {
                     return;
                 }
                 s.loading_older = false;
@@ -1839,6 +1941,7 @@ impl Voxhold {
                             s.merge_message(true, row);
                         }
                         s.trim_history(true);
+                        s.sync_tools_message(cx);
                         s.older_retry_at = None;
                         s.pending_anchor = anchor;
                     }
@@ -4927,6 +5030,146 @@ mod ui_tests {
                 );
                 assert_eq!(v.unread_after, 42, "the divider stays at the open boundary");
                 assert_eq!(v.channel_reads.get(&(1, 7)), Some(&44));
+            });
+        });
+    }
+
+    #[gpui::test]
+    async fn context_merge_keeps_ws_edits_reactions_and_pending_events(cx: &mut TestAppContext) {
+        cx.update(|cx| gpui_component::init(cx));
+        let (_window, view) = add_auth_window(cx);
+        cx.update(|app| {
+            view.update(app, |v, _| {
+                v.server = 1;
+                v.channel = 7;
+                let dto = |id, revision, text, reactions| {
+                    serde_json::from_value::<Message>(message_json_with_reactions(
+                        id, revision, text, reactions,
+                    ))
+                    .unwrap()
+                };
+                v.merge_message(true, dto(10, 5, "confirmed", 7));
+                v.merge_message(true, dto(11, 2, "other", 0));
+                // WS edit and reactions arrive while /context is in flight.
+                v.apply_realtime_event("message.updated", &message_json(10, 6, "edited by ws"));
+                v.apply_realtime_event(
+                    "message.reactions_changed",
+                    &serde_json::json!({"channel_id":7,"message_id":10,"revision":9,
+                        "reactions":[{"emoji":"🔥","count":1,"me":true}]}),
+                );
+                // The target is outside the window, so its changes are pending.
+                v.apply_realtime_event("message.updated", &message_json(12, 8, "late target edit"));
+                v.apply_realtime_event(
+                    "message.reactions_changed",
+                    &serde_json::json!({"channel_id":7,"message_id":12,"revision":11,
+                        "reactions":[{"emoji":"🔥","count":2,"me":false}]}),
+                );
+                let context = voxhold_api::MessageContext {
+                    messages: vec![
+                        dto(9, 1, "deleted before context", 0),
+                        dto(10, 2, "stale context", 1),
+                        dto(11, 1, "old other", 0),
+                        dto(12, 1, "old target", 0),
+                    ],
+                    target_message_id: 12,
+                    target_index: 3,
+                };
+                v.deleted_ids.insert(9);
+                assert!(v.apply_context_snapshot(context));
+                let ids: Vec<_> = v.messages.iter().map(|message| message.id).collect();
+                assert_eq!(ids, [10, 11, 12], "deleted context rows stay tombstoned");
+                assert_eq!(v.messages[0].content, "edited by ws");
+                assert_eq!(v.messages[0].reactions_revision, 9);
+                assert!(v.messages[0].reactions[0].me);
+                assert_eq!(v.messages[2].content, "late target edit");
+                assert_eq!(v.messages[2].reactions_revision, 11);
+                assert!(!v.pending_edits.contains_key(&12));
+                assert!(!v.pending_reactions.contains_key(&12));
+                assert_eq!(v.before, Some(10));
+                assert_eq!(v.pending_jump, Some(12));
+                assert!(v.error.is_empty());
+            });
+        });
+    }
+
+    #[gpui::test]
+    async fn context_target_deleted_during_request_keeps_the_window(cx: &mut TestAppContext) {
+        cx.update(|cx| gpui_component::init(cx));
+        let (_window, view) = add_auth_window(cx);
+        cx.update(|app| {
+            view.update(app, |v, _| {
+                v.server = 1;
+                v.channel = 7;
+                let dto =
+                    |id| serde_json::from_value::<Message>(message_json(id, 1, "row")).unwrap();
+                v.merge_message(true, dto(10));
+                v.merge_message(true, dto(11));
+                v.apply_realtime_event(
+                    "message.deleted",
+                    &serde_json::json!({"channel_id":7,"message_id":12}),
+                );
+                let context = voxhold_api::MessageContext {
+                    messages: vec![dto(10), dto(11), dto(12)],
+                    target_message_id: 12,
+                    target_index: 2,
+                };
+                assert!(!v.apply_context_snapshot(context));
+                assert_eq!(
+                    v.messages
+                        .iter()
+                        .map(|message| message.id)
+                        .collect::<Vec<_>>(),
+                    [10, 11],
+                    "the old window must survive a deleted target"
+                );
+                assert_eq!(v.error, "Сообщение недоступно");
+            });
+        });
+    }
+
+    #[gpui::test]
+    async fn context_replacement_invalidates_the_old_older_page(cx: &mut TestAppContext) {
+        cx.update(|cx| gpui_component::init(cx));
+        let (_window, view) = add_auth_window(cx);
+        cx.update(|app| {
+            view.update(app, |v, _| {
+                v.server = 1;
+                v.channel = 7;
+                v.before = Some(100);
+                v.older_request = 42;
+                v.loading_older = true;
+                v.older_error = "старая ошибка".into();
+                v.older_retry_at =
+                    Some(std::time::Instant::now() + std::time::Duration::from_secs(60));
+                v.older_scheduled = true;
+                let (generation, access) = (v.generation, v.access_generation);
+                assert!(v.accepts_older_reply(42, 100, 1, 7, generation, access));
+
+                let messages = (30..=80)
+                    .map(|id| {
+                        serde_json::from_value::<Message>(message_json(id, 1, "row")).unwrap()
+                    })
+                    .collect();
+                let context = voxhold_api::MessageContext {
+                    messages,
+                    target_message_id: 55,
+                    target_index: 25,
+                };
+                assert!(v.apply_context_snapshot(context));
+                assert_eq!(v.before, Some(30));
+                assert!(!v.loading_older);
+                assert_eq!(v.older_request, 0);
+                assert!(v.older_error.is_empty());
+                assert!(v.older_retry_at.is_none());
+                assert!(!v.older_scheduled);
+                assert!(v.has_more);
+                assert!(v.history_has_newer);
+
+                assert!(!v.accepts_older_reply(42, 100, 1, 7, generation, access));
+                v.older_request = 43;
+                assert!(v.accepts_older_reply(43, 30, 1, 7, generation, access));
+                assert!(!v.accepts_older_reply(43, 100, 1, 7, generation, access));
+                assert!(!v.accepts_older_reply(42, 30, 1, 7, generation, access));
             });
         });
     }

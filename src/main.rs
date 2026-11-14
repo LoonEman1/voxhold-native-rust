@@ -93,6 +93,9 @@ struct Voxhold {
     /// `(message_id, offset_in_item)` captured before a prepend so the visible
     /// row stays under the same pixel after older rows are merged.
     pending_anchor: Option<(i64, gpui::Pixels)>,
+    /// Deleting a message is terminal: a late page or a repeated event must not
+    /// bring the row back.
+    deleted_ids: std::collections::HashSet<i64>,
     _activation_subscription: gpui::Subscription,
 }
 impl Voxhold {
@@ -107,7 +110,12 @@ impl Voxhold {
         history_list.set_scroll_handler(move |event, window, cx| {
             if let Some(view) = weak.upgrade() {
                 view.update(cx, |s, cx| {
-                    s.mark_visible_read(event.visible_range.clone(), window, cx)
+                    s.mark_visible_read(event.visible_range.clone(), window, cx);
+                    // Go loads the previous page when the reader reaches the
+                    // top area instead of waiting for the explicit button.
+                    if event.visible_range.start <= 3 && s.has_more && !s.loading_older {
+                        s.load_older(cx);
+                    }
                 });
             }
         });
@@ -190,6 +198,7 @@ impl Voxhold {
             auth_background: None,
             initial_focus_done: false,
             pending_anchor: None,
+            deleted_ids: Default::default(),
             _activation_subscription: cx.observe_window_activation(window, |s, window, cx| {
                 if s.theme_mode == theme::ThemeMode::System {
                     let light = theme::system_light();
@@ -354,6 +363,8 @@ impl Voxhold {
         self.members.clear();
         self.messages.clear();
         self.history_keys.clear();
+        self.deleted_ids.clear();
+        self.pending_anchor = None;
         self.history_list.reset(0);
         self.self_user_id = 0;
         self.server = 0;
@@ -508,6 +519,8 @@ impl Voxhold {
         self.reads.clear();
         self.read_sent = 0;
         self.read_pending = false;
+        self.deleted_ids.clear();
+        self.pending_anchor = None;
         self.show_tools = false;
         self.show_channel_settings = false;
         let role = self
@@ -662,80 +675,8 @@ impl Voxhold {
                         .events_overflow
                         .swap(false, std::sync::atomic::Ordering::Relaxed);
                     for event in events {
-                        match event.kind.as_str() {
-                            "channel.subscribed" | "channel.sync_required" => resync = true,
-                            "channel.read_snapshot" => {
-                                if event.data["server_id"].as_i64() == Some(s.server)
-                                    && event.data["channel_id"].as_i64() == Some(s.channel)
-                                {
-                                    if let Some(reads) = event.data["reads"].as_array() {
-                                        for value in reads {
-                                            if let Ok(read) =
-                                                serde_json::from_value::<voxhold_api::ChannelRead>(
-                                                    value.clone(),
-                                                )
-                                            {
-                                                let slot = s.reads.entry(read.user_id).or_default();
-                                                *slot = (*slot).max(read.last_read_message_id);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            "channel.read" => {
-                                if let Ok(read) =
-                                    serde_json::from_value::<voxhold_api::ChannelRead>(event.data)
-                                {
-                                    if read.server_id == s.server && read.channel_id == s.channel {
-                                        let slot = s.reads.entry(read.user_id).or_default();
-                                        *slot = (*slot).max(read.last_read_message_id);
-                                    }
-                                }
-                            }
-                            "message.created" | "message.updated" => {
-                                if let Ok(message) = serde_json::from_value::<Message>(event.data) {
-                                    if message.channel_id == s.channel && message.id > 0 {
-                                        if let Some(existing) =
-                                            s.messages.iter_mut().find(|m| m.id == message.id)
-                                        {
-                                            *existing = message;
-                                        } else if event.kind == "message.created" {
-                                            s.messages.push(message);
-                                        }
-                                        s.messages.sort_by_key(|m| m.id);
-                                        if s.messages.len() > 1000 {
-                                            s.messages.remove(0);
-                                        }
-                                    }
-                                }
-                            }
-                            "message.deleted" => {
-                                if event.data["channel_id"].as_i64() == Some(s.channel) {
-                                    if let Some(id) = event.data["message_id"].as_i64() {
-                                        s.messages.retain(|m| m.id != id);
-                                    }
-                                }
-                            }
-                            "message.reactions_changed" => {
-                                if let Ok(update) = serde_json::from_value::<
-                                    voxhold_api::ReactionsUpdate,
-                                >(event.data)
-                                {
-                                    if update.channel_id == s.channel {
-                                        if let Some(message) = s
-                                            .messages
-                                            .iter_mut()
-                                            .find(|m| m.id == update.message_id)
-                                        {
-                                            if update.revision >= message.reactions_revision {
-                                                message.reactions = update.reactions;
-                                                message.reactions_revision = update.revision;
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            _ => {}
+                        if s.apply_realtime_event(&event.kind, &event.data) {
+                            resync = true;
                         }
                     }
                     if resync {
@@ -751,6 +692,111 @@ impl Voxhold {
         })
         .detach();
     }
+    /// Apply one realtime event to the active scope. Returns `true` when an
+    /// authoritative history refresh is required.
+    ///
+    /// The merge policy is the part that regresses most easily, so it lives in
+    /// its own method with unit coverage: stale revisions never overwrite a
+    /// confirmed row, a tombstone wins over late `created`/`updated` events and
+    /// a repeated `created` for an existing id is an update.
+    fn apply_realtime_event(&mut self, kind: &str, data: &serde_json::Value) -> bool {
+        let mut resync = false;
+        match kind {
+            "channel.subscribed" | "channel.sync_required" => resync = true,
+            "channel.read_snapshot" => {
+                if data["server_id"].as_i64() == Some(self.server)
+                    && data["channel_id"].as_i64() == Some(self.channel)
+                {
+                    if let Some(reads) = data["reads"].as_array() {
+                        for value in reads {
+                            if let Ok(read) =
+                                serde_json::from_value::<voxhold_api::ChannelRead>(value.clone())
+                            {
+                                let slot = self.reads.entry(read.user_id).or_default();
+                                *slot = (*slot).max(read.last_read_message_id);
+                            }
+                        }
+                    }
+                }
+            }
+            "channel.read" => {
+                if let Ok(read) = serde_json::from_value::<voxhold_api::ChannelRead>(data.clone()) {
+                    if read.server_id == self.server && read.channel_id == self.channel {
+                        let slot = self.reads.entry(read.user_id).or_default();
+                        *slot = (*slot).max(read.last_read_message_id);
+                    }
+                }
+            }
+            "message.created" | "message.updated" => {
+                if let Ok(message) = serde_json::from_value::<Message>(data.clone()) {
+                    if message.channel_id == self.channel && message.id > 0 {
+                        if self.deleted_ids.contains(&message.id) {
+                            // A tombstone wins over late events.
+                        } else if let Some(existing) =
+                            self.messages.iter_mut().find(|m| m.id == message.id)
+                        {
+                            if message.revision >= existing.revision {
+                                *existing = message;
+                            }
+                        } else if kind == "message.created" {
+                            self.messages.push(message);
+                        }
+                        self.messages.sort_by_key(|m| m.id);
+                        if self.messages.len() > 1000 {
+                            self.messages.remove(0);
+                        }
+                    }
+                }
+            }
+            "message.deleted" => {
+                if data["channel_id"].as_i64() == Some(self.channel) {
+                    if let Some(id) = data["message_id"].as_i64() {
+                        self.deleted_ids.insert(id);
+                        self.messages.retain(|m| m.id != id);
+                    }
+                }
+            }
+            "message.reactions_changed" => {
+                if let Ok(update) =
+                    serde_json::from_value::<voxhold_api::ReactionsUpdate>(data.clone())
+                {
+                    if update.channel_id == self.channel {
+                        if let Some(message) =
+                            self.messages.iter_mut().find(|m| m.id == update.message_id)
+                        {
+                            if update.revision >= message.reactions_revision {
+                                message.reactions = update.reactions;
+                                message.reactions_revision = update.revision;
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        resync
+    }
+    /// Rows currently intersecting the viewport, derived from the real list
+    /// geometry. Used to aggregate read receipts only for messages the reader
+    /// can actually see.
+    fn visible_history_range(&self) -> std::ops::Range<usize> {
+        let bounds = self.history_list.viewport_bounds();
+        let start = self.history_list.logical_scroll_top().item_ix;
+        let count = self.history_list.item_count();
+        if bounds.size.height <= px(0.) || start >= count {
+            return start..start;
+        }
+        let mut end = start;
+        for ix in start..count.min(start + 200) {
+            match self.history_list.bounds_for_item(ix) {
+                Some(row) if row.origin.y < bounds.bottom() => end = ix + 1,
+                Some(_) => break,
+                None => break,
+            }
+        }
+        start..end.max((start + 1).min(count))
+    }
+
     fn mark_visible_read(
         &mut self,
         range: std::ops::Range<usize>,
@@ -837,11 +883,18 @@ impl Voxhold {
                     match result {
                         Ok(page) => {
                             if let Some(minimum) = page.messages.iter().map(|m| m.id).min() {
-                                s.messages.retain(|m| m.id < minimum);
+                                let deleted = &s.deleted_ids;
+                                s.messages
+                                    .retain(|m| m.id < minimum && !deleted.contains(&m.id));
                             } else {
                                 s.messages.clear();
                             }
-                            s.messages.extend(page.messages);
+                            let deleted = &s.deleted_ids;
+                            s.messages.extend(
+                                page.messages
+                                    .into_iter()
+                                    .filter(|m| !deleted.contains(&m.id)),
+                            );
                             s.messages.sort_by_key(|m| m.id);
                             s.messages.dedup_by_key(|m| m.id);
                             if s.messages.len() > 1000 {
@@ -897,7 +950,12 @@ impl Voxhold {
                         Ok(page) => {
                             s.before = page.pagination.next_before_id;
                             s.has_more = page.pagination.has_more;
-                            s.messages.extend(page.messages);
+                            let deleted = &s.deleted_ids;
+                            s.messages.extend(
+                                page.messages
+                                    .into_iter()
+                                    .filter(|m| !deleted.contains(&m.id)),
+                            );
                             s.messages.sort_by_key(|m| m.id);
                             s.messages.dedup_by_key(|m| m.id);
                             if s.messages.len() > 1000 {
@@ -2405,8 +2463,8 @@ impl Render for Voxhold {
                 if let Some(view) = weak.upgrade() {
                     view.update(cx, |s, cx| {
                         if s.history_list.viewport_bounds().size.height > px(0.) {
-                            let index = s.history_list.logical_scroll_top().item_ix;
-                            s.mark_visible_read(index..index.saturating_add(1), window, cx);
+                            let range = s.visible_history_range();
+                            s.mark_visible_read(range, window, cx);
                         }
                     });
                 }
@@ -3027,5 +3085,57 @@ mod ui_tests {
             let retried = view.read_with(&*cx, |v, _| v.auth.login_attempt());
             assert_eq!(retried, failed_attempt + 1);
         }
+    }
+
+    fn message_json(id: i64, revision: i64, content: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "channel_id": 7,
+            "conversation_id": 0,
+            "content": content,
+            "author": {"user_id": 1, "username": "neva"},
+            "created_at": 1,
+            "revision": revision,
+            "comment_count": 0,
+            "client_message_id": "",
+            "reactions": [],
+            "reactions_revision": 0,
+            "attachments": [],
+            "poll": null
+        })
+    }
+
+    /// Regression for the R02 merge policy: a stale revision cannot overwrite a
+    /// confirmed row, and a deleted id never comes back from a late event.
+    #[gpui::test]
+    async fn realtime_merge_keeps_revisions_and_tombstones(cx: &mut TestAppContext) {
+        cx.update(|cx| gpui_component::init(cx));
+        let (_window, view) = add_auth_window(cx);
+        cx.update(|app| {
+            view.update(app, |v, _| {
+                v.channel = 7;
+                v.apply_realtime_event("message.created", &message_json(2, 5, "confirmed"));
+                v.apply_realtime_event("message.created", &message_json(2, 4, "stale"));
+                assert_eq!(v.messages.len(), 1);
+                assert_eq!(v.messages[0].content, "confirmed");
+
+                v.apply_realtime_event("message.updated", &message_json(2, 6, "edited"));
+                assert_eq!(v.messages[0].content, "edited");
+
+                v.apply_realtime_event(
+                    "message.deleted",
+                    &serde_json::json!({"channel_id": 7, "message_id": 2}),
+                );
+                assert!(v.messages.is_empty());
+                assert!(v.deleted_ids.contains(&2));
+
+                v.apply_realtime_event("message.created", &message_json(2, 7, "resurrected"));
+                assert!(v.messages.is_empty(), "a tombstone must win");
+
+                v.apply_realtime_event("message.created", &message_json(3, 1, "next"));
+                assert_eq!(v.messages.len(), 1);
+                assert_eq!(v.messages[0].id, 3);
+            });
+        });
     }
 }

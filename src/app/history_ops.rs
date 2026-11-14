@@ -1,0 +1,659 @@
+use super::*;
+use crate::history::{apply_reactions, merge_revision};
+
+impl Voxhold {
+    pub(super) fn schedule_visible_read(&mut self, window: &Window, cx: &mut Context<Self>) {
+        self.read_scheduled = true;
+        let scope = (self.server, self.channel, self.access_generation);
+        let painted = self.painted_read.clone();
+        let weak = cx.entity().downgrade();
+        window.on_next_frame(move |window, cx| {
+            if let Some(this) = weak.upgrade() {
+                this.update(cx, |s, cx| {
+                    if (s.server, s.channel, s.access_generation) != scope {
+                        return;
+                    }
+                    s.read_scheduled = false;
+                    s.mark_visible_read(painted.get(), window, cx);
+                });
+            }
+        });
+    }
+
+    /// Deferred auto-load for the top of history. Never touches `ListState` from
+    /// the scroll callback itself.
+    pub(super) fn schedule_older_check(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.older_scheduled = true;
+        let scope = (self.server, self.channel, self.access_generation);
+        cx.spawn_in(window, async move |this, window| {
+            window
+                .background_executor()
+                .timer(std::time::Duration::from_millis(1))
+                .await;
+            let _ = this.update_in(window, |s, window, cx| {
+                if (s.server, s.channel, s.access_generation) != scope {
+                    return;
+                }
+                s.older_scheduled = false;
+                if s.loading_older || !s.has_more {
+                    return;
+                }
+                if s.history_list.logical_scroll_top().item_ix <= 3 {
+                    s.load_older(window, cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Access changed for the current scope: drop confirmed data, invalidate
+    /// in-flight requests and take a fresh channel snapshot before restoring the chat.
+    pub(super) fn mark_visible_read(
+        &mut self,
+        message_id: i64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !window.is_window_active()
+            || self.read_pending
+            || self.access_pending
+            || self
+                .read_retry_at
+                .is_some_and(|at| at > std::time::Instant::now())
+            || !self
+                .channels
+                .iter()
+                .any(|c| c.id == self.channel && c.has_history())
+        {
+            return;
+        }
+        if message_id <= self.read_sent
+            || self
+                .messages
+                .binary_search_by_key(&message_id, |message| message.id)
+                .is_err()
+        {
+            return;
+        }
+        let Some(client) = self.client.clone() else {
+            return;
+        };
+        let (server, channel, generation, access_generation) = (
+            self.server,
+            self.channel,
+            self.generation,
+            self.access_generation,
+        );
+        let runtime = self.runtime.clone();
+        self.read_pending = true;
+        let task = cx.background_spawn(async move {
+            runtime.block_on(client.mark_read(server, channel, message_id))
+        });
+        cx.spawn_in(window, async move |this, window| {
+            let result = task.await;
+            let _ = this.update_in(window, |s, window, cx| {
+                if s.generation != generation || s.access_generation != access_generation {
+                    return;
+                }
+                s.read_pending = false;
+                match result {
+                    Ok(_) => {
+                        s.read_sent = s.read_sent.max(message_id);
+                        let known = s.channel_reads.entry((s.server, s.channel)).or_default();
+                        *known = (*known).max(message_id);
+                    }
+                    Err(voxhold_api::Error::Http(403 | 404)) => {
+                        s.invalidate_access(window, cx);
+                    }
+                    Err(error) => {
+                        let delay = Self::history_retry_delay(&error);
+                        s.read_retry_at = Some(std::time::Instant::now() + delay);
+                        let timer = cx.background_executor().timer(delay);
+                        cx.spawn_in(window, async move |this, window| {
+                            timer.await;
+                            let _ = this.update_in(window, |s, _, cx| {
+                                if s.access_generation == access_generation {
+                                    cx.notify();
+                                }
+                            });
+                        })
+                        .detach();
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+    /// Toggle a reaction from a row chip. One in-flight request per message and
+    /// emoji; the confirmed update is applied through the same revision rule as
+    /// HTTP history and realtime events.
+    pub(super) fn toggle_reaction(
+        &mut self,
+        message_id: i64,
+        emoji: String,
+        active: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if self.access_pending
+            || !self
+                .channels
+                .iter()
+                .any(|channel| channel.id == self.channel && channel.has_history())
+        {
+            return;
+        }
+        let key = (message_id, emoji.clone());
+        if !self.reaction_requests.insert(key.clone()) {
+            return;
+        }
+        let Some(client) = self.client.clone() else {
+            self.reaction_requests.remove(&key);
+            return;
+        };
+        let (server, channel, generation, access) = (
+            self.server,
+            self.channel,
+            self.generation,
+            self.access_generation,
+        );
+        let runtime = self.runtime.clone();
+        let recent = self.recent_reactions.clone();
+        let task = cx.background_spawn(async move {
+            runtime.block_on(client.set_reaction(server, channel, message_id, &emoji, !active))
+        });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            if let Some(this) = this.upgrade() {
+                this.update(cx, |s, cx| {
+                    s.reaction_requests.remove(&key);
+                    if s.generation != generation
+                        || s.access_generation != access
+                        || s.server != server
+                        || s.channel != channel
+                    {
+                        return;
+                    }
+                    match result {
+                        Ok(update) => {
+                            s.apply_reaction_update(update);
+                            if !active {
+                                reactions::touch_recent(&mut recent.borrow_mut(), &key.1);
+                            }
+                            s.sync_tools_message(cx);
+                            s.error.clear();
+                        }
+                        Err(error) => s.error = error.to_string(),
+                    }
+                    cx.notify();
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
+
+    /// Focus an already loaded row or open a bounded `context` page around a
+    /// quoted message that is outside the current window.
+    pub(super) fn jump_to_message(&mut self, message_id: i64, cx: &mut Context<Self>) {
+        if let Some(index) = self
+            .messages
+            .iter()
+            .position(|message| message.id == message_id)
+        {
+            self.history_list.scroll_to(gpui::ListOffset {
+                item_ix: index,
+                offset_in_item: px(0.),
+            });
+            cx.notify();
+            return;
+        }
+        if self.context_request.is_some() || self.access_pending {
+            return;
+        }
+        let Some(client) = self.client.clone() else {
+            return;
+        };
+        let (server, channel, generation, access) = (
+            self.server,
+            self.channel,
+            self.generation,
+            self.access_generation,
+        );
+        self.request_seq = self.request_seq.wrapping_add(1);
+        let request = self.request_seq;
+        self.context_request = Some(request);
+        let runtime = self.runtime.clone();
+        let task = cx.background_spawn(async move {
+            runtime.block_on(client.message_context(server, channel, message_id, 25, 25))
+        });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            if let Some(this) = this.upgrade() {
+                this.update(cx, |s, cx| {
+                    if !s.accepts_context_reply(request, generation, access, server, channel) {
+                        return;
+                    }
+                    s.context_request = None;
+                    match result {
+                        Ok(context) => {
+                            if s.apply_context_snapshot(context) {
+                                s.sync_tools_message(cx);
+                            }
+                        }
+                        Err(voxhold_api::Error::Http(404)) => {
+                            s.error = "Сообщение недоступно".into();
+                        }
+                        Err(error) => s.error = error.to_string(),
+                    }
+                    cx.notify();
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
+
+    /// Merge a bounded context page into the current window with the same
+    /// revision/tombstone rules as history and realtime events. `false` means
+    /// the target was deleted while the request was in flight; the old window
+    /// is kept and an unavailable message is shown.
+    pub(super) fn apply_context_snapshot(&mut self, context: voxhold_api::MessageContext) -> bool {
+        let target = context.target_message_id;
+        if self.deleted_ids.contains(&target) {
+            self.error = "Сообщение недоступно".into();
+            return false;
+        }
+        let context_len = context.messages.len();
+        let target_index = context.target_index;
+        let current: std::collections::HashMap<i64, Message> = self
+            .messages
+            .iter()
+            .cloned()
+            .map(|message| (message.id, message))
+            .collect();
+        let mut merged = Vec::with_capacity(context_len);
+        let mut applied = Vec::new();
+        for mut message in context.messages {
+            if message.channel_id != self.channel
+                || (message.thread_root_id.is_some() && message.id != target)
+                || self.deleted_ids.contains(&message.id)
+            {
+                continue;
+            }
+            if let Some(existing) = current.get(&message.id).cloned() {
+                let mut existing = existing;
+                merge_revision(&mut existing, message);
+                message = existing;
+            }
+            if let Some(edit) = self.pending_edits.get(&message.id).cloned() {
+                merge_revision(&mut message, edit);
+            }
+            if let Some(update) = self.pending_reactions.get(&message.id).cloned() {
+                apply_reactions(&mut message, update);
+            }
+            applied.push(message.id);
+            merged.push(message);
+        }
+        if !applied.contains(&target) {
+            self.error = "Сообщение недоступно".into();
+            return false;
+        }
+        merged.sort_by_key(|message| message.id);
+        for id in &applied {
+            self.pending_edits.remove(id);
+            self.pending_reactions.remove(id);
+        }
+        self.messages = merged;
+        self.history_keys.clear();
+        self.history_list.reset(0);
+        self.before = self.messages.first().map(|message| message.id);
+        self.has_more = target_index >= 25;
+        self.history_has_newer = context_len.saturating_sub(target_index + 1) >= 25;
+        self.pending_anchor = None;
+        self.pending_jump = Some(target);
+        // The old page belongs to the replaced window; invalidate its pending
+        // cursor and its retry state before the next `load_older`.
+        self.older_request = 0;
+        self.loading_older = false;
+        self.older_error.clear();
+        self.older_retry_at = None;
+        self.older_scheduled = false;
+        self.error.clear();
+        true
+    }
+
+    /// The guard applied to a `messages_page` answer. Extracted so a context
+    /// replacement can be tested against a late older-page response.
+    pub(super) fn accepts_older_reply(
+        &self,
+        request: u64,
+        before: i64,
+        server: i64,
+        channel: i64,
+        generation: u64,
+        access: u64,
+    ) -> bool {
+        self.generation == generation
+            && self.access_generation == access
+            && self.older_request == request
+            && self.before == Some(before)
+            && self.server == server
+            && self.channel == channel
+    }
+
+    pub(super) fn accepts_context_reply(
+        &self,
+        request: u64,
+        generation: u64,
+        access: u64,
+        server: i64,
+        channel: i64,
+    ) -> bool {
+        self.context_request == Some(request)
+            && self.generation == generation
+            && self.access_generation == access
+            && self.server == server
+            && self.channel == channel
+    }
+
+    /// "К последним" owns the next window. A late `/context` answer must not
+    /// reopen the older window after this reset.
+    pub(super) fn reset_for_latest(&mut self) {
+        self.context_request = None;
+        self.pending_jump = None;
+        self.history_reset_pending = true;
+    }
+
+    /// Common reaction confirmation used by row chips and the open picker.
+    /// Applies the revision rule to the loaded row, or stores a bounded pending
+    /// update when that row is outside the window.
+    pub(super) fn apply_reaction_update(&mut self, update: voxhold_api::ReactionsUpdate) {
+        if update.channel_id != self.channel
+            || self.deleted_ids.contains(&update.message_id)
+            || update.revision <= 0
+        {
+            return;
+        }
+        if let Some(message) = self
+            .messages
+            .iter_mut()
+            .find(|message| message.id == update.message_id)
+        {
+            apply_reactions(message, update);
+        } else if self.pending_reactions.len() < 128
+            || self.pending_reactions.contains_key(&update.message_id)
+        {
+            let entry = self
+                .pending_reactions
+                .entry(update.message_id)
+                .or_insert_with(|| update.clone());
+            if update.revision > entry.revision {
+                *entry = update;
+            }
+        }
+    }
+
+    /// Push the confirmed row into an open action panel so its reaction state
+    /// follows history/WS changes even when the panel was opened earlier.
+    pub(super) fn sync_tools_message(&mut self, cx: &mut Context<Self>) {
+        let Some(tools) = self.message_tools.clone() else {
+            return;
+        };
+        let Some(id) = tools.read(cx).selected_id() else {
+            return;
+        };
+        let message = self
+            .messages
+            .iter()
+            .find(|message| message.id == id)
+            .cloned();
+        tools.update(cx, |tools, cx| {
+            tools.sync_message(message.as_ref(), cx);
+        });
+    }
+
+    pub(super) fn history_anchor(&self) -> Option<(i64, gpui::Pixels)> {
+        let offset = self.history_list.logical_scroll_top();
+        self.history_keys
+            .get(offset.item_ix)
+            .map(|(id, ..)| (*id, offset.offset_in_item))
+    }
+
+    pub(super) fn history_retry_delay(error: &voxhold_api::Error) -> std::time::Duration {
+        match error {
+            voxhold_api::Error::Http(429) => std::time::Duration::from_secs(20),
+            voxhold_api::Error::Http(status) if (500..600).contains(status) => {
+                std::time::Duration::from_secs(8)
+            }
+            _ => std::time::Duration::from_secs(3),
+        }
+    }
+
+    pub(super) fn schedule_retry_label(
+        &self,
+        window: &mut Window,
+        access: u64,
+        request: u64,
+        cx: &mut Context<Self>,
+    ) {
+        let timer = cx
+            .background_executor()
+            .timer(std::time::Duration::from_secs(1));
+        cx.spawn_in(window, async move |this, window| {
+            timer.await;
+            let _ = this.update_in(window, |s, window, cx| {
+                if s.access_generation != access || s.older_request != request {
+                    return;
+                }
+                if s.older_retry_at
+                    .is_some_and(|at| at > std::time::Instant::now())
+                {
+                    s.schedule_retry_label(window, access, request, cx);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub(super) fn refresh_history(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(client) = self.client.clone() else {
+            return;
+        };
+        let (server, channel, generation, access) = (
+            self.server,
+            self.channel,
+            self.generation,
+            self.access_generation,
+        );
+        if self.access_pending
+            || !self
+                .channels
+                .iter()
+                .any(|c| c.id == channel && c.has_history())
+        {
+            return;
+        }
+        if self.refresh_request.is_some() {
+            self.refresh_again = true;
+            return;
+        }
+        self.request_seq = self.request_seq.wrapping_add(1);
+        let request = self.request_seq;
+        self.refresh_request = Some(request);
+        self.refresh_new_ids.clear();
+        self.older_request = 0;
+        self.loading_older = false;
+        let runtime = self.runtime.clone();
+        let task = cx.background_spawn(async move {
+            runtime.block_on(client.messages_page(server, channel, 0))
+        });
+        cx.spawn_in(window, async move |this, window| {
+            let result = task.await;
+            let _ = this.update_in(window, |s, window, cx| {
+                if s.generation != generation
+                    || s.access_generation != access
+                    || s.refresh_request != Some(request)
+                    || s.server != server
+                    || s.channel != channel
+                {
+                    return;
+                }
+                s.refresh_request = None;
+                let refresh_again = std::mem::take(&mut s.refresh_again);
+                let new_ids = std::mem::take(&mut s.refresh_new_ids);
+                match result {
+                    Ok(page) => {
+                        let anchor = s.history_anchor();
+                        if std::mem::take(&mut s.history_reset_pending) {
+                            s.messages.clear();
+                            s.history_keys.clear();
+                            s.history_list.reset(0);
+                            s.before = None;
+                        }
+                        s.apply_history_snapshot(page, new_ids);
+                        s.sync_tools_message(cx);
+                        s.older_error.clear();
+                        s.older_retry_at = None;
+                        s.error.clear();
+                        s.pending_anchor = anchor;
+                    }
+                    Err(error) => match error {
+                        voxhold_api::Error::Http(403) | voxhold_api::Error::Http(404) => {
+                            s.invalidate_access(window, cx);
+                        }
+                        other => s.error = other.to_string(),
+                    },
+                }
+                if refresh_again && !s.access_pending {
+                    s.refresh_history(window, cx);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub(super) fn apply_history_snapshot(
+        &mut self,
+        page: voxhold_api::MessagePage,
+        new_ids: std::collections::HashSet<i64>,
+    ) {
+        let mut current: std::collections::HashMap<_, _> = std::mem::take(&mut self.messages)
+            .into_iter()
+            .map(|row| (row.id, row))
+            .collect();
+        let last = page.messages.iter().map(|m| m.id).max().unwrap_or(0);
+        self.before = page.pagination.next_before_id;
+        self.has_more = page.pagination.has_more;
+        self.history_has_newer = false;
+        for mut row in page.messages {
+            if let Some(mut existing) = current.remove(&row.id) {
+                merge_revision(&mut existing, row);
+                row = existing;
+            }
+            self.merge_message(true, row);
+        }
+        for row in current
+            .into_values()
+            .filter(|row| row.id > last && new_ids.contains(&row.id))
+        {
+            self.merge_message(true, row);
+        }
+        self.trim_history(false);
+    }
+
+    pub(super) fn trim_history(&mut self, prepending: bool) {
+        const MAX_ROWS: usize = 1000;
+        if self.messages.len() <= MAX_ROWS {
+            return;
+        }
+        let excess = self.messages.len() - MAX_ROWS;
+        let keep_from = if prepending || self.history_has_newer {
+            0
+        } else {
+            self.history_anchor()
+                .and_then(|(id, _)| self.messages.binary_search_by_key(&id, |row| row.id).ok())
+                .map_or(excess, |anchor| excess.min(anchor))
+        };
+        self.history_has_newer |= keep_from < excess;
+        self.messages.truncate(keep_from + MAX_ROWS);
+        if keep_from != 0 {
+            self.messages.drain(0..keep_from);
+            self.before = self.messages.first().map(|row| row.id);
+            self.has_more = true;
+        }
+    }
+
+    pub(super) fn load_older(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.loading_older
+            || !self.has_more
+            || self.access_pending
+            || self.refresh_request.is_some()
+        {
+            return;
+        }
+        if let Some(at) = self.older_retry_at {
+            if std::time::Instant::now() < at {
+                return;
+            }
+        }
+        let (Some(client), Some(before)) = (self.client.clone(), self.before) else {
+            return;
+        };
+        let (server, channel, generation, access) = (
+            self.server,
+            self.channel,
+            self.generation,
+            self.access_generation,
+        );
+        self.request_seq = self.request_seq.wrapping_add(1);
+        let request = self.request_seq;
+        self.older_request = request;
+        self.loading_older = true;
+        self.older_error.clear();
+        cx.notify();
+        let runtime = self.runtime.clone();
+        let task = cx.background_spawn(async move {
+            runtime.block_on(client.messages_page(server, channel, before))
+        });
+        cx.spawn_in(window, async move |this, window| {
+            let result = task.await;
+            let _ = this.update_in(window, |s, window, cx| {
+                if !s.accepts_older_reply(request, before, server, channel, generation, access) {
+                    return;
+                }
+                s.loading_older = false;
+                match result {
+                    Ok(page) => {
+                        // The anchor is captured when the page is applied,
+                        // not when it was requested, so a reader who scrolled
+                        // away keeps the new position.
+                        let anchor = s.history_anchor();
+                        s.before = page.pagination.next_before_id;
+                        s.has_more = page.pagination.has_more;
+                        for row in page.messages {
+                            s.merge_message(true, row);
+                        }
+                        s.trim_history(true);
+                        s.sync_tools_message(cx);
+                        s.older_retry_at = None;
+                        s.pending_anchor = anchor;
+                    }
+                    Err(voxhold_api::Error::Http(403) | voxhold_api::Error::Http(404)) => {
+                        s.invalidate_access(window, cx);
+                    }
+                    Err(error) => {
+                        s.older_retry_at =
+                            Some(std::time::Instant::now() + Self::history_retry_delay(&error));
+                        s.older_error = error.to_string();
+                        s.schedule_retry_label(window, access, request, cx);
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+}

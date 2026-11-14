@@ -13,6 +13,32 @@ pub const QUOTE_HEIGHT: f32 = 75.0;
 /// Go `reactionPitch`.
 pub const REACTION_PITCH: f32 = 62.0;
 
+/// Merge a confirmed row while keeping the body revision and the separate
+/// reaction revision apart. The backend `message.updated` event omits
+/// `reactions`, so replacing the object wholesale would reset them to 0.
+pub(crate) fn merge_revision(current: &mut Message, mut incoming: Message) {
+    let use_reactions = incoming.reactions_revision > 0
+        && incoming.reactions_revision >= current.reactions_revision;
+    if incoming.revision >= current.revision {
+        if !use_reactions {
+            incoming.reactions_revision = current.reactions_revision;
+            incoming.reactions = std::mem::take(&mut current.reactions);
+        }
+        *current = incoming;
+    } else if use_reactions {
+        current.reactions_revision = incoming.reactions_revision;
+        current.reactions = incoming.reactions;
+    }
+}
+
+/// Apply a reaction snapshot only when its revision is newer.
+pub(crate) fn apply_reactions(message: &mut Message, update: voxhold_api::ReactionsUpdate) {
+    if update.revision > message.reactions_revision {
+        message.reactions = update.reactions;
+        message.reactions_revision = update.revision;
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RowMeta {
     /// The row belongs to the previous author header.

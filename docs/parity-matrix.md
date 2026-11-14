@@ -15,9 +15,9 @@
 
 | ID и точка входа | Роль и данные | Go | Rust baseline | Где повторить | Git |
 | --- | --- | --- | --- | --- | --- |
-| `R01` адрес → вход | owner из bootstrap, HTTPS или loopback | Два шага: адрес, затем учётные данные | В работе: `auth::AuthState` с двумя шагами, валидацией и текстами Go; окно `1280×900`, Inter, тема и системная рамка | `auth-instance`, `auth-login`, ошибка 401, поздний ответ | см. `codex/r01-ui-shell` |
-| `R01` раскладка и сплиттеры | любой аккаунт | `ComputeLayout`, `1180/760`, ширины 252/238 | В работе: `layout::compute_layout` + тесты контрольных bounds, drag обеих ручек, сохранение в `workspace-layout.json` | `workspace-empty`, `workspace-text`, `1180/1181`, `760/761` | см. `codex/r01-ui-shell` |
-| `R02` история и realtime | member в текстовом канале | Автодогрузка, якорь, группировка, даты, непрочитанное | Описано: ручная загрузка, `ListState`, события WS | 200+ сообщений, prepend, reconnect | — |
+| `R01` адрес → вход | owner из bootstrap, HTTPS или loopback | Два шага: адрес, затем учётные данные | В работе: `auth::AuthState` с двумя шагами, валидацией и текстами Go; окно `1280×900`, Inter, тема, SVG-иконки из `assets`, одна подложка поля, «Назад» к адресу | `auth-instance`, `auth-login`, ошибка 401, поздний ответ | см. `codex/r01-r02-review-fixes` |
+| `R01` раскладка и сплиттеры | любой аккаунт | `ComputeLayout`, `1180/760`, ширины 252/238 | В работе: `layout::compute_layout` + тесты контрольных bounds, drag обеих ручек, сохранение в `workspace-layout.json`, выбор сервера в узком окне | `workspace-empty`, `workspace-text`, `1180/1181`, `760/761` | см. `codex/r01-r02-review-fixes` |
+| `R02` история и realtime | member в текстовом канале | Автодогрузка, якорь, группировка, даты, непрочитанное | В работе: отложенная автодогрузка без чтения `ListState`, backoff 20/8/3 с, слияние по revision тела и реакций, tombstones, инвалидация доступа, непрерывный снимок после reconnect, read по реально видимым строкам | 200+ сообщений, prepend, reconnect, revoke | см. `codex/r01-r02-review-fixes` |
 | `R03` композер и файлы | member с правом записи | Потоковая передача, clipboard, drop, лимиты | Описано: выбор файла, буферизация в памяти | 8 и 60 МиБ, `private bytes` | — |
 | `R04` действия сообщений, поиск, ЛС | owner/member | Контекстное меню, ветки, закрепы, ЛС | Описано: панели `message_tools`, `search`, `inbox` | две роли, закрытый канал | — |
 | `R05` участники и настройки | owner/admin/member | Участники, профиль, роли, квоты | Описано: черновые панели | каждый таб, 403 | — |
@@ -31,8 +31,9 @@
 | --- | --- |
 | `cargo fmt --all -- --check` | пройдено после `R00: fix baseline rustfmt debt` |
 | `cargo check --workspace --locked` | пройдено |
-| `cargo test --workspace --locked` | пройдено (API 4, media 6) |
-| Release-сборка | не выполнена |
+| `cargo test --workspace --locked` | пройдено (API 4, media 6, приложение 34) |
+| Release-сборка | выполнена, EXE GUI-subsystem |
+| GitHub Actions | workflow обновлён на workspace check и test; прогон не снят |
 | Изолированный backend | не поднят |
 | Замеры памяти и FPS | не выполнены |
 | Кадры Go/Rust | частично: auth-экран Rust снят на 1280×900 в `R01` |

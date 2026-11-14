@@ -98,6 +98,18 @@ impl Client {
         body: Option<Value>,
         max: usize,
     ) -> Result<Vec<u8>> {
+        self.bytes_with_etag(method, path, body, max)
+            .await
+            .map(|(body, _)| body)
+    }
+
+    async fn bytes_with_etag(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<Value>,
+        max: usize,
+    ) -> Result<(Vec<u8>, Option<String>)> {
         let mut r = self.http.request(method, self.url(path)?);
         if !self.token.is_empty() {
             r = r.bearer_auth(self.token.as_ref());
@@ -109,6 +121,11 @@ impl Client {
         if !response.status().is_success() {
             return Err(Error::Http(response.status().as_u16()));
         }
+        let etag = response
+            .headers()
+            .get(reqwest::header::ETAG)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
         let mut out = Vec::new();
         while let Some(chunk) = response.chunk().await.map_err(|_| Error::Network)? {
             if out.len().saturating_add(chunk.len()) > max {
@@ -118,7 +135,7 @@ impl Client {
             }
             out.extend_from_slice(&chunk);
         }
-        Ok(out)
+        Ok((out, etag))
     }
     pub async fn request<T: DeserializeOwned>(
         &self,
@@ -165,14 +182,19 @@ impl Client {
             .await
     }
     pub async fn channel_members(&self, sid: i64, cid: i64) -> Result<Vec<i64>> {
-        let v: Value = self
+        #[derive(Deserialize)]
+        struct Members {
+            #[serde(default, deserialize_with = "null_default")]
+            user_ids: Vec<i64>,
+        }
+        let members: Members = self
             .request(
                 Method::GET,
                 &format!("{}/members", channel_path(sid, cid)),
                 None,
             )
             .await?;
-        Ok(serde_json::from_value(v["user_ids"].clone())?)
+        Ok(members.user_ids)
     }
     async fn page(&self, path: &str, before: i64) -> Result<MessagePage> {
         let path = format!(
@@ -507,6 +529,23 @@ pub struct RealtimeEvent {
     pub data: Value,
     pub request_id: String,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChannelSubscription {
+    pub server_id: i64,
+    pub channel_id: i64,
+    pub generation: u64,
+}
+
+impl ChannelSubscription {
+    fn payload(self) -> Value {
+        json!({"server_id":self.server_id,"channel_id":self.channel_id})
+    }
+
+    fn request_id(self) -> String {
+        format!("native-channel-{}", self.generation)
+    }
+}
 dto!(IceServer { urls:Vec<String>, username:String, credential:String });
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WebRtcConfig {
@@ -557,14 +596,91 @@ impl Client {
                     .send(
                         "channel.subscribe",
                         json!({"server_id":sid,"channel_id":cid}),
-                        None,
+                        Some("native-channel-subscribe"),
                     )
                     .await?;
             }
             if event.kind == "error" {
+                if event.request_id == "native-channel-subscribe"
+                    && event.data["code"].as_str() == Some("forbidden")
+                {
+                    return Err(Error::Http(403));
+                }
                 return Ok(());
             }
             receive(event);
+        }
+    }
+
+    /// Keep account events on the same socket when the selected channel changes.
+    pub async fn subscribe_channels(
+        &self,
+        mut desired: tokio::sync::watch::Receiver<Option<ChannelSubscription>>,
+        mut receive: impl FnMut(RealtimeEvent),
+    ) -> Result<()> {
+        let mut socket = self.open_voice_socket().await?;
+        let ready = tokio::time::timeout(Duration::from_secs(8), socket.read())
+            .await
+            .map_err(|_| Error::Network)??;
+        if ready.kind != "ready" {
+            return Err(Error::InvalidResponse(
+                "Сервер не подтвердил WebSocket-сессию.",
+            ));
+        }
+        receive(ready);
+
+        let mut subscribed: Option<ChannelSubscription> = None;
+        loop {
+            let next = *desired.borrow_and_update();
+            if next != subscribed {
+                if let Some(previous) = subscribed {
+                    socket
+                        .send("channel.unsubscribe", previous.payload(), None)
+                        .await?;
+                }
+                if let Some(next) = next {
+                    socket
+                        .send(
+                            "channel.subscribe",
+                            next.payload(),
+                            Some(&next.request_id()),
+                        )
+                        .await?;
+                }
+                subscribed = next;
+            }
+
+            tokio::select! {
+                changed = desired.changed() => {
+                    if changed.is_err() {
+                        return Ok(());
+                    }
+                }
+                event = socket.read() => {
+                    let mut event = event?;
+                    if event.kind == "channel.subscribed" {
+                        let Some(channel) = subscribed.filter(|channel| event.request_id == channel.request_id()) else {
+                            continue;
+                        };
+                        if event.data["server_id"].as_i64() != Some(channel.server_id)
+                            || event.data["channel_id"].as_i64() != Some(channel.channel_id)
+                        {
+                            continue;
+                        }
+                        event.data["generation"] = json!(channel.generation);
+                    }
+                    if event.kind == "error" {
+                        if let Some(channel) = subscribed.filter(|channel| event.request_id == channel.request_id()) {
+                            if event.data["code"].as_str() == Some("forbidden") {
+                                event.kind = "native.subscription_forbidden".into();
+                                event.data = channel.payload();
+                                event.data["generation"] = json!(channel.generation);
+                            }
+                        }
+                    }
+                    receive(event);
+                }
+            }
         }
     }
     pub async fn upload_attachment(
@@ -628,7 +744,11 @@ impl Client {
     }
     pub async fn image(&self, path: &str, max_edge: u32) -> Result<image::DynamicImage> {
         let bytes = self.bytes(Method::GET, path, None, 4 << 20).await?;
-        let reader = image::ImageReader::new(std::io::Cursor::new(&bytes))
+        Self::decode_image(&bytes, max_edge)
+    }
+
+    fn decode_image(bytes: &[u8], max_edge: u32) -> Result<image::DynamicImage> {
+        let reader = image::ImageReader::new(std::io::Cursor::new(bytes))
             .with_guessed_format()
             .map_err(|_| Error::InvalidResponse("invalid image"))?;
         let format = reader.format();
@@ -640,16 +760,29 @@ impl Client {
             return Err(Error::InvalidResponse("invalid image dimensions"));
         }
         image::load_from_memory_with_format(
-            &bytes,
+            bytes,
             format.ok_or(Error::InvalidResponse("invalid image"))?,
         )
         .map_err(|_| Error::InvalidResponse("invalid image"))
     }
-    pub async fn avatar(&self, id: i64) -> Result<image::DynamicImage> {
-        if id <= 0 {
-            return Err(Error::InvalidResponse("invalid avatar id"));
+    pub async fn avatar(&self, id: i64, version: &str) -> Result<image::DynamicImage> {
+        if id <= 0 || !valid_id(version, 64) {
+            return Err(Error::InvalidResponse(
+                "Некорректный ID или версия аватара.",
+            ));
         }
-        self.image(&format!("/api/v1/users/{id}/avatar"), 256).await
+        let path = format!("/api/v1/users/{id}/avatar?v={version}");
+        let (bytes, etag) = self
+            .bytes_with_etag(Method::GET, &path, None, 4 << 20)
+            .await?;
+        if etag
+            .as_deref()
+            .and_then(|tag| tag.strip_prefix('"')?.strip_suffix('"'))
+            != Some(version)
+        {
+            return Err(Error::InvalidResponse("Версия аватара изменилась."));
+        }
+        Self::decode_image(&bytes, 256)
     }
     pub async fn attachment_thumbnail(&self, id: &str) -> Result<image::DynamicImage> {
         if !valid_id(id, 32) {
@@ -1128,6 +1261,76 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn changing_channels_reuses_the_authenticated_socket() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    let mut client = Client::new(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+                    client.set_token("fixture".into());
+                    let first = ChannelSubscription { server_id: 1, channel_id: 10, generation: 1 };
+                    let second = ChannelSubscription { server_id: 1, channel_id: 11, generation: 2 };
+                    let (target, desired) = tokio::sync::watch::channel(Some(first));
+                    let (events, mut received) = tokio::sync::mpsc::unbounded_channel();
+                    let mut worker = tokio::spawn(async move {
+                        client.subscribe_channels(desired, |event| {
+                            let _ = events.send(event);
+                        }).await
+                    });
+                    let (connection, _) = tokio::select! {
+                        connection = listener.accept() => connection.unwrap(),
+                        result = &mut worker => panic!("WebSocket client stopped before connecting: {result:?}"),
+                    };
+                    let mut peer = tokio_tungstenite::accept_async(connection).await.unwrap();
+                    async fn next(
+                        peer: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+                    ) -> RealtimeEvent {
+                        let message = peer.next().await.unwrap().unwrap();
+                        serde_json::from_str(message.to_text().unwrap()).unwrap()
+                    }
+                    async fn send(
+                        peer: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+                        event: Value,
+                    ) {
+                        peer.send(tokio_tungstenite::tungstenite::Message::Text(event.to_string().into())).await.unwrap();
+                    }
+                    assert_eq!(next(&mut peer).await.kind, "auth");
+                    send(&mut peer, json!({"type":"ready"})).await;
+                    let subscribe = next(&mut peer).await;
+                    assert_eq!(subscribe.kind, "channel.subscribe");
+                    assert_eq!(subscribe.data, first.payload());
+
+                    target.send(Some(second)).unwrap();
+                    let unsubscribe = next(&mut peer).await;
+                    assert_eq!(unsubscribe.kind, "channel.unsubscribe");
+                    assert_eq!(unsubscribe.data, first.payload());
+                    let subscribe = next(&mut peer).await;
+                    assert_eq!(subscribe.kind, "channel.subscribe");
+                    assert_eq!(subscribe.data, second.payload());
+
+                    send(&mut peer, json!({"type":"error","request_id":first.request_id(),"data":{"code":"forbidden"}})).await;
+                    send(&mut peer, json!({"type":"error","request_id":second.request_id(),"data":{"code":"forbidden"}})).await;
+                    assert_eq!(received.recv().await.unwrap().kind, "ready");
+                    assert_eq!(received.recv().await.unwrap().kind, "error");
+                    let denied = received.recv().await.unwrap();
+                    assert_eq!(denied.kind, "native.subscription_forbidden");
+                    assert_eq!(denied.data["channel_id"], 11);
+                    assert_eq!(denied.data["generation"], 2);
+
+                    target.send(None).unwrap();
+                    assert_eq!(next(&mut peer).await.kind, "channel.unsubscribe");
+                    send(&mut peer, json!({"type":"presence.updated","data":{"user_id":4,"status":"online"}})).await;
+                    assert_eq!(received.recv().await.unwrap().kind, "presence.updated");
+                    drop(target);
+                    worker.await.unwrap().unwrap();
+                }).await.unwrap();
+            });
+    }
     #[test]
     fn origin_security() {
         for bad in [

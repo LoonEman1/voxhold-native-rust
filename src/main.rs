@@ -1,10 +1,12 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
+mod assets;
 mod attachments;
 mod auth;
 mod background;
 mod channel_settings;
 mod inbox;
 mod layout;
+mod members;
 mod message_tools;
 mod personal_settings;
 mod search;
@@ -12,7 +14,6 @@ mod server_settings;
 mod theme;
 #[cfg(feature = "voxhold-media")]
 mod voice_panel;
-#[cfg(windows)]
 mod window_chrome;
 use gpui::{
     div, list, prelude::*, px, rgba, size, AnyElement, App, Application, Bounds, Context, Entity,
@@ -23,7 +24,7 @@ use gpui_component::{
     Root,
 };
 use layout::{SplitterDrag, SplitterSide};
-use voxhold_api::{Channel, Client, Member, Message, Server};
+use voxhold_api::{Channel, ChannelSubscription, Client, Member, Message, Server};
 
 struct Voxhold {
     runtime: std::sync::Arc<tokio::runtime::Runtime>,
@@ -50,6 +51,7 @@ struct Voxhold {
     show_inbox: bool,
     show_members: bool,
     show_channels: bool,
+    show_servers: bool,
     #[cfg(feature = "voxhold-media")]
     voice: Option<Entity<voice_panel::VoicePanel>>,
     #[cfg(feature = "voxhold-media")]
@@ -57,18 +59,42 @@ struct Voxhold {
     servers: Vec<Server>,
     channels: Vec<Channel>,
     members: Vec<Member>,
+    roster: members::Roster,
     messages: Vec<Message>,
     history_list: ListState,
     history_keys: Vec<(i64, i64, i64)>,
     before: Option<i64>,
     has_more: bool,
+    history_has_newer: bool,
     loading_older: bool,
+    /// Bumped whenever the visible access scope changes (channel switch, access
+    /// event, logout). In-flight history/send results from an older value are
+    /// discarded before they touch the UI.
+    access_generation: u64,
+    access_pending: bool,
+    access_reload_in_flight: bool,
+    access_refresh_again: bool,
+    refresh_request: Option<u64>,
+    refresh_again: bool,
+    refresh_new_ids: std::collections::HashSet<i64>,
+    pending_edits: std::collections::HashMap<i64, Message>,
+    pending_reactions: std::collections::HashMap<i64, voxhold_api::ReactionsUpdate>,
+    request_seq: u64,
+    older_request: u64,
+    older_retry_at: Option<std::time::Instant>,
+    older_error: String,
+    older_scheduled: bool,
+    read_scheduled: bool,
+    read_retry_at: Option<std::time::Instant>,
+    painted_read: std::rc::Rc<std::cell::Cell<i64>>,
     event_task: Option<tokio::task::JoinHandle<()>>,
+    realtime_generation: u64,
+    event_subscription: Option<tokio::sync::watch::Sender<Option<ChannelSubscription>>>,
+    online_by_server: std::collections::HashMap<i64, std::collections::HashSet<i64>>,
     events: Option<
         std::sync::Arc<std::sync::Mutex<std::sync::mpsc::Receiver<voxhold_api::RealtimeEvent>>>,
     >,
     events_overflow: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    events_version: u64,
     reads: std::collections::HashMap<i64, i64>,
     read_sent: i64,
     read_pending: bool,
@@ -97,8 +123,26 @@ struct Voxhold {
     /// bring the row back.
     deleted_ids: std::collections::HashSet<i64>,
     _activation_subscription: gpui::Subscription,
+    _appearance_subscription: gpui::Subscription,
 }
+
+impl Drop for Voxhold {
+    fn drop(&mut self) {
+        self.stop_realtime();
+    }
+}
+
 impl Voxhold {
+    fn stop_realtime(&mut self) {
+        if let Some(task) = self.event_task.take() {
+            task.abort();
+        }
+        self.events = None;
+        self.event_subscription = None;
+        self.realtime_generation = self.realtime_generation.wrapping_add(1);
+        self.online_by_server.clear();
+    }
+
     fn new(
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -107,14 +151,14 @@ impl Voxhold {
     ) -> Self {
         let history_list = ListState::new(0, ListAlignment::Bottom, px(400.));
         let weak = cx.entity().downgrade();
-        history_list.set_scroll_handler(move |event, window, cx| {
+        history_list.set_scroll_handler(move |_, window, cx| {
             if let Some(view) = weak.upgrade() {
                 view.update(cx, |s, cx| {
-                    s.mark_visible_read(event.visible_range.clone(), window, cx);
-                    // Go loads the previous page when the reader reaches the
-                    // top area instead of waiting for the explicit button.
-                    if event.visible_range.start <= 3 && s.has_more && !s.loading_older {
-                        s.load_older(cx);
+                    // The list is mutably borrowed while this callback runs, so
+                    // never touch `ListState` here. Both follow-ups recompute
+                    // their range from a later frame.
+                    if !s.loading_older && !s.older_scheduled && s.has_more {
+                        s.schedule_older_check(window, cx);
                     }
                 });
             }
@@ -159,6 +203,7 @@ impl Voxhold {
             show_inbox: false,
             show_members: false,
             show_channels: false,
+            show_servers: false,
             #[cfg(feature = "voxhold-media")]
             voice: None,
             #[cfg(feature = "voxhold-media")]
@@ -166,16 +211,37 @@ impl Voxhold {
             servers: vec![],
             channels: vec![],
             members: vec![],
+            roster: members::Roster::default(),
             messages: vec![],
             history_list,
             history_keys: Vec::new(),
             before: None,
             has_more: false,
+            history_has_newer: false,
             loading_older: false,
+            access_generation: 0,
+            access_pending: false,
+            access_reload_in_flight: false,
+            access_refresh_again: false,
+            refresh_request: None,
+            refresh_again: false,
+            refresh_new_ids: Default::default(),
+            pending_edits: Default::default(),
+            pending_reactions: Default::default(),
+            request_seq: 0,
+            older_request: 0,
+            older_retry_at: None,
+            older_error: String::new(),
+            older_scheduled: false,
+            read_scheduled: false,
+            read_retry_at: None,
+            painted_read: Default::default(),
             event_task: None,
+            realtime_generation: 0,
+            event_subscription: None,
+            online_by_server: Default::default(),
             events: None,
             events_overflow: Default::default(),
-            events_version: 0,
             reads: Default::default(),
             read_sent: 0,
             read_pending: false,
@@ -200,18 +266,13 @@ impl Voxhold {
             pending_anchor: None,
             deleted_ids: Default::default(),
             _activation_subscription: cx.observe_window_activation(window, |s, window, cx| {
-                if s.theme_mode == theme::ThemeMode::System {
-                    let light = theme::system_light();
-                    if light != s.system_light {
-                        s.system_light = light;
-                        s.palette = theme::Palette::resolve(s.theme_mode, light);
-                        s.auth_background = None;
-                        window_chrome::apply(window, s.palette.light);
-                        cx.notify();
-                    }
-                }
+                s.sync_system_theme(window, cx);
+                cx.notify();
             }),
+            _appearance_subscription: cx.observe_window_appearance(window, Self::sync_system_theme),
         };
+        gpui_component::Theme::change(component_theme_mode(view.palette.light), Some(window), cx);
+        gpui_component::Theme::global_mut(cx).font_family = "Inter".into();
         window_chrome::apply(window, view.palette.light);
         view
     }
@@ -235,6 +296,8 @@ impl Voxhold {
         }
         self.auth.screen = auth::AuthScreen::Instance;
         self.auth.status.clear();
+        self.password
+            .update(cx, |input, cx| input.set_value("", window, cx));
         self.instance.update(cx, |input, cx| {
             input.focus(window, cx);
         });
@@ -299,19 +362,18 @@ impl Voxhold {
                 cx.observe_in(&attachments, window, |s, attachments, window, cx| {
                     let sent = attachments.update(cx, |a, _| a.take_sent());
                     if let Some(message) = sent {
-                        if let Some((generation, text)) = s.attachment_pending.take() {
-                            if generation == s.generation {
+                        if let Some((access, text)) = s.attachment_pending.take() {
+                            if access == s.access_generation
+                                && !s.access_pending
+                                && message.channel_id == s.channel
+                                && !s.deleted_ids.contains(&message.id)
+                            {
                                 if s.composer.read(cx).value().as_ref() == text {
                                     s.composer
                                         .update(cx, |input, cx| input.set_value("", window, cx));
                                 }
-                                if !s.messages.iter().any(|m| m.id == message.id) {
-                                    s.messages.push(message);
-                                    s.messages.sort_by_key(|m| m.id);
-                                }
-                                if s.messages.len() > 1000 {
-                                    s.messages.remove(0);
-                                }
+                                s.merge_message(true, message);
+                                s.trim_history(false);
                             }
                         }
                         cx.notify();
@@ -342,12 +404,18 @@ impl Voxhold {
                 let inbox_client = c.clone();
                 s.inbox = Some(cx.new(|cx| inbox::Inbox::new(inbox_client, runtime, window, cx)));
                 s.self_user_id = self_user_id;
-                s.client = Some(c);
+                s.client = Some(c.clone());
+                s.start_realtime(c, window, cx);
                 s.servers = servers;
                 s.auth.status = "Choose a server".into();
                 // Go selects the first server after login; an empty list leaves
-                // the workspace on its empty state.
+                // the workspace on its empty state. This also gives narrow
+                // layouts a working channel list even without the rail.
                 s.shell_initialized = false;
+                let first_server = s.servers.first().map(|server| server.id);
+                if let Some(id) = first_server {
+                    s.select_server(id, window, cx);
+                }
                 cx.notify();
             });
         })
@@ -355,8 +423,15 @@ impl Voxhold {
     }
 
     fn logout(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.event_task = None;
-        self.events = None;
+        self.stop_realtime();
+        #[cfg(feature = "voxhold-media")]
+        if let Some(voice) = self.voice.take() {
+            voice.update(cx, |voice, cx| voice.leave_in_window(window, cx));
+        }
+        #[cfg(feature = "voxhold-media")]
+        {
+            self.voice_channel = 0;
+        }
         self.client = None;
         self.servers.clear();
         self.channels.clear();
@@ -366,17 +441,61 @@ impl Voxhold {
         self.deleted_ids.clear();
         self.pending_anchor = None;
         self.history_list.reset(0);
+        self.before = None;
+        self.has_more = false;
+        self.history_has_newer = false;
         self.self_user_id = 0;
         self.server = 0;
         self.channel = 0;
+        self.reset_roster(window);
         self.error.clear();
         self.busy = false;
         self.drafts.clear();
+        self.generation = self.generation.wrapping_add(1);
+        self.access_generation = self.access_generation.wrapping_add(1);
+        self.request_seq = self.request_seq.wrapping_add(1);
+        self.access_pending = false;
+        self.access_reload_in_flight = false;
+        self.access_refresh_again = false;
+        self.refresh_request = None;
+        self.refresh_again = false;
+        self.refresh_new_ids.clear();
+        self.pending_edits.clear();
+        self.pending_reactions.clear();
+        self.attachment_pending = None;
+        self.older_request = 0;
+        self.loading_older = false;
+        self.older_error.clear();
+        self.older_retry_at = None;
+        self.older_scheduled = false;
+        self.read_scheduled = false;
+        self.read_pending = false;
+        self.read_retry_at = None;
+        self.read_sent = 0;
+        self.reads.clear();
+        self.attachments = None;
+        self.settings = None;
+        self.server_settings = None;
+        self.channel_settings = None;
+        self.inbox = None;
+        self.search = None;
+        self.message_tools = None;
+        self.show_inbox = false;
+        self.show_settings = false;
+        self.show_server_settings = false;
+        self.show_channel_settings = false;
+        self.show_search = false;
+        self.show_tools = false;
+        self.show_servers = false;
         self.auth = {
             let origin = self.auth.origin.clone();
             auth::AuthState::with_prefill(&origin)
         };
         self.auth.screen = auth::AuthScreen::Login;
+        self.username
+            .update(cx, |input, cx| input.set_value("", window, cx));
+        self.composer
+            .update(cx, |input, cx| input.set_value("", window, cx));
         self.password
             .update(cx, |input, cx| input.set_value("", window, cx));
         self.instance.update(cx, |input, cx| {
@@ -426,11 +545,11 @@ impl Voxhold {
         let runtime = self.runtime.clone();
         let tools =
             cx.new(|cx| message_tools::MessageTools::new(tools_client, runtime, window, cx));
-        cx.observe(&tools, |this, tools, cx| {
+        cx.observe_in(&tools, window, |this, tools, window, cx| {
             let revision = tools.read(cx).revision();
             if revision != this.tools_revision {
                 this.tools_revision = revision;
-                this.refresh_history(cx);
+                this.refresh_history(window, cx);
             }
         })
         .detach();
@@ -448,19 +567,45 @@ impl Voxhold {
                 cx.new(|cx| personal_settings::PersonalSettings::new(client, runtime, window, cx));
             self.settings = Some(settings);
         }
-        if let Some(task) = self.event_task.take() {
-            task.abort();
-        }
-        self.events = None;
         self.channels.clear();
         self.messages.clear();
         self.before = None;
         self.has_more = false;
+        self.history_has_newer = false;
         self.loading_older = false;
         self.members.clear();
+        self.reset_roster(window);
+        self.reads.clear();
+        self.read_sent = 0;
+        self.read_pending = false;
+        self.read_scheduled = false;
+        self.older_scheduled = false;
+        self.read_retry_at = None;
+        self.busy = false;
         self.generation += 1;
+        self.access_generation = self.access_generation.wrapping_add(1);
+        self.access_pending = false;
+        self.access_reload_in_flight = false;
+        self.access_refresh_again = false;
+        self.refresh_request = None;
+        self.refresh_again = false;
+        self.pending_edits.clear();
+        self.pending_reactions.clear();
+        self.request_seq = self.request_seq.wrapping_add(1);
+        self.older_request = 0;
+        self.older_error.clear();
+        self.older_retry_at = None;
+        self.deleted_ids.clear();
+        self.pending_anchor = None;
+        self.history_list.reset(0);
+        self.history_keys.clear();
         let generation = self.generation;
         self.error.clear();
+        self.update_channel_subscription(false);
+        if id == 0 {
+            cx.notify();
+            return;
+        }
         cx.notify();
         let rt = self.runtime.clone();
         let task = cx.background_spawn(async move {
@@ -474,13 +619,13 @@ impl Voxhold {
             let result = task.await;
             if let Some(this) = this.upgrade() {
                 this.update(cx, |s, cx| {
-                    if s.generation != generation {
+                    if s.generation != generation || s.access_pending {
                         return;
                     }
                     match result {
                         Ok((channels, members)) => {
                             s.channels = channels;
-                            s.members = members
+                            s.members = members;
                         }
                         Err(e) => s.error = e,
                     }
@@ -492,7 +637,13 @@ impl Voxhold {
         .detach();
     }
     fn select_channel(&mut self, id: i64, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(c) = self.client.clone() else { return };
+        if self.access_pending {
+            return;
+        }
+        if self.client.is_none() {
+            return;
+        }
+        let previous_channel = self.channel;
         if self.channel != 0 {
             self.drafts.insert(
                 (self.server, self.channel),
@@ -506,10 +657,6 @@ impl Voxhold {
             .unwrap_or_default();
         self.composer
             .update(cx, |input, cx| input.set_value(draft, window, cx));
-        if let Some(task) = self.event_task.take() {
-            task.abort();
-        }
-        self.events = None;
         self.channel = id;
         self.attachment_pending = None;
         let writable = self.channels.iter().any(|ch| ch.id == id && ch.writable());
@@ -519,10 +666,32 @@ impl Voxhold {
         self.reads.clear();
         self.read_sent = 0;
         self.read_pending = false;
-        self.deleted_ids.clear();
+        self.read_retry_at = None;
+        if id != previous_channel {
+            self.deleted_ids.clear();
+        }
         self.pending_anchor = None;
+        self.access_generation = self.access_generation.wrapping_add(1);
+        self.access_pending = false;
+        self.access_reload_in_flight = false;
+        self.access_refresh_again = false;
+        self.refresh_request = None;
+        self.refresh_again = false;
+        self.pending_edits.clear();
+        self.pending_reactions.clear();
+        self.request_seq = self.request_seq.wrapping_add(1);
+        self.older_request = 0;
+        self.older_error.clear();
+        self.older_retry_at = None;
+        self.loading_older = false;
+        self.older_scheduled = false;
+        self.read_scheduled = false;
+        self.busy = false;
+        self.roster.reset_channel();
+        self.roster.loading.clear();
         self.show_tools = false;
         self.show_channel_settings = false;
+        self.show_channels = false;
         let role = self
             .servers
             .iter()
@@ -542,20 +711,18 @@ impl Voxhold {
             });
         }
         #[cfg(feature = "voxhold-media")]
-        if self
-            .channels
-            .iter()
-            .any(|ch| ch.id == id && ch.kind == "voice" && ch.readable() && !ch.e2ee_required)
-            && self.voice_channel != id
-        {
+        if let Some(client) = self.client.clone().filter(|_| {
+            self.voice_channel != id
+                && self.channels.iter().any(|ch| {
+                    ch.id == id && ch.kind == "voice" && ch.readable() && !ch.e2ee_required
+                })
+        }) {
             if let Some(voice) = self.voice.take() {
                 voice.update(cx, |voice, cx| voice.leave_in_window(window, cx));
             }
-            let voice_client = c.clone();
             let server = self.server;
-            self.voice = Some(
-                cx.new(|cx| voice_panel::VoicePanel::new(voice_client, server, id, window, cx)),
-            );
+            self.voice =
+                Some(cx.new(|cx| voice_panel::VoicePanel::new(client, server, id, window, cx)));
             self.voice_channel = id;
         }
         if let Some(tools) = &self.message_tools {
@@ -567,77 +734,59 @@ impl Voxhold {
             search.update(cx, |panel, cx| panel.set_scope(self.server, id, cx));
         }
         self.messages.clear();
+        self.history_keys.clear();
+        self.history_list.reset(0);
         self.before = None;
         self.has_more = false;
+        self.history_has_newer = false;
         self.loading_older = false;
         self.generation += 1;
-        let generation = self.generation;
         self.error.clear();
-        let sid = self.server;
-        if !self
+        let has_history = self
             .channels
             .iter()
-            .any(|ch| ch.id == id && ch.has_history())
-        {
-            cx.notify();
-            return;
+            .any(|ch| ch.id == id && ch.has_history());
+        self.update_channel_subscription(has_history);
+        self.load_channel_members(cx);
+        if has_history {
+            self.refresh_history(window, cx);
         }
-        self.start_channel_events(c.clone(), sid, id, cx);
-        let events_version = self.events_version;
         cx.notify();
-        let rt = self.runtime.clone();
-        let task = cx.background_spawn(async move {
-            rt.block_on(c.messages_page(sid, id, 0))
-                .map_err(|e| e.to_string())
-        });
-        cx.spawn(async move |this, cx| {
-            let result = task.await;
-            if let Some(this) = this.upgrade() {
-                this.update(cx, |s, cx| {
-                    if s.generation != generation {
-                        return;
-                    }
-                    match result {
-                        Ok(page) => {
-                            s.before = page.pagination.next_before_id;
-                            s.has_more = page.pagination.has_more;
-                            if s.events_version != events_version {
-                                s.refresh_history(cx);
-                                return;
-                            }
-                            let mut current = std::mem::take(&mut s.messages);
-                            s.messages = page.messages;
-                            s.messages
-                                .retain(|m| !current.iter().any(|newer| newer.id == m.id));
-                            s.messages.append(&mut current);
-                            s.messages.sort_by_key(|m| m.id);
-                        }
-                        Err(e) => s.error = e,
-                    }
-                    cx.notify();
-                })
-                .ok();
-            }
-        })
-        .detach();
     }
-    fn start_channel_events(
-        &mut self,
-        client: Client,
-        server: i64,
-        channel: i64,
-        cx: &mut Context<Self>,
-    ) {
+    fn update_channel_subscription(&self, enabled: bool) {
+        if let Some(sender) = &self.event_subscription {
+            sender.send_if_modified(|current| {
+                let next = enabled.then_some(ChannelSubscription {
+                    server_id: self.server,
+                    channel_id: self.channel,
+                    generation: self.access_generation,
+                });
+                if *current == next {
+                    return false;
+                }
+                *current = next;
+                true
+            });
+        }
+    }
+
+    fn start_realtime(&mut self, client: Client, window: &mut Window, cx: &mut Context<Self>) {
+        let (subscription, desired) = tokio::sync::watch::channel(None);
+        self.event_subscription = Some(subscription);
         let (tx, rx) = std::sync::mpsc::sync_channel(128);
         let overflow = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         self.events_overflow = overflow.clone();
         self.events = Some(std::sync::Arc::new(std::sync::Mutex::new(rx)));
         self.event_task = Some(self.runtime.spawn(async move {
+            let mut connected = false;
             loop {
                 let sender = tx.clone();
                 let overflow = overflow.clone();
                 let _ = client
-                    .subscribe(server, channel, move |event| {
+                    .subscribe_channels(desired.clone(), |mut event| {
+                        if event.kind == "ready" && std::mem::replace(&mut connected, true) {
+                            event.kind = "native.reconnected".into();
+                        }
                         if sender.try_send(event).is_err() {
                             overflow.store(true, std::sync::atomic::Ordering::Relaxed);
                         }
@@ -646,64 +795,202 @@ impl Voxhold {
                 tokio::time::sleep(std::time::Duration::from_secs(3)).await;
             }
         }));
-        self.schedule_events(self.generation, cx);
+        self.schedule_events(self.realtime_generation, window, cx);
     }
-    fn schedule_events(&self, generation: u64, cx: &mut Context<Self>) {
+    fn schedule_events(&self, generation: u64, window: &mut Window, cx: &mut Context<Self>) {
         let timer = cx
             .background_executor()
             .timer(std::time::Duration::from_millis(150));
-        cx.spawn(async move |this, cx| {
+        cx.spawn_in(window, async move |this, cx| {
             timer.await;
-            if let Some(this) = this.upgrade() {
-                this.update(cx, |s, cx| {
-                    if s.generation != generation || s.events.is_none() {
-                        return;
+            let _ = this.update_in(cx, |s, window, cx| {
+                if s.realtime_generation != generation || s.events.is_none() {
+                    return;
+                }
+                let events: Vec<_> = s
+                    .events
+                    .as_ref()
+                    .unwrap()
+                    .lock()
+                    .unwrap()
+                    .try_iter()
+                    .collect();
+                let changed = !events.is_empty();
+                let mut resync = s
+                    .events_overflow
+                    .swap(false, std::sync::atomic::Ordering::Relaxed);
+                let mut access = resync && s.channel != 0;
+                let mut server_removed = false;
+                for event in events {
+                    let effect = s.apply_realtime_event(&event.kind, &event.data);
+                    resync |= effect.resync;
+                    access |= effect.access;
+                    server_removed |= effect.server_removed;
+                }
+                if server_removed {
+                    s.remove_current_server(window, cx);
+                } else if access {
+                    // Access changed: hide confirmed data first, then take a
+                    // new authoritative channel snapshot and history.
+                    if s.access_reload_in_flight {
+                        s.access_refresh_again = true;
+                    } else {
+                        s.invalidate_access(window, cx);
                     }
-                    let events: Vec<_> = s
-                        .events
-                        .as_ref()
-                        .unwrap()
-                        .lock()
-                        .unwrap()
-                        .try_iter()
-                        .collect();
-                    let changed = !events.is_empty();
-                    if changed {
-                        s.events_version = s.events_version.wrapping_add(1);
-                    }
-                    let mut resync = s
-                        .events_overflow
-                        .swap(false, std::sync::atomic::Ordering::Relaxed);
-                    for event in events {
-                        if s.apply_realtime_event(&event.kind, &event.data) {
-                            resync = true;
-                        }
-                    }
-                    if resync {
-                        s.refresh_history(cx);
-                    }
-                    if changed || resync {
-                        cx.notify();
-                    }
-                    s.schedule_events(generation, cx);
-                })
-                .ok();
-            }
+                } else if resync {
+                    s.refresh_history(window, cx);
+                }
+                if changed || resync || access {
+                    cx.notify();
+                }
+                if s.realtime_generation == generation && s.events.is_some() {
+                    s.schedule_events(generation, window, cx);
+                }
+            });
         })
         .detach();
     }
-    /// Apply one realtime event to the active scope. Returns `true` when an
-    /// authoritative history refresh is required.
+    /// Merge one message while keeping the body revision and the separate
+    /// reaction revision apart. Backend `message.updated` omits `reactions`, so
+    /// replacing the object wholesale would reset them to version 0.
+    fn merge_message(&mut self, created: bool, message: Message) {
+        if message.id <= 0
+            || message.channel_id != self.channel
+            || message.thread_root_id.is_some()
+            || self.deleted_ids.contains(&message.id)
+        {
+            return;
+        }
+        let id = message.id;
+        let position = self.messages.binary_search_by_key(&id, |row| row.id);
+        match position {
+            Ok(index) => merge_revision(&mut self.messages[index], message),
+            Err(index) if created => {
+                if self.refresh_request.is_some() {
+                    self.refresh_new_ids.insert(id);
+                }
+                let mut message = message;
+                if let Some(edit) = self.pending_edits.remove(&id) {
+                    merge_revision(&mut message, edit);
+                }
+                if let Some(update) = self.pending_reactions.remove(&id) {
+                    apply_reactions(&mut message, update);
+                }
+                self.messages.insert(index, message);
+            }
+            Err(_) => {
+                if self.pending_edits.len() >= 128 && !self.pending_edits.contains_key(&id) {
+                    self.pending_edits.clear();
+                }
+                self.pending_edits
+                    .entry(id)
+                    .and_modify(|row| merge_revision(row, message.clone()))
+                    .or_insert(message);
+            }
+        }
+    }
+
+    /// Apply one realtime event to the active scope.
     ///
-    /// The merge policy is the part that regresses most easily, so it lives in
-    /// its own method with unit coverage: stale revisions never overwrite a
-    /// confirmed row, a tombstone wins over late `created`/`updated` events and
-    /// a repeated `created` for an existing id is an update.
-    fn apply_realtime_event(&mut self, kind: &str, data: &serde_json::Value) -> bool {
-        let mut resync = false;
+    /// A stale body revision never overwrites a confirmed row, a tombstone wins
+    /// over late `created`/`updated` events and access events invalidate the
+    /// confirmed scope before any late HTTP answer can be applied.
+    fn apply_realtime_event(&mut self, kind: &str, data: &serde_json::Value) -> RealtimeEffect {
+        let mut effect = RealtimeEffect::default();
         match kind {
-            "channel.subscribed" | "channel.sync_required" => resync = true,
-            "channel.read_snapshot" => {
+            "channel.subscribed" | "channel.sync_required"
+                if data["server_id"].as_i64() == Some(self.server)
+                    && data["channel_id"].as_i64() == Some(self.channel)
+                    && (kind == "channel.sync_required"
+                        || data["generation"].as_u64() == Some(self.access_generation)) =>
+            {
+                effect.resync = true;
+            }
+            "native.reconnected" => effect.access = self.server != 0,
+            "native.subscription_forbidden"
+                if data["server_id"].as_i64() == Some(self.server)
+                    && data["channel_id"].as_i64() == Some(self.channel)
+                    && data["generation"].as_u64() == Some(self.access_generation) =>
+            {
+                effect.access = true;
+            }
+            "channels.changed" | "channel.created" | "channel.updated" | "channel.deleted"
+                if data["server_id"].as_i64() == Some(self.server) =>
+            {
+                effect.access = true;
+            }
+            "server.member_joined" | "server.member_role_updated"
+                if data["server_id"].as_i64() == Some(self.server) =>
+            {
+                if let Ok(member) = serde_json::from_value::<Member>(data["member"].clone()) {
+                    if member.user_id == self.self_user_id {
+                        if let Some(server) = self
+                            .servers
+                            .iter_mut()
+                            .find(|server| server.id == self.server)
+                        {
+                            server.role = member.role.clone();
+                        }
+                    }
+                    self.members
+                        .retain(|current| current.user_id != member.user_id);
+                    self.members.push(member);
+                }
+                effect.access = true;
+            }
+            "server.member_removed" | "server.deleted" if data["server_id"].as_i64().is_some() => {
+                let user_id = data["user_id"].as_i64();
+                let server = data["server_id"].as_i64().unwrap_or_default();
+                let removed = kind == "server.deleted" || user_id == Some(self.self_user_id);
+                if removed {
+                    self.online_by_server.remove(&server);
+                }
+                if server == self.server {
+                    effect.server_removed = removed;
+                    self.members
+                        .retain(|member| Some(member.user_id) != user_id);
+                    effect.access = true;
+                } else if removed {
+                    self.servers.retain(|item| item.id != server);
+                    self.drafts.retain(|(id, _), _| *id != server);
+                }
+            }
+            "presence.snapshot" => {
+                if let Some(servers) = data["servers"].as_array() {
+                    for server in servers {
+                        if let (Some(id), Some(ids)) = (
+                            server["server_id"].as_i64(),
+                            server["online_user_ids"].as_array(),
+                        ) {
+                            self.online_by_server.insert(
+                                id,
+                                ids.iter().filter_map(serde_json::Value::as_i64).collect(),
+                            );
+                        }
+                    }
+                }
+            }
+            "presence.updated" => {
+                if let (Some(server), Some(id)) =
+                    (data["server_id"].as_i64(), data["user_id"].as_i64())
+                {
+                    let online = self.online_by_server.entry(server).or_default();
+                    match data["status"].as_str() {
+                        Some("online") => {
+                            online.insert(id);
+                        }
+                        Some("offline") => {
+                            online.remove(&id);
+                        }
+                        _ => {}
+                    }
+                    if let Some(at) = data["last_seen_at"].as_i64() {
+                        let seen = self.roster.last_seen.entry(id).or_default();
+                        *seen = (*seen).max(at);
+                    }
+                }
+            }
+            "channel.read_snapshot" if !self.access_pending => {
                 if data["server_id"].as_i64() == Some(self.server)
                     && data["channel_id"].as_i64() == Some(self.channel)
                 {
@@ -719,7 +1006,7 @@ impl Voxhold {
                     }
                 }
             }
-            "channel.read" => {
+            "channel.read" if !self.access_pending => {
                 if let Ok(read) = serde_json::from_value::<voxhold_api::ChannelRead>(data.clone()) {
                     if read.server_id == self.server && read.channel_id == self.channel {
                         let slot = self.reads.entry(read.user_id).or_default();
@@ -727,84 +1014,296 @@ impl Voxhold {
                     }
                 }
             }
-            "message.created" | "message.updated" => {
+            "message.created" | "message.updated" if !self.access_pending => {
                 if let Ok(message) = serde_json::from_value::<Message>(data.clone()) {
-                    if message.channel_id == self.channel && message.id > 0 {
-                        if self.deleted_ids.contains(&message.id) {
-                            // A tombstone wins over late events.
-                        } else if let Some(existing) =
-                            self.messages.iter_mut().find(|m| m.id == message.id)
-                        {
-                            if message.revision >= existing.revision {
-                                *existing = message;
-                            }
-                        } else if kind == "message.created" {
-                            self.messages.push(message);
-                        }
-                        self.messages.sort_by_key(|m| m.id);
-                        if self.messages.len() > 1000 {
-                            self.messages.remove(0);
-                        }
+                    if message.channel_id == self.channel {
+                        self.merge_message(kind == "message.created", message);
+                        self.trim_history(false);
                     }
                 }
             }
-            "message.deleted" => {
+            "message.deleted" if !self.access_pending => {
                 if data["channel_id"].as_i64() == Some(self.channel) {
                     if let Some(id) = data["message_id"].as_i64() {
                         self.deleted_ids.insert(id);
                         self.messages.retain(|m| m.id != id);
+                        self.pending_edits.remove(&id);
+                        self.pending_reactions.remove(&id);
                     }
                 }
             }
-            "message.reactions_changed" => {
+            "message.reactions_changed" if !self.access_pending => {
                 if let Ok(update) =
                     serde_json::from_value::<voxhold_api::ReactionsUpdate>(data.clone())
                 {
-                    if update.channel_id == self.channel {
+                    if update.channel_id == self.channel
+                        && !self.deleted_ids.contains(&update.message_id)
+                    {
                         if let Some(message) =
                             self.messages.iter_mut().find(|m| m.id == update.message_id)
                         {
-                            if update.revision >= message.reactions_revision {
-                                message.reactions = update.reactions;
-                                message.reactions_revision = update.revision;
+                            apply_reactions(message, update);
+                        } else {
+                            if self.pending_reactions.len() >= 128
+                                && !self.pending_reactions.contains_key(&update.message_id)
+                            {
+                                self.pending_reactions.clear();
+                            }
+                            let entry = self
+                                .pending_reactions
+                                .entry(update.message_id)
+                                .or_insert_with(|| update.clone());
+                            if update.revision > entry.revision {
+                                *entry = update;
                             }
                         }
                     }
                 }
             }
+            "avatar.updated" => {
+                if let Some(user) = data["user_id"].as_i64() {
+                    let version = data["version"]
+                        .as_str()
+                        .filter(|version| !version.is_empty())
+                        .map(str::to_owned);
+                    if let Some(member) = self.members.iter_mut().find(|m| m.user_id == user) {
+                        member.avatar_version = version;
+                    }
+                    self.roster.failures.remove(&user);
+                    self.roster.loading.remove(&user);
+                }
+            }
             _ => {}
         }
-        resync
+        effect
     }
-    /// Rows currently intersecting the viewport, derived from the real list
-    /// geometry. Used to aggregate read receipts only for messages the reader
-    /// can actually see.
-    fn visible_history_range(&self) -> std::ops::Range<usize> {
-        let bounds = self.history_list.viewport_bounds();
-        let start = self.history_list.logical_scroll_top().item_ix;
-        let count = self.history_list.item_count();
-        if bounds.size.height <= px(0.) || start >= count {
-            return start..start;
-        }
-        let mut end = start;
-        for ix in start..count.min(start + 200) {
-            match self.history_list.bounds_for_item(ix) {
-                Some(row) if row.origin.y < bounds.bottom() => end = ix + 1,
-                Some(_) => break,
-                None => break,
+    fn schedule_visible_read(&mut self, window: &Window, cx: &mut Context<Self>) {
+        self.read_scheduled = true;
+        let scope = (self.server, self.channel, self.access_generation);
+        let painted = self.painted_read.clone();
+        let weak = cx.entity().downgrade();
+        window.on_next_frame(move |window, cx| {
+            if let Some(this) = weak.upgrade() {
+                this.update(cx, |s, cx| {
+                    if (s.server, s.channel, s.access_generation) != scope {
+                        return;
+                    }
+                    s.read_scheduled = false;
+                    s.mark_visible_read(painted.get(), window, cx);
+                });
             }
-        }
-        start..end.max((start + 1).min(count))
+        });
     }
 
-    fn mark_visible_read(
-        &mut self,
-        range: std::ops::Range<usize>,
-        window: &Window,
-        cx: &mut Context<Self>,
-    ) {
+    /// Deferred auto-load for the top of history. Never touches `ListState` from
+    /// the scroll callback itself.
+    fn schedule_older_check(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.older_scheduled = true;
+        let scope = (self.server, self.channel, self.access_generation);
+        cx.spawn_in(window, async move |this, window| {
+            window
+                .background_executor()
+                .timer(std::time::Duration::from_millis(1))
+                .await;
+            let _ = this.update_in(window, |s, window, cx| {
+                if (s.server, s.channel, s.access_generation) != scope {
+                    return;
+                }
+                s.older_scheduled = false;
+                if s.loading_older || !s.has_more {
+                    return;
+                }
+                if s.history_list.logical_scroll_top().item_ix <= 3 {
+                    s.load_older(window, cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Access changed for the current scope: drop confirmed data, invalidate
+    /// in-flight requests and take a fresh channel snapshot before restoring the chat.
+    fn invalidate_access(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.server == 0 || self.access_reload_in_flight {
+            return;
+        }
+        self.access_pending = true;
+        self.access_reload_in_flight = false;
+        self.access_refresh_again = false;
+        self.error.clear();
+        self.access_generation = self.access_generation.wrapping_add(1);
+        self.refresh_request = None;
+        self.refresh_again = false;
+        self.refresh_new_ids.clear();
+        self.pending_edits.clear();
+        self.pending_reactions.clear();
+        self.messages.clear();
+        self.history_keys.clear();
+        self.history_list.reset(0);
+        self.before = None;
+        self.has_more = false;
+        self.history_has_newer = false;
+        self.loading_older = false;
+        self.pending_anchor = None;
+        self.older_error.clear();
+        self.older_retry_at = None;
+        self.older_request = 0;
+        self.older_scheduled = false;
+        self.read_scheduled = false;
+        self.read_pending = false;
+        self.read_retry_at = None;
+        self.read_sent = 0;
+        self.reads.clear();
+        self.busy = false;
+        self.attachment_pending = None;
+        self.roster.reset_channel();
+        self.roster.loading.clear();
+        for (_, (image, _)) in self.roster.avatars.drain() {
+            let _ = window.drop_image(image);
+        }
+        self.roster.failures.clear();
+        self.show_tools = false;
+        self.show_search = false;
+        self.show_channel_settings = false;
+        self.show_server_settings = false;
+        if let Some(attachments) = &self.attachments {
+            attachments.update(cx, |a, cx| a.set_scope(self.server, 0, false, cx));
+        }
+        if let Some(search) = &self.search {
+            search.update(cx, |panel, cx| panel.set_scope(0, 0, cx));
+        }
+        if let Some(tools) = &self.message_tools {
+            tools.update(cx, |panel, cx| {
+                panel.select(0, 0, None, Default::default(), cx)
+            });
+        }
+        if let Some(settings) = &self.channel_settings {
+            settings.update(cx, |panel, cx| panel.set_scope(0, 0, "", false, cx));
+        }
+        if let Some(settings) = &self.server_settings {
+            settings.update(cx, |panel, cx| panel.set_scope(0, "", false, window, cx));
+        }
+        self.reload_channels(window, cx);
+        cx.notify();
+    }
+
+    fn remove_current_server(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.servers.retain(|server| server.id != self.server);
+        self.drafts.retain(|(server, _), _| *server != self.server);
+        if let Some(attachments) = &self.attachments {
+            attachments.update(cx, |panel, _| panel.clear_server_drafts(self.server));
+        }
+        let next = self.servers.first().map_or(0, |server| server.id);
+        self.channel = 0;
+        self.select_server(next, window, cx);
+    }
+
+    fn reload_channels(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(client) = self.client.clone() else {
+            return;
+        };
+        self.access_reload_in_flight = true;
+        let (server, generation, access) = (self.server, self.generation, self.access_generation);
+        let runtime = self.runtime.clone();
+        let task = cx.background_spawn(async move {
+            runtime.block_on(async {
+                let channels = client.channels(server).await?;
+                let members = client.members(server).await;
+                Ok::<_, voxhold_api::Error>((channels, members))
+            })
+        });
+        cx.spawn_in(window, async move |this, window| {
+            let result = task.await;
+            let _ = this.update_in(window, |s, window, cx| {
+                if s.generation != generation || s.server != server || s.access_generation != access
+                {
+                    return;
+                }
+                s.access_reload_in_flight = false;
+                if std::mem::take(&mut s.access_refresh_again) {
+                    s.invalidate_access(window, cx);
+                    return;
+                }
+                match result {
+                    Ok((channels, members)) => {
+                        s.channels = channels;
+                        if let Ok(members) = members {
+                            s.members = members;
+                        }
+                        if let Some(server) = s.servers.iter_mut().find(|item| item.id == server) {
+                            if let Some(member) = s
+                                .members
+                                .iter()
+                                .find(|member| member.user_id == s.self_user_id)
+                            {
+                                server.role = member.role.clone();
+                            }
+                            if let Some(settings) = &s.server_settings {
+                                settings.update(cx, |panel, cx| {
+                                    panel.set_scope(
+                                        server.id,
+                                        &server.name,
+                                        server.role == "owner",
+                                        window,
+                                        cx,
+                                    )
+                                });
+                            }
+                        }
+                        let channel = s
+                            .channels
+                            .iter()
+                            .find(|c| c.id == s.channel && c.readable() && !c.e2ee_required)
+                            .map(|c| c.id);
+                        #[cfg(feature = "voxhold-media")]
+                        if !s.channels.iter().any(|c| {
+                            c.id == s.voice_channel
+                                && c.kind == "voice"
+                                && c.readable()
+                                && !c.e2ee_required
+                        }) {
+                            if let Some(voice) = s.voice.take() {
+                                voice.update(cx, |voice, cx| voice.leave_in_window(window, cx));
+                            }
+                            s.voice_channel = 0;
+                        }
+                        s.access_pending = false;
+                        s.error.clear();
+                        let channel = channel.unwrap_or_default();
+                        if channel != 0 {
+                            s.select_channel(channel, window, cx);
+                        } else {
+                            if s.channel != 0 {
+                                s.drafts.insert(
+                                    (s.server, s.channel),
+                                    s.composer.read(cx).value().to_string(),
+                                );
+                            }
+                            s.channel = 0;
+                            s.deleted_ids.clear();
+                            s.composer
+                                .update(cx, |input, cx| input.set_value("", window, cx));
+                            s.update_channel_subscription(false);
+                        }
+                    }
+                    Err(voxhold_api::Error::Http(403 | 404)) => {
+                        s.remove_current_server(window, cx);
+                    }
+                    Err(error) => s.error = error.to_string(),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn mark_visible_read(&mut self, message_id: i64, window: &mut Window, cx: &mut Context<Self>) {
         if !window.is_window_active()
             || self.read_pending
+            || self.access_pending
+            || self
+                .read_retry_at
+                .is_some_and(|at| at > std::time::Instant::now())
             || !self
                 .channels
                 .iter()
@@ -812,173 +1311,305 @@ impl Voxhold {
         {
             return;
         }
-        let Some(message_id) = range
-            .filter_map(|index| self.messages.get(index).map(|m| m.id))
-            .max()
-        else {
-            return;
-        };
-        if message_id <= self.read_sent {
-            return;
-        }
-        let Some(client) = self.client.clone() else {
-            return;
-        };
-        let (server, channel, generation) = (self.server, self.channel, self.generation);
-        let runtime = self.runtime.clone();
-        self.read_pending = true;
-        let task = cx.background_spawn(async move {
-            runtime
-                .block_on(client.mark_read(server, channel, message_id))
-                .map_err(|e| e.to_string())
-        });
-        cx.spawn(async move |this, cx| {
-            let result = task.await;
-            if let Some(this) = this.upgrade() {
-                this.update(cx, |s, cx| {
-                    if s.generation != generation {
-                        return;
-                    }
-                    s.read_pending = false;
-                    if result.is_ok() {
-                        s.read_sent = s.read_sent.max(message_id);
-                    }
-                    cx.notify();
-                })
-                .ok();
-            }
-        })
-        .detach();
-    }
-    fn refresh_history(&mut self, cx: &mut Context<Self>) {
-        let Some(client) = self.client.clone() else {
-            return;
-        };
-        let (server, channel, generation) = (self.server, self.channel, self.generation);
-        let events_version = self.events_version;
-        if !self
-            .channels
-            .iter()
-            .any(|c| c.id == channel && c.has_history())
+        if message_id <= self.read_sent
+            || self
+                .messages
+                .binary_search_by_key(&message_id, |message| message.id)
+                .is_err()
         {
             return;
         }
+        let Some(client) = self.client.clone() else {
+            return;
+        };
+        let (server, channel, generation, access_generation) = (
+            self.server,
+            self.channel,
+            self.generation,
+            self.access_generation,
+        );
         let runtime = self.runtime.clone();
+        self.read_pending = true;
         let task = cx.background_spawn(async move {
-            runtime
-                .block_on(client.messages_page(server, channel, 0))
-                .map_err(|e| e.to_string())
+            runtime.block_on(client.mark_read(server, channel, message_id))
         });
-        cx.spawn(async move |this, cx| {
+        cx.spawn_in(window, async move |this, window| {
             let result = task.await;
-            if let Some(this) = this.upgrade() {
-                this.update(cx, |s, cx| {
-                    if s.generation != generation {
-                        return;
+            let _ = this.update_in(window, |s, window, cx| {
+                if s.generation != generation || s.access_generation != access_generation {
+                    return;
+                }
+                s.read_pending = false;
+                match result {
+                    Ok(_) => s.read_sent = s.read_sent.max(message_id),
+                    Err(voxhold_api::Error::Http(403 | 404)) => {
+                        s.invalidate_access(window, cx);
                     }
-                    if s.events_version != events_version {
-                        s.refresh_history(cx);
-                        return;
+                    Err(error) => {
+                        let delay = Self::history_retry_delay(&error);
+                        s.read_retry_at = Some(std::time::Instant::now() + delay);
+                        let timer = cx.background_executor().timer(delay);
+                        cx.spawn_in(window, async move |this, window| {
+                            timer.await;
+                            let _ = this.update_in(window, |s, _, cx| {
+                                if s.access_generation == access_generation {
+                                    cx.notify();
+                                }
+                            });
+                        })
+                        .detach();
                     }
-                    match result {
-                        Ok(page) => {
-                            if let Some(minimum) = page.messages.iter().map(|m| m.id).min() {
-                                let deleted = &s.deleted_ids;
-                                s.messages
-                                    .retain(|m| m.id < minimum && !deleted.contains(&m.id));
-                            } else {
-                                s.messages.clear();
-                            }
-                            let deleted = &s.deleted_ids;
-                            s.messages.extend(
-                                page.messages
-                                    .into_iter()
-                                    .filter(|m| !deleted.contains(&m.id)),
-                            );
-                            s.messages.sort_by_key(|m| m.id);
-                            s.messages.dedup_by_key(|m| m.id);
-                            if s.messages.len() > 1000 {
-                                let excess = s.messages.len() - 1000;
-                                s.messages.drain(0..excess);
-                            }
-                        }
-                        Err(e) => s.error = e,
-                    }
-                    cx.notify();
-                })
-                .ok();
-            }
+                }
+                cx.notify();
+            });
         })
         .detach();
     }
-    fn load_older(&mut self, cx: &mut Context<Self>) {
-        if self.loading_older || !self.has_more {
+    fn history_anchor(&self) -> Option<(i64, gpui::Pixels)> {
+        let offset = self.history_list.logical_scroll_top();
+        self.history_keys
+            .get(offset.item_ix)
+            .map(|(id, _, _)| (*id, offset.offset_in_item))
+    }
+
+    fn history_retry_delay(error: &voxhold_api::Error) -> std::time::Duration {
+        match error {
+            voxhold_api::Error::Http(429) => std::time::Duration::from_secs(20),
+            voxhold_api::Error::Http(status) if (500..600).contains(status) => {
+                std::time::Duration::from_secs(8)
+            }
+            _ => std::time::Duration::from_secs(3),
+        }
+    }
+
+    fn schedule_retry_label(
+        &self,
+        window: &mut Window,
+        access: u64,
+        request: u64,
+        cx: &mut Context<Self>,
+    ) {
+        let timer = cx
+            .background_executor()
+            .timer(std::time::Duration::from_secs(1));
+        cx.spawn_in(window, async move |this, window| {
+            timer.await;
+            let _ = this.update_in(window, |s, window, cx| {
+                if s.access_generation != access || s.older_request != request {
+                    return;
+                }
+                if s.older_retry_at
+                    .is_some_and(|at| at > std::time::Instant::now())
+                {
+                    s.schedule_retry_label(window, access, request, cx);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn refresh_history(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(client) = self.client.clone() else {
+            return;
+        };
+        let (server, channel, generation, access) = (
+            self.server,
+            self.channel,
+            self.generation,
+            self.access_generation,
+        );
+        if self.access_pending
+            || !self
+                .channels
+                .iter()
+                .any(|c| c.id == channel && c.has_history())
+        {
             return;
         }
-        let (Some(c), Some(before)) = (self.client.clone(), self.before) else {
+        if self.refresh_request.is_some() {
+            self.refresh_again = true;
+            return;
+        }
+        self.request_seq = self.request_seq.wrapping_add(1);
+        let request = self.request_seq;
+        self.refresh_request = Some(request);
+        self.refresh_new_ids.clear();
+        self.older_request = 0;
+        self.loading_older = false;
+        let runtime = self.runtime.clone();
+        let task = cx.background_spawn(async move {
+            runtime.block_on(client.messages_page(server, channel, 0))
+        });
+        cx.spawn_in(window, async move |this, window| {
+            let result = task.await;
+            let _ = this.update_in(window, |s, window, cx| {
+                if s.generation != generation
+                    || s.access_generation != access
+                    || s.refresh_request != Some(request)
+                    || s.server != server
+                    || s.channel != channel
+                {
+                    return;
+                }
+                s.refresh_request = None;
+                let refresh_again = std::mem::take(&mut s.refresh_again);
+                let new_ids = std::mem::take(&mut s.refresh_new_ids);
+                match result {
+                    Ok(page) => {
+                        let anchor = s.history_anchor();
+                        s.apply_history_snapshot(page, new_ids);
+                        s.older_error.clear();
+                        s.older_retry_at = None;
+                        s.error.clear();
+                        s.pending_anchor = anchor;
+                    }
+                    Err(error) => match error {
+                        voxhold_api::Error::Http(403) | voxhold_api::Error::Http(404) => {
+                            s.invalidate_access(window, cx);
+                        }
+                        other => s.error = other.to_string(),
+                    },
+                }
+                if refresh_again && !s.access_pending {
+                    s.refresh_history(window, cx);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn apply_history_snapshot(
+        &mut self,
+        page: voxhold_api::MessagePage,
+        new_ids: std::collections::HashSet<i64>,
+    ) {
+        let mut current: std::collections::HashMap<_, _> = std::mem::take(&mut self.messages)
+            .into_iter()
+            .map(|row| (row.id, row))
+            .collect();
+        let last = page.messages.iter().map(|m| m.id).max().unwrap_or(0);
+        self.before = page.pagination.next_before_id;
+        self.has_more = page.pagination.has_more;
+        self.history_has_newer = false;
+        for mut row in page.messages {
+            if let Some(mut existing) = current.remove(&row.id) {
+                merge_revision(&mut existing, row);
+                row = existing;
+            }
+            self.merge_message(true, row);
+        }
+        for row in current
+            .into_values()
+            .filter(|row| row.id > last && new_ids.contains(&row.id))
+        {
+            self.merge_message(true, row);
+        }
+        self.trim_history(false);
+    }
+
+    fn trim_history(&mut self, prepending: bool) {
+        const MAX_ROWS: usize = 1000;
+        if self.messages.len() <= MAX_ROWS {
+            return;
+        }
+        let excess = self.messages.len() - MAX_ROWS;
+        let keep_from = if prepending || self.history_has_newer {
+            0
+        } else {
+            self.history_anchor()
+                .and_then(|(id, _)| self.messages.binary_search_by_key(&id, |row| row.id).ok())
+                .map_or(excess, |anchor| excess.min(anchor))
+        };
+        self.history_has_newer |= keep_from < excess;
+        self.messages.truncate(keep_from + MAX_ROWS);
+        if keep_from != 0 {
+            self.messages.drain(0..keep_from);
+            self.before = self.messages.first().map(|row| row.id);
+            self.has_more = true;
+        }
+    }
+
+    fn load_older(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.loading_older
+            || !self.has_more
+            || self.access_pending
+            || self.refresh_request.is_some()
+        {
+            return;
+        }
+        if let Some(at) = self.older_retry_at {
+            if std::time::Instant::now() < at {
+                return;
+            }
+        }
+        let (Some(client), Some(before)) = (self.client.clone(), self.before) else {
             return;
         };
-        // Remember the top visible row so prepending does not move the reader.
-        let anchor = {
-            let offset = self.history_list.logical_scroll_top();
-            self.messages
-                .get(offset.item_ix)
-                .map(|m| (m.id, offset.offset_in_item))
-        };
-        let (sid, cid, generation) = (self.server, self.channel, self.generation);
-        let events_version = self.events_version;
+        let (server, channel, generation, access) = (
+            self.server,
+            self.channel,
+            self.generation,
+            self.access_generation,
+        );
+        self.request_seq = self.request_seq.wrapping_add(1);
+        let request = self.request_seq;
+        self.older_request = request;
         self.loading_older = true;
+        self.older_error.clear();
         cx.notify();
-        let rt = self.runtime.clone();
+        let runtime = self.runtime.clone();
         let task = cx.background_spawn(async move {
-            rt.block_on(c.messages_page(sid, cid, before))
-                .map_err(|e| e.to_string())
+            runtime.block_on(client.messages_page(server, channel, before))
         });
-        cx.spawn(async move |this, cx| {
+        cx.spawn_in(window, async move |this, window| {
             let result = task.await;
-            if let Some(this) = this.upgrade() {
-                this.update(cx, |s, cx| {
-                    if s.generation != generation {
-                        return;
-                    }
-                    s.loading_older = false;
-                    if s.events_version != events_version {
-                        s.load_older(cx);
-                        return;
-                    }
-                    match result {
-                        Ok(page) => {
-                            s.before = page.pagination.next_before_id;
-                            s.has_more = page.pagination.has_more;
-                            let deleted = &s.deleted_ids;
-                            s.messages.extend(
-                                page.messages
-                                    .into_iter()
-                                    .filter(|m| !deleted.contains(&m.id)),
-                            );
-                            s.messages.sort_by_key(|m| m.id);
-                            s.messages.dedup_by_key(|m| m.id);
-                            if s.messages.len() > 1000 {
-                                let excess = s.messages.len() - 1000;
-                                s.messages.drain(0..excess);
-                                s.has_more = false;
-                            }
-                            // Applied by `render` after the list splices its
-                            // item count, so the scroll target is in range.
-                            s.pending_anchor = anchor;
+            let _ = this.update_in(window, |s, window, cx| {
+                if s.generation != generation
+                    || s.access_generation != access
+                    || s.older_request != request
+                    || s.before != Some(before)
+                    || s.server != server
+                    || s.channel != channel
+                {
+                    return;
+                }
+                s.loading_older = false;
+                match result {
+                    Ok(page) => {
+                        // The anchor is captured when the page is applied,
+                        // not when it was requested, so a reader who scrolled
+                        // away keeps the new position.
+                        let anchor = s.history_anchor();
+                        s.before = page.pagination.next_before_id;
+                        s.has_more = page.pagination.has_more;
+                        for row in page.messages {
+                            s.merge_message(true, row);
                         }
-                        Err(error) => s.error = error,
+                        s.trim_history(true);
+                        s.older_retry_at = None;
+                        s.pending_anchor = anchor;
                     }
-                    cx.notify();
-                })
-                .ok();
-            }
+                    Err(voxhold_api::Error::Http(403) | voxhold_api::Error::Http(404)) => {
+                        s.invalidate_access(window, cx);
+                    }
+                    Err(error) => {
+                        s.older_retry_at =
+                            Some(std::time::Instant::now() + Self::history_retry_delay(&error));
+                        s.older_error = error.to_string();
+                        s.schedule_retry_label(window, access, request, cx);
+                    }
+                }
+                cx.notify();
+            });
         })
         .detach();
     }
     fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(c) = self.client.clone() else { return };
         if self.busy
+            || self.access_pending
             || !self
                 .channels
                 .iter()
@@ -999,14 +1630,14 @@ impl Voxhold {
                 if attachments.read(cx).is_busy() {
                     return;
                 }
-                self.attachment_pending = Some((self.generation, text.clone()));
+                self.attachment_pending = Some((self.access_generation, text.clone()));
                 attachments.update(cx, |a, cx| a.send(&text, 0, cx));
             }
             return;
         }
         let sid = self.server;
         let cid = self.channel;
-        let generation = self.generation;
+        let access = self.access_generation;
         self.busy = true;
         cx.notify();
         let sent_text = text.clone();
@@ -1018,23 +1649,25 @@ impl Voxhold {
         cx.spawn_in(window, async move |this, window| {
             let result = task.await;
             let _ = this.update_in(window, |s, window, cx| {
+                if s.access_generation != access || s.access_pending {
+                    return;
+                }
                 s.busy = false;
                 match result {
-                    Ok(message) if s.generation == generation => {
+                    Ok(message)
+                        if s.server == sid
+                            && s.channel == cid
+                            && !s.deleted_ids.contains(&message.id) =>
+                    {
                         if s.composer.read(cx).value().as_ref() == sent_text {
                             s.composer
                                 .update(cx, |input, cx| input.set_value("", window, cx));
                         }
-                        if !s.messages.iter().any(|m| m.id == message.id) {
-                            s.messages.push(message);
-                        }
-                        if s.messages.len() > 1000 {
-                            s.messages.remove(0);
-                        }
+                        s.merge_message(true, message);
+                        s.trim_history(false);
                     }
                     Ok(_) => {}
-                    Err(e) if s.generation == generation => s.error = e,
-                    Err(_) => {}
+                    Err(e) => s.error = e,
                 }
                 cx.notify();
             });
@@ -1045,6 +1678,64 @@ impl Voxhold {
 /// `rgb` tokens are stored as `0xRRGGBB`; GPUI colors need alpha.
 fn ink(value: u32) -> gpui::Rgba {
     rgba((value << 8) | 0xff)
+}
+
+/// One icon from the shipped `assets/` directory. SVGs use `currentColor`, so
+/// the caller controls the tint through `text_color`.
+fn icon(resource: &'static str, size: f32, color: gpui::Rgba) -> AnyElement {
+    gpui::svg()
+        .path(resource)
+        .w(px(size))
+        .h(px(size))
+        .text_color(color)
+        .into_any_element()
+}
+
+fn channel_icon(kind: &str, color: gpui::Rgba) -> AnyElement {
+    let resource = match kind {
+        "voice" => "icons/volume.svg",
+        "news" => "icons/news.svg",
+        _ => "icons/hash.svg",
+    };
+    icon(resource, 15., color)
+}
+
+/// What a realtime event asks the controller to do next.
+#[derive(Default)]
+struct RealtimeEffect {
+    resync: bool,
+    access: bool,
+    server_removed: bool,
+}
+
+fn merge_revision(current: &mut Message, mut incoming: Message) {
+    let use_reactions = incoming.reactions_revision > 0
+        && incoming.reactions_revision >= current.reactions_revision;
+    if incoming.revision >= current.revision {
+        if !use_reactions {
+            incoming.reactions_revision = current.reactions_revision;
+            incoming.reactions = std::mem::take(&mut current.reactions);
+        }
+        *current = incoming;
+    } else if use_reactions {
+        current.reactions_revision = incoming.reactions_revision;
+        current.reactions = incoming.reactions;
+    }
+}
+
+fn apply_reactions(message: &mut Message, update: voxhold_api::ReactionsUpdate) {
+    if update.revision > message.reactions_revision {
+        message.reactions = update.reactions;
+        message.reactions_revision = update.revision;
+    }
+}
+
+fn component_theme_mode(light: bool) -> gpui_component::ThemeMode {
+    if light {
+        gpui_component::ThemeMode::Light
+    } else {
+        gpui_component::ThemeMode::Dark
+    }
 }
 
 impl Voxhold {
@@ -1062,14 +1753,34 @@ impl Voxhold {
         cx.notify();
     }
 
+    fn sync_system_theme(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.theme_mode == theme::ThemeMode::System {
+            let light = theme::system_light();
+            if light != self.system_light {
+                self.system_light = light;
+                self.palette = theme::Palette::resolve(self.theme_mode, light);
+                self.auth_background = None;
+                gpui_component::Theme::change(component_theme_mode(light), Some(window), cx);
+                window_chrome::set_theme(window, light);
+                cx.notify();
+            }
+        }
+    }
+
     fn toggle_theme(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let mode = self.theme_mode.toggled(self.system_light);
         self.apply_theme(mode, cx);
-        window_chrome::apply(window, self.palette.light);
+        gpui_component::Theme::change(component_theme_mode(self.palette.light), Some(window), cx);
+        window_chrome::set_theme(window, self.palette.light);
     }
 
     fn set_members_open(&mut self, open: bool, cx: &mut Context<Self>) {
         self.show_members = open;
+        if open {
+            self.load_channel_members(cx);
+        } else {
+            self.roster.loading.clear();
+        }
         self.shell.members_open = open;
         self.save_shell();
         cx.notify();
@@ -1125,6 +1836,8 @@ impl Voxhold {
             .bg(ink(p.field_bg))
             .border_1()
             .border_color(ink(p.field_border))
+            .flex()
+            .items_center()
             .capture_key_down(cx.listener(|s, event: &gpui::KeyDownEvent, window, cx| {
                 let key = &event.keystroke;
                 if key.key == "enter"
@@ -1144,11 +1857,17 @@ impl Voxhold {
                 }
             }))
             .child(
-                TextInput::new(entity)
-                    .text_size(px(if compact { 17. } else { 16. }))
-                    .font_family("Inter")
-                    .bordered(false)
-                    .h_full(),
+                // The wrapper owns the only background and border; the inner
+                // input stays transparent so no second plate appears.
+                div().w_full().px(px(14.)).child(
+                    TextInput::new(entity)
+                        .text_size(px(if compact { 17. } else { 16. }))
+                        .font_family("Inter")
+                        .text_color(ink(p.fg))
+                        .bg(gpui::transparent_black())
+                        .bordered(false)
+                        .h(px(rect.h - 2.0)),
+                ),
             )
             .into_any_element()
     }
@@ -1577,39 +2296,15 @@ impl Voxhold {
                 .text_size(px(16.))
                 .text_color(ink(p.toggle_ink))
                 .on_click(cx.listener(|s, _, window, cx| s.toggle_theme(window, cx)))
-                .child(if p.light {
-                    div()
-                        .relative()
-                        .w(px(14.))
-                        .h(px(14.))
-                        .child(
-                            div()
-                                .absolute()
-                                .left(px(0.))
-                                .top(px(0.))
-                                .w(px(14.))
-                                .h(px(14.))
-                                .rounded_full()
-                                .bg(ink(p.toggle_ink)),
-                        )
-                        .child(
-                            div()
-                                .absolute()
-                                .left(px(5.))
-                                .top(px(-3.))
-                                .w(px(14.))
-                                .h(px(14.))
-                                .rounded_full()
-                                .bg(ink(p.toggle_bg)),
-                        )
-                } else {
-                    div()
-                        .w(px(11.))
-                        .h(px(11.))
-                        .rounded_full()
-                        .border_2()
-                        .border_color(ink(p.toggle_ink))
-                }),
+                .child(icon(
+                    if p.light {
+                        "icons/moon.svg"
+                    } else {
+                        "icons/sun.svg"
+                    },
+                    16.,
+                    ink(p.toggle_ink),
+                )),
         );
         // Mobile brand above the card when the story column is hidden.
         if l.story == 0.0 {
@@ -1679,26 +2374,50 @@ impl Voxhold {
                 );
         } else {
             let font = (vw * 0.03).clamp(32.0, 42.0);
-            let mut card = div()
-                .absolute()
-                .left(px(inner.x))
-                .top(px(inner.y + 4.0))
-                .text_size(px(12.))
-                .font_weight(gpui::FontWeight::BOLD)
-                .text_color(ink(p.story_accent))
-                .child("ДОБРО ПОЖАЛОВАТЬ");
-            card = card.child(
-                div()
-                    .absolute()
-                    .left(px(inner.x))
-                    .top(px(inner.y + 34.0))
-                    .w(px(inner.w))
-                    .text_size(px(font))
-                    .font_weight(gpui::FontWeight::BOLD)
-                    .child("С возвращением"),
-            );
+            // Back to the address step. Kept above the card so it does not
+            // change the measured heading rows.
+            root = root
+                .child(
+                    div()
+                        .id("auth-back")
+                        .absolute()
+                        .left(px(l.card.x))
+                        .top(px((l.card.y - 28.0).max(8.0)))
+                        .cursor_pointer()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .text_size(px(12.))
+                        .text_color(ink(p.muted))
+                        .on_click(cx.listener(|s, _, window, cx| s.back_to_instance(window, cx)))
+                        .child(icon("icons/up.svg", 12., ink(p.muted)))
+                        .child("Назад"),
+                )
+                // Every label is positioned in client coordinates directly, not
+                // inside another absolutely positioned container.
+                .child(
+                    div()
+                        .absolute()
+                        .left(px(inner.x))
+                        .top(px(inner.y + 4.0))
+                        .w(px(inner.w))
+                        .text_size(px(12.))
+                        .font_weight(gpui::FontWeight::BOLD)
+                        .text_color(ink(p.story_accent))
+                        .child("ДОБРО ПОЖАЛОВАТЬ"),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .left(px(inner.x))
+                        .top(px(inner.y + 34.0))
+                        .w(px(inner.w))
+                        .text_size(px(font))
+                        .font_weight(gpui::FontWeight::BOLD)
+                        .child("С возвращением"),
+                );
             if inner.w < 330.0 {
-                card = card
+                root = root
                     .child(
                         div()
                             .absolute()
@@ -1720,7 +2439,7 @@ impl Voxhold {
                             .child("Voxhold."),
                     );
             } else {
-                card = card.child(
+                root = root.child(
                     div()
                         .absolute()
                         .left(px(inner.x))
@@ -1731,7 +2450,7 @@ impl Voxhold {
                         .child("Войдите в существующий аккаунт Voxhold."),
                 );
             }
-            card = card
+            root = root
                 .child(
                     div()
                         .absolute()
@@ -1765,7 +2484,6 @@ impl Voxhold {
                         .text_color(ink(p.muted))
                         .child("Продолжая, вы принимаете правила сообщества и политику конфиденциальности."),
                 );
-            root = root.child(card);
         }
         if instance {
             let field = self.instance.clone();
@@ -1823,7 +2541,7 @@ impl Voxhold {
 
     fn rail(&self, cx: &mut Context<Self>) -> AnyElement {
         let p = self.palette;
-        let mut rail = div()
+        let rail = div()
             .size_full()
             .flex()
             .flex_col()
@@ -1833,17 +2551,37 @@ impl Voxhold {
             .bg(ink(p.panel))
             .child(
                 div()
+                    .id("open-instance")
                     .w(px(39.))
                     .h(px(39.))
-                    .rounded(px(11.))
-                    .bg(ink(p.lime))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .text_size(px(20.))
-                    .font_weight(gpui::FontWeight::BOLD)
-                    .text_color(ink(0x10100f))
-                    .child("V"),
+                    .cursor_pointer()
+                    .on_click(cx.listener(|s, _, window, cx| {
+                        if s.servers.len() == 1 {
+                            let server = s.servers[0].id;
+                            s.open_server(server, window, cx);
+                        } else if !s.servers.is_empty() {
+                            s.show_servers = !s.show_servers;
+                            cx.notify();
+                        }
+                    }))
+                    .child(
+                        gpui::img("icons/brand.svg")
+                            .size_full()
+                            .with_fallback(move || {
+                                div()
+                                    .size_full()
+                                    .flex()
+                                    .justify_center()
+                                    .items_center()
+                                    .rounded(px(11.))
+                                    .bg(ink(p.lime))
+                                    .text_color(ink(0x151510))
+                                    .text_size(px(20.))
+                                    .font_weight(gpui::FontWeight::BOLD)
+                                    .child("V")
+                                    .into_any_element()
+                            }),
+                    ),
             )
             .child(
                 div()
@@ -1856,7 +2594,7 @@ impl Voxhold {
                     .items_center()
                     .justify_center()
                     .cursor_pointer()
-                    .child("ЛС")
+                    .child(icon("icons/inbox.svg", 18., ink(p.muted)))
                     .on_click(cx.listener(|s, _, window, cx| {
                         s.show_inbox = !s.show_inbox;
                         if s.show_inbox {
@@ -1867,27 +2605,6 @@ impl Voxhold {
                         cx.notify();
                     })),
             );
-        for server in &self.servers {
-            let id = server.id;
-            let active = id == self.server;
-            rail = rail.child(
-                div()
-                    .id(("server", id as u64))
-                    .w(px(48.))
-                    .h(px(48.))
-                    .rounded(px(14.))
-                    .cursor_pointer()
-                    .bg(if active { ink(p.lime) } else { ink(p.surface) })
-                    .text_color(if active { ink(0x10100f) } else { ink(p.fg) })
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .text_size(px(18.))
-                    .font_weight(gpui::FontWeight::BOLD)
-                    .on_click(cx.listener(move |s, _, w, cx| s.select_server(id, w, cx)))
-                    .child(server.name.chars().next().unwrap_or('?').to_string()),
-            );
-        }
         rail.child(div().flex_1())
             .child(
                 div()
@@ -1899,9 +2616,7 @@ impl Voxhold {
                     .items_center()
                     .justify_center()
                     .cursor_pointer()
-                    .text_size(px(10.))
-                    .text_color(ink(p.muted))
-                    .child("Настройки")
+                    .child(icon("icons/settings.svg", 18., ink(p.muted)))
                     .on_click(cx.listener(|s, _, _, cx| {
                         s.show_settings = !s.show_settings;
                         if s.show_settings {
@@ -1912,6 +2627,48 @@ impl Voxhold {
                         cx.notify();
                     })),
             )
+            .into_any_element()
+    }
+
+    fn open_server(&mut self, id: i64, window: &mut Window, cx: &mut Context<Self>) {
+        self.show_servers = false;
+        self.show_inbox = false;
+        self.show_settings = false;
+        if self.server != id || self.access_pending || self.channels.is_empty() {
+            self.select_server(id, window, cx);
+        }
+        cx.notify();
+    }
+
+    fn server_picker(&self, cx: &mut Context<Self>) -> AnyElement {
+        let p = self.palette;
+        div()
+            .id("server-picker")
+            .absolute()
+            .left(px(layout::RAIL_WIDTH))
+            .top(px(10.))
+            .w(px(230.))
+            .max_h(px(self.viewport.1 - 20.))
+            .overflow_y_scroll()
+            .occlude()
+            .p_2()
+            .rounded(px(10.))
+            .shadow_lg()
+            .bg(ink(p.surface))
+            .border_1()
+            .border_color(ink(p.line))
+            .children(self.servers.iter().map(|server| {
+                let id = server.id;
+                div()
+                    .id(("server-choice", id as u64))
+                    .p_2()
+                    .rounded(px(6.))
+                    .cursor_pointer()
+                    .when(id == self.server, |row| row.bg(ink(p.selection)))
+                    .hover(|row| row.bg(ink(p.selection)))
+                    .on_click(cx.listener(move |s, _, window, cx| s.open_server(id, window, cx)))
+                    .child(server.name.clone())
+            }))
             .into_any_element()
     }
 
@@ -1951,6 +2708,47 @@ impl Voxhold {
                     .child(name)
                     .child(div().text_size(px(12.)).text_color(ink(p.muted)).child("‹")),
             );
+        // Without the rail (narrow layout) the channels overlay is the only
+        // place to switch servers, so it carries the server strip.
+        if self.viewport.0 <= layout::MOBILE_MAX_WIDTH && self.servers.len() > 1 {
+            let mut strip = div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .px(px(12.))
+                .py(px(8.))
+                .border_b_1()
+                .border_color(ink(p.line));
+            for server in self.servers.clone() {
+                let id = server.id;
+                let active = id == self.server;
+                strip = strip.child(
+                    div()
+                        .id(("mobile-server", id as u64))
+                        .w(px(34.))
+                        .h(px(34.))
+                        .rounded(px(10.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .cursor_pointer()
+                        .bg(if active {
+                            ink(p.lime)
+                        } else {
+                            ink(p.selection)
+                        })
+                        .text_color(if active { ink(0x10100f) } else { ink(p.fg) })
+                        .font_weight(gpui::FontWeight::BOLD)
+                        .on_click(cx.listener(move |s, _, window, cx| {
+                            s.select_server(id, window, cx);
+                            s.show_channels = false;
+                            cx.notify();
+                        }))
+                        .child(server.name.chars().next().unwrap_or('?').to_string()),
+                );
+            }
+            panel = panel.child(strip);
+        }
         if owner {
             panel = panel.child(
                 div()
@@ -2017,6 +2815,7 @@ impl Voxhold {
                 let id = channel.id;
                 let active = id == self.channel;
                 let locked = channel.kind == "news" && !channel.writable() || !channel.readable();
+                let color = if active { ink(p.fg) } else { ink(p.muted) };
                 panel = panel.child(
                     div()
                         .id(("channel", id as u64))
@@ -2031,18 +2830,21 @@ impl Voxhold {
                         } else {
                             rgba(0x00000000)
                         })
-                        .text_color(if active { ink(p.fg) } else { ink(p.muted) })
-                        .child(format!(
-                            "{} {}",
-                            if channel.kind == "voice" {
-                                "●"
-                            } else if channel.kind == "news" {
-                                "◆"
-                            } else {
-                                "#"
-                            },
-                            channel.name
-                        ))
+                        .text_color(color)
+                        .child(channel_icon(&channel.kind, color))
+                        .child(
+                            div()
+                                .flex_1()
+                                .overflow_hidden()
+                                .text_size(px(14.))
+                                .child(channel.name.clone()),
+                        )
+                        .when(
+                            channel.access_restricted
+                                || channel.e2ee_required
+                                || !channel.readable(),
+                            |row| row.child(icon("icons/lock.svg", 12., ink(p.muted))),
+                        )
                         .when(locked, |row| row.text_color(ink(p.muted)))
                         .on_click(cx.listener(move |s, _, w, cx| s.select_channel(id, w, cx))),
                 );
@@ -2051,7 +2853,8 @@ impl Voxhold {
         panel = panel.child(div().flex_1());
         #[cfg(feature = "voxhold-media")]
         if let Some(voice) = &self.voice {
-            if self.channel == self.voice_channel && self.voice_channel != 0 {
+            if !self.access_pending && self.channel == self.voice_channel && self.voice_channel != 0
+            {
                 panel = panel.child(div().h(px(260.)).child(voice.clone()));
             }
         }
@@ -2084,14 +2887,15 @@ impl Voxhold {
                             .cursor_pointer()
                             .text_color(ink(p.muted))
                             .on_click(cx.listener(|s, _, window, cx| s.toggle_theme(window, cx)))
-                            .child(
-                                div()
-                                    .w(px(11.))
-                                    .h(px(11.))
-                                    .rounded_full()
-                                    .border_2()
-                                    .border_color(ink(p.muted)),
-                            ),
+                            .child(icon(
+                                if p.light {
+                                    "icons/moon.svg"
+                                } else {
+                                    "icons/sun.svg"
+                                },
+                                15.,
+                                ink(p.muted),
+                            )),
                     )
                     .child(
                         div()
@@ -2105,93 +2909,10 @@ impl Voxhold {
                             .cursor_pointer()
                             .text_color(ink(p.muted))
                             .on_click(cx.listener(|s, _, w, cx| s.logout(w, cx)))
-                            .child(div().text_size(px(9.)).child("Выход")),
+                            .child(icon("icons/logout.svg", 15., ink(p.muted))),
                     ),
             )
             .into_any_element()
-    }
-
-    fn members_panel(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let p = self.palette;
-        let mut panel = div()
-            .size_full()
-            .flex()
-            .flex_col()
-            .bg(ink(p.panel))
-            .border_l_1()
-            .border_color(ink(p.line))
-            .child(
-                div()
-                    .h(px(67.))
-                    .px(px(16.))
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .text_size(px(14.))
-                    .font_weight(gpui::FontWeight::BOLD)
-                    .child("Участники")
-                    .child(
-                        div()
-                            .id("members-close")
-                            .cursor_pointer()
-                            .text_size(px(13.))
-                            .text_color(ink(p.muted))
-                            .on_click(cx.listener(|s, _, _, cx| s.set_members_open(false, cx)))
-                            .child("×"),
-                    ),
-            );
-        let online: Vec<(i64, String)> = self
-            .members
-            .iter()
-            .map(|m| (m.user_id, m.username.clone()))
-            .collect();
-        panel = panel.child(
-            div()
-                .px(px(16.))
-                .pt(px(10.))
-                .pb(px(4.))
-                .text_size(px(10.))
-                .font_weight(gpui::FontWeight::BOLD)
-                .text_color(ink(p.muted))
-                .child(format!("В СЕТИ — {}", online.len())),
-        );
-        for (id, name) in online {
-            panel = panel.child(
-                div()
-                    .id(("member", id as u64))
-                    .h(px(72.))
-                    .px(px(14.))
-                    .flex()
-                    .items_center()
-                    .gap_3()
-                    .child(
-                        div()
-                            .w(px(40.))
-                            .h(px(40.))
-                            .rounded_full()
-                            .bg(ink(p.selection))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .text_size(px(15.))
-                            .font_weight(gpui::FontWeight::BOLD)
-                            .child(name.chars().next().unwrap_or('?').to_string()),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .child(div().text_size(px(14.)).child(name))
-                            .child(
-                                div()
-                                    .text_size(px(12.))
-                                    .text_color(ink(p.muted))
-                                    .child("В сети"),
-                            ),
-                    ),
-            );
-        }
-        panel.child(div().flex_1()).into_any_element()
     }
 }
 
@@ -2207,7 +2928,7 @@ impl Render for Voxhold {
             .font_family("Inter")
             .bg(ink(p.bg))
             .text_color(ink(p.fg))
-            .capture_key_down(cx.listener(|s, event: &gpui::KeyDownEvent, _, cx| {
+            .capture_key_down(cx.listener(|s, event: &gpui::KeyDownEvent, window, cx| {
                 match event.keystroke.key.as_str() {
                     "escape" => {
                         s.show_search = false;
@@ -2217,11 +2938,16 @@ impl Render for Voxhold {
                         s.show_server_settings = false;
                         s.show_inbox = false;
                         s.show_channels = false;
+                        s.show_servers = false;
                         cx.notify();
                         cx.stop_propagation();
                     }
                     "f5" if s.client.is_some() => {
-                        s.refresh_history(cx);
+                        if s.access_pending {
+                            s.invalidate_access(window, cx);
+                        } else {
+                            s.refresh_history(window, cx);
+                        }
                         cx.stop_propagation();
                     }
                     _ => {}
@@ -2274,7 +3000,11 @@ impl Render for Voxhold {
                 window.on_next_frame(move |window, cx| {
                     if let Some(view) = weak.upgrade() {
                         view.update(cx, |s, cx| {
-                            let entity = s.instance.clone();
+                            let entity = if s.auth.is_instance() {
+                                s.instance.clone()
+                            } else {
+                                s.username.clone()
+                            };
                             entity.update(cx, |input, cx| input.focus(window, cx));
                         });
                     }
@@ -2292,6 +3022,7 @@ impl Render for Voxhold {
             // Go hides the members drawer on first creation for narrow windows;
             // the saved value is kept for the next wide start.
             self.show_members = self.shell.members_open && vw > layout::COMPACT_MAX_WIDTH;
+            self.load_channel_members(cx);
         }
         let mobile = vw <= layout::MOBILE_MAX_WIDTH;
         let channels_open = !mobile || self.show_channels;
@@ -2343,8 +3074,8 @@ impl Render for Voxhold {
             }
         }
         let selected = self.channels.iter().find(|c| c.id == self.channel).cloned();
-        let readable = selected.as_ref().is_some_and(|c| c.has_history());
-        let writable = selected.as_ref().is_some_and(|c| c.writable());
+        let readable = !self.access_pending && selected.as_ref().is_some_and(|c| c.has_history());
+        let writable = !self.access_pending && selected.as_ref().is_some_and(|c| c.writable());
         let role = self
             .servers
             .iter()
@@ -2390,12 +3121,17 @@ impl Render for Voxhold {
             })
             .collect();
         let weak = cx.entity().downgrade();
+        self.painted_read = Default::default();
+        let painted_read = self.painted_read.clone();
         let history_list = list(self.history_list.clone(), move |index, _, _| {
             let (message, permissions, status) = rows[index].clone();
+            let id = message.id;
+            let painted_read = painted_read.clone();
             let selected_message = message.clone();
             let weak = weak.clone();
             div()
                 .id(("message", message.id as u64))
+                .relative()
                 .px_4()
                 .py_2()
                 .cursor_pointer()
@@ -2436,39 +3172,84 @@ impl Render for Voxhold {
                         .text_color(ink(p.muted))
                         .child(status),
                 )
+                .child(
+                    gpui::canvas(
+                        |_, _, _| (),
+                        move |bounds, (), window, _| {
+                            if bounds.intersects(&window.content_mask().bounds) {
+                                painted_read.set(painted_read.get().max(id));
+                            }
+                        },
+                    )
+                    .absolute()
+                    .size_full()
+                    .top_0()
+                    .left_0(),
+                )
                 .into_any_element()
         })
         .flex_1();
         let mut history = div().flex_1().flex().flex_col().min_h(px(0.));
         if self.has_more {
+            let retry_in = self
+                .older_retry_at
+                .map(|at| {
+                    let remaining = at.saturating_duration_since(std::time::Instant::now());
+                    remaining.as_secs() + u64::from(remaining.subsec_nanos() > 0)
+                })
+                .unwrap_or(0);
+            let label = if self.loading_older {
+                "Загрузка…".to_string()
+            } else if retry_in > 0 {
+                format!("Повторить через {retry_in} с")
+            } else if !self.older_error.is_empty() {
+                "Повторить".to_string()
+            } else {
+                "Загрузить предыдущие сообщения".to_string()
+            };
             history = history.child(
                 div()
                     .id("older")
                     .p_2()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
                     .cursor_pointer()
                     .text_size(px(12.))
                     .text_color(ink(p.muted))
-                    .on_click(cx.listener(|s, _, _, cx| s.load_older(cx)))
-                    .child(if self.loading_older {
-                        "Загрузка…"
-                    } else {
-                        "Загрузить предыдущие сообщения"
+                    .on_click(cx.listener(|s, _, window, cx| s.load_older(window, cx)))
+                    .child(label)
+                    .when(!self.older_error.is_empty(), |row| {
+                        row.child(
+                            div()
+                                .text_size(px(11.))
+                                .text_color(ink(p.danger))
+                                .child(self.older_error.clone()),
+                        )
                     }),
             );
         }
         history = history.child(history_list);
-        if !self.messages.is_empty() {
-            let weak = cx.entity().downgrade();
-            window.on_next_frame(move |window, cx| {
-                if let Some(view) = weak.upgrade() {
-                    view.update(cx, |s, cx| {
-                        if s.history_list.viewport_bounds().size.height > px(0.) {
-                            let range = s.visible_history_range();
-                            s.mark_visible_read(range, window, cx);
-                        }
-                    });
-                }
-            });
+        if self.history_has_newer {
+            history = history.child(
+                div()
+                    .id("history-latest")
+                    .p_2()
+                    .cursor_pointer()
+                    .text_size(px(12.))
+                    .text_color(ink(p.muted))
+                    .child("К последним")
+                    .on_click(cx.listener(|s, _, window, cx| {
+                        s.history_list.scroll_to(gpui::ListOffset {
+                            item_ix: s.history_list.item_count(),
+                            offset_in_item: px(0.),
+                        });
+                        s.refresh_history(window, cx);
+                    })),
+            );
+        }
+        if readable && !self.messages.is_empty() && !self.read_pending && !self.read_scheduled {
+            self.schedule_visible_read(window, cx);
         }
         let title = selected
             .as_ref()
@@ -2487,6 +3268,7 @@ impl Render for Voxhold {
             })
             .unwrap_or("");
         let mut chat = div().relative().size_full().flex().flex_col().bg(ink(p.bg));
+        let show_labels = l.chat.w > 860.0 && !mobile;
         let header = div()
             .h(px(if mobile { 58. } else { 67. }))
             .px(px(16.))
@@ -2511,7 +3293,7 @@ impl Render for Voxhold {
                                     s.show_channels = !s.show_channels;
                                     cx.notify();
                                 }))
-                                .child(div().text_size(px(11.)).child("Меню")),
+                                .child(icon("icons/menu.svg", 18., ink(p.muted))),
                         )
                     })
                     .child(
@@ -2531,26 +3313,48 @@ impl Render for Voxhold {
                     .child(
                         div()
                             .id("toggle-search")
+                            .flex()
+                            .items_center()
+                            .gap_2()
                             .cursor_pointer()
                             .on_click(cx.listener(|s, _, _, cx| {
                                 s.show_search = !s.show_search;
                                 cx.notify();
                             }))
-                            .child("Поиск"),
+                            .child(icon("icons/search.svg", 16., ink(p.muted)))
+                            .when(show_labels, |button| button.child("Поиск")),
                     )
                     .child(
                         div()
                             .id("members-toggle")
+                            .flex()
+                            .items_center()
+                            .gap_2()
                             .cursor_pointer()
                             .on_click(cx.listener(|s, _, _, cx| {
                                 let open = !s.show_members;
                                 s.set_members_open(open, cx);
                             }))
-                            .child("Участники"),
+                            .child(icon("icons/people.svg", 16., ink(p.muted)))
+                            .when(show_labels, |button| button.child("Участники")),
                     ),
             );
         chat = chat.child(header);
         chat = chat.child(history);
+        if self.access_pending {
+            let status = div().p_2().text_color(ink(p.muted));
+            chat = chat.child(if self.access_reload_in_flight {
+                status.child("Проверяем доступ…")
+            } else {
+                status.child(
+                    div()
+                        .id("retry-channel-access")
+                        .cursor_pointer()
+                        .child("Повторить проверку доступа")
+                        .on_click(cx.listener(|s, _, window, cx| s.invalidate_access(window, cx))),
+                )
+            });
+        }
         if !explanation.is_empty() {
             chat = chat.child(
                 div()
@@ -2571,8 +3375,10 @@ impl Render for Voxhold {
                     .child(self.error.clone()),
             );
         }
-        if let Some(attachments) = &self.attachments {
-            chat = chat.child(attachments.clone());
+        if readable {
+            if let Some(attachments) = &self.attachments {
+                chat = chat.child(attachments.clone());
+            }
         }
         if writable {
             chat = chat.child(
@@ -2610,7 +3416,7 @@ impl Render for Voxhold {
                     .child(
                         div()
                             .id("send")
-                            .w(px(98.))
+                            .w(px(112.))
                             .h(px(40.))
                             .rounded(px(11.))
                             .bg(ink(p.lime))
@@ -2620,8 +3426,10 @@ impl Render for Voxhold {
                             .flex()
                             .items_center()
                             .justify_center()
+                            .gap_2()
                             .cursor_pointer()
                             .on_click(cx.listener(|s, _, w, cx| s.send(w, cx)))
+                            .child(icon("icons/send.svg", 16., ink(0x10100f)))
                             .child("Отправить"),
                     ),
             );
@@ -2652,7 +3460,7 @@ impl Render for Voxhold {
             }
         }
         #[cfg(feature = "voxhold-media")]
-        if self.channel == self.voice_channel && self.voice_channel != 0 {
+        if !self.access_pending && self.channel == self.voice_channel && self.voice_channel != 0 {
             if let Some(voice) = &self.voice {
                 chat = chat.child(div().h(px(400.)).child(voice.clone()));
             }
@@ -2840,7 +3648,7 @@ impl Render for Voxhold {
                     .top(px(l.members.y))
                     .w(px(l.members.w))
                     .h(px(l.members.h))
-                    .child(self.members_panel(cx)),
+                    .child(self.members_panel(window, cx)),
             );
         }
         // Splitter handles sit 6 px before the panel edge with a 13 px hitbox.
@@ -2892,6 +3700,9 @@ impl Render for Voxhold {
                     ),
             );
         }
+        if !mobile && self.show_servers {
+            root = root.child(self.server_picker(cx));
+        }
         root.into_any_element()
     }
 }
@@ -2932,35 +3743,37 @@ fn parse_args() -> (String, Option<std::path::PathBuf>, f32, f32) {
 
 fn main() {
     let (server, layout_path, width, height) = parse_args();
-    Application::new().run(move |cx: &mut App| {
-        gpui_component::init(cx);
-        let fonts: Vec<std::borrow::Cow<'static, [u8]>> = vec![
-            std::borrow::Cow::Borrowed(include_bytes!("../assets/fonts/Inter-Regular.ttf")),
-            std::borrow::Cow::Borrowed(include_bytes!("../assets/fonts/Inter-Bold.ttf")),
-        ];
-        let _ = cx.text_system().add_fonts(fonts);
-        let bounds = Bounds::centered(None, size(px(width), px(height)), cx);
-        let prefill = server.clone();
-        let layout_path = layout_path.clone();
-        cx.open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                titlebar: Some(gpui::TitlebarOptions {
-                    title: Some("Voxhold".into()),
-                    appears_transparent: false,
-                    traffic_light_position: None,
-                }),
-                window_min_size: Some(size(px(320.), px(360.))),
-                ..Default::default()
-            },
-            move |window, cx| {
-                let view = cx.new(|cx| Voxhold::new(window, cx, &prefill, layout_path.clone()));
-                cx.new(|cx| Root::new(view.into(), window, cx))
-            },
-        )
-        .expect("failed to open window");
-        cx.activate(true);
-    });
+    Application::new()
+        .with_assets(assets::Assets::discover())
+        .run(move |cx: &mut App| {
+            gpui_component::init(cx);
+            let fonts: Vec<std::borrow::Cow<'static, [u8]>> = vec![
+                std::borrow::Cow::Borrowed(include_bytes!("../assets/fonts/Inter-Regular.ttf")),
+                std::borrow::Cow::Borrowed(include_bytes!("../assets/fonts/Inter-Bold.ttf")),
+            ];
+            let _ = cx.text_system().add_fonts(fonts);
+            let bounds = Bounds::centered(None, size(px(width), px(height)), cx);
+            let prefill = server.clone();
+            let layout_path = layout_path.clone();
+            cx.open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    titlebar: Some(gpui::TitlebarOptions {
+                        title: Some("Voxhold".into()),
+                        appears_transparent: false,
+                        traffic_light_position: None,
+                    }),
+                    window_min_size: Some(size(px(320.), px(360.))),
+                    ..Default::default()
+                },
+                move |window, cx| {
+                    let view = cx.new(|cx| Voxhold::new(window, cx, &prefill, layout_path.clone()));
+                    cx.new(|cx| Root::new(view.into(), window, cx))
+                },
+            )
+            .expect("failed to open window");
+            cx.activate(true);
+        });
 }
 
 #[cfg(test)]
@@ -3088,6 +3901,20 @@ mod ui_tests {
     }
 
     fn message_json(id: i64, revision: i64, content: &str) -> serde_json::Value {
+        message_json_with_reactions(id, revision, content, 0)
+    }
+
+    fn message_json_with_reactions(
+        id: i64,
+        revision: i64,
+        content: &str,
+        reactions_revision: i64,
+    ) -> serde_json::Value {
+        let reactions = if reactions_revision > 0 {
+            serde_json::json!([{"emoji": "❤️", "count": 1, "me": false}])
+        } else {
+            serde_json::json!([])
+        };
         serde_json::json!({
             "id": id,
             "channel_id": 7,
@@ -3098,15 +3925,16 @@ mod ui_tests {
             "revision": revision,
             "comment_count": 0,
             "client_message_id": "",
-            "reactions": [],
-            "reactions_revision": 0,
+            "reactions": reactions,
+            "reactions_revision": reactions_revision,
             "attachments": [],
             "poll": null
         })
     }
 
     /// Regression for the R02 merge policy: a stale revision cannot overwrite a
-    /// confirmed row, and a deleted id never comes back from a late event.
+    /// confirmed row, a deleted id never comes back from a late event and an
+    /// edit that omits `reactions` keeps the confirmed reaction revision.
     #[gpui::test]
     async fn realtime_merge_keeps_revisions_and_tombstones(cx: &mut TestAppContext) {
         cx.update(|cx| gpui_component::init(cx));
@@ -3114,13 +3942,20 @@ mod ui_tests {
         cx.update(|app| {
             view.update(app, |v, _| {
                 v.channel = 7;
-                v.apply_realtime_event("message.created", &message_json(2, 5, "confirmed"));
+                v.apply_realtime_event(
+                    "message.created",
+                    &message_json_with_reactions(2, 5, "confirmed", 6),
+                );
                 v.apply_realtime_event("message.created", &message_json(2, 4, "stale"));
                 assert_eq!(v.messages.len(), 1);
                 assert_eq!(v.messages[0].content, "confirmed");
+                assert_eq!(v.messages[0].reactions_revision, 6);
 
+                // Backend `message.updated` omits reactions.
                 v.apply_realtime_event("message.updated", &message_json(2, 6, "edited"));
                 assert_eq!(v.messages[0].content, "edited");
+                assert_eq!(v.messages[0].reactions.len(), 1);
+                assert_eq!(v.messages[0].reactions_revision, 6);
 
                 v.apply_realtime_event(
                     "message.deleted",
@@ -3135,7 +3970,148 @@ mod ui_tests {
                 v.apply_realtime_event("message.created", &message_json(3, 1, "next"));
                 assert_eq!(v.messages.len(), 1);
                 assert_eq!(v.messages[0].id, 3);
+
+                v.server = 1;
+                let effect = v
+                    .apply_realtime_event("channels.changed", &serde_json::json!({"server_id": 1}));
+                assert!(effect.access, "an access event must invalidate the scope");
             });
         });
+    }
+
+    /// A confirmed message must disappear as soon as the access scope changes,
+    /// before any new HTTP answer arrives.
+    #[gpui::test]
+    async fn access_change_hides_confirmed_history(cx: &mut TestAppContext) {
+        cx.update(|cx| gpui_component::init(cx));
+        let (window, view) = add_auth_window(cx);
+        let mut visual = VisualTestContext::from_window(window.into(), cx);
+        visual.update(|window, app| {
+            view.update(app, |v, cx| {
+                v.server = 1;
+                v.channel = 7;
+                v.apply_realtime_event("message.created", &message_json(4, 1, "private"));
+                assert_eq!(v.messages.len(), 1);
+                let before = v.access_generation;
+                v.invalidate_access(window, cx);
+                assert!(v.messages.is_empty());
+                assert!(v.history_keys.is_empty());
+                assert_eq!(v.access_generation, before + 1);
+                assert!(!v.show_tools && !v.show_search);
+            });
+        });
+    }
+
+    #[gpui::test]
+    async fn snapshot_keeps_newer_ws_state_and_discards_absent_old_rows(cx: &mut TestAppContext) {
+        cx.update(|cx| gpui_component::init(cx));
+        let (_window, view) = add_auth_window(cx);
+        cx.update(|app| {
+            view.update(app, |v, _| {
+                v.channel = 7;
+                let dto = |id, revision, text, reactions| {
+                    serde_json::from_value::<Message>(message_json_with_reactions(
+                        id, revision, text, reactions,
+                    ))
+                    .unwrap()
+                };
+                v.merge_message(true, dto(1, 2, "absent from snapshot", 0));
+                v.merge_message(true, dto(2, 12, "edit from WS", 18));
+                v.merge_message(false, dto(3, 16, "edit before first page", 0));
+                v.merge_message(true, dto(6, 1, "deleted while offline", 0));
+                v.refresh_request = Some(1);
+                v.merge_message(true, dto(7, 17, "new WS row", 0));
+                v.apply_realtime_event(
+                    "message.deleted",
+                    &serde_json::json!({"channel_id":7,"message_id":4}),
+                );
+                let pending = std::mem::take(&mut v.refresh_new_ids);
+                v.apply_history_snapshot(
+                    voxhold_api::MessagePage {
+                        messages: vec![
+                            dto(2, 11, "old body", 19),
+                            dto(3, 10, "old row", 0),
+                            dto(4, 10, "late deleted", 0),
+                        ],
+                        pagination: voxhold_api::Pagination {
+                            next_before_id: Some(2),
+                            has_more: true,
+                        },
+                    },
+                    pending,
+                );
+                assert_eq!(
+                    v.messages.iter().map(|row| row.id).collect::<Vec<_>>(),
+                    [2, 3, 7]
+                );
+                assert_eq!(v.messages[0].content, "edit from WS");
+                assert_eq!(v.messages[0].reactions_revision, 19);
+                assert_eq!(v.messages[1].content, "edit before first page");
+            })
+        });
+    }
+
+    #[gpui::test]
+    async fn painted_history_at_tail_reports_latest_row(cx: &mut TestAppContext) {
+        cx.update(|cx| gpui_component::init(cx));
+        let (window, view) = add_auth_window(cx);
+        let mut visual = VisualTestContext::from_window(window.into(), cx);
+        visual.update(|window, app| {
+            view.update(app, |v, cx| {
+                v.client = Some(Client::new("http://127.0.0.1:1").unwrap());
+                v.server = 1;
+                v.channel = 7;
+                v.channels.push(Channel {
+                    id: 7,
+                    kind: "text".into(),
+                    permissions: 1,
+                    ..Default::default()
+                });
+                for id in 1..=50 {
+                    v.apply_realtime_event("message.created", &message_json(id, id, "row"));
+                }
+                cx.notify();
+            });
+            window.draw(app).clear();
+        });
+        let painted = view.read_with(&*visual, |v, _| v.painted_read.get());
+        assert_eq!(painted, 50);
+    }
+
+    #[gpui::test]
+    async fn presence_snapshot_and_changes_stay_in_the_current_server(cx: &mut TestAppContext) {
+        cx.update(|cx| gpui_component::init(cx));
+        let (_window, view) = add_auth_window(cx);
+        cx.update(|app| view.update(app, |v, _| {
+            v.server = 7;
+            v.apply_realtime_event("presence.snapshot", &serde_json::json!({
+                "servers": [
+                    {"server_id": 7, "online_user_ids": [2,3]},
+                    {"server_id": 8, "online_user_ids": [4]}
+                ]
+            }));
+            v.apply_realtime_event("presence.updated", &serde_json::json!({"server_id":7,"user_id":2,"status":"offline","last_seen_at":42}));
+            v.apply_realtime_event("presence.updated", &serde_json::json!({"server_id":8,"user_id":5,"status":"online"}));
+            assert_eq!(v.online_by_server[&7], [3].into_iter().collect());
+            assert_eq!(v.online_by_server[&8], [4, 5].into_iter().collect());
+            assert_eq!(v.roster.last_seen.get(&2), Some(&42));
+        }));
+    }
+
+    #[test]
+    fn history_retry_delay_matches_go() {
+        use std::time::Duration;
+        assert_eq!(
+            Voxhold::history_retry_delay(&voxhold_api::Error::Http(429)),
+            Duration::from_secs(20)
+        );
+        assert_eq!(
+            Voxhold::history_retry_delay(&voxhold_api::Error::Http(503)),
+            Duration::from_secs(8)
+        );
+        assert_eq!(
+            Voxhold::history_retry_delay(&voxhold_api::Error::Network),
+            Duration::from_secs(3)
+        );
     }
 }

@@ -34,6 +34,6 @@
 | `cargo test --workspace --locked` | пройдено (API 4, media 6, приложение 34) |
 | Release-сборка | выполнена, EXE GUI-subsystem |
 | GitHub Actions | workflow обновлён на workspace check и test; прогон не снят |
-| Изолированный backend | не поднят |
+| Изолированный backend | поднят в follow-up PR #6: миграции 1–41, `/readyz`, вход, история, аватар; полный GUI-сценарий нет |
 | Замеры памяти и FPS | не выполнены |
 | Кадры Go/Rust | частично: auth-экран Rust снят на 1280×900 в `R01` |

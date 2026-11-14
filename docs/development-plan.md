@@ -884,7 +884,7 @@ http_active,thumb_bytes,link_bytes,recording_bytes,workers,peers,live_textures
 
 ## 7. Журнал выполнения и сдача
 
-Сценарии исправлений после merge [PR #2–#4](review-r00-r02.md) проверены на `dev` `6213379`. Начни с падения автодогрузки, завершения сессии, отзыва доступа и исправлений формы входа.
+Сценарии исправлений после merge [PR #2–#4](review-r00-r02.md) и сами исправления влиты в `dev` через PR [#5](https://github.com/LoonEman1/voxhold-native-rust/pull/5) и [#6](https://github.com/LoonEman1/voxhold-native-rust/pull/6), итоговый коммит `ef72a63`. Следующие срезы: `R01a` (каталог эмодзи) и детальная вёрстка ленты `R02`.
 
 ### Статусы плана
 
@@ -893,10 +893,10 @@ http_active,thumb_bytes,link_bytes,recording_bytes,workers,peers,live_textures
 | Задание | Статус | PR или коммит в `dev` | Выпуск в `main` |
 | --- | --- | --- | --- |
 | Начальный снимок Rust | Опубликован | [`3500e96`](https://github.com/LoonEman1/voxhold-native-rust/commit/3500e961ca5e9f05ec2b03e89084351a5902c8ac) | Тот же исходный снимок |
-| `R00` | Первый срез в dev · PR [#2](https://github.com/LoonEman1/voxhold-native-rust/pull/2) | [`03745b1`](https://github.com/LoonEman1/voxhold-native-rust/commit/03745b11139adfd51834d5b1a2c2a26f48ed4d12), остаются стенд, seed и замеры | — |
-| `R01` | Первый срез в dev · PR [#3](https://github.com/LoonEman1/voxhold-native-rust/pull/3) | [`4fdd645`](https://github.com/LoonEman1/voxhold-native-rust/commit/4fdd64589d8a65637626c581652b41744337ed74), исправления и кадры по итогам ревью | — |
-| `R01a` | К выполнению | — | — |
-| `R02` | Первый срез в dev · PR [#4](https://github.com/LoonEman1/voxhold-native-rust/pull/4) | [`6213379`](https://github.com/LoonEman1/voxhold-native-rust/commit/62133794e5428a262f15f7b4591e8f11d0be4ff1), исправления и стенд по итогам ревью | — |
+| `R00` | Первый срез в dev · PR [#2](https://github.com/LoonEman1/voxhold-native-rust/pull/2) | [`03745b1`](https://github.com/LoonEman1/voxhold-native-rust/commit/03745b11139adfd51834d5b1a2c2a26f48ed4d12); остаются стенд, seed, release-прогон и замеры | — |
+| `R01` | Первый срез и ревью в dev · PR [#3](https://github.com/LoonEman1/voxhold-native-rust/pull/3), [#6](https://github.com/LoonEman1/voxhold-native-rust/pull/6) | [`ef72a63`](https://github.com/LoonEman1/voxhold-native-rust/commit/ef72a63) (включает исправления #6 и аватары/присутствие); визуальные пары с Go не сняты | — |
+| `R01a` | В работе | Пикер и каталог эмодзи ещё не перенесены; SVG подключены, `AssetSource` есть | — |
+| `R02` | Первый срез и ревью в dev · PR [#4](https://github.com/LoonEman1/voxhold-native-rust/pull/4), [#6](https://github.com/LoonEman1/voxhold-native-rust/pull/6) | [`ef72a63`](https://github.com/LoonEman1/voxhold-native-rust/commit/ef72a63) (merge/access/read/backoff); реальный стенд и детальная вёрстка ленты впереди | — |
 | `R03` | К выполнению | — | — |
 | `R04` | К выполнению | — | — |
 | `R05` | К выполнению | — | — |

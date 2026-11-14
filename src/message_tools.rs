@@ -18,6 +18,7 @@ pub struct MessageTools {
     destination: Entity<InputState>,
     picker: Entity<ReactionPicker>,
     recents: SharedRecents,
+    on_reaction: Option<Box<dyn Fn(ReactionsUpdate, &mut gpui::App) + 'static>>,
     comments: Vec<Message>,
     error: String,
     busy: bool,
@@ -59,6 +60,7 @@ impl MessageTools {
                 .new(|cx| InputState::new(window, cx).placeholder("ID канала для пересылки")),
             picker,
             recents,
+            on_reaction: None,
             comments: Vec::new(),
             error: String::new(),
             busy: false,
@@ -106,6 +108,12 @@ impl MessageTools {
     }
     pub fn selected_id(&self) -> Option<i64> {
         self.message.as_ref().map(|message| message.id)
+    }
+    pub(crate) fn set_reaction_handler(
+        &mut self,
+        handler: Option<Box<dyn Fn(ReactionsUpdate, &mut gpui::App) + 'static>>,
+    ) {
+        self.on_reaction = handler;
     }
     /// Keep the open panel aligned with a row confirmed by history or a
     /// realtime event. Revision rules stay in the same place as the feed.
@@ -159,7 +167,7 @@ impl MessageTools {
         })
     }
     /// `true` means the next request is PUT, `false` means DELETE.
-    fn reaction_request_active(&self, emoji: &str) -> bool {
+    pub(crate) fn reaction_request_active(&self, emoji: &str) -> bool {
         !self.reaction_is_active(emoji)
     }
     /// Apply the confirmed server update; a stale or wrong-row answer keeps the
@@ -175,6 +183,26 @@ impl MessageTools {
         message.reactions_revision = update.revision;
         self.sync_picker(cx);
         cx.notify();
+        true
+    }
+    /// A confirmed reaction applies to the panel and to the shared history row,
+    /// but it is not a history edit and must not trigger a full reload.
+    pub(crate) fn handle_reaction_result(
+        &mut self,
+        update: ReactionsUpdate,
+        emoji: &str,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let parent_update = update.clone();
+        if !self.apply_reaction_update(update, cx) {
+            return false;
+        }
+        if self.reaction_is_active(emoji) {
+            reactions::touch_recent(&mut self.recents.borrow_mut(), emoji);
+        }
+        if let Some(handler) = &self.on_reaction {
+            handler(parent_update, cx);
+        }
         true
     }
     pub fn react_with(&mut self, value: &str, cx: &mut Context<Self>) {
@@ -230,8 +258,6 @@ impl MessageTools {
         let runtime = self.runtime.clone();
         let server = self.server;
         let channel = self.channel;
-        let picker = self.picker.clone();
-        let recents = self.recents.clone();
         let react_value = emoji.clone();
         let react_active = self.reaction_request_active(&emoji);
         // A stable random client key is generated before invoking idempotent endpoints.
@@ -294,17 +320,9 @@ impl MessageTools {
                     match result {
                         Ok(ActionResult::Comments(comments)) => s.comments = comments,
                         Ok(ActionResult::Reactions(update)) => {
-                            if s.apply_reaction_update(update, cx) {
-                                let added = s.reaction_is_active(&react_value);
-                                if added {
-                                    reactions::touch_recent(
-                                        &mut recents.borrow_mut(),
-                                        &react_value,
-                                    );
-                                }
-                                picker.update(cx, |_, cx| cx.notify());
-                                s.revision += 1;
-                            }
+                            // Keep the selected row and picker; do not bump
+                            // `revision`, which reloads the newest page.
+                            s.handle_reaction_result(update, &react_value, cx);
                         }
                         Ok(ActionResult::Done) => s.revision += 1,
                         Err(e) => s.error = e,

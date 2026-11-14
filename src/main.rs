@@ -589,6 +589,17 @@ impl Voxhold {
                 cx,
             )
         });
+        let weak_view = cx.entity().downgrade();
+        tools.update(cx, |tools, _| {
+            tools.set_reaction_handler(Some(Box::new(move |update, cx| {
+                if let Some(view) = weak_view.upgrade() {
+                    view.update(cx, |view, cx| {
+                        view.apply_reaction_update(update);
+                        cx.notify();
+                    });
+                }
+            })));
+        });
         cx.observe_in(&tools, window, |this, tools, window, cx| {
             let revision = tools.read(cx).revision();
             if revision != this.tools_revision {
@@ -1510,24 +1521,7 @@ impl Voxhold {
                     }
                     match result {
                         Ok(update) => {
-                            let deleted = s.deleted_ids.contains(&update.message_id);
-                            if update.channel_id == channel && !deleted && update.revision > 0 {
-                                if let Some(message) = s
-                                    .messages
-                                    .iter_mut()
-                                    .find(|message| message.id == update.message_id)
-                                {
-                                    apply_reactions(message, update);
-                                } else if s.pending_reactions.len() < 128 {
-                                    let entry = s
-                                        .pending_reactions
-                                        .entry(update.message_id)
-                                        .or_insert_with(|| update.clone());
-                                    if update.revision > entry.revision {
-                                        *entry = update;
-                                    }
-                                }
-                            }
+                            s.apply_reaction_update(update);
                             if !active {
                                 reactions::touch_recent(&mut recent.borrow_mut(), &key.1);
                             }
@@ -1582,12 +1576,7 @@ impl Voxhold {
             let result = task.await;
             if let Some(this) = this.upgrade() {
                 this.update(cx, |s, cx| {
-                    if s.context_request != Some(request)
-                        || s.generation != generation
-                        || s.access_generation != access
-                        || s.server != server
-                        || s.channel != channel
-                    {
+                    if !s.accepts_context_reply(request, generation, access, server, channel) {
                         return;
                     }
                     s.context_request = None;
@@ -1696,6 +1685,58 @@ impl Voxhold {
             && self.before == Some(before)
             && self.server == server
             && self.channel == channel
+    }
+
+    fn accepts_context_reply(
+        &self,
+        request: u64,
+        generation: u64,
+        access: u64,
+        server: i64,
+        channel: i64,
+    ) -> bool {
+        self.context_request == Some(request)
+            && self.generation == generation
+            && self.access_generation == access
+            && self.server == server
+            && self.channel == channel
+    }
+
+    /// "К последним" owns the next window. A late `/context` answer must not
+    /// reopen the older window after this reset.
+    fn reset_for_latest(&mut self) {
+        self.context_request = None;
+        self.pending_jump = None;
+        self.history_reset_pending = true;
+    }
+
+    /// Common reaction confirmation used by row chips and the open picker.
+    /// Applies the revision rule to the loaded row, or stores a bounded pending
+    /// update when that row is outside the window.
+    fn apply_reaction_update(&mut self, update: voxhold_api::ReactionsUpdate) {
+        if update.channel_id != self.channel
+            || self.deleted_ids.contains(&update.message_id)
+            || update.revision <= 0
+        {
+            return;
+        }
+        if let Some(message) = self
+            .messages
+            .iter_mut()
+            .find(|message| message.id == update.message_id)
+        {
+            apply_reactions(message, update);
+        } else if self.pending_reactions.len() < 128
+            || self.pending_reactions.contains_key(&update.message_id)
+        {
+            let entry = self
+                .pending_reactions
+                .entry(update.message_id)
+                .or_insert_with(|| update.clone());
+            if update.revision > entry.revision {
+                *entry = update;
+            }
+        }
     }
 
     /// Push the confirmed row into an open action panel so its reaction state
@@ -4084,7 +4125,7 @@ impl Render for Voxhold {
                     .text_color(ink(p.fg))
                     .child("К последним")
                     .on_click(cx.listener(|s, _, window, cx| {
-                        s.history_reset_pending = true;
+                        s.reset_for_latest();
                         s.refresh_history(window, cx);
                     })),
             );
@@ -5170,6 +5211,119 @@ mod ui_tests {
                 assert!(v.accepts_older_reply(43, 30, 1, 7, generation, access));
                 assert!(!v.accepts_older_reply(43, 100, 1, 7, generation, access));
                 assert!(!v.accepts_older_reply(42, 30, 1, 7, generation, access));
+            });
+        });
+    }
+
+    #[gpui::test]
+    async fn reaction_on_old_row_keeps_selection_and_skips_history_reload(cx: &mut TestAppContext) {
+        cx.update(|cx| gpui_component::init(cx));
+        let (window, view) = add_auth_window(cx);
+        let mut visual = VisualTestContext::from_window(window.into(), cx);
+        visual.update(|window, app| {
+            view.update(app, |v, _| {
+                v.server = 1;
+                v.channel = 7;
+                for id in 1..=60 {
+                    let message =
+                        serde_json::from_value::<Message>(message_json(id, 1, "row")).unwrap();
+                    v.merge_message(true, message);
+                }
+            });
+            let runtime = view.read_with(app, |v, _| v.runtime.clone());
+            let recents = view.read_with(app, |v, _| v.recent_reactions.clone());
+            let client = Client::new("http://127.0.0.1:1").unwrap();
+            let tools = app
+                .new(|cx| message_tools::MessageTools::new(client, runtime, recents, window, cx));
+            let weak = view.downgrade();
+            tools.update(app, |tools, _| {
+                tools.set_reaction_handler(Some(Box::new(move |update, cx| {
+                    if let Some(view) = weak.upgrade() {
+                        view.update(cx, |view, cx| {
+                            view.apply_reaction_update(update);
+                            cx.notify();
+                        });
+                    }
+                })));
+            });
+            view.update(app, |v, _| v.message_tools = Some(tools.clone()));
+            let old = view.read_with(app, |v, _| v.messages[0].clone());
+            tools.update(app, |tools, cx| {
+                tools.select(
+                    1,
+                    7,
+                    Some(old),
+                    message_tools::MessagePermissions {
+                        react: true,
+                        ..Default::default()
+                    },
+                    cx,
+                );
+            });
+
+            tools.update(app, |tools, cx| {
+                assert_eq!(tools.selected_id(), Some(1));
+                assert_eq!(tools.revision(), 0, "a reaction must not reload history");
+                assert!(tools.reaction_request_active("🔥"), "first click is PUT");
+                let update = voxhold_api::ReactionsUpdate {
+                    channel_id: 7,
+                    message_id: 1,
+                    revision: 1,
+                    reactions: vec![voxhold_api::Reaction {
+                        emoji: "🔥".into(),
+                        count: 1,
+                        me: true,
+                    }],
+                };
+                assert!(tools.handle_reaction_result(update, "🔥", cx));
+                assert_eq!(tools.revision(), 0);
+                assert_eq!(tools.selected_id(), Some(1));
+                assert!(
+                    !tools.reaction_request_active("🔥"),
+                    "second click is DELETE"
+                );
+                let removed = voxhold_api::ReactionsUpdate {
+                    channel_id: 7,
+                    message_id: 1,
+                    revision: 2,
+                    reactions: Vec::new(),
+                };
+                assert!(tools.handle_reaction_result(removed, "🔥", cx));
+                assert!(tools.reaction_request_active("🔥"));
+            });
+            view.read_with(app, |v, _| {
+                assert_eq!(v.messages.len(), 60, "the old window stays loaded");
+                assert_eq!(v.messages[0].id, 1);
+                assert_eq!(v.messages[0].reactions_revision, 2);
+                assert!(!v.messages[0].reactions.iter().any(|reaction| reaction.me));
+            });
+        });
+    }
+
+    #[gpui::test]
+    async fn latest_cancels_a_late_context_reply(cx: &mut TestAppContext) {
+        cx.update(|cx| gpui_component::init(cx));
+        let (_window, view) = add_auth_window(cx);
+        cx.update(|app| {
+            view.update(app, |v, _| {
+                v.server = 1;
+                v.channel = 7;
+                v.generation = 3;
+                v.access_generation = 4;
+                v.context_request = Some(7);
+                assert!(v.accepts_context_reply(7, 3, 4, 1, 7));
+
+                v.reset_for_latest();
+                assert!(v.context_request.is_none());
+                assert!(v.history_reset_pending);
+                assert!(
+                    !v.accepts_context_reply(7, 3, 4, 1, 7),
+                    "latest owns the window; the old context reply is stale"
+                );
+
+                v.context_request = Some(8);
+                assert!(!v.accepts_context_reply(7, 3, 4, 1, 7));
+                assert!(v.accepts_context_reply(8, 3, 4, 1, 7));
             });
         });
     }

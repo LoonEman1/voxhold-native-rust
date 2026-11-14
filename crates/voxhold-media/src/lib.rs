@@ -272,6 +272,6 @@ mod tests {
         assert!(events.poll(Duration::ZERO).is_none());
     }
 }
+pub mod devices;
 pub mod runtime;
 pub mod stream;
-pub mod devices;

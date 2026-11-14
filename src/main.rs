@@ -90,6 +90,10 @@ struct Voxhold {
     viewport: (f32, f32),
     auth_background: Option<(u32, u32, bool, std::sync::Arc<gpui::RenderImage>)>,
     initial_focus_done: bool,
+    /// `(message_id, offset_in_item)` captured before a prepend so the visible
+    /// row stays under the same pixel after older rows are merged.
+    pending_anchor: Option<(i64, gpui::Pixels)>,
+    _activation_subscription: gpui::Subscription,
 }
 impl Voxhold {
     fn new(
@@ -185,6 +189,19 @@ impl Voxhold {
             viewport: (0.0, 0.0),
             auth_background: None,
             initial_focus_done: false,
+            pending_anchor: None,
+            _activation_subscription: cx.observe_window_activation(window, |s, window, cx| {
+                if s.theme_mode == theme::ThemeMode::System {
+                    let light = theme::system_light();
+                    if light != s.system_light {
+                        s.system_light = light;
+                        s.palette = theme::Palette::resolve(s.theme_mode, light);
+                        s.auth_background = None;
+                        window_chrome::apply(window, s.palette.light);
+                        cx.notify();
+                    }
+                }
+            }),
         };
         window_chrome::apply(window, view.palette.light);
         view
@@ -848,6 +865,13 @@ impl Voxhold {
         let (Some(c), Some(before)) = (self.client.clone(), self.before) else {
             return;
         };
+        // Remember the top visible row so prepending does not move the reader.
+        let anchor = {
+            let offset = self.history_list.logical_scroll_top();
+            self.messages
+                .get(offset.item_ix)
+                .map(|m| (m.id, offset.offset_in_item))
+        };
         let (sid, cid, generation) = (self.server, self.channel, self.generation);
         let events_version = self.events_version;
         self.loading_older = true;
@@ -881,6 +905,9 @@ impl Voxhold {
                                 s.messages.drain(0..excess);
                                 s.has_more = false;
                             }
+                            // Applied by `render` after the list splices its
+                            // item count, so the scroll target is in range.
+                            s.pending_anchor = anchor;
                         }
                         Err(error) => s.error = error,
                     }
@@ -2246,6 +2273,16 @@ impl Render for Voxhold {
                 keys.len() - prefix - suffix,
             );
             self.history_keys = keys;
+        }
+        // A prepend keeps `(message_id, offset_in_row)` under the pointer. The
+        // list count was just spliced, so the target index is in range.
+        if let Some((id, offset_in_item)) = self.pending_anchor.take() {
+            if let Some(item_ix) = self.messages.iter().position(|m| m.id == id) {
+                self.history_list.scroll_to(gpui::ListOffset {
+                    item_ix,
+                    offset_in_item,
+                });
+            }
         }
         let selected = self.channels.iter().find(|c| c.id == self.channel).cloned();
         let readable = selected.as_ref().is_some_and(|c| c.has_history());

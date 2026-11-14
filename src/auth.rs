@@ -55,6 +55,7 @@ impl AuthState {
 
     /// Number of credential attempts started by this form. Used by the UI test
     /// that checks double Enter does not open two requests.
+    #[allow(dead_code)]
     pub fn login_attempt(&self) -> u64 {
         self.login_attempt
     }

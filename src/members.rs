@@ -196,7 +196,7 @@ impl Voxhold {
         cx.notify();
     }
 
-    fn request_avatar(
+    pub(crate) fn request_avatar(
         &mut self,
         user_id: i64,
         version: String,

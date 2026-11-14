@@ -4,11 +4,13 @@ mod attachments;
 mod auth;
 mod background;
 mod channel_settings;
+mod history;
 mod inbox;
 mod layout;
 mod members;
 mod message_tools;
 mod personal_settings;
+mod reactions;
 mod search;
 mod server_settings;
 mod theme;
@@ -17,7 +19,7 @@ mod voice_panel;
 mod window_chrome;
 use gpui::{
     div, list, prelude::*, px, rgba, size, AnyElement, App, Application, Bounds, Context, Entity,
-    ListAlignment, ListState, MouseButton, Window, WindowBounds, WindowOptions,
+    ListAlignment, ListState, MouseButton, SharedString, Window, WindowBounds, WindowOptions,
 };
 use gpui_component::{
     input::{InputState, TextInput},
@@ -62,7 +64,7 @@ struct Voxhold {
     roster: members::Roster,
     messages: Vec<Message>,
     history_list: ListState,
-    history_keys: Vec<(i64, i64, i64)>,
+    history_keys: Vec<HistoryKey>,
     before: Option<i64>,
     has_more: bool,
     history_has_newer: bool,
@@ -87,6 +89,23 @@ struct Voxhold {
     read_scheduled: bool,
     read_retry_at: Option<std::time::Instant>,
     painted_read: std::rc::Rc<std::cell::Cell<i64>>,
+    /// The last confirmed read id per `(server, channel)`, used to place the
+    /// "Новые сообщения" divider when a channel is opened again.
+    channel_reads: std::collections::HashMap<(i64, i64), i64>,
+    unread_after: i64,
+    /// One request per `(message, emoji)` so a double click cannot toggle twice.
+    reaction_requests: std::collections::HashSet<(i64, String)>,
+    recent_reactions: reactions::SharedRecents,
+    /// Custom history scrollbar drag captured from the root pointer handler.
+    scrollbar_drag: Option<ScrollbarDrag>,
+    /// A bounded `message_context` request for a quote outside the window.
+    context_request: Option<u64>,
+    /// Scroll to this id after the spliced list has the matching row.
+    pending_jump: Option<i64>,
+    /// The next successful refresh replaces the window instead of merging it.
+    /// Used by "К последним" after a quote opened a bounded context page.
+    history_reset_pending: bool,
+    hovered_message: i64,
     event_task: Option<tokio::task::JoinHandle<()>>,
     realtime_generation: u64,
     event_subscription: Option<tokio::sync::watch::Sender<Option<ChannelSubscription>>>,
@@ -236,6 +255,15 @@ impl Voxhold {
             read_scheduled: false,
             read_retry_at: None,
             painted_read: Default::default(),
+            channel_reads: Default::default(),
+            unread_after: 0,
+            reaction_requests: Default::default(),
+            recent_reactions: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
+            scrollbar_drag: None,
+            context_request: None,
+            pending_jump: None,
+            history_reset_pending: false,
+            hovered_message: 0,
             event_task: None,
             realtime_generation: 0,
             event_subscription: None,
@@ -473,6 +501,15 @@ impl Voxhold {
         self.read_retry_at = None;
         self.read_sent = 0;
         self.reads.clear();
+        self.channel_reads.clear();
+        self.unread_after = 0;
+        self.reaction_requests.clear();
+        self.recent_reactions.borrow_mut().clear();
+        self.scrollbar_drag = None;
+        self.context_request = None;
+        self.pending_jump = None;
+        self.history_reset_pending = false;
+        self.hovered_message = 0;
         self.attachments = None;
         self.settings = None;
         self.server_settings = None;
@@ -543,8 +580,15 @@ impl Voxhold {
             Some(cx.new(|cx| search::SearchPanel::new(search_client, runtime, id, window, cx)));
         let tools_client = c.clone();
         let runtime = self.runtime.clone();
-        let tools =
-            cx.new(|cx| message_tools::MessageTools::new(tools_client, runtime, window, cx));
+        let tools = cx.new(|cx| {
+            message_tools::MessageTools::new(
+                tools_client,
+                runtime,
+                self.recent_reactions.clone(),
+                window,
+                cx,
+            )
+        });
         cx.observe_in(&tools, window, |this, tools, window, cx| {
             let revision = tools.read(cx).revision();
             if revision != this.tools_revision {
@@ -667,6 +711,16 @@ impl Voxhold {
         self.read_sent = 0;
         self.read_pending = false;
         self.read_retry_at = None;
+        self.unread_after = self
+            .channel_reads
+            .get(&(self.server, id))
+            .copied()
+            .unwrap_or(0);
+        self.reaction_requests.clear();
+        self.context_request = None;
+        self.pending_jump = None;
+        self.history_reset_pending = false;
+        self.hovered_message = 0;
         if id != previous_channel {
             self.deleted_ids.clear();
         }
@@ -994,6 +1048,7 @@ impl Voxhold {
                 if data["server_id"].as_i64() == Some(self.server)
                     && data["channel_id"].as_i64() == Some(self.channel)
                 {
+                    let mut mine = 0;
                     if let Some(reads) = data["reads"].as_array() {
                         for value in reads {
                             if let Ok(read) =
@@ -1001,7 +1056,22 @@ impl Voxhold {
                             {
                                 let slot = self.reads.entry(read.user_id).or_default();
                                 *slot = (*slot).max(read.last_read_message_id);
+                                if read.user_id == self.self_user_id {
+                                    mine = mine.max(read.last_read_message_id);
+                                }
                             }
+                        }
+                    }
+                    if mine > 0 {
+                        let key = (self.server, self.channel);
+                        let slot = self.channel_reads.entry(key).or_default();
+                        let known_before = *slot;
+                        *slot = (*slot).max(mine);
+                        // The snapshot arrives after the channel was opened.
+                        // Place the divider at the confirmed read id once, and
+                        // never move it after a read from this visit.
+                        if self.unread_after == 0 && self.read_sent == 0 && known_before == 0 {
+                            self.unread_after = *slot;
                         }
                     }
                 }
@@ -1011,6 +1081,13 @@ impl Voxhold {
                     if read.server_id == self.server && read.channel_id == self.channel {
                         let slot = self.reads.entry(read.user_id).or_default();
                         *slot = (*slot).max(read.last_read_message_id);
+                        if read.user_id == self.self_user_id {
+                            let known = self
+                                .channel_reads
+                                .entry((self.server, self.channel))
+                                .or_default();
+                            *known = (*known).max(read.last_read_message_id);
+                        }
                     }
                 }
             }
@@ -1154,6 +1231,16 @@ impl Voxhold {
         self.read_retry_at = None;
         self.read_sent = 0;
         self.reads.clear();
+        self.unread_after = self
+            .channel_reads
+            .get(&(self.server, self.channel))
+            .copied()
+            .unwrap_or(0);
+        self.reaction_requests.clear();
+        self.context_request = None;
+        self.pending_jump = None;
+        self.history_reset_pending = false;
+        self.hovered_message = 0;
         self.busy = false;
         self.attachment_pending = None;
         self.roster.reset_channel();
@@ -1341,7 +1428,11 @@ impl Voxhold {
                 }
                 s.read_pending = false;
                 match result {
-                    Ok(_) => s.read_sent = s.read_sent.max(message_id),
+                    Ok(_) => {
+                        s.read_sent = s.read_sent.max(message_id);
+                        let known = s.channel_reads.entry((s.server, s.channel)).or_default();
+                        *known = (*known).max(message_id);
+                    }
                     Err(voxhold_api::Error::Http(403 | 404)) => {
                         s.invalidate_access(window, cx);
                     }
@@ -1365,11 +1456,165 @@ impl Voxhold {
         })
         .detach();
     }
+    /// Toggle a reaction from a row chip. One in-flight request per message and
+    /// emoji; the confirmed update is applied through the same revision rule as
+    /// HTTP history and realtime events.
+    fn toggle_reaction(
+        &mut self,
+        message_id: i64,
+        emoji: String,
+        active: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if self.access_pending
+            || !self
+                .channels
+                .iter()
+                .any(|channel| channel.id == self.channel && channel.has_history())
+        {
+            return;
+        }
+        let key = (message_id, emoji.clone());
+        if !self.reaction_requests.insert(key.clone()) {
+            return;
+        }
+        let Some(client) = self.client.clone() else {
+            self.reaction_requests.remove(&key);
+            return;
+        };
+        let (server, channel, generation, access) = (
+            self.server,
+            self.channel,
+            self.generation,
+            self.access_generation,
+        );
+        let runtime = self.runtime.clone();
+        let recent = self.recent_reactions.clone();
+        let task = cx.background_spawn(async move {
+            runtime.block_on(client.set_reaction(server, channel, message_id, &emoji, !active))
+        });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            if let Some(this) = this.upgrade() {
+                this.update(cx, |s, cx| {
+                    s.reaction_requests.remove(&key);
+                    if s.generation != generation
+                        || s.access_generation != access
+                        || s.server != server
+                        || s.channel != channel
+                    {
+                        return;
+                    }
+                    match result {
+                        Ok(update) => {
+                            let deleted = s.deleted_ids.contains(&update.message_id);
+                            if update.channel_id == channel && !deleted && update.revision > 0 {
+                                if let Some(message) = s
+                                    .messages
+                                    .iter_mut()
+                                    .find(|message| message.id == update.message_id)
+                                {
+                                    apply_reactions(message, update);
+                                } else if s.pending_reactions.len() < 128 {
+                                    let entry = s
+                                        .pending_reactions
+                                        .entry(update.message_id)
+                                        .or_insert_with(|| update.clone());
+                                    if update.revision > entry.revision {
+                                        *entry = update;
+                                    }
+                                }
+                            }
+                            if !active {
+                                reactions::touch_recent(&mut recent.borrow_mut(), &key.1);
+                            }
+                            s.error.clear();
+                        }
+                        Err(error) => s.error = error.to_string(),
+                    }
+                    cx.notify();
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
+
+    /// Focus an already loaded row or open a bounded `context` page around a
+    /// quoted message that is outside the current window.
+    fn jump_to_message(&mut self, message_id: i64, cx: &mut Context<Self>) {
+        if let Some(index) = self
+            .messages
+            .iter()
+            .position(|message| message.id == message_id)
+        {
+            self.history_list.scroll_to(gpui::ListOffset {
+                item_ix: index,
+                offset_in_item: px(0.),
+            });
+            cx.notify();
+            return;
+        }
+        if self.context_request.is_some() || self.access_pending {
+            return;
+        }
+        let Some(client) = self.client.clone() else {
+            return;
+        };
+        let (server, channel, generation, access) = (
+            self.server,
+            self.channel,
+            self.generation,
+            self.access_generation,
+        );
+        self.request_seq = self.request_seq.wrapping_add(1);
+        let request = self.request_seq;
+        self.context_request = Some(request);
+        let runtime = self.runtime.clone();
+        let task = cx.background_spawn(async move {
+            runtime.block_on(client.message_context(server, channel, message_id, 25, 25))
+        });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            if let Some(this) = this.upgrade() {
+                this.update(cx, |s, cx| {
+                    if s.context_request != Some(request)
+                        || s.generation != generation
+                        || s.access_generation != access
+                        || s.server != server
+                        || s.channel != channel
+                    {
+                        return;
+                    }
+                    s.context_request = None;
+                    match result {
+                        Ok(context) => {
+                            s.messages = context.messages;
+                            s.messages.sort_by_key(|message| message.id);
+                            s.history_keys.clear();
+                            s.history_list.reset(0);
+                            s.before = s.messages.first().map(|message| message.id);
+                            s.has_more = s.before.is_some();
+                            s.history_has_newer = true;
+                            s.pending_anchor = None;
+                            s.pending_jump = Some(context.target_message_id);
+                            s.error.clear();
+                        }
+                        Err(error) => s.error = error.to_string(),
+                    }
+                    cx.notify();
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
+
     fn history_anchor(&self) -> Option<(i64, gpui::Pixels)> {
         let offset = self.history_list.logical_scroll_top();
         self.history_keys
             .get(offset.item_ix)
-            .map(|(id, _, _)| (*id, offset.offset_in_item))
+            .map(|(id, ..)| (*id, offset.offset_in_item))
     }
 
     fn history_retry_delay(error: &voxhold_api::Error) -> std::time::Duration {
@@ -1458,6 +1703,12 @@ impl Voxhold {
                 match result {
                     Ok(page) => {
                         let anchor = s.history_anchor();
+                        if std::mem::take(&mut s.history_reset_pending) {
+                            s.messages.clear();
+                            s.history_keys.clear();
+                            s.history_list.reset(0);
+                            s.before = None;
+                        }
                         s.apply_history_snapshot(page, new_ids);
                         s.older_error.clear();
                         s.older_retry_at = None;
@@ -1680,6 +1931,10 @@ fn ink(value: u32) -> gpui::Rgba {
     rgba((value << 8) | 0xff)
 }
 
+fn ink_alpha(value: u32, alpha: u8) -> gpui::Rgba {
+    rgba((value << 8) | u32::from(alpha))
+}
+
 /// One icon from the shipped `assets/` directory. SVGs use `currentColor`, so
 /// the caller controls the tint through `text_color`.
 fn icon(resource: &'static str, size: f32, color: gpui::Rgba) -> AnyElement {
@@ -1688,6 +1943,36 @@ fn icon(resource: &'static str, size: f32, color: gpui::Rgba) -> AnyElement {
         .w(px(size))
         .h(px(size))
         .text_color(color)
+        .into_any_element()
+}
+
+/// A centered history divider: the line is masked by the label, matching Go's
+/// date separator and the unread boundary.
+fn history_divider(label: &str, accent: u32, line: u32, bg: u32, bold: bool) -> AnyElement {
+    div()
+        .relative()
+        .w_full()
+        .h(px(36.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(
+            div()
+                .absolute()
+                .left(px(20.))
+                .right(px(20.))
+                .h(px(1.))
+                .bg(ink(line)),
+        )
+        .child(
+            div()
+                .px(px(12.))
+                .bg(ink(bg))
+                .text_size(px(12.))
+                .text_color(ink(accent))
+                .when(bold, |text| text.font_weight(gpui::FontWeight::BOLD))
+                .child(label.to_string()),
+        )
         .into_any_element()
 }
 
@@ -1700,12 +1985,28 @@ fn channel_icon(kind: &str, color: gpui::Rgba) -> AnyElement {
     icon(resource, 15., color)
 }
 
+/// `(id, body revision, reactions revision, date divider, grouped, unread)`.
+/// The last three force a re-measure when only grouping or a divider changes.
+type HistoryKey = (i64, i64, i64, String, bool, bool);
+
 /// What a realtime event asks the controller to do next.
 #[derive(Default)]
 struct RealtimeEffect {
     resync: bool,
     access: bool,
     server_removed: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ScrollbarDrag {
+    /// Window-space top of the scrollbar track.
+    top: f32,
+    /// Track height in logical pixels.
+    height: f32,
+    /// Thumb height in logical pixels.
+    thumb: f32,
+    /// Pointer offset inside the thumb.
+    grab: f32,
 }
 
 fn merge_revision(current: &mut Message, mut incoming: Message) {
@@ -2954,6 +3255,22 @@ impl Render for Voxhold {
                 }
             }))
             .on_mouse_move(cx.listener(|s, event: &gpui::MouseMoveEvent, _, cx| {
+                if let Some(drag) = s.scrollbar_drag {
+                    if event.pressed_button != Some(MouseButton::Left) {
+                        s.scrollbar_drag = None;
+                        s.history_list.scrollbar_drag_ended();
+                        cx.notify();
+                        return;
+                    }
+                    let y: f32 = event.position.y.into();
+                    let ratio = ((y - drag.grab - drag.top) / (drag.height - drag.thumb).max(1.))
+                        .clamp(0., 1.);
+                    let max: f32 = s.history_list.max_offset_for_scrollbar().height.into();
+                    s.history_list
+                        .set_offset_from_scrollbar(gpui::point(px(0.), px(ratio * max)));
+                    cx.notify();
+                    return;
+                }
                 let Some(drag) = s.drag else { return };
                 if event.pressed_button != Some(MouseButton::Left) {
                     s.drag = None;
@@ -2985,6 +3302,10 @@ impl Render for Voxhold {
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|s, _, _, cx| {
+                    if s.scrollbar_drag.take().is_some() {
+                        s.history_list.scrollbar_drag_ended();
+                        cx.notify();
+                    }
                     if s.drag.take().is_some() {
                         s.save_shell();
                         cx.notify();
@@ -3039,10 +3360,27 @@ impl Render for Voxhold {
             );
         }
         // Chat column: fixed header, history, composer, panels.
-        let keys: Vec<_> = self
+        let channel_kind = self
+            .channels
+            .iter()
+            .find(|channel| channel.id == self.channel)
+            .map(|channel| channel.kind.as_str())
+            .unwrap_or("");
+        let meta = history::row_meta(&self.messages, channel_kind, self.unread_after);
+        let keys: Vec<HistoryKey> = self
             .messages
             .iter()
-            .map(|m| (m.id, m.revision, m.reactions_revision))
+            .zip(&meta)
+            .map(|(message, meta)| {
+                (
+                    message.id,
+                    message.revision,
+                    message.reactions_revision,
+                    meta.date.clone().unwrap_or_default(),
+                    meta.grouped,
+                    meta.unread,
+                )
+            })
             .collect();
         if keys != self.history_keys {
             let prefix = self
@@ -3086,54 +3424,148 @@ impl Render for Voxhold {
             || role == "admin"
             || selected.as_ref().is_some_and(|c| c.permissions & 16 != 0);
         let news = selected.as_ref().is_some_and(|c| c.kind == "news");
+        // Avatars are requested only for the neighbourhood of the viewport. The
+        // member list carries the version; the cache is shared with the rail.
+        let start = self
+            .history_list
+            .logical_scroll_top()
+            .item_ix
+            .saturating_sub(3);
+        let end = (start + 40).min(self.messages.len());
+        let mut wanted: Vec<(i64, String)> = self.messages[start..end]
+            .iter()
+            .filter_map(|message| {
+                self.members
+                    .iter()
+                    .find(|member| member.user_id == message.author.user_id)
+                    .and_then(|member| {
+                        member
+                            .avatar_version
+                            .as_ref()
+                            .filter(|version| !version.is_empty())
+                            .map(|version| (member.user_id, version.clone()))
+                    })
+            })
+            .collect();
+        wanted.sort();
+        wanted.dedup();
+        for (user_id, version) in wanted {
+            self.request_avatar(user_id, version, window, cx);
+        }
+        let mut avatar_by_user = std::collections::HashMap::new();
+        for ((user_id, version), (image, used)) in self.roster.avatars.iter_mut() {
+            avatar_by_user.insert((*user_id, version.clone()), image.clone());
+            *used = std::time::Instant::now();
+        }
+        let member_info: std::collections::HashMap<i64, (String, Option<String>)> = self
+            .members
+            .iter()
+            .map(|member| {
+                (
+                    member.user_id,
+                    (member.role.clone(), member.avatar_version.clone()),
+                )
+            })
+            .collect();
         let rows: Vec<_> = self
             .messages
             .iter()
-            .map(|m| {
-                let own = self.self_user_id > 0 && self.self_user_id == m.author.user_id;
+            .zip(meta)
+            .map(|(message, meta)| {
+                let own = self.self_user_id > 0 && self.self_user_id == message.author.user_id;
                 let permissions = message_tools::MessagePermissions {
                     write: readable && writable && !news,
-                    edit: readable && own && m.forward.is_none() && (!news || writable),
+                    edit: readable && own && message.forward.is_none() && (!news || writable),
                     delete: readable && (own || moderate),
                     react: readable,
                     pin: readable && moderate,
                     forward: readable,
                     comments: readable
-                        && m.thread_root_id.is_none()
+                        && message.thread_root_id.is_none()
                         && selected.as_ref().is_some_and(|c| {
-                            c.kind == "text" || c.comments_enabled || m.comment_count > 0
+                            c.kind == "text" || c.comments_enabled || message.comment_count > 0
                         }),
                 };
-                let status = if own {
-                    if self
-                        .reads
-                        .iter()
-                        .any(|(user, last)| *user != self.self_user_id && *last >= m.id)
-                    {
-                        "Прочитано"
-                    } else {
-                        "Отправлено"
-                    }
-                } else {
-                    ""
-                };
-                (m.clone(), permissions, status)
+                let read_by_other = self
+                    .reads
+                    .iter()
+                    .any(|(user, last)| *user != self.self_user_id && *last >= message.id);
+                let (role, avatar) = member_info
+                    .get(&message.author.user_id)
+                    .cloned()
+                    .map(|(role, version)| {
+                        let avatar = version.as_ref().and_then(|version| {
+                            avatar_by_user
+                                .get(&(message.author.user_id, version.clone()))
+                                .cloned()
+                        });
+                        (role, avatar)
+                    })
+                    .unwrap_or_default();
+                (
+                    message.clone(),
+                    permissions,
+                    meta,
+                    read_by_other,
+                    own,
+                    role,
+                    avatar,
+                )
             })
             .collect();
         let weak = cx.entity().downgrade();
         self.painted_read = Default::default();
         let painted_read = self.painted_read.clone();
-        let history_list = list(self.history_list.clone(), move |index, _, _| {
-            let (message, permissions, status) = rows[index].clone();
+        let hovered_message = self.hovered_message;
+        let history_list = list(self.history_list.clone(), move |index, _, _cx| {
+            let (message, permissions, meta, read_by_other, own, role, avatar) =
+                rows[index].clone();
             let id = message.id;
             let painted_read = painted_read.clone();
             let selected_message = message.clone();
             let weak = weak.clone();
-            div()
+            let weak_hover = weak.clone();
+            let weak_quote = weak.clone();
+            let weak_reaction = weak.clone();
+            let role_color = history::role_color(&role, p.light);
+            let time = history::format_time(message.created_at);
+            let quote = history::quote_labels(&message);
+            let quote_target = message
+                .reply
+                .as_ref()
+                .filter(|reply| !reply.deleted && reply.message_id > 0)
+                .map(|reply| reply.message_id);
+            let face = if let Some(image) = avatar {
+                div()
+                    .w(px(38.))
+                    .h(px(38.))
+                    .flex_shrink_0()
+                    .rounded_full()
+                    .overflow_hidden()
+                    .child(
+                        gpui::img(image)
+                            .size_full()
+                            .object_fit(gpui::ObjectFit::Cover),
+                    )
+            } else {
+                div()
+                    .w(px(38.))
+                    .h(px(38.))
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_full()
+                    .bg(ink(members::avatar_color(&message.author.username)))
+                    .text_size(px(14.))
+                    .font_weight(gpui::FontWeight::BOLD)
+                    .text_color(ink(0x151510))
+                    .child(members::initials(&message.author.username))
+            };
+            let mut row = div()
                 .id(("message", message.id as u64))
                 .relative()
-                .px_4()
-                .py_2()
+                .w_full()
                 .cursor_pointer()
                 .on_click(move |_, _, cx| {
                     if let Some(view) = weak.upgrade() {
@@ -3158,38 +3590,339 @@ impl Render for Voxhold {
                         });
                     }
                 })
-                .child(
-                    div()
-                        .text_size(px(14.))
-                        .font_weight(gpui::FontWeight::BOLD)
-                        .text_color(ink(p.lime))
-                        .child(message.author.username),
-                )
-                .child(div().text_size(px(14.)).child(message.content))
-                .child(
-                    div()
-                        .text_size(px(11.))
-                        .text_color(ink(p.muted))
-                        .child(status),
-                )
-                .child(
-                    gpui::canvas(
-                        |_, _, _| (),
-                        move |bounds, (), window, _| {
-                            if bounds.intersects(&window.content_mask().bounds) {
-                                painted_read.set(painted_read.get().max(id));
+                .on_hover(move |hovered, _, cx| {
+                    if let Some(view) = weak_hover.upgrade() {
+                        view.update(cx, |s, cx| {
+                            let next = if *hovered {
+                                id
+                            } else if s.hovered_message == id {
+                                0
+                            } else {
+                                s.hovered_message
+                            };
+                            if s.hovered_message != next {
+                                s.hovered_message = next;
+                                cx.notify();
                             }
-                        },
-                    )
-                    .absolute()
-                    .size_full()
-                    .top_0()
-                    .left_0(),
+                        });
+                    }
+                });
+            if let Some(date) = &meta.date {
+                row = row.child(history_divider(date, p.muted, p.line, p.bg, false));
+            }
+            if meta.unread {
+                row = row.child(history_divider(
+                    "Новые сообщения",
+                    p.lime,
+                    p.line,
+                    p.bg,
+                    true,
+                ));
+            }
+            let mut head = div()
+                .flex()
+                .items_center()
+                .gap(px(7.))
+                .h(px(20.))
+                .child(
+                    div()
+                        .text_size(px(13.))
+                        .font_weight(gpui::FontWeight::BOLD)
+                        .text_color(ink(role_color))
+                        .child(message.author.username.clone()),
                 )
-                .into_any_element()
+                .child(
+                    div()
+                        .px(px(6.))
+                        .h(px(18.))
+                        .rounded(px(5.))
+                        .bg(ink_alpha(role_color, 48))
+                        .border_1()
+                        .border_color(ink_alpha(role_color, 87))
+                        .text_size(px(11.))
+                        .font_weight(gpui::FontWeight::BOLD)
+                        .text_color(ink(role_color))
+                        .child(history::role_label(&role, true)),
+                );
+            if own {
+                head = head.child(
+                    div()
+                        .px(px(5.))
+                        .h(px(16.))
+                        .rounded(px(4.))
+                        .bg(ink(p.lime))
+                        .text_size(px(10.))
+                        .font_weight(gpui::FontWeight::BOLD)
+                        .text_color(ink(0x17170f))
+                        .child("Вы"),
+                );
+            }
+            head = head.child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(ink(p.muted))
+                    .child(time.clone()),
+            );
+            let mut body = div().flex_1().min_w(px(0.)).flex().flex_col();
+            if !meta.grouped {
+                body = body.child(head);
+            }
+            if let Some(target) = quote_target {
+                let name = quote.0.clone();
+                let excerpt = quote.1.clone();
+                body = body.child(
+                    div()
+                        .id(("quote", id as u64))
+                        .w_full()
+                        .max_w(px(580.))
+                        .h(px(history::QUOTE_HEIGHT - 7.))
+                        .mb(px(4.))
+                        .rounded(px(9.))
+                        .bg(ink(if p.light { 0xf0f2d9 } else { 0x26291b }))
+                        .border_l_2()
+                        .border_color(ink_alpha(if p.light { 0xb5cf16 } else { 0xe7ff5b }, 163))
+                        .pl(px(12.))
+                        .pr(px(12.))
+                        .pt(px(6.))
+                        .cursor_pointer()
+                        .on_click(move |_, _, cx| {
+                            if let Some(view) = weak_quote.upgrade() {
+                                view.update(cx, |s, cx| s.jump_to_message(target, cx));
+                            }
+                            cx.stop_propagation();
+                        })
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_1()
+                                .child(icon(
+                                    "icons/reply.svg",
+                                    15.,
+                                    ink(if p.light { 0xb5cf16 } else { 0xe7ff5b }),
+                                ))
+                                .child(
+                                    div()
+                                        .text_size(px(12.))
+                                        .font_weight(gpui::FontWeight::BOLD)
+                                        .text_color(ink(if p.light { 0xb5cf16 } else { 0xe7ff5b }))
+                                        .truncate()
+                                        .child(name),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(12.))
+                                .text_color(ink(p.muted))
+                                .truncate()
+                                .child(excerpt),
+                        ),
+                );
+            } else if message.forward.is_some() {
+                body = body.child(
+                    div()
+                        .h(px(history::QUOTE_HEIGHT - 7.))
+                        .w_full()
+                        .max_w(px(580.))
+                        .mb(px(4.))
+                        .rounded(px(9.))
+                        .bg(ink(if p.light { 0xf0f2d9 } else { 0x26291b }))
+                        .pl(px(12.))
+                        .pt(px(6.))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_1()
+                                .child(icon("icons/forward.svg", 15., ink(p.lime)))
+                                .child(
+                                    div()
+                                        .text_size(px(12.))
+                                        .font_weight(gpui::FontWeight::BOLD)
+                                        .text_color(ink(p.lime))
+                                        .child(quote.0.clone()),
+                                ),
+                        ),
+                );
+            }
+            body = body.child(
+                div()
+                    .w_full()
+                    .text_size(px(14.))
+                    .line_height(px(20.))
+                    .text_color(ink(if p.light { 0x3b3b36 } else { 0xbab8b0 }))
+                    .child(message.content.clone()),
+            );
+            for file in &message.attachments {
+                let (width, height) = history::attachment_size(
+                    file.width,
+                    file.height,
+                    (l.chat.w - history::HISTORY_TEXT_INSET).max(1.),
+                );
+                let label = history::attachment_label(file);
+                if history::image_attachment(file) {
+                    body = body.child(
+                        div()
+                            .w(px(width))
+                            .mb(px(4.))
+                            .flex()
+                            .flex_col()
+                            .child(
+                                div()
+                                    .w(px(width))
+                                    .h(px(height))
+                                    .rounded(px(7.))
+                                    .bg(ink(if p.light { 0xe8e8e0 } else { 0x20201d })),
+                            )
+                            .child(
+                                div()
+                                    .h(px(25.))
+                                    .text_size(px(11.))
+                                    .text_color(ink(p.muted))
+                                    .truncate()
+                                    .child(label),
+                            ),
+                    );
+                } else {
+                    body = body.child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .h(px(29.))
+                            .child(icon("icons/paperclip.svg", 14., ink(p.muted)))
+                            .child(
+                                div()
+                                    .text_size(px(11.))
+                                    .text_color(ink(p.muted))
+                                    .truncate()
+                                    .child(label),
+                            ),
+                    );
+                }
+            }
+            if !message.reactions.is_empty() {
+                let mut reactions = div().flex().flex_wrap().gap(px(4.)).mt(px(4.)).w_full();
+                for reaction in message.reactions.clone() {
+                    let emoji = reaction.emoji.clone();
+                    let active = reaction.me;
+                    let count = history::reaction_count(&reaction);
+                    let weak_reaction = weak_reaction.clone();
+                    reactions = reactions.child(
+                        div()
+                            .id(SharedString::from(format!(
+                                "reaction-{id}-{}",
+                                reaction.emoji
+                            )))
+                            .h(px(22.))
+                            .min_w(px(history::REACTION_PITCH - 4.))
+                            .px_1()
+                            .flex()
+                            .items_center()
+                            .gap(px(4.))
+                            .rounded(px(6.))
+                            .bg(ink(if active {
+                                if p.light {
+                                    0xe9edbd
+                                } else {
+                                    0x353c23
+                                }
+                            } else if p.light {
+                                0xecece3
+                            } else {
+                                0x292925
+                            }))
+                            .text_size(px(15.))
+                            .cursor_pointer()
+                            .on_click(move |_, _, cx| {
+                                if let Some(view) = weak_reaction.upgrade() {
+                                    view.update(cx, |s, cx| {
+                                        s.toggle_reaction(id, emoji.clone(), active, cx);
+                                    });
+                                }
+                                cx.stop_propagation();
+                            })
+                            .child(
+                                div()
+                                    .font_family(crate::reactions::EMOJI_FONT)
+                                    .text_size(px(15.))
+                                    .child(reaction.emoji.clone()),
+                            )
+                            .child(div().text_size(px(12.)).text_color(ink(p.fg)).child(count)),
+                    );
+                }
+                body = body.child(reactions);
+            }
+            row = row.child(
+                div()
+                    .flex()
+                    .items_start()
+                    .gap(px(10.))
+                    .px(px(19.))
+                    .pr(px(21.))
+                    .pt(px(4.))
+                    .pb(px(10.))
+                    .when(!meta.grouped, |line| line.child(face))
+                    .when(meta.grouped, |line| {
+                        line.child(
+                            div()
+                                .w(px(38.))
+                                .h(px(20.))
+                                .flex_shrink_0()
+                                .text_size(px(10.))
+                                .text_color(ink(p.muted))
+                                .child(if hovered_message == id {
+                                    time.clone()
+                                } else {
+                                    String::new()
+                                }),
+                        )
+                    })
+                    .child(body),
+            );
+            if own {
+                let mut checks = div()
+                    .absolute()
+                    .right(px(14.))
+                    .bottom(px(2.))
+                    .flex()
+                    .items_center();
+                checks = checks.child(icon("icons/check.svg", 12., ink(0x63d8e6)));
+                if read_by_other {
+                    checks = checks.child(div().ml(px(-7.)).child(icon(
+                        "icons/check.svg",
+                        12.,
+                        ink(0x63d8e6),
+                    )));
+                }
+                row = row.child(checks);
+            }
+            row.child(
+                gpui::canvas(
+                    |_, _, _| (),
+                    move |bounds, (), window, _| {
+                        if bounds.intersects(&window.content_mask().bounds) {
+                            painted_read.set(painted_read.get().max(id));
+                        }
+                    },
+                )
+                .absolute()
+                .size_full()
+                .top_0()
+                .left_0(),
+            )
+            .into_any_element()
         })
         .flex_1();
-        let mut history = div().flex_1().flex().flex_col().min_h(px(0.));
+        if let Some(id) = self.pending_jump.take() {
+            if let Some(item_ix) = self.messages.iter().position(|message| message.id == id) {
+                self.history_list.scroll_to(gpui::ListOffset {
+                    item_ix,
+                    offset_in_item: px(0.),
+                });
+            }
+        }
+        let mut history = div().relative().flex_1().flex().flex_col().min_h(px(0.));
         if self.has_more {
             let retry_in = self
                 .older_retry_at
@@ -3211,6 +3944,7 @@ impl Render for Voxhold {
                 div()
                     .id("older")
                     .p_2()
+                    .flex_shrink_0()
                     .flex()
                     .flex_col()
                     .gap_1()
@@ -3234,18 +3968,81 @@ impl Render for Voxhold {
             history = history.child(
                 div()
                     .id("history-latest")
-                    .p_2()
+                    .absolute()
+                    .right(px(24.))
+                    .bottom(px(8.))
+                    .px(px(10.))
+                    .py(px(5.))
+                    .rounded(px(7.))
+                    .bg(ink(p.selection))
                     .cursor_pointer()
                     .text_size(px(12.))
-                    .text_color(ink(p.muted))
+                    .text_color(ink(p.fg))
                     .child("К последним")
                     .on_click(cx.listener(|s, _, window, cx| {
-                        s.history_list.scroll_to(gpui::ListOffset {
-                            item_ix: s.history_list.item_count(),
-                            offset_in_item: px(0.),
-                        });
+                        s.history_reset_pending = true;
                         s.refresh_history(window, cx);
                     })),
+            );
+        }
+        let scroll_max: f32 = self.history_list.max_offset_for_scrollbar().height.into();
+        let scroll_offset: f32 = (-self.history_list.scroll_px_offset_for_scrollbar().y).into();
+        let viewport_h: f32 = self.history_list.viewport_bounds().size.height.into();
+        if scroll_max > 0.5 && viewport_h > 40. {
+            let track_h = viewport_h - 10.;
+            let content = viewport_h + scroll_max;
+            let thumb_h = (viewport_h * viewport_h / content).max(28.).min(track_h);
+            let progress = (scroll_offset / scroll_max).clamp(0., 1.);
+            let thumb_top = (track_h - thumb_h) * progress;
+            let track_top: f32 = self.history_list.viewport_bounds().origin.y.into();
+            let history_top = l.chat.y + if mobile { 58. } else { 67. };
+            history = history.child(
+                div()
+                    .id("history-scrollbar")
+                    .absolute()
+                    .right(px(2.))
+                    .top(px(track_top + 5. - history_top))
+                    .w(px(15.))
+                    .h(px(track_h))
+                    .cursor(gpui::CursorStyle::default())
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |s, event: &gpui::MouseDownEvent, _, cx| {
+                            let y: f32 = event.position.y.into();
+                            let top = track_top + 5.;
+                            let thumb_y = top + thumb_top;
+                            let grab = (y - thumb_y).clamp(0., thumb_h);
+                            s.scrollbar_drag = Some(ScrollbarDrag {
+                                top,
+                                height: track_h,
+                                thumb: thumb_h,
+                                grab,
+                            });
+                            s.history_list.scrollbar_drag_started();
+                            let ratio =
+                                ((y - grab - top) / (track_h - thumb_h).max(1.)).clamp(0., 1.);
+                            s.history_list.set_offset_from_scrollbar(gpui::point(
+                                px(0.),
+                                px(ratio * scroll_max),
+                            ));
+                            cx.notify();
+                            cx.stop_propagation();
+                        }),
+                    )
+                    .child(
+                        div()
+                            .absolute()
+                            .left(px(4.))
+                            .top(px(thumb_top))
+                            .w(px(7.))
+                            .h(px(thumb_h))
+                            .rounded(px(4.))
+                            .bg(ink(if self.scrollbar_drag.is_some() {
+                                0x96968e
+                            } else {
+                                0x50504a
+                            })),
+                    ),
             );
         }
         if readable && !self.messages.is_empty() && !self.read_pending && !self.read_scheduled {
@@ -4096,6 +4893,41 @@ mod ui_tests {
             assert_eq!(v.online_by_server[&8], [4, 5].into_iter().collect());
             assert_eq!(v.roster.last_seen.get(&2), Some(&42));
         }));
+    }
+
+    /// The unread divider is data-driven: the first confirmed snapshot places it
+    /// once, and reads sent during the visit never move it forward.
+    #[gpui::test]
+    async fn read_snapshot_places_the_unread_divider_once(cx: &mut TestAppContext) {
+        cx.update(|cx| gpui_component::init(cx));
+        let (_window, view) = add_auth_window(cx);
+        cx.update(|app| {
+            view.update(app, |v, _| {
+                v.server = 1;
+                v.channel = 7;
+                v.self_user_id = 9;
+                v.apply_realtime_event(
+                    "channel.read_snapshot",
+                    &serde_json::json!({"server_id":1,"channel_id":7,"reads":[
+                        {"server_id":1,"channel_id":7,"user_id":9,"last_read_message_id":42},
+                        {"server_id":1,"channel_id":7,"user_id":2,"last_read_message_id":40}
+                    ]}),
+                );
+                assert_eq!(v.unread_after, 42);
+                assert_eq!(v.channel_reads.get(&(1, 7)), Some(&42));
+                assert_eq!(v.reads.get(&2), Some(&40));
+
+                v.read_sent = 42;
+                v.apply_realtime_event(
+                    "channel.read_snapshot",
+                    &serde_json::json!({"server_id":1,"channel_id":7,"reads":[
+                        {"server_id":1,"channel_id":7,"user_id":9,"last_read_message_id":44}
+                    ]}),
+                );
+                assert_eq!(v.unread_after, 42, "the divider stays at the open boundary");
+                assert_eq!(v.channel_reads.get(&(1, 7)), Some(&44));
+            });
+        });
     }
 
     #[test]

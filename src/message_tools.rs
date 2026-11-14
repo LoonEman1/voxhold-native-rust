@@ -3,6 +3,8 @@ use gpui_component::input::{InputState, TextInput};
 use std::sync::Arc;
 use voxhold_api::{Client, Message};
 
+use crate::reactions::{self, ReactionPicker, SharedRecents};
+
 /// Actions for a selected message. Parent supplies the current selection and
 /// reloads history after an action by observing `revision()`.
 pub struct MessageTools {
@@ -14,6 +16,8 @@ pub struct MessageTools {
     text: Entity<InputState>,
     emoji: Entity<InputState>,
     destination: Entity<InputState>,
+    picker: Entity<ReactionPicker>,
+    recents: SharedRecents,
     comments: Vec<Message>,
     error: String,
     busy: bool,
@@ -26,9 +30,19 @@ impl MessageTools {
     pub fn new(
         client: Client,
         runtime: Arc<tokio::runtime::Runtime>,
+        recents: SharedRecents,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let picker = cx.new(|cx| ReactionPicker::new(recents.clone(), window, cx));
+        let weak = cx.entity().downgrade();
+        picker.update(cx, |picker, _| {
+            picker.on_pick = Some(Box::new(move |value, cx| {
+                if let Some(tools) = weak.upgrade() {
+                    tools.update(cx, |tools, cx| tools.react_with(value, cx));
+                }
+            }));
+        });
         Self {
             client,
             runtime,
@@ -43,6 +57,8 @@ impl MessageTools {
             emoji: cx.new(|cx| InputState::new(window, cx).placeholder("Эмодзи")),
             destination: cx
                 .new(|cx| InputState::new(window, cx).placeholder("ID канала для пересылки")),
+            picker,
+            recents,
             comments: Vec::new(),
             error: String::new(),
             busy: false,
@@ -69,12 +85,32 @@ impl MessageTools {
         self.error.clear();
         self.busy = false;
         self.generation += 1;
+        let mine = self
+            .message
+            .as_ref()
+            .map(|message| {
+                message
+                    .reactions
+                    .iter()
+                    .filter(|reaction| reaction.me)
+                    .map(|reaction| reaction.emoji.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        self.picker
+            .update(cx, |picker, cx| picker.reset_for_message(mine, cx));
         cx.notify();
     }
     pub fn revision(&self) -> u64 {
         self.revision
     }
+    pub fn react_with(&mut self, value: &str, cx: &mut Context<Self>) {
+        self.run_with(Action::React, Some(value.to_string()), cx);
+    }
     fn run(&mut self, action: Action, cx: &mut Context<Self>) {
+        self.run_with(action, None, cx);
+    }
+    fn run_with(&mut self, action: Action, emoji_override: Option<String>, cx: &mut Context<Self>) {
         if self.busy || !self.permissions.allows(action) {
             return;
         }
@@ -87,7 +123,7 @@ impl MessageTools {
             return;
         };
         let text = self.text.read(cx).value().to_string();
-        let emoji = self.emoji.read(cx).value().to_string();
+        let emoji = emoji_override.unwrap_or_else(|| self.emoji.read(cx).value().to_string());
         let destination = self.destination.read(cx).value().to_string();
         if matches!(action, Action::Reply | Action::Edit | Action::Comment)
             && (text.trim().is_empty() || text.chars().count() > 5120)
@@ -121,6 +157,9 @@ impl MessageTools {
         let runtime = self.runtime.clone();
         let server = self.server;
         let channel = self.channel;
+        let picker = self.picker.clone();
+        let recents = self.recents.clone();
+        let react_value = emoji.clone();
         // A stable random client key is generated before invoking idempotent endpoints.
         let key = format!("{:032x}", uuid::Uuid::new_v4().as_u128());
         let task = cx.background_spawn(async move {
@@ -180,7 +219,13 @@ impl MessageTools {
                     s.busy = false;
                     match result {
                         Ok(Some(comments)) => s.comments = comments,
-                        Ok(None) => s.revision += 1,
+                        Ok(None) => {
+                            if matches!(action, Action::React) {
+                                reactions::touch_recent(&mut recents.borrow_mut(), &react_value);
+                                picker.update(cx, |_, cx| cx.notify());
+                            }
+                            s.revision += 1;
+                        }
                         Err(e) => s.error = e,
                     }
                     cx.notify();
@@ -233,12 +278,14 @@ enum Action {
 impl Render for MessageTools {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let mut view = div()
+            .id("message-tools")
             .w(px(320.))
             .h_full()
             .p_3()
             .flex()
             .flex_col()
             .gap_2()
+            .overflow_y_scroll()
             .bg(rgb(0x202323))
             .text_color(rgb(0xf3f4eb));
         let Some(message) = &self.message else {
@@ -286,13 +333,17 @@ impl Render for MessageTools {
             );
         }
         if self.permissions.react {
-            view = view.child(TextInput::new(&self.emoji)).child(
-                div()
-                    .id("react")
-                    .cursor_pointer()
-                    .on_click(cx.listener(|s, _, _, cx| s.run(Action::React, cx)))
-                    .child("Добавить / убрать реакцию"),
-            );
+            view = view
+                .child(div().text_size(px(12.)).child("Быстрые и все реакции"))
+                .child(self.picker.clone())
+                .child(TextInput::new(&self.emoji))
+                .child(
+                    div()
+                        .id("react")
+                        .cursor_pointer()
+                        .on_click(cx.listener(|s, _, _, cx| s.run(Action::React, cx)))
+                        .child("Добавить / убрать реакцию"),
+                );
         }
         if self.permissions.forward {
             view = view.child(TextInput::new(&self.destination)).child(

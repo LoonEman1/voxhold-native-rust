@@ -8,6 +8,7 @@ mod background;
 mod channel_settings;
 mod clipboard;
 mod draft;
+mod file_io;
 mod history;
 mod inbox;
 mod layout;

@@ -6,7 +6,7 @@ use gpui::{div, prelude::*, px, rgb, Context, PathPromptOptions, Window};
 use std::{collections::HashSet, path::PathBuf, sync::Arc};
 use voxhold_api::{Attachment, Client};
 
-use crate::{clipboard, draft};
+use crate::{clipboard, draft, file_io};
 
 pub struct Attachments {
     client: Client,
@@ -239,7 +239,7 @@ impl Attachments {
         if self.saving.contains(&file.id) {
             return;
         }
-        let name = download_name(&file.filename);
+        let name = file_io::safe_file_name(&file.filename);
         let directory = std::env::var_os("USERPROFILE")
             .map(PathBuf::from)
             .unwrap_or_else(std::env::temp_dir);
@@ -268,13 +268,21 @@ impl Attachments {
                 .update(cx, |state, cx| {
                     let client = state.client.clone();
                     let runtime = state.runtime.clone();
+                    let file = file.clone();
                     let id = id.clone();
                     cx.background_spawn(async move {
-                        let data = runtime
-                            .block_on(client.download_attachment(&id))
-                            .map_err(|error| draft::describe_error(&error))?;
-                        std::fs::write(&path, data)
-                            .map_err(|_| "Не удалось сохранить файл.".to_string())
+                        let mut save = file_io::PartFile::create(&path)?;
+                        let expected = (file.size_bytes > 0).then_some(file.size_bytes as u64);
+                        let downloaded = runtime.block_on(
+                            client.download_attachment_to(&id, &mut |chunk| save.write(chunk)),
+                        );
+                        match downloaded {
+                            Ok(_) => save.finish(expected).map(|_| ()),
+                            Err(error) => {
+                                save.abort();
+                                Err(draft::describe_error(&error))
+                            }
+                        }
                     })
                 })
                 .ok();
@@ -384,30 +392,6 @@ impl Render for Attachments {
             root = root.child(div().text_color(rgb(0xff7777)).child(self.error.clone()));
         }
         root
-    }
-}
-
-/// One safe path component for the save dialog; the user still chooses the
-/// directory. `file_io::safe_file_name` takes this over with the streaming save.
-fn download_name(name: &str) -> String {
-    let base = name
-        .rsplit(['/', '\\'])
-        .next()
-        .unwrap_or(name)
-        .trim()
-        .trim_matches('.');
-    let cleaned: String = base
-        .chars()
-        .map(|ch| match ch {
-            '<' | '>' | ':' | '"' | '|' | '?' | '*' | '\0' => '_',
-            other if other.is_control() => '_',
-            other => other,
-        })
-        .collect();
-    if cleaned.is_empty() {
-        "attachment".into()
-    } else {
-        cleaned
     }
 }
 

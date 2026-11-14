@@ -23,3 +23,6 @@ smallvec = "1"
 
 [target.'cfg(windows)'.dependencies]
 raw-window-handle = "0.6"
+
+[dev-dependencies]
+gpui = { version = "=0.2.2", features = ["test-support"] }

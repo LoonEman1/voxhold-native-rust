@@ -195,15 +195,8 @@ impl Voxhold {
     fn submit_instance(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let raw = self.instance.read(cx).value().to_string();
         if self.auth.submit_instance(&raw).is_some() {
-            let weak = cx.entity().downgrade();
-            window.on_next_frame(move |window, cx| {
-                if let Some(view) = weak.upgrade() {
-                    view.update(cx, |s, cx| {
-                        let entity = s.username.clone();
-                        entity.update(cx, |input, cx| input.focus(window, cx));
-                    });
-                }
-            });
+            self.username
+                .update(cx, |input, cx| input.focus(window, cx));
         }
         cx.notify();
     }
@@ -1030,10 +1023,11 @@ impl Voxhold {
     }
 
     fn auth_field(
-        &self,
+        &mut self,
         entity: &Entity<InputState>,
         rect: layout::Rect,
         compact: bool,
+        cx: &mut Context<Self>,
     ) -> AnyElement {
         let p = self.palette;
         div()
@@ -1046,6 +1040,24 @@ impl Voxhold {
             .bg(ink(p.field_bg))
             .border_1()
             .border_color(ink(p.field_border))
+            .capture_key_down(cx.listener(|s, event: &gpui::KeyDownEvent, window, cx| {
+                let key = &event.keystroke;
+                if key.key == "enter"
+                    && !key.modifiers.shift
+                    && !key.modifiers.control
+                    && !key.modifiers.alt
+                    && !key.modifiers.platform
+                {
+                    // Enter belongs to the form: GPUI would otherwise insert a
+                    // newline into a single-line field.
+                    if s.auth.is_instance() {
+                        s.submit_instance(window, cx);
+                    } else {
+                        s.submit_login(window, cx);
+                    }
+                    cx.stop_propagation();
+                }
+            }))
             .child(
                 TextInput::new(entity)
                     .text_size(px(if compact { 17. } else { 16. }))
@@ -1671,10 +1683,13 @@ impl Voxhold {
             root = root.child(card);
         }
         if instance {
-            root = root.child(self.auth_field(&self.instance.clone(), l.user, compact));
+            let field = self.instance.clone();
+            root = root.child(self.auth_field(&field, l.user, compact, cx));
         } else {
-            root = root.child(self.auth_field(&self.username.clone(), l.user, compact));
-            root = root.child(self.auth_field(&self.password.clone(), l.password, compact));
+            let username = self.username.clone();
+            let password = self.password.clone();
+            root = root.child(self.auth_field(&username, l.user, compact, cx));
+            root = root.child(self.auth_field(&password, l.password, compact, cx));
         }
         // Primary action: "Продолжить" on the address step, then sign-in.
         let busy = self.auth.busy;
@@ -2851,4 +2866,129 @@ fn main() {
         .expect("failed to open window");
         cx.activate(true);
     });
+}
+
+#[cfg(test)]
+mod ui_tests {
+    use super::*;
+    use gpui::{TestAppContext, VisualTestContext};
+
+    /// Build the real root view in a test window without touching the user's
+    /// preferences: the layout file points at a fresh temporary path. The window
+    /// root must be `gpui_component::Root`, exactly like the shipped window.
+    fn add_auth_window(cx: &mut TestAppContext) -> (gpui::WindowHandle<Root>, Entity<Voxhold>) {
+        let shell = std::env::temp_dir().join(format!(
+            "voxhold-ui-test-{}-{}.json",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let slot: std::rc::Rc<std::cell::RefCell<Option<Entity<Voxhold>>>> = Default::default();
+        let captured = slot.clone();
+        let window = cx.add_window(move |window, cx| {
+            let view = cx.new(|cx| Voxhold::new(window, cx, "", Some(shell)));
+            *captured.borrow_mut() = Some(view.clone());
+            Root::new(view.into(), window, cx)
+        });
+        let view = slot.borrow().clone().expect("view");
+        (window, view)
+    }
+
+    fn focus_field(
+        cx: &mut VisualTestContext,
+        view: &Entity<Voxhold>,
+        pick: fn(&Voxhold) -> Entity<InputState>,
+    ) {
+        let view = view.clone();
+        cx.update(|window, cx| {
+            view.update(cx, |v, cx| {
+                let field = pick(v);
+                field.update(cx, |input, cx| input.focus(window, cx));
+            });
+        });
+    }
+
+    #[gpui::test]
+    async fn instance_validation_keeps_the_screen_and_the_typed_value(cx: &mut TestAppContext) {
+        cx.update(|cx| gpui_component::init(cx));
+        let (window, view) = add_auth_window(cx);
+        let mut cx = VisualTestContext::from_window(window.into(), cx).into_mut();
+        focus_field(&mut cx, &view, |v| v.instance.clone());
+        cx.simulate_input("http://example.com");
+        let raw = view.read_with(&*cx, |v, cx| v.instance.read(cx).text().to_string());
+        assert_eq!(raw, "http://example.com", "raw input text");
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+
+        let (screen, status, value) = view.read_with(&*cx, |v, cx| {
+            (
+                v.auth.screen,
+                v.auth.status.clone(),
+                v.instance.read(cx).value().to_string(),
+            )
+        });
+        assert_eq!(screen, auth::AuthScreen::Instance);
+        assert_eq!(status, "Введите корректный HTTPS-адрес инстанса");
+        assert_eq!(value, "http://example.com");
+    }
+
+    #[gpui::test]
+    async fn loopback_advances_to_login_and_types_into_the_right_fields(cx: &mut TestAppContext) {
+        cx.update(|cx| gpui_component::init(cx));
+        let (window, view) = add_auth_window(cx);
+        let mut cx = VisualTestContext::from_window(window.into(), cx).into_mut();
+        focus_field(&mut cx, &view, |v| v.instance.clone());
+        cx.simulate_input("http://127.0.0.1:1");
+        cx.simulate_keystrokes("enter");
+
+        let (screen, origin) = view.read_with(&*cx, |v, _| (v.auth.screen, v.auth.origin.clone()));
+        assert_eq!(screen, auth::AuthScreen::Login);
+        assert_eq!(origin, "http://127.0.0.1:1");
+
+        // Enter must hand focus to the user name; otherwise these characters
+        // would land in the address field behind the new screen.
+        cx.simulate_input("neva");
+        let (username, address) = view.read_with(&*cx, |v, cx| {
+            (
+                v.username.read(cx).value().to_string(),
+                v.instance.read(cx).value().to_string(),
+            )
+        });
+        assert_eq!(username, "neva");
+        assert_eq!(address, "http://127.0.0.1:1");
+
+        focus_field(&mut cx, &view, |v| v.password.clone());
+        cx.simulate_input("password123");
+        let password = view.read_with(&*cx, |v, cx| v.password.read(cx).unmask_value().to_string());
+        assert_eq!(password, "password123");
+
+        cx.simulate_keystrokes("enter");
+        let (first, password_after) = view.read_with(&*cx, |v, cx| {
+            (
+                (v.auth.busy, v.auth.login_attempt(), v.auth.status.clone()),
+                v.password.read(cx).unmask_value().to_string(),
+            )
+        });
+        assert_eq!(first.1, 1, "Enter must start exactly one attempt");
+        assert_eq!(
+            password_after, "password123",
+            "Enter must not reach the field"
+        );
+        // Nothing listens on 127.0.0.1:1, so the attempt either is still pending
+        // or already finished with the Go network message.
+        assert!(
+            first.0 || first.2 == "Не удалось связаться с сервером",
+            "unexpected state after Enter: {first:?}"
+        );
+
+        // After the failure the form stays on the same screen and a repeated
+        // Enter starts a fresh attempt with the same confirmed origin.
+        let (failed_attempt, screen) =
+            view.read_with(&*cx, |v, _| (v.auth.login_attempt(), v.auth.screen));
+        assert_eq!(screen, auth::AuthScreen::Login);
+        if !first.0 {
+            cx.simulate_keystrokes("enter");
+            let retried = view.read_with(&*cx, |v, _| v.auth.login_attempt());
+            assert_eq!(retried, failed_attempt + 1);
+        }
+    }
 }

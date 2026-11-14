@@ -9,6 +9,11 @@
 pub fn apply(window: &gpui::Window, light: bool) {
     use raw_window_handle::RawWindowHandle;
 
+    // GPUI's test window is not backed by a platform window and its
+    // `window_handle` is explicitly unimplemented.
+    if cfg!(test) {
+        return;
+    }
     let Ok(handle) = raw_window_handle::HasWindowHandle::window_handle(window) else {
         return;
     };

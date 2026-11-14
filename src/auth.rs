@@ -53,6 +53,12 @@ impl AuthState {
         self.screen == AuthScreen::Instance
     }
 
+    /// Number of credential attempts started by this form. Used by the UI test
+    /// that checks double Enter does not open two requests.
+    pub fn login_attempt(&self) -> u64 {
+        self.login_attempt
+    }
+
     /// Validate and commit the address. Returns the trimmed origin on success.
     pub fn submit_instance(&mut self, raw: &str) -> Option<String> {
         if self.busy {

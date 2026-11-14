@@ -176,11 +176,14 @@ impl MessageTools {
         let Some(message) = self.message.as_mut() else {
             return false;
         };
-        if update.message_id != message.id || update.revision <= message.reactions_revision {
+        if update.message_id != message.id {
             return false;
         }
-        message.reactions = update.reactions;
-        message.reactions_revision = update.revision;
+        let before = message.reactions_revision;
+        crate::apply_reactions(message, update);
+        if message.reactions_revision == before {
+            return false;
+        }
         self.sync_picker(cx);
         cx.notify();
         true

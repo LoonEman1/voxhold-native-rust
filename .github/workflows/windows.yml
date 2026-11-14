@@ -20,6 +20,12 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: "0"
     steps:
       - uses: actions/checkout@v4
+      - name: Check repository file limits
+        shell: pwsh
+        run: pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/check-file-sizes.ps1 -All
+      - name: Self-test file limit checker
+        shell: pwsh
+        run: pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/check-file-sizes.ps1 -SelfTest
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt

@@ -1,0 +1,8 @@
+# File size exceptions (versioned, reviewed with the check).
+#
+# Format: path-or-glob|limit|concrete reason
+# The default limit is 1000 physical lines. An exception may raise it to 1200
+# only when splitting would make the code less coherent. Entries above 1200 are
+# rejected by scripts/check-file-sizes.ps1.
+#
+# There are currently no exceptions.

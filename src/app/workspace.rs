@@ -259,7 +259,13 @@ impl Voxhold {
         }
         self.messages.clear();
         self.history_keys.clear();
-        self.history_list.reset(0);
+        let alignment = if kind == "news" {
+            ListAlignment::Top
+        } else {
+            ListAlignment::Bottom
+        };
+        self.history_list = Self::new_history_list(alignment, cx);
+        self.scrollbar_drag = None;
         self.before = None;
         self.has_more = false;
         self.history_has_newer = false;

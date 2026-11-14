@@ -178,13 +178,8 @@ impl Voxhold {
         self.online_by_server.clear();
     }
 
-    pub(super) fn new(
-        window: &mut Window,
-        cx: &mut Context<Self>,
-        prefill: &str,
-        shell_path: Option<std::path::PathBuf>,
-    ) -> Self {
-        let history_list = ListState::new(0, ListAlignment::Bottom, px(400.));
+    fn new_history_list(alignment: ListAlignment, cx: &Context<Self>) -> ListState {
+        let history_list = ListState::new(0, alignment, px(400.));
         let weak = cx.entity().downgrade();
         history_list.set_scroll_handler(move |_, window, cx| {
             if let Some(view) = weak.upgrade() {
@@ -198,6 +193,16 @@ impl Voxhold {
                 });
             }
         });
+        history_list
+    }
+
+    pub(super) fn new(
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        prefill: &str,
+        shell_path: Option<std::path::PathBuf>,
+    ) -> Self {
+        let history_list = Self::new_history_list(ListAlignment::Bottom, cx);
         let system_light = theme::system_light();
         let theme_path = theme::theme_path();
         let theme_mode = theme::load_mode(theme_path.as_deref());

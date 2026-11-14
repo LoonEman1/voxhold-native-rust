@@ -379,10 +379,18 @@ impl Render for Voxhold {
                             .min_h(px(47.))
                             .key_context("Composer")
                             .on_action(cx.listener(|s, _: &composer::ComposerSend, window, cx| {
+                                // While the viewer is open it owns the
+                                // keyboard, like Go `imageViewerEvent`.
+                                if s.media.viewer.is_some() {
+                                    return;
+                                }
                                 s.send(window, cx);
                             }))
                             .on_action(cx.listener(
                                 |s, _: &composer::ComposerPasteFiles, _window, cx| {
+                                    if s.media.viewer.is_some() {
+                                        return;
+                                    }
                                     if !s.paste_attachments(cx) {
                                         // The clipboard has no files: let the
                                         // input widget paste ordinary text.

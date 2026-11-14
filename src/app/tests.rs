@@ -663,6 +663,41 @@ fn history_retry_delay_matches_go() {
     );
 }
 
+#[gpui::test]
+async fn the_viewer_owns_enter_and_escape_while_it_is_open(cx: &mut TestAppContext) {
+    cx.update(|cx| gpui_component::init(cx));
+    let (window, view) = add_auth_window(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
+    visual.update(|_, app| {
+        view.update(app, |v, _| writable_workspace(v));
+    });
+    visual.update(|window, app| {
+        window.draw(app).clear();
+    });
+    focus_field(&mut visual, &view, |v| v.composer.clone());
+    visual.simulate_input("текст");
+    visual.update(|window, app| {
+        view.update(app, |v, _| {
+            v.media.viewer = Some(crate::media::Viewer::new(crate::media::ViewerKey {
+                chat: v.chat_key(),
+                access: v.access_generation,
+                message_id: 5,
+                attachment_id: "a".repeat(32),
+                open_id: 1,
+            }));
+        });
+        window.draw(app).clear();
+    });
+    visual.simulate_keystrokes("enter");
+    assert_eq!(
+        view.read_with(&*visual, |v, _| v.send_attempt),
+        0,
+        "the viewer consumes Enter instead of sending"
+    );
+    visual.simulate_keystrokes("escape");
+    assert!(view.read_with(&*visual, |v, _| v.media.viewer.is_none()));
+}
+
 fn writable_workspace(v: &mut Voxhold) {
     v.client = Some(Client::new("http://127.0.0.1:1").unwrap());
     v.server = 1;

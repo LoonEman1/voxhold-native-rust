@@ -7,6 +7,12 @@ pub(super) struct RealtimeEffect {
     pub(super) resync: bool,
     pub(super) access: bool,
     pub(super) server_removed: bool,
+    /// Attachment ids removed by the server; their thumbnails and viewer are
+    /// released by the event pump where a `Window` is available.
+    pub(super) attachments: Vec<String>,
+    /// A bounded attachment tombstone rolled over and cancelled the initial
+    /// history refresh; the pump restarts one fresh refresh after the batch.
+    pub(super) restart_history: bool,
 }
 
 impl Voxhold {
@@ -71,11 +77,18 @@ impl Voxhold {
                     .swap(false, std::sync::atomic::Ordering::Relaxed);
                 let mut access = resync && s.channel != 0;
                 let mut server_removed = false;
+                let mut removed_attachments = Vec::new();
+                let mut restart_history = false;
                 for event in events {
                     let effect = s.apply_realtime_event(&event.kind, &event.data);
                     resync |= effect.resync;
                     access |= effect.access;
                     server_removed |= effect.server_removed;
+                    restart_history |= effect.restart_history;
+                    removed_attachments.extend(effect.attachments);
+                }
+                if !removed_attachments.is_empty() {
+                    restart_history |= s.purge_attachments(&removed_attachments, window, cx);
                 }
                 if server_removed {
                     s.remove_current_server(window, cx);
@@ -87,11 +100,22 @@ impl Voxhold {
                     } else {
                         s.invalidate_access(window, cx);
                     }
-                } else if resync {
+                } else if resync || restart_history {
+                    // A cancelled initial load would leave the chat empty, so
+                    // restart exactly one refresh after the whole batch.
                     s.refresh_history(window, cx);
                 }
                 if changed {
                     s.sync_tools_message(cx);
+                    // Deleting (or dropping from the window) the viewed message
+                    // closes the viewer before a late content answer arrives.
+                    let stale_viewer = s.media.viewer.as_ref().is_some_and(|viewer| {
+                        s.deleted_ids.contains(&viewer.key.message_id)
+                            || !s.messages.iter().any(|row| row.id == viewer.key.message_id)
+                    });
+                    if stale_viewer {
+                        s.close_viewer(window);
+                    }
                 }
                 if changed || resync || access {
                     cx.notify();
@@ -141,10 +165,14 @@ impl Voxhold {
                     .or_insert(message);
             }
         }
+        // An older page or a late event cannot resurrect a deleted attachment.
+        let purged = &self.media.purged;
+        if let Ok(index) = self.messages.binary_search_by_key(&id, |row| row.id) {
+            crate::history::apply_attachment_tombstones(&mut self.messages[index], purged);
+        }
     }
 
-    /// Apply one realtime event to the active scope.
-    ///
+    /// Apply one realtime event to the active scope.    ///
     /// A stale body revision never overwrites a confirmed row, a tombstone wins
     /// over late `created`/`updated` events and access events invalidate the
     /// confirmed scope before any late HTTP answer can be applied.
@@ -209,7 +237,7 @@ impl Voxhold {
                     effect.access = true;
                 } else if removed {
                     self.servers.retain(|item| item.id != server);
-                    self.drafts.retain(|(id, _), _| *id != server);
+                    self.drafts.borrow_mut().clear_server(server);
                 }
             }
             "presence.snapshot" => {
@@ -309,6 +337,44 @@ impl Voxhold {
                         self.messages.retain(|m| m.id != id);
                         self.pending_edits.remove(&id);
                         self.pending_reactions.remove(&id);
+                    }
+                }
+            }
+            "attachments.changed" if !self.access_pending => {
+                if data["channel_id"].as_i64() == Some(self.channel) {
+                    let ids: Vec<String> = data["attachment_ids"]
+                        .as_array()
+                        .map(|values| {
+                            values
+                                .iter()
+                                .filter_map(serde_json::Value::as_str)
+                                .map(str::to_owned)
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    if ids.is_empty() {
+                        // The fallback for an event without a list.
+                        effect.resync = true;
+                    } else {
+                        let mut history_stale = false;
+                        for id in &ids {
+                            for message in &mut self.messages {
+                                for file in &mut message.attachments {
+                                    if file.id == *id {
+                                        file.deleted = true;
+                                    }
+                                }
+                            }
+                            history_stale |= self.media.mark_purged(id);
+                        }
+                        if history_stale {
+                            // A marker rolled out of the bounded set. Answers
+                            // requested before this point may still describe
+                            // the evicted attachment as live, so discard them.
+                            effect.restart_history = self.invalidate_history_requests();
+                        }
+                        self.attachment_epoch = self.attachment_epoch.wrapping_add(1);
+                        effect.attachments = ids;
                     }
                 }
             }

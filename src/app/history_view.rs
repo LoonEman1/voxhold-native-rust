@@ -2,6 +2,15 @@ use super::ui::{history_divider, icon, ink, ink_alpha};
 use super::*;
 use crate::history;
 
+/// Byte offset of a rune index, for text runs and highlights.
+fn char_byte_index(content: &str, index: usize) -> usize {
+    content
+        .char_indices()
+        .nth(index)
+        .map(|(byte, _)| byte)
+        .unwrap_or(content.len())
+}
+
 impl Voxhold {
     pub(super) fn render_history(
         &mut self,
@@ -30,6 +39,7 @@ impl Voxhold {
                     meta.date.clone().unwrap_or_default(),
                     meta.grouped,
                     meta.unread,
+                    self.attachment_epoch,
                 )
             })
             .collect();
@@ -103,6 +113,54 @@ impl Voxhold {
         for (user_id, version) in wanted {
             self.request_avatar(user_id, version, window, cx);
         }
+        // Thumbnails and link previews are requested for the same viewport
+        // window as the avatars, then read from the bounded caches.
+        let mut thumbs: std::collections::HashMap<
+            media::ThumbKey,
+            std::sync::Arc<gpui::RenderImage>,
+        > = std::collections::HashMap::new();
+        let mut previews: std::collections::HashMap<
+            String,
+            (
+                media::PreviewEntry,
+                Option<std::sync::Arc<gpui::RenderImage>>,
+            ),
+        > = std::collections::HashMap::new();
+        let mut wanted_thumbs = Vec::new();
+        let mut wanted_previews = Vec::new();
+        for message in &self.messages[start..end] {
+            for file in &message.attachments {
+                if !history::image_attachment(file) {
+                    continue;
+                }
+                let (width, height) = history::attachment_size(
+                    file.width,
+                    file.height,
+                    (chat.w - history::HISTORY_TEXT_INSET).max(1.),
+                );
+                wanted_thumbs.push(media::ThumbKey::new(&file.id, width, height - 25.));
+            }
+            let (_, hrefs) = links::scan(&message.content);
+            wanted_previews.extend(hrefs);
+        }
+        for key in wanted_thumbs {
+            self.request_thumbnail(key.clone(), window, cx);
+            if let Some(image) = self.media.thumbs.get(&key) {
+                thumbs.insert(key, image);
+            }
+        }
+        let visible_previews: std::collections::HashSet<String> = wanted_previews
+            .iter()
+            .map(|preview| preview.cache_url.clone())
+            .collect();
+        for preview in wanted_previews {
+            self.request_preview(preview.cache_url.clone(), window, cx);
+            if let Some(entry) = self.media.preview_entry(&preview.cache_url) {
+                let image = self.media.preview_images.get(&preview.cache_url);
+                previews.insert(preview.cache_url, (entry, image));
+            }
+        }
+        self.ensure_preview_timer(&visible_previews, window, cx);
         let mut avatar_by_user = std::collections::HashMap::new();
         for ((user_id, version), (image, used)) in self.roster.avatars.iter_mut() {
             avatar_by_user.insert((*user_id, version.clone()), image.clone());
@@ -168,6 +226,8 @@ impl Voxhold {
         self.painted_read = Default::default();
         let painted_read = self.painted_read.clone();
         let hovered_message = self.hovered_message;
+        let thumbs_for_rows = thumbs;
+        let previews_for_rows = previews;
         let history_list = list(self.history_list.clone(), move |index, _, _cx| {
             let (message, permissions, meta, read_by_other, own, role, avatar) =
                 rows[index].clone();
@@ -178,6 +238,7 @@ impl Voxhold {
             let weak_hover = weak.clone();
             let weak_quote = weak.clone();
             let weak_reaction = weak.clone();
+            let weak_media = weak.clone();
             let role_color = history::role_color(&role, p.light);
             let time = history::format_time(message.created_at);
             let quote = history::quote_labels(&message);
@@ -396,15 +457,133 @@ impl Voxhold {
                         ),
                 );
             }
-            body = body.child(
-                div()
+            let (link_list, hrefs) = links::scan(&message.content);
+            let mut ranges = Vec::new();
+            let mut link_targets = Vec::new();
+            for link in &link_list {
+                let start = char_byte_index(&message.content, link.start);
+                let end = char_byte_index(&message.content, link.end);
+                if start < end {
+                    ranges.push(start..end);
+                    link_targets.push(link.href.clone());
+                }
+            }
+            let highlights: Vec<_> = ranges
+                .iter()
+                .map(|range| {
+                    (
+                        range.clone(),
+                        gpui::HighlightStyle {
+                            color: Some(ink(p.lime).into()),
+                            ..Default::default()
+                        },
+                    )
+                })
+                .collect();
+            let text = div()
+                .w_full()
+                .text_size(px(14.))
+                .line_height(px(20.))
+                .text_color(ink(if p.light { 0x3b3b36 } else { 0xbab8b0 }));
+            body = body.child(if ranges.is_empty() {
+                text.child(message.content.clone())
+            } else {
+                let weak_text = weak_media.clone();
+                text.child(
+                    gpui::InteractiveText::new(
+                        ("message-text", id as u64),
+                        gpui::StyledText::new(message.content.clone()).with_highlights(highlights),
+                    )
+                    .on_click(ranges, move |index, _window, cx| {
+                        let Some(href) = link_targets.get(index).cloned() else {
+                            return;
+                        };
+                        if let Some(view) = weak_text.upgrade() {
+                            view.update(cx, |s, cx| s.open_link(&href, cx));
+                        }
+                        cx.stop_propagation();
+                    }),
+                )
+            });
+            // A card is reserved as soon as the message contains a link, so a
+            // late metadata answer never grows the row.
+            for preview in hrefs.iter().take(2) {
+                let cache_url = &preview.cache_url;
+                let (meta, image) = match previews_for_rows.get(cache_url) {
+                    Some((entry, image)) => (entry.meta.clone(), image.clone()),
+                    None => (voxhold_api::LinkPreview::default(), None),
+                };
+                let labels = media::Media::preview_labels(cache_url, &meta);
+                let mut labels_column = div()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .flex()
+                    .flex_col()
+                    .gap(px(1.))
+                    .py(px(6.));
+                for (line, value) in labels.into_iter().enumerate() {
+                    if value.is_empty() {
+                        continue;
+                    }
+                    labels_column = labels_column.child(
+                        div()
+                            .h(px(19.))
+                            .truncate()
+                            .text_size(px(if line == 1 { 14. } else { 11. }))
+                            .font_weight(if line == 1 {
+                                gpui::FontWeight::BOLD
+                            } else {
+                                gpui::FontWeight::NORMAL
+                            })
+                            .text_color(ink(if line == 1 { p.fg } else { p.muted }))
+                            .child(value),
+                    );
+                }
+                let weak_link = weak_media.clone();
+                let target = preview.open_href.clone();
+                let card = div()
+                    .id(gpui::ElementId::Name(
+                        format!("link-card-{}-{}", id, cache_url).into(),
+                    ))
                     .w_full()
-                    .text_size(px(14.))
-                    .line_height(px(20.))
-                    .text_color(ink(if p.light { 0x3b3b36 } else { 0xbab8b0 }))
-                    .child(message.content.clone()),
-            );
-            for file in &message.attachments {
+                    .max_w(px(580.))
+                    .h(px(96.))
+                    .mb(px(4.))
+                    .rounded(px(10.))
+                    .border_1()
+                    .border_color(ink(if p.light { 0xdcdcd2 } else { 0x34342e }))
+                    .bg(ink(if p.light { 0xf4f4ec } else { 0x1b1b18 }))
+                    .flex()
+                    .items_center()
+                    .gap(px(12.))
+                    .px(px(13.))
+                    .cursor_pointer()
+                    .on_click(move |_, _, cx| {
+                        if let Some(view) = weak_link.upgrade() {
+                            view.update(cx, |s, cx| s.open_link(&target, cx));
+                        }
+                        cx.stop_propagation();
+                    })
+                    .child(div().flex_1().min_w(px(0.)).child(labels_column));
+                body = body.child(if let Some(image) = image {
+                    card.child(
+                        div()
+                            .w(px(98.))
+                            .h(px(76.))
+                            .flex_shrink_0()
+                            .overflow_hidden()
+                            .child(
+                                gpui::img(image)
+                                    .w(px(98.))
+                                    .h(px(76.))
+                                    .object_fit(gpui::ObjectFit::Cover),
+                            ),
+                    )
+                } else {
+                    card
+                });
+            }
+            for (file_index, file) in message.attachments.iter().enumerate() {
                 let (width, height) = history::attachment_size(
                     file.width,
                     file.height,
@@ -412,19 +591,42 @@ impl Voxhold {
                 );
                 let label = history::attachment_label(file);
                 if history::image_attachment(file) {
+                    let key = media::ThumbKey::new(&file.id, width, height - 25.);
+                    let thumbnail = thumbs_for_rows.get(&key).cloned();
+                    let file_for_click = file.clone();
+                    let weak_image = weak_media.clone();
+                    let message_id = message.id;
+                    let slot = div()
+                        .id(("attachment-image", file_index))
+                        .w(px(width))
+                        .h(px(height))
+                        .flex_shrink_0()
+                        .rounded(px(7.))
+                        .overflow_hidden()
+                        .bg(ink(if p.light { 0xe8e8e0 } else { 0x20201d }))
+                        .cursor_pointer()
+                        .when_some(thumbnail, |slot, image| {
+                            slot.child(
+                                gpui::img(image)
+                                    .size_full()
+                                    .object_fit(gpui::ObjectFit::Cover),
+                            )
+                        })
+                        .on_click(move |_, window, cx| {
+                            if let Some(view) = weak_image.upgrade() {
+                                view.update(cx, |s, cx| {
+                                    s.open_viewer(message_id, &file_for_click, window, cx)
+                                });
+                            }
+                            cx.stop_propagation();
+                        });
                     body = body.child(
                         div()
                             .w(px(width))
                             .mb(px(4.))
                             .flex()
                             .flex_col()
-                            .child(
-                                div()
-                                    .w(px(width))
-                                    .h(px(height))
-                                    .rounded(px(7.))
-                                    .bg(ink(if p.light { 0xe8e8e0 } else { 0x20201d })),
-                            )
+                            .child(slot)
                             .child(
                                 div()
                                     .h(px(25.))

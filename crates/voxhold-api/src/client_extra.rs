@@ -117,6 +117,36 @@ impl Client {
         )
         .await
     }
+    /// One idempotent channel send for text, files and replies. The backend
+    /// stores `client_message_id` and returns the same row for a retry, or
+    /// `409` when the same key is reused with different content.
+    pub async fn send_channel_message(
+        &self,
+        s: i64,
+        c: i64,
+        content: &str,
+        key: &str,
+        ids: &[String],
+        reply: i64,
+        thread_root: i64,
+    ) -> Result<Message> {
+        let mut v = json!({"content":content,"client_message_id":key});
+        if !ids.is_empty() {
+            v["attachment_ids"] = json!(ids);
+        }
+        if reply > 0 {
+            v["reply_to_message_id"] = json!(reply);
+        }
+        if thread_root > 0 {
+            v["thread_root_id"] = json!(thread_root);
+        }
+        self.request(
+            Method::POST,
+            &format!("{}/messages", channel_path(s, c)),
+            Some(v),
+        )
+        .await
+    }
     pub async fn forward_message(
         &self,
         s: i64,
@@ -439,4 +469,161 @@ impl Client {
         })
         .await
     }
+    pub async fn upload_attachment(
+        &self,
+        kind: &str,
+        destination: i64,
+        id: &str,
+        filename: &str,
+        data: Vec<u8>,
+    ) -> Result<Attachment> {
+        if !(kind == "channels" || kind == "conversations") || destination <= 0 || !valid_id(id, 32)
+        {
+            return Err(Error::InvalidResponse("invalid attachment destination"));
+        }
+        let mut u = self.url(&format!("/api/v1/{kind}/{destination}/attachments/{id}"))?;
+        u.query_pairs_mut().append_pair("filename", filename);
+        let bytes = self.binary(Method::PUT, u, data, 1 << 20).await?;
+        let result: Attachment = serde_json::from_slice(&bytes)?;
+        if result.id != id {
+            return Err(Error::InvalidResponse("invalid attachment response"));
+        }
+        Ok(result)
+    }
+
+    /// Go `UploadAttachmentStream`: send the file from disk with an explicit
+    /// `Content-Length` so a 64 MiB attachment never becomes a `Vec<u8>` in the
+    /// draft or in the request body. The blocking reads happen in 64 KiB
+    /// chunks on the transfer task, never on the UI thread.
+    pub async fn upload_attachment_file(
+        &self,
+        kind: &str,
+        destination: i64,
+        id: &str,
+        filename: &str,
+        file: std::fs::File,
+        size: u64,
+    ) -> Result<Attachment> {
+        if !(kind == "channels" || kind == "conversations") || destination <= 0 || !valid_id(id, 32)
+        {
+            return Err(Error::InvalidResponse("invalid attachment destination"));
+        }
+        if size == 0 || size > 64 << 20 {
+            return Err(Error::Local(
+                "Файл пуст, недоступен или превышает 64 МиБ.".into(),
+            ));
+        }
+        let mut u = self.url(&format!("/api/v1/{kind}/{destination}/attachments/{id}"))?;
+        u.query_pairs_mut().append_pair("filename", filename);
+        let stream = futures_util::stream::unfold(file, |mut file| async move {
+            use std::io::Read;
+            let mut chunk = vec![0u8; 64 << 10];
+            match file.read(&mut chunk) {
+                Ok(0) => None,
+                Ok(read) => {
+                    chunk.truncate(read);
+                    Some((Ok::<_, std::io::Error>(chunk), file))
+                }
+                Err(error) => Some((Err(error), file)),
+            }
+        });
+        let mut request = self
+            .http
+            .request(Method::PUT, u)
+            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+            .header(reqwest::header::CONTENT_LENGTH, size)
+            .timeout(Duration::from_secs(180))
+            .body(reqwest::Body::wrap_stream(stream));
+        if !self.token.is_empty() {
+            request = request.bearer_auth(self.token.as_ref());
+        }
+        let response = request.send().await.map_err(|_| Error::Network)?;
+        if !response.status().is_success() {
+            return Err(Error::Http(response.status().as_u16()));
+        }
+        let bytes = read_capped(response, 1 << 20).await?;
+        let result: Attachment = serde_json::from_slice(&bytes)?;
+        if result.id != id {
+            return Err(Error::InvalidResponse("invalid attachment response"));
+        }
+        Ok(result)
+    }
+
+    pub async fn download_attachment(&self, id: &str) -> Result<Vec<u8>> {
+        if !valid_id(id, 32) {
+            return Err(Error::InvalidResponse("invalid attachment id"));
+        }
+        self.binary(
+            Method::GET,
+            self.url(&format!("/api/v1/attachments/{id}/content"))?,
+            vec![],
+            64 << 20,
+        )
+        .await
+    }
+
+    /// Go `DownloadAttachment`: stream authorized content into the supplied
+    /// sink. The caller writes to a unique `.part` file outside the UI thread,
+    /// so a large download never becomes one buffer.
+    pub async fn download_attachment_to(
+        &self,
+        id: &str,
+        sink: &mut dyn FnMut(&[u8]) -> std::result::Result<(), String>,
+    ) -> Result<u64> {
+        if !valid_id(id, 32) {
+            return Err(Error::InvalidResponse("invalid attachment id"));
+        }
+        let mut request = self
+            .http
+            .get(self.url(&format!("/api/v1/attachments/{id}/content"))?)
+            .timeout(Duration::from_secs(180));
+        if !self.token.is_empty() {
+            request = request.bearer_auth(self.token.as_ref());
+        }
+        let mut response = request.send().await.map_err(|_| Error::Network)?;
+        if response.status() != reqwest::StatusCode::OK {
+            return Err(Error::Http(response.status().as_u16()));
+        }
+        let mut written = 0u64;
+        while let Some(chunk) = response.chunk().await.map_err(|_| Error::Network)? {
+            written = written.saturating_add(chunk.len() as u64);
+            if written > 64 << 20 {
+                return Err(Error::Local("Файл превышает 64 МиБ.".into()));
+            }
+            sink(&chunk).map_err(Error::Local)?;
+        }
+        Ok(written)
+    }
+    async fn binary(&self, method: Method, url: Url, data: Vec<u8>, max: usize) -> Result<Vec<u8>> {
+        let mut r = self
+            .http
+            .request(method.clone(), url)
+            .timeout(Duration::from_secs(180));
+        if !self.token.is_empty() {
+            r = r.bearer_auth(self.token.as_ref());
+        }
+        if method == Method::PUT {
+            r = r
+                .header("Content-Type", "application/octet-stream")
+                .body(data);
+        }
+        let res = r.send().await.map_err(|_| Error::Network)?;
+        if !res.status().is_success() {
+            return Err(Error::Http(res.status().as_u16()));
+        }
+        read_capped(res, max).await
+    }
+}
+
+/// Read a response body with a hard cap. Used by JSON answers and by streaming
+/// transfers that must never grow past their budget.
+async fn read_capped(mut response: reqwest::Response, max: usize) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|_| Error::Network)? {
+        if out.len().saturating_add(chunk.len()) > max {
+            return Err(Error::InvalidResponse("response too large"));
+        }
+        out.extend_from_slice(&chunk);
+    }
+    Ok(out)
 }

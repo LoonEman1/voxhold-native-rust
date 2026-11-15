@@ -10,6 +10,8 @@ pub enum Error {
     InvalidOrigin,
     InvalidResponse(&'static str),
     Http(u16),
+    /// A local file or pipe problem with a ready user-facing text.
+    Local(String),
     Network,
     Json(serde_json::Error),
     WebSocket(String),
@@ -23,9 +25,20 @@ impl fmt::Display for Error {
             ),
             Self::InvalidResponse(s) => write!(f, "{s}"),
             Self::Http(s) => write!(f, "Сервер вернул ошибку {s}."),
+            Self::Local(s) => write!(f, "{s}"),
             Self::Network => write!(f, "Не удалось связаться с сервером."),
             Self::Json(_) => write!(f, "Некорректный ответ сервера."),
             Self::WebSocket(_) => write!(f, "Соединение с сервером прервано."),
+        }
+    }
+}
+impl Error {
+    /// HTTP status of a refused request, used by retry gates and `429`
+    /// backoff. Local and transport errors have no status.
+    pub fn status(&self) -> Option<u16> {
+        match self {
+            Self::Http(status) => Some(*status),
+            _ => None,
         }
     }
 }
@@ -456,6 +469,7 @@ dto!(Attachment {
     id: String,
     filename: String,
     mime_type: String,
+    size_bytes: i64,
     width: i32,
     height: i32,
     deleted: bool
@@ -514,7 +528,8 @@ dto!(LinkPreview {
     title: String,
     description: String,
     site_name: String,
-    image_path: String
+    image_path: String,
+    unavailable: bool
 });
 dto!(ChannelRead {
     server_id: i64,
@@ -684,71 +699,12 @@ impl Client {
             }
         }
     }
-    pub async fn upload_attachment(
-        &self,
-        kind: &str,
-        destination: i64,
-        id: &str,
-        filename: &str,
-        data: Vec<u8>,
-    ) -> Result<Attachment> {
-        if !(kind == "channels" || kind == "conversations") || destination <= 0 || !valid_id(id, 32)
-        {
-            return Err(Error::InvalidResponse("invalid attachment destination"));
-        }
-        let mut u = self.url(&format!("/api/v1/{kind}/{destination}/attachments/{id}"))?;
-        u.query_pairs_mut().append_pair("filename", filename);
-        let bytes = self.binary(Method::PUT, u, data, 1 << 20).await?;
-        let result: Attachment = serde_json::from_slice(&bytes)?;
-        if result.id != id {
-            return Err(Error::InvalidResponse("invalid attachment response"));
-        }
-        Ok(result)
-    }
-    pub async fn download_attachment(&self, id: &str) -> Result<Vec<u8>> {
-        if !valid_id(id, 32) {
-            return Err(Error::InvalidResponse("invalid attachment id"));
-        }
-        self.binary(
-            Method::GET,
-            self.url(&format!("/api/v1/attachments/{id}/content"))?,
-            vec![],
-            64 << 20,
-        )
-        .await
-    }
-    async fn binary(&self, method: Method, url: Url, data: Vec<u8>, max: usize) -> Result<Vec<u8>> {
-        let mut r = self
-            .http
-            .request(method.clone(), url)
-            .timeout(Duration::from_secs(180));
-        if !self.token.is_empty() {
-            r = r.bearer_auth(self.token.as_ref());
-        }
-        if method == Method::PUT {
-            r = r
-                .header("Content-Type", "application/octet-stream")
-                .body(data);
-        }
-        let mut res = r.send().await.map_err(|_| Error::Network)?;
-        if !res.status().is_success() {
-            return Err(Error::Http(res.status().as_u16()));
-        }
-        let mut out = Vec::new();
-        while let Some(chunk) = res.chunk().await.map_err(|_| Error::Network)? {
-            if out.len().saturating_add(chunk.len()) > max {
-                return Err(Error::InvalidResponse("response too large"));
-            }
-            out.extend_from_slice(&chunk);
-        }
-        Ok(out)
-    }
     pub async fn image(&self, path: &str, max_edge: u32) -> Result<image::DynamicImage> {
         let bytes = self.bytes(Method::GET, path, None, 4 << 20).await?;
-        Self::decode_image(&bytes, max_edge)
+        Self::decode_image(&bytes, max_edge, 4_000_000)
     }
 
-    fn decode_image(bytes: &[u8], max_edge: u32) -> Result<image::DynamicImage> {
+    fn decode_image(bytes: &[u8], max_edge: u32, max_pixels: u64) -> Result<image::DynamicImage> {
         let reader = image::ImageReader::new(std::io::Cursor::new(bytes))
             .with_guessed_format()
             .map_err(|_| Error::InvalidResponse("invalid image"))?;
@@ -756,7 +712,11 @@ impl Client {
         let (w, h) = reader
             .into_dimensions()
             .map_err(|_| Error::InvalidResponse("invalid image"))?;
-        if w == 0 || h == 0 || w > max_edge || h > max_edge || u64::from(w) * u64::from(h) > 4 << 20
+        if w == 0
+            || h == 0
+            || w > max_edge
+            || h > max_edge
+            || u64::from(w) * u64::from(h) > max_pixels
         {
             return Err(Error::InvalidResponse("invalid image dimensions"));
         }
@@ -783,23 +743,40 @@ impl Client {
         {
             return Err(Error::InvalidResponse("Версия аватара изменилась."));
         }
-        Self::decode_image(&bytes, 256)
+        Self::decode_image(&bytes, 256, 4_000_000)
     }
     pub async fn attachment_thumbnail(&self, id: &str) -> Result<image::DynamicImage> {
         if !valid_id(id, 32) {
             return Err(Error::InvalidResponse("invalid attachment id"));
         }
-        self.image(&format!("/api/v1/attachments/{id}/thumbnail"), 480)
+        self.image(&format!("/api/v1/attachments/{id}/thumbnail"), 512)
             .await
+    }
+    /// Original chat picture for the viewer. Go limits: 48 MiB compressed,
+    /// 8192 px per side and 40 megapixels decoded.
+    pub async fn attachment_content_image(&self, id: &str) -> Result<image::DynamicImage> {
+        if !valid_id(id, 32) {
+            return Err(Error::InvalidResponse("invalid attachment id"));
+        }
+        let bytes = self
+            .bytes(
+                Method::GET,
+                &format!("/api/v1/attachments/{id}/content"),
+                None,
+                48 << 20,
+            )
+            .await?;
+        Self::decode_image(&bytes, 8192, 40_000_000)
     }
     pub async fn link_preview_image(&self, path: &str) -> Result<image::DynamicImage> {
         let prefix = "/api/v1/link-preview/images/";
         if !path.strip_prefix(prefix).is_some_and(|s| valid_id(s, 64)) {
             return Err(Error::InvalidResponse("invalid preview image path"));
         }
-        self.image(path, 4096).await
+        self.image(path, 1024).await
     }
 }
+
 fn valid_id(s: &str, len: usize) -> bool {
     s.len() == len
         && s.bytes()

@@ -4,10 +4,10 @@ impl Voxhold {
     pub(super) fn select_server(&mut self, id: i64, window: &mut Window, cx: &mut Context<Self>) {
         let Some(c) = self.client.clone() else { return };
         if self.channel != 0 {
-            self.drafts.insert(
-                (self.server, self.channel),
-                self.composer.read(cx).value().to_string(),
-            );
+            let text = self.composer.read(cx).value().to_string();
+            self.drafts
+                .borrow_mut()
+                .set_text(draft::ChatKey::channel(self.server, self.channel), &text);
         }
         self.composer
             .update(cx, |input, cx| input.set_value("", window, cx));
@@ -19,9 +19,10 @@ impl Voxhold {
             self.voice_channel = 0;
         }
         self.server = id;
-        self.attachment_pending = None;
+        self.composer_error.clear();
+        self.clear_media(window);
         if let Some(attachments) = &self.attachments {
-            attachments.update(cx, |a, cx| a.set_scope(id, 0, false, cx));
+            attachments.update(cx, |a, cx| a.set_scope(None, false, cx));
         }
         self.show_server_settings = false;
         let server_info = self.servers.iter().find(|s| s.id == id);
@@ -159,23 +160,27 @@ impl Voxhold {
         }
         let previous_channel = self.channel;
         if self.channel != 0 {
-            self.drafts.insert(
-                (self.server, self.channel),
-                self.composer.read(cx).value().to_string(),
-            );
+            let text = self.composer.read(cx).value().to_string();
+            self.drafts
+                .borrow_mut()
+                .set_text(draft::ChatKey::channel(self.server, self.channel), &text);
         }
         let draft = self
             .drafts
-            .get(&(self.server, id))
-            .cloned()
-            .unwrap_or_default();
+            .borrow()
+            .text(draft::ChatKey::channel(self.server, id));
         self.composer
             .update(cx, |input, cx| input.set_value(draft, window, cx));
         self.channel = id;
-        self.attachment_pending = None;
+        self.composer_error.clear();
+        self.close_viewer(window);
+        self.preview_wakeup = None;
+        self.preview_wake_at = None;
         let writable = self.channels.iter().any(|ch| ch.id == id && ch.writable());
         if let Some(attachments) = &self.attachments {
-            attachments.update(cx, |a, cx| a.set_scope(self.server, id, writable, cx));
+            attachments.update(cx, |a, cx| {
+                a.set_scope(Some(draft::ChatKey::channel(self.server, id)), writable, cx)
+            });
         }
         self.reads.clear();
         self.read_sent = 0;
@@ -342,7 +347,8 @@ impl Voxhold {
         self.history_reset_pending = false;
         self.hovered_message = 0;
         self.busy = false;
-        self.attachment_pending = None;
+        self.composer_error.clear();
+        self.clear_media(window);
         self.roster.reset_channel();
         self.roster.loading.clear();
         for (_, (image, _)) in self.roster.avatars.drain() {
@@ -354,7 +360,7 @@ impl Voxhold {
         self.show_channel_settings = false;
         self.show_server_settings = false;
         if let Some(attachments) = &self.attachments {
-            attachments.update(cx, |a, cx| a.set_scope(self.server, 0, false, cx));
+            attachments.update(cx, |a, cx| a.set_scope(None, false, cx));
         }
         if let Some(search) = &self.search {
             search.update(cx, |panel, cx| panel.set_scope(0, 0, cx));
@@ -376,10 +382,7 @@ impl Voxhold {
 
     pub(super) fn remove_current_server(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.servers.retain(|server| server.id != self.server);
-        self.drafts.retain(|(server, _), _| *server != self.server);
-        if let Some(attachments) = &self.attachments {
-            attachments.update(cx, |panel, _| panel.clear_server_drafts(self.server));
-        }
+        self.drafts.borrow_mut().clear_server(self.server);
         let next = self.servers.first().map_or(0, |server| server.id);
         self.channel = 0;
         self.select_server(next, window, cx);
@@ -461,10 +464,10 @@ impl Voxhold {
                             s.select_channel(channel, window, cx);
                         } else {
                             if s.channel != 0 {
-                                s.drafts.insert(
-                                    (s.server, s.channel),
-                                    s.composer.read(cx).value().to_string(),
-                                );
+                                let text = s.composer.read(cx).value().to_string();
+                                s.drafts
+                                    .borrow_mut()
+                                    .set_text(draft::ChatKey::channel(s.server, s.channel), &text);
                             }
                             s.channel = 0;
                             s.deleted_ids.clear();

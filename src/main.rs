@@ -6,15 +6,23 @@ mod attachments;
 mod auth;
 mod background;
 mod channel_settings;
+mod clipboard;
+mod draft;
+mod file_io;
 mod history;
 mod inbox;
 mod layout;
+mod links;
+mod media;
 mod members;
 mod message_tools;
+mod open_url;
 mod personal_settings;
 mod reactions;
 mod search;
 mod server_settings;
+#[cfg(test)]
+mod test_support;
 mod theme;
 #[cfg(feature = "voxhold-media")]
 mod voice_panel;

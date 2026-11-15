@@ -2,6 +2,7 @@ mod auth_view;
 mod composer;
 mod history_ops;
 mod history_view;
+mod media_ops;
 mod members_view;
 mod navigation_view;
 mod realtime;
@@ -24,14 +25,22 @@ use voxhold_api::{Channel, ChannelSubscription, Client, Member, Message, Server}
 #[cfg(feature = "voxhold-media")]
 use crate::voice_panel;
 use crate::{
-    attachments, auth, background, channel_settings, inbox, layout, members, message_tools,
-    personal_settings, reactions, search, server_settings, theme, window_chrome,
+    attachments, auth, background, channel_settings, draft, inbox, layout, links, media, members,
+    message_tools, personal_settings, reactions, search, server_settings, theme, window_chrome,
 };
 use ui::{icon, ink};
 
-/// (id, body revision, reactions revision, date divider, grouped, unread).
-/// The last three force a re-measure when only grouping or a divider changes.
-type HistoryKey = (i64, i64, i64, String, bool, bool);
+/// (id, body revision, reactions revision, date divider, grouped, unread,
+/// attachment epoch). The last four force a re-measure when only grouping, a
+/// divider or a server-side attachment deletion changes.
+type HistoryKey = (i64, i64, i64, String, bool, bool, u64);
+
+/// One in-flight send for a chat. The attempt number distinguishes two sends
+/// of the same chat; the abort handle stops the runtime task on logout.
+struct PendingSend {
+    attempt: u64,
+    abort: tokio::task::AbortHandle,
+}
 
 #[derive(Clone, Copy, Debug)]
 struct ScrollbarDrag {
@@ -58,7 +67,6 @@ pub(crate) struct Voxhold {
     tools_revision: u64,
     show_tools: bool,
     attachments: Option<Entity<attachments::Attachments>>,
-    attachment_pending: Option<(u64, String)>,
     settings: Option<Entity<personal_settings::PersonalSettings>>,
     show_settings: bool,
     channel_settings: Option<Entity<channel_settings::ChannelSettings>>,
@@ -122,6 +130,14 @@ pub(crate) struct Voxhold {
     /// Used by "К последним" after a quote opened a bounded context page.
     history_reset_pending: bool,
     hovered_message: i64,
+    /// Bumped when `attachments.changed` confirms a deletion, so the row
+    /// re-measures without touching the server revision.
+    attachment_epoch: u64,
+    /// Bounded thumbnails, link previews and the single image viewer.
+    media: media::Media,
+    /// One timer for the nearest preview retry gate.
+    preview_wakeup: Option<gpui::Task<()>>,
+    preview_wake_at: Option<std::time::Instant>,
     event_task: Option<tokio::task::JoinHandle<()>>,
     realtime_generation: u64,
     event_subscription: Option<tokio::sync::watch::Sender<Option<ChannelSubscription>>>,
@@ -136,9 +152,19 @@ pub(crate) struct Voxhold {
     server: i64,
     channel: i64,
     error: String,
+    /// Error or limit text shown next to the composer (Go `SendError`).
+    composer_error: String,
+    /// One confirmed send in flight per chat. The runtime task is aborted on
+    /// logout, so no POST starts after the session ended.
+    pending_sends: std::collections::HashMap<draft::ChatKey, PendingSend>,
+    /// Monotonic id of the latest send, stored in `PendingSend::attempt`.
+    send_attempt: u64,
+    /// Changes on login and logout; a send result from another session is
+    /// discarded even when it arrives after the channel was switched.
+    session_generation: u64,
     busy: bool,
     generation: u64,
-    drafts: std::collections::HashMap<(i64, i64), String>,
+    drafts: draft::Shared,
     auth: auth::AuthState,
     palette: theme::Palette,
     theme_mode: theme::ThemeMode,
@@ -232,7 +258,6 @@ impl Voxhold {
             tools_revision: 0,
             show_tools: false,
             attachments: None,
-            attachment_pending: None,
             settings: None,
             show_settings: false,
             channel_settings: None,
@@ -285,6 +310,10 @@ impl Voxhold {
             pending_jump: None,
             history_reset_pending: false,
             hovered_message: 0,
+            attachment_epoch: 0,
+            media: media::Media::default(),
+            preview_wakeup: None,
+            preview_wake_at: None,
             event_task: None,
             realtime_generation: 0,
             event_subscription: None,
@@ -297,9 +326,13 @@ impl Voxhold {
             server: 0,
             channel: 0,
             error: String::new(),
+            composer_error: String::new(),
+            pending_sends: Default::default(),
+            send_attempt: 0,
+            session_generation: 0,
             busy: false,
             generation: 0,
-            drafts: Default::default(),
+            drafts: draft::Drafts::shared(),
             auth: auth::AuthState::with_prefill(prefill),
             palette: theme::Palette::resolve(theme_mode, system_light),
             theme_mode,
@@ -327,6 +360,7 @@ impl Voxhold {
         );
         gpui_component::Theme::global_mut(cx).font_family = "Inter".into();
         window_chrome::apply(window, view.palette.light);
+        Self::bind_composer_keys(cx);
         view
     }
 }

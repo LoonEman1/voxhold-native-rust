@@ -204,6 +204,7 @@ impl Voxhold {
                         }
                     }
                 }
+                s.ensure_preview_timer(window, cx);
                 cx.notify();
             });
         })
@@ -219,9 +220,14 @@ impl Voxhold {
         cx.notify();
     }
 
-    /// Remove every cached picture of a deleted attachment and close the
-    /// viewer if it shows that file.
-    pub(super) fn purge_attachments(&mut self, ids: &[String], window: &mut Window) {
+    /// Remove every cached picture of a deleted attachment, close the viewer
+    /// if it shows that file and drop it from the save panel.
+    pub(super) fn purge_attachments(
+        &mut self,
+        ids: &[String],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         for id in ids {
             for image in self.media.remove_attachment(id) {
                 let _ = window.drop_image(image);
@@ -235,6 +241,39 @@ impl Voxhold {
                 self.close_viewer(window);
             }
         }
+        if let Some(attachments) = &self.attachments {
+            attachments.update(cx, |panel, cx| panel.remove_message_files(ids, cx));
+        }
+    }
+
+    /// Schedule one wakeup for the nearest preview retry gate. When it fires
+    /// the next frame re-requests the visible links without any user input.
+    pub(super) fn ensure_preview_timer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let now = Instant::now();
+        let Some(delay) = self.media.next_preview_retry(now) else {
+            return;
+        };
+        let at = now + delay;
+        if self
+            .preview_wake_at
+            .is_some_and(|scheduled| scheduled <= at)
+        {
+            return;
+        }
+        let generation = self.access_generation;
+        let timer = cx.background_executor().timer(delay);
+        let handle = cx.spawn_in(window, async move |this, window| {
+            timer.await;
+            let _ = this.update_in(window, |s, _window, cx| {
+                if s.access_generation != generation {
+                    return;
+                }
+                s.preview_wake_at = None;
+                cx.notify();
+            });
+        });
+        self.preview_wakeup = Some(handle);
+        self.preview_wake_at = Some(at);
     }
 
     /// Open the original picture on click. Reuses the single viewer and
@@ -246,6 +285,9 @@ impl Voxhold {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if file.deleted || self.media.is_purged(&file.id) {
+            return;
+        }
         if let Some(viewer) = &self.media.viewer {
             if viewer.key.attachment_id == file.id && viewer.key.chat == self.chat_key() {
                 return;
@@ -380,6 +422,8 @@ impl Voxhold {
     /// Close the viewer and release every cached private picture. Used when
     /// the access scope changes or the session ends.
     pub(super) fn clear_media(&mut self, window: &mut Window) {
+        self.preview_wakeup = None;
+        self.preview_wake_at = None;
         for image in self.media.clear() {
             let _ = window.drop_image(image);
         }

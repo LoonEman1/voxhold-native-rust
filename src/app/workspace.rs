@@ -19,7 +19,6 @@ impl Voxhold {
             self.voice_channel = 0;
         }
         self.server = id;
-        self.sending = false;
         self.composer_error.clear();
         self.clear_media(window);
         if let Some(attachments) = &self.attachments {
@@ -173,9 +172,10 @@ impl Voxhold {
         self.composer
             .update(cx, |input, cx| input.set_value(draft, window, cx));
         self.channel = id;
-        self.sending = false;
         self.composer_error.clear();
         self.close_viewer(window);
+        self.preview_wakeup = None;
+        self.preview_wake_at = None;
         let writable = self.channels.iter().any(|ch| ch.id == id && ch.writable());
         if let Some(attachments) = &self.attachments {
             attachments.update(cx, |a, cx| {
@@ -347,7 +347,6 @@ impl Voxhold {
         self.history_reset_pending = false;
         self.hovered_message = 0;
         self.busy = false;
-        self.sending = false;
         self.composer_error.clear();
         self.clear_media(window);
         self.roster.reset_channel();

@@ -34,10 +34,14 @@ impl Voxhold {
                 .any(|channel| channel.id == self.channel && channel.writable())
     }
 
+    pub(super) fn is_sending(&self) -> bool {
+        self.pending_sends.contains_key(&self.chat_key())
+    }
+
     /// Go `Editor.OnSubmit` / `Model.Send`: validate the draft, freeze one
     /// idempotent send and keep the text and files until the server confirms.
     pub(super) fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.busy || self.sending || !self.composer_writable() {
+        if self.busy || self.is_sending() || !self.composer_writable() {
             return;
         }
         let Some(client) = self.client.clone() else {
@@ -63,52 +67,67 @@ impl Voxhold {
                 return;
             }
         };
-        let plan_key = plan.key;
+        let plan_key = key;
         self.send_attempt = self.send_attempt.wrapping_add(1);
+        let attempt = self.send_attempt;
         let session = self.session_generation;
         let runtime = self.runtime.clone();
-        self.sending = true;
+        // The whole upload + POST chain runs as one runtime task so `abort()`
+        // really stops it; a GPUI task wrapping `block_on` would keep going.
+        let task = runtime.spawn(async move {
+            let ids = attachments::upload_draft(&client, &plan).await?;
+            let message = if plan.key.is_conversation() {
+                client
+                    .create_conversation_message(
+                        plan.key.channel,
+                        &plan.content,
+                        &plan.send_key,
+                        &ids,
+                    )
+                    .await
+            } else {
+                client
+                    .send_channel_message(
+                        plan.key.server,
+                        plan.key.channel,
+                        &plan.content,
+                        &plan.send_key,
+                        &ids,
+                        plan.reply,
+                        plan.key.root,
+                    )
+                    .await
+            };
+            message
+                .map(|message| (plan, message))
+                .map_err(|error| draft::describe_error(&error))
+        });
+        let abort = task.abort_handle();
+        self.pending_sends
+            .insert(key, PendingSend { attempt, abort });
         self.composer_error.clear();
         cx.notify();
-        let task = cx.background_spawn(async move {
-            runtime.block_on(async move {
-                let ids = attachments::upload_draft(&client, &plan).await?;
-                let message = if plan.key.is_conversation() {
-                    client
-                        .create_conversation_message(
-                            plan.key.channel,
-                            &plan.content,
-                            &plan.send_key,
-                            &ids,
-                        )
-                        .await
-                } else {
-                    client
-                        .send_channel_message(
-                            plan.key.server,
-                            plan.key.channel,
-                            &plan.content,
-                            &plan.send_key,
-                            &ids,
-                            plan.reply,
-                            plan.key.root,
-                        )
-                        .await
-                };
-                message
-                    .map(|message| (plan, message))
-                    .map_err(|error| draft::describe_error(&error))
-            })
-        });
-        let handle = cx.spawn_in(window, async move |this, window| {
+        cx.spawn_in(window, async move |this, window| {
             let result = task.await;
             let _ = this.update_in(window, |s, window, cx| {
-                // Logout aborts the task; the generation check also drops a
-                // result that raced with it.
+                // Logout aborts the task and bumps the session; a result from
+                // another session never touches the new one.
                 if s.session_generation != session {
                     return;
                 }
-                s.sending = false;
+                let current = s
+                    .pending_sends
+                    .get(&plan_key)
+                    .is_some_and(|pending| pending.attempt == attempt);
+                if !current {
+                    return;
+                }
+                s.pending_sends.remove(&plan_key);
+                let result = match result {
+                    Ok(Ok(value)) => Ok(value),
+                    Ok(Err(error)) => Err(error),
+                    Err(_aborted) => return,
+                };
                 let (plan, message) = match result {
                     Ok(value) => value,
                     Err(error) => {
@@ -130,11 +149,8 @@ impl Voxhold {
                 }
                 cx.notify();
             });
-        });
-        if self.send_tasks.len() >= 8 {
-            self.send_tasks.remove(0);
-        }
-        self.send_tasks.push(handle);
+        })
+        .detach();
     }
 
     /// Apply one confirmed send. Returns true when the composer must be
@@ -149,18 +165,13 @@ impl Voxhold {
         composer_now: &str,
     ) -> bool {
         let active = self.chat_key() == plan.key;
-        let text_now = if active {
-            composer_now
-        } else {
-            plan.composer_text.as_str()
-        };
         let sent_ids: Vec<String> = plan.files.iter().map(|file| file.id.clone()).collect();
         let finished = self.drafts.borrow_mut().finish_send(
             plan.key,
             plan.revision,
             &plan.composer_text,
             &sent_ids,
-            text_now,
+            active.then_some(composer_now),
         );
         if active && message.channel_id == self.channel && !self.deleted_ids.contains(&message.id) {
             self.merge_message(true, message);

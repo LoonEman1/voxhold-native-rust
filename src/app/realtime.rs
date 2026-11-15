@@ -83,7 +83,7 @@ impl Voxhold {
                     removed_attachments.extend(effect.attachments);
                 }
                 if !removed_attachments.is_empty() {
-                    s.purge_attachments(&removed_attachments, window);
+                    s.purge_attachments(&removed_attachments, window, cx);
                 }
                 if server_removed {
                     s.remove_current_server(window, cx);
@@ -157,6 +157,11 @@ impl Voxhold {
                     .and_modify(|row| merge_revision(row, message.clone()))
                     .or_insert(message);
             }
+        }
+        // An older page or a late event cannot resurrect a deleted attachment.
+        let purged = &self.media.purged;
+        if let Ok(index) = self.messages.binary_search_by_key(&id, |row| row.id) {
+            crate::history::apply_attachment_tombstones(&mut self.messages[index], purged);
         }
     }
 
@@ -330,14 +335,33 @@ impl Voxhold {
             }
             "attachments.changed" if !self.access_pending => {
                 if data["channel_id"].as_i64() == Some(self.channel) {
-                    if let Some(ids) = data["attachment_ids"].as_array() {
-                        for id in ids.iter().filter_map(serde_json::Value::as_str) {
-                            effect.attachments.push(id.to_string());
+                    let ids: Vec<String> = data["attachment_ids"]
+                        .as_array()
+                        .map(|values| {
+                            values
+                                .iter()
+                                .filter_map(serde_json::Value::as_str)
+                                .map(str::to_owned)
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    if ids.is_empty() {
+                        // The fallback for an event without a list.
+                        effect.resync = true;
+                    } else {
+                        for id in &ids {
+                            for message in &mut self.messages {
+                                for file in &mut message.attachments {
+                                    if file.id == *id {
+                                        file.deleted = true;
+                                    }
+                                }
+                            }
+                            self.media.mark_purged(id);
                         }
+                        self.attachment_epoch = self.attachment_epoch.wrapping_add(1);
+                        effect.attachments = ids;
                     }
-                    // The snapshot carries `deleted` on the attachment; a fresh
-                    // page also re-measures the row without a local revision.
-                    effect.resync = true;
                 }
             }
             "message.reactions_changed" if !self.access_pending => {

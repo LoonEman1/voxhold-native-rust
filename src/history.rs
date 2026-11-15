@@ -39,6 +39,20 @@ pub(crate) fn apply_reactions(message: &mut Message, update: voxhold_api::Reacti
     }
 }
 
+/// Keep a server-side attachment deletion even when an older page or a late
+/// event still says `deleted: false`. `purged` is the confirmed set from
+/// `attachments.changed`.
+pub(crate) fn apply_attachment_tombstones(
+    message: &mut Message,
+    purged: &std::collections::HashSet<String>,
+) {
+    for file in &mut message.attachments {
+        if purged.contains(&file.id) {
+            file.deleted = true;
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RowMeta {
     /// The row belongs to the previous author header.

@@ -7,9 +7,75 @@ use std::{
     net::TcpListener,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
+        Arc, Condvar, Mutex,
     },
+    time::Duration,
 };
+
+/// Holds one response until the test releases it. `arm` makes only the next
+/// gated requests block, so setup requests (history, members) are not caught.
+#[derive(Default)]
+pub struct Gate {
+    armed: AtomicBool,
+    arrived: (Mutex<bool>, Condvar),
+    released: (Mutex<bool>, Condvar),
+}
+
+impl Gate {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    pub fn arm(&self) {
+        *self.arrived.0.lock().unwrap() = false;
+        *self.released.0.lock().unwrap() = false;
+        self.armed.store(true, Ordering::SeqCst);
+    }
+
+    pub fn release(&self) {
+        self.armed.store(false, Ordering::SeqCst);
+        *self.released.0.lock().unwrap() = true;
+        self.released.1.notify_all();
+    }
+
+    /// Wait until a gated request reached the server.
+    pub fn wait_arrived(&self, timeout: Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut arrived = self.arrived.0.lock().unwrap();
+        while !*arrived {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                return false;
+            }
+            let (next, result) = self.arrived.1.wait_timeout(arrived, left).unwrap();
+            arrived = next;
+            if result.timed_out() && !*arrived {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn block_if_armed(&self) {
+        if !self.armed.load(Ordering::SeqCst) {
+            return;
+        }
+        *self.arrived.0.lock().unwrap() = true;
+        self.arrived.1.notify_all();
+        let mut released = self.released.0.lock().unwrap();
+        while !*released {
+            released = self
+                .released
+                .1
+                .wait_timeout(released, Duration::from_secs(10))
+                .unwrap()
+                .0;
+            if !*released {
+                break;
+            }
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct Recorded {
@@ -36,11 +102,12 @@ pub enum ReplyBody {
     File(std::path::PathBuf),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Reply {
     pub status: u16,
     pub body: ReplyBody,
     pub content_type: &'static str,
+    pub gate: Option<Arc<Gate>>,
 }
 
 impl Reply {
@@ -49,6 +116,7 @@ impl Reply {
             status,
             body: ReplyBody::Bytes(body.as_bytes().to_vec()),
             content_type: "application/json",
+            gate: None,
         }
     }
 
@@ -58,6 +126,7 @@ impl Reply {
             status,
             body: ReplyBody::Bytes(body),
             content_type: "image/png",
+            gate: None,
         }
     }
 
@@ -67,7 +136,13 @@ impl Reply {
             status,
             body: ReplyBody::File(path),
             content_type,
+            gate: None,
         }
+    }
+
+    pub fn with_gate(mut self, gate: Arc<Gate>) -> Self {
+        self.gate = Some(gate);
+        self
     }
 
     fn content_length(&self) -> u64 {
@@ -112,6 +187,9 @@ impl TestServer {
                     .get(index)
                     .cloned()
                     .unwrap_or(Reply::new(500, "{\"error\":\"unexpected request\"}"));
+                if let Some(gate) = &reply.gate {
+                    gate.block_if_armed();
+                }
                 let mut response = format!(
                     "HTTP/1.1 {} X\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                     reply.status,

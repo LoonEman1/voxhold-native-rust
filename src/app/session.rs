@@ -132,7 +132,9 @@ impl Voxhold {
 
     pub(super) fn logout(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.stop_realtime();
-        self.send_tasks.clear();
+        for (_, pending) in self.pending_sends.drain() {
+            pending.abort.abort();
+        }
         self.session_generation = self.session_generation.wrapping_add(1);
         #[cfg(feature = "voxhold-media")]
         if let Some(voice) = self.voice.take() {
@@ -160,7 +162,6 @@ impl Voxhold {
         self.reset_roster(window);
         self.error.clear();
         self.composer_error.clear();
-        self.sending = false;
         self.busy = false;
         self.clear_media(window);
         self.drafts.borrow_mut().clear_all();

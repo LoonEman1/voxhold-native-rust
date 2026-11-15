@@ -291,9 +291,9 @@ impl Render for Voxhold {
                 .attachments
                 .as_ref()
                 .is_some_and(|attachments| attachments.read(cx).is_reading());
-            let attachments_ready = self.attachments.is_some() && !self.sending && !reading;
+            let attachments_ready = self.attachments.is_some() && !self.is_sending() && !reading;
             let valid = draft::validate_send(&text, &files).is_ok();
-            let can_send = valid && !self.sending && !reading && !self.access_pending;
+            let can_send = valid && !self.is_sending() && !reading && !self.access_pending;
             if let Some(counter) = draft::counter(&text) {
                 chat = chat.child(
                     div()
@@ -332,7 +332,7 @@ impl Render for Voxhold {
                         .cursor_pointer()
                         .on_click(cx.listener(|s, _, w, cx| s.send(w, cx)))
                 })
-                .child(if self.sending {
+                .child(if self.is_sending() {
                     "Отправка…".into_any_element()
                 } else {
                     div()

@@ -702,6 +702,10 @@ fn writable_workspace(v: &mut Voxhold) {
     v.client = Some(Client::new("http://127.0.0.1:1").unwrap());
     v.server = 1;
     v.channel = 7;
+    // Keep the test scope free of the first-frame members request unless a
+    // test explicitly opens the panel.
+    v.shell_initialized = true;
+    v.show_members = false;
     v.channels.push(Channel {
         id: 7,
         kind: "text".into(),
@@ -758,7 +762,7 @@ async fn enter_sends_once_and_shift_enter_adds_a_newline(cx: &mut TestAppContext
     for _ in 0..600 {
         visual.run_until_parked();
         settled = view.read_with(&*visual, |v, cx| {
-            !v.sending && v.composer.read(cx).value().as_ref() == "первая\nвторая"
+            !v.is_sending() && v.composer.read(cx).value().as_ref() == "первая\nвторая"
         });
         if settled {
             break;
@@ -768,6 +772,30 @@ async fn enter_sends_once_and_shift_enter_adds_a_newline(cx: &mut TestAppContext
     assert!(settled, "the failed send must settle");
     let error = view.read_with(&*visual, |v, _| v.composer_error.clone());
     assert_eq!(error, "Не удалось связаться с сервером.");
+    // A retry of the unchanged draft reuses the same idempotency key.
+    let key = draft::ChatKey::channel(1, 7);
+    let first_key = view.read_with(&*visual, |v, _| {
+        v.drafts
+            .borrow()
+            .get(key)
+            .map(|draft| draft.send_key.clone())
+    });
+    assert!(first_key.as_ref().is_some_and(|key| !key.is_empty()));
+    visual.simulate_keystrokes("enter");
+    for _ in 0..200 {
+        visual.run_until_parked();
+        if !view.read_with(&*visual, |v, _| v.is_sending()) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let second_key = view.read_with(&*visual, |v, _| {
+        v.drafts
+            .borrow()
+            .get(key)
+            .map(|draft| draft.send_key.clone())
+    });
+    assert_eq!(first_key, second_key, "the retry keeps client_message_id");
     let draft = view.read_with(&*visual, |v, _| {
         v.drafts.borrow().text(draft::ChatKey::channel(1, 7))
     });

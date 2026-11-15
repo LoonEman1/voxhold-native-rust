@@ -357,20 +357,24 @@ impl Drafts {
         })
     }
 
-    /// Apply a confirmed send. Go compares `Draft.Revision`; the raw composer
-    /// text is compared as well because the UI can change between two sends.
+    /// Apply a confirmed send. `editor` is the live composer text only when
+    /// the chat from `key` is open; otherwise the draft's own text is used so a
+    /// later confirmation never overwrites an edit stored while switching.
     pub fn finish_send(
         &mut self,
         key: ChatKey,
         sent_revision: u64,
         sent_text: &str,
         sent_files: &[String],
-        composer_now: &str,
+        editor: Option<&str>,
     ) -> Finish {
         let Some(draft) = self.entries.get_mut(&key) else {
             return Finish::Cleared;
         };
-        if draft.revision == sent_revision && sent_text == composer_now {
+        let current_text = editor
+            .map(str::to_owned)
+            .unwrap_or_else(|| draft.text.clone());
+        if draft.revision == sent_revision && current_text == sent_text {
             let files = std::mem::take(&mut draft.files);
             for file in &files {
                 file.cleanup();
@@ -381,7 +385,10 @@ impl Drafts {
             draft.revision += 1;
             return Finish::Cleared;
         }
-        draft.text = composer_now.to_string();
+        if draft.text != current_text {
+            draft.text = current_text;
+            draft.revision += 1;
+        }
         let removed: Vec<_> = draft
             .files
             .iter()
@@ -665,7 +672,7 @@ mod tests {
         drafts.set_text(key, "отправлено");
         let plan = drafts.begin_send(key, "отправлено").unwrap();
         assert_eq!(
-            drafts.finish_send(key, plan.revision, "отправлено", &[], "отправлено"),
+            drafts.finish_send(key, plan.revision, "отправлено", &[], Some("отправлено")),
             Finish::Cleared
         );
         assert_eq!(drafts.text(key), "");
@@ -676,10 +683,32 @@ mod tests {
         let plan = drafts.begin_send(key, "новый текст").unwrap();
         drafts.set_text(key, "новый текст и ещё");
         assert_eq!(
-            drafts.finish_send(key, plan.revision, "новый текст", &[], "новый текст и ещё"),
+            drafts.finish_send(
+                key,
+                plan.revision,
+                "новый текст",
+                &[],
+                Some("новый текст и ещё")
+            ),
             Finish::Kept
         );
         assert_eq!(drafts.text(key), "новый текст и ещё");
+    }
+
+    #[test]
+    fn a_late_confirmation_keeps_the_edit_saved_while_switching() {
+        let mut drafts = Drafts::default();
+        let key = ChatKey::channel(1, 7);
+        drafts.set_text(key, "Первый");
+        let plan = drafts.begin_send(key, "Первый").unwrap();
+        // `select_channel` stores the live editor into the leaving draft.
+        drafts.set_text(key, "Второй");
+        assert_eq!(
+            drafts.finish_send(key, plan.revision, "Первый", &[], None),
+            Finish::Kept
+        );
+        assert_eq!(drafts.text(key), "Второй");
+        assert!(drafts.get(key).unwrap().send_key.is_empty());
     }
 
     #[test]
@@ -693,7 +722,13 @@ mod tests {
         let plan = drafts.begin_send(key, "с файлом").unwrap();
         drafts.add_files(key, vec![file("second.bin", 3)]);
         assert_eq!(
-            drafts.finish_send(key, plan.revision, "с файлом", &[first_id], "с файлом"),
+            drafts.finish_send(
+                key,
+                plan.revision,
+                "с файлом",
+                &[first_id],
+                Some("с файлом")
+            ),
             Finish::Kept
         );
         let files = drafts.files(key);

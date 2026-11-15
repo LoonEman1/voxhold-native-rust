@@ -93,12 +93,26 @@ impl Attachments {
         &self.error
     }
 
+    #[cfg(test)]
+    pub(crate) fn message_file_count(&self) -> usize {
+        self.message_files.len()
+    }
+
     fn can_edit(&self) -> bool {
         !self.loading && self.writable && self.key.is_some()
     }
 
     /// Open the system file dialog. Go reaches the same adapter from clipboard
     /// and drop; this is the visible entry point of the native composer.
+    /// Drop confirmed deleted files from the save list immediately, before a
+    /// history refresh can rebuild the selected message.
+    pub fn remove_message_files(&mut self, ids: &[String], cx: &mut Context<Self>) {
+        if self.message_files.iter().any(|file| ids.contains(&file.id)) {
+            self.message_files.retain(|file| !ids.contains(&file.id));
+            cx.notify();
+        }
+    }
+
     pub fn pick(&mut self, cx: &mut Context<Self>) {
         if !self.can_edit() {
             return;

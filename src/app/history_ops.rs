@@ -292,6 +292,7 @@ impl Voxhold {
             if let Some(update) = self.pending_reactions.get(&message.id).cloned() {
                 apply_reactions(&mut message, update);
             }
+            crate::history::apply_attachment_tombstones(&mut message, &self.media.purged);
             applied.push(message.id);
             merged.push(message);
         }

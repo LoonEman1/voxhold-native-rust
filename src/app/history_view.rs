@@ -39,6 +39,7 @@ impl Voxhold {
                     meta.date.clone().unwrap_or_default(),
                     meta.grouped,
                     meta.unread,
+                    self.attachment_epoch,
                 )
             })
             .collect();
@@ -148,13 +149,14 @@ impl Voxhold {
                 thumbs.insert(key, image);
             }
         }
-        for href in wanted_previews {
-            self.request_preview(href.clone(), window, cx);
-            if let Some(entry) = self.media.preview_entry(&href) {
-                let image = self.media.preview_images.get(&href);
-                previews.insert(href, (entry, image));
+        for preview in wanted_previews {
+            self.request_preview(preview.cache_url.clone(), window, cx);
+            if let Some(entry) = self.media.preview_entry(&preview.cache_url) {
+                let image = self.media.preview_images.get(&preview.cache_url);
+                previews.insert(preview.cache_url, (entry, image));
             }
         }
+        self.ensure_preview_timer(window, cx);
         let mut avatar_by_user = std::collections::HashMap::new();
         for ((user_id, version), (image, used)) in self.roster.avatars.iter_mut() {
             avatar_by_user.insert((*user_id, version.clone()), image.clone());
@@ -501,12 +503,13 @@ impl Voxhold {
             });
             // A card is reserved as soon as the message contains a link, so a
             // late metadata answer never grows the row.
-            for href in hrefs.iter().take(2) {
-                let (meta, image) = match previews_for_rows.get(href) {
+            for preview in hrefs.iter().take(2) {
+                let cache_url = &preview.cache_url;
+                let (meta, image) = match previews_for_rows.get(cache_url) {
                     Some((entry, image)) => (entry.meta.clone(), image.clone()),
                     None => (voxhold_api::LinkPreview::default(), None),
                 };
-                let labels = media::Media::preview_labels(href, &meta);
+                let labels = media::Media::preview_labels(cache_url, &meta);
                 let mut labels_column = div()
                     .flex_1()
                     .min_w(px(0.))
@@ -533,10 +536,10 @@ impl Voxhold {
                     );
                 }
                 let weak_link = weak_media.clone();
-                let target = href.clone();
+                let target = preview.open_href.clone();
                 let card = div()
                     .id(gpui::ElementId::Name(
-                        format!("link-card-{}-{}", id, href).into(),
+                        format!("link-card-{}-{}", id, cache_url).into(),
                     ))
                     .w_full()
                     .max_w(px(580.))

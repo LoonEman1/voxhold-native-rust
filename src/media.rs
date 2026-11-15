@@ -330,10 +330,18 @@ impl Media {
         self.purged.contains(id)
     }
 
+    /// Confirm a deletion before the event pump can release the GPU images.
+    pub fn mark_purged(&mut self, id: &str) {
+        self.purged.insert(id.to_string());
+        if self.purged.len() > 1024 {
+            self.purged.clear();
+        }
+    }
+
     /// Go `loadPreview`: a reusable entry is a successful preview or a
     /// permanent `400` failure without a retry gate. An expired transient
     /// failure returns `None` so the caller can retry it.
-    pub fn preview_entry(&mut self, href: &str) -> Option<PreviewEntry> {
+    pub fn preview_entry(&self, href: &str) -> Option<PreviewEntry> {
         let entry = self.previews.get(href)?;
         if entry.retry_at.is_none() {
             Some(entry.clone())
@@ -346,6 +354,15 @@ impl Media {
         self.preview_failures
             .get(href)
             .is_some_and(|(until, _)| now < *until)
+    }
+
+    /// Shortest remaining retry gate across all preview failures, used to
+    /// schedule the next wakeup without any scroll or input.
+    pub fn next_preview_retry(&self, now: Instant) -> Option<Duration> {
+        self.preview_failures
+            .values()
+            .map(|(until, _)| until.saturating_duration_since(now))
+            .min()
     }
 
     /// Whether this link already failed permanently (`400`): it is kept but
@@ -417,12 +434,17 @@ pub fn retry_delay(status: Option<u16>, already_failed: bool) -> Duration {
     }
 }
 
-/// Go `loadPreview` retry gate: a `400` means the URL will never preview.
+/// Go `loadPreview` retry gate: a `400` means the URL will never preview;
+/// `429` waits 15 s, any other transient failure 5 s, doubled after a repeat.
 pub fn preview_retry(status: Option<u16>, already_failed: bool) -> Option<Duration> {
     if status == Some(400) {
         return None;
     }
-    let base = Duration::from_secs(5);
+    let base = if status == Some(429) {
+        Duration::from_secs(15)
+    } else {
+        Duration::from_secs(5)
+    };
     Some(if already_failed { base * 2 } else { base })
 }
 
@@ -482,6 +504,7 @@ mod tests {
         assert_eq!(retry_delay(None, true), Duration::from_secs(10));
         assert_eq!(retry_delay(Some(429), true), Duration::from_secs(30));
         assert_eq!(preview_retry(Some(400), false), None);
+        assert_eq!(preview_retry(Some(400), true), None);
         assert_eq!(
             preview_retry(Some(404), false),
             Some(Duration::from_secs(5))
@@ -490,6 +513,42 @@ mod tests {
             preview_retry(Some(500), true),
             Some(Duration::from_secs(10))
         );
+        assert_eq!(
+            preview_retry(Some(429), false),
+            Some(Duration::from_secs(15))
+        );
+        assert_eq!(
+            preview_retry(Some(429), true),
+            Some(Duration::from_secs(30))
+        );
+    }
+
+    #[test]
+    fn the_next_preview_wakeup_is_the_shortest_gate() {
+        let mut media = Media::default();
+        let now = Instant::now();
+        let long = PreviewEntry {
+            retry_at: Some(now + Duration::from_secs(10)),
+            failed: true,
+            ..Default::default()
+        };
+        let short = PreviewEntry {
+            retry_at: Some(now + Duration::from_secs(3)),
+            failed: true,
+            ..Default::default()
+        };
+        media.put_preview("https://long.example.com/", long);
+        media.put_preview("https://short.example.com/", short);
+        let delay = media.next_preview_retry(now).expect("a gate");
+        assert!(delay <= Duration::from_secs(3));
+        assert!(delay > Duration::from_secs(2));
+        let past = PreviewEntry {
+            retry_at: Some(now - Duration::from_secs(1)),
+            failed: true,
+            ..Default::default()
+        };
+        media.put_preview("https://past.example.com/", past);
+        assert_eq!(media.next_preview_retry(now), Some(Duration::ZERO));
     }
 
     #[test]

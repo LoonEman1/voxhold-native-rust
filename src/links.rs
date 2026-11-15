@@ -13,16 +13,26 @@ pub struct TextLink {
     pub start: usize,
     /// Rune index after the last character.
     pub end: usize,
+    /// The exact address opened by a click: explicit `http://` and a `#fragment`
+    /// stay as written; a bare domain becomes `https://`.
     pub href: String,
 }
 
+/// One preview card. The cache key is normalized (HTTPS, no fragment) while a
+/// click opens the first original address of that key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreviewLink {
+    pub cache_url: String,
+    pub open_href: String,
+}
+
 /// Scan a message body. Returns the clickable links and up to two preview
-/// targets normalized to `https`, without a fragment.
-pub fn scan(content: &str) -> (Vec<TextLink>, Vec<String>) {
+/// keys, each with the address the card opens.
+pub fn scan(content: &str) -> (Vec<TextLink>, Vec<PreviewLink>) {
     let chars: Vec<char> = content.chars().collect();
     let code = code_spans(&chars);
     let mut links = Vec::new();
-    let mut previews: Vec<String> = Vec::new();
+    let mut previews: Vec<PreviewLink> = Vec::new();
     let mut index = 0;
     while index < chars.len() {
         let Some(len) = candidate_len(&chars, index) else {
@@ -42,14 +52,19 @@ pub fn scan(content: &str) -> (Vec<TextLink>, Vec<String>) {
             continue;
         }
         let value: String = chars[index..end].iter().collect();
-        if let Some(href) = normalize(&value) {
+        if let Some((open_href, cache_url)) = normalize(&value) {
             links.push(TextLink {
                 start: index,
                 end,
-                href: href.clone(),
+                href: open_href.clone(),
             });
-            if previews.len() < 2 && previews.first() != Some(&href) {
-                previews.push(href);
+            if previews.len() < 2
+                && previews.first().map(|item| &item.cache_url) != Some(&cache_url)
+            {
+                previews.push(PreviewLink {
+                    cache_url,
+                    open_href,
+                });
             }
         }
         index = end;
@@ -206,7 +221,9 @@ fn trim_end(value: &[char]) -> usize {
 
 /// Go normalization: http(s) only, no userinfo, `https` scheme, no fragment
 /// and an explicit root path.
-fn normalize(value: &str) -> Option<String> {
+/// Go normalization: `(open, cache)`. The click keeps the original scheme and
+/// fragment; the preview key is HTTPS without a fragment and with a root path.
+fn normalize(value: &str) -> Option<(String, String)> {
     let target = if value
         .get(..7)
         .is_some_and(|head| head.eq_ignore_ascii_case("http://"))
@@ -218,7 +235,7 @@ fn normalize(value: &str) -> Option<String> {
     } else {
         format!("https://{value}")
     };
-    let mut url = Url::parse(&target).ok()?;
+    let url = Url::parse(&target).ok()?;
     if !url.username().is_empty() || url.password().is_some() {
         return None;
     }
@@ -228,12 +245,14 @@ fn normalize(value: &str) -> Option<String> {
     if url.scheme() != "https" && url.scheme() != "http" {
         return None;
     }
-    url.set_scheme("https").ok()?;
-    url.set_fragment(None);
-    if url.path().is_empty() {
-        url.set_path("/");
+    let open_href = url.to_string();
+    let mut cache = url;
+    cache.set_scheme("https").ok()?;
+    cache.set_fragment(None);
+    if cache.path().is_empty() {
+        cache.set_path("/");
     }
-    Some(url.to_string())
+    Some((open_href, cache.to_string()))
 }
 
 #[cfg(test)]
@@ -245,7 +264,7 @@ mod tests {
     }
 
     #[test]
-    fn plain_and_bare_links_become_https() {
+    fn click_links_keep_their_original_scheme_and_fragment() {
         assert_eq!(
             hrefs("смотри https://example.com/a."),
             ["https://example.com/a"]
@@ -253,9 +272,13 @@ mod tests {
         assert_eq!(hrefs("example.com/path"), ["https://example.com/path"]);
         assert_eq!(
             hrefs("https://example.com/page#section"),
-            ["https://example.com/page"]
+            ["https://example.com/page#section"]
         );
         assert_eq!(hrefs("https://example.com"), ["https://example.com/"]);
+        assert_eq!(
+            hrefs("http://127.0.0.1:8080/docs#setup"),
+            ["http://127.0.0.1:8080/docs#setup"]
+        );
     }
 
     #[test]
@@ -283,9 +306,30 @@ mod tests {
         assert!(hrefs("x_example.com").is_empty());
         assert!(hrefs("@example.com").is_empty());
         assert!(hrefs("https://user:pass@example.com").is_empty());
-        assert!(hrefs("http://localhost:8080/health")
-            .iter()
-            .all(|href| href.starts_with("https://localhost:8080")));
+        assert_eq!(
+            hrefs("http://localhost:8080/health"),
+            ["http://localhost:8080/health"]
+        );
+    }
+
+    #[test]
+    fn preview_keys_are_https_without_a_fragment() {
+        let (links, previews) = scan("http://127.0.0.1:8080/docs#setup");
+        assert_eq!(links[0].href, "http://127.0.0.1:8080/docs#setup");
+        assert_eq!(previews.len(), 1);
+        assert_eq!(previews[0].cache_url, "https://127.0.0.1:8080/docs");
+        assert_eq!(previews[0].open_href, "http://127.0.0.1:8080/docs#setup");
+    }
+
+    #[test]
+    fn two_fragments_share_one_card_but_keep_two_click_addresses() {
+        let (links, previews) = scan("https://example.com/a#one and https://example.com/a#two");
+        assert_eq!(links.len(), 2);
+        assert_eq!(previews.len(), 1);
+        assert_eq!(previews[0].cache_url, "https://example.com/a");
+        assert_eq!(previews[0].open_href, "https://example.com/a#one");
+        assert_eq!(links[0].href, "https://example.com/a#one");
+        assert_eq!(links[1].href, "https://example.com/a#two");
     }
 
     #[test]
@@ -294,8 +338,9 @@ mod tests {
             "https://one.example.com https://one.example.com https://two.example.com https://three.example.com",
         );
         assert_eq!(links.len(), 4);
+        let cache: Vec<_> = previews.iter().map(|p| p.cache_url.clone()).collect();
         assert_eq!(
-            previews,
+            cache,
             ["https://one.example.com/", "https://two.example.com/"]
         );
     }

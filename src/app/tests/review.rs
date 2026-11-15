@@ -3,9 +3,11 @@
 
 use super::*;
 use super::{add_auth_window, focus_field, message_json, writable_workspace};
+use crate::test_support::{Gate, Reply, TestServer};
+use std::time::Duration;
 
 #[gpui::test]
-async fn attachments_changed_marks_the_file_and_requests_a_refresh(cx: &mut TestAppContext) {
+async fn attachments_changed_marks_the_file_without_waiting_for_history(cx: &mut TestAppContext) {
     cx.update(|cx| gpui_component::init(cx));
     let (_window, view) = add_auth_window(cx);
     cx.update(|app| {
@@ -24,12 +26,23 @@ async fn attachments_changed_marks_the_file_and_requests_a_refresh(cx: &mut Test
                 "deleted": false
             }]);
             v.merge_message(true, serde_json::from_value::<Message>(dto).unwrap());
+            let epoch = v.attachment_epoch;
             let effect = v.apply_realtime_event(
                 "attachments.changed",
                 &serde_json::json!({"channel_id": 7, "attachment_ids": [id]}),
             );
             assert_eq!(effect.attachments, vec![id.clone()]);
-            assert!(effect.resync, "the row is rebuilt from a fresh page");
+            assert!(!effect.resync, "the confirmed ids update the row in place");
+            assert!(v.messages[0].attachments[0].deleted);
+            assert!(
+                v.attachment_epoch > epoch,
+                "the row re-measures immediately"
+            );
+
+            // An event without a list keeps the history refresh as fallback.
+            let effect = v
+                .apply_realtime_event("attachments.changed", &serde_json::json!({"channel_id": 7}));
+            assert!(effect.resync);
         });
     });
 }
@@ -298,5 +311,280 @@ async fn channel_switch_applies_the_confirmation_to_the_original_draft(cx: &mut 
         assert_eq!(v.channel, 8);
         assert!(v.messages.is_empty(), "another chat keeps its own history");
         assert_eq!(v.composer.read(cx).value().as_ref(), "");
+    });
+}
+
+#[gpui::test]
+async fn logout_aborts_the_upload_before_the_post(cx: &mut TestAppContext) {
+    cx.update(|cx| gpui_component::init(cx));
+    let (window, view) = add_auth_window(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
+    let gate = Gate::new();
+    gate.arm();
+    let file_id = "a".repeat(32);
+    let attachment = format!(
+        "{{\"id\":\"{file_id}\",\"filename\":\"old.png\",\"mime_type\":\"image/png\",\"size_bytes\":4096,\"deleted\":false}}"
+    );
+    let message = message_json(9, 1, "файл").to_string();
+    let server = TestServer::spawn(vec![
+        Reply::new(200, &attachment).with_gate(gate.clone()),
+        Reply::new(201, &message).with_gate(gate.clone()),
+    ]);
+    let path = std::env::temp_dir().join(format!(
+        "voxhold-gate-{}-{}.png",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::write(&path, vec![7u8; 4096]).unwrap();
+    let file = draft::DraftFile::from_path(path.clone()).unwrap();
+    let key = draft::ChatKey::channel(1, 7);
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            writable_workspace(v);
+            v.client = Some(Client::new(&server.base).unwrap());
+            v.drafts.borrow_mut().add_files(key, vec![file]);
+            v.composer
+                .update(cx, |input, cx| input.set_value("файл", window, cx));
+            v.send(window, cx);
+        });
+    });
+    assert!(
+        gate.wait_arrived(Duration::from_secs(3)),
+        "the upload request reached the server"
+    );
+    // The PUT response is held; logout must abort the chain before the POST.
+    visual.update(|window, app| {
+        view.update(app, |v, cx| v.logout(window, cx));
+    });
+    gate.release();
+    for _ in 0..60 {
+        visual.run_until_parked();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let requests = server.requests();
+    assert!(
+        requests
+            .iter()
+            .all(|request| !request.path.contains("/messages")),
+        "no POST can begin after logout: {requests:?}"
+    );
+    assert_eq!(
+        requests.len(),
+        1,
+        "only the held upload was sent: {requests:?}"
+    );
+    assert_eq!(requests[0].method, "PUT");
+    view.read_with(&*visual, |v, _| {
+        assert!(v.drafts.borrow().text(key).is_empty());
+        assert!(!v.is_sending());
+    });
+    std::fs::remove_file(path).unwrap();
+}
+
+#[gpui::test]
+async fn one_chat_confirmation_does_not_clear_another_chat_send(cx: &mut TestAppContext) {
+    cx.update(|cx| gpui_component::init(cx));
+    let (window, view) = add_auth_window(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
+    let gate = Gate::new();
+    let message = message_json(9, 1, "ответ").to_string();
+    let replies = (0..8)
+        .map(|_| Reply::new(201, &message).with_gate(gate.clone()))
+        .collect();
+    let server = TestServer::spawn(replies);
+    let key_a = draft::ChatKey::channel(1, 7);
+    let key_b = draft::ChatKey::channel(1, 8);
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            writable_workspace(v);
+            v.client = Some(Client::new(&server.base).unwrap());
+            v.channels.push(Channel {
+                id: 8,
+                kind: "text".into(),
+                permissions: 3,
+                ..Default::default()
+            });
+            v.composer
+                .update(cx, |input, cx| input.set_value("первый", window, cx));
+            v.send(window, cx);
+        });
+    });
+    let mut first_done = false;
+    for _ in 0..200 {
+        visual.run_until_parked();
+        first_done = view.read_with(&*visual, |v, _| v.drafts.borrow().text(key_a).is_empty());
+        if first_done {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(first_done, "the first chat confirmed");
+
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            v.select_channel(8, window, cx);
+            v.composer
+                .update(cx, |input, cx| input.set_value("второй", window, cx));
+        });
+    });
+    gate.arm();
+    visual.update(|window, app| {
+        view.update(app, |v, cx| v.send(window, cx));
+    });
+    assert!(
+        gate.wait_arrived(Duration::from_secs(3)),
+        "the second chat POST reached the server"
+    );
+    view.read_with(&*visual, |v, _| {
+        assert!(v.is_sending(), "the second chat is still sending");
+        assert!(v.pending_sends.contains_key(&key_b));
+        assert_eq!(v.drafts.borrow().text(key_a), "");
+    });
+    gate.release();
+    let mut second_done = false;
+    for _ in 0..200 {
+        visual.run_until_parked();
+        second_done = view.read_with(&*visual, |v, _| v.drafts.borrow().text(key_b).is_empty());
+        if second_done {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(second_done, "the second chat confirmed after release");
+    view.read_with(&*visual, |v, _| {
+        assert!(!v.is_sending());
+        assert!(v.pending_sends.is_empty());
+    });
+}
+
+#[gpui::test]
+async fn a_late_confirmation_keeps_the_edit_and_the_new_attachment(cx: &mut TestAppContext) {
+    cx.update(|cx| gpui_component::init(cx));
+    let (window, view) = add_auth_window(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
+    let gate = Gate::new();
+    gate.arm();
+    let old_path = std::env::temp_dir().join(format!(
+        "voxhold-old-{}-{}.png",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    let new_path = std::env::temp_dir().join(format!(
+        "voxhold-new-{}-{}.png",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::write(&old_path, vec![1u8; 512]).unwrap();
+    std::fs::write(&new_path, vec![2u8; 512]).unwrap();
+    let old = draft::DraftFile::from_path(old_path.clone()).unwrap();
+    let new = draft::DraftFile::from_path(new_path.clone()).unwrap();
+    let old_id = old.id.clone();
+    let old_name = old.name.clone();
+    let attachment = format!(
+        "{{\"id\":\"{old_id}\",\"filename\":\"{old_name}\",\"mime_type\":\"image/png\",\"size_bytes\":512,\"deleted\":false}}"
+    );
+    let message = message_json(9, 1, "Первый").to_string();
+    let replies = (0..8)
+        .map(|index| {
+            if index == 0 {
+                Reply::new(200, &attachment).with_gate(gate.clone())
+            } else {
+                Reply::new(201, &message).with_gate(gate.clone())
+            }
+        })
+        .collect();
+    let server = TestServer::spawn(replies);
+    let key = draft::ChatKey::channel(1, 7);
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            writable_workspace(v);
+            v.client = Some(Client::new(&server.base).unwrap());
+            v.channels.push(Channel {
+                id: 8,
+                kind: "text".into(),
+                permissions: 3,
+                ..Default::default()
+            });
+            v.drafts.borrow_mut().add_files(key, vec![old]);
+            v.composer
+                .update(cx, |input, cx| input.set_value("Первый", window, cx));
+            v.send(window, cx);
+        });
+    });
+    assert!(gate.wait_arrived(Duration::from_secs(3)));
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            // Edit the text and add a second file, then leave the chat.
+            v.composer
+                .update(cx, |input, cx| input.set_value("Второй", window, cx));
+            v.drafts.borrow_mut().add_files(key, vec![new]);
+            v.select_channel(8, window, cx);
+        });
+    });
+    gate.release();
+    let mut done = false;
+    for _ in 0..200 {
+        visual.run_until_parked();
+        done = view.read_with(&*visual, |v, _| {
+            v.drafts
+                .borrow()
+                .files(key)
+                .iter()
+                .all(|file| !file.name.contains("voxhold-old-"))
+        });
+        if done {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(done, "the sent file was removed from the draft");
+    visual.update(|window, app| {
+        view.update(app, |v, cx| v.select_channel(7, window, cx));
+    });
+    view.read_with(&*visual, |v, cx| {
+        assert_eq!(v.composer.read(cx).value().as_ref(), "Второй");
+        let files = v.drafts.borrow().files(key);
+        assert_eq!(files.len(), 1);
+        assert!(files[0].name.contains("voxhold-new-"));
+    });
+    std::fs::remove_file(old_path).unwrap();
+    std::fs::remove_file(new_path).unwrap();
+}
+
+#[gpui::test]
+async fn deleting_an_attachment_drops_it_from_the_save_panel(cx: &mut TestAppContext) {
+    cx.update(|cx| gpui_component::init(cx));
+    let (window, view) = add_auth_window(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    let drafts = draft::Drafts::shared();
+    let id = "d".repeat(32);
+    let mut dto = message_json(1, 1, "файл");
+    dto["attachments"] = serde_json::json!([{
+        "id": id,
+        "filename": "photo.png",
+        "mime_type": "image/png",
+        "size_bytes": 12,
+        "width": 10,
+        "height": 10,
+        "deleted": false
+    }]);
+    let message: Message = serde_json::from_value(dto).unwrap();
+    let slot = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let captured = slot.clone();
+    visual.update(|window, app| {
+        view.update(app, |v, _| writable_workspace(v));
+        let (client, runtime) = view.read_with(app, |v, _| {
+            (v.client.clone().expect("client"), v.runtime.clone())
+        });
+        let panel = app
+            .new(|cx| attachments::Attachments::new(client, runtime, drafts.clone(), window, cx));
+        panel.update(app, |panel, cx| {
+            panel.set_scope(Some(draft::ChatKey::channel(1, 7)), true, cx);
+            panel.set_message(Some(&message), cx);
+            assert_eq!(panel.message_file_count(), 1);
+            panel.remove_message_files(&[id.clone()], cx);
+            assert_eq!(panel.message_file_count(), 0);
+        });
+        *captured.borrow_mut() = Some(panel);
     });
 }

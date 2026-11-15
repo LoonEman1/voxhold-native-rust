@@ -30,9 +30,17 @@ use crate::{
 };
 use ui::{icon, ink};
 
-/// (id, body revision, reactions revision, date divider, grouped, unread).
-/// The last three force a re-measure when only grouping or a divider changes.
-type HistoryKey = (i64, i64, i64, String, bool, bool);
+/// (id, body revision, reactions revision, date divider, grouped, unread,
+/// attachment epoch). The last four force a re-measure when only grouping, a
+/// divider or a server-side attachment deletion changes.
+type HistoryKey = (i64, i64, i64, String, bool, bool, u64);
+
+/// One in-flight send for a chat. The attempt number distinguishes two sends
+/// of the same chat; the abort handle stops the runtime task on logout.
+struct PendingSend {
+    attempt: u64,
+    abort: tokio::task::AbortHandle,
+}
 
 #[derive(Clone, Copy, Debug)]
 struct ScrollbarDrag {
@@ -122,8 +130,14 @@ pub(crate) struct Voxhold {
     /// Used by "К последним" after a quote opened a bounded context page.
     history_reset_pending: bool,
     hovered_message: i64,
+    /// Bumped when `attachments.changed` confirms a deletion, so the row
+    /// re-measures without touching the server revision.
+    attachment_epoch: u64,
     /// Bounded thumbnails, link previews and the single image viewer.
     media: media::Media,
+    /// One timer for the nearest preview retry gate.
+    preview_wakeup: Option<gpui::Task<()>>,
+    preview_wake_at: Option<std::time::Instant>,
     event_task: Option<tokio::task::JoinHandle<()>>,
     realtime_generation: u64,
     event_subscription: Option<tokio::sync::watch::Sender<Option<ChannelSubscription>>>,
@@ -140,12 +154,11 @@ pub(crate) struct Voxhold {
     error: String,
     /// Error or limit text shown next to the composer (Go `SendError`).
     composer_error: String,
-    /// One confirmed send in flight for this chat; the button is disabled.
-    sending: bool,
+    /// One confirmed send in flight per chat. The runtime task is aborted on
+    /// logout, so no POST starts after the session ended.
+    pending_sends: std::collections::HashMap<draft::ChatKey, PendingSend>,
+    /// Monotonic id of the latest send, stored in `PendingSend::attempt`.
     send_attempt: u64,
-    /// In-flight sends; cleared on logout so a slow upload cannot finish with
-    /// the old token. A later send must not cancel an earlier one.
-    send_tasks: Vec<gpui::Task<()>>,
     /// Changes on login and logout; a send result from another session is
     /// discarded even when it arrives after the channel was switched.
     session_generation: u64,
@@ -297,7 +310,10 @@ impl Voxhold {
             pending_jump: None,
             history_reset_pending: false,
             hovered_message: 0,
+            attachment_epoch: 0,
             media: media::Media::default(),
+            preview_wakeup: None,
+            preview_wake_at: None,
             event_task: None,
             realtime_generation: 0,
             event_subscription: None,
@@ -311,9 +327,8 @@ impl Voxhold {
             channel: 0,
             error: String::new(),
             composer_error: String::new(),
-            sending: false,
+            pending_sends: Default::default(),
             send_attempt: 0,
-            send_tasks: Vec::new(),
             session_generation: 0,
             busy: false,
             generation: 0,

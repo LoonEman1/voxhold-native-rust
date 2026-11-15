@@ -142,6 +142,8 @@ impl Voxhold {
         self.refresh_again = false;
         self.channel_snapshot_request = None;
         self.conversation_reaction_requests.clear();
+        self.search_permissions_request = None;
+        self.search_permissions_ready = false;
         self.pending_edits.clear();
         self.pending_reactions.clear();
         self.request_seq = self.request_seq.wrapping_add(1);
@@ -180,6 +182,7 @@ impl Voxhold {
                         Ok((channels, members)) => {
                             s.channels = channels;
                             s.members = members;
+                            s.search_permissions_ready = true;
                             s.sync_search_permissions(cx);
                         }
                         Err(e) => s.error = e,
@@ -243,6 +246,8 @@ impl Voxhold {
         self.reaction_requests.clear();
         self.conversation_reaction_requests.clear();
         self.channel_snapshot_request = None;
+        self.search_permissions_request = None;
+        self.search_permissions_ready = true;
         self.context_request = None;
         self.pending_jump = None;
         self.history_reset_pending = false;
@@ -366,6 +371,8 @@ impl Voxhold {
         self.refresh_again = false;
         self.channel_snapshot_request = None;
         self.conversation_reaction_requests.clear();
+        self.search_permissions_request = None;
+        self.search_permissions_ready = false;
         self.refresh_new_ids.clear();
         self.pending_edits.clear();
         self.pending_reactions.clear();
@@ -425,7 +432,7 @@ impl Voxhold {
         if let Some(search) = &self.search {
             search.update(cx, |panel, cx| {
                 panel.set_scope(0, 0, cx);
-                panel.set_allowed_channels(Default::default(), cx);
+                panel.set_permissions(Default::default(), false, cx);
             });
         }
         if let Some(settings) = &self.channel_settings {
@@ -475,6 +482,7 @@ impl Voxhold {
                 match result {
                     Ok((channels, members)) => {
                         s.channels = channels;
+                        s.search_permissions_ready = true;
                         s.sync_search_permissions(cx);
                         if let Ok(members) = members {
                             s.members = members;

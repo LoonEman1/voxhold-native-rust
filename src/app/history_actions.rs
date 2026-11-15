@@ -569,17 +569,91 @@ impl Voxhold {
     }
 
     /// Keep the search popup's permission snapshot aligned with the confirmed
-    /// channel rows. Only readable history channels may disclose a hit.
+    /// channel rows. While an access snapshot is being read, the popup stays
+    /// closed to queries and keeps no allowed ids.
     pub(super) fn sync_search_permissions(&mut self, cx: &mut Context<Self>) {
-        let allowed: std::collections::HashSet<i64> = self
-            .channels
-            .iter()
-            .filter(|channel| channel.has_history())
-            .map(|channel| channel.id)
-            .collect();
+        let ready = self.search_permissions_ready
+            && self.server > 0
+            && !self.access_pending
+            && !self.access_reload_in_flight;
+        let allowed: std::collections::HashSet<i64> = if ready {
+            self.channels
+                .iter()
+                .filter(|channel| channel.has_history())
+                .map(|channel| channel.id)
+                .collect()
+        } else {
+            Default::default()
+        };
         if let Some(search) = &self.search {
-            search.update(cx, |panel, cx| panel.set_allowed_channels(allowed, cx));
+            search.update(cx, |panel, cx| panel.set_permissions(allowed, ready, cx));
         }
+    }
+
+    /// Read a fresh channel list before a search from a personal conversation.
+    /// The popup stays unconfirmed until this answer is accepted.
+    pub(super) fn refresh_search_permissions(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.server <= 0 {
+            self.search_permissions_ready = false;
+            self.sync_search_permissions(cx);
+            return;
+        }
+        if self.search_permissions_request.is_some() {
+            self.sync_search_permissions(cx);
+            return;
+        }
+        let Some(client) = self.client.clone() else {
+            self.search_permissions_ready = false;
+            self.sync_search_permissions(cx);
+            return;
+        };
+        self.action_seq = self.action_seq.wrapping_add(1);
+        let request = self.action_seq;
+        self.search_permissions_request = Some(request);
+        self.search_permissions_ready = false;
+        self.sync_search_permissions(cx);
+        let (server, generation, access) = (self.server, self.generation, self.access_generation);
+        let runtime = self.runtime.clone();
+        let task = runtime.spawn(async move { client.channels(server).await });
+        cx.spawn_in(window, async move |this, window| {
+            let result = task.await;
+            let _ = this.update_in(window, |s, window, cx| {
+                if s.search_permissions_request != Some(request) {
+                    return;
+                }
+                s.search_permissions_request = None;
+                if s.server != server || s.generation != generation || s.access_generation != access
+                {
+                    return;
+                }
+                match result {
+                    Ok(Ok(channels)) => {
+                        s.channels = channels;
+                        s.search_permissions_ready = true;
+                        s.sync_search_permissions(cx);
+                    }
+                    Ok(Err(voxhold_api::Error::Http(403 | 404))) => {
+                        s.search_permissions_ready = false;
+                        if !s.in_conversation() {
+                            s.invalidate_access(window, cx);
+                        } else {
+                            s.sync_search_permissions(cx);
+                        }
+                    }
+                    _ => {
+                        // Keep the popup unconfirmed; the next open retries.
+                        s.search_permissions_ready = false;
+                        s.sync_search_permissions(cx);
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// Search and pin jumps validate the target against the current channel
@@ -647,6 +721,8 @@ impl Voxhold {
         self.action_seq = self.action_seq.wrapping_add(1);
         let request = self.action_seq;
         self.channel_snapshot_request = Some(request);
+        self.search_permissions_ready = false;
+        self.sync_search_permissions(cx);
         let (server, channel, generation, access) = (
             self.server,
             self.channel,
@@ -672,6 +748,7 @@ impl Voxhold {
                 }
                 if let Ok(channels) = result {
                     s.channels = channels;
+                    s.search_permissions_ready = true;
                     s.sync_search_permissions(cx);
                     let readable = s
                         .channels
@@ -690,6 +767,8 @@ impl Voxhold {
                             s.editing = None;
                         }
                     }
+                } else {
+                    s.sync_search_permissions(cx);
                 }
                 cx.notify();
             });
@@ -706,6 +785,8 @@ impl Voxhold {
         if self.server <= 0 {
             return;
         }
+        self.search_permissions_ready = false;
+        self.sync_search_permissions(cx);
         let (server, generation) = (self.server, self.generation);
         let runtime = self.runtime.clone();
         cx.spawn(async move |this, cx| {
@@ -719,8 +800,10 @@ impl Voxhold {
                     }
                     if let Ok(channels) = result {
                         s.channels = channels;
-                        cx.notify();
+                        s.search_permissions_ready = true;
                     }
+                    s.sync_search_permissions(cx);
+                    cx.notify();
                 })
                 .ok();
             }
@@ -773,7 +856,11 @@ impl Voxhold {
         } else {
             search::Mode::Search
         };
-        self.sync_search_permissions(cx);
+        if self.in_conversation() {
+            self.refresh_search_permissions(window, cx);
+        } else {
+            self.sync_search_permissions(cx);
+        }
         let (server, channel) = (self.server, self.channel);
         if let Some(panel) = &self.search {
             panel.update(cx, |panel, cx| {

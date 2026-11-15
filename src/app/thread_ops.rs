@@ -59,6 +59,11 @@ impl Voxhold {
             }));
             panel.set_target(target);
         });
+        let key = panel.read(cx).key();
+        if let Some(pending) = self.pending_sends.get(&key) {
+            let attempt = pending.attempt;
+            panel.update(cx, |panel, _| panel.set_pending(attempt));
+        }
         panel.update(cx, |panel, cx| panel.load_initial(cx));
         self.thread = Some(panel);
         self.show_thread = true;
@@ -86,15 +91,57 @@ impl Voxhold {
             })
     }
 
-    /// Confirmation for a thread POST owned by the workspace. The draft is
-    /// finished even when the panel was closed while the request was in
-    /// flight; the panel is repainted only for the same key and attempt.
-    #[allow(clippy::too_many_arguments)]
+    /// Start one idempotent thread POST. The attempt lives in `pending_sends`
+    /// under `ChatKey::thread`, so reopening the panel sees it and a logout
+    /// can abort it like a main-composer send.
+    pub(crate) fn start_thread_send(
+        &mut self,
+        plan: draft::SendPlan,
+        news: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<u64> {
+        if let Some(pending) = self.pending_sends.get(&plan.key) {
+            return Some(pending.attempt);
+        }
+        let client = self.client.clone()?;
+        self.send_attempt = self.send_attempt.wrapping_add(1);
+        let attempt = self.send_attempt;
+        let session = self.session_generation;
+        let access = self.access_generation;
+        let (server, channel, root) = (plan.key.server, plan.key.channel, plan.key.root);
+        let runtime = self.runtime.clone();
+        let content = plan.content.clone();
+        let send_key = plan.send_key.clone();
+        let task = runtime.spawn(async move {
+            client
+                .send_thread_message(server, channel, root, &content, &send_key, news)
+                .await
+        });
+        let abort = task.abort_handle();
+        self.pending_sends
+            .insert(plan.key, PendingSend { attempt, abort });
+        cx.spawn_in(window, async move |this, window| {
+            let result = match task.await {
+                Ok(result) => result,
+                Err(_) => Err(voxhold_api::Error::Network),
+            };
+            let _ = this.update_in(window, |s, window, cx| {
+                s.finish_thread_send(plan, attempt, access, session, result, window, cx);
+            });
+        })
+        .detach();
+        Some(attempt)
+    }
+
+    /// Confirmation for a thread POST owned by the workspace. Only the attempt
+    /// that still owns `pending_sends` may change the draft or retry key. The
+    /// draft is finished even when the panel was closed in the meantime; the
+    /// panel is repainted only for the same key and current access scope.
     pub(crate) fn finish_thread_send(
         &mut self,
         plan: draft::SendPlan,
         attempt: u64,
-        generation: u64,
         access: u64,
         session: u64,
         result: Result<Message, voxhold_api::Error>,
@@ -104,10 +151,19 @@ impl Voxhold {
         if self.session_generation != session {
             return;
         }
-        let active = self
-            .thread
-            .as_ref()
-            .is_some_and(|panel| panel.read(cx).key() == plan.key);
+        let owns = self
+            .pending_sends
+            .get(&plan.key)
+            .is_some_and(|pending| pending.attempt == attempt);
+        if !owns {
+            return;
+        }
+        self.pending_sends.remove(&plan.key);
+        let active = self.access_generation == access
+            && self
+                .thread
+                .as_ref()
+                .is_some_and(|panel| panel.read(cx).key() == plan.key);
         let mut clear = false;
         if result.is_ok() {
             let composer_now = if active {
@@ -130,9 +186,7 @@ impl Voxhold {
         if active {
             if let Some(panel) = &self.thread {
                 panel.update(cx, |panel, cx| {
-                    panel.apply_send_result(
-                        attempt, generation, access, plan.key, &result, clear, window, cx,
-                    )
+                    panel.apply_send_result(attempt, plan.key, &result, clear, window, cx)
                 });
             }
         }

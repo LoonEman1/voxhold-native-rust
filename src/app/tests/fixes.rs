@@ -462,14 +462,27 @@ async fn thread_send_is_independent_from_paging_and_keeps_edits(cx: &mut TestApp
         let runtime = view.read_with(app, |v, _| v.runtime.clone());
         let drafts = view.read_with(app, |v, _| v.drafts.clone());
         let root = serde_json::from_value::<Message>(message_json(5, 1, "root")).unwrap();
-        let panel = app
-            .new(|cx| ThreadPanel::new(client, runtime, 1, 7, root, true, 0, drafts, window, cx));
+        let panel = app.new(|cx| {
+            ThreadPanel::new(
+                client.clone(),
+                runtime,
+                1,
+                7,
+                root,
+                true,
+                0,
+                drafts,
+                window,
+                cx,
+            )
+        });
         let owner = view.downgrade();
         panel.update(app, |panel, _| {
             panel.set_context(false, owner, 0);
             panel.set_read_for_test(1000);
         });
         view.update(app, |v, _| {
+            v.client = Some(client);
             v.server = 1;
             v.channel = 7;
             v.thread = Some(panel.clone());
@@ -761,14 +774,27 @@ async fn closing_the_thread_finishes_the_original_draft(cx: &mut TestAppContext)
         let runtime = view.read_with(app, |v, _| v.runtime.clone());
         let drafts = view.read_with(app, |v, _| v.drafts.clone());
         let root = serde_json::from_value::<Message>(message_json(5, 1, "root")).unwrap();
-        let panel = app
-            .new(|cx| ThreadPanel::new(client, runtime, 1, 7, root, true, 0, drafts, window, cx));
+        let panel = app.new(|cx| {
+            ThreadPanel::new(
+                client.clone(),
+                runtime,
+                1,
+                7,
+                root,
+                true,
+                0,
+                drafts,
+                window,
+                cx,
+            )
+        });
         let owner = view.downgrade();
         panel.update(app, |panel, _| {
             panel.set_context(false, owner, 0);
             panel.set_read_for_test(1000);
         });
         view.update(app, |v, _| {
+            v.client = Some(client);
             v.server = 1;
             v.channel = 7;
             v.thread = Some(panel.clone());

@@ -30,6 +30,9 @@ pub struct ThreadPanel {
     owner: Option<WeakEntity<Voxhold>>,
     session: u64,
     deleted: HashSet<i64>,
+    /// A latest-page GET owns the rows that arrive while it is in flight.
+    latest_loading: bool,
+    refresh_new_ids: HashSet<i64>,
     messages: Vec<Message>,
     before: Option<i64>,
     has_more: bool,
@@ -101,6 +104,8 @@ impl ThreadPanel {
             owner: None,
             session: 0,
             deleted: HashSet::new(),
+            latest_loading: false,
+            refresh_new_ids: HashSet::new(),
             messages: Vec::new(),
             before: None,
             has_more: false,
@@ -210,7 +215,20 @@ impl ThreadPanel {
         target: Option<i64>,
         anchored: bool,
     ) {
-        self.apply_page(page, before, target, anchored);
+        self.apply_page(page, before, target, anchored, &HashSet::new());
+    }
+
+    #[cfg(test)]
+    pub fn begin_latest_for_test(&mut self) {
+        self.latest_loading = true;
+        self.refresh_new_ids.clear();
+    }
+
+    #[cfg(test)]
+    pub fn apply_latest_page_for_test(&mut self, page: voxhold_api::MessagePage) {
+        let new_ids = std::mem::take(&mut self.refresh_new_ids);
+        self.latest_loading = false;
+        self.apply_page(page, 0, None, false, &new_ids);
     }
 
     pub fn load_initial(&mut self, cx: &mut Context<Self>) {
@@ -238,6 +256,11 @@ impl ThreadPanel {
         let request = self.request;
         let (server, channel, root) = (self.server, self.channel, self.root.id);
         let target = self.target.filter(|_| before == 0);
+        let latest = before == 0 && target.is_none();
+        if latest {
+            self.latest_loading = true;
+            self.refresh_new_ids.clear();
+        }
         let generation = self.generation;
         let access = self.access;
         let client = self.client.clone();
@@ -268,9 +291,15 @@ impl ThreadPanel {
                         return;
                     }
                     s.loading = false;
+                    let new_ids = if latest {
+                        s.latest_loading = false;
+                        std::mem::take(&mut s.refresh_new_ids)
+                    } else {
+                        HashSet::new()
+                    };
                     match result {
                         Ok((page, anchored)) => {
-                            s.apply_page(page, before, target, anchored);
+                            s.apply_page(page, before, target, anchored, &new_ids);
                             s.mark_visible(s.messages.last().map_or(0, |message| message.id), cx);
                         }
                         Err(error) => s.error = error.to_string(),
@@ -290,6 +319,7 @@ impl ThreadPanel {
         before: i64,
         target: Option<i64>,
         anchored: bool,
+        new_ids: &HashSet<i64>,
     ) {
         let mut current: std::collections::HashMap<i64, Message> =
             std::mem::take(&mut self.messages)
@@ -302,28 +332,38 @@ impl ThreadPanel {
             for row in page.messages {
                 self.apply_change(row);
             }
-        } else if target.is_none() && self.initial && !self.anchored && !page.messages.is_empty() {
-            let first = page.messages.first().map_or(0, |message| message.id);
-            let last = page
-                .messages
-                .iter()
-                .map(|message| message.id)
-                .max()
-                .unwrap_or(0);
-            // Keep older pages and rows created while this page was in
-            // flight. Rows inside the window that the server omitted stay
-            // deleted, and a matched row keeps its newer WS/post revision.
-            for row in current.values() {
-                if row.id < first || row.id > last {
-                    self.apply_change(row.clone());
+        } else if target.is_none() && !self.anchored {
+            if page.messages.is_empty() {
+                // A WS comment or a confirmed POST that arrived while the
+                // latest page was in flight survives an empty answer.
+                self.messages = current
+                    .into_values()
+                    .filter(|row| new_ids.contains(&row.id) && !self.deleted.contains(&row.id))
+                    .collect();
+                self.messages.sort_by_key(|message| message.id);
+            } else {
+                let first = page.messages.first().map_or(0, |message| message.id);
+                let last = page
+                    .messages
+                    .iter()
+                    .map(|message| message.id)
+                    .max()
+                    .unwrap_or(0);
+                // Keep older pages and rows created while this page was in
+                // flight. Rows inside the window that the server omitted stay
+                // deleted, and a matched row keeps its newer WS/post revision.
+                for row in current.values() {
+                    if row.id < first || row.id > last || new_ids.contains(&row.id) {
+                        self.apply_change(row.clone());
+                    }
                 }
-            }
-            for mut row in page.messages {
-                if let Some(mut existing) = current.remove(&row.id) {
-                    history::merge_revision(&mut existing, row);
-                    row = existing;
+                for mut row in page.messages {
+                    if let Some(mut existing) = current.remove(&row.id) {
+                        history::merge_revision(&mut existing, row);
+                        row = existing;
+                    }
+                    self.apply_change(row);
                 }
-                self.apply_change(row);
             }
         } else {
             let mut next = Vec::with_capacity(page.messages.len());
@@ -362,6 +402,9 @@ impl ThreadPanel {
             }
             history::merge_revision(existing, message);
             return;
+        }
+        if self.latest_loading {
+            self.refresh_new_ids.insert(message.id);
         }
         let index = self
             .messages
@@ -478,72 +521,61 @@ impl ThreadPanel {
                 return;
             }
         };
-        let client = self.client.clone();
-        let (server, channel, root) = (self.server, self.channel, self.root.id);
-        let runtime = self.runtime.clone();
-        self.send_attempt = self.send_attempt.wrapping_add(1);
-        let attempt = self.send_attempt;
-        let generation = self.generation;
-        let access = self.access;
-        let session = self.session;
         let news = self.news;
         let owner = self.owner.clone();
         let Some(owner) = owner else {
             self.sending = false;
             return;
         };
+        // The workspace owns the in-flight POST in `pending_sends` keyed by
+        // `ChatKey::thread`, so a reopened panel sees the same attempt.
+        let attempt = owner
+            .update(cx, |view, cx| {
+                view.start_thread_send(plan, news, window, cx)
+            })
+            .ok()
+            .flatten();
+        match attempt {
+            Some(attempt) => {
+                self.send_attempt = attempt;
+                self.sending = true;
+                self.send_error.clear();
+            }
+            None => {
+                self.sending = false;
+                self.send_error = "Не удалось отправить комментарий.".into();
+            }
+        }
+        cx.notify();
+    }
+
+    /// A reopened panel must keep showing "Отправка…" for the attempt that is
+    /// still in `pending_sends`.
+    pub fn set_pending(&mut self, attempt: u64) {
+        self.send_attempt = attempt;
         self.sending = true;
         self.send_error.clear();
-        let content = plan.content.clone();
-        let send_key = plan.send_key.clone();
-        // Start the HTTP work on the runtime directly: a gated POST must reach
-        // the server even while the foreground executor is idle.
-        let task = runtime.spawn(async move {
-            client
-                .send_thread_message(server, channel, root, &content, &send_key, news)
-                .await
-        });
-        // The confirmation belongs to the workspace, not to this entity: a
-        // closed panel must still finish the original draft.
-        window
-            .spawn(cx, async move |cx| {
-                let result = match task.await {
-                    Ok(result) => result,
-                    Err(_) => Err(voxhold_api::Error::Network),
-                };
-                let _ = cx.update(|window, cx| {
-                    if let Some(view) = owner.upgrade() {
-                        view.update(cx, |view, cx| {
-                            view.finish_thread_send(
-                                plan, attempt, generation, access, session, result, window, cx,
-                            )
-                        });
-                    }
-                });
-            })
-            .detach();
-        cx.notify();
+    }
+
+    #[cfg(test)]
+    pub fn attempt(&self) -> u64 {
+        self.send_attempt
     }
 
     /// Apply one accepted send to the still-open panel. The load request id is
     /// deliberately not part of this check: paging while a POST is in flight
-    /// must not leave the composer stuck on "Отправка…".
+    /// must not leave the composer stuck on "Отправка…". Only the attempt that
+    /// owns the pending POST may change the composer or apply the row.
     pub fn apply_send_result(
         &mut self,
         attempt: u64,
-        generation: u64,
-        access: u64,
         key: ChatKey,
         result: &Result<Message, voxhold_api::Error>,
         clear: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.send_attempt != attempt
-            || self.key != key
-            || self.generation != generation
-            || self.access != access
-        {
+        if self.send_attempt != attempt || self.key != key {
             return;
         }
         self.sending = false;

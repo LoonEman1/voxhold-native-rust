@@ -174,6 +174,8 @@ impl Voxhold {
         self.reaction_requests.clear();
         self.conversation_reaction_requests.clear();
         self.channel_snapshot_request = None;
+        self.search_permissions_request = None;
+        self.search_permissions_ready = false;
         self.context_request = None;
         self.pending_jump = None;
         self.history_reset_pending = false;

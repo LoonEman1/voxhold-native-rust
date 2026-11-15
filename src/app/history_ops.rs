@@ -534,24 +534,47 @@ impl Voxhold {
         {
             return;
         }
-        if !self.conversation_reaction_requests.insert(message_id) {
+        let chat = self.chat_key();
+        let key = (chat, message_id);
+        if let Some(active) = self.conversation_reaction_requests.get_mut(&key) {
+            // A second event owns one repeat after the active answer. It must
+            // not start a parallel GET or free the first request's slot.
+            active.again = true;
             return;
         }
         let Some(client) = self.client.clone() else {
-            self.conversation_reaction_requests.remove(&message_id);
             return;
         };
-        let (generation, access, chat) = (self.generation, self.access_generation, self.chat_key());
+        self.action_seq = self.action_seq.wrapping_add(1);
+        let request = self.action_seq;
+        self.conversation_reaction_requests.insert(
+            key,
+            ConversationReactionRequest {
+                request,
+                again: false,
+            },
+        );
+        let (generation, access) = (self.generation, self.access_generation);
         let runtime = self.runtime.clone();
         let before = message_id.saturating_add(1);
-        let task = cx.background_spawn(async move {
-            runtime.block_on(client.conversation_messages(conversation_id, before))
-        });
+        let task = runtime
+            .spawn(async move { client.conversation_messages(conversation_id, before).await });
         cx.spawn(async move |this, cx| {
-            let result = task.await;
+            let result = match task.await {
+                Ok(result) => result,
+                Err(_) => Err(voxhold_api::Error::Network),
+            };
             if let Some(this) = this.upgrade() {
                 this.update(cx, |s, cx| {
-                    s.conversation_reaction_requests.remove(&message_id);
+                    let Some(active) = s.conversation_reaction_requests.get_mut(&key) else {
+                        return;
+                    };
+                    if active.request != request {
+                        // A late callback may only free the slot it owns.
+                        return;
+                    }
+                    let again = std::mem::take(&mut active.again);
+                    s.conversation_reaction_requests.remove(&key);
                     if s.generation != generation
                         || s.access_generation != access
                         || s.chat_key() != chat
@@ -577,6 +600,9 @@ impl Voxhold {
                         if let Some(row) = s.messages.iter_mut().find(|row| row.id == message_id) {
                             apply_reactions(row, update);
                         }
+                    }
+                    if again {
+                        s.refresh_conversation_reaction(conversation_id, message_id, cx);
                     }
                     cx.notify();
                 })

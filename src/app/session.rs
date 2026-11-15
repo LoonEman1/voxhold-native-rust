@@ -213,6 +213,9 @@ impl Voxhold {
         self.channel_reads.clear();
         self.unread_after = 0;
         self.reaction_requests.clear();
+        self.conversation_reaction_requests.clear();
+        self.search_permissions_request = None;
+        self.search_permissions_ready = false;
         self.recent_reactions.borrow_mut().clear();
         self.scrollbar_drag = None;
         self.context_request = None;

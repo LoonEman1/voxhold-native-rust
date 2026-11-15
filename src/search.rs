@@ -46,6 +46,9 @@ pub struct SearchPanel {
     results: Vec<SearchResult>,
     pins: Vec<Message>,
     allowed_channels: HashSet<i64>,
+    /// No query or result may paint until the channel ACL snapshot used by the
+    /// popup is confirmed by the current access generation.
+    permissions_ready: bool,
     next: Option<i64>,
     has_more: bool,
     loading: bool,
@@ -96,6 +99,7 @@ impl SearchPanel {
             results: Vec::new(),
             pins: Vec::new(),
             allowed_channels: HashSet::new(),
+            permissions_ready: false,
             next: None,
             has_more: false,
             loading: false,
@@ -124,10 +128,12 @@ impl SearchPanel {
     /// keeps the cursor of the original API page, so a fully filtered page can
     /// still be followed by the next one. A changed snapshot invalidates every
     /// in-flight search answer and existing row.
-    pub fn set_allowed_channels(&mut self, allowed: HashSet<i64>, cx: &mut Context<Self>) {
-        if self.allowed_channels == allowed {
+    pub fn set_permissions(&mut self, allowed: HashSet<i64>, ready: bool, cx: &mut Context<Self>) {
+        let allowed = if ready { allowed } else { HashSet::new() };
+        if self.permissions_ready == ready && self.allowed_channels == allowed {
             return;
         }
+        self.permissions_ready = ready;
         self.allowed_channels = allowed;
         self.request = self.request.wrapping_add(1);
         self.pins_request = self.pins_request.wrapping_add(1);
@@ -141,6 +147,10 @@ impl SearchPanel {
         self.pins_loading = false;
         self.pins_error.clear();
         cx.notify();
+    }
+
+    pub fn set_allowed_channels(&mut self, allowed: HashSet<i64>, cx: &mut Context<Self>) {
+        self.set_permissions(allowed, true, cx);
     }
 
     fn filter_results(&self, results: Vec<SearchResult>) -> Vec<SearchResult> {
@@ -223,6 +233,7 @@ impl SearchPanel {
         self.pins_loading = false;
         self.error.clear();
         self.pins_error.clear();
+        self.permissions_ready = false;
         cx.notify();
     }
 
@@ -243,7 +254,7 @@ impl SearchPanel {
 
     fn submit(&mut self, cx: &mut Context<Self>) {
         let query = self.query.read(cx).value().trim().to_string();
-        if query.is_empty() || self.server <= 0 {
+        if !self.permissions_ready || query.is_empty() || self.server <= 0 {
             return;
         }
         self.request = self.request.wrapping_add(1);
@@ -291,7 +302,7 @@ impl SearchPanel {
     }
 
     fn load_more(&mut self, cx: &mut Context<Self>) {
-        if self.loading || self.loading_more || !self.has_more {
+        if !self.permissions_ready || self.loading || self.loading_more || !self.has_more {
             return;
         }
         let Some(before) = self.next.filter(|id| *id > 0) else {
@@ -344,7 +355,7 @@ impl SearchPanel {
     }
 
     fn load_pins(&mut self, cx: &mut Context<Self>) {
-        if self.server <= 0 || self.channel <= 0 {
+        if !self.permissions_ready || self.server <= 0 || self.channel <= 0 {
             return;
         }
         self.pins_request = self.pins_request.wrapping_add(1);
@@ -453,6 +464,16 @@ impl SearchPanel {
     pub(crate) fn has_more(&self) -> bool {
         self.has_more
     }
+
+    #[cfg(test)]
+    pub(crate) fn permissions_ready(&self) -> bool {
+        self.permissions_ready
+    }
+
+    #[cfg(test)]
+    pub(crate) fn allowed_for_test(&self) -> &HashSet<i64> {
+        &self.allowed_channels
+    }
 }
 
 impl Render for SearchPanel {
@@ -525,7 +546,14 @@ impl Render for SearchPanel {
             .flex()
             .flex_col()
             .gap_1();
-        if self.mode == Mode::Pins {
+        if !self.permissions_ready {
+            list = list.child(
+                div()
+                    .text_size(px(12.))
+                    .text_color(crate::ink(p.muted))
+                    .child("Проверка доступа…"),
+            );
+        } else if self.mode == Mode::Pins {
             if self.pins_loading {
                 list = list.child(
                     div()
@@ -785,6 +813,17 @@ mod tests {
                 .iter()
                 .all(|hit| hit.channel_name != "closed"));
         });
+        // Re-reading the channel list clears previously painted rows before
+        // the new snapshot is confirmed.
+        visual.update(|_window, app| {
+            view.update(app, |panel, cx| {
+                panel.set_permissions(HashSet::new(), false, cx)
+            });
+        });
+        view.read_with(&*visual, |panel, _| {
+            assert!(!panel.permissions_ready());
+            assert!(panel.results().is_empty());
+        });
     }
 
     #[gpui::test]
@@ -817,8 +856,17 @@ mod tests {
         assert!(gate.wait_arrived(Duration::from_secs(3)));
         visual.update(|_window, app| {
             view.update(app, |panel, cx| {
-                panel.set_allowed_channels(HashSet::new(), cx)
+                panel.set_permissions(HashSet::new(), false, cx);
+                panel.submit_for_test(cx);
             });
+        });
+        view.read_with(&*visual, |panel, _| {
+            assert!(!panel.permissions_ready());
+            assert!(
+                !panel.search_loading(),
+                "an unconfirmed search cannot start"
+            );
+            assert!(panel.results().is_empty());
         });
         gate.release();
         wait_panel(&mut visual, &view, |panel| !panel.search_loading());

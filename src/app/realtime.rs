@@ -108,8 +108,6 @@ impl Voxhold {
                 if pins {
                     s.refresh_pins(cx);
                 }
-                conversation_reactions.sort_unstable();
-                conversation_reactions.dedup();
                 for (conversation, message) in conversation_reactions {
                     s.refresh_conversation_reaction(conversation, message, cx);
                 }

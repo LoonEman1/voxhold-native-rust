@@ -80,6 +80,14 @@ struct ActionRequest {
     request: u64,
 }
 
+/// One reaction-only GET for a loaded personal message. A second event while
+/// the GET is active only sets `again`; the completion starts one repeat.
+#[derive(Clone, Debug)]
+struct ConversationReactionRequest {
+    request: u64,
+    again: bool,
+}
+
 #[derive(Clone, Debug)]
 struct ForwardState {
     message_id: i64,
@@ -101,6 +109,10 @@ pub(crate) struct Voxhold {
     self_user_id: i64,
     search: Option<Entity<search::SearchPanel>>,
     show_search: bool,
+    /// The search popup may only query against a channel snapshot confirmed
+    /// for the current server/access generation.
+    search_permissions_ready: bool,
+    search_permissions_request: Option<u64>,
     thread: Option<Entity<thread_panel::ThreadPanel>>,
     show_thread: bool,
     message_menu: Option<MessageMenu>,
@@ -180,7 +192,8 @@ pub(crate) struct Voxhold {
     reaction_requests: std::collections::HashSet<(i64, String)>,
     /// One reaction-only refresh per personal message. The answer is merged
     /// into the loaded window instead of replacing it with the latest page.
-    conversation_reaction_requests: std::collections::HashSet<i64>,
+    conversation_reaction_requests:
+        std::collections::HashMap<(draft::ChatKey, i64), ConversationReactionRequest>,
     recent_reactions: reactions::SharedRecents,
     /// Custom history scrollbar drag captured from the root pointer handler.
     scrollbar_drag: Option<ScrollbarDrag>,
@@ -321,6 +334,8 @@ impl Voxhold {
             self_user_id: 0,
             search: None,
             show_search: false,
+            search_permissions_ready: false,
+            search_permissions_request: None,
             thread: None,
             show_thread: false,
             message_menu: None,

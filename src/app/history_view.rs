@@ -1,6 +1,7 @@
 use super::ui::{history_divider, icon, ink, ink_alpha};
 use super::*;
 use crate::history;
+use crate::message_tools::HoverAction;
 
 /// Byte offset of a rune index, for text runs and highlights.
 fn char_byte_index(content: &str, index: usize) -> usize {
@@ -20,12 +21,15 @@ impl Voxhold {
         mobile: bool,
     ) -> AnyElement {
         let p = self.palette; // Chat column: fixed header, history, composer, panels.
-        let channel_kind = self
-            .channels
-            .iter()
-            .find(|channel| channel.id == self.channel)
-            .map(|channel| channel.kind.as_str())
-            .unwrap_or("");
+        let channel_kind = if self.conversation.is_some() {
+            "text"
+        } else {
+            self.channels
+                .iter()
+                .find(|channel| channel.id == self.channel)
+                .map(|channel| channel.kind.as_str())
+                .unwrap_or("")
+        };
         let meta = history::row_meta(&self.messages, channel_kind, self.unread_after);
         let keys: Vec<HistoryKey> = self
             .messages
@@ -73,18 +77,15 @@ impl Voxhold {
             }
         }
         let selected = self.channels.iter().find(|c| c.id == self.channel).cloned();
-        let readable = !self.access_pending && selected.as_ref().is_some_and(|c| c.has_history());
-        let writable = !self.access_pending && selected.as_ref().is_some_and(|c| c.writable());
+        let conversation = self.conversation.is_some();
+        let readable = conversation
+            || (!self.access_pending && selected.as_ref().is_some_and(|c| c.has_history()));
         let role = self
             .servers
             .iter()
             .find(|s| s.id == self.server)
-            .map(|s| s.role.as_str())
-            .unwrap_or("");
-        let moderate = role == "owner"
-            || role == "admin"
-            || selected.as_ref().is_some_and(|c| c.permissions & 16 != 0);
-        let news = selected.as_ref().is_some_and(|c| c.kind == "news");
+            .map(|s| s.role.clone())
+            .unwrap_or_default();
         // Avatars are requested only for the neighbourhood of the viewport. The
         // member list carries the version; the cache is shared with the rail.
         let start = self
@@ -176,66 +177,99 @@ impl Voxhold {
                 )
             })
             .collect();
-        let rows: Vec<_> = self
-            .messages
-            .iter()
-            .zip(meta)
-            .map(|(message, meta)| {
-                let own = self.self_user_id > 0 && self.self_user_id == message.author.user_id;
-                let permissions = message_tools::MessagePermissions {
-                    write: readable && writable && !news,
-                    edit: readable && own && message.forward.is_none() && (!news || writable),
-                    delete: readable && (own || moderate),
-                    react: readable,
-                    pin: readable && moderate,
-                    forward: readable,
-                    comments: readable
-                        && message.thread_root_id.is_none()
-                        && selected.as_ref().is_some_and(|c| {
-                            c.kind == "text" || c.comments_enabled || message.comment_count > 0
-                        }),
-                };
-                let read_by_other = self
-                    .reads
-                    .iter()
-                    .any(|(user, last)| *user != self.self_user_id && *last >= message.id);
-                let (role, avatar) = member_info
-                    .get(&message.author.user_id)
-                    .cloned()
-                    .map(|(role, version)| {
-                        let avatar = version.as_ref().and_then(|version| {
-                            avatar_by_user
-                                .get(&(message.author.user_id, version.clone()))
-                                .cloned()
+        let rows: Vec<_> =
+            self.messages
+                .iter()
+                .zip(meta)
+                .map(|(message, meta)| {
+                    let own = self.self_user_id > 0 && self.self_user_id == message.author.user_id;
+                    let permissions = message_tools::permissions_for(
+                        self.self_user_id,
+                        &role,
+                        selected.as_ref(),
+                        message,
+                        conversation,
+                    );
+                    let read_by_other = self
+                        .reads
+                        .iter()
+                        .any(|(user, last)| *user != self.self_user_id && *last >= message.id);
+                    let (role_label, avatar) = member_info
+                        .get(&message.author.user_id)
+                        .cloned()
+                        .map(|(role, version)| {
+                            let avatar = version.as_ref().and_then(|version| {
+                                avatar_by_user
+                                    .get(&(message.author.user_id, version.clone()))
+                                    .cloned()
+                            });
+                            (role, avatar)
+                        })
+                        .unwrap_or_default();
+                    let selected_row = self.selected_messages.contains(&message.id);
+                    let pinned = self.pinned_ids.contains(&message.id);
+                    let highlighted = self
+                        .highlighted_message
+                        .is_some_and(|(id, _)| id == message.id);
+                    let editing = self.editing == Some(message.id);
+                    let delete_confirm = self.confirm_delete == Some(message.id)
+                        || self.message_menu.as_ref().is_some_and(|menu| {
+                            menu.message_id == message.id && menu.confirm_delete
                         });
-                        (role, avatar)
-                    })
-                    .unwrap_or_default();
-                (
-                    message.clone(),
-                    permissions,
-                    meta,
-                    read_by_other,
-                    own,
-                    role,
-                    avatar,
-                )
-            })
-            .collect();
+                    let error = self
+                        .action_error
+                        .as_ref()
+                        .filter(|(id, _)| *id == message.id)
+                        .map(|(_, error)| error.clone())
+                        .unwrap_or_default();
+                    (
+                        message.clone(),
+                        permissions,
+                        meta,
+                        read_by_other,
+                        own,
+                        role_label,
+                        avatar,
+                        selected_row,
+                        pinned,
+                        highlighted,
+                        editing,
+                        delete_confirm,
+                        error,
+                    )
+                })
+                .collect();
         let weak = cx.entity().downgrade();
         self.painted_read = Default::default();
         let painted_read = self.painted_read.clone();
         let hovered_message = self.hovered_message;
+        let scroll_epoch = self.scroll_epoch;
+        let menu_closed = self.message_menu.is_none();
+        let edit_input = self.edit_input.clone();
         let thumbs_for_rows = thumbs;
         let previews_for_rows = previews;
         let history_list = list(self.history_list.clone(), move |index, _, _cx| {
-            let (message, permissions, meta, read_by_other, own, role, avatar) =
-                rows[index].clone();
+            let (
+                message,
+                permissions,
+                meta,
+                read_by_other,
+                own,
+                role,
+                avatar,
+                selected_row,
+                pinned,
+                highlighted,
+                editing,
+                delete_confirm,
+                action_error,
+            ) = rows[index].clone();
             let id = message.id;
             let painted_read = painted_read.clone();
-            let selected_message = message.clone();
             let weak = weak.clone();
             let weak_hover = weak.clone();
+            let weak_menu = weak.clone();
+            let weak_select = weak.clone();
             let weak_quote = weak.clone();
             let weak_reaction = weak.clone();
             let weak_media = weak.clone();
@@ -279,29 +313,29 @@ impl Voxhold {
                 .relative()
                 .w_full()
                 .cursor_pointer()
-                .on_click(move |_, _, cx| {
-                    if let Some(view) = weak.upgrade() {
-                        view.update(cx, |s, cx| {
-                            if let Some(tools) = &s.message_tools {
-                                tools.update(cx, |tools, cx| {
-                                    tools.select(
-                                        s.server,
-                                        s.channel,
-                                        Some(selected_message.clone()),
-                                        permissions,
-                                        cx,
-                                    )
-                                });
-                                s.show_tools = true;
-                            }
-                            if let Some(attachments) = &s.attachments {
-                                attachments
-                                    .update(cx, |a, cx| a.set_message(Some(&selected_message), cx));
-                            }
-                            cx.notify();
-                        });
+                .when(selected_row, |row| {
+                    row.bg(ink(if p.light { 0xe4e8cf } else { 0x2b2f1f }))
+                })
+                .when(highlighted && !selected_row, |row| {
+                    row.bg(ink(if p.light { 0xf1f3d8 } else { 0x30341f }))
+                })
+                .on_click(move |event, _, cx| {
+                    if let Some(view) = weak_select.upgrade() {
+                        let additive = event.modifiers().control || event.modifiers().shift;
+                        view.update(cx, |s, cx| s.toggle_selected(id, additive, cx));
                     }
                 })
+                .on_mouse_down(
+                    MouseButton::Right,
+                    move |event: &gpui::MouseDownEvent, _, cx| {
+                        if let Some(view) = weak_menu.upgrade() {
+                            let x: f32 = event.position.x.into();
+                            let y: f32 = event.position.y.into();
+                            view.update(cx, |s, cx| s.open_message_menu(id, x, y, false, cx));
+                        }
+                        cx.stop_propagation();
+                    },
+                )
                 .on_hover(move |hovered, _, cx| {
                     if let Some(view) = weak_hover.upgrade() {
                         view.update(cx, |s, cx| {
@@ -314,6 +348,9 @@ impl Voxhold {
                             };
                             if s.hovered_message != next {
                                 s.hovered_message = next;
+                                if next == 0 {
+                                    s.hovered_action = None;
+                                }
                                 cx.notify();
                             }
                         });
@@ -330,6 +367,98 @@ impl Voxhold {
                     p.bg,
                     true,
                 ));
+            }
+            if hovered_message == id && menu_closed {
+                let buttons = message_tools::hover_actions(permissions, conversation, false);
+                let mut bar = div()
+                    .id(gpui::ElementId::Name(format!("hover-actions-{id}").into()))
+                    .absolute()
+                    .right(px(12.))
+                    .top(px(-10.))
+                    .h(px(29.))
+                    .flex()
+                    .items_center()
+                    .rounded(px(8.))
+                    .border_1()
+                    .border_color(ink(0x3b3b36))
+                    .bg(ink(0x252522))
+                    .occlude();
+                for (index, action) in buttons.into_iter().enumerate() {
+                    let key = action.key();
+                    let hovered_key = (id, key.to_string());
+                    let active = match action {
+                        HoverAction::Quick(emoji) => message
+                            .reactions
+                            .iter()
+                            .any(|reaction| reaction.emoji == emoji && reaction.me),
+                        _ => false,
+                    };
+                    let weak_button = weak.clone();
+                    let mut button = div()
+                        .id(gpui::ElementId::Name(format!("hover-{id}-{index}").into()))
+                        .w(px(29.))
+                        .h(px(29.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(6.))
+                        .cursor_pointer()
+                        .when(active, |button| button.bg(ink(0x393a2e)))
+                        .on_hover(move |hovered, _, cx| {
+                            if let Some(view) = weak_button.upgrade() {
+                                view.update(cx, |s, cx| {
+                                    let next = if *hovered {
+                                        Some(hovered_key.clone())
+                                    } else if s.hovered_action.as_ref() == Some(&hovered_key) {
+                                        None
+                                    } else {
+                                        s.hovered_action.clone()
+                                    };
+                                    if s.hovered_action != next {
+                                        s.hovered_action = next;
+                                        cx.notify();
+                                    }
+                                });
+                            }
+                        });
+                    button = match action {
+                        HoverAction::Quick(emoji) => button.child(
+                            div()
+                                .font_family(crate::reactions::EMOJI_FONT)
+                                .text_size(px(16.))
+                                .child(emoji),
+                        ),
+                        HoverAction::Picker => {
+                            button.child(icon("icons/emoji.svg", 15., ink(p.muted)))
+                        }
+                        HoverAction::Reply => {
+                            button.child(icon("icons/reply.svg", 15., ink(p.muted)))
+                        }
+                        HoverAction::Forward => {
+                            button.child(icon("icons/forward.svg", 15., ink(p.muted)))
+                        }
+                        HoverAction::More => {
+                            button.child(icon("icons/more.svg", 15., ink(p.muted)))
+                        }
+                    };
+                    let weak_click = weak.clone();
+                    button = button.on_click(move |event, window, cx| {
+                        let Some(view) = weak_click.upgrade() else {
+                            return;
+                        };
+                        let x: f32 = event.position().x.into();
+                        let y: f32 = event.position().y.into();
+                        view.update(cx, |s, cx| match action {
+                            HoverAction::Picker | HoverAction::More => {
+                                s.open_message_menu(id, x, y, false, cx)
+                            }
+                            other => s.dispatch_hover_action(id, other, scroll_epoch, window, cx),
+                        });
+                        cx.stop_propagation();
+                    });
+                    bar = bar.child(button);
+                }
+                row = row.child(bar);
             }
             let mut head = div()
                 .flex()
@@ -397,9 +526,9 @@ impl Voxhold {
                         .pr(px(12.))
                         .pt(px(6.))
                         .cursor_pointer()
-                        .on_click(move |_, _, cx| {
+                        .on_click(move |_, window, cx| {
                             if let Some(view) = weak_quote.upgrade() {
-                                view.update(cx, |s, cx| s.jump_to_message(target, cx));
+                                view.update(cx, |s, cx| s.jump_to_message(target, window, cx));
                             }
                             cx.stop_propagation();
                         })
@@ -734,6 +863,117 @@ impl Voxhold {
                     })
                     .child(body),
             );
+            if pinned {
+                row = row.child(
+                    div()
+                        .px(px(19.))
+                        .text_size(px(10.))
+                        .text_color(ink(p.lime))
+                        .child("Закреплено"),
+                );
+            }
+            if editing {
+                let weak_save = weak.clone();
+                let weak_cancel = weak.clone();
+                row = row.child(
+                    div()
+                        .px(px(19.))
+                        .pb(px(6.))
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(TextInput::new(&edit_input))
+                        .child(
+                            div()
+                                .flex()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .id(("edit-save", id as u64))
+                                        .cursor_pointer()
+                                        .text_size(px(12.))
+                                        .text_color(ink(p.lime))
+                                        .on_click(move |_, window, cx| {
+                                            if let Some(view) = weak_save.upgrade() {
+                                                view.update(cx, |s, cx| s.save_edit(window, cx));
+                                            }
+                                            cx.stop_propagation();
+                                        })
+                                        .child("Сохранить"),
+                                )
+                                .child(
+                                    div()
+                                        .id(("edit-cancel", id as u64))
+                                        .cursor_pointer()
+                                        .text_size(px(12.))
+                                        .text_color(ink(p.muted))
+                                        .on_click(move |_, _, cx| {
+                                            if let Some(view) = weak_cancel.upgrade() {
+                                                view.update(cx, |s, cx| s.cancel_edit(cx));
+                                            }
+                                            cx.stop_propagation();
+                                        })
+                                        .child("Отмена"),
+                                ),
+                        ),
+                );
+            }
+            if delete_confirm {
+                let weak_yes = weak.clone();
+                let weak_no = weak.clone();
+                row = row.child(
+                    div()
+                        .px(px(19.))
+                        .pb(px(6.))
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .text_size(px(12.))
+                        .child("Удалить сообщение?")
+                        .child(
+                            div()
+                                .id(("delete-no", id as u64))
+                                .cursor_pointer()
+                                .text_color(ink(p.muted))
+                                .on_click(move |_, _, cx| {
+                                    if let Some(view) = weak_no.upgrade() {
+                                        view.update(cx, |s, cx| {
+                                            s.cancel_delete(cx);
+                                            s.message_menu = None;
+                                            cx.notify();
+                                        });
+                                    }
+                                    cx.stop_propagation();
+                                })
+                                .child("Нет"),
+                        )
+                        .child(
+                            div()
+                                .id(("delete-yes", id as u64))
+                                .cursor_pointer()
+                                .text_color(ink(p.danger))
+                                .on_click(move |_, window, cx| {
+                                    if let Some(view) = weak_yes.upgrade() {
+                                        view.update(cx, |s, cx| {
+                                            s.confirm_delete_now(id, window, cx)
+                                        });
+                                    }
+                                    cx.stop_propagation();
+                                })
+                                .child("Да"),
+                        ),
+                );
+            }
+            if !action_error.is_empty() {
+                row = row.child(
+                    div()
+                        .px(px(19.))
+                        .pb(px(4.))
+                        .text_size(px(11.))
+                        .text_color(ink(p.danger))
+                        .child(action_error),
+                );
+            }
             if own {
                 let mut checks = div()
                     .absolute()

@@ -21,8 +21,16 @@ impl Render for Voxhold {
                             cx.stop_propagation();
                             return;
                         }
+                        if s.show_thread {
+                            s.close_thread(window, cx);
+                            cx.stop_propagation();
+                            return;
+                        }
                         s.show_search = false;
-                        s.show_tools = false;
+                        s.message_menu = None;
+                        s.forward = None;
+                        s.editing = None;
+                        s.confirm_delete = None;
                         s.show_settings = false;
                         s.show_channel_settings = false;
                         s.show_server_settings = false;
@@ -152,25 +160,44 @@ impl Render for Voxhold {
             );
         }
         let selected = self.channels.iter().find(|c| c.id == self.channel).cloned();
-        let readable = !self.access_pending && selected.as_ref().is_some_and(|c| c.has_history());
-        let writable = !self.access_pending && selected.as_ref().is_some_and(|c| c.writable());
-        let history = self.render_history(window, cx, l.chat, mobile);
-        let title = selected
-            .as_ref()
-            .map(|c| c.name.clone())
-            .unwrap_or_else(|| "Выберите канал".into());
-        let explanation = selected
-            .as_ref()
-            .map(|c| {
-                if c.e2ee_required {
-                    "Этот канал требует E2EE; сообщения недоступны."
-                } else if c.kind == "voice" && !c.readable() {
-                    "Нет доступа к голосовому каналу."
-                } else {
-                    ""
-                }
-            })
-            .unwrap_or("");
+        let readable = self.conversation.is_some()
+            || (!self.access_pending && selected.as_ref().is_some_and(|c| c.has_history()));
+        let writable = self.conversation.is_some()
+            || (!self.access_pending && selected.as_ref().is_some_and(|c| c.writable()));
+        let thread_active = self.show_thread && self.thread.is_some();
+        let history = if thread_active {
+            div()
+                .flex_1()
+                .min_h(px(0.))
+                .child(self.thread.clone().expect("thread"))
+                .into_any_element()
+        } else {
+            self.render_history(window, cx, l.chat, mobile)
+        };
+        let title = if let Some(conversation) = &self.conversation {
+            inbox::conversation_title(conversation, self.self_user_id)
+        } else {
+            selected
+                .as_ref()
+                .map(|c| c.name.clone())
+                .unwrap_or_else(|| "Выберите канал".into())
+        };
+        let explanation = if self.conversation.is_some() {
+            ""
+        } else {
+            selected
+                .as_ref()
+                .map(|c| {
+                    if c.e2ee_required {
+                        "Этот канал требует E2EE; сообщения недоступны."
+                    } else if c.kind == "voice" && !c.readable() {
+                        "Нет доступа к голосовому каналу."
+                    } else {
+                        ""
+                    }
+                })
+                .unwrap_or("")
+        };
         let mut chat = div().relative().size_full().flex().flex_col().bg(ink(p.bg));
         let show_labels = l.chat.w > 860.0 && !mobile;
         let header = div()
@@ -221,13 +248,27 @@ impl Render for Voxhold {
                             .items_center()
                             .gap_2()
                             .cursor_pointer()
-                            .on_click(cx.listener(|s, _, _, cx| {
-                                s.show_search = !s.show_search;
-                                cx.notify();
+                            .on_click(cx.listener(|s, _, window, cx| {
+                                s.open_search_popup(false, window, cx)
                             }))
                             .child(icon("icons/search.svg", 16., ink(p.muted)))
                             .when(show_labels, |button| button.child("Поиск")),
                     )
+                    .when(!self.conversation.is_some(), |row| {
+                        row.child(
+                            div()
+                                .id("toggle-pins")
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .cursor_pointer()
+                                .on_click(cx.listener(|s, _, window, cx| {
+                                    s.open_search_popup(true, window, cx)
+                                }))
+                                .child(icon("icons/pin.svg", 16., ink(p.muted)))
+                                .when(show_labels, |button| button.child("Закрепы")),
+                        )
+                    })
                     .child(
                         div()
                             .id("members-toggle")
@@ -279,12 +320,12 @@ impl Render for Voxhold {
                     .child(self.error.clone()),
             );
         }
-        if readable {
+        if readable && !thread_active {
             if let Some(attachments) = &self.attachments {
                 chat = chat.child(attachments.clone());
             }
         }
-        if writable {
+        if writable && !thread_active {
             let text = self.composer.read(cx).value().to_string();
             let files = self.drafts.borrow().files(self.chat_key());
             let reading = self
@@ -294,6 +335,52 @@ impl Render for Voxhold {
             let attachments_ready = self.attachments.is_some() && !self.is_sending() && !reading;
             let valid = draft::validate_send(&text, &files).is_ok();
             let can_send = valid && !self.is_sending() && !reading && !self.access_pending;
+            let reply_id = self.drafts.borrow().reply(self.chat_key());
+            if reply_id > 0 {
+                let (author, excerpt) = self
+                    .messages
+                    .iter()
+                    .find(|message| message.id == reply_id)
+                    .map(|message| {
+                        (
+                            message.author.username.clone(),
+                            message.content.replace('\n', " "),
+                        )
+                    })
+                    .unwrap_or_else(|| ("Сообщение".into(), format!("#{reply_id}")));
+                chat = chat.child(
+                    div()
+                        .mx(px(18.))
+                        .mb(px(4.))
+                        .px(px(10.))
+                        .py(px(5.))
+                        .rounded(px(7.))
+                        .bg(ink(p.surface))
+                        .border_l_2()
+                        .border_color(ink(p.lime))
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.))
+                                .truncate()
+                                .text_size(px(11.))
+                                .text_color(ink(p.muted))
+                                .child(format!("Ответ: {author} · {excerpt}")),
+                        )
+                        .child(
+                            div()
+                                .id("clear-reply")
+                                .cursor_pointer()
+                                .text_size(px(11.))
+                                .text_color(ink(p.muted))
+                                .on_click(cx.listener(|s, _, _, cx| s.clear_reply(cx)))
+                                .child("Убрать"),
+                        ),
+                );
+            }
             if let Some(counter) = draft::counter(&text) {
                 chat = chat.child(
                     div()
@@ -408,55 +495,10 @@ impl Render for Voxhold {
                     .child(send_button),
             );
         }
-        if self.show_search {
-            if let Some(search) = &self.search {
-                chat = chat.child(div().h(px(300.)).child(search.clone()));
-            }
-        }
-        if self.show_tools {
-            if let Some(tools) = &self.message_tools {
-                chat = chat.child(
-                    div()
-                        .h(px(360.))
-                        .child(
-                            div()
-                                .id("close-message-tools")
-                                .cursor_pointer()
-                                .text_size(px(12.))
-                                .on_click(cx.listener(|s, _, _, cx| {
-                                    s.show_tools = false;
-                                    cx.notify();
-                                }))
-                                .child("Закрыть"),
-                        )
-                        .child(tools.clone()),
-                );
-            }
-        }
         #[cfg(feature = "voxhold-media")]
         if !self.access_pending && self.channel == self.voice_channel && self.voice_channel != 0 {
             if let Some(voice) = &self.voice {
                 chat = chat.child(div().h(px(400.)).child(voice.clone()));
-            }
-        }
-        if self.show_inbox {
-            if let Some(inbox) = &self.inbox {
-                chat = chat.child(
-                    div()
-                        .h(px(500.))
-                        .child(
-                            div()
-                                .id("inbox-close")
-                                .cursor_pointer()
-                                .text_size(px(12.))
-                                .on_click(cx.listener(|s, _, _, cx| {
-                                    s.show_inbox = false;
-                                    cx.notify();
-                                }))
-                                .child("Закрыть"),
-                        )
-                        .child(inbox.clone()),
-                );
             }
         }
         if self.show_server_settings {
@@ -678,6 +720,34 @@ impl Render for Voxhold {
             root = root.child(self.server_picker(cx));
         }
         self.ensure_viewer_scale(window, cx);
+        let popup_open = self.show_search
+            || self.show_inbox
+            || self.message_menu.is_some()
+            || self.forward.is_some();
+        if popup_open {
+            root = root.child(
+                div()
+                    .id("overlay-backdrop")
+                    .absolute()
+                    .size_full()
+                    .on_click(cx.listener(|s, _, _, cx| s.dismiss_overlays(cx))),
+            );
+        }
+        if let Some(overlay) = self.inbox_overlay(window, cx) {
+            root = root.child(overlay);
+        }
+        if let Some(overlay) = self.search_overlay(cx) {
+            root = root.child(overlay);
+        }
+        if let Some(overlay) = self.forward_overlay(cx) {
+            root = root.child(overlay);
+        }
+        if let Some(overlay) = self.message_menu_overlay(window, cx) {
+            root = root.child(overlay);
+        }
+        if let Some(notice) = self.notice_overlay() {
+            root = root.child(notice);
+        }
         if let Some(layer) = self.viewer_layer(window, cx) {
             root = root.child(layer);
         }

@@ -1,16 +1,21 @@
+mod action_io;
 mod auth_view;
 mod composer;
+mod history_actions;
 mod history_ops;
 mod history_view;
+mod inbox_ops;
 mod media_ops;
 mod members_view;
 mod navigation_view;
+mod overlays_view;
 mod realtime;
 mod session;
 mod shell_view;
 #[cfg(test)]
 mod tests;
 mod theme_ops;
+mod thread_ops;
 pub(crate) mod ui;
 mod workspace;
 
@@ -26,7 +31,8 @@ use voxhold_api::{Channel, ChannelSubscription, Client, Member, Message, Server}
 use crate::voice_panel;
 use crate::{
     attachments, auth, background, channel_settings, draft, inbox, layout, links, media, members,
-    message_tools, personal_settings, reactions, search, server_settings, theme, window_chrome,
+    message_tools, personal_settings, reactions, search, server_settings, theme, thread_panel,
+    window_chrome,
 };
 use ui::{icon, ink};
 
@@ -53,6 +59,38 @@ struct ScrollbarDrag {
     /// Pointer offset inside the thumb.
     grab: f32,
 }
+
+/// One open context menu. Only the id is authoritative: every paint re-reads
+/// the row and its permissions from the current snapshot.
+#[derive(Clone, Debug)]
+struct MessageMenu {
+    message_id: i64,
+    x: f32,
+    y: f32,
+    expanded: bool,
+    confirm_delete: bool,
+}
+
+/// A short operation in flight. The token guards pending/error state against
+/// a late answer after a chat switch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ActionRequest {
+    chat: draft::ChatKey,
+    access: u64,
+    request: u64,
+}
+
+#[derive(Clone, Debug)]
+struct ForwardState {
+    message_id: i64,
+    source: draft::ChatKey,
+    source_kind: &'static str,
+    request: u64,
+    destinations: Vec<voxhold_api::ForwardDestination>,
+    loading: bool,
+    sending: bool,
+    error: String,
+}
 pub(crate) struct Voxhold {
     runtime: std::sync::Arc<tokio::runtime::Runtime>,
     instance: Entity<InputState>,
@@ -63,9 +101,30 @@ pub(crate) struct Voxhold {
     self_user_id: i64,
     search: Option<Entity<search::SearchPanel>>,
     show_search: bool,
-    message_tools: Option<Entity<message_tools::MessageTools>>,
-    tools_revision: u64,
-    show_tools: bool,
+    thread: Option<Entity<thread_panel::ThreadPanel>>,
+    show_thread: bool,
+    message_menu: Option<MessageMenu>,
+    forward: Option<ForwardState>,
+    action_requests: std::collections::HashMap<String, ActionRequest>,
+    action_seq: u64,
+    action_error: Option<(i64, String)>,
+    action_notice: String,
+    editing: Option<i64>,
+    edit_input: Entity<InputState>,
+    reaction_picker: Entity<reactions::ReactionPicker>,
+    confirm_delete: Option<i64>,
+    pinned_ids: std::collections::HashSet<i64>,
+    pinned_request: Option<u64>,
+    scroll_epoch: u64,
+    hovered_action: Option<(i64, String)>,
+    highlighted_message: Option<(i64, u64)>,
+    highlight_seq: u64,
+    selected_messages: Vec<i64>,
+    conversation: Option<voxhold_api::Conversation>,
+    conversations: Vec<voxhold_api::Conversation>,
+    recents_request: Option<u64>,
+    recents_again: bool,
+    channel_snapshot_request: Option<u64>,
     attachments: Option<Entity<attachments::Attachments>>,
     settings: Option<Entity<personal_settings::PersonalSettings>>,
     show_settings: bool,
@@ -213,6 +272,8 @@ impl Voxhold {
                     // The list is mutably borrowed while this callback runs, so
                     // never touch `ListState` here. Both follow-ups recompute
                     // their range from a later frame.
+                    s.scroll_epoch = s.scroll_epoch.wrapping_add(1);
+                    s.hovered_action = None;
                     if !s.loading_older && !s.older_scheduled && s.has_more {
                         s.schedule_older_check(window, cx);
                     }
@@ -236,6 +297,9 @@ impl Voxhold {
             .as_deref()
             .map(layout::Settings::load)
             .unwrap_or_default();
+        let recent_reactions = reactions::SharedRecents::default();
+        let reaction_picker =
+            cx.new(|cx| reactions::ReactionPicker::new(recent_reactions.clone(), window, cx));
         let view = Self {
             runtime: std::sync::Arc::new(tokio::runtime::Runtime::new().expect("Tokio runtime")),
             instance: cx.new(|cx| InputState::new(window, cx).placeholder("https://example.com")),
@@ -254,9 +318,34 @@ impl Voxhold {
             self_user_id: 0,
             search: None,
             show_search: false,
-            message_tools: None,
-            tools_revision: 0,
-            show_tools: false,
+            thread: None,
+            show_thread: false,
+            message_menu: None,
+            forward: None,
+            action_requests: Default::default(),
+            action_seq: 0,
+            action_error: None,
+            action_notice: String::new(),
+            editing: None,
+            edit_input: cx.new(|cx| {
+                InputState::new(window, cx)
+                    .multi_line()
+                    .placeholder("Изменить сообщение")
+            }),
+            reaction_picker,
+            confirm_delete: None,
+            pinned_ids: Default::default(),
+            pinned_request: None,
+            scroll_epoch: 0,
+            hovered_action: None,
+            highlighted_message: None,
+            highlight_seq: 0,
+            selected_messages: Vec::new(),
+            conversation: None,
+            conversations: Vec::new(),
+            recents_request: None,
+            recents_again: false,
+            channel_snapshot_request: None,
             attachments: None,
             settings: None,
             show_settings: false,
@@ -304,7 +393,7 @@ impl Voxhold {
             channel_reads: Default::default(),
             unread_after: 0,
             reaction_requests: Default::default(),
-            recent_reactions: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
+            recent_reactions: recent_reactions.clone(),
             scrollbar_drag: None,
             context_request: None,
             pending_jump: None,

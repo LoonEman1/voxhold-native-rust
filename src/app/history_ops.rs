@@ -4,13 +4,18 @@ use crate::history::{apply_reactions, merge_revision};
 impl Voxhold {
     pub(super) fn schedule_visible_read(&mut self, window: &Window, cx: &mut Context<Self>) {
         self.read_scheduled = true;
-        let scope = (self.server, self.channel, self.access_generation);
+        let scope = (
+            self.chat_key(),
+            self.server,
+            self.channel,
+            self.access_generation,
+        );
         let painted = self.painted_read.clone();
         let weak = cx.entity().downgrade();
         window.on_next_frame(move |window, cx| {
             if let Some(this) = weak.upgrade() {
                 this.update(cx, |s, cx| {
-                    if (s.server, s.channel, s.access_generation) != scope {
+                    if (s.chat_key(), s.server, s.channel, s.access_generation) != scope {
                         return;
                     }
                     s.read_scheduled = false;
@@ -24,14 +29,19 @@ impl Voxhold {
     /// the scroll callback itself.
     pub(super) fn schedule_older_check(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.older_scheduled = true;
-        let scope = (self.server, self.channel, self.access_generation);
+        let scope = (
+            self.chat_key(),
+            self.server,
+            self.channel,
+            self.access_generation,
+        );
         cx.spawn_in(window, async move |this, window| {
             window
                 .background_executor()
                 .timer(std::time::Duration::from_millis(1))
                 .await;
             let _ = this.update_in(window, |s, window, cx| {
-                if (s.server, s.channel, s.access_generation) != scope {
+                if (s.chat_key(), s.server, s.channel, s.access_generation) != scope {
                     return;
                 }
                 s.older_scheduled = false;
@@ -54,16 +64,18 @@ impl Voxhold {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let conversation = self.in_conversation();
         if !window.is_window_active()
             || self.read_pending
             || self.access_pending
             || self
                 .read_retry_at
                 .is_some_and(|at| at > std::time::Instant::now())
-            || !self
-                .channels
-                .iter()
-                .any(|c| c.id == self.channel && c.has_history())
+            || (!conversation
+                && !self
+                    .channels
+                    .iter()
+                    .any(|c| c.id == self.channel && c.has_history()))
         {
             return;
         }
@@ -84,23 +96,39 @@ impl Voxhold {
             self.generation,
             self.access_generation,
         );
+        let chat = self.chat_key();
         let runtime = self.runtime.clone();
         self.read_pending = true;
         let task = cx.background_spawn(async move {
-            runtime.block_on(client.mark_read(server, channel, message_id))
+            if conversation {
+                runtime.block_on(client.mark_conversation_read(channel, message_id))
+            } else {
+                runtime.block_on(client.mark_read(server, channel, message_id))
+            }
         });
         cx.spawn_in(window, async move |this, window| {
             let result = task.await;
             let _ = this.update_in(window, |s, window, cx| {
-                if s.generation != generation || s.access_generation != access_generation {
+                if s.generation != generation
+                    || s.access_generation != access_generation
+                    || s.chat_key() != chat
+                {
                     return;
                 }
                 s.read_pending = false;
                 match result {
                     Ok(_) => {
                         s.read_sent = s.read_sent.max(message_id);
-                        let known = s.channel_reads.entry((s.server, s.channel)).or_default();
-                        *known = (*known).max(message_id);
+                        if !conversation {
+                            let known = s.channel_reads.entry((s.server, s.channel)).or_default();
+                            *known = (*known).max(message_id);
+                        } else {
+                            s.refresh_recents(cx);
+                        }
+                    }
+                    Err(voxhold_api::Error::Http(403 | 404)) if conversation => {
+                        s.error = "Диалог недоступен.".into();
+                        s.refresh_recents(cx);
                     }
                     Err(voxhold_api::Error::Http(403 | 404)) => {
                         s.invalidate_access(window, cx);
@@ -135,12 +163,22 @@ impl Voxhold {
         active: bool,
         cx: &mut Context<Self>,
     ) {
+        let conversation = self.in_conversation();
         if self.access_pending
-            || !self
-                .channels
-                .iter()
-                .any(|channel| channel.id == self.channel && channel.has_history())
+            || (!conversation
+                && !self
+                    .channels
+                    .iter()
+                    .any(|channel| channel.id == self.channel && channel.has_history()))
         {
+            return;
+        }
+        let Some(message) = self.message_snapshot(message_id) else {
+            return;
+        };
+        if !self.permissions_for_row(&message).react {
+            self.action_error = Some((message_id, "Недостаточно прав доступа.".into()));
+            cx.notify();
             return;
         }
         let key = (message_id, emoji.clone());
@@ -157,10 +195,24 @@ impl Voxhold {
             self.generation,
             self.access_generation,
         );
+        let chat = self.chat_key();
         let runtime = self.runtime.clone();
         let recent = self.recent_reactions.clone();
         let task = cx.background_spawn(async move {
-            runtime.block_on(client.set_reaction(server, channel, message_id, &emoji, !active))
+            if conversation {
+                runtime
+                    .block_on(
+                        client.set_conversation_reaction(channel, message_id, &emoji, !active),
+                    )
+                    .map(|answer| voxhold_api::ReactionsUpdate {
+                        channel_id: 0,
+                        message_id,
+                        revision: answer.revision,
+                        reactions: answer.reactions,
+                    })
+            } else {
+                runtime.block_on(client.set_reaction(server, channel, message_id, &emoji, !active))
+            }
         });
         cx.spawn(async move |this, cx| {
             let result = task.await;
@@ -169,6 +221,7 @@ impl Voxhold {
                     s.reaction_requests.remove(&key);
                     if s.generation != generation
                         || s.access_generation != access
+                        || s.chat_key() != chat
                         || s.server != server
                         || s.channel != channel
                     {
@@ -180,10 +233,15 @@ impl Voxhold {
                             if !active {
                                 reactions::touch_recent(&mut recent.borrow_mut(), &key.1);
                             }
-                            s.sync_tools_message(cx);
                             s.error.clear();
+                            s.action_error = None;
                         }
-                        Err(error) => s.error = error.to_string(),
+                        Err(error) => {
+                            s.action_error = Some((message_id, error.to_string()));
+                            if error.status() == Some(403) {
+                                s.recheck_channel_snapshot_no_window(cx);
+                            }
+                        }
                     }
                     cx.notify();
                 })
@@ -194,8 +252,15 @@ impl Voxhold {
     }
 
     /// Focus an already loaded row or open a bounded `context` page around a
-    /// quoted message that is outside the current window.
-    pub(super) fn jump_to_message(&mut self, message_id: i64, cx: &mut Context<Self>) {
+    /// quoted message that is outside the current window. A comment target
+    /// opens its root thread instead of inserting the comment into the main
+    /// timeline.
+    pub(super) fn jump_to_message(
+        &mut self,
+        message_id: i64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if let Some(index) = self
             .messages
             .iter()
@@ -205,10 +270,12 @@ impl Voxhold {
                 item_ix: index,
                 offset_in_item: px(0.),
             });
+            self.pending_jump = None;
+            self.highlight_message(message_id, cx);
             cx.notify();
             return;
         }
-        if self.context_request.is_some() || self.access_pending {
+        if self.context_request.is_some() || self.access_pending || self.in_conversation() {
             return;
         }
         let Some(client) = self.client.clone() else {
@@ -220,36 +287,64 @@ impl Voxhold {
             self.generation,
             self.access_generation,
         );
+        // The context answer owns the next window. Invalidate a refresh that
+        // started with the channel switch so it cannot replace the context.
+        self.refresh_request = None;
+        self.refresh_again = false;
+        self.refresh_new_ids.clear();
         self.request_seq = self.request_seq.wrapping_add(1);
         let request = self.request_seq;
         self.context_request = Some(request);
         let runtime = self.runtime.clone();
         let task = cx.background_spawn(async move {
-            runtime.block_on(client.message_context(server, channel, message_id, 25, 25))
+            runtime.block_on(async move {
+                let context = client
+                    .message_context(server, channel, message_id, 25, 25)
+                    .await?;
+                let root = context
+                    .messages
+                    .get(context.target_index)
+                    .and_then(|message| message.thread_root_id)
+                    .filter(|root| *root > 0);
+                let root_context = match root {
+                    Some(root) => Some(client.message_context(server, channel, root, 1, 1).await?),
+                    None => None,
+                };
+                Ok::<_, voxhold_api::Error>((context, root_context))
+            })
         });
-        cx.spawn(async move |this, cx| {
+        cx.spawn_in(window, async move |this, window| {
             let result = task.await;
-            if let Some(this) = this.upgrade() {
-                this.update(cx, |s, cx| {
-                    if !s.accepts_context_reply(request, generation, access, server, channel) {
-                        return;
-                    }
-                    s.context_request = None;
-                    match result {
-                        Ok(context) => {
-                            if s.apply_context_snapshot(context) {
-                                s.sync_tools_message(cx);
-                            }
-                        }
-                        Err(voxhold_api::Error::Http(404)) => {
+            let _ = this.update_in(window, |s, window, cx| {
+                if !s.accepts_context_reply(request, generation, access, server, channel) {
+                    return;
+                }
+                s.context_request = None;
+                match result {
+                    Ok((_context, Some(root_context))) => {
+                        let root = root_context
+                            .messages
+                            .get(root_context.target_index)
+                            .cloned();
+                        let Some(root) = root else {
                             s.error = "Сообщение недоступно".into();
-                        }
-                        Err(error) => s.error = error.to_string(),
+                            cx.notify();
+                            return;
+                        };
+                        s.open_thread(root, message_id, window, cx);
                     }
-                    cx.notify();
-                })
-                .ok();
-            }
+                    Ok((context, None)) => {
+                        if s.apply_context_snapshot(context) {
+                            s.highlight_message(message_id, cx);
+                        }
+                    }
+                    Err(voxhold_api::Error::Http(404)) => {
+                        s.error = "Сообщение недоступно".into();
+                    }
+                    Err(error) => s.error = error.to_string(),
+                }
+                cx.notify();
+            });
         })
         .detach();
     }
@@ -390,10 +485,16 @@ impl Voxhold {
     /// Applies the revision rule to the loaded row, or stores a bounded pending
     /// update when that row is outside the window.
     pub(super) fn apply_reaction_update(&mut self, update: voxhold_api::ReactionsUpdate) {
-        if update.channel_id != self.channel
-            || self.deleted_ids.contains(&update.message_id)
-            || update.revision <= 0
-        {
+        let in_scope = if self.in_conversation() {
+            update.channel_id == 0
+                && self
+                    .messages
+                    .iter()
+                    .any(|message| message.id == update.message_id)
+        } else {
+            update.channel_id == self.channel
+        };
+        if !in_scope || self.deleted_ids.contains(&update.message_id) || update.revision <= 0 {
             return;
         }
         if let Some(message) = self
@@ -402,8 +503,9 @@ impl Voxhold {
             .find(|message| message.id == update.message_id)
         {
             apply_reactions(message, update);
-        } else if self.pending_reactions.len() < 128
-            || self.pending_reactions.contains_key(&update.message_id)
+        } else if !self.in_conversation()
+            && (self.pending_reactions.len() < 128
+                || self.pending_reactions.contains_key(&update.message_id))
         {
             let entry = self
                 .pending_reactions
@@ -415,23 +517,14 @@ impl Voxhold {
         }
     }
 
-    /// Push the confirmed row into an open action panel so its reaction state
-    /// follows history/WS changes even when the panel was opened earlier.
-    pub(super) fn sync_tools_message(&mut self, cx: &mut Context<Self>) {
-        let Some(tools) = self.message_tools.clone() else {
-            return;
-        };
-        let Some(id) = tools.read(cx).selected_id() else {
-            return;
-        };
-        let message = self
-            .messages
-            .iter()
-            .find(|message| message.id == id)
-            .cloned();
-        tools.update(cx, |tools, cx| {
-            tools.sync_message(message.as_ref(), cx);
-        });
+    /// Push the confirmed row state into the open thread and context menu. The
+    /// old side panel no longer owns message state.
+    pub(super) fn sync_open_views(&mut self, cx: &mut Context<Self>) {
+        if let Some(thread) = &self.thread {
+            thread.update(cx, |thread, cx| {
+                thread.sync_from_history(&self.messages, cx)
+            });
+        }
     }
 
     pub(super) fn history_anchor(&self) -> Option<(i64, gpui::Pixels)> {
@@ -482,17 +575,20 @@ impl Voxhold {
         let Some(client) = self.client.clone() else {
             return;
         };
+        let conversation = self.in_conversation();
         let (server, channel, generation, access) = (
             self.server,
             self.channel,
             self.generation,
             self.access_generation,
         );
+        let chat = self.chat_key();
         if self.access_pending
-            || !self
-                .channels
-                .iter()
-                .any(|c| c.id == channel && c.has_history())
+            || (!conversation
+                && !self
+                    .channels
+                    .iter()
+                    .any(|c| c.id == channel && c.has_history()))
         {
             return;
         }
@@ -508,7 +604,11 @@ impl Voxhold {
         self.loading_older = false;
         let runtime = self.runtime.clone();
         let task = cx.background_spawn(async move {
-            runtime.block_on(client.messages_page(server, channel, 0))
+            if conversation {
+                runtime.block_on(client.conversation_messages(channel, 0))
+            } else {
+                runtime.block_on(client.messages_page(server, channel, 0))
+            }
         });
         cx.spawn_in(window, async move |this, window| {
             let result = task.await;
@@ -516,6 +616,7 @@ impl Voxhold {
                 if s.generation != generation
                     || s.access_generation != access
                     || s.refresh_request != Some(request)
+                    || s.chat_key() != chat
                     || s.server != server
                     || s.channel != channel
                 {
@@ -542,12 +643,21 @@ impl Voxhold {
                         if return_to_latest {
                             s.pending_jump = s.messages.last().map(|message| message.id);
                         }
-                        s.sync_tools_message(cx);
+                        s.sync_open_views(cx);
                         s.older_error.clear();
                         s.older_retry_at = None;
                         s.error.clear();
                     }
                     Err(error) => match error {
+                        voxhold_api::Error::Http(403) | voxhold_api::Error::Http(404)
+                            if conversation =>
+                        {
+                            s.messages.clear();
+                            s.history_keys.clear();
+                            s.history_list.reset(0);
+                            s.error = "Диалог недоступен.".into();
+                            s.refresh_recents(cx);
+                        }
                         voxhold_api::Error::Http(403) | voxhold_api::Error::Http(404) => {
                             s.invalidate_access(window, cx);
                         }
@@ -630,12 +740,14 @@ impl Voxhold {
         let (Some(client), Some(before)) = (self.client.clone(), self.before) else {
             return;
         };
+        let conversation = self.in_conversation();
         let (server, channel, generation, access) = (
             self.server,
             self.channel,
             self.generation,
             self.access_generation,
         );
+        let chat = self.chat_key();
         self.request_seq = self.request_seq.wrapping_add(1);
         let request = self.request_seq;
         self.older_request = request;
@@ -644,12 +756,18 @@ impl Voxhold {
         cx.notify();
         let runtime = self.runtime.clone();
         let task = cx.background_spawn(async move {
-            runtime.block_on(client.messages_page(server, channel, before))
+            if conversation {
+                runtime.block_on(client.conversation_messages(channel, before))
+            } else {
+                runtime.block_on(client.messages_page(server, channel, before))
+            }
         });
         cx.spawn_in(window, async move |this, window| {
             let result = task.await;
             let _ = this.update_in(window, |s, window, cx| {
-                if !s.accepts_older_reply(request, before, server, channel, generation, access) {
+                if !s.accepts_older_reply(request, before, server, channel, generation, access)
+                    || s.chat_key() != chat
+                {
                     return;
                 }
                 s.loading_older = false;
@@ -665,9 +783,14 @@ impl Voxhold {
                             s.merge_message(true, row);
                         }
                         s.trim_history(true);
-                        s.sync_tools_message(cx);
+                        s.sync_open_views(cx);
                         s.older_retry_at = None;
                         s.pending_anchor = anchor;
+                    }
+                    Err(voxhold_api::Error::Http(403) | voxhold_api::Error::Http(404))
+                        if conversation =>
+                    {
+                        s.older_error = "Диалог недоступен.".into();
                     }
                     Err(voxhold_api::Error::Http(403) | voxhold_api::Error::Http(404)) => {
                         s.invalidate_access(window, cx);

@@ -108,9 +108,33 @@ impl Voxhold {
                 s.channel_settings = Some(cx.new(|cx| {
                     channel_settings::ChannelSettings::new(admin_client, runtime, window, cx)
                 }));
-                let runtime = s.runtime.clone();
-                let inbox_client = c.clone();
-                s.inbox = Some(cx.new(|cx| inbox::Inbox::new(inbox_client, runtime, window, cx)));
+                s.inbox = Some(cx.new(|_| inbox::Inbox::new()));
+                let inbox = s.inbox.clone().expect("inbox");
+                let weak = cx.entity().downgrade();
+                inbox.update(cx, |inbox, _| {
+                    inbox.set_select_handler(Box::new(move |id, window, cx| {
+                        if let Some(view) = weak.upgrade() {
+                            view.update(cx, |view, cx| {
+                                if let Some(conversation) = view
+                                    .conversations
+                                    .iter()
+                                    .find(|conversation| conversation.id == id)
+                                    .cloned()
+                                {
+                                    view.select_conversation(conversation, window, cx);
+                                }
+                            });
+                        }
+                    }));
+                });
+                let weak = cx.entity().downgrade();
+                inbox.update(cx, |inbox, _| {
+                    inbox.set_refresh_handler(Box::new(move |_window, cx| {
+                        if let Some(view) = weak.upgrade() {
+                            view.update(cx, |view, cx| view.refresh_recents(cx));
+                        }
+                    }));
+                });
                 s.self_user_id = self_user_id;
                 s.client = Some(c.clone());
                 s.start_realtime(c, window, cx);
@@ -195,19 +219,36 @@ impl Voxhold {
         self.pending_jump = None;
         self.history_reset_pending = false;
         self.hovered_message = 0;
+        self.hovered_action = None;
+        self.message_menu = None;
+        self.forward = None;
+        self.editing = None;
+        self.confirm_delete = None;
+        self.action_requests.clear();
+        self.action_error = None;
+        self.action_notice.clear();
+        self.selected_messages.clear();
+        self.pinned_ids.clear();
+        self.pinned_request = None;
+        self.highlighted_message = None;
+        self.thread = None;
+        self.show_thread = false;
+        self.conversation = None;
+        self.conversations.clear();
+        self.recents_request = None;
+        self.recents_again = false;
+        self.channel_snapshot_request = None;
         self.attachments = None;
         self.settings = None;
         self.server_settings = None;
         self.channel_settings = None;
         self.inbox = None;
         self.search = None;
-        self.message_tools = None;
         self.show_inbox = false;
         self.show_settings = false;
         self.show_server_settings = false;
         self.show_channel_settings = false;
         self.show_search = false;
-        self.show_tools = false;
         self.show_servers = false;
         self.auth = {
             let origin = self.auth.origin.clone();

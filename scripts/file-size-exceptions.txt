@@ -6,3 +6,4 @@
 # rejected by scripts/check-file-sizes.ps1.
 #
 # There are currently no exceptions.
+src/app/history_view.rs|1200|The row painter keeps hover actions, quote/link identity, inline edit and delete confirmation in one closure over the same row snapshot; extracting it would duplicate a dozen scope captures and make the two-click targets harder to audit.

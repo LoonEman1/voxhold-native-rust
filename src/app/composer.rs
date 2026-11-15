@@ -13,13 +13,20 @@ impl Voxhold {
             gpui::KeyBinding::new("ctrl-enter", ComposerSend, Some("Composer > Input")),
             gpui::KeyBinding::new("ctrl-v", ComposerPasteFiles, Some("Composer > Input")),
             gpui::KeyBinding::new("cmd-v", ComposerPasteFiles, Some("Composer > Input")),
+            gpui::KeyBinding::new(
+                "enter",
+                thread_panel::ThreadSend,
+                Some("ThreadComposer > Input"),
+            ),
         ]);
     }
 
     /// Key of the chat that owns the composer draft. A personal conversation
     /// has no server id, a thread adds its root to the channel key.
     pub(super) fn chat_key(&self) -> draft::ChatKey {
-        if self.server == 0 {
+        if self.conversation.is_some() {
+            draft::ChatKey::conversation(self.channel)
+        } else if self.server == 0 {
             draft::ChatKey::conversation(self.channel)
         } else {
             draft::ChatKey::channel(self.server, self.channel)
@@ -27,6 +34,9 @@ impl Voxhold {
     }
 
     pub(super) fn composer_writable(&self) -> bool {
+        if self.conversation.is_some() {
+            return !self.access_pending && self.channel > 0;
+        }
         !self.access_pending
             && self
                 .channels
@@ -140,7 +150,7 @@ impl Voxhold {
                 };
                 let composer_now = s.composer.read(cx).value().to_string();
                 let active = s.chat_key() == plan.key;
-                if s.apply_send_success(plan, message, &composer_now) {
+                if s.apply_send_success(plan, message, &composer_now, cx) {
                     s.composer
                         .update(cx, |input, cx| input.set_value("", window, cx));
                 }
@@ -163,6 +173,7 @@ impl Voxhold {
         plan: draft::SendPlan,
         message: Message,
         composer_now: &str,
+        cx: &mut Context<Self>,
     ) -> bool {
         let active = self.chat_key() == plan.key;
         let sent_ids: Vec<String> = plan.files.iter().map(|file| file.id.clone()).collect();
@@ -179,11 +190,14 @@ impl Voxhold {
         // a late POST answer must not put a private row back into that gap.
         if !self.access_pending
             && active
-            && message.channel_id == self.channel
+            && self.message_in_scope(&message)
             && !self.deleted_ids.contains(&message.id)
         {
             self.merge_message(true, message);
             self.trim_history(false);
+        }
+        if plan.key.is_conversation() {
+            self.refresh_recents(cx);
         }
         active && finished == draft::Finish::Cleared && composer_now == plan.composer_text
     }

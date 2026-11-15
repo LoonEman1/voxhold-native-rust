@@ -1,191 +1,309 @@
-use gpui::{div, prelude::*, px, rgb, Context, Entity, Window};
-use gpui_component::input::{InputState, TextInput};
+//! Recent personal conversations. The list is owned by the workspace (the
+//! same data feeds the rail/inbox); this entity only paints the popup and
+//! forwards a click. Titles follow Go `recents.go::conversationTile`.
+
+use gpui::{div, prelude::*, px, App, Context, Render, Window};
 use std::sync::Arc;
-use voxhold_api::{Client, Conversation, Message};
+use voxhold_api::Conversation;
+
+#[derive(Clone)]
+pub struct ConversationTile {
+    pub id: i64,
+    pub title: String,
+    pub direct: bool,
+    pub unread: i64,
+    pub muted: bool,
+    pub peer_id: i64,
+    pub avatar: Option<Arc<gpui::RenderImage>>,
+}
 
 pub struct Inbox {
-    client: Client,
-    runtime: Arc<tokio::runtime::Runtime>,
-    composer: Entity<InputState>,
-    conversations: Vec<Conversation>,
-    selected: i64,
-    messages: Vec<Message>,
-    busy: bool,
-    generation: u64,
+    tiles: Vec<ConversationTile>,
+    loading: bool,
     error: String,
+    on_select: Option<Box<dyn Fn(i64, &mut Window, &mut App) + 'static>>,
+    on_refresh: Option<Box<dyn Fn(&mut Window, &mut App) + 'static>>,
 }
+
 impl Inbox {
-    pub fn new(
-        client: Client,
-        runtime: Arc<tokio::runtime::Runtime>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Self {
+    pub fn new() -> Self {
         Self {
-            client,
-            runtime,
-            composer: cx.new(|cx| {
-                InputState::new(window, cx)
-                    .multi_line()
-                    .placeholder("Сообщение")
-            }),
-            conversations: vec![],
-            selected: 0,
-            messages: vec![],
-            busy: false,
-            generation: 0,
+            tiles: Vec::new(),
+            loading: false,
             error: String::new(),
+            on_select: None,
+            on_refresh: None,
         }
     }
-    pub fn load(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.run(Operation::List, window, cx);
+
+    pub fn set_select_handler(
+        &mut self,
+        handler: Box<dyn Fn(i64, &mut Window, &mut App) + 'static>,
+    ) {
+        self.on_select = Some(handler);
     }
-    fn select(&mut self, id: i64, window: &mut Window, cx: &mut Context<Self>) {
-        self.selected = id;
-        self.messages.clear();
-        self.generation += 1;
-        self.busy = false;
-        self.run(Operation::History, window, cx);
+
+    pub fn set_refresh_handler(&mut self, handler: Box<dyn Fn(&mut Window, &mut App) + 'static>) {
+        self.on_refresh = Some(handler);
     }
-    fn run(&mut self, op: Operation, window: &mut Window, cx: &mut Context<Self>) {
-        if self.busy {
-            return;
-        }
-        let text = self.composer.read(cx).value().to_string();
-        if matches!(op, Operation::Send)
-            && (self.selected <= 0 || text.trim().is_empty() || text.chars().count() > 5120)
-        {
-            self.error = "Введите сообщение длиной до 5120 символов.".into();
-            cx.notify();
-            return;
-        }
-        self.busy = true;
-        self.error.clear();
-        let generation = self.generation;
-        let selected = self.selected;
-        let client = self.client.clone();
-        let runtime = self.runtime.clone();
-        let key = uuid::Uuid::new_v4().simple().to_string();
+
+    pub fn set_loading(&mut self, loading: bool, cx: &mut Context<Self>) {
+        self.loading = loading;
         cx.notify();
-        let sent_text = text.clone();
-        let task = cx.background_spawn(async move {
-            runtime.block_on(async move {
-                match op {
-                    Operation::List => client.recent_conversations().await.map(Response::List),
-                    Operation::History => client
-                        .conversation_messages(selected, 0)
-                        .await
-                        .map(|p| Response::History(p.messages)),
-                    Operation::Send => client
-                        .create_conversation_message(selected, &text, &key, &[])
-                        .await
-                        .map(Response::Sent),
-                }
-                .map_err(|e| e.to_string())
-            })
-        });
-        cx.spawn_in(window, async move |this, window| {
-            let result = task.await;
-            let _ = this.update_in(window, |s, window, cx| {
-                if s.generation != generation {
-                    return;
-                }
-                s.busy = false;
-                match result {
-                    Ok(Response::List(v)) => s.conversations = v,
-                    Ok(Response::History(mut v)) => {
-                        v.sort_by_key(|m| m.id);
-                        s.messages = v
-                    }
-                    Ok(Response::Sent(m)) => {
-                        if s.composer.read(cx).value().as_ref() == sent_text {
-                            s.composer
-                                .update(cx, |input, cx| input.set_value("", window, cx));
-                        }
-                        s.messages.push(m);
-                        if s.messages.len() > 200 {
-                            s.messages.remove(0);
-                        }
-                    }
-                    Err(e) => s.error = e,
-                };
-                cx.notify();
-            });
-        })
-        .detach();
+    }
+
+    pub fn set_error(&mut self, error: String, cx: &mut Context<Self>) {
+        self.error = error;
+        cx.notify();
+    }
+
+    pub fn set_tiles(&mut self, tiles: Vec<ConversationTile>, cx: &mut Context<Self>) {
+        self.tiles = tiles;
+        self.loading = false;
+        self.error.clear();
+        cx.notify();
     }
 }
-#[derive(Clone, Copy)]
-enum Operation {
-    List,
-    History,
-    Send,
+
+/// Go `conversationTile`: an explicit group name wins, a direct chat uses the
+/// other member, and a nameless multi-person chat falls back to "Беседа".
+pub fn conversation_title(conversation: &Conversation, self_user_id: i64) -> String {
+    let mut names = Vec::new();
+    for person in &conversation.members {
+        if self_user_id > 0 && person.user_id == self_user_id {
+            continue;
+        }
+        names.push(person.username.clone());
+    }
+    if !conversation.name.is_empty() {
+        return conversation.name.clone();
+    }
+    if names.is_empty() {
+        return "Беседа".into();
+    }
+    names.join(", ")
 }
-enum Response {
-    List(Vec<Conversation>),
-    History(Vec<Message>),
-    Sent(Message),
+
+pub fn conversation_peer(conversation: &Conversation, self_user_id: i64) -> i64 {
+    if !conversation.direct {
+        return 0;
+    }
+    conversation
+        .members
+        .iter()
+        .find(|person| person.user_id != self_user_id)
+        .map(|person| person.user_id)
+        .unwrap_or(0)
 }
+
 impl Render for Inbox {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut list = div().flex().flex_col().gap_2().child("Последние диалоги");
-        for c in &self.conversations {
-            let id = c.id;
-            let title = if c.name.is_empty() {
-                c.members
-                    .iter()
-                    .map(|m| m.username.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
+        let p = crate::theme::dark_palette();
+        let mut list = div().flex().flex_col().gap_1();
+        if self.loading {
+            list = list.child(
+                div()
+                    .text_size(px(12.))
+                    .text_color(crate::ink(p.muted))
+                    .child("Загрузка…"),
+            );
+        } else if !self.error.is_empty() {
+            list = list.child(
+                div()
+                    .id("inbox-retry")
+                    .cursor_pointer()
+                    .text_size(px(12.))
+                    .text_color(crate::ink(p.danger))
+                    .on_click(cx.listener(|s, _, window, cx| {
+                        if let Some(handler) = &s.on_refresh {
+                            handler(window, cx);
+                        }
+                    }))
+                    .child(format!("{} · Повторить", self.error)),
+            );
+        } else if self.tiles.is_empty() {
+            list = list.child(
+                div()
+                    .text_size(px(12.))
+                    .text_color(crate::ink(p.muted))
+                    .child("Личных диалогов пока нет"),
+            );
+        }
+        for tile in &self.tiles {
+            let id = tile.id;
+            let face = if let Some(image) = tile.avatar.clone() {
+                div()
+                    .w(px(30.))
+                    .h(px(30.))
+                    .flex_shrink_0()
+                    .rounded_full()
+                    .overflow_hidden()
+                    .child(
+                        gpui::img(image)
+                            .size_full()
+                            .object_fit(gpui::ObjectFit::Cover),
+                    )
+                    .into_any_element()
             } else {
-                c.name.clone()
+                div()
+                    .w(px(30.))
+                    .h(px(30.))
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_full()
+                    .bg(crate::ink(crate::members::avatar_color(&tile.title)))
+                    .text_size(px(11.))
+                    .font_weight(gpui::FontWeight::BOLD)
+                    .text_color(crate::ink(0x151510))
+                    .child(crate::members::initials(&tile.title))
+                    .into_any_element()
             };
             list = list.child(
                 div()
                     .id(("conversation", id as u64))
+                    .h(px(38.))
+                    .px(px(6.))
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .rounded(px(7.))
                     .cursor_pointer()
-                    .on_click(cx.listener(move |s, _, window, cx| s.select(id, window, cx)))
-                    .child(format!("{} ({})", title, c.unread_count)),
+                    .hover(|row| row.bg(crate::ink(p.selection)))
+                    .child(face)
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .truncate()
+                            .text_size(px(13.))
+                            .child(tile.title.clone()),
+                    )
+                    .when(tile.muted, |row| {
+                        row.child(
+                            div()
+                                .text_size(px(10.))
+                                .text_color(crate::ink(p.muted))
+                                .child("тихо"),
+                        )
+                    })
+                    .child(
+                        div()
+                            .text_size(px(9.))
+                            .text_color(crate::ink(p.muted))
+                            .child(if tile.direct { "ЛС" } else { "Группа" }),
+                    )
+                    .when(tile.unread > 0, |row| {
+                        row.child(
+                            div()
+                                .min_w(px(18.))
+                                .h(px(18.))
+                                .px(px(5.))
+                                .rounded_full()
+                                .bg(crate::ink(p.lime))
+                                .text_size(px(10.))
+                                .font_weight(gpui::FontWeight::BOLD)
+                                .text_color(crate::ink(0x10100f))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(tile.unread.min(99).to_string()),
+                        )
+                    })
+                    .on_click(cx.listener(move |s, _, window, cx| {
+                        if let Some(handler) = &s.on_select {
+                            handler(id, window, cx);
+                        }
+                    })),
             );
         }
-        let mut history = div()
-            .id("inbox-history")
-            .flex_1()
-            .overflow_y_scroll()
-            .flex()
-            .flex_col()
-            .gap_2();
-        for m in &self.messages {
-            history = history.child(div().child(format!("{}: {}", m.author.username, m.content)));
-        }
-        let mut root = div()
-            .w(px(380.))
-            .h_full()
+        div()
+            .id("inbox-popup")
+            .w(px(320.))
+            .max_h(px(440.))
+            .occlude()
+            .rounded(px(10.))
+            .shadow_lg()
+            .border_1()
+            .border_color(crate::ink(p.line))
+            .bg(crate::ink(p.surface))
+            .text_color(crate::ink(p.fg))
             .p_3()
             .flex()
             .flex_col()
             .gap_2()
-            .bg(rgb(0x202323))
-            .text_color(rgb(0xf3f4eb))
             .child(
                 div()
-                    .id("inbox-refresh")
-                    .cursor_pointer()
-                    .on_click(cx.listener(|s, _, window, cx| s.load(window, cx)))
-                    .child("Обновить диалоги"),
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .text_size(px(13.))
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .child("Личные диалоги"),
+                    )
+                    .child(
+                        div()
+                            .id("inbox-refresh")
+                            .cursor_pointer()
+                            .text_size(px(12.))
+                            .text_color(crate::ink(p.muted))
+                            .on_click(cx.listener(|s, _, window, cx| {
+                                if let Some(handler) = &s.on_refresh {
+                                    handler(window, cx);
+                                }
+                            }))
+                            .child("Обновить"),
+                    ),
             )
-            .child(list)
-            .child(history);
-        if self.selected > 0 {
-            root = root.child(TextInput::new(&self.composer)).child(
+            .child(
                 div()
-                    .id("inbox-send")
-                    .cursor_pointer()
-                    .on_click(cx.listener(|s, _, window, cx| s.run(Operation::Send, window, cx)))
-                    .child("Отправить"),
-            );
+                    .id("inbox-list")
+                    .flex_1()
+                    .min_h(px(0.))
+                    .overflow_y_scroll()
+                    .child(list),
+            )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use voxhold_api::Author;
+
+    fn conversation(name: &str, direct: bool, members: Vec<(i64, &str)>) -> Conversation {
+        Conversation {
+            id: 7,
+            name: name.into(),
+            direct,
+            members: members
+                .into_iter()
+                .map(|(user_id, username)| Author {
+                    user_id,
+                    username: username.into(),
+                })
+                .collect(),
+            ..Default::default()
         }
-        root.child(if self.busy { "Загрузка…" } else { "" })
-            .child(div().text_color(rgb(0xff7777)).child(self.error.clone()))
+    }
+
+    #[test]
+    fn direct_and_group_titles_follow_go_recents() {
+        let direct = conversation("", true, vec![(1, "me"), (2, "neva")]);
+        assert_eq!(conversation_title(&direct, 1), "neva");
+        assert_eq!(conversation_peer(&direct, 1), 2);
+
+        let group = conversation("", false, vec![(1, "me"), (2, "neva"), (3, "alex")]);
+        assert_eq!(conversation_title(&group, 1), "neva, alex");
+        assert_eq!(conversation_peer(&group, 1), 0);
+
+        let named = conversation("Проект", true, vec![(1, "me"), (2, "neva")]);
+        assert_eq!(conversation_title(&named, 1), "Проект");
+
+        let empty = conversation("", false, vec![(1, "me")]);
+        assert_eq!(conversation_title(&empty, 1), "Беседа");
     }
 }

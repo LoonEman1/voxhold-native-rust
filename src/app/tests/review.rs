@@ -335,7 +335,7 @@ async fn a_late_send_confirmation_waits_for_confirmed_access_before_inserting(
             assert!(v.messages.is_empty());
             let message = serde_json::from_value::<Message>(message_json(9, 1, "текст")).unwrap();
             assert!(
-                v.apply_send_success(plan, message, "текст"),
+                v.apply_send_success(plan, message, "текст", cx),
                 "the confirmed send still clears the original draft"
             );
             assert_eq!(v.drafts.borrow().text(key), "");

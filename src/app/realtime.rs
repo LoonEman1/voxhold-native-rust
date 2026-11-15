@@ -13,6 +13,8 @@ pub(super) struct RealtimeEffect {
     /// A bounded attachment tombstone rolled over and cancelled the initial
     /// history refresh; the pump restarts one fresh refresh after the batch.
     pub(super) restart_history: bool,
+    /// Personal conversation list or an open direct history changed.
+    pub(super) recents: bool,
 }
 
 impl Voxhold {
@@ -79,13 +81,19 @@ impl Voxhold {
                 let mut server_removed = false;
                 let mut removed_attachments = Vec::new();
                 let mut restart_history = false;
-                for event in events {
+                let mut recents = false;
+                for event in &events {
+                    s.forward_thread_event(event, cx);
                     let effect = s.apply_realtime_event(&event.kind, &event.data);
                     resync |= effect.resync;
                     access |= effect.access;
                     server_removed |= effect.server_removed;
                     restart_history |= effect.restart_history;
+                    recents |= effect.recents;
                     removed_attachments.extend(effect.attachments);
+                }
+                if recents {
+                    s.refresh_recents(cx);
                 }
                 if !removed_attachments.is_empty() {
                     restart_history |= s.purge_attachments(&removed_attachments, window, cx);
@@ -106,7 +114,7 @@ impl Voxhold {
                     s.refresh_history(window, cx);
                 }
                 if changed {
-                    s.sync_tools_message(cx);
+                    s.sync_open_views(cx);
                     // Deleting (or dropping from the window) the viewed message
                     // closes the viewer before a late content answer arrives.
                     let stale_viewer = s.media.viewer.as_ref().is_some_and(|viewer| {
@@ -127,13 +135,35 @@ impl Voxhold {
         })
         .detach();
     }
+    pub(super) fn message_in_scope(&self, message: &Message) -> bool {
+        if self.in_conversation() {
+            message.conversation_id == self.channel && message.thread_root_id.is_none()
+        } else {
+            message.channel_id == self.channel && message.thread_root_id.is_none()
+        }
+    }
+
+    /// Thread rows live in their own timeline; only the root and its comments
+    /// are forwarded there.
+    pub(super) fn forward_thread_event(
+        &mut self,
+        event: &voxhold_api::RealtimeEvent,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(thread) = &self.thread else {
+            return;
+        };
+        thread.update(cx, |thread, cx| {
+            thread.handle_event(&event.kind, &event.data, self.access_generation, cx)
+        });
+    }
+
     /// Merge one message while keeping the body revision and the separate
     /// reaction revision apart. Backend `message.updated` omits `reactions`, so
     /// replacing the object wholesale would reset them to version 0.
     pub(super) fn merge_message(&mut self, created: bool, message: Message) {
         if message.id <= 0
-            || message.channel_id != self.channel
-            || message.thread_root_id.is_some()
+            || !self.message_in_scope(&message)
             || self.deleted_ids.contains(&message.id)
         {
             return;
@@ -330,7 +360,7 @@ impl Voxhold {
                     }
                 }
             }
-            "message.deleted" if !self.access_pending => {
+            "message.deleted" if !self.access_pending && !self.in_conversation() => {
                 if data["channel_id"].as_i64() == Some(self.channel) {
                     if let Some(id) = data["message_id"].as_i64() {
                         self.deleted_ids.insert(id);
@@ -339,6 +369,48 @@ impl Voxhold {
                         self.pending_reactions.remove(&id);
                     }
                 }
+            }
+            "conversation.message" if !self.access_pending => {
+                if let Ok(message) = serde_json::from_value::<Message>(data.clone()) {
+                    if self.in_conversation() && message.conversation_id == self.channel {
+                        self.merge_message(true, message);
+                        self.trim_history(false);
+                    }
+                }
+                effect.recents = true;
+            }
+            "conversation.deleted" => {
+                let matches = self.in_conversation()
+                    && data["conversation_id"].as_i64() == Some(self.channel);
+                if matches {
+                    if let Some(id) = data["message_id"].as_i64() {
+                        self.deleted_ids.insert(id);
+                        self.messages.retain(|row| row.id != id);
+                        self.pending_edits.remove(&id);
+                        self.pending_reactions.remove(&id);
+                        self.selected_messages.retain(|row| *row != id);
+                    }
+                }
+                effect.recents = true;
+            }
+            "conversation.changed" => {
+                let matches = self.in_conversation()
+                    && data["conversation_id"].as_i64() == Some(self.channel);
+                if matches {
+                    effect.resync = true;
+                }
+                effect.recents = true;
+            }
+            "conversation.reactions" if !self.access_pending => {
+                if self.in_conversation() && data["conversation_id"].as_i64() == Some(self.channel)
+                {
+                    // The event carries only the id; the authoritative body is
+                    // fetched through the normal history merge.
+                    effect.resync = true;
+                }
+            }
+            "conversation.notification" | "conversation.read" => {
+                effect.recents = true;
             }
             "attachments.changed" if !self.access_pending => {
                 if data["channel_id"].as_i64() == Some(self.channel) {
@@ -378,7 +450,7 @@ impl Voxhold {
                     }
                 }
             }
-            "message.reactions_changed" if !self.access_pending => {
+            "message.reactions_changed" if !self.access_pending && !self.in_conversation() => {
                 if let Ok(update) =
                     serde_json::from_value::<voxhold_api::ReactionsUpdate>(data.clone())
                 {

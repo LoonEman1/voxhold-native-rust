@@ -959,7 +959,7 @@ PR [#13](https://github.com/LoonEman1/voxhold-native-rust/pull/13); сверен
 
 Проверено в PR: `cargo fmt --all -- --check`, `cargo test --workspace --locked`
 (147 тестов приложения: 146 passed, 1 `ignored`; 6 API; 6 media), release-сборка,
-размеры (131 файл; исключение 1200 строк для `src/app/history_view.rs`) и smoke.
+размеры (132 файла; исключение 1200 строк для `src/app/history_view.rs`) и smoke.
 На backend `9b29fdd` пройдены вход, канал и ЛС с одним числовым id 1, поиск,
 закреп, комментарий/thread read, отправка и реакция ЛС, read, recents; member
 получил `403` на удаление чужого сообщения и pin. Осталось до merge/релиза:

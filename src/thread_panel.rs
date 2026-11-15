@@ -2,11 +2,13 @@
 //! never enters the main channel window, the root has its own read cursor, and
 //! the panel owns its draft under `ChatKey::thread`.
 
-use gpui::{div, prelude::*, px, Context, Entity, Render, ScrollHandle, Window};
+use gpui::{div, prelude::*, px, Context, Entity, Render, ScrollHandle, WeakEntity, Window};
 use gpui_component::input::{InputEvent, InputState, TextInput};
+use std::collections::HashSet;
 use std::sync::Arc;
 use voxhold_api::{Client, Message};
 
+use crate::app::Voxhold;
 use crate::draft::{ChatKey, Shared as SharedDrafts};
 use crate::history;
 
@@ -23,6 +25,11 @@ pub struct ThreadPanel {
     access: u64,
     generation: u64,
     request: u64,
+    send_attempt: u64,
+    news: bool,
+    owner: Option<WeakEntity<Voxhold>>,
+    session: u64,
+    deleted: HashSet<i64>,
     messages: Vec<Message>,
     before: Option<i64>,
     has_more: bool,
@@ -89,6 +96,11 @@ impl ThreadPanel {
             access,
             generation: 0,
             request: 0,
+            send_attempt: 0,
+            news: false,
+            owner: None,
+            session: 0,
+            deleted: HashSet::new(),
             messages: Vec::new(),
             before: None,
             has_more: false,
@@ -117,6 +129,18 @@ impl ThreadPanel {
         self.on_close = Some(handler);
     }
 
+    /// The workspace owns the send confirmation so it can finish the original
+    /// draft even after this panel was closed.
+    pub fn set_context(&mut self, news: bool, owner: WeakEntity<Voxhold>, session: u64) {
+        self.news = news;
+        self.owner = Some(owner);
+        self.session = session;
+    }
+
+    pub fn key(&self) -> ChatKey {
+        self.key
+    }
+
     pub fn root_id(&self) -> i64 {
         self.root.id
     }
@@ -129,6 +153,64 @@ impl ThreadPanel {
     #[cfg(test)]
     pub fn messages(&self) -> &[Message] {
         &self.messages
+    }
+
+    #[cfg(test)]
+    pub fn sending(&self) -> bool {
+        self.sending
+    }
+
+    #[cfg(test)]
+    pub fn send_error(&self) -> &str {
+        &self.send_error
+    }
+
+    pub fn composer_text(&self, cx: &gpui::App) -> String {
+        self.composer.read(cx).value().to_string()
+    }
+
+    #[cfg(test)]
+    pub fn loading(&self) -> bool {
+        self.loading
+    }
+
+    #[cfg(test)]
+    pub fn set_read_for_test(&mut self, id: i64) {
+        self.read = id;
+        self.read_wanted = id;
+    }
+
+    #[cfg(test)]
+    pub fn set_composer_for_test(
+        &mut self,
+        text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let text = text.to_string();
+        self.composer
+            .update(cx, move |input, cx| input.set_value(text, window, cx));
+    }
+
+    #[cfg(test)]
+    pub fn send_for_test(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.send(window, cx);
+    }
+
+    #[cfg(test)]
+    pub fn load_for_test(&mut self, before: i64, cx: &mut Context<Self>) {
+        self.load(before, cx);
+    }
+
+    #[cfg(test)]
+    pub fn apply_page_for_test(
+        &mut self,
+        page: voxhold_api::MessagePage,
+        before: i64,
+        target: Option<i64>,
+        anchored: bool,
+    ) {
+        self.apply_page(page, before, target, anchored);
     }
 
     pub fn load_initial(&mut self, cx: &mut Context<Self>) {
@@ -209,21 +291,53 @@ impl ThreadPanel {
         target: Option<i64>,
         anchored: bool,
     ) {
+        let mut current: std::collections::HashMap<i64, Message> =
+            std::mem::take(&mut self.messages)
+                .into_iter()
+                .map(|row| (row.id, row))
+                .collect();
         if before > 0 {
+            self.messages = current.into_values().collect();
+            self.messages.sort_by_key(|message| message.id);
             for row in page.messages {
                 self.apply_change(row);
             }
         } else if target.is_none() && self.initial && !self.anchored && !page.messages.is_empty() {
             let first = page.messages.first().map_or(0, |message| message.id);
-            self.messages.retain(|message| message.id < first);
-            for row in page.messages {
+            let last = page
+                .messages
+                .iter()
+                .map(|message| message.id)
+                .max()
+                .unwrap_or(0);
+            // Keep older pages and rows created while this page was in
+            // flight. Rows inside the window that the server omitted stay
+            // deleted, and a matched row keeps its newer WS/post revision.
+            for row in current.values() {
+                if row.id < first || row.id > last {
+                    self.apply_change(row.clone());
+                }
+            }
+            for mut row in page.messages {
+                if let Some(mut existing) = current.remove(&row.id) {
+                    history::merge_revision(&mut existing, row);
+                    row = existing;
+                }
                 self.apply_change(row);
             }
         } else {
-            self.messages.clear();
-            for row in page.messages {
-                self.apply_change(row);
+            let mut next = Vec::with_capacity(page.messages.len());
+            for mut row in page.messages {
+                if let Some(mut existing) = current.remove(&row.id) {
+                    history::merge_revision(&mut existing, row);
+                    row = existing;
+                }
+                if row.id > 0 && !self.deleted.contains(&row.id) {
+                    next.push(row);
+                }
             }
+            next.sort_by_key(|message| message.id);
+            self.messages = next;
         }
         if before == 0 {
             self.anchored = anchored;
@@ -239,7 +353,7 @@ impl ThreadPanel {
     }
 
     fn apply_change(&mut self, message: Message) {
-        if message.id <= 0 {
+        if message.id <= 0 || self.deleted.contains(&message.id) {
             return;
         }
         if let Some(existing) = self.messages.iter_mut().find(|row| row.id == message.id) {
@@ -257,6 +371,7 @@ impl ThreadPanel {
     }
 
     pub fn remove_message(&mut self, id: i64, cx: &mut Context<Self>) {
+        self.deleted.insert(id);
         self.messages.retain(|message| message.id != id);
         cx.notify();
     }
@@ -314,11 +429,14 @@ impl ThreadPanel {
                     return;
                 };
                 if id == self.root.id {
-                    self.close(cx);
-                } else {
-                    self.messages.retain(|message| message.id != id);
-                    cx.notify();
+                    // The workspace handles root deletion before this panel
+                    // is updated, so it can close the panel and save the
+                    // draft without re-entering the workspace.
+                    return;
                 }
+                self.deleted.insert(id);
+                self.messages.retain(|message| message.id != id);
+                cx.notify();
             }
             _ => {}
         }
@@ -363,51 +481,83 @@ impl ThreadPanel {
         let client = self.client.clone();
         let (server, channel, root) = (self.server, self.channel, self.root.id);
         let runtime = self.runtime.clone();
-        let request = self.request;
+        self.send_attempt = self.send_attempt.wrapping_add(1);
+        let attempt = self.send_attempt;
         let generation = self.generation;
         let access = self.access;
+        let session = self.session;
+        let news = self.news;
+        let owner = self.owner.clone();
+        let Some(owner) = owner else {
+            self.sending = false;
+            return;
+        };
         self.sending = true;
         self.send_error.clear();
-        let sent_text = plan.composer_text.clone();
-        let task = cx.background_spawn(async move {
-            runtime.block_on(client.send_thread_message(
-                server,
-                channel,
-                root,
-                &plan.content,
-                &plan.send_key,
-            ))
+        let content = plan.content.clone();
+        let send_key = plan.send_key.clone();
+        // Start the HTTP work on the runtime directly: a gated POST must reach
+        // the server even while the foreground executor is idle.
+        let task = runtime.spawn(async move {
+            client
+                .send_thread_message(server, channel, root, &content, &send_key, news)
+                .await
         });
-        cx.spawn_in(window, async move |this, window| {
-            let result = task.await;
-            let _ = this.update_in(window, |s, window, cx| {
-                if !s.accepts(request, generation, access) {
-                    return;
-                }
-                s.sending = false;
-                match result {
-                    Ok(message) => {
-                        let now = s.composer.read(cx).value().to_string();
-                        s.drafts.borrow_mut().finish_send(
-                            plan.key,
-                            plan.revision,
-                            &plan.composer_text,
-                            &[],
-                            Some(&now),
-                        );
-                        if now == sent_text {
-                            s.composer
-                                .update(cx, |input, cx| input.set_value("", window, cx));
-                        }
-                        s.apply_change(message);
-                        s.mark_visible(s.messages.last().map_or(0, |row| row.id), cx);
+        // The confirmation belongs to the workspace, not to this entity: a
+        // closed panel must still finish the original draft.
+        window
+            .spawn(cx, async move |cx| {
+                let result = match task.await {
+                    Ok(result) => result,
+                    Err(_) => Err(voxhold_api::Error::Network),
+                };
+                let _ = cx.update(|window, cx| {
+                    if let Some(view) = owner.upgrade() {
+                        view.update(cx, |view, cx| {
+                            view.finish_thread_send(
+                                plan, attempt, generation, access, session, result, window, cx,
+                            )
+                        });
                     }
-                    Err(error) => s.send_error = error.to_string(),
+                });
+            })
+            .detach();
+        cx.notify();
+    }
+
+    /// Apply one accepted send to the still-open panel. The load request id is
+    /// deliberately not part of this check: paging while a POST is in flight
+    /// must not leave the composer stuck on "Отправка…".
+    pub fn apply_send_result(
+        &mut self,
+        attempt: u64,
+        generation: u64,
+        access: u64,
+        key: ChatKey,
+        result: &Result<Message, voxhold_api::Error>,
+        clear: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.send_attempt != attempt
+            || self.key != key
+            || self.generation != generation
+            || self.access != access
+        {
+            return;
+        }
+        self.sending = false;
+        match result {
+            Ok(message) => {
+                if clear {
+                    self.composer
+                        .update(cx, |input, cx| input.set_value("", window, cx));
                 }
-                cx.notify();
-            });
-        })
-        .detach();
+                self.apply_change(message.clone());
+                self.mark_visible(self.messages.last().map_or(0, |row| row.id), cx);
+            }
+            Err(error) => self.send_error = error.to_string(),
+        }
         cx.notify();
     }
 

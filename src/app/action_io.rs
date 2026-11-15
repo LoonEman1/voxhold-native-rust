@@ -237,7 +237,7 @@ impl Voxhold {
         let task = cx.background_spawn(async move {
             runtime.block_on(client.forward_message_to(
                 source_kind,
-                source.channel,
+                message_id,
                 &destination_kind,
                 destination_id,
                 &key,

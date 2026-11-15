@@ -172,6 +172,8 @@ impl Voxhold {
         self.read_retry_at = None;
         self.unread_after = 0;
         self.reaction_requests.clear();
+        self.conversation_reaction_requests.clear();
+        self.channel_snapshot_request = None;
         self.context_request = None;
         self.pending_jump = None;
         self.history_reset_pending = false;

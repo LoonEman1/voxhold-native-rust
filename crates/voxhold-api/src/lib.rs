@@ -265,21 +265,6 @@ impl Client {
         )
         .await
     }
-    pub async fn send_thread_message(
-        &self,
-        sid: i64,
-        cid: i64,
-        root: i64,
-        content: &str,
-        key: &str,
-    ) -> Result<Message> {
-        self.request(
-            Method::POST,
-            &format!("{}/messages", channel_path(sid, cid)),
-            Some(json!({"content":content,"thread_root_id":root,"client_message_id":key})),
-        )
-        .await
-    }
     pub async fn reply_message(
         &self,
         sid: i64,

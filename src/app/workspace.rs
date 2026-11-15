@@ -49,12 +49,27 @@ impl Voxhold {
         let search = cx.new(|cx| search::SearchPanel::new(search_client, runtime, window, cx));
         let weak_view = cx.entity().downgrade();
         search.update(cx, |panel, _| {
+            let weak_view = weak_view.clone();
             panel.set_select_handler(Box::new(move |channel, message, window, cx| {
-                if let Some(view) = weak_view.upgrade() {
+                // The click runs inside `SearchPanel::update`. Navigation must
+                // wait until that entity is off the stack, otherwise
+                // `select_channel` re-enters the same panel and GPUI panics.
+                let Some(view) = weak_view.upgrade() else {
+                    return;
+                };
+                let scope = view.read(cx).search_jump_scope();
+                let weak_view = weak_view.clone();
+                window.defer(cx, move |window, cx| {
+                    let Some(view) = weak_view.upgrade() else {
+                        return;
+                    };
                     view.update(cx, |view, cx| {
-                        view.open_search_hit(channel, message, window, cx)
+                        if view.search_jump_scope() != scope {
+                            return;
+                        }
+                        view.open_search_hit(channel, message, window, cx);
                     });
-                }
+                });
             }));
         });
         let weak_pins = cx.entity().downgrade();
@@ -125,6 +140,8 @@ impl Voxhold {
         self.access_refresh_again = false;
         self.refresh_request = None;
         self.refresh_again = false;
+        self.channel_snapshot_request = None;
+        self.conversation_reaction_requests.clear();
         self.pending_edits.clear();
         self.pending_reactions.clear();
         self.request_seq = self.request_seq.wrapping_add(1);
@@ -163,6 +180,7 @@ impl Voxhold {
                         Ok((channels, members)) => {
                             s.channels = channels;
                             s.members = members;
+                            s.sync_search_permissions(cx);
                         }
                         Err(e) => s.error = e,
                     }
@@ -223,6 +241,8 @@ impl Voxhold {
             .copied()
             .unwrap_or(0);
         self.reaction_requests.clear();
+        self.conversation_reaction_requests.clear();
+        self.channel_snapshot_request = None;
         self.context_request = None;
         self.pending_jump = None;
         self.history_reset_pending = false;
@@ -344,6 +364,8 @@ impl Voxhold {
         self.access_generation = self.access_generation.wrapping_add(1);
         self.refresh_request = None;
         self.refresh_again = false;
+        self.channel_snapshot_request = None;
+        self.conversation_reaction_requests.clear();
         self.refresh_new_ids.clear();
         self.pending_edits.clear();
         self.pending_reactions.clear();
@@ -401,7 +423,10 @@ impl Voxhold {
             attachments.update(cx, |a, cx| a.set_scope(None, false, cx));
         }
         if let Some(search) = &self.search {
-            search.update(cx, |panel, cx| panel.set_scope(0, 0, cx));
+            search.update(cx, |panel, cx| {
+                panel.set_scope(0, 0, cx);
+                panel.set_allowed_channels(Default::default(), cx);
+            });
         }
         if let Some(settings) = &self.channel_settings {
             settings.update(cx, |panel, cx| panel.set_scope(0, 0, "", false, cx));
@@ -450,6 +475,7 @@ impl Voxhold {
                 match result {
                     Ok((channels, members)) => {
                         s.channels = channels;
+                        s.sync_search_permissions(cx);
                         if let Ok(members) = members {
                             s.members = members;
                         }

@@ -147,6 +147,33 @@ impl Client {
         )
         .await
     }
+    /// A thread comment. The backend dispatches news comments from
+    /// `reply_to_message_id` before it looks at `thread_root_id`, so the news
+    /// payload carries both; a text-channel comment keeps its original shape.
+    pub async fn send_thread_message(
+        &self,
+        sid: i64,
+        cid: i64,
+        root: i64,
+        content: &str,
+        key: &str,
+        news: bool,
+    ) -> Result<Message> {
+        let mut body = json!({
+            "content": content,
+            "thread_root_id": root,
+            "client_message_id": key
+        });
+        if news {
+            body["reply_to_message_id"] = json!(root);
+        }
+        self.request(
+            Method::POST,
+            &format!("{}/messages", channel_path(sid, cid)),
+            Some(body),
+        )
+        .await
+    }
     pub async fn forward_message(
         &self,
         s: i64,

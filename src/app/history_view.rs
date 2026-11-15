@@ -448,11 +448,8 @@ impl Voxhold {
                         };
                         let x: f32 = event.position().x.into();
                         let y: f32 = event.position().y.into();
-                        view.update(cx, |s, cx| match action {
-                            HoverAction::Picker | HoverAction::More => {
-                                s.open_message_menu(id, x, y, false, cx)
-                            }
-                            other => s.dispatch_hover_action(id, other, scroll_epoch, window, cx),
+                        view.update(cx, |s, cx| {
+                            s.dispatch_hover_action(id, action, scroll_epoch, x, y, window, cx)
                         });
                         cx.stop_propagation();
                     });

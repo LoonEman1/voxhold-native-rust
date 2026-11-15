@@ -517,6 +517,75 @@ impl Voxhold {
         }
     }
 
+    /// Reaction-only refresh for a loaded personal message. The backend uses
+    /// a strict `id < before_id`, so `mid + 1` makes the reacted row the first
+    /// answer. The current window, cursor and scroll anchor stay untouched.
+    pub(super) fn refresh_conversation_reaction(
+        &mut self,
+        conversation_id: i64,
+        message_id: i64,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.in_conversation()
+            || self.channel != conversation_id
+            || self.access_pending
+            || !self.messages.iter().any(|row| row.id == message_id)
+            || self.deleted_ids.contains(&message_id)
+        {
+            return;
+        }
+        if !self.conversation_reaction_requests.insert(message_id) {
+            return;
+        }
+        let Some(client) = self.client.clone() else {
+            self.conversation_reaction_requests.remove(&message_id);
+            return;
+        };
+        let (generation, access, chat) = (self.generation, self.access_generation, self.chat_key());
+        let runtime = self.runtime.clone();
+        let before = message_id.saturating_add(1);
+        let task = cx.background_spawn(async move {
+            runtime.block_on(client.conversation_messages(conversation_id, before))
+        });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            if let Some(this) = this.upgrade() {
+                this.update(cx, |s, cx| {
+                    s.conversation_reaction_requests.remove(&message_id);
+                    if s.generation != generation
+                        || s.access_generation != access
+                        || s.chat_key() != chat
+                        || s.channel != conversation_id
+                        || !s.in_conversation()
+                    {
+                        return;
+                    }
+                    if let Ok(page) = result {
+                        let Some(fetched) = page.messages.iter().find(|row| row.id == message_id)
+                        else {
+                            return;
+                        };
+                        if s.deleted_ids.contains(&message_id) {
+                            return;
+                        }
+                        let update = voxhold_api::ReactionsUpdate {
+                            channel_id: 0,
+                            message_id,
+                            revision: fetched.reactions_revision,
+                            reactions: fetched.reactions.clone(),
+                        };
+                        if let Some(row) = s.messages.iter_mut().find(|row| row.id == message_id) {
+                            apply_reactions(row, update);
+                        }
+                    }
+                    cx.notify();
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
+
     /// Push the confirmed row state into the open thread and context menu. The
     /// old side panel no longer owns message state.
     pub(super) fn sync_open_views(&mut self, cx: &mut Context<Self>) {

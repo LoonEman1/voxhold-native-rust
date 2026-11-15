@@ -163,6 +163,8 @@ impl Voxhold {
         message_id: i64,
         action: HoverAction,
         epoch: u64,
+        x: f32,
+        y: f32,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -188,12 +190,13 @@ impl Voxhold {
                 self.toggle_reaction(message_id, emoji.to_string(), active, cx);
             }
             HoverAction::Picker => {
-                self.open_message_menu(message_id, 0., 0., true, cx);
+                self.open_message_menu(message_id, x, y, true, cx);
             }
-            HoverAction::Reply | HoverAction::Forward | HoverAction::More => {
-                if action == HoverAction::More {
-                    self.open_message_menu(message_id, 0., 0., false, cx);
-                } else if let Some(action) = message_tools::hover_menu_action(action) {
+            HoverAction::More => {
+                self.open_message_menu(message_id, x, y, false, cx);
+            }
+            HoverAction::Reply | HoverAction::Forward => {
+                if let Some(action) = message_tools::hover_menu_action(action) {
                     self.dispatch_message_action(message_id, action, window, cx);
                 }
             }
@@ -553,6 +556,32 @@ impl Voxhold {
         .detach();
     }
 
+    /// Scope captured when a search row is clicked. The deferred navigation
+    /// only runs while the same session, server and access snapshot are open
+    /// and the popup still owns the screen.
+    pub(super) fn search_jump_scope(&self) -> (u64, i64, u64, bool) {
+        (
+            self.session_generation,
+            self.server,
+            self.access_generation,
+            self.show_search,
+        )
+    }
+
+    /// Keep the search popup's permission snapshot aligned with the confirmed
+    /// channel rows. Only readable history channels may disclose a hit.
+    pub(super) fn sync_search_permissions(&mut self, cx: &mut Context<Self>) {
+        let allowed: std::collections::HashSet<i64> = self
+            .channels
+            .iter()
+            .filter(|channel| channel.has_history())
+            .map(|channel| channel.id)
+            .collect();
+        if let Some(search) = &self.search {
+            search.update(cx, |panel, cx| panel.set_allowed_channels(allowed, cx));
+        }
+    }
+
     /// Search and pin jumps validate the target against the current channel
     /// snapshot first, so a fake or revoked result cannot reveal a closed
     /// channel.
@@ -595,6 +624,17 @@ impl Voxhold {
         cx.notify();
     }
 
+    /// Release the channel-snapshot slot only when it still belongs to this
+    /// request. A callback from channel A must leave B's slot untouched.
+    pub(super) fn release_channel_snapshot(&mut self, request: u64) -> bool {
+        if self.channel_snapshot_request == Some(request) {
+            self.channel_snapshot_request = None;
+            true
+        } else {
+            false
+        }
+    }
+
     /// Reload the channel snapshot after `403` without hiding the confirmed
     /// history. Actions that are no longer allowed disappear immediately.
     pub(super) fn recheck_channel_snapshot(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -607,21 +647,32 @@ impl Voxhold {
         self.action_seq = self.action_seq.wrapping_add(1);
         let request = self.action_seq;
         self.channel_snapshot_request = Some(request);
-        let (server, generation) = (self.server, self.generation);
+        let (server, channel, generation, access) = (
+            self.server,
+            self.channel,
+            self.generation,
+            self.access_generation,
+        );
         let runtime = self.runtime.clone();
         let task = cx.background_spawn(async move { runtime.block_on(client.channels(server)) });
         cx.spawn_in(window, async move |this, window| {
             let result = task.await;
             let _ = this.update_in(window, |s, window, cx| {
-                if s.channel_snapshot_request != Some(request)
-                    || s.server != server
+                // A late answer must not clear the slot that a newer request
+                // installed after the channel changed.
+                if !s.release_channel_snapshot(request) {
+                    return;
+                }
+                if s.server != server
+                    || s.channel != channel
                     || s.generation != generation
+                    || s.access_generation != access
                 {
                     return;
                 }
-                s.channel_snapshot_request = None;
                 if let Ok(channels) = result {
                     s.channels = channels;
+                    s.sync_search_permissions(cx);
                     let readable = s
                         .channels
                         .iter()
@@ -722,6 +773,7 @@ impl Voxhold {
         } else {
             search::Mode::Search
         };
+        self.sync_search_permissions(cx);
         let (server, channel) = (self.server, self.channel);
         if let Some(panel) = &self.search {
             panel.update(cx, |panel, cx| {

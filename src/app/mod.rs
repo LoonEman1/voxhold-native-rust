@@ -178,6 +178,9 @@ pub(crate) struct Voxhold {
     unread_after: i64,
     /// One request per `(message, emoji)` so a double click cannot toggle twice.
     reaction_requests: std::collections::HashSet<(i64, String)>,
+    /// One reaction-only refresh per personal message. The answer is merged
+    /// into the loaded window instead of replacing it with the latest page.
+    conversation_reaction_requests: std::collections::HashSet<i64>,
     recent_reactions: reactions::SharedRecents,
     /// Custom history scrollbar drag captured from the root pointer handler.
     scrollbar_drag: Option<ScrollbarDrag>,
@@ -393,6 +396,7 @@ impl Voxhold {
             channel_reads: Default::default(),
             unread_after: 0,
             reaction_requests: Default::default(),
+            conversation_reaction_requests: Default::default(),
             recent_reactions: recent_reactions.clone(),
             scrollbar_drag: None,
             context_request: None,

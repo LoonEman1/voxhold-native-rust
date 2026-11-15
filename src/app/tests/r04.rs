@@ -210,13 +210,40 @@ async fn a_hover_click_from_before_the_scroll_is_ignored(cx: &mut TestAppContext
             v.hovered_message = 5;
             v.hovered_action = Some((5, "more".into()));
             v.scroll_epoch = 4;
-            v.dispatch_hover_action(5, message_tools::HoverAction::More, 3, window, cx);
+            v.dispatch_hover_action(5, message_tools::HoverAction::More, 3, 0., 0., window, cx);
             assert!(
                 v.message_menu.is_none(),
                 "the old frame's bar must not open a menu"
             );
-            v.dispatch_hover_action(5, message_tools::HoverAction::More, 4, window, cx);
+            v.dispatch_hover_action(5, message_tools::HoverAction::More, 4, 0., 0., window, cx);
             assert!(v.message_menu.is_some(), "the current frame still works");
+            v.message_menu = None;
+            v.hovered_action = Some((5, "emoji".into()));
+            v.dispatch_hover_action(
+                5,
+                message_tools::HoverAction::Picker,
+                3,
+                10.,
+                20.,
+                window,
+                cx,
+            );
+            assert!(
+                v.message_menu.is_none(),
+                "the picker from before the scroll is ignored too"
+            );
+            v.dispatch_hover_action(
+                5,
+                message_tools::HoverAction::Picker,
+                4,
+                10.,
+                20.,
+                window,
+                cx,
+            );
+            let menu = v.message_menu.as_ref().expect("picker menu");
+            assert!(menu.expanded, "the emoji button opens the full catalogue");
+            assert_eq!((menu.x, menu.y), (10., 20.));
         });
     });
 }

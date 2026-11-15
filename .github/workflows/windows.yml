@@ -47,14 +47,28 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           cache-bin: "false"
-      - run: cargo build --release --locked -p voxhold-native-rust
-      - name: Package Windows client
+      - name: Build and package Windows client
         run: |
           $ErrorActionPreference = 'Stop'
+          $webrtcBuild = cargo build --release --locked -p voxhold-native-rust --message-format=json-render-diagnostics |
+            ForEach-Object { ConvertFrom-Json -InputObject $_ } |
+            Where-Object { $_.reason -eq 'build-script-executed' -and $_.package_id -match '#webrtc-sys@' }
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          # Use the license next to the library selected by the build script.
+          $webrtcLicenses = @($webrtcBuild.linked_paths |
+            Where-Object { $_ -like 'native=*' } |
+            ForEach-Object { Join-Path (Split-Path -Parent ($_ -replace '^native=')) 'LICENSE.md' } |
+            Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } |
+            Select-Object -Unique)
+          if ($webrtcLicenses.Count -ne 1) { throw 'Expected one license file for the linked WebRTC build' }
+
           $bundle = 'target/voxhold-windows'
           New-Item -ItemType Directory -Force $bundle | Out-Null
           Copy-Item target/release/voxhold-native-rust.exe $bundle
+          Copy-Item -LiteralPath LICENSE, THIRD_PARTY_NOTICES.md -Destination $bundle
           Copy-Item -Recurse assets $bundle
+          Copy-Item -LiteralPath $webrtcLicenses[0] -Destination "$bundle/assets/licenses/WebRTC-LICENSE.md"
           foreach ($file in 'voxhold.ico', 'icons/brand.svg', 'icons/hash.svg', 'icons/news.svg', 'icons/volume.svg', 'icons/lock.svg', 'licenses/Inter-OFL.txt') {
             if (!(Test-Path -LiteralPath "$bundle/assets/$file" -PathType Leaf)) {
               throw "Missing asset $file"

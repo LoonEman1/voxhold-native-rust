@@ -28,3 +28,8 @@ git config --local core.hooksPath .githooks
 В GitHub Actions workflow **Windows** проверяет форматирование и запускает тесты всего workspace с включённым медиа для каждого PR. После успешных тестов на `dev` и `main` он публикует артефакт `voxhold-windows` с release EXE и каталогом `assets/`. Когда этот workflow попадёт в `main`, собрать такой же архив для другой ветки можно вручную через **Actions → Windows → Run workflow**.
 
 Клиент требует HTTPS, кроме localhost и loopback. Токен сессии хранится в памяти; не записывайте его и пароли в журналы или тестовые данные. Производительность относительно прежнего клиента не измерялась. См. [архитектуру](docs/architecture.md).
+
+## Лицензия
+
+Исходный код Voxhold Native Rust распространяется по [Apache License 2.0](LICENSE).
+Сведения о сторонних компонентах и ресурсах приведены в [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

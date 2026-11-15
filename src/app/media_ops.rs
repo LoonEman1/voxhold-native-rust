@@ -49,6 +49,7 @@ impl Voxhold {
             || self.media.thumb_pending.contains(&key)
             || self.media.thumb_pending.len() >= media::THUMB_CONCURRENCY
             || self.media.thumb_blocked(&key, now)
+            || self.media.is_purged(&key.id)
         {
             return;
         }
@@ -71,6 +72,18 @@ impl Voxhold {
             let _ = this.update_in(window, |s, window, cx| {
                 s.media.thumb_pending.remove(&key);
                 if s.access_generation != access {
+                    return;
+                }
+                // The attachment may have been deleted while the thumbnail was
+                // in flight; do not resurrect it after the purge.
+                if s.media.is_purged(&key.id)
+                    || s.messages.iter().any(|message| {
+                        message
+                            .attachments
+                            .iter()
+                            .any(|file| file.id == key.id && file.deleted)
+                    })
+                {
                     return;
                 }
                 match result {
@@ -101,6 +114,7 @@ impl Voxhold {
             || self.media.preview_pending.contains(&href)
             || self.media.preview_pending.len() >= PREVIEW_CONCURRENCY
             || self.media.preview_blocked(&href, now)
+            || self.media.preview_permanent_failure(&href)
         {
             return;
         }
@@ -113,7 +127,10 @@ impl Voxhold {
         self.media.preview_pending.insert(href.clone());
         let task = cx.background_spawn(async move {
             runtime.block_on(async move {
-                let mut meta = client.link_preview(&requested).await.unwrap_or_default();
+                let mut meta = client
+                    .link_preview(&requested)
+                    .await
+                    .map_err(|error| error.status())?;
                 // The server echoes the clicked URL; anything else is stale.
                 if meta.url != requested {
                     meta = Default::default();
@@ -127,7 +144,7 @@ impl Voxhold {
                         .ok()
                         .map(|image| thumbnail_frame(image, PREVIEW_IMAGE.0, PREVIEW_IMAGE.1))
                 };
-                Ok::<_, voxhold_api::Error>((meta, image))
+                Ok::<_, Option<u16>>((meta, image))
             })
         });
         cx.spawn_in(window, async move |this, window| {
@@ -138,28 +155,13 @@ impl Voxhold {
                     return;
                 }
                 match result {
-                    Ok((mut meta, image)) => {
-                        let failed = meta.url.is_empty();
-                        if failed {
-                            meta.url = href.clone();
-                            meta.site_name = url::Url::parse(&href)
-                                .ok()
-                                .and_then(|url| url.host_str().map(str::to_owned))
-                                .unwrap_or_default();
-                            meta.title = meta.site_name.clone();
-                            meta.unavailable = true;
-                        }
-                        let retry = if failed {
-                            media::preview_retry(None, false).map(|delay| Instant::now() + delay)
-                        } else {
-                            None
-                        };
+                    Ok((meta, image)) => {
                         let released = s.media.put_preview(
                             &href,
                             PreviewEntry {
                                 meta,
-                                retry_at: retry,
-                                failed,
+                                retry_at: None,
+                                failed: false,
                             },
                         );
                         if let Some(released) = released {
@@ -173,23 +175,66 @@ impl Voxhold {
                             }
                         }
                     }
-                    Err(_) => {
-                        let retry =
-                            media::preview_retry(None, true).map(|delay| Instant::now() + delay);
-                        s.media.put_preview(
+                    Err(status) => {
+                        // Keep the HTTP status: a 400 never retries, a
+                        // transient failure retries after the Go gate.
+                        let already = s.media.preview_failures.contains_key(&href);
+                        let retry_at = media::preview_retry(status, already)
+                            .map(|delay| Instant::now() + delay);
+                        let mut meta = voxhold_api::LinkPreview {
+                            url: href.clone(),
+                            unavailable: true,
+                            ..Default::default()
+                        };
+                        meta.site_name = url::Url::parse(&href)
+                            .ok()
+                            .and_then(|url| url.host_str().map(str::to_owned))
+                            .unwrap_or_default();
+                        meta.title = meta.site_name.clone();
+                        let released = s.media.put_preview(
                             &href,
                             PreviewEntry {
-                                meta: Default::default(),
-                                retry_at: retry,
+                                meta,
+                                retry_at,
                                 failed: true,
                             },
                         );
+                        if let Some(released) = released {
+                            let _ = window.drop_image(released);
+                        }
                     }
                 }
                 cx.notify();
             });
         })
         .detach();
+    }
+
+    /// Open a link from a card in the system browser; a failure stays in the
+    /// chat error line like Go `View.OpenURL`.
+    pub(super) fn open_link(&mut self, href: &str, cx: &mut Context<Self>) {
+        if crate::open_url::open(href).is_err() {
+            self.error = "Не удалось открыть ссылку.".into();
+        }
+        cx.notify();
+    }
+
+    /// Remove every cached picture of a deleted attachment and close the
+    /// viewer if it shows that file.
+    pub(super) fn purge_attachments(&mut self, ids: &[String], window: &mut Window) {
+        for id in ids {
+            for image in self.media.remove_attachment(id) {
+                let _ = window.drop_image(image);
+            }
+            if self
+                .media
+                .viewer
+                .as_ref()
+                .is_some_and(|viewer| viewer.key.attachment_id == *id)
+            {
+                self.close_viewer(window);
+            }
+        }
     }
 
     /// Open the original picture on click. Reuses the single viewer and

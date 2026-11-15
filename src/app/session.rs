@@ -132,6 +132,8 @@ impl Voxhold {
 
     pub(super) fn logout(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.stop_realtime();
+        self.send_tasks.clear();
+        self.session_generation = self.session_generation.wrapping_add(1);
         #[cfg(feature = "voxhold-media")]
         if let Some(voice) = self.voice.take() {
             voice.update(cx, |voice, cx| voice.leave_in_window(window, cx));

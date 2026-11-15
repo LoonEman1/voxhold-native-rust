@@ -126,6 +126,36 @@ async fn a_closed_viewer_never_reopens_from_a_late_answer(cx: &mut TestAppContex
 }
 
 #[gpui::test]
+async fn a_deleted_attachment_releases_its_thumbnail_and_viewer(cx: &mut TestAppContext) {
+    cx.update(|cx| gpui_component::init(cx));
+    let (window, view) = add_auth_window(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
+    let id = "b".repeat(32);
+    let key = crate::media::ThumbKey::new(&id, 16., 16.);
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            v.server = 1;
+            v.channel = 7;
+            let frame = image::Frame::new(image::RgbaImage::new(16, 16));
+            let render = std::sync::Arc::new(gpui::RenderImage::new(smallvec::smallvec![frame]));
+            v.media.thumbs.put(key.clone(), render, 1024);
+            v.media.viewer = Some(crate::media::Viewer::new(crate::media::ViewerKey {
+                chat: v.chat_key(),
+                access: v.access_generation,
+                message_id: 5,
+                attachment_id: id.clone(),
+                open_id: 1,
+            }));
+            v.purge_attachments(&[id.clone()], window);
+            assert!(!v.media.thumbs.contains(&key));
+            assert!(v.media.is_purged(&id));
+            assert!(v.media.viewer.is_none());
+            cx.notify();
+        });
+    });
+}
+
+#[gpui::test]
 async fn access_change_releases_cached_media(cx: &mut TestAppContext) {
     cx.update(|cx| gpui_component::init(cx));
     let (window, view) = add_auth_window(cx);

@@ -281,6 +281,19 @@ impl Drafts {
         true
     }
 
+    /// Pre-check before a clipboard picture is written to disk, so a rejected
+    /// paste never leaves a temporary file behind.
+    pub fn can_add(&self, key: ChatKey, size: u64) -> Result<(), String> {
+        let count = self.entries.get(&key).map_or(0, |draft| draft.files.len());
+        if count >= MAX_FILES {
+            return Err("Можно прикрепить не более 10 файлов.".into());
+        }
+        if size > MAX_DRAFT_BYTES.saturating_sub(self.bytes()) {
+            return Err("Всего в черновиках допускается до 128 МиБ файлов.".into());
+        }
+        Ok(())
+    }
+
     /// Add metadata for already validated files. Mirrors Go
     /// `AddAttachmentPaths`: accepted files stay even when a later one hits a
     /// limit, and the caller shows the message.

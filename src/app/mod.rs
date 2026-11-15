@@ -143,6 +143,12 @@ pub(crate) struct Voxhold {
     /// One confirmed send in flight for this chat; the button is disabled.
     sending: bool,
     send_attempt: u64,
+    /// In-flight sends; cleared on logout so a slow upload cannot finish with
+    /// the old token. A later send must not cancel an earlier one.
+    send_tasks: Vec<gpui::Task<()>>,
+    /// Changes on login and logout; a send result from another session is
+    /// discarded even when it arrives after the channel was switched.
+    session_generation: u64,
     busy: bool,
     generation: u64,
     drafts: draft::Shared,
@@ -307,6 +313,8 @@ impl Voxhold {
             composer_error: String::new(),
             sending: false,
             send_attempt: 0,
+            send_tasks: Vec::new(),
+            session_generation: 0,
             busy: false,
             generation: 0,
             drafts: draft::Drafts::shared(),

@@ -2,6 +2,15 @@ use super::ui::{history_divider, icon, ink, ink_alpha};
 use super::*;
 use crate::history;
 
+/// Byte offset of a rune index, for text runs and highlights.
+fn char_byte_index(content: &str, index: usize) -> usize {
+    content
+        .char_indices()
+        .nth(index)
+        .map(|(byte, _)| byte)
+        .unwrap_or(content.len())
+}
+
 impl Voxhold {
     pub(super) fn render_history(
         &mut self,
@@ -442,20 +451,62 @@ impl Voxhold {
                         ),
                 );
             }
-            body = body.child(
-                div()
-                    .w_full()
-                    .text_size(px(14.))
-                    .line_height(px(20.))
-                    .text_color(ink(if p.light { 0x3b3b36 } else { 0xbab8b0 }))
-                    .child(message.content.clone()),
-            );
-            let (_, hrefs) = links::scan(&message.content);
-            for (preview_index, href) in hrefs.iter().take(2).enumerate() {
-                let Some((entry, image)) = previews_for_rows.get(href) else {
-                    continue;
+            let (link_list, hrefs) = links::scan(&message.content);
+            let mut ranges = Vec::new();
+            let mut link_targets = Vec::new();
+            for link in &link_list {
+                let start = char_byte_index(&message.content, link.start);
+                let end = char_byte_index(&message.content, link.end);
+                if start < end {
+                    ranges.push(start..end);
+                    link_targets.push(link.href.clone());
+                }
+            }
+            let highlights: Vec<_> = ranges
+                .iter()
+                .map(|range| {
+                    (
+                        range.clone(),
+                        gpui::HighlightStyle {
+                            color: Some(ink(p.lime).into()),
+                            ..Default::default()
+                        },
+                    )
+                })
+                .collect();
+            let text = div()
+                .w_full()
+                .text_size(px(14.))
+                .line_height(px(20.))
+                .text_color(ink(if p.light { 0x3b3b36 } else { 0xbab8b0 }));
+            body = body.child(if ranges.is_empty() {
+                text.child(message.content.clone())
+            } else {
+                let weak_text = weak_media.clone();
+                text.child(
+                    gpui::InteractiveText::new(
+                        ("message-text", id as u64),
+                        gpui::StyledText::new(message.content.clone()).with_highlights(highlights),
+                    )
+                    .on_click(ranges, move |index, _window, cx| {
+                        let Some(href) = link_targets.get(index).cloned() else {
+                            return;
+                        };
+                        if let Some(view) = weak_text.upgrade() {
+                            view.update(cx, |s, cx| s.open_link(&href, cx));
+                        }
+                        cx.stop_propagation();
+                    }),
+                )
+            });
+            // A card is reserved as soon as the message contains a link, so a
+            // late metadata answer never grows the row.
+            for href in hrefs.iter().take(2) {
+                let (meta, image) = match previews_for_rows.get(href) {
+                    Some((entry, image)) => (entry.meta.clone(), image.clone()),
+                    None => (voxhold_api::LinkPreview::default(), None),
                 };
-                let labels = media::Media::preview_labels(href, &entry.meta);
+                let labels = media::Media::preview_labels(href, &meta);
                 let mut labels_column = div()
                     .flex_1()
                     .min_w(px(0.))
@@ -481,7 +532,12 @@ impl Voxhold {
                             .child(value),
                     );
                 }
+                let weak_link = weak_media.clone();
+                let target = href.clone();
                 let card = div()
+                    .id(gpui::ElementId::Name(
+                        format!("link-card-{}-{}", id, href).into(),
+                    ))
                     .w_full()
                     .max_w(px(580.))
                     .h(px(96.))
@@ -494,6 +550,13 @@ impl Voxhold {
                     .items_center()
                     .gap(px(12.))
                     .px(px(13.))
+                    .cursor_pointer()
+                    .on_click(move |_, _, cx| {
+                        if let Some(view) = weak_link.upgrade() {
+                            view.update(cx, |s, cx| s.open_link(&target, cx));
+                        }
+                        cx.stop_propagation();
+                    })
                     .child(div().flex_1().min_w(px(0.)).child(labels_column));
                 body = body.child(if let Some(image) = image {
                     card.child(
@@ -503,7 +566,7 @@ impl Voxhold {
                             .flex_shrink_0()
                             .overflow_hidden()
                             .child(
-                                gpui::img(image.clone())
+                                gpui::img(image)
                                     .w(px(98.))
                                     .h(px(76.))
                                     .object_fit(gpui::ObjectFit::Cover),
@@ -512,7 +575,6 @@ impl Voxhold {
                 } else {
                     card
                 });
-                let _ = preview_index;
             }
             for (file_index, file) in message.attachments.iter().enumerate() {
                 let (width, height) = history::attachment_size(

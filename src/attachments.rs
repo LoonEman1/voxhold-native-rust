@@ -81,6 +81,18 @@ impl Attachments {
         self.loading
     }
 
+    /// Scope generation of the panel; a dialog result is only accepted by the
+    /// same generation and chat.
+    #[cfg(test)]
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    #[cfg(test)]
+    pub(crate) fn error(&self) -> &str {
+        &self.error
+    }
+
     fn can_edit(&self) -> bool {
         !self.loading && self.writable && self.key.is_some()
     }
@@ -97,41 +109,47 @@ impl Attachments {
             multiple: true,
             prompt: Some("Выберите файлы".into()),
         });
+        let expected = self.key;
         let generation = self.generation;
         self.loading = true;
         cx.notify();
         cx.spawn(async move |this, cx| {
-            let paths = match prompt.await {
-                Ok(Ok(Some(paths))) => paths,
-                Ok(Ok(None)) => {
-                    if let Some(this) = this.upgrade() {
-                        let _ = this.update(cx, |state, cx| {
-                            if state.generation == generation {
-                                state.loading = false;
-                                cx.notify();
-                            }
-                        });
-                    }
-                    return;
-                }
-                _ => {
-                    if let Some(this) = this.upgrade() {
-                        let _ = this.update(cx, |state, cx| {
-                            if state.generation == generation {
-                                state.loading = false;
-                                state.error = "Не удалось выбрать файлы".into();
-                                cx.notify();
-                            }
-                        });
-                    }
-                    return;
-                }
+            let result = match prompt.await {
+                Ok(Ok(Some(paths))) => Ok(paths),
+                Ok(Ok(None)) => Err(String::new()),
+                _ => Err("Не удалось выбрать файлы".into()),
             };
             if let Some(this) = this.upgrade() {
-                let _ = this.update(cx, |state, cx| state.add_paths(paths, cx));
+                let _ = this.update(cx, |state, cx| {
+                    state.finish_pick(result, expected, generation, cx)
+                });
             }
         })
         .detach();
+    }
+
+    /// The dialog result belongs to the chat and scope that opened it. A
+    /// switch or access change discards it without touching the new draft.
+    pub(crate) fn finish_pick(
+        &mut self,
+        result: Result<Vec<PathBuf>, String>,
+        expected: Option<draft::ChatKey>,
+        generation: u64,
+        cx: &mut Context<Self>,
+    ) {
+        if self.generation != generation || self.key != expected {
+            return;
+        }
+        self.loading = false;
+        match result {
+            Ok(paths) => self.add_paths(paths, cx),
+            Err(error) => {
+                if !error.is_empty() {
+                    self.error = error;
+                }
+                cx.notify();
+            }
+        }
     }
 
     /// Metadata-only intake from the file dialog, OS drop or clipboard paths.
@@ -185,6 +203,13 @@ impl Attachments {
         let Some(key) = self.key else {
             return false;
         };
+        // Check the draft limits before writing anything into %TEMP%; a
+        // rejected picture must not leave a file behind.
+        if let Err(error) = self.drafts.borrow().can_add(key, bytes.len() as u64) {
+            self.error = error;
+            cx.notify();
+            return true;
+        }
         let generation = self.generation;
         self.loading = true;
         self.error.clear();
@@ -207,7 +232,14 @@ impl Attachments {
                     state.loading = false;
                     match result {
                         Ok(file) => {
-                            let (_, error) = state.drafts.borrow_mut().add_files(key, vec![file]);
+                            let cleanup = file.clone();
+                            let (added, error) =
+                                state.drafts.borrow_mut().add_files(key, vec![file]);
+                            if added == 0 {
+                                // The draft grew meanwhile; release the
+                                // temporary clipboard copy.
+                                cleanup.cleanup();
+                            }
                             if !error.is_empty() {
                                 state.error = error;
                             }

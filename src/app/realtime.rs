@@ -7,6 +7,9 @@ pub(super) struct RealtimeEffect {
     pub(super) resync: bool,
     pub(super) access: bool,
     pub(super) server_removed: bool,
+    /// Attachment ids removed by the server; their thumbnails and viewer are
+    /// released by the event pump where a `Window` is available.
+    pub(super) attachments: Vec<String>,
 }
 
 impl Voxhold {
@@ -71,11 +74,16 @@ impl Voxhold {
                     .swap(false, std::sync::atomic::Ordering::Relaxed);
                 let mut access = resync && s.channel != 0;
                 let mut server_removed = false;
+                let mut removed_attachments = Vec::new();
                 for event in events {
                     let effect = s.apply_realtime_event(&event.kind, &event.data);
                     resync |= effect.resync;
                     access |= effect.access;
                     server_removed |= effect.server_removed;
+                    removed_attachments.extend(effect.attachments);
+                }
+                if !removed_attachments.is_empty() {
+                    s.purge_attachments(&removed_attachments, window);
                 }
                 if server_removed {
                     s.remove_current_server(window, cx);
@@ -152,8 +160,7 @@ impl Voxhold {
         }
     }
 
-    /// Apply one realtime event to the active scope.
-    ///
+    /// Apply one realtime event to the active scope.    ///
     /// A stale body revision never overwrites a confirmed row, a tombstone wins
     /// over late `created`/`updated` events and access events invalidate the
     /// confirmed scope before any late HTTP answer can be applied.
@@ -319,6 +326,18 @@ impl Voxhold {
                         self.pending_edits.remove(&id);
                         self.pending_reactions.remove(&id);
                     }
+                }
+            }
+            "attachments.changed" if !self.access_pending => {
+                if data["channel_id"].as_i64() == Some(self.channel) {
+                    if let Some(ids) = data["attachment_ids"].as_array() {
+                        for id in ids.iter().filter_map(serde_json::Value::as_str) {
+                            effect.attachments.push(id.to_string());
+                        }
+                    }
+                    // The snapshot carries `deleted` on the attachment; a fresh
+                    // page also re-measures the row without a local revision.
+                    effect.resync = true;
                 }
             }
             "message.reactions_changed" if !self.access_pending => {

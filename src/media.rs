@@ -70,8 +70,9 @@ pub struct PreviewEntry {
 }
 
 impl PreviewEntry {
-    pub fn available(&self, now: Instant) -> bool {
-        self.retry_at.is_none_or(|until| now >= until)
+    #[allow(dead_code)] // mirrors Go's `retryAt.IsZero()` check
+    pub fn is_success(&self) -> bool {
+        !self.failed && self.retry_at.is_none()
     }
 }
 
@@ -145,6 +146,28 @@ impl<K: std::hash::Hash + Eq + Clone> ImageCache<K> {
         let (image, size, _) = self.entries.remove(key)?;
         self.used = self.used.saturating_sub(size);
         Some(image)
+    }
+
+    /// Remove every entry whose key matches, e.g. all thumbnails of one
+    /// attachment. Returns the GPU images for the caller to drop.
+    pub fn remove_matching(
+        &mut self,
+        mut matches: impl FnMut(&K) -> bool,
+    ) -> Vec<Arc<RenderImage>> {
+        let keys: Vec<K> = self
+            .entries
+            .keys()
+            .filter(|key| matches(key))
+            .cloned()
+            .collect();
+        let mut removed = Vec::new();
+        for key in keys {
+            if let Some((image, size, _)) = self.entries.remove(&key) {
+                self.used = self.used.saturating_sub(size);
+                removed.push(image);
+            }
+        }
+        removed
     }
 
     pub fn clear(&mut self) -> Vec<Arc<RenderImage>> {
@@ -222,6 +245,8 @@ pub struct Media {
     pub preview_failures: HashMap<String, (Instant, bool)>,
     pub viewer: Option<Viewer>,
     pub viewer_seq: u64,
+    /// Attachment ids the server removed; a late thumbnail must not reappear.
+    pub purged: HashSet<String>,
 }
 
 impl Default for Media {
@@ -237,6 +262,7 @@ impl Default for Media {
             preview_failures: HashMap::new(),
             viewer: None,
             viewer_seq: 0,
+            purged: HashSet::new(),
         }
     }
 }
@@ -258,6 +284,7 @@ impl Media {
         self.preview_order.clear();
         self.preview_pending.clear();
         self.preview_failures.clear();
+        self.purged.clear();
         images
     }
 
@@ -287,13 +314,31 @@ impl Media {
         self.thumb_failures.remove(key);
     }
 
-    /// Go `loadPreview`: an entry inside its gate is reused, otherwise the
-    /// caller starts one request. A failed entry without a gate is retried.
+    /// Drop every thumbnail variant of one attachment and its retry state.
+    pub fn remove_attachment(&mut self, id: &str) -> Vec<Arc<RenderImage>> {
+        let images = self.thumbs.remove_matching(|key| key.id == id);
+        self.thumb_pending.retain(|key| key.id != id);
+        self.thumb_failures.retain(|key, _| key.id != id);
+        self.purged.insert(id.to_string());
+        if self.purged.len() > 1024 {
+            self.purged.clear();
+        }
+        images
+    }
+
+    pub fn is_purged(&self, id: &str) -> bool {
+        self.purged.contains(id)
+    }
+
+    /// Go `loadPreview`: a reusable entry is a successful preview or a
+    /// permanent `400` failure without a retry gate. An expired transient
+    /// failure returns `None` so the caller can retry it.
     pub fn preview_entry(&mut self, href: &str) -> Option<PreviewEntry> {
-        let now = Instant::now();
-        match self.previews.get(href) {
-            Some(entry) if entry.available(now) => Some(entry.clone()),
-            _ => None,
+        let entry = self.previews.get(href)?;
+        if entry.retry_at.is_none() {
+            Some(entry.clone())
+        } else {
+            None
         }
     }
 
@@ -301,6 +346,14 @@ impl Media {
         self.preview_failures
             .get(href)
             .is_some_and(|(until, _)| now < *until)
+    }
+
+    /// Whether this link already failed permanently (`400`): it is kept but
+    /// never requested again, exactly like Go keeps a entry with a zero gate.
+    pub fn preview_permanent_failure(&self, href: &str) -> bool {
+        self.previews
+            .get(href)
+            .is_some_and(|entry| entry.failed && entry.retry_at.is_none())
     }
 
     /// Store metadata, bounded to 128 entries with FIFO eviction like Go
@@ -318,15 +371,8 @@ impl Media {
         }
         match &entry.retry_at {
             Some(until) => {
-                let doubled = self
-                    .preview_failures
-                    .get(href)
-                    .is_some_and(|(_, doubled)| *doubled);
-                let delay = until.saturating_duration_since(Instant::now());
-                self.preview_failures.insert(
-                    href.to_string(),
-                    (Instant::now() + delay, doubled || entry.failed),
-                );
+                self.preview_failures
+                    .insert(href.to_string(), (*until, true));
             }
             None => {
                 self.preview_failures.remove(href);
@@ -497,6 +543,28 @@ mod tests {
         media.put_preview("https://broken.example.com/", entry);
         assert!(media.preview_blocked("https://broken.example.com/", Instant::now()));
         assert!(media.preview_entry("https://broken.example.com/").is_none());
+
+        // Once the gate expires the entry is retried instead of being reused
+        // forever; a permanent 400 stays cached without another request.
+        let expired = PreviewEntry {
+            retry_at: Some(Instant::now() - Duration::from_secs(1)),
+            failed: true,
+            ..Default::default()
+        };
+        media.put_preview("https://expired.example.com/", expired);
+        assert!(!media.preview_blocked("https://expired.example.com/", Instant::now()));
+        assert!(media
+            .preview_entry("https://expired.example.com/")
+            .is_none());
+
+        let permanent = PreviewEntry {
+            retry_at: None,
+            failed: true,
+            ..Default::default()
+        };
+        media.put_preview("https://gone.example.com/", permanent);
+        assert!(media.preview_entry("https://gone.example.com/").is_some());
+        assert!(media.preview_permanent_failure("https://gone.example.com/"));
     }
 
     #[test]

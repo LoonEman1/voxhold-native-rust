@@ -63,9 +63,9 @@ impl Voxhold {
                 return;
             }
         };
+        let plan_key = plan.key;
         self.send_attempt = self.send_attempt.wrapping_add(1);
-        let attempt = self.send_attempt;
-        let access = self.access_generation;
+        let session = self.session_generation;
         let runtime = self.runtime.clone();
         self.sending = true;
         self.composer_error.clear();
@@ -100,60 +100,73 @@ impl Voxhold {
                     .map_err(|error| draft::describe_error(&error))
             })
         });
-        cx.spawn_in(window, async move |this, window| {
+        let handle = cx.spawn_in(window, async move |this, window| {
             let result = task.await;
             let _ = this.update_in(window, |s, window, cx| {
-                if s.send_attempt != attempt || s.access_generation != access || s.access_pending {
+                // Logout aborts the task; the generation check also drops a
+                // result that raced with it.
+                if s.session_generation != session {
                     return;
                 }
                 s.sending = false;
                 let (plan, message) = match result {
                     Ok(value) => value,
                     Err(error) => {
-                        s.composer_error = error;
+                        if s.chat_key() == plan_key {
+                            s.composer_error = error;
+                        }
                         cx.notify();
                         return;
                     }
                 };
                 let composer_now = s.composer.read(cx).value().to_string();
+                let active = s.chat_key() == plan.key;
                 if s.apply_send_success(plan, message, &composer_now) {
                     s.composer
                         .update(cx, |input, cx| input.set_value("", window, cx));
                 }
-                s.composer.update(cx, |input, cx| input.focus(window, cx));
+                if active {
+                    s.composer.update(cx, |input, cx| input.focus(window, cx));
+                }
                 cx.notify();
             });
-        })
-        .detach();
+        });
+        if self.send_tasks.len() >= 8 {
+            self.send_tasks.remove(0);
+        }
+        self.send_tasks.push(handle);
     }
 
     /// Apply one confirmed send. Returns true when the composer must be
-    /// cleared: only when the draft belonged to this chat, never when the user
-    /// edited it while the request was in flight. A row that already arrived
-    /// over WS is merged by id instead of being appended twice.
+    /// cleared: only when the draft belongs to the open chat and the user did
+    /// not edit it while the request was in flight. A result for another chat
+    /// still updates that chat's draft, so a switch does not turn a delivered
+    /// message into an unsent draft.
     pub(super) fn apply_send_success(
         &mut self,
         plan: draft::SendPlan,
         message: Message,
         composer_now: &str,
     ) -> bool {
-        if self.chat_key() != plan.key
-            || message.channel_id != self.channel
-            || self.deleted_ids.contains(&message.id)
-        {
-            return false;
-        }
+        let active = self.chat_key() == plan.key;
+        let text_now = if active {
+            composer_now
+        } else {
+            plan.composer_text.as_str()
+        };
         let sent_ids: Vec<String> = plan.files.iter().map(|file| file.id.clone()).collect();
         let finished = self.drafts.borrow_mut().finish_send(
             plan.key,
             plan.revision,
             &plan.composer_text,
             &sent_ids,
-            composer_now,
+            text_now,
         );
-        self.merge_message(true, message);
-        self.trim_history(false);
-        finished == draft::Finish::Cleared && composer_now == plan.composer_text
+        if active && message.channel_id == self.channel && !self.deleted_ids.contains(&message.id) {
+            self.merge_message(true, message);
+            self.trim_history(false);
+        }
+        active && finished == draft::Finish::Cleared && composer_now == plan.composer_text
     }
 
     /// Go `OnPasteFiles` priority: paths, then a clipboard picture, then the

@@ -897,7 +897,7 @@ http_active,thumb_bytes,link_bytes,recording_bytes,workers,peers,live_textures
 | `R01` | Первый срез и ревью в dev · PR [#3](https://github.com/LoonEman1/voxhold-native-rust/pull/3), [#6](https://github.com/LoonEman1/voxhold-native-rust/pull/6) | [`ef72a63`](https://github.com/LoonEman1/voxhold-native-rust/commit/ef72a63) (включает исправления #6 и аватары/присутствие); визуальные пары с Go не сняты | — |
 | `R01a` | В работе | Пикер и каталог эмодзи ещё не перенесены; SVG подключены, `AssetSource` есть | — |
 | `R02` | Первый срез и ревью в dev · PR [#4](https://github.com/LoonEman1/voxhold-native-rust/pull/4), [#6](https://github.com/LoonEman1/voxhold-native-rust/pull/6) | [`ef72a63`](https://github.com/LoonEman1/voxhold-native-rust/commit/ef72a63) (merge/access/read/backoff); реальный стенд и детальная вёрстка ленты впереди | — |
-| `R03` | Первый срез в PR [#12](https://github.com/LoonEman1/voxhold-native-rust/pull/12) · ветка `codex/r03-composer-media` | Композер/черновики/идемпотентная отправка, потоковая загрузка, атомарное сохранение, кеши и viewer; живой стенд, кадры и DPI не проверены | — |
+| `R03` | Первый срез и три раунда ревью в PR [#12](https://github.com/LoonEman1/voxhold-native-rust/pull/12) · ветка `codex/r03-composer-media` | [`6f044fd`](https://github.com/LoonEman1/voxhold-native-rust/commit/6f044fdce10831d4f485b51b2c9147467a90f3d1); композер/черновики/идемпотентная отправка, потоковая загрузка, атомарное сохранение, кеши и viewer, границы доступа и tombstone-маркеры; живой стенд, кадры и DPI не проверены | — |
 | `R04` | К выполнению | — | — |
 | `R05` | К выполнению | — | — |
 | `R06` | К выполнению | — | — |
@@ -905,6 +905,37 @@ http_active,thumb_bytes,link_bytes,recording_bytes,workers,peers,live_textures
 | `R07b` | К выполнению | — | — |
 | `R08` | К выполнению | — | — |
 | `W02b/c`–`W13` | Очередь расширений | — | — |
+
+### R03 · Композер, вложения и медиа — журнал PR #12
+
+Ветка `codex/r03-composer-media`, последний коммит
+[`6f044fd`](https://github.com/LoonEman1/voxhold-native-rust/commit/6f044fdce10831d4f485b51b2c9147467a90f3d1),
+PR [#12](https://github.com/LoonEman1/voxhold-native-rust/pull/12) в `dev`.
+
+- `src/draft.rs`, `src/app/composer.rs`, `src/attachments.rs`: черновики по
+  `ChatKey`, идемпотентная отправка, сохранение правок и новых файлов при
+  позднем подтверждении, отмена всех отправок при logout, потоковая загрузка
+  и проверка неизменности файла перед повторным открытием.
+- `src/file_io.rs`: атомарное сохранение через `.part`, проверка размера,
+  замена цели и отказ при занятом файле.
+- `src/links.rs`, `src/media.rs`, `src/app/history_view.rs`,
+  `src/app/media_ops.rs`: кеши миниатюр и превью, карточки ссылок, один viewer,
+  видимость запросов и таймер только по будущим срокам видимых ссылок.
+- `src/history.rs`, `src/app/realtime.rs`, `src/app/history_ops.rs`: слияние
+  revision и реакций, tombstone вложений по ID, ограниченный набор маркеров,
+  инвалидация `/context`, refresh и older-page при вытеснении маркера,
+  перезапуск одного свежего refresh после пачки событий и запрет вставки
+  позднего подтверждения отправки при `access_pending`.
+- Тесты: отмена отправки использует реальный upload ID, параллельные отправки
+  удерживаются двумя запросами одновременно, добавлены регрессии на превью
+  вне экрана, массовое удаление, отсутствующую строку `/context` и отменённую
+  первую загрузку истории.
+
+Проверено в PR: `cargo fmt --all -- --check`,
+`cargo test --workspace --locked` (130 тестов приложения: 129 passed,
+1 `ignored`; 5 API; 6 media), проверка размеров (124 файла). Осталось до
+merge/релиза: CI на PR, живой backend и веб-пары, кадры и DPI, ручной сценарий
+двух аккаунтов; подробности в [status.md](status.md).
 
 ### Что обязательно приложить к PR
 

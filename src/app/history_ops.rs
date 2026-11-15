@@ -324,6 +324,26 @@ impl Voxhold {
         true
     }
 
+    /// A deletion marker rolled out of the bounded set, so a server answer
+    /// requested before the deletion may still describe that attachment as
+    /// live. Drop the in-flight history, older-page and `/context` answers and
+    /// their request slots; later requests start after the deletion. Returns
+    /// whether a history refresh was cancelled and must be restarted once the
+    /// whole event batch has been applied.
+    pub(super) fn invalidate_history_requests(&mut self) -> bool {
+        let refresh_was_active = self.refresh_request.is_some();
+        self.refresh_request = None;
+        self.refresh_again = false;
+        self.refresh_new_ids.clear();
+        self.older_request = 0;
+        self.loading_older = false;
+        self.older_error.clear();
+        self.older_retry_at = None;
+        self.older_scheduled = false;
+        self.context_request = None;
+        refresh_was_active
+    }
+
     /// The guard applied to a `messages_page` answer. Extracted so a context
     /// replacement can be tested against a late older-page response.
     pub(super) fn accepts_older_reply(

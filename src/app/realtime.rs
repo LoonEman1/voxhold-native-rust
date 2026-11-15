@@ -10,6 +10,9 @@ pub(super) struct RealtimeEffect {
     /// Attachment ids removed by the server; their thumbnails and viewer are
     /// released by the event pump where a `Window` is available.
     pub(super) attachments: Vec<String>,
+    /// A bounded attachment tombstone rolled over and cancelled the initial
+    /// history refresh; the pump restarts one fresh refresh after the batch.
+    pub(super) restart_history: bool,
 }
 
 impl Voxhold {
@@ -75,15 +78,17 @@ impl Voxhold {
                 let mut access = resync && s.channel != 0;
                 let mut server_removed = false;
                 let mut removed_attachments = Vec::new();
+                let mut restart_history = false;
                 for event in events {
                     let effect = s.apply_realtime_event(&event.kind, &event.data);
                     resync |= effect.resync;
                     access |= effect.access;
                     server_removed |= effect.server_removed;
+                    restart_history |= effect.restart_history;
                     removed_attachments.extend(effect.attachments);
                 }
                 if !removed_attachments.is_empty() {
-                    s.purge_attachments(&removed_attachments, window, cx);
+                    restart_history |= s.purge_attachments(&removed_attachments, window, cx);
                 }
                 if server_removed {
                     s.remove_current_server(window, cx);
@@ -95,7 +100,9 @@ impl Voxhold {
                     } else {
                         s.invalidate_access(window, cx);
                     }
-                } else if resync {
+                } else if resync || restart_history {
+                    // A cancelled initial load would leave the chat empty, so
+                    // restart exactly one refresh after the whole batch.
                     s.refresh_history(window, cx);
                 }
                 if changed {
@@ -349,6 +356,7 @@ impl Voxhold {
                         // The fallback for an event without a list.
                         effect.resync = true;
                     } else {
+                        let mut history_stale = false;
                         for id in &ids {
                             for message in &mut self.messages {
                                 for file in &mut message.attachments {
@@ -357,7 +365,13 @@ impl Voxhold {
                                     }
                                 }
                             }
-                            self.media.mark_purged(id);
+                            history_stale |= self.media.mark_purged(id);
+                        }
+                        if history_stale {
+                            // A marker rolled out of the bounded set. Answers
+                            // requested before this point may still describe
+                            // the evicted attachment as live, so discard them.
+                            effect.restart_history = self.invalidate_history_requests();
                         }
                         self.attachment_epoch = self.attachment_epoch.wrapping_add(1);
                         effect.attachments = ids;

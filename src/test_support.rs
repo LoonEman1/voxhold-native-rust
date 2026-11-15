@@ -162,14 +162,24 @@ pub struct TestServer {
 
 impl TestServer {
     pub fn spawn(replies: Vec<Reply>) -> Self {
+        Self::start(replies, false)
+    }
+
+    /// Thread-per-connection server for tests that must hold two requests at
+    /// the same time. `spawn` keeps the deterministic single-threaded order.
+    pub fn spawn_concurrent(replies: Vec<Reply>) -> Self {
+        Self::start(replies, true)
+    }
+
+    fn start(replies: Vec<Reply>, concurrent: bool) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
         let base = format!("http://{}", listener.local_addr().unwrap());
         let requests = Arc::new(Mutex::new(Vec::new()));
         let stop = Arc::new(AtomicBool::new(false));
         let recorded = requests.clone();
         let running = stop.clone();
+        let replies = Arc::new(replies);
         let handle = std::thread::spawn(move || {
-            let replies = replies;
             for stream in listener.incoming() {
                 if running.load(Ordering::Relaxed) {
                     break;
@@ -187,37 +197,16 @@ impl TestServer {
                     .get(index)
                     .cloned()
                     .unwrap_or(Reply::new(500, "{\"error\":\"unexpected request\"}"));
-                if let Some(gate) = &reply.gate {
-                    gate.block_if_armed();
-                }
-                let mut response = format!(
-                    "HTTP/1.1 {} X\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    reply.status,
-                    reply.content_type,
-                    reply.content_length()
-                )
-                .into_bytes();
-                let _ = stream.write_all(&response);
-                match &reply.body {
-                    ReplyBody::Bytes(bytes) => {
-                        let _ = stream.write_all(bytes);
-                    }
-                    ReplyBody::File(path) => {
-                        if let Ok(mut file) = std::fs::File::open(path) {
-                            let mut chunk = vec![0u8; 64 << 10];
-                            loop {
-                                use std::io::Read;
-                                match file.read(&mut chunk) {
-                                    Ok(0) | Err(_) => break,
-                                    Ok(read) => {
-                                        if stream.write_all(&chunk[..read]).is_err() {
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
+                if concurrent {
+                    let running = running.clone();
+                    std::thread::spawn(move || {
+                        if running.load(Ordering::Relaxed) {
+                            return;
                         }
-                    }
+                        write_reply(&mut stream, &reply);
+                    });
+                } else {
+                    write_reply(&mut stream, &reply);
                 }
             }
         });
@@ -231,6 +220,43 @@ impl TestServer {
 
     pub fn requests(&self) -> Vec<Recorded> {
         self.requests.lock().unwrap().clone()
+    }
+}
+
+/// Write one queued answer. Called on the accept thread for the deterministic
+/// server and on a connection thread for the concurrent one.
+fn write_reply(stream: &mut std::net::TcpStream, reply: &Reply) {
+    if let Some(gate) = &reply.gate {
+        gate.block_if_armed();
+    }
+    let mut response = format!(
+        "HTTP/1.1 {} X\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        reply.status,
+        reply.content_type,
+        reply.content_length()
+    )
+    .into_bytes();
+    let _ = stream.write_all(&response);
+    match &reply.body {
+        ReplyBody::Bytes(bytes) => {
+            let _ = stream.write_all(bytes);
+        }
+        ReplyBody::File(path) => {
+            if let Ok(mut file) = std::fs::File::open(path) {
+                let mut chunk = vec![0u8; 64 << 10];
+                loop {
+                    use std::io::Read;
+                    match file.read(&mut chunk) {
+                        Ok(0) | Err(_) => break,
+                        Ok(read) => {
+                            if stream.write_all(&chunk[..read]).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 

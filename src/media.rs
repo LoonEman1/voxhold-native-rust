@@ -27,6 +27,9 @@ pub const THUMB_BUCKET: u32 = 16;
 pub const THUMB_CONCURRENCY: usize = 3;
 /// Go `previewEntries`.
 pub const PREVIEW_ENTRIES: usize = 128;
+/// Attachment deletion markers kept until the access scope is invalidated.
+/// Past this limit the oldest ids roll over instead of clearing every marker.
+pub const PURGED_MARKERS: usize = 1024;
 /// Go `imageViewer` limits. The content request enforces the 48 MiB compressed
 /// cap; the viewer checks the edge and pixel limits before building a surface.
 #[allow(dead_code)]
@@ -247,6 +250,8 @@ pub struct Media {
     pub viewer_seq: u64,
     /// Attachment ids the server removed; a late thumbnail must not reappear.
     pub purged: HashSet<String>,
+    /// Insertion order of `purged`, so a full set evicts only the oldest id.
+    purged_order: VecDeque<String>,
 }
 
 impl Default for Media {
@@ -263,6 +268,7 @@ impl Default for Media {
             viewer: None,
             viewer_seq: 0,
             purged: HashSet::new(),
+            purged_order: VecDeque::new(),
         }
     }
 }
@@ -285,6 +291,7 @@ impl Media {
         self.preview_pending.clear();
         self.preview_failures.clear();
         self.purged.clear();
+        self.purged_order.clear();
         images
     }
 
@@ -315,15 +322,14 @@ impl Media {
     }
 
     /// Drop every thumbnail variant of one attachment and its retry state.
-    pub fn remove_attachment(&mut self, id: &str) -> Vec<Arc<RenderImage>> {
+    /// The flag reports whether a deletion marker had to be evicted, which
+    /// makes any history or `/context` answer requested before it stale.
+    pub fn remove_attachment(&mut self, id: &str) -> (Vec<Arc<RenderImage>>, bool) {
         let images = self.thumbs.remove_matching(|key| key.id == id);
         self.thumb_pending.retain(|key| key.id != id);
         self.thumb_failures.retain(|key, _| key.id != id);
-        self.purged.insert(id.to_string());
-        if self.purged.len() > 1024 {
-            self.purged.clear();
-        }
-        images
+        let evicted = self.remember_purged(id);
+        (images, evicted)
     }
 
     pub fn is_purged(&self, id: &str) -> bool {
@@ -331,11 +337,27 @@ impl Media {
     }
 
     /// Confirm a deletion before the event pump can release the GPU images.
-    pub fn mark_purged(&mut self, id: &str) {
-        self.purged.insert(id.to_string());
-        if self.purged.len() > 1024 {
-            self.purged.clear();
+    /// The flag reports whether the oldest marker had to leave a full set.
+    pub fn mark_purged(&mut self, id: &str) -> bool {
+        self.remember_purged(id)
+    }
+
+    /// Keep the marker until the access scope changes; only the oldest id
+    /// leaves a full set, so one late page cannot resurrect every attachment.
+    fn remember_purged(&mut self, id: &str) -> bool {
+        if !self.purged.insert(id.to_string()) {
+            return false;
         }
+        self.purged_order.push_back(id.to_string());
+        let mut evicted = false;
+        while self.purged.len() > PURGED_MARKERS {
+            let Some(oldest) = self.purged_order.pop_front() else {
+                break;
+            };
+            self.purged.remove(&oldest);
+            evicted = true;
+        }
+        evicted
     }
 
     /// Go `loadPreview`: a reusable entry is a successful preview or a
@@ -356,12 +378,17 @@ impl Media {
             .is_some_and(|(until, _)| now < *until)
     }
 
-    /// Shortest remaining retry gate across all preview failures, used to
-    /// schedule the next wakeup without any scroll or input.
-    pub fn next_preview_retry(&self, now: Instant) -> Option<Duration> {
-        self.preview_failures
-            .values()
+    /// Shortest *future* retry gate among the visible link cards. An expired
+    /// gate is not a wakeup: `request_preview` retries it on the current frame,
+    /// and when every preview slot is busy the finishing request redraws. An
+    /// expired entry for a link that scrolled away must never schedule a timer,
+    /// otherwise every frame would wake itself at zero delay.
+    pub fn next_preview_retry(&self, visible: &HashSet<String>, now: Instant) -> Option<Duration> {
+        visible
+            .iter()
+            .filter_map(|href| self.preview_failures.get(href))
             .map(|(until, _)| until.saturating_duration_since(now))
+            .filter(|delay| !delay.is_zero())
             .min()
     }
 
@@ -524,7 +551,7 @@ mod tests {
     }
 
     #[test]
-    fn the_next_preview_wakeup_is_the_shortest_gate() {
+    fn only_future_gates_of_visible_previews_schedule_a_wakeup() {
         let mut media = Media::default();
         let now = Instant::now();
         let long = PreviewEntry {
@@ -539,16 +566,35 @@ mod tests {
         };
         media.put_preview("https://long.example.com/", long);
         media.put_preview("https://short.example.com/", short);
-        let delay = media.next_preview_retry(now).expect("a gate");
+        let visible: HashSet<String> = ["https://long.example.com/".into()].into_iter().collect();
+        let delay = media.next_preview_retry(&visible, now).expect("a gate");
+        assert!(delay <= Duration::from_secs(10));
+        assert!(delay > Duration::from_secs(9));
+
+        let visible: HashSet<String> = [
+            "https://long.example.com/".into(),
+            "https://short.example.com/".into(),
+        ]
+        .into_iter()
+        .collect();
+        let delay = media.next_preview_retry(&visible, now).expect("a gate");
         assert!(delay <= Duration::from_secs(3));
         assert!(delay > Duration::from_secs(2));
+
+        // An expired entry for an off-screen card must not create a zero-delay
+        // wakeup loop; only the visible links decide the timer.
         let past = PreviewEntry {
             retry_at: Some(now - Duration::from_secs(1)),
             failed: true,
             ..Default::default()
         };
         media.put_preview("https://past.example.com/", past);
-        assert_eq!(media.next_preview_retry(now), Some(Duration::ZERO));
+        assert_eq!(media.next_preview_retry(&visible, now), Some(delay));
+        let only_past: HashSet<String> = ["https://past.example.com/".into()].into_iter().collect();
+        assert_eq!(media.next_preview_retry(&only_past, now), None);
+        let offscreen: HashSet<String> =
+            ["https://other.example.com/".into()].into_iter().collect();
+        assert_eq!(media.next_preview_retry(&offscreen, now), None);
     }
 
     #[test]

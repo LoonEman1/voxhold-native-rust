@@ -173,7 +173,15 @@ impl Voxhold {
             &sent_ids,
             active.then_some(composer_now),
         );
-        if active && message.channel_id == self.channel && !self.deleted_ids.contains(&message.id) {
+        // The draft still belongs to the original chat, but the feed may only
+        // receive the confirmed row while access to the open channel is
+        // confirmed. `invalidate_access` clears history and sets this flag;
+        // a late POST answer must not put a private row back into that gap.
+        if !self.access_pending
+            && active
+            && message.channel_id == self.channel
+            && !self.deleted_ids.contains(&message.id)
+        {
             self.merge_message(true, message);
             self.trim_history(false);
         }

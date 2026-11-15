@@ -149,6 +149,10 @@ impl Voxhold {
                 thumbs.insert(key, image);
             }
         }
+        let visible_previews: std::collections::HashSet<String> = wanted_previews
+            .iter()
+            .map(|preview| preview.cache_url.clone())
+            .collect();
         for preview in wanted_previews {
             self.request_preview(preview.cache_url.clone(), window, cx);
             if let Some(entry) = self.media.preview_entry(&preview.cache_url) {
@@ -156,7 +160,7 @@ impl Voxhold {
                 previews.insert(preview.cache_url, (entry, image));
             }
         }
-        self.ensure_preview_timer(window, cx);
+        self.ensure_preview_timer(&visible_previews, window, cx);
         let mut avatar_by_user = std::collections::HashMap::new();
         for ((user_id, version), (image, used)) in self.roster.avatars.iter_mut() {
             avatar_by_user.insert((*user_id, version.clone()), image.clone());

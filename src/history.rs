@@ -20,6 +20,20 @@ pub(crate) fn merge_revision(current: &mut Message, mut incoming: Message) {
     let use_reactions = incoming.reactions_revision > 0
         && incoming.reactions_revision >= current.reactions_revision;
     if incoming.revision >= current.revision {
+        // A confirmed deletion is a tombstone at the row level too: an older
+        // page or a replayed event that still says `deleted: false` must not
+        // resurrect a file that this row already showed as deleted. The
+        // bounded `purged` set may have rolled past that id by now.
+        for file in &mut incoming.attachments {
+            if !file.deleted
+                && current
+                    .attachments
+                    .iter()
+                    .any(|row| row.deleted && row.id == file.id)
+            {
+                file.deleted = true;
+            }
+        }
         if !use_reactions {
             incoming.reactions_revision = current.reactions_revision;
             incoming.reactions = std::mem::take(&mut current.reactions);

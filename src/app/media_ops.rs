@@ -204,7 +204,8 @@ impl Voxhold {
                         }
                     }
                 }
-                s.ensure_preview_timer(window, cx);
+                // The next frame re-evaluates the visible cards and schedules
+                // the one retry timer from their remaining gates.
                 cx.notify();
             });
         })
@@ -227,9 +228,12 @@ impl Voxhold {
         ids: &[String],
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
+    ) -> bool {
+        let mut history_stale = false;
         for id in ids {
-            for image in self.media.remove_attachment(id) {
+            let (images, evicted) = self.media.remove_attachment(id);
+            history_stale |= evicted;
+            for image in images {
                 let _ = window.drop_image(image);
             }
             if self
@@ -241,16 +245,26 @@ impl Voxhold {
                 self.close_viewer(window);
             }
         }
+        let restart_history = history_stale && self.invalidate_history_requests();
         if let Some(attachments) = &self.attachments {
             attachments.update(cx, |panel, cx| panel.remove_message_files(ids, cx));
         }
+        restart_history
     }
 
-    /// Schedule one wakeup for the nearest preview retry gate. When it fires
-    /// the next frame re-requests the visible links without any user input.
-    pub(super) fn ensure_preview_timer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// Schedule one wakeup for the nearest future retry gate of the link cards
+    /// that are currently visible. When it fires the next frame re-requests
+    /// those links without any user input. Expired gates and off-screen cards
+    /// are ignored on purpose: the next frame retries the visible one itself,
+    /// and a finished request redraws when all preview slots were busy.
+    pub(super) fn ensure_preview_timer(
+        &mut self,
+        visible: &std::collections::HashSet<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let now = Instant::now();
-        let Some(delay) = self.media.next_preview_retry(now) else {
+        let Some(delay) = self.media.next_preview_retry(visible, now) else {
             return;
         };
         let at = now + delay;

@@ -315,21 +315,45 @@ async fn channel_switch_applies_the_confirmation_to_the_original_draft(cx: &mut 
 }
 
 #[gpui::test]
+async fn a_late_send_confirmation_waits_for_confirmed_access_before_inserting(
+    cx: &mut TestAppContext,
+) {
+    cx.update(|cx| gpui_component::init(cx));
+    let (window, view) = add_auth_window(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
+    let key = draft::ChatKey::channel(1, 7);
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            v.server = 1;
+            v.channel = 7;
+            v.drafts.borrow_mut().set_text(key, "текст");
+            let plan = v.drafts.borrow_mut().begin_send(key, "текст").unwrap();
+            // The access scope changed after the POST was sent: history is
+            // gone until the channel/member reload confirms the current chat.
+            v.invalidate_access(window, cx);
+            assert!(v.access_pending);
+            assert!(v.messages.is_empty());
+            let message = serde_json::from_value::<Message>(message_json(9, 1, "текст")).unwrap();
+            assert!(
+                v.apply_send_success(plan, message, "текст"),
+                "the confirmed send still clears the original draft"
+            );
+            assert_eq!(v.drafts.borrow().text(key), "");
+            assert!(
+                v.messages.is_empty(),
+                "a private row must not return while access is unconfirmed"
+            );
+        });
+    });
+}
+
+#[gpui::test]
 async fn logout_aborts_the_upload_before_the_post(cx: &mut TestAppContext) {
     cx.update(|cx| gpui_component::init(cx));
     let (window, view) = add_auth_window(cx);
     let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
     let gate = Gate::new();
     gate.arm();
-    let file_id = "a".repeat(32);
-    let attachment = format!(
-        "{{\"id\":\"{file_id}\",\"filename\":\"old.png\",\"mime_type\":\"image/png\",\"size_bytes\":4096,\"deleted\":false}}"
-    );
-    let message = message_json(9, 1, "файл").to_string();
-    let server = TestServer::spawn(vec![
-        Reply::new(200, &attachment).with_gate(gate.clone()),
-        Reply::new(201, &message).with_gate(gate.clone()),
-    ]);
     let path = std::env::temp_dir().join(format!(
         "voxhold-gate-{}-{}.png",
         std::process::id(),
@@ -337,6 +361,22 @@ async fn logout_aborts_the_upload_before_the_post(cx: &mut TestAppContext) {
     ));
     std::fs::write(&path, vec![7u8; 4096]).unwrap();
     let file = draft::DraftFile::from_path(path.clone()).unwrap();
+    // The upload answer must name the file that was actually loaded from the
+    // draft; a different id is an invalid response and stops the chain even
+    // when no abort happened.
+    let attachment = serde_json::json!({
+        "id": file.id.clone(),
+        "filename": file.name.clone(),
+        "mime_type": "image/png",
+        "size_bytes": file.size,
+        "deleted": false
+    })
+    .to_string();
+    let message = message_json(9, 1, "файл").to_string();
+    let server = TestServer::spawn(vec![
+        Reply::new(200, &attachment).with_gate(gate.clone()),
+        Reply::new(201, &message).with_gate(gate.clone()),
+    ]);
     let key = draft::ChatKey::channel(1, 7);
     visual.update(|window, app| {
         view.update(app, |v, cx| {
@@ -386,12 +426,16 @@ async fn one_chat_confirmation_does_not_clear_another_chat_send(cx: &mut TestApp
     cx.update(|cx| gpui_component::init(cx));
     let (window, view) = add_auth_window(cx);
     let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
-    let gate = Gate::new();
-    let message = message_json(9, 1, "ответ").to_string();
-    let replies = (0..8)
-        .map(|_| Reply::new(201, &message).with_gate(gate.clone()))
-        .collect();
-    let server = TestServer::spawn(replies);
+    let gate_a = Gate::new();
+    let gate_b = Gate::new();
+    gate_a.arm();
+    gate_b.arm();
+    let message_a = message_json(9, 1, "ответ").to_string();
+    let message_b = message_json(10, 1, "ответ").to_string();
+    let server = TestServer::spawn_concurrent(vec![
+        Reply::new(201, &message_a).with_gate(gate_a.clone()),
+        Reply::new(201, &message_b).with_gate(gate_b.clone()),
+    ]);
     let key_a = draft::ChatKey::channel(1, 7);
     let key_b = draft::ChatKey::channel(1, 8);
     visual.update(|window, app| {
@@ -409,6 +453,33 @@ async fn one_chat_confirmation_does_not_clear_another_chat_send(cx: &mut TestApp
             v.send(window, cx);
         });
     });
+    assert!(
+        gate_a.wait_arrived(Duration::from_secs(3)),
+        "the first chat POST reached the server"
+    );
+    // Start B while A is still held by the server, then wait until both POSTs
+    // are in flight together. A confirmed A before this point would hide the
+    // regression this test exists for.
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            v.channel = 8;
+            v.composer
+                .update(cx, |input, cx| input.set_value("второй", window, cx));
+            v.send(window, cx);
+        });
+    });
+    assert!(
+        gate_b.wait_arrived(Duration::from_secs(3)),
+        "the second chat POST reached the server while A was still held"
+    );
+    view.read_with(&*visual, |v, _| {
+        assert!(v.pending_sends.contains_key(&key_a));
+        assert!(v.pending_sends.contains_key(&key_b));
+        assert_eq!(v.drafts.borrow().text(key_a), "первый");
+        assert_eq!(v.drafts.borrow().text(key_b), "второй");
+    });
+
+    gate_a.release();
     let mut first_done = false;
     for _ in 0..200 {
         visual.run_until_parked();
@@ -419,28 +490,17 @@ async fn one_chat_confirmation_does_not_clear_another_chat_send(cx: &mut TestApp
         std::thread::sleep(Duration::from_millis(5));
     }
     assert!(first_done, "the first chat confirmed");
-
-    visual.update(|window, app| {
-        view.update(app, |v, cx| {
-            v.select_channel(8, window, cx);
-            v.composer
-                .update(cx, |input, cx| input.set_value("второй", window, cx));
-        });
-    });
-    gate.arm();
-    visual.update(|window, app| {
-        view.update(app, |v, cx| v.send(window, cx));
-    });
-    assert!(
-        gate.wait_arrived(Duration::from_secs(3)),
-        "the second chat POST reached the server"
-    );
     view.read_with(&*visual, |v, _| {
-        assert!(v.is_sending(), "the second chat is still sending");
-        assert!(v.pending_sends.contains_key(&key_b));
+        assert!(!v.pending_sends.contains_key(&key_a));
+        assert!(
+            v.pending_sends.contains_key(&key_b),
+            "A's confirmation must not clear B's in-flight send"
+        );
         assert_eq!(v.drafts.borrow().text(key_a), "");
+        assert_eq!(v.drafts.borrow().text(key_b), "второй");
     });
-    gate.release();
+
+    gate_b.release();
     let mut second_done = false;
     for _ in 0..200 {
         visual.run_until_parked();

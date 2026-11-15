@@ -224,10 +224,249 @@ async fn a_deleted_attachment_cannot_be_reopened_before_history(cx: &mut TestApp
     assert!(server.requests().is_empty());
 }
 
+#[gpui::test]
+async fn rolling_the_purged_set_does_not_resurrect_a_deleted_attachment(cx: &mut TestAppContext) {
+    cx.update(|cx| gpui_component::init(cx));
+    let (_window, view) = add_auth_window(cx);
+    cx.update(|app| {
+        view.update(app, |v, _| {
+            v.server = 1;
+            v.channel = 7;
+            let id = "e".repeat(32);
+            let row = |revision: i64, deleted: bool| {
+                let mut dto = message_json(1, revision, "файл");
+                dto["attachments"] = serde_json::json!([{
+                    "id": id.clone(),
+                    "filename": "photo.png",
+                    "mime_type": "image/png",
+                    "size_bytes": 64,
+                    "width": 10,
+                    "height": 10,
+                    "deleted": deleted
+                }]);
+                serde_json::from_value::<Message>(dto).unwrap()
+            };
+            v.merge_message(true, row(1, false));
+            let mut ids = vec![id.clone()];
+            ids.extend((1..=crate::media::PURGED_MARKERS).map(|index| format!("{index:032x}")));
+            let effect = v.apply_realtime_event(
+                "attachments.changed",
+                &serde_json::json!({"channel_id": 7, "attachment_ids": ids}),
+            );
+            assert_eq!(effect.attachments.len(), crate::media::PURGED_MARKERS + 1);
+            assert!(v.messages[0].attachments[0].deleted);
+            assert!(
+                !v.media.is_purged(&id),
+                "the oldest marker rolled out of the bounded set"
+            );
+            assert!(v.media.purged.len() <= crate::media::PURGED_MARKERS);
+
+            // The late page still carries `deleted: false`; the row's own
+            // tombstone must win even after its id left `purged`.
+            v.apply_history_snapshot(
+                voxhold_api::MessagePage {
+                    messages: vec![row(2, false)],
+                    pagination: voxhold_api::Pagination::default(),
+                },
+                Default::default(),
+            );
+            assert!(
+                v.messages[0].attachments[0].deleted,
+                "a late row cannot resurrect an attachment this row already dropped"
+            );
+        });
+    });
+}
+
+#[gpui::test]
+async fn a_late_context_answer_cannot_resurrect_an_evicted_attachment(cx: &mut TestAppContext) {
+    cx.update(|cx| gpui_component::init(cx));
+    let (_window, view) = add_auth_window(cx);
+    cx.update(|app| {
+        view.update(app, |v, _| {
+            v.server = 1;
+            v.channel = 7;
+            v.generation = 3;
+            v.access_generation = 4;
+            v.before = Some(10);
+            assert!(
+                v.messages.is_empty(),
+                "the /context target is not in the loaded feed"
+            );
+            // A /context, a refresh and an older-page request are in flight.
+            v.context_request = Some(7);
+            v.refresh_request = Some(8);
+            v.older_request = 9;
+            v.loading_older = true;
+            assert!(v.accepts_context_reply(7, 3, 4, 1, 7));
+            assert!(v.accepts_older_reply(9, 10, 1, 7, 3, 4));
+
+            let id = "f".repeat(32);
+            let mut ids = vec![id.clone()];
+            ids.extend((1..=crate::media::PURGED_MARKERS).map(|index| format!("{index:032x}")));
+            let effect = v.apply_realtime_event(
+                "attachments.changed",
+                &serde_json::json!({"channel_id": 7, "attachment_ids": ids}),
+            );
+            assert_eq!(effect.attachments.len(), crate::media::PURGED_MARKERS + 1);
+            assert!(
+                !v.media.is_purged(&id),
+                "the first attachment marker rolled out of the bounded set"
+            );
+
+            assert!(v.context_request.is_none());
+            assert!(v.refresh_request.is_none());
+            assert_eq!(v.older_request, 0);
+            assert!(!v.loading_older);
+            assert!(
+                !v.accepts_context_reply(7, 3, 4, 1, 7),
+                "the /context answer requested before the deletion is stale"
+            );
+            assert!(
+                !v.accepts_older_reply(9, 10, 1, 7, 3, 4),
+                "the history answer requested before the deletion is stale"
+            );
+
+            // Run the callback's guard exactly as the background task would.
+            let mut row = message_json(50, 1, "старое сообщение");
+            row["attachments"] = serde_json::json!([{
+                "id": id,
+                "filename": "old.png",
+                "mime_type": "image/png",
+                "size_bytes": 64,
+                "width": 10,
+                "height": 10,
+                "deleted": false
+            }]);
+            let context: voxhold_api::MessageContext = serde_json::from_value(serde_json::json!({
+                "messages": [row],
+                "target_message_id": 50,
+                "target_index": 0
+            }))
+            .unwrap();
+            if v.accepts_context_reply(7, 3, 4, 1, 7) {
+                v.apply_context_snapshot(context);
+            }
+            assert!(
+                v.messages.is_empty(),
+                "the late context row must not return the evicted attachment"
+            );
+
+            // Requests started after the deletion are not affected.
+            v.context_request = Some(10);
+            assert!(v.accepts_context_reply(10, 3, 4, 1, 7));
+        });
+    });
+}
+
+#[gpui::test]
+async fn an_evicted_marker_restarts_a_cancelled_initial_history_load(cx: &mut TestAppContext) {
+    cx.update(|cx| gpui_component::init(cx));
+    let (window, view) = add_auth_window(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
+    let row = message_json(1, 1, "свежая строка");
+    let page = serde_json::json!({
+        "messages": [row],
+        "pagination": {"next_before_id": null, "has_more": false}
+    })
+    .to_string();
+    let server =
+        crate::test_support::TestServer::spawn(vec![crate::test_support::Reply::new(200, &page)]);
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            writable_workspace(v);
+            v.client = Some(Client::new(&server.base).unwrap());
+            v.generation = 3;
+            v.access_generation = 4;
+            assert!(v.messages.is_empty());
+            // The first history load is already in flight.
+            v.request_seq = 8;
+            v.refresh_request = Some(8);
+
+            let id = "a".repeat(32);
+            let mut ids = vec![id];
+            ids.extend((1..=crate::media::PURGED_MARKERS).map(|index| format!("{index:032x}")));
+            let effect = v.apply_realtime_event(
+                "attachments.changed",
+                &serde_json::json!({"channel_id": 7, "attachment_ids": ids}),
+            );
+            assert!(effect.restart_history);
+            assert!(v.refresh_request.is_none());
+
+            // This is the event pump's post-batch action.
+            if effect.restart_history {
+                v.refresh_history(window, cx);
+            }
+            assert!(v.refresh_request.is_some(), "a fresh refresh started");
+        });
+    });
+
+    let mut loaded = false;
+    for _ in 0..200 {
+        visual.run_until_parked();
+        loaded = view.read_with(&*visual, |v, _| !v.messages.is_empty());
+        if loaded {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(loaded, "the replacement history page is applied");
+    view.read_with(&*visual, |v, _| {
+        assert_eq!(v.messages.len(), 1);
+        assert_eq!(v.messages[0].content, "свежая строка");
+        assert!(v.refresh_request.is_none());
+    });
+    let requests = server.requests();
+    assert_eq!(
+        requests.len(),
+        1,
+        "exactly one fresh history request: {requests:?}"
+    );
+    assert!(requests[0].path.contains("/messages"));
+}
+
 fn preview_json(url: &str, title: &str) -> String {
     format!(
         "{{\"url\":\"{url}\",\"title\":\"{title}\",\"description\":\"Описание\",\"site_name\":\"Example\",\"image_path\":\"\"}}"
     )
+}
+
+#[gpui::test]
+async fn an_expired_off_screen_preview_does_not_loop_the_redraw(cx: &mut TestAppContext) {
+    cx.update(|cx| gpui_component::init(cx));
+    let (window, view) = add_auth_window(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            writable_workspace(v);
+            v.media.put_preview(
+                "https://offscreen.example.com/",
+                crate::media::PreviewEntry {
+                    retry_at: Some(std::time::Instant::now() - Duration::from_secs(1)),
+                    failed: true,
+                    ..Default::default()
+                },
+            );
+            cx.notify();
+        });
+        window.draw(app).clear();
+    });
+    visual.run_until_parked();
+    // The entry is still cached, but no link card is visible: the render must
+    // not schedule a timer at zero delay for it.
+    visual.update(|window, app| {
+        window.draw(app).clear();
+    });
+    view.read_with(&*visual, |v, _| {
+        assert!(v
+            .media
+            .preview_failures
+            .contains_key("https://offscreen.example.com/"));
+        assert!(
+            v.preview_wake_at.is_none(),
+            "an off-screen expired gate must not wake every frame"
+        );
+    });
 }
 
 #[gpui::test]

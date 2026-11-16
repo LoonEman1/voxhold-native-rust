@@ -1,5 +1,10 @@
 mod client_extra;
+mod recordings;
 use futures_util::{SinkExt, StreamExt};
+pub use recordings::{
+    Recording, RecordingList, RECORDING_DELETED, RECORDING_FAILED, RECORDING_LOCAL_ONLY,
+    RECORDING_READY, RECORDING_STARTED, RECORDING_UPLOADING,
+};
 use reqwest::{Method, Url};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};

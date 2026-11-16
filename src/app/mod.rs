@@ -18,6 +18,8 @@ mod profile_view;
 mod realtime;
 mod recordings_download;
 mod recordings_ops;
+#[cfg(test)]
+mod recordings_tests;
 mod recordings_view;
 mod server_ops;
 mod session;

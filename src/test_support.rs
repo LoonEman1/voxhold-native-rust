@@ -108,6 +108,9 @@ pub struct Reply {
     pub body: ReplyBody,
     pub content_type: &'static str,
     pub gate: Option<Arc<Gate>>,
+    /// Hold the response for a while before writing headers. Used by the
+    /// long-recording test that must outlive the eight-second JSON timeout.
+    pub delay: Option<Duration>,
 }
 
 impl Reply {
@@ -117,6 +120,7 @@ impl Reply {
             body: ReplyBody::Bytes(body.as_bytes().to_vec()),
             content_type: "application/json",
             gate: None,
+            delay: None,
         }
     }
 
@@ -127,6 +131,7 @@ impl Reply {
             body: ReplyBody::Bytes(body),
             content_type: "image/png",
             gate: None,
+            delay: None,
         }
     }
 
@@ -137,11 +142,17 @@ impl Reply {
             body: ReplyBody::File(path),
             content_type,
             gate: None,
+            delay: None,
         }
     }
 
     pub fn with_gate(mut self, gate: Arc<Gate>) -> Self {
         self.gate = Some(gate);
+        self
+    }
+
+    pub fn with_delay(mut self, delay: Duration) -> Self {
+        self.delay = Some(delay);
         self
     }
 
@@ -226,6 +237,9 @@ impl TestServer {
 /// Write one queued answer. Called on the accept thread for the deterministic
 /// server and on a connection thread for the concurrent one.
 fn write_reply(stream: &mut std::net::TcpStream, reply: &Reply) {
+    if let Some(delay) = reply.delay {
+        std::thread::sleep(delay);
+    }
     if let Some(gate) = &reply.gate {
         gate.block_if_armed();
     }

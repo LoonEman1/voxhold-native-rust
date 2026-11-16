@@ -348,13 +348,16 @@ impl Voxhold {
                 if s.session_generation != session || !s.personal_settle(token) {
                     return;
                 }
+                let keep_dispatched = s.active_profile_save.is_some();
                 if let Some(panel) = &mut s.personal {
                     panel.profile_loading = false;
                     // A successful PATCH answered after this GET started. Its
                     // confirmed snapshot is newer than the page on the wire.
                     if panel.profile_epoch == epoch {
                         match result {
-                            Ok(profile) => panel.set_profile(profile, window, cx),
+                            Ok(profile) => {
+                                panel.apply_profile_snapshot(profile, keep_dispatched, window, cx)
+                            }
                             Err(error) => panel.local_error = error,
                         }
                     }

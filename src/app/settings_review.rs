@@ -284,6 +284,121 @@ async fn a_successful_patch_refreshes_a_reopened_profile_but_keeps_new_edits(
 }
 
 #[gpui::test]
+async fn a_get_answer_keeps_an_inflight_patch_edit(cx: &mut TestAppContext) {
+    cx.update(|cx| gpui_component::init(cx));
+    let get_gate = Gate::new();
+    let patch_gate = Gate::new();
+    let patched = voxhold_api::Profile {
+        about: "patched about".into(),
+        country_code: Some("RU".into()),
+        ..profile("old")
+    };
+    let final_profile = voxhold_api::Profile {
+        about: "patched about".into(),
+        country_code: Some("KZ".into()),
+        ..profile("old")
+    };
+    let get_server = TestServer::spawn_concurrent(vec![Reply::new(
+        200,
+        &serde_json::to_string(&profile("old")).unwrap(),
+    )
+    .with_gate(get_gate.clone())]);
+    let patch_server = TestServer::spawn_concurrent(vec![
+        Reply::new(200, &serde_json::to_string(&patched).unwrap()).with_gate(patch_gate.clone()),
+        Reply::new(200, &serde_json::to_string(&final_profile).unwrap()),
+    ]);
+    let mut get_client = voxhold_api::Client::new(&get_server.base).unwrap();
+    get_client.set_token("token".into());
+    let mut patch_client = voxhold_api::Client::new(&patch_server.base).unwrap();
+    patch_client.set_token("token".into());
+    let (window, view) = make_app(cx, patch_client.clone());
+    let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
+    let (get_gate, patch_gate, view_a) = (get_gate, patch_gate, view.clone());
+    visual.update(|window, app| {
+        view_a.update(app, |v, cx| {
+            v.active_settings = Some(SettingsKind::Personal);
+            let panel = v.personal.as_mut().unwrap();
+            panel.reopen(v.theme_mode, false);
+            panel.profile = Some(profile("old"));
+            panel.about_form.load("old".into());
+            panel.country_form.load(Some("RU".into()));
+            panel.country_index = crate::settings::country_index(&panel.countries, Some("RU"));
+            panel
+                .about
+                .update(cx, |input, cx| input.set_value("old", window, cx));
+            v.client = Some(get_client.clone());
+            get_gate.arm();
+            v.load_personal_profile(window, cx);
+            v.client = Some(patch_client.clone());
+            v.personal
+                .as_mut()
+                .unwrap()
+                .about
+                .update(cx, |input, cx| input.set_value("local edit", window, cx));
+            patch_gate.arm();
+            v.save_profile(window, cx);
+        });
+    });
+    // The old GET answers first, while the PATCH is still in flight.
+    let release = std::thread::spawn(move || {
+        let get = get_gate.wait_arrived(Duration::from_secs(5));
+        get_gate.release();
+        let patch = patch_gate.wait_arrived(Duration::from_secs(5));
+        std::thread::sleep(Duration::from_millis(200));
+        patch_gate.release();
+        (get, patch)
+    });
+    visual.run_until_parked();
+    let (get, patch) = release.join().unwrap();
+    assert!(get, "the GET reached the server");
+    assert!(patch, "the PATCH reached the server");
+    wait_for(&mut visual, &view, |v| v.active_profile_save.is_none());
+    view.read_with(&*visual, |v, cx| {
+        let panel = v.personal.as_ref().unwrap();
+        assert_eq!(panel.profile.as_ref().unwrap().about, "patched about");
+        assert_eq!(
+            panel.about.read(cx).value().to_string(),
+            "patched about",
+            "the GET must not clear the PATCH dispatch or its confirmed answer"
+        );
+    });
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            let index = v
+                .personal
+                .as_ref()
+                .unwrap()
+                .countries
+                .iter()
+                .position(|country| country.code == "KZ")
+                .map(|index| index + 1)
+                .unwrap();
+            v.settings_action(
+                SettingsAct::Personal(personal_settings::Action::ChooseCountry(index)),
+                window,
+                cx,
+            );
+            v.save_profile(window, cx);
+        });
+    });
+    wait_for(&mut visual, &view, |v| {
+        v.active_profile_save.is_none()
+            && v.personal
+                .as_ref()
+                .and_then(|panel| panel.profile.as_ref())
+                .is_some_and(|profile| profile.country_code.as_deref() == Some("KZ"))
+    });
+    let requests = patch_server.requests();
+    let patch = &requests[1];
+    let body = String::from_utf8_lossy(&patch.body);
+    assert!(
+        body.contains("patched about"),
+        "the next PATCH must not resend the old about text: {body}"
+    );
+    assert!(body.contains("KZ"));
+}
+
+#[gpui::test]
 async fn a_patch_answer_updates_the_profile_while_privacy_is_active(cx: &mut TestAppContext) {
     cx.update(|cx| gpui_component::init(cx));
     let gate = Gate::new();

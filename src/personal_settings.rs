@@ -266,6 +266,38 @@ impl PersonalSettings {
         self.profile = Some(profile);
     }
 
+    /// Merge a GET answer without discarding a local edit or the `dispatched`
+    /// value of a PATCH that is still in flight. `set_profile` remains the
+    /// force-reset used by "Отмена".
+    pub fn apply_profile_snapshot(
+        &mut self,
+        profile: Profile,
+        keep_dispatched: bool,
+        window: &mut Window,
+        cx: &mut Context<crate::app::Voxhold>,
+    ) {
+        let current_about = self.about.read(cx).value().to_string();
+        let current_country = self.country_code();
+        let about_edited = current_about != self.about_form.snapshot;
+        let country_edited = current_country != self.country_form.snapshot;
+        self.about_form.snapshot = profile.about.clone();
+        self.country_form.snapshot = profile.country_code.clone();
+        if !keep_dispatched {
+            self.about_form.dispatched = None;
+            self.country_form.dispatched = None;
+        }
+        if !about_edited {
+            self.about.update(cx, |input, cx| {
+                input.set_value(profile.about.clone(), window, cx)
+            });
+        }
+        if !country_edited {
+            self.country_index =
+                settings::country_index(&self.countries, profile.country_code.as_deref());
+        }
+        self.profile = Some(profile);
+    }
+
     pub fn country_code(&self) -> Option<String> {
         if self.country_index == 0 {
             return None;

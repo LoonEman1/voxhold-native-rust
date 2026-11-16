@@ -1006,10 +1006,11 @@ backend `9b29fdd`, frontend `ed7cb00`, Go `09c82b9`.
 старого файла при совпавшем `preview_token`. Успешный PATCH обновляет
 снимок переоткрытого профиля на любой открытой вкладке настроек, сохраняя
 поля, отредактированные в новой форме; GET профиля, начатый до ответа
-PATCH, отбрасывается по epoch.
+PATCH, отбрасывается по epoch, а GET во время PATCH сохраняет локальные
+поля и `dispatched` активного запроса.
 
 Проверки после правок: `cargo fmt --all -- --check`,
-`cargo test --workspace --locked` (226 тестов приложения: 225 passed,
+`cargo test --workspace --locked` (227 тестов приложения: 226 passed,
 1 `ignored`; 6 API; 6 media), `cargo build --release --locked
 -p voxhold-native-rust`, `scripts/check-file-sizes.ps1`. Живой backend,
 ручной GUI owner/admin/member, два аккаунта, кадры/DPI и фактический

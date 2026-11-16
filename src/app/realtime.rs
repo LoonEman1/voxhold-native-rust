@@ -88,11 +88,7 @@ impl Voxhold {
     /// Drain and apply one batch of queued events. The overflow flag is folded
     /// into the batch so a dropped `channels.changed` or credential event still
     /// unconfirms the recordings snapshot even when no event remains.
-    pub(super) fn process_realtime_batch(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub(super) fn process_realtime_batch(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let events: Vec<_> = self
             .events
             .as_ref()
@@ -190,7 +186,10 @@ impl Voxhold {
             // closes the viewer before a late content answer arrives.
             let stale_viewer = self.media.viewer.as_ref().is_some_and(|viewer| {
                 self.deleted_ids.contains(&viewer.key.message_id)
-                    || !self.messages.iter().any(|row| row.id == viewer.key.message_id)
+                    || !self
+                        .messages
+                        .iter()
+                        .any(|row| row.id == viewer.key.message_id)
             });
             if stale_viewer {
                 self.close_viewer(window);

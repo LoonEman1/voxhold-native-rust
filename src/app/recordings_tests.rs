@@ -485,11 +485,7 @@ async fn recording_release_outside_the_list_clears_the_press(cx: &mut TestAppCon
         assert!(dialog.max_scroll > 0.);
         let row = &dialog.rows[0];
         assert!(dialog.list.contains(row.download.center()));
-        (
-            row.download.center(),
-            row.record.id.clone(),
-            dialog.list.y,
-        )
+        (row.download.center(), row.record.id.clone(), dialog.list.y)
     });
     visual.simulate_mouse_down(at(point.0, point.1), MouseButton::Left, Default::default());
     view.read_with(&*visual, |v, _| {
@@ -783,9 +779,7 @@ async fn late_recording_preview_keeps_the_new_pending_entry(cx: &mut TestAppCont
                 dialog.preview_pending.insert(key.clone());
                 (dialog.generation, dialog.epoch)
             };
-            let image = || {
-                image::DynamicImage::ImageRgba8(image::RgbaImage::new(4, 4))
-            };
+            let image = || image::DynamicImage::ImageRgba8(image::RgbaImage::new(4, 4));
             // Generation 6 is stale: it must not clear generation 7's pending
             // entry or write its picture into the current cache.
             v.finish_recording_preview(

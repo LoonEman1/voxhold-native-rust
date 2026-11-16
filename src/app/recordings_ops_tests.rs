@@ -127,7 +127,9 @@ async fn recording_tombstone_survives_a_404_and_an_old_ready(cx: &mut TestAppCon
     visual.update(|window, app| {
         view.update(app, |v, cx| v.delete_recording(row, window, cx));
     });
-    wait_for(&mut visual, &view, |v| v.recordings.tombstones.contains(&deleted_id));
+    wait_for(&mut visual, &view, |v| {
+        v.recordings.tombstones.contains(&deleted_id)
+    });
 
     visual.update(|window, app| {
         view.update(app, |v, cx| v.refresh_recordings(0, window, cx));
@@ -320,9 +322,7 @@ async fn recording_delete_from_an_old_server_is_discarded(cx: &mut TestAppContex
     wait_for(&mut visual, &view, |v| {
         !v.recordings.loading && v.recordings.records.len() == 1
     });
-    let row = view.read_with(&*visual, |v, _| {
-        v.recordings.records[0].clone()
-    });
+    let row = view.read_with(&*visual, |v, _| v.recordings.records[0].clone());
     visual.update(|window, app| {
         view.update(app, |v, cx| {
             v.delete_recording(row, window, cx);

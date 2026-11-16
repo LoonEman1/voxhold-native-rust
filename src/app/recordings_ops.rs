@@ -148,9 +148,8 @@ impl Voxhold {
                         .recordings_button_mounted()
                         .then(|| voice.recordings_focus())
                 });
-                self.recordings_return_focus = Some(
-                    voice_focus.unwrap_or_else(|| self.recordings_entry_focus.clone()),
-                );
+                self.recordings_return_focus =
+                    Some(voice_focus.unwrap_or_else(|| self.recordings_entry_focus.clone()));
             }
             if let Some(focus) = self.recordings_return_focus.take() {
                 window.focus(&focus);

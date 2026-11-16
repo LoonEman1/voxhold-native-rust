@@ -115,11 +115,10 @@ impl Voxhold {
                 .map_err(|error| crate::draft::describe_error(&error))?;
             let mut save = file_io::PartFile::create(&path)?;
             let expected = (expect > 0).then_some(expect as u64);
-            let result = runtime.block_on(client.download_recording_to(
-                &ticket,
-                expect,
-                &mut |chunk| save.write(chunk),
-            ));
+            let result =
+                runtime.block_on(
+                    client.download_recording_to(&ticket, expect, &mut |chunk| save.write(chunk)),
+                );
             match result {
                 Ok(_) => save.finish(expected).map(|_| ()),
                 Err(error) => {

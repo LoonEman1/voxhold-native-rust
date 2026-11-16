@@ -574,10 +574,7 @@ mod tests {
         );
 
         // A late live event cannot refill the unconfirmed snapshot.
-        assert!(state.apply_event(
-            record(&"b".repeat(32), RECORDING_READY, 10),
-            1_700_000_100
-        ));
+        assert!(state.apply_event(record(&"b".repeat(32), RECORDING_READY, 10), 1_700_000_100));
         assert!(state.sorted(1_700_000_100).is_empty());
 
         let request = state.begin_refresh(1, 5, 1);

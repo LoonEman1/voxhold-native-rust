@@ -568,6 +568,51 @@ fn recording_24_mib_download_outlives_json_timeout_and_saves_atomically() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+#[gpui::test]
+async fn recordings_render_at_reference_frames(cx: &mut TestAppContext) {
+    cx.update(|cx| gpui_component::init(cx));
+    let both = list_json(&[
+        recording_json(&"1".repeat(32), RECORDING_READY, 1),
+        recording_json(&"2".repeat(32), RECORDING_STARTED, 2),
+    ]);
+    let server = TestServer::spawn(vec![Reply::new(200, &both)]);
+    let (window, view) = make_app(cx, client(&server.base));
+    let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
+    visual.update(|window, app| {
+        view.update(app, |v, cx| v.toggle_recordings("header", window, cx));
+    });
+    wait_for(&mut visual, &view, |v| !v.recordings.loading);
+    for (width, height) in [(1440., 900.), (900., 720.), (390., 760.)] {
+        visual.simulate_resize(gpui::size(gpui::px(width), gpui::px(height)));
+        visual.update(|window, app| {
+            window.draw(app).clear();
+        });
+        visual.run_until_parked();
+        view.read_with(&*visual, |v, _| {
+            assert!(
+                (v.viewport.0 - width).abs() < 1. && (v.viewport.1 - height).abs() < 1.,
+                "viewport {:?} at {width}x{height}",
+                v.viewport
+            );
+            let dialog = v.recordings_dialog.as_ref().unwrap();
+            assert!(dialog.bounds.w <= 570.);
+            assert!(dialog.bounds.w <= width - 8.);
+            assert!(dialog.bounds.x >= 0.);
+            assert!(dialog.bounds.bottom() <= height);
+            assert!(dialog.list.h >= 60.);
+            assert_eq!(dialog.rows.len(), 2);
+            if width == 390. {
+                assert!(
+                    crate::recordings_dialog::stacked(
+                        dialog.bounds.w - 2. * crate::recordings::CARD_PADDING
+                    ),
+                    "the narrow frame stacks the cards"
+                );
+            }
+        });
+    }
+}
+
 #[test]
 fn recordings_layout_covers_reference_frames() {
     let ready = record(ID, RECORDING_READY, 1);

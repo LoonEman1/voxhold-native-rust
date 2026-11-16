@@ -1004,11 +1004,12 @@ backend `9b29fdd`, frontend `ed7cb00`, Go `09c82b9`.
 принимаются обработчиком, пока PUT не ответил; расчёт превью аватара
 захватывает ID файла из самого `CropDraft` и не применяет результат
 старого файла при совпавшем `preview_token`. Успешный PATCH обновляет
-снимок переоткрытого профиля, сохраняя поля, отредактированные в новой
-форме, а GET профиля, начатый до ответа PATCH, отбрасывается по epoch.
+снимок переоткрытого профиля на любой открытой вкладке настроек, сохраняя
+поля, отредактированные в новой форме; GET профиля, начатый до ответа
+PATCH, отбрасывается по epoch.
 
 Проверки после правок: `cargo fmt --all -- --check`,
-`cargo test --workspace --locked` (225 тестов приложения: 224 passed,
+`cargo test --workspace --locked` (226 тестов приложения: 225 passed,
 1 `ignored`; 6 API; 6 media), `cargo build --release --locked
 -p voxhold-native-rust`, `scripts/check-file-sizes.ps1`. Живой backend,
 ручной GUI owner/admin/member, два аккаунта, кадры/DPI и фактический

@@ -763,7 +763,7 @@ impl Voxhold {
                         let current_country = panel.country_code();
                         let reply_about = profile.about.clone();
                         let reply_country = profile.country_code.clone();
-                        let profile_open = open_profile && panel.tab() == 0;
+                        let profile_visible = open_profile && panel.tab() == 0;
                         if accepted {
                             // A local edit made after dispatch stays in the
                             // editor; only the confirmed snapshot is replaced.
@@ -788,11 +788,12 @@ impl Voxhold {
                                     reply_country.as_deref(),
                                 );
                             }
-                        } else if profile_open {
-                            // The PATCH came from a form that was closed and
-                            // reopened. The new form may already hold an older
-                            // GET snapshot; replace the confirmed values but
-                            // keep fields the user edited in the new form.
+                        } else {
+                            // The PATCH came from a form that was closed,
+                            // reopened or left on another tab. The panel may
+                            // already hold an older GET snapshot; replace the
+                            // confirmed values on every tab but keep fields the
+                            // user edited locally.
                             let about_edited = current_about != panel.about_form.snapshot
                                 && current_about != sent_about;
                             let country_edited = current_country != panel.country_form.snapshot
@@ -811,8 +812,8 @@ impl Voxhold {
                                 );
                             }
                         }
-                        if accepted || profile_open {
-                            panel.profile = Some(profile);
+                        panel.profile = Some(profile);
+                        if accepted || profile_visible {
                             panel.notice = "Профиль обновлён.".into();
                         }
                     }

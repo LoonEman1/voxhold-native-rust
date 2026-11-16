@@ -284,6 +284,141 @@ async fn a_successful_patch_refreshes_a_reopened_profile_but_keeps_new_edits(
 }
 
 #[gpui::test]
+async fn a_patch_answer_updates_the_profile_while_privacy_is_active(cx: &mut TestAppContext) {
+    cx.update(|cx| gpui_component::init(cx));
+    let gate = Gate::new();
+    let server_profile = voxhold_api::Profile {
+        about: "server about".into(),
+        country_code: Some("RU".into()),
+        ..profile("old")
+    };
+    let final_profile = voxhold_api::Profile {
+        about: "server about".into(),
+        country_code: Some("KZ".into()),
+        ..profile("old")
+    };
+    let old_server = TestServer::spawn_concurrent(vec![Reply::new(
+        200,
+        &serde_json::to_string(&server_profile).unwrap(),
+    )
+    .with_gate(gate.clone())]);
+    let new_server = TestServer::spawn(vec![Reply::new(
+        200,
+        &serde_json::to_string(&final_profile).unwrap(),
+    )]);
+    let mut old_client = voxhold_api::Client::new(&old_server.base).unwrap();
+    old_client.set_token("token".into());
+    let mut new_client = voxhold_api::Client::new(&new_server.base).unwrap();
+    new_client.set_token("token".into());
+    let (window, view) = make_app(cx, old_client);
+    let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
+    let (gate, view_a, view_b) = (gate, view.clone(), view.clone());
+    visual.update(|window, app| {
+        view_a.update(app, |v, cx| {
+            v.active_settings = Some(SettingsKind::Personal);
+            let panel = v.personal.as_mut().unwrap();
+            panel.profile = Some(profile("old"));
+            panel
+                .about
+                .update(cx, |input, cx| input.set_value("old", window, cx));
+            gate.arm();
+            v.save_profile(window, cx);
+        });
+    });
+    visual.update(|window, app| {
+        view_b.update(app, |v, cx| {
+            v.client = None;
+            v.close_settings(false, window, cx);
+            let panel = v.personal.as_mut().unwrap();
+            panel.reopen(v.theme_mode, false);
+            panel.profile = Some(profile("old"));
+            panel.about_form.load("old".into());
+            panel.country_form.load(Some("RU".into()));
+            panel.country_index = crate::settings::country_index(&panel.countries, Some("RU"));
+            panel
+                .about
+                .update(cx, |input, cx| input.set_value("old", window, cx));
+            // The reopened GET already answered the old snapshot.
+            panel.dialog.loads[0] = crate::settings::LoadState::Loaded;
+            v.active_settings = Some(SettingsKind::Personal);
+            v.activate_settings_tab(2, window, cx);
+            v.client = Some(new_client.clone());
+            assert_eq!(v.personal.as_ref().unwrap().tab(), 2);
+        });
+    });
+    let waiter = release_on_arrival(gate.clone());
+    visual.run_until_parked();
+    assert!(waiter.join().unwrap(), "the PATCH reached the server");
+    wait_for(&mut visual, &view, |v| v.active_profile_save.is_none());
+    view.read_with(&*visual, |v, _| {
+        assert_eq!(
+            v.personal.as_ref().unwrap().profile.as_ref().unwrap().about,
+            "server about"
+        );
+        assert_eq!(v.personal.as_ref().unwrap().tab(), 2);
+    });
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            v.activate_settings_tab(0, window, cx);
+            assert_eq!(
+                v.personal.as_ref().unwrap().dialog.loads[0],
+                crate::settings::LoadState::Loaded
+            );
+        });
+    });
+    view.read_with(&*visual, |v, cx| {
+        assert_eq!(
+            v.personal
+                .as_ref()
+                .unwrap()
+                .about
+                .read(cx)
+                .value()
+                .to_string(),
+            "server about",
+            "the return shows the confirmed PATCH snapshot without a new GET"
+        );
+    });
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            let index = v
+                .personal
+                .as_ref()
+                .unwrap()
+                .countries
+                .iter()
+                .position(|country| country.code == "KZ")
+                .map(|index| index + 1)
+                .unwrap();
+            v.settings_action(
+                SettingsAct::Personal(personal_settings::Action::ChooseCountry(index)),
+                window,
+                cx,
+            );
+            v.save_profile(window, cx);
+        });
+    });
+    wait_for(&mut visual, &view, |v| {
+        v.active_profile_save.is_none()
+            && v.personal
+                .as_ref()
+                .and_then(|panel| panel.profile.as_ref())
+                .is_some_and(|profile| profile.country_code.as_deref() == Some("KZ"))
+    });
+    let requests = new_server.requests();
+    let patch = requests
+        .iter()
+        .find(|request| request.method == "PATCH")
+        .expect("the country-only save sends one PATCH");
+    let body = String::from_utf8_lossy(&patch.body);
+    assert!(
+        body.contains("server about"),
+        "the next PATCH must not resend the old about text: {body}"
+    );
+    assert!(body.contains("KZ"));
+}
+
+#[gpui::test]
 async fn a_reopened_profile_keeps_a_new_edit_from_the_patch_snapshot(cx: &mut TestAppContext) {
     cx.update(|cx| gpui_component::init(cx));
     let reply = voxhold_api::Profile {

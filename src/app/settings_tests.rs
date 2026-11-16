@@ -129,7 +129,7 @@ async fn a_late_profile_answer_does_not_overwrite_a_new_edit(cx: &mut TestAppCon
 }
 
 #[gpui::test]
-async fn closing_the_tab_discards_a_pending_profile_answer(cx: &mut TestAppContext) {
+async fn a_profile_patch_updates_the_snapshot_while_another_tab_is_active(cx: &mut TestAppContext) {
     cx.update(|cx| gpui_component::init(cx));
     let gate = Gate::new();
     let reply = serde_json::to_string(&profile("late")).unwrap();
@@ -162,8 +162,9 @@ async fn closing_the_tab_discards_a_pending_profile_answer(cx: &mut TestAppConte
     assert!(waiter.join().unwrap());
     view.read_with(&*visual, |v, cx| {
         let panel = v.personal.as_ref().unwrap();
-        assert_eq!(panel.about.read(cx).value().to_string(), "old");
-        assert!(panel.notice.is_empty());
+        assert_eq!(panel.about.read(cx).value().to_string(), "late");
+        assert_eq!(panel.profile.as_ref().unwrap().about, "late");
+        assert!(panel.notice.is_empty(), "the hidden tab shows no notice");
         assert_eq!(panel.dialog.pending, 0, "old tab did not leak pending");
     });
 }

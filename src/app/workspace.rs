@@ -12,6 +12,7 @@ impl Voxhold {
         self.close_thread(window, cx);
         self.show_inbox = false;
         self.message_menu = None;
+        self.member_menu = None;
         self.forward = None;
         self.editing = None;
         self.confirm_delete = None;
@@ -34,15 +35,7 @@ impl Voxhold {
         if let Some(attachments) = &self.attachments {
             attachments.update(cx, |a, cx| a.set_scope(None, false, cx));
         }
-        self.show_server_settings = false;
-        let server_info = self.servers.iter().find(|s| s.id == id);
-        let name = server_info.map(|s| s.name.clone()).unwrap_or_default();
-        let owner = server_info.is_some_and(|s| s.role == "owner");
-        if let Some(settings) = &self.server_settings {
-            settings.update(cx, |settings, cx| {
-                settings.set_scope(id, &name, owner, window, cx)
-            });
-        }
+        self.close_stale_settings(id, 0, window, cx);
         self.channel = 0;
         let search_client = c.clone();
         let runtime = self.runtime.clone();
@@ -111,12 +104,17 @@ impl Voxhold {
             });
             self.inbox = Some(inbox);
         }
-        if self.settings.is_none() {
-            let client = c.clone();
-            let runtime = self.runtime.clone();
-            let settings =
-                cx.new(|cx| personal_settings::PersonalSettings::new(client, runtime, window, cx));
-            self.settings = Some(settings);
+        if self.personal.is_none() {
+            self.personal = Some(personal_settings::PersonalSettings::new(window, cx));
+        }
+        if self.server_settings.is_none() {
+            self.server_settings = Some(server_settings::ServerSettings::new(window, cx));
+        }
+        if self.channel_settings.is_none() {
+            self.channel_settings = Some(channel_settings::ChannelSettings::new(window, cx));
+        }
+        if self.channel_notifications.is_none() {
+            self.channel_notifications = Some(channel_settings::ChannelNotifications::new());
         }
         self.channels.clear();
         self.messages.clear();
@@ -179,7 +177,8 @@ impl Voxhold {
                         return;
                     }
                     match result {
-                        Ok((channels, members)) => {
+                        Ok((channels, mut members)) => {
+                            crate::members::sort_members(&mut members);
                             s.channels = channels;
                             s.members = members;
                             s.search_permissions_ready = true;
@@ -210,6 +209,7 @@ impl Voxhold {
         self.conversation = None;
         self.close_thread(window, cx);
         self.message_menu = None;
+        self.member_menu = None;
         self.forward = None;
         self.editing = None;
         self.confirm_delete = None;
@@ -275,26 +275,8 @@ impl Voxhold {
         self.roster.loading.clear();
         self.show_search = false;
         self.pinned_ids.clear();
-        self.show_channel_settings = false;
         self.show_channels = false;
-        let role = self
-            .servers
-            .iter()
-            .find(|s| s.id == self.server)
-            .map(|s| s.role.as_str())
-            .unwrap_or("");
-        let allowed = role == "owner" || role == "admin";
-        let kind = self
-            .channels
-            .iter()
-            .find(|ch| ch.id == id)
-            .map(|ch| ch.kind.clone())
-            .unwrap_or_default();
-        if let Some(settings) = &self.channel_settings {
-            settings.update(cx, |settings, cx| {
-                settings.set_scope(self.server, id, &kind, allowed, cx)
-            });
-        }
+        self.close_stale_settings(self.server, id, window, cx);
         #[cfg(feature = "voxhold-media")]
         if let Some(client) = self.client.clone().filter(|_| {
             self.voice_channel != id
@@ -319,6 +301,12 @@ impl Voxhold {
         self.sync_search_permissions(cx);
         self.messages.clear();
         self.history_keys.clear();
+        let kind = self
+            .channels
+            .iter()
+            .find(|channel| channel.id == self.channel)
+            .map(|channel| channel.kind.clone())
+            .unwrap_or_default();
         let alignment = if kind == "news" {
             ListAlignment::Top
         } else {
@@ -434,8 +422,6 @@ impl Voxhold {
         self.selected_messages.clear();
         self.highlighted_message = None;
         self.hovered_action = None;
-        self.show_channel_settings = false;
-        self.show_server_settings = false;
         if let Some(attachments) = &self.attachments {
             attachments.update(cx, |a, cx| a.set_scope(None, false, cx));
         }
@@ -444,12 +430,6 @@ impl Voxhold {
                 panel.set_scope(0, 0, cx);
                 panel.set_permissions(Default::default(), false, cx);
             });
-        }
-        if let Some(settings) = &self.channel_settings {
-            settings.update(cx, |panel, cx| panel.set_scope(0, 0, "", false, cx));
-        }
-        if let Some(settings) = &self.server_settings {
-            settings.update(cx, |panel, cx| panel.set_scope(0, "", false, window, cx));
         }
         self.reload_channels(window, cx);
         cx.notify();
@@ -492,9 +472,20 @@ impl Voxhold {
                 match result {
                     Ok((channels, members)) => {
                         s.channels = channels;
+                        let channel_missing = s
+                            .channel_settings
+                            .as_ref()
+                            .filter(|_| s.active_settings == Some(SettingsKind::Channel))
+                            .is_some_and(|panel| {
+                                !s.channels.iter().any(|channel| channel.id == panel.channel)
+                            });
+                        if channel_missing {
+                            s.close_settings(false, window, cx);
+                        }
                         s.search_permissions_ready = true;
                         s.sync_search_permissions(cx);
-                        if let Ok(members) = members {
+                        if let Ok(mut members) = members {
+                            crate::members::sort_members(&mut members);
                             s.members = members;
                         }
                         if s.in_conversation() {
@@ -511,17 +502,6 @@ impl Voxhold {
                                 .find(|member| member.user_id == s.self_user_id)
                             {
                                 server.role = member.role.clone();
-                            }
-                            if let Some(settings) = &s.server_settings {
-                                settings.update(cx, |panel, cx| {
-                                    panel.set_scope(
-                                        server.id,
-                                        &server.name,
-                                        server.role == "owner",
-                                        window,
-                                        cx,
-                                    )
-                                });
                             }
                         }
                         let channel = s

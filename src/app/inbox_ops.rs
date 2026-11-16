@@ -199,10 +199,7 @@ impl Voxhold {
         self.busy = false;
         self.roster.reset_channel();
         self.roster.loading.clear();
-        self.show_channel_settings = false;
-        if let Some(settings) = &self.channel_settings {
-            settings.update(cx, |settings, cx| settings.set_scope(0, 0, "", false, cx));
-        }
+        self.close_stale_settings(self.server, 0, window, cx);
         if let Some(search) = &self.search {
             search.update(cx, |panel, cx| panel.set_scope(self.server, 0, cx));
         }

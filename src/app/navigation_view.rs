@@ -80,15 +80,12 @@ impl Voxhold {
                     .items_center()
                     .justify_center()
                     .cursor_pointer()
+                    .track_focus(&self.settings_entry_focus)
+                    .tab_index(0)
                     .child(icon("icons/settings.svg", 18., ink(p.muted)))
-                    .on_click(cx.listener(|s, _, _, cx| {
-                        s.show_settings = !s.show_settings;
-                        if s.show_settings {
-                            if let Some(settings) = &s.settings {
-                                settings.update(cx, |settings, cx| settings.load(cx));
-                            }
-                        }
-                        cx.notify();
+                    .on_click(cx.listener(|s, _, window, cx| {
+                        let focus = s.settings_entry_focus.clone();
+                        s.open_settings(SettingsKind::Personal, focus, window, cx);
                     })),
             )
             .into_any_element()
@@ -97,7 +94,7 @@ impl Voxhold {
     pub(super) fn open_server(&mut self, id: i64, window: &mut Window, cx: &mut Context<Self>) {
         self.show_servers = false;
         self.show_inbox = false;
-        self.show_settings = false;
+        self.close_stale_settings(id, 0, window, cx);
         if self.server != id
             || self.access_pending
             || self.channels.is_empty()
@@ -147,10 +144,10 @@ impl Voxhold {
             .iter()
             .find(|s| s.id == self.server)
             .is_some_and(|s| s.role == "owner" || s.role == "admin");
-        let owner = self
-            .servers
-            .iter()
-            .any(|s| s.id == self.server && s.role == "owner");
+        let owner = self.servers.iter().any(|server| {
+            server.id == self.server
+                && crate::settings::Role::parse(&server.role).can_manage_server()
+        });
         let name = self
             .servers
             .iter()
@@ -226,13 +223,12 @@ impl Voxhold {
                     .cursor_pointer()
                     .text_size(px(12.))
                     .text_color(ink(p.muted))
+                    .track_focus(&self.server_entry_focus)
+                    .tab_index(0)
                     .child("Настройки сервера")
                     .on_click(cx.listener(|s, _, window, cx| {
-                        s.show_server_settings = true;
-                        if let Some(settings) = &s.server_settings {
-                            settings.update(cx, |settings, cx| settings.load(window, cx));
-                        }
-                        cx.notify();
+                        let focus = s.server_entry_focus.clone();
+                        s.open_settings(SettingsKind::Server, focus, window, cx);
                     })),
             );
         }
@@ -245,15 +241,37 @@ impl Voxhold {
                     .cursor_pointer()
                     .text_size(px(12.))
                     .text_color(ink(p.muted))
+                    .track_focus(&self.channel_entry_focus)
+                    .tab_index(0)
                     .child("Настройки канала")
                     .on_click(cx.listener(|s, _, window, cx| {
-                        s.show_channel_settings = true;
-                        if let Some(settings) = &s.channel_settings {
-                            settings.update(cx, |settings, cx| settings.load(window, cx));
-                        }
-                        cx.notify();
+                        let focus = s.channel_entry_focus.clone();
+                        s.open_settings(SettingsKind::Channel, focus, window, cx);
                     })),
             );
+            let notification_channel = self
+                .channels
+                .iter()
+                .find(|channel| channel.id == self.channel && channel.has_history())
+                .cloned();
+            if let Some(channel) = notification_channel {
+                panel = panel.child(
+                    div()
+                        .id("channel-notifications-open")
+                        .px(px(16.))
+                        .py(px(6.))
+                        .cursor_pointer()
+                        .text_size(px(12.))
+                        .text_color(ink(p.muted))
+                        .track_focus(&self.notifications_entry_focus)
+                        .tab_index(0)
+                        .child(format!("Уведомления · {}", channel.name))
+                        .on_click(cx.listener(|s, _, window, cx| {
+                            let focus = s.notifications_entry_focus.clone();
+                            s.open_settings(SettingsKind::ChannelNotifications, focus, window, cx);
+                        })),
+                );
+            }
         }
         for (kind, title) in [
             ("news", "НОВОСТНЫЕ КАНАЛЫ"),

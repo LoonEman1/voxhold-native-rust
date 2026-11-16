@@ -1073,10 +1073,10 @@ backend `9b29fdd`, frontend `ed7cb00`, Go `09c82b9`.
   `recording_wheel_after_click_scrolls_to_list_end`,
   `recording_release_in_clipped_part_cancels_press`, пустая версия preview,
   delete → WS → GET 404, 24 МиБ за >8 с и кадры 1440×900 / 900×720 /
-  390×760 на чистой геометрии.
+  390×760 в тестовом окне плюс чистая геометрия.
 
 Проверки после правок: `cargo fmt --all -- --check`,
-`cargo test --workspace --locked` (253 теста приложения: 252 passed,
+`cargo test --workspace --locked` (254 теста приложения: 253 passed,
 1 `ignored`; 11 API; 6 media), `cargo build --release --locked
 -p voxhold-native-rust`, `scripts/check-file-sizes.ps1` (158 файлов),
 smoke release (процесс активен через 4 с). Живой backend, реальная

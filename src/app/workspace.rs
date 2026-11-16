@@ -30,6 +30,7 @@ impl Voxhold {
             self.voice_channel = 0;
         }
         self.server = id;
+        self.reset_recordings(window, cx);
         self.composer_error.clear();
         self.clear_media(window);
         if let Some(attachments) = &self.attachments {
@@ -156,6 +157,9 @@ impl Voxhold {
         self.error.clear();
         self.update_channel_subscription(false);
         self.refresh_recents(cx);
+        if id != 0 {
+            self.refresh_recordings(0, window, cx);
+        }
         if id == 0 {
             cx.notify();
             return;
@@ -289,9 +293,26 @@ impl Voxhold {
             }
             let server = self.server;
             let push_to_talk = self.voice_settings.prefs.input_mode == "push_to_talk";
-            self.voice = Some(cx.new(|cx| {
+            let panel = cx.new(|cx| {
                 voice_panel::VoicePanel::new(client, server, id, push_to_talk, window, cx)
-            }));
+            });
+            let weak_view = cx.entity().downgrade();
+            let recordings_live = self.recordings_live.clone();
+            panel.update(cx, |panel, _| {
+                panel.set_recordings_live(recordings_live);
+                panel.set_recordings_handler(Box::new(move |window, cx| {
+                    let Some(_view) = weak_view.upgrade() else {
+                        return;
+                    };
+                    let weak = weak_view.clone();
+                    window.defer(cx, move |window, cx| {
+                        if let Some(view) = weak.upgrade() {
+                            view.update(cx, |view, cx| view.toggle_recordings("voice", window, cx));
+                        }
+                    });
+                }));
+            });
+            self.voice = Some(panel);
             self.voice_channel = id;
         }
         if let Some(search) = &self.search {

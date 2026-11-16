@@ -277,6 +277,7 @@ impl Voxhold {
                 );
             }
         }
+        let now = super::recordings_ops::now_secs();
         for (kind, title) in [
             ("news", "НОВОСТНЫЕ КАНАЛЫ"),
             ("text", "ТЕКСТОВЫЕ КАНАЛЫ"),
@@ -334,6 +335,14 @@ impl Voxhold {
                                 || channel.e2ee_required
                                 || !channel.readable(),
                             |row| row.child(icon("icons/lock.svg", 12., ink(p.muted))),
+                        )
+                        .when(
+                            channel.kind == "voice" && self.recordings.live(id, now).is_some(),
+                            |row| {
+                                row.child(
+                                    div().w(px(7.)).h(px(7.)).rounded_full().bg(ink(p.danger)),
+                                )
+                            },
                         )
                         .when(locked, |row| row.text_color(ink(p.muted)))
                         .on_click(cx.listener(move |s, _, w, cx| s.select_channel(id, w, cx))),

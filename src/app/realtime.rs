@@ -21,6 +21,11 @@ pub(super) struct RealtimeEffect {
     /// Personal messages whose reactions must be fetched without replacing
     /// the loaded history window.
     pub(super) conversation_reactions: Vec<(i64, i64)>,
+    /// A reconnect, channel or member change unconfirms the recordings
+    /// snapshot and any private preview.
+    pub(super) recording_access: bool,
+    /// One `recording.updated` was merged into the server snapshot.
+    pub(super) recording_event: bool,
 }
 
 impl Voxhold {
@@ -90,6 +95,8 @@ impl Voxhold {
                 let mut recents = false;
                 let mut pins = false;
                 let mut conversation_reactions = Vec::new();
+                let mut recording_access = false;
+                let mut recording_event = false;
                 for event in &events {
                     s.forward_thread_event(event, window, cx);
                     s.deliver_notification(event, window);
@@ -100,8 +107,13 @@ impl Voxhold {
                     restart_history |= effect.restart_history;
                     recents |= effect.recents;
                     pins |= effect.pins;
+                    recording_access |= effect.recording_access;
+                    recording_event |= effect.recording_event;
                     conversation_reactions.extend(effect.conversation_reactions);
                     removed_attachments.extend(effect.attachments);
+                }
+                if recording_access {
+                    s.invalidate_recordings(window, cx);
                 }
                 if recents {
                     s.refresh_recents(cx);
@@ -167,7 +179,7 @@ impl Voxhold {
                         s.close_viewer(window);
                     }
                 }
-                if changed || resync || access {
+                if changed || resync || access || recording_event {
                     cx.notify();
                 }
                 if s.realtime_generation == generation && s.events.is_some() {
@@ -295,7 +307,13 @@ impl Voxhold {
             {
                 effect.resync = true;
             }
+            "ready" => {
+                // A reconnect can miss a permission change; unconfirm the
+                // recordings snapshot before the next list request.
+                effect.recording_access = true;
+            }
             "native.reconnected" => {
+                effect.recording_access = true;
                 if self.in_conversation() {
                     // An open direct chat missed whatever arrived while the
                     // socket was down; refresh its history and recents even
@@ -317,10 +335,12 @@ impl Voxhold {
                 if data["server_id"].as_i64() == Some(self.server) =>
             {
                 effect.access = true;
+                effect.recording_access = true;
             }
             "server.member_joined" | "server.member_role_updated"
                 if data["server_id"].as_i64() == Some(self.server) =>
             {
+                effect.recording_access = true;
                 if let Ok(member) = serde_json::from_value::<Member>(data["member"].clone()) {
                     if member.user_id == self.self_user_id {
                         if let Some(server) = self
@@ -347,12 +367,24 @@ impl Voxhold {
                 }
                 if server == self.server {
                     effect.server_removed = removed;
+                    effect.recording_access = true;
                     self.members
                         .retain(|member| Some(member.user_id) != user_id);
                     effect.access = true;
                 } else if removed {
                     self.servers.retain(|item| item.id != server);
                     self.drafts.borrow_mut().clear_server(server);
+                }
+            }
+            "recording.updated" => {
+                if let Ok(record) = serde_json::from_value::<voxhold_api::Recording>(data.clone()) {
+                    if record.server_id == self.server
+                        && self
+                            .recordings
+                            .apply_event(record, super::recordings_ops::now_secs())
+                    {
+                        effect.recording_event = true;
+                    }
                 }
             }
             "presence.snapshot" => {

@@ -21,6 +21,11 @@ impl Render for Voxhold {
                             cx.stop_propagation();
                             return;
                         }
+                        if s.recordings_dialog.is_some() {
+                            s.close_recordings(true, window, cx);
+                            cx.stop_propagation();
+                            return;
+                        }
                         if s.show_thread {
                             s.close_thread(window, cx);
                             cx.stop_propagation();
@@ -158,6 +163,13 @@ impl Render for Voxhold {
             self.load_channel_members(cx);
         }
         let mobile = vw <= layout::MOBILE_MAX_WIDTH;
+        *self.recordings_live.borrow_mut() = if self.conversation.is_none() {
+            self.recordings
+                .live(self.channel, super::recordings_ops::now_secs())
+                .map(|record| record.owner_username)
+        } else {
+            None
+        };
         let channels_open = !mobile || self.show_channels;
         let l = layout::compute_layout(vw, vh, self.shell, channels_open, self.show_members);
         if !mobile {
@@ -266,6 +278,23 @@ impl Render for Voxhold {
                             .child(icon("icons/search.svg", 16., ink(p.muted)))
                             .when(show_labels, |button| button.child("Поиск")),
                     )
+                    .when(self.server != 0 && self.conversation.is_none(), |row| {
+                        row.child(
+                            div()
+                                .id("toggle-recordings")
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .cursor_pointer()
+                                .track_focus(&self.recordings_entry_focus)
+                                .tab_index(0)
+                                .on_click(cx.listener(|s, _, window, cx| {
+                                    s.toggle_recordings("header", window, cx)
+                                }))
+                                .child(icon("icons/inbox.svg", 16., ink(p.muted)))
+                                .when(show_labels, |button| button.child("Записи")),
+                        )
+                    })
                     .when(!self.conversation.is_some(), |row| {
                         row.child(
                             div()
@@ -702,6 +731,9 @@ impl Render for Voxhold {
             root = root.child(notice);
         }
         if let Some(layer) = self.settings_overlay(window, cx) {
+            root = root.child(layer);
+        }
+        if let Some(layer) = self.recordings_overlay(window, cx) {
             root = root.child(layer);
         }
         if let Some(layer) = self.viewer_layer(window, cx) {

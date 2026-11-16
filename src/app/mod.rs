@@ -72,6 +72,7 @@ struct PendingSend {
 /// pending entry.
 struct PreviewAbort {
     key: String,
+    dialog: u64,
     generation: u64,
     abort: tokio::task::AbortHandle,
 }
@@ -217,7 +218,6 @@ pub(crate) struct Voxhold {
     recordings_entry_focus: FocusHandle,
     recordings_close_focus: FocusHandle,
     recordings_voice_entry: bool,
-    recordings_preview_tasks: Vec<gpui::Task<()>>,
     recordings_preview_aborts: Vec<PreviewAbort>,
     /// Owner name of the active recording in the open voice channel; shared
     /// with the voice panel so the red marker and label read one snapshot.
@@ -483,7 +483,6 @@ impl Voxhold {
             recordings_entry_focus: cx.focus_handle(),
             recordings_close_focus: cx.focus_handle(),
             recordings_voice_entry: false,
-            recordings_preview_tasks: Vec::new(),
             recordings_preview_aborts: Vec::new(),
             recordings_live: std::rc::Rc::new(std::cell::RefCell::new(None)),
             voice_settings: crate::voice_settings::VoiceSettings::with_path(voice_path),

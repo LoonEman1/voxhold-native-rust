@@ -2,6 +2,7 @@
 //! previews and clipped card actions.
 
 use super::settings_tests::{make_app, wait_for};
+use super::tests::message_json;
 use super::*;
 use crate::test_support::{Gate, Reply, ReplyBody, TestServer};
 use gpui::{TestAppContext, VisualTestContext};
@@ -82,7 +83,7 @@ fn run<T>(future: impl std::future::Future<Output = T>) -> T {
         .block_on(future)
 }
 
-fn wait_arrival(visual: &mut VisualTestContext, gate: &Gate) {
+pub(super) fn wait_arrival(visual: &mut VisualTestContext, gate: &Gate) {
     for _ in 0..1000 {
         if gate.wait_arrived(Duration::ZERO) {
             return;
@@ -96,11 +97,11 @@ fn wait_arrival(visual: &mut VisualTestContext, gate: &Gate) {
     panic!("the gated request never arrived");
 }
 
-fn at(x: f32, y: f32) -> gpui::Point<gpui::Pixels> {
+pub(super) fn at(x: f32, y: f32) -> gpui::Point<gpui::Pixels> {
     gpui::point(gpui::px(x), gpui::px(y))
 }
 
-fn draw(visual: &mut VisualTestContext) {
+pub(super) fn draw(visual: &mut VisualTestContext) {
     visual.update(|window, app| {
         window.draw(app).clear();
     });
@@ -689,10 +690,112 @@ async fn recording_wheel_uses_pixels_not_double_scaled_lines(cx: &mut TestAppCon
 }
 
 #[gpui::test]
+async fn slow_recording_preview_does_not_poison_a_slot(cx: &mut TestAppContext) {
+    cx.update(|cx| gpui_component::init(cx));
+    let rows: Vec<serde_json::Value> = (0..11)
+        .map(|index| recording_without_preview(&format!("{index:032x}"), RECORDING_READY, index))
+        .map(|mut row| {
+            row["preview_version"] = serde_json::json!("etag-1234");
+            row
+        })
+        .collect();
+    let list = list_json(&rows);
+    let gate = Gate::new();
+    let jpeg_reply = || Reply {
+        status: 200,
+        body: ReplyBody::Bytes(jpeg(320, 180)),
+        content_type: "image/jpeg",
+        gate: None,
+        body_gate: None,
+        delay: None,
+    };
+    let mut replies = vec![Reply::new(200, &list)];
+    replies.push(Reply {
+        status: 200,
+        body: ReplyBody::Bytes(jpeg(320, 180)),
+        content_type: "image/jpeg",
+        gate: None,
+        body_gate: Some(gate.clone()),
+        delay: None,
+    });
+    replies.extend((0..8).map(|_| jpeg_reply()));
+    replies.extend((0..2).map(|_| Reply {
+        delay: Some(Duration::from_secs(1)),
+        ..jpeg_reply()
+    }));
+    let server = TestServer::spawn_concurrent(replies);
+    let (window, view) = make_app(cx, client(&server.base));
+    let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
+    visual.simulate_resize(gpui::size(gpui::px(390.), gpui::px(400.)));
+    gate.arm();
+    visual.update(|window, app| {
+        view.update(app, |v, cx| v.toggle_recordings("header", window, cx));
+    });
+    wait_for(&mut visual, &view, |v| !v.recordings.loading);
+    draw(&mut visual);
+    wait_arrival(&mut visual, &gate);
+
+    // The first picture is held open. Each later row is scrolled in alone, so
+    // eight more previews pass through the free slot one after another.
+    for index in 1..=8 {
+        let key = view.read_with(&*visual, |v, _| {
+            let dialog = v.recordings_dialog.as_ref().unwrap();
+            format!("{}@etag-1234", dialog.rows[index].record.id)
+        });
+        visual.update(|window, app| {
+            view.update(app, |v, _| {
+                let dialog = v.recordings_dialog.as_mut().unwrap();
+                let row = &dialog.rows[index];
+                dialog.scroll += row.card.y - dialog.list.y;
+            });
+            window.draw(app).clear();
+        });
+        visual.run_until_parked();
+        wait_for(&mut visual, &view, |v| {
+            v.recordings_dialog
+                .as_ref()
+                .is_some_and(|dialog| dialog.previews.contains(&key))
+        });
+    }
+
+    let held = view.read_with(&*visual, |v, _| {
+        let dialog = v.recordings_dialog.as_ref().unwrap();
+        format!("{}@etag-1234", dialog.rows[0].record.id)
+    });
+    gate.release();
+    wait_for(&mut visual, &view, |v| {
+        v.recordings_dialog.as_ref().is_some_and(|dialog| {
+            dialog.previews.contains(&held) && dialog.preview_pending.is_empty()
+        })
+    });
+
+    // Both slots are usable again: the next two visible rows request together.
+    visual.simulate_resize(gpui::size(gpui::px(390.), gpui::px(760.)));
+    draw(&mut visual);
+    visual.update(|window, app| {
+        view.update(app, |v, _| {
+            let dialog = v.recordings_dialog.as_mut().unwrap();
+            let row = &dialog.rows[9];
+            dialog.scroll += row.card.y - dialog.list.y;
+        });
+        window.draw(app).clear();
+    });
+    visual.run_until_parked();
+    wait_for(&mut visual, &view, |v| calls(&server, "/preview") >= 11);
+    view.read_with(&*visual, |v, _| {
+        let dialog = v.recordings_dialog.as_ref().unwrap();
+        assert_eq!(
+            dialog.preview_pending.len(),
+            2,
+            "the free slots were not filled together"
+        );
+    });
+}
+
+#[gpui::test]
 async fn recording_preview_cache_is_hidden_during_refresh_and_after_503(cx: &mut TestAppContext) {
     cx.update(|cx| gpui_component::init(cx));
     let ready = list_json(&[recording_json(ID, RECORDING_READY, 1)]);
-    let gate = Gate::new();
     let server = TestServer::spawn(vec![
         Reply::new(200, &ready),
         Reply {
@@ -703,7 +806,7 @@ async fn recording_preview_cache_is_hidden_during_refresh_and_after_503(cx: &mut
             body_gate: None,
             delay: None,
         },
-        Reply::new(503, "{\"error\":\"unavailable\"}").with_gate(gate.clone()),
+        Reply::new(503, "{\"error\":\"unavailable\"}").with_delay(Duration::from_secs(1)),
     ]);
     let (window, view) = make_app(cx, client(&server.base));
     let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
@@ -723,11 +826,9 @@ async fn recording_preview_cache_is_hidden_during_refresh_and_after_503(cx: &mut
         assert_eq!(v.recordings.sorted(1_700_000_100).len(), 1);
     });
 
-    gate.arm();
     visual.update(|window, app| {
         view.update(app, |v, cx| v.refresh_recordings(0, window, cx));
     });
-    wait_arrival(&mut visual, &gate);
     view.read_with(&*visual, |v, _| {
         assert!(!v.recordings_visible_for_preview());
         assert!(!v.recording_preview_allowed(ID, "etag-1234"));
@@ -744,7 +845,6 @@ async fn recording_preview_cache_is_hidden_during_refresh_and_after_503(cx: &mut
         1,
         "a held refresh started another preview"
     );
-    gate.release();
     wait_for(&mut visual, &view, |v| {
         !v.recordings.loading && !v.recordings.error.is_empty()
     });
@@ -847,10 +947,6 @@ async fn recording_preview_stops_when_dialog_closes(cx: &mut TestAppContext) {
     });
     view.read_with(&*visual, |v, _| {
         assert!(v.recordings_dialog.is_none());
-        assert!(
-            v.recordings_preview_tasks.is_empty(),
-            "closing did not cancel the preview task"
-        );
         assert!(
             v.recordings_preview_aborts.is_empty(),
             "closing did not abort the preview HTTP task"

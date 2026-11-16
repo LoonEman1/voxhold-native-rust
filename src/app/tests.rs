@@ -121,7 +121,7 @@ async fn loopback_advances_to_login_and_types_into_the_right_fields(cx: &mut Tes
     }
 }
 
-fn message_json(id: i64, revision: i64, content: &str) -> serde_json::Value {
+pub(super) fn message_json(id: i64, revision: i64, content: &str) -> serde_json::Value {
     message_json_with_reactions(id, revision, content, 0)
 }
 

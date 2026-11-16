@@ -2,11 +2,12 @@
 //! late picker answers and DELETE results after the modal or server changed.
 
 use super::recordings_tests::{
-    calls, client, list_json, recording_json, recording_without_preview, ID,
+    at, calls, client, draw, list_json, recording_json, recording_without_preview, wait_arrival, ID,
 };
 use super::settings_tests::{make_app, wait_for};
+use super::tests::message_json;
 use super::*;
-use crate::test_support::{Gate, Reply, TestServer};
+use crate::test_support::{Reply, TestServer};
 use gpui::{TestAppContext, VisualTestContext};
 use std::time::Duration;
 use voxhold_api::{RECORDING_DELETED, RECORDING_READY, RECORDING_STARTED};
@@ -19,10 +20,9 @@ async fn recording_overflow_unconfirms_the_snapshot_in_a_direct_chat(cx: &mut Te
     ready["preview_version"] = serde_json::Value::Null;
     live["preview_version"] = serde_json::Value::Null;
     let both = list_json(&[ready, live]);
-    let gate = Gate::new();
     let server = TestServer::spawn(vec![
         Reply::new(200, &both),
-        Reply::new(503, "{\"error\":\"unavailable\"}").with_gate(gate.clone()),
+        Reply::new(503, "{\"error\":\"unavailable\"}").with_delay(Duration::from_secs(1)),
     ]);
     let (window, view) = make_app(cx, client(&server.base));
     let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
@@ -37,7 +37,6 @@ async fn recording_overflow_unconfirms_the_snapshot_in_a_direct_chat(cx: &mut Te
     // The queue overflowed, so `channels.changed` may be gone. A personal
     // conversation must still unconfirm the server snapshot as soon as the
     // batch is processed, and the next list is held open.
-    gate.arm();
     visual.update(|window, app| {
         view.update(app, |v, cx| {
             v.conversation = Some(voxhold_api::Conversation {
@@ -69,7 +68,6 @@ async fn recording_overflow_unconfirms_the_snapshot_in_a_direct_chat(cx: &mut Te
         previews_before,
         "an unconfirmed snapshot started a preview"
     );
-    gate.release();
 
     // A 503 does not re-confirm what the access change already invalidated.
     wait_for(&mut visual, &view, |v| {
@@ -79,6 +77,56 @@ async fn recording_overflow_unconfirms_the_snapshot_in_a_direct_chat(cx: &mut Te
         assert!(v.recordings.sorted(1_700_000_100).is_empty());
         assert!(v.recordings.live(7, 1_700_000_100).is_none());
     });
+}
+
+#[gpui::test]
+async fn recording_access_error_after_a_ws_event_does_not_retry(cx: &mut TestAppContext) {
+    cx.update(|cx| gpui_component::init(cx));
+    let ready = list_json(&[
+        recording_without_preview(&"1".repeat(32), RECORDING_READY, 1),
+        recording_without_preview(&"2".repeat(32), RECORDING_STARTED, 2),
+    ]);
+    let server = TestServer::spawn(vec![
+        Reply::new(200, &ready),
+        Reply::new(404, "{\"error\":\"not found\"}").with_delay(Duration::from_millis(300)),
+    ]);
+    let (window, view) = make_app(cx, client(&server.base));
+    let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
+    visual.update(|window, app| {
+        view.update(app, |v, cx| v.toggle_recordings("header", window, cx));
+    });
+    wait_for(&mut visual, &view, |v| {
+        !v.recordings.loading && v.recordings.confirmed_epoch == Some(v.recordings.access_epoch)
+    });
+    visual.update(|window, app| {
+        view.update(app, |v, cx| v.refresh_recordings(0, window, cx));
+    });
+    visual.update(|_, app| {
+        view.update(app, |v, _| {
+            let event = recording_without_preview(&"3".repeat(32), RECORDING_READY, 3);
+            assert!(
+                v.apply_realtime_event("recording.updated", &event)
+                    .recording_event
+            );
+        });
+    });
+    wait_for(&mut visual, &view, |v| {
+        !v.recordings.loading && !v.recordings.error.is_empty()
+    });
+    view.read_with(&*visual, |v, _| {
+        assert_eq!(
+            v.recordings.confirmed_epoch, None,
+            "error={} active={:?}",
+            v.recordings.error, v.recordings.active
+        );
+        assert!(v.recordings.sorted(1_700_000_100).is_empty());
+        assert!(v.recordings.live(7, 1_700_000_100).is_none());
+    });
+    assert_eq!(
+        calls(&server, "/recordings"),
+        2,
+        "a 404 after a WS event started a retry"
+    );
 }
 
 #[gpui::test]
@@ -210,6 +258,43 @@ async fn late_recording_pick_cannot_clear_another_attempt(cx: &mut TestAppContex
         });
     });
     assert_eq!(calls(&server, "/download"), 0);
+}
+
+#[gpui::test]
+async fn recording_delete_requires_a_confirmed_snapshot(cx: &mut TestAppContext) {
+    cx.update(|cx| gpui_component::init(cx));
+    let ready = list_json(&[recording_without_preview(ID, RECORDING_READY, 1)]);
+    let server = TestServer::spawn(vec![Reply::new(200, &ready)]);
+    let (window, view) = make_app(cx, client(&server.base));
+    let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
+    visual.update(|window, app| {
+        view.update(app, |v, cx| v.toggle_recordings("header", window, cx));
+    });
+    wait_for(&mut visual, &view, |v| {
+        !v.recordings.loading && v.recordings.records.len() == 1
+    });
+    let row = view.read_with(&*visual, |v, _| v.recordings.records[0].clone());
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            // A row from an old frame is still in `records`, but the snapshot
+            // is no longer confirmed for the current access generation.
+            v.recording_access_epoch = v.recording_access_epoch.wrapping_add(1);
+            v.recordings.set_access_epoch(v.recording_access_epoch);
+            v.delete_recording(row, window, cx);
+            assert!(v
+                .recordings_dialog
+                .as_ref()
+                .is_some_and(|dialog| dialog.busy.is_empty()));
+        });
+    });
+    visual.run_until_parked();
+    assert!(
+        !server
+            .requests()
+            .iter()
+            .any(|request| request.method == "DELETE"),
+        "an unconfirmed row reached DELETE"
+    );
 }
 
 #[gpui::test]
@@ -347,5 +432,111 @@ async fn recording_delete_from_an_old_server_is_discarded(cx: &mut TestAppContex
     view.read_with(&*visual, |v, _| {
         assert!(!v.recordings.tombstones.contains(ID));
         assert!(v.recordings.records.is_empty());
+    });
+}
+
+#[gpui::test]
+async fn recording_backdrop_blocks_right_click_and_wheel_over_history(cx: &mut TestAppContext) {
+    cx.update(|cx| gpui_component::init(cx));
+    let ready = list_json(&[recording_without_preview(ID, RECORDING_READY, 1)]);
+    let server = TestServer::spawn(vec![Reply::new(200, &ready)]);
+    let (window, view) = make_app(cx, client(&server.base));
+    let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
+    visual.simulate_resize(gpui::size(gpui::px(1440.), gpui::px(900.)));
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            v.channel = 7;
+            v.messages = (0..40)
+                .map(|index| {
+                    serde_json::from_value(message_json(
+                        100 + index,
+                        1,
+                        &format!("history row {index}"),
+                    ))
+                    .unwrap()
+                })
+                .collect();
+            v.toggle_recordings("header", window, cx);
+        });
+    });
+    wait_for(&mut visual, &view, |v| !v.recordings.loading);
+    draw(&mut visual);
+    visual.update(|window, app| {
+        view.update(app, |v, _| {
+            v.history_list.scroll_to(gpui::ListOffset {
+                item_ix: 5,
+                offset_in_item: gpui::px(0.),
+            });
+        });
+        window.draw(app).clear();
+    });
+    visual.run_until_parked();
+    let (point, before) = view.read_with(&*visual, |v, _| {
+        let dialog = v.recordings_dialog.as_ref().unwrap();
+        let row = v.history_list.bounds_for_item(5).expect("history row");
+        let x = if f32::from(row.left()) < dialog.bounds.x {
+            f32::from(row.left()) + 10.
+        } else {
+            f32::from(row.right()) - 10.
+        };
+        let y = f32::from(row.center().y);
+        assert!(
+            !dialog.bounds.contains((x, y)),
+            "the history point must be outside the modal card"
+        );
+        let top = v.history_list.logical_scroll_top();
+        (at(x, y), (top.item_ix, f32::from(top.offset_in_item)))
+    });
+    visual.simulate_mouse_down(point, MouseButton::Right, Default::default());
+    visual.simulate_mouse_up(point, MouseButton::Right, Default::default());
+    view.read_with(&*visual, |v, _| {
+        assert!(v.message_menu.is_none(), "the background menu opened");
+        assert!(
+            v.recordings_dialog.is_some(),
+            "the modal closed on right click"
+        );
+    });
+    visual.simulate_event(gpui::ScrollWheelEvent {
+        position: point,
+        delta: gpui::ScrollDelta::Pixels(gpui::point(gpui::px(0.), gpui::px(-120.))),
+        ..Default::default()
+    });
+    view.read_with(&*visual, |v, _| {
+        let top = v.history_list.logical_scroll_top();
+        assert_eq!(
+            (top.item_ix, f32::from(top.offset_in_item)),
+            before,
+            "the background history scrolled through the modal backdrop"
+        );
+    });
+}
+
+#[cfg(feature = "voxhold-media")]
+#[gpui::test]
+async fn recording_voice_close_falls_back_when_the_call_panel_is_hidden(cx: &mut TestAppContext) {
+    cx.update(|cx| gpui_component::init(cx));
+    let server = TestServer::spawn(Vec::new());
+    let (window, view) = make_app(cx, client(&server.base));
+    let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            v.voice_channel = 7;
+            v.channel = 7;
+            v.access_pending = false;
+            assert!(v.recordings_voice_panel_visible());
+            v.access_pending = true;
+            assert!(
+                !v.recordings_voice_panel_visible(),
+                "a hidden call panel must not receive focus"
+            );
+            v.recordings_dialog = Some(crate::recordings_dialog::DialogState::new(
+                1,
+                1,
+                v.recording_access_epoch,
+            ));
+            v.recordings_voice_entry = true;
+            v.close_recordings(true, window, cx);
+            assert!(v.recordings_entry_focus.is_focused(window));
+        });
     });
 }

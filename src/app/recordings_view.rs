@@ -375,32 +375,45 @@ impl Voxhold {
                 .id("recordings-backdrop")
                 .absolute()
                 .size_full()
+                .occlude()
                 .bg(gpui::rgba(0x000000ad))
                 .on_mouse_down(
                     MouseButton::Left,
-                    cx.listener(|s, event: &gpui::MouseDownEvent, window, cx| {
+                    cx.listener(|s, event: &gpui::MouseDownEvent, _window, cx| {
                         let inside = s.recordings_dialog.as_ref().is_some_and(|dialog| {
                             dialog
                                 .bounds
                                 .contains((event.position.x.into(), event.position.y.into()))
                         });
-                        if !inside {
-                            s.close_recordings(true, window, cx);
+                        if let Some(dialog) = s.recordings_dialog.as_mut() {
+                            dialog.backdrop_pressed = !inside;
                         }
                         // The backdrop is a full input barrier: the search and
                         // every other control below the modal never see this
                         // press, even when the click lands outside the card.
                         cx.stop_propagation();
+                        cx.notify();
                     }),
                 )
                 .on_mouse_up(
                     MouseButton::Left,
-                    cx.listener(|s, _event: &gpui::MouseUpEvent, _window, cx| {
-                        // Any release that did not activate a card action
-                        // clears the press, including a release outside the
-                        // button or in the clipped part of the list.
-                        if let Some(dialog) = s.recordings_dialog.as_mut() {
+                    cx.listener(|s, event: &gpui::MouseUpEvent, window, cx| {
+                        let inside = s.recordings_dialog.as_ref().is_some_and(|dialog| {
+                            dialog
+                                .bounds
+                                .contains((event.position.x.into(), event.position.y.into()))
+                        });
+                        let completed = s.recordings_dialog.as_mut().is_some_and(|dialog| {
+                            let completed = dialog.backdrop_pressed && !inside;
+                            dialog.backdrop_pressed = false;
+                            // Any release that did not activate a card action
+                            // clears the press, including a release outside the
+                            // button or in the clipped part of the list.
                             dialog.pressed = None;
+                            completed
+                        });
+                        if completed {
+                            s.close_recordings(true, window, cx);
                         }
                         cx.stop_propagation();
                         cx.notify();
@@ -949,18 +962,23 @@ impl Voxhold {
                     .await
             });
             self.recordings_preview_aborts.retain(|request| {
-                !(request.key == key && request.generation == preview_generation)
+                !(request.key == key
+                    && request.dialog == generation
+                    && request.generation == preview_generation)
             });
             self.recordings_preview_aborts.push(super::PreviewAbort {
                 key: key.clone(),
+                dialog: generation,
                 generation: preview_generation,
                 abort: handle.abort_handle(),
             });
-            let task = cx.spawn_in(window, async move |this, window| {
+            cx.spawn_in(window, async move |this, window| {
                 let result = handle.await;
                 let _ = this.update_in(window, |s, window, cx| {
                     s.recordings_preview_aborts.retain(|request| {
-                        !(request.key == key && request.generation == preview_generation)
+                        !(request.key == key
+                            && request.dialog == generation
+                            && request.generation == preview_generation)
                     });
                     s.finish_recording_preview(
                         key,
@@ -974,11 +992,8 @@ impl Voxhold {
                         cx,
                     );
                 });
-            });
-            self.recordings_preview_tasks.push(task);
-            if self.recordings_preview_tasks.len() > 8 {
-                let _ = self.recordings_preview_tasks.remove(0);
-            }
+            })
+            .detach();
         }
     }
 

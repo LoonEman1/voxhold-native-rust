@@ -134,7 +134,6 @@ impl Voxhold {
             return;
         };
         dialog.generation = dialog.generation.wrapping_add(1);
-        self.recordings_preview_tasks.clear();
         self.abort_recording_previews();
         for image in dialog.renew_preview_scope() {
             let _ = window.drop_image(image);
@@ -142,12 +141,16 @@ impl Voxhold {
         if restore_focus {
             #[cfg(feature = "voxhold-media")]
             if self.recordings_voice_entry {
-                let voice_focus = self.voice.as_ref().and_then(|voice| {
-                    let voice = voice.read(cx);
-                    voice
-                        .recordings_button_mounted()
-                        .then(|| voice.recordings_focus())
-                });
+                let voice_focus = if self.recordings_voice_panel_visible() {
+                    self.voice.as_ref().and_then(|voice| {
+                        let voice = voice.read(cx);
+                        voice
+                            .recordings_button_mounted()
+                            .then(|| voice.recordings_focus())
+                    })
+                } else {
+                    None
+                };
                 self.recordings_return_focus =
                     Some(voice_focus.unwrap_or_else(|| self.recordings_entry_focus.clone()));
             }
@@ -205,7 +208,6 @@ impl Voxhold {
             dialog.pressed = None;
             dialog.renew_preview_scope()
         };
-        self.recordings_preview_tasks.clear();
         self.abort_recording_previews();
         for image in images {
             let _ = window.drop_image(image);
@@ -216,6 +218,12 @@ impl Voxhold {
         for request in self.recordings_preview_aborts.drain(..) {
             request.abort.abort();
         }
+    }
+
+    /// The call panel and its "Записи" button share this visibility rule.
+    #[cfg(feature = "voxhold-media")]
+    pub(super) fn recordings_voice_panel_visible(&self) -> bool {
+        !self.access_pending && self.channel == self.voice_channel && self.voice_channel != 0
     }
 
     /// Keep the keyboard ring inside the dialog when the focused action was
@@ -325,6 +333,12 @@ impl Voxhold {
         }
         let server = dialog.server_id;
         if server != self.server
+            || self.recordings.confirmed_epoch != Some(self.recording_access_epoch)
+            || !self
+                .recordings
+                .sorted(now)
+                .iter()
+                .any(|row| row.id == record.id)
             || !self
                 .recordings
                 .owns(&record, self.self_user_id, &self.auth.username)

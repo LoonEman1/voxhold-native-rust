@@ -128,47 +128,44 @@ impl RecordingsState {
             self.loading = false;
             return ListOutcome::Retry;
         }
+        self.active = None;
+        self.loading = false;
+        // An access answer is authoritative even when a live event raced it.
+        // Retrying would keep the old rows and live marker visible after 403/404.
+        if let Err(error) = result {
+            self.error = crate::draft::describe_error(&error);
+            if matches!(error.status(), Some(403 | 404)) {
+                // An access answer revokes the confirmation itself. A late
+                // `recording.updated` must not refill the visible snapshot
+                // without a successful GET in this generation. Tombstones
+                // stay until the whole server model is reset.
+                self.confirmed_epoch = None;
+                self.records.clear();
+                self.touched.clear();
+            }
+            return ListOutcome::Applied;
+        }
         if request.event_seq != self.event_seq {
             if request.attempt < RETRY_BUDGET {
-                self.active = None;
-                self.loading = false;
                 return ListOutcome::Retry;
             }
             // The retry budget is spent: merge what the events already applied
             // instead of rolling the rows back to the older HTTP snapshot.
         }
-        self.active = None;
-        self.loading = false;
-        match result {
-            Ok(list) => {
-                self.error.clear();
-                if list.quota_bytes > 0 {
-                    self.quota_bytes = list.quota_bytes;
-                }
-                if list.max_file_bytes > 0 {
-                    self.max_file_bytes = list.max_file_bytes;
-                }
-                if list.retention_seconds > 0 {
-                    self.retention_seconds = list.retention_seconds;
-                }
-                self.apply_rows(list.recordings, request.event_seq, now);
-                self.confirmed_epoch = Some(request.epoch);
-                ListOutcome::Applied
-            }
-            Err(error) => {
-                self.error = crate::draft::describe_error(&error);
-                if matches!(error.status(), Some(403 | 404)) {
-                    // An access answer revokes the confirmation itself. A late
-                    // `recording.updated` must not refill the visible snapshot
-                    // without a successful GET in this generation. Tombstones
-                    // stay until the whole server model is reset.
-                    self.confirmed_epoch = None;
-                    self.records.clear();
-                    self.touched.clear();
-                }
-                ListOutcome::Applied
-            }
+        let list = result.expect("the error branch returned above");
+        self.error.clear();
+        if list.quota_bytes > 0 {
+            self.quota_bytes = list.quota_bytes;
         }
+        if list.max_file_bytes > 0 {
+            self.max_file_bytes = list.max_file_bytes;
+        }
+        if list.retention_seconds > 0 {
+            self.retention_seconds = list.retention_seconds;
+        }
+        self.apply_rows(list.recordings, request.event_seq, now);
+        self.confirmed_epoch = Some(request.epoch);
+        ListOutcome::Applied
     }
 
     fn apply_rows(&mut self, records: Vec<Recording>, since: u64, now: i64) {
@@ -714,6 +711,34 @@ mod tests {
         assert!(dialog.scroll_to.is_none());
         assert!(dialog.action_visible(&key));
         assert!(dialog.activate_key(&key));
+    }
+
+    #[test]
+    fn access_error_after_a_live_event_still_unconfirms_immediately() {
+        for status in [403, 404] {
+            let mut state = ready_state();
+            let deleted = "a".repeat(32);
+            state.apply_event(record(&deleted, RECORDING_DELETED, 9), 1_700_000_100);
+            let request = state.begin_refresh(1, 5, 1);
+            // The WS event is newer than the request; an HTTP access error must
+            // still be applied instead of asking for another GET first.
+            state.apply_event(record(&"b".repeat(32), RECORDING_READY, 10), 1_700_000_100);
+            let outcome = state.apply_list(
+                Err(voxhold_api::Error::Http(status)),
+                request,
+                5,
+                1_700_000_100,
+            );
+            assert_eq!(outcome, ListOutcome::Applied, "status {status}");
+            assert_eq!(state.confirmed_epoch, None);
+            assert!(state.active.is_none(), "an access error started a retry");
+            assert!(state.sorted(1_700_000_100).is_empty());
+            assert!(state.live(7, 1_700_000_100).is_none());
+            assert!(
+                state.tombstones.contains(&deleted),
+                "the tombstone was lost after {status}"
+            );
+        }
     }
 
     #[test]

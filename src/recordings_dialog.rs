@@ -221,6 +221,8 @@ pub struct DialogState {
     pub pressed: Option<String>,
     /// The card action that currently owns the keyboard focus.
     pub focused_key: Option<String>,
+    /// A left press started on the backdrop and has not been released yet.
+    pub backdrop_pressed: bool,
     /// A one-shot focus move for the next rendered action ring. The handle is
     /// created during render, so an action handler cannot focus it directly.
     pub focus_request: Option<String>,
@@ -258,6 +260,7 @@ impl DialogState {
             scroll_to: None,
             pressed: None,
             focused_key: None,
+            backdrop_pressed: false,
             focus_request: None,
             previews: ImageCache::new(PREVIEW_BUDGET),
             preview_pending: HashSet::new(),

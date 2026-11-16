@@ -538,7 +538,7 @@ impl Render for Voxhold {
             );
         }
         #[cfg(feature = "voxhold-media")]
-        if !self.access_pending && self.channel == self.voice_channel && self.voice_channel != 0 {
+        if self.recordings_voice_panel_visible() {
             if let Some(voice) = &self.voice {
                 chat = chat.child(div().h(px(400.)).child(voice.clone()));
             }

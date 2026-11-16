@@ -351,10 +351,10 @@ async fn closed_dm_search_refreshes_on_the_next_open(cx: &mut TestAppContext) {
     });
 }
 
-/// A `/channels` answer started before `channels.changed` may not confirm the
-/// new snapshot even when it is the first to arrive.
+/// A `/channels` answer started by the `403` recheck before `channels.changed`
+/// may not confirm the new snapshot even when it is the first to arrive.
 #[gpui::test]
-async fn dm_old_channel_snapshot_cannot_restore_search(cx: &mut TestAppContext) {
+async fn dm_403_recheck_cannot_restore_search_after_access_event(cx: &mut TestAppContext) {
     cx.update(|cx| gpui_component::init(cx));
     let (window, view) = add_auth_window(cx);
     let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
@@ -408,13 +408,18 @@ async fn dm_old_channel_snapshot_cannot_restore_search(cx: &mut TestAppContext) 
             panel.update(cx, |panel, cx| {
                 panel.set_allowed_channels(HashSet::from([7]), cx)
             });
-            v.refresh_search_permissions(window, cx);
+            // The reaction `403` starts this request and owns the separate
+            // `channel_snapshot_request` slot.
+            v.recheck_channel_snapshot_no_window(cx);
         });
         panel.update(app, |panel, cx| panel.open(1, 5, search::Mode::Search, cx));
         *captured.borrow_mut() = Some(panel);
     });
     let panel = panel_slot.borrow().clone().expect("search panel");
     assert!(gate_old.wait_arrived(Duration::from_secs(3)));
+    view.read_with(&*visual, |v, _| {
+        assert!(v.channel_snapshot_request.is_some());
+    });
 
     queue_event(
         &mut visual,
@@ -423,6 +428,14 @@ async fn dm_old_channel_snapshot_cannot_restore_search(cx: &mut TestAppContext) 
         serde_json::json!({"server_id": 1}),
     );
     assert!(gate_new.wait_arrived(Duration::from_secs(3)));
+    view.read_with(&*visual, |v, _| {
+        assert!(
+            v.channel_snapshot_request.is_none(),
+            "the access event released the old recheck slot"
+        );
+        assert!(v.search_permissions_request.is_some());
+        assert!(!v.search_permissions_ready);
+    });
     gate_old.release();
     visual.run_until_parked();
     panel.read_with(&*visual, |panel, _| {
@@ -459,6 +472,19 @@ async fn selecting_a_channel_loads_pins_before_the_popup_opens(cx: &mut TestAppC
     let (window, view) = add_auth_window(cx);
     let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
     let pins = serde_json::json!([{
+        // One array element is both a Channel and a PinnedMessage. The
+        // concurrent server can then answer the channel-snapshot and pin
+        // requests in either order; history arrays simply fail to parse.
+        "id": 8,
+        "name": "kept",
+        "kind": "text",
+        "position": 0,
+        "permissions": 3,
+        "access_restricted": false,
+        "e2ee_required": false,
+        "comments_enabled": false,
+        "can_publish": false,
+        "unread_count": 0,
         "message": {
             "id": 42,
             "channel_id": 8,
@@ -478,9 +504,12 @@ async fn selecting_a_channel_loads_pins_before_the_popup_opens(cx: &mut TestAppC
         "pinned_at": 1
     }])
     .to_string();
-    // History and pins may reach the concurrent server in either order; every
-    // queued answer is a valid pin page, so the pin request always succeeds.
+    // Every queued answer is valid for both `/channels` and `/pins`.
     let server = TestServer::spawn_concurrent(vec![
+        Reply::new(200, &pins),
+        Reply::new(200, &pins),
+        Reply::new(200, &pins),
+        Reply::new(200, &pins),
         Reply::new(200, &pins),
         Reply::new(200, &pins),
         Reply::new(200, &pins),
@@ -514,6 +543,8 @@ async fn selecting_a_channel_loads_pins_before_the_popup_opens(cx: &mut TestAppC
             panel.update(cx, |panel, cx| {
                 panel.set_allowed_channels(HashSet::from([7, 8]), cx)
             });
+            // The real DM -> channel path leaves the snapshot unconfirmed.
+            v.select_conversation(conversation(5), window, cx);
             v.select_channel(8, window, cx);
         });
     });
@@ -529,13 +560,18 @@ async fn selecting_a_channel_loads_pins_before_the_popup_opens(cx: &mut TestAppC
         assert!(actions.contains(&Action::Unpin));
         assert_eq!(Action::Unpin.label(), "Открепить");
     });
+    let requests = server.requests();
     assert!(
-        server
-            .requests()
+        requests
+            .iter()
+            .any(|request| request.path == "/api/v1/servers/1/channels"),
+        "the unconfirmed snapshot was re-read: {requests:?}"
+    );
+    assert!(
+        requests
             .iter()
             .any(|request| request.path.contains("/channels/8/pins")),
-        "the selected channel requested its pins: {:?}",
-        server.requests()
+        "the selected channel requested its pins: {requests:?}"
     );
 }
 

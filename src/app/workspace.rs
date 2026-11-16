@@ -340,7 +340,14 @@ impl Voxhold {
         self.load_channel_members(cx);
         if has_history {
             self.refresh_history(window, cx);
-            self.refresh_pins(cx);
+            if self.search_permissions_ready {
+                self.refresh_pins(cx);
+            } else if self.search.is_some() {
+                // Returning from a personal conversation lost the confirmed
+                // snapshot. Read it now; its callback installs the panel
+                // permissions and then refreshes the pins.
+                self.refresh_search_permissions(window, cx);
+            }
         }
         cx.notify();
     }

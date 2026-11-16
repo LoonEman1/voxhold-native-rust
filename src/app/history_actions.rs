@@ -797,10 +797,12 @@ impl Voxhold {
         self.sync_search_permissions(cx);
         let (server, generation, access) = (self.server, self.generation, self.access_generation);
         let runtime = self.runtime.clone();
+        let task = runtime.spawn(async move { client.channels(server).await });
         cx.spawn(async move |this, cx| {
-            let task =
-                cx.background_spawn(async move { runtime.block_on(client.channels(server)) });
-            let result = task.await;
+            let result = match task.await {
+                Ok(result) => result,
+                Err(_) => Err(voxhold_api::Error::Network),
+            };
             if let Some(this) = this.upgrade() {
                 this.update(cx, |s, cx| {
                     // Only the request that still owns the slot may confirm

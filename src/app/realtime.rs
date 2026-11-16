@@ -123,6 +123,11 @@ impl Voxhold {
                         // have changed. Drop the confirmed search snapshot and
                         // every answer started under it before asking again.
                         if s.in_conversation() {
+                            // The `403` recheck owns a separate slot and can
+                            // still return the old channel list. Release it
+                            // together with the search snapshot so its late
+                            // callback fails the owner check.
+                            s.channel_snapshot_request = None;
                             s.search_permissions_request = None;
                             s.search_permissions_ready = false;
                             s.sync_search_permissions(cx);

@@ -65,6 +65,15 @@ struct PendingSend {
     abort: tokio::task::AbortHandle,
 }
 
+/// One runtime preview request. The generation is the dialog preview scope; an
+/// answer from a previous scope may not clear or replace the next request's
+/// pending entry.
+struct PreviewAbort {
+    key: String,
+    generation: u64,
+    abort: tokio::task::AbortHandle,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct ScrollbarDrag {
     /// Window-space top of the scrollbar track.
@@ -197,12 +206,17 @@ pub(crate) struct Voxhold {
     /// Server recordings snapshot and the one open dialog.
     recordings: recordings::RecordingsState,
     recording_access_epoch: u64,
+    /// Monotonic id of one open recordings modal. It stays stable until close.
+    recordings_dialog_seq: u64,
+    /// Monotonic attempt id for download/delete operations.
+    recordings_op_seq: u64,
     recordings_dialog: Option<recordings_dialog::DialogState>,
     recordings_return_focus: Option<FocusHandle>,
     recordings_entry_focus: FocusHandle,
     recordings_close_focus: FocusHandle,
     recordings_voice_entry: bool,
     recordings_preview_tasks: Vec<gpui::Task<()>>,
+    recordings_preview_aborts: Vec<PreviewAbort>,
     /// Owner name of the active recording in the open voice channel; shared
     /// with the voice panel so the red marker and label read one snapshot.
     recordings_live: std::rc::Rc<std::cell::RefCell<Option<String>>>,
@@ -460,12 +474,15 @@ impl Voxhold {
             channel_notifications: None,
             recordings: recordings::RecordingsState::default(),
             recording_access_epoch: 0,
+            recordings_dialog_seq: 0,
+            recordings_op_seq: 0,
             recordings_dialog: None,
             recordings_return_focus: None,
             recordings_entry_focus: cx.focus_handle(),
             recordings_close_focus: cx.focus_handle(),
             recordings_voice_entry: false,
             recordings_preview_tasks: Vec::new(),
+            recordings_preview_aborts: Vec::new(),
             recordings_live: std::rc::Rc::new(std::cell::RefCell::new(None)),
             voice_settings: crate::voice_settings::VoiceSettings::with_path(voice_path),
             notifications: crate::notifications::NotificationCenter::with_path(notification_path),

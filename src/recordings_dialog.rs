@@ -212,10 +212,15 @@ pub struct DialogState {
     pub rows: Vec<RowView>,
     pub confirm: String,
     pub busy: String,
+    /// Attempt that owns `busy`; a late answer from an older attempt may not
+    /// clear or replace it.
+    pub busy_attempt: u64,
     pub error: String,
     /// A focus change asks for exactly one layout scroll.
     pub scroll_to: Option<String>,
     pub pressed: Option<String>,
+    /// The card action that currently owns the keyboard focus.
+    pub focused_key: Option<String>,
     pub previews: ImageCache<String>,
     pub preview_pending: HashSet<String>,
     pub preview_retry: HashMap<String, Instant>,
@@ -245,9 +250,11 @@ impl DialogState {
             rows: Vec::new(),
             confirm: String::new(),
             busy: String::new(),
+            busy_attempt: 0,
             error: String::new(),
             scroll_to: None,
             pressed: None,
+            focused_key: None,
             previews: ImageCache::new(PREVIEW_BUDGET),
             preview_pending: HashSet::new(),
             preview_retry: HashMap::new(),
@@ -256,9 +263,9 @@ impl DialogState {
     }
 
     /// Invalidate every preview task and cached picture of the previous access
-    /// generation or dialog instance.
+    /// generation. The modal id stays stable until the dialog closes; only the
+    /// preview scope moves on.
     pub fn renew_preview_scope(&mut self) -> Vec<std::sync::Arc<RenderImage>> {
-        self.generation = self.generation.wrapping_add(1);
         self.preview_generation = self.preview_generation.wrapping_add(1);
         self.preview_pending.clear();
         self.preview_retry.clear();

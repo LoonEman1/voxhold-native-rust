@@ -330,7 +330,6 @@ impl Voxhold {
             },
         ));
 
-        let _ = confirm;
         Some(
             div()
                 .id("recordings-backdrop")

@@ -161,10 +161,7 @@ impl Voxhold {
         {
             self.voice_channel = 0;
         }
-        self.recordings_preview_tasks.clear();
-        self.recordings_dialog = None;
-        self.recordings_return_focus = None;
-        self.recordings_voice_entry = false;
+        self.close_recordings(false, window, cx);
         self.recording_access_epoch = self.recording_access_epoch.wrapping_add(1);
         self.recordings.reset();
         self.recordings

@@ -59,8 +59,10 @@ pub struct RecordingsState {
     pub loaded: bool,
     /// The access generation currently on screen.
     pub access_epoch: u64,
-    /// The generation whose authoritative list is on screen.
-    pub confirmed_epoch: u64,
+    /// The generation whose authoritative list is on screen. `None` means the
+    /// current access has not been confirmed by a successful list yet, so live
+    /// events must not make a visible snapshot out of unverified rows.
+    pub confirmed_epoch: Option<u64>,
     pub event_seq: u64,
     pub touched: HashMap<String, u64>,
     pub tombstones: HashSet<String>,
@@ -79,7 +81,7 @@ impl RecordingsState {
         self.error.clear();
         self.loaded = false;
         self.access_epoch = 0;
-        self.confirmed_epoch = 0;
+        self.confirmed_epoch = None;
         self.event_seq = self.event_seq.wrapping_add(1);
         self.touched.clear();
         self.tombstones.clear();
@@ -150,14 +152,18 @@ impl RecordingsState {
                     self.retention_seconds = list.retention_seconds;
                 }
                 self.apply_rows(list.recordings, request.event_seq, now);
-                self.confirmed_epoch = request.epoch;
+                self.confirmed_epoch = Some(request.epoch);
                 ListOutcome::Applied
             }
             Err(error) => {
                 self.error = crate::draft::describe_error(&error);
                 if matches!(error.status(), Some(403 | 404)) {
+                    // An access answer revokes the confirmation itself. A late
+                    // `recording.updated` must not refill the visible snapshot
+                    // without a successful GET in this generation. Tombstones
+                    // stay until the whole server model is reset.
+                    self.confirmed_epoch = None;
                     self.records.clear();
-                    self.tombstones.clear();
                     self.touched.clear();
                 }
                 ListOutcome::Applied
@@ -245,7 +251,7 @@ impl RecordingsState {
     /// Live rows first, then newest `created_at`, then id descending — the
     /// server's order recomputed after events.
     pub fn sorted(&self, now: i64) -> Vec<Recording> {
-        if self.confirmed_epoch != self.access_epoch {
+        if self.confirmed_epoch != Some(self.access_epoch) {
             return Vec::new();
         }
         let mut rows: Vec<Recording> = self
@@ -267,7 +273,7 @@ impl RecordingsState {
     }
 
     pub fn live(&self, channel_id: i64, now: i64) -> Option<Recording> {
-        if channel_id == 0 || self.confirmed_epoch != self.access_epoch {
+        if channel_id == 0 || self.confirmed_epoch != Some(self.access_epoch) {
             return None;
         }
         self.records
@@ -545,6 +551,72 @@ mod tests {
     }
 
     #[test]
+    fn access_error_unconfirms_the_snapshot_and_keeps_tombstones() {
+        let mut state = ready_state();
+        let deleted = "a".repeat(32);
+        state.apply_event(record(&deleted, RECORDING_DELETED, 9), 1_700_000_100);
+        assert!(state.tombstones.contains(&deleted));
+
+        let request = state.begin_refresh(1, 5, 0);
+        state.apply_list(
+            Err(voxhold_api::Error::Http(404)),
+            request,
+            5,
+            1_700_000_100,
+        );
+        assert_eq!(state.confirmed_epoch, None);
+        assert!(state.records.is_empty());
+        assert_eq!(state.sorted(1_700_000_100).len(), 0);
+        assert!(state.live(7, 1_700_000_100).is_none());
+        assert!(
+            state.tombstones.contains(&deleted),
+            "an access error must not let a late list resurrect the row"
+        );
+
+        // A late live event cannot refill the unconfirmed snapshot.
+        assert!(state.apply_event(
+            record(&"b".repeat(32), RECORDING_READY, 10),
+            1_700_000_100
+        ));
+        assert!(state.sorted(1_700_000_100).is_empty());
+
+        let request = state.begin_refresh(1, 5, 1);
+        state.apply_list(
+            Ok(RecordingList {
+                recordings: vec![
+                    record(&deleted, RECORDING_READY, 11),
+                    record(&"b".repeat(32), RECORDING_READY, 10),
+                ],
+                ..RecordingList::default()
+            }),
+            request,
+            5,
+            1_700_000_100,
+        );
+        let ids: Vec<String> = state
+            .sorted(1_700_000_100)
+            .into_iter()
+            .map(|row| row.id)
+            .collect();
+        assert_eq!(ids, vec!["b".repeat(32)]);
+    }
+
+    #[test]
+    fn a_failed_manual_refresh_keeps_a_confirmed_snapshot_visible() {
+        let mut state = ready_state();
+        let request = state.begin_refresh(1, 5, 1);
+        state.apply_list(
+            Err(voxhold_api::Error::Http(503)),
+            request,
+            5,
+            1_700_000_100,
+        );
+        assert_eq!(state.confirmed_epoch, Some(5));
+        assert_eq!(state.sorted(1_700_000_100).len(), 2);
+        assert!(state.live(7, 1_700_000_100).is_some());
+    }
+
+    #[test]
     fn tombstone_is_final_and_expiry_filters_rows() {
         let mut state = ready_state();
         let id = "a".repeat(32);
@@ -692,7 +764,7 @@ mod tests {
             ..RecordingsState::default()
         };
         state.access_epoch = 1;
-        state.confirmed_epoch = 1;
+        state.confirmed_epoch = Some(1);
         assert_eq!(size(6 << 30), "6.0 ГБ");
         assert_eq!(size(1536 << 20), "1.5 ГБ");
         assert_eq!(duration(61_500), "1:01");

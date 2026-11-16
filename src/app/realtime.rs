@@ -76,118 +76,129 @@ impl Voxhold {
                 if s.realtime_generation != generation || s.events.is_none() {
                     return;
                 }
-                let events: Vec<_> = s
-                    .events
-                    .as_ref()
-                    .unwrap()
-                    .lock()
-                    .unwrap()
-                    .try_iter()
-                    .collect();
-                let changed = !events.is_empty();
-                let mut resync = s
-                    .events_overflow
-                    .swap(false, std::sync::atomic::Ordering::Relaxed);
-                let mut access = resync && s.channel != 0;
-                let mut server_removed = false;
-                let mut removed_attachments = Vec::new();
-                let mut restart_history = false;
-                let mut recents = false;
-                let mut pins = false;
-                let mut conversation_reactions = Vec::new();
-                let mut recording_access = false;
-                let mut recording_event = false;
-                for event in &events {
-                    s.forward_thread_event(event, window, cx);
-                    s.deliver_notification(event, window);
-                    let effect = s.apply_realtime_event(&event.kind, &event.data);
-                    resync |= effect.resync;
-                    access |= effect.access;
-                    server_removed |= effect.server_removed;
-                    restart_history |= effect.restart_history;
-                    recents |= effect.recents;
-                    pins |= effect.pins;
-                    recording_access |= effect.recording_access;
-                    recording_event |= effect.recording_event;
-                    conversation_reactions.extend(effect.conversation_reactions);
-                    removed_attachments.extend(effect.attachments);
-                }
-                if recording_access {
-                    s.invalidate_recordings(window, cx);
-                }
-                if recents {
-                    s.refresh_recents(cx);
-                }
-                if pins {
-                    s.refresh_pins(cx);
-                }
-                for (conversation, message) in conversation_reactions {
-                    s.refresh_conversation_reaction(conversation, message, cx);
-                }
-                if !removed_attachments.is_empty() {
-                    restart_history |= s.purge_attachments(&removed_attachments, window, cx);
-                }
-                if server_removed {
-                    s.remove_current_server(window, cx);
-                } else {
-                    if access {
-                        // A personal conversation keeps its history, composer
-                        // and selection, but the server channel ACL may still
-                        // have changed. Drop the confirmed search snapshot and
-                        // every answer started under it before asking again.
-                        if s.in_conversation() {
-                            // The `403` recheck owns a separate slot and can
-                            // still return the old channel list. Release it
-                            // together with the search snapshot so its late
-                            // callback fails the owner check.
-                            s.channel_snapshot_request = None;
-                            s.search_permissions_request = None;
-                            s.search_permissions_ready = false;
-                            s.sync_search_permissions(cx);
-                            if s.show_search {
-                                s.refresh_search_permissions(window, cx);
-                            }
-                        } else if s.access_reload_in_flight {
-                            // Access changed: hide confirmed data first, then
-                            // take a new authoritative channel snapshot and
-                            // history.
-                            s.access_refresh_again = true;
-                        } else {
-                            s.invalidate_access(window, cx);
-                        }
-                    }
-                    // A reconnect or resync of an open personal conversation
-                    // must not be swallowed by a server-channel access event.
-                    if (resync || restart_history)
-                        && !s.access_pending
-                        && !s.access_reload_in_flight
-                    {
-                        // A cancelled initial load would leave the chat empty,
-                        // so restart exactly one refresh after the batch.
-                        s.refresh_history(window, cx);
-                    }
-                }
-                if changed {
-                    s.sync_open_views(cx);
-                    // Deleting (or dropping from the window) the viewed message
-                    // closes the viewer before a late content answer arrives.
-                    let stale_viewer = s.media.viewer.as_ref().is_some_and(|viewer| {
-                        s.deleted_ids.contains(&viewer.key.message_id)
-                            || !s.messages.iter().any(|row| row.id == viewer.key.message_id)
-                    });
-                    if stale_viewer {
-                        s.close_viewer(window);
-                    }
-                }
-                if changed || resync || access || recording_event {
-                    cx.notify();
-                }
+                s.process_realtime_batch(window, cx);
                 if s.realtime_generation == generation && s.events.is_some() {
                     s.schedule_events(generation, window, cx);
                 }
             });
         })
         .detach();
+    }
+
+    /// Drain and apply one batch of queued events. The overflow flag is folded
+    /// into the batch so a dropped `channels.changed` or credential event still
+    /// unconfirms the recordings snapshot even when no event remains.
+    pub(super) fn process_realtime_batch(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let events: Vec<_> = self
+            .events
+            .as_ref()
+            .map(|events| events.lock().unwrap().try_iter().collect())
+            .unwrap_or_default();
+        let changed = !events.is_empty();
+        // A full queue may have dropped `channels.changed` or a credential
+        // revocation, so the overflow itself must unconfirm the recordings
+        // snapshot even when the batch is empty or the open chat is a personal
+        // conversation.
+        let overflow = self
+            .events_overflow
+            .swap(false, std::sync::atomic::Ordering::Relaxed);
+        let mut resync = overflow;
+        let mut access = overflow && self.channel != 0;
+        let mut server_removed = false;
+        let mut removed_attachments = Vec::new();
+        let mut restart_history = false;
+        let mut recents = false;
+        let mut pins = false;
+        let mut conversation_reactions = Vec::new();
+        let mut recording_access = overflow;
+        let mut recording_event = false;
+        for event in &events {
+            self.forward_thread_event(event, window, cx);
+            self.deliver_notification(event, window);
+            let effect = self.apply_realtime_event(&event.kind, &event.data);
+            resync |= effect.resync;
+            access |= effect.access;
+            server_removed |= effect.server_removed;
+            restart_history |= effect.restart_history;
+            recents |= effect.recents;
+            pins |= effect.pins;
+            recording_access |= effect.recording_access;
+            recording_event |= effect.recording_event;
+            conversation_reactions.extend(effect.conversation_reactions);
+            removed_attachments.extend(effect.attachments);
+        }
+        if recording_access && !server_removed {
+            self.invalidate_recordings(window, cx);
+        }
+        if recents {
+            self.refresh_recents(cx);
+        }
+        if pins {
+            self.refresh_pins(cx);
+        }
+        for (conversation, message) in conversation_reactions {
+            self.refresh_conversation_reaction(conversation, message, cx);
+        }
+        if !removed_attachments.is_empty() {
+            restart_history |= self.purge_attachments(&removed_attachments, window, cx);
+        }
+        if server_removed {
+            self.remove_current_server(window, cx);
+        } else {
+            if access {
+                // A personal conversation keeps its history, composer
+                // and selection, but the server channel ACL may still
+                // have changed. Drop the confirmed search snapshot and
+                // every answer started under it before asking again.
+                if self.in_conversation() {
+                    // The `403` recheck owns a separate slot and can
+                    // still return the old channel list. Release it
+                    // together with the search snapshot so its late
+                    // callback fails the owner check.
+                    self.channel_snapshot_request = None;
+                    self.search_permissions_request = None;
+                    self.search_permissions_ready = false;
+                    self.sync_search_permissions(cx);
+                    if self.show_search {
+                        self.refresh_search_permissions(window, cx);
+                    }
+                } else if self.access_reload_in_flight {
+                    // Access changed: hide confirmed data first, then
+                    // take a new authoritative channel snapshot and
+                    // history.
+                    self.access_refresh_again = true;
+                } else {
+                    self.invalidate_access(window, cx);
+                }
+            }
+            // A reconnect or resync of an open personal conversation
+            // must not be swallowed by a server-channel access event.
+            if (resync || restart_history) && !self.access_pending && !self.access_reload_in_flight
+            {
+                // A cancelled initial load would leave the chat empty,
+                // so restart exactly one refresh after the batch.
+                self.refresh_history(window, cx);
+            }
+        }
+        if changed {
+            self.sync_open_views(cx);
+            // Deleting (or dropping from the window) the viewed message
+            // closes the viewer before a late content answer arrives.
+            let stale_viewer = self.media.viewer.as_ref().is_some_and(|viewer| {
+                self.deleted_ids.contains(&viewer.key.message_id)
+                    || !self.messages.iter().any(|row| row.id == viewer.key.message_id)
+            });
+            if stale_viewer {
+                self.close_viewer(window);
+            }
+        }
+        if changed || resync || access || recording_event {
+            cx.notify();
+        }
     }
     /// A native notification is offered only while the setting is enabled and
     /// the window is not focused. A failed tray call does not remember the key,

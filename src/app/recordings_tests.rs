@@ -325,6 +325,166 @@ async fn recordings_hide_metadata_while_access_is_unconfirmed(cx: &mut TestAppCo
 }
 
 #[gpui::test]
+async fn recording_overflow_unconfirms_the_snapshot_in_a_direct_chat(cx: &mut TestAppContext) {
+    cx.update(|cx| gpui_component::init(cx));
+    let mut ready = recording_json(&"1".repeat(32), RECORDING_READY, 1);
+    let mut live = recording_json(&"2".repeat(32), RECORDING_STARTED, 2);
+    ready["preview_version"] = serde_json::Value::Null;
+    live["preview_version"] = serde_json::Value::Null;
+    let both = list_json(&[ready, live]);
+    let gate = Gate::new();
+    let server = TestServer::spawn(vec![
+        Reply::new(200, &both),
+        Reply::new(503, "{\"error\":\"unavailable\"}").with_gate(gate.clone()),
+    ]);
+    let (window, view) = make_app(cx, client(&server.base));
+    let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
+    visual.update(|window, app| {
+        view.update(app, |v, cx| v.toggle_recordings("header", window, cx));
+    });
+    wait_for(&mut visual, &view, |v| {
+        !v.recordings.loading && v.recordings.confirmed_epoch == Some(v.recordings.access_epoch)
+    });
+    let previews_before = calls(&server, "/preview");
+
+    // The queue overflowed, so `channels.changed` may be gone. A personal
+    // conversation must still unconfirm the server snapshot as soon as the
+    // batch is processed, and the next list is held open.
+    gate.arm();
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            v.conversation = Some(voxhold_api::Conversation {
+                id: 99,
+                direct: true,
+                ..Default::default()
+            });
+            v.access_pending = true;
+            v.events_overflow
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            v.process_realtime_batch(window, cx);
+        });
+    });
+    view.read_with(&*visual, |v, _| {
+        assert!(v.recordings.sorted(1_700_000_100).is_empty());
+        assert!(v.recordings.live(7, 1_700_000_100).is_none());
+    });
+
+    // While the new GET is held no card, live marker or preview may appear.
+    visual.update(|window, app| {
+        view.update(app, |v, _| {
+            v.conversation = None;
+            v.access_pending = false;
+        });
+        window.draw(app).clear();
+    });
+    assert_eq!(
+        calls(&server, "/preview"),
+        previews_before,
+        "an unconfirmed snapshot started a preview"
+    );
+    gate.release();
+
+    // A 503 does not re-confirm what the access change already invalidated.
+    wait_for(&mut visual, &view, |v| {
+        !v.recordings.loading && !v.recordings.error.is_empty()
+    });
+    view.read_with(&*visual, |v, _| {
+        assert!(v.recordings.sorted(1_700_000_100).is_empty());
+        assert!(v.recordings.live(7, 1_700_000_100).is_none());
+    });
+}
+
+#[gpui::test]
+async fn recording_tombstone_survives_a_404_and_an_old_ready(cx: &mut TestAppContext) {
+    cx.update(|cx| gpui_component::init(cx));
+    let deleted_id = "1".repeat(32);
+    let kept_id = "2".repeat(32);
+    let mut deleted = recording_json(&deleted_id, RECORDING_READY, 1);
+    let mut kept = recording_json(&kept_id, RECORDING_READY, 2);
+    deleted["preview_version"] = serde_json::Value::Null;
+    kept["preview_version"] = serde_json::Value::Null;
+    let both = list_json(&[deleted.clone(), kept.clone()]);
+    let tombstone = serde_json::to_string(&serde_json::json!({
+        "id": deleted_id,
+        "server_id": 1,
+        "channel_id": 7,
+        "owner_user_id": 1,
+        "owner_username": "owner",
+        "status": RECORDING_DELETED,
+        "updated_at": 3,
+        "expires_at": 1_800_000_000,
+    }))
+    .unwrap();
+    let server = TestServer::spawn(vec![
+        Reply::new(200, &both),
+        Reply::new(200, &tombstone),
+        Reply::new(404, "{\"error\":\"not found\"}"),
+        Reply::new(200, &both),
+    ]);
+    let (window, view) = make_app(cx, client(&server.base));
+    let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
+    visual.update(|window, app| {
+        view.update(app, |v, cx| v.toggle_recordings("header", window, cx));
+    });
+    wait_for(&mut visual, &view, |v| {
+        !v.recordings.loading && v.recordings.records.len() == 2
+    });
+    let row = view.read_with(&*visual, |v, _| {
+        v.recordings
+            .records
+            .iter()
+            .find(|row| row.id == deleted_id)
+            .cloned()
+            .unwrap()
+    });
+    visual.update(|window, app| {
+        view.update(app, |v, cx| v.delete_recording(row, window, cx));
+    });
+    wait_for(&mut visual, &view, |v| v.recordings.tombstones.contains(&deleted_id));
+
+    visual.update(|window, app| {
+        view.update(app, |v, cx| v.refresh_recordings(0, window, cx));
+    });
+    wait_for(&mut visual, &view, |v| {
+        !v.recordings.loading && !v.recordings.error.is_empty()
+    });
+    view.read_with(&*visual, |v, _| {
+        assert_eq!(v.recordings.confirmed_epoch, None);
+        assert!(v.recordings.sorted(1_700_000_100).is_empty());
+        assert!(v.recordings.tombstones.contains(&deleted_id));
+    });
+
+    // An old ready event unconfirms again but must not drop the tombstone; the
+    // successful list still hides the deleted row instead of resurrecting it.
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            let (tx, rx) = std::sync::mpsc::sync_channel(1);
+            tx.send(voxhold_api::RealtimeEvent {
+                kind: "ready".into(),
+                ..Default::default()
+            })
+            .unwrap();
+            v.events = Some(std::sync::Arc::new(std::sync::Mutex::new(rx)));
+            v.events_overflow = Default::default();
+            v.process_realtime_batch(window, cx);
+        });
+    });
+    wait_for(&mut visual, &view, |v| {
+        !v.recordings.loading && v.recordings.confirmed_epoch == Some(v.recordings.access_epoch)
+    });
+    view.read_with(&*visual, |v, _| {
+        let ids: Vec<String> = v
+            .recordings
+            .sorted(1_700_000_100)
+            .into_iter()
+            .map(|row| row.id)
+            .collect();
+        assert_eq!(ids, vec![kept_id.clone()]);
+        assert!(v.recordings.tombstones.contains(&deleted_id));
+    });
+}
+
+#[gpui::test]
 async fn recording_preview_waits_for_access_confirmation(cx: &mut TestAppContext) {
     cx.update(|cx| gpui_component::init(cx));
     let ready = list_json(&[recording_json(ID, RECORDING_READY, 1)]);
@@ -360,7 +520,7 @@ async fn recording_preview_waits_for_access_confirmation(cx: &mut TestAppContext
         view.update(app, |v, cx| v.refresh_recordings(0, window, cx));
     });
     wait_for(&mut visual, &view, |v| {
-        !v.recordings.loading && v.recordings.confirmed_epoch == v.recordings.access_epoch
+        !v.recordings.loading && v.recordings.confirmed_epoch == Some(v.recordings.access_epoch)
     });
     visual.update(|window, app| {
         window.draw(app).clear();

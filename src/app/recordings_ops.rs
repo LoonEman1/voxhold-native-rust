@@ -276,7 +276,7 @@ impl Voxhold {
             return false;
         };
         dialog.epoch == self.recording_access_epoch
-            && self.recordings.confirmed_epoch == self.recording_access_epoch
+            && self.recordings.confirmed_epoch == Some(self.recording_access_epoch)
             && !self.recordings.loading
             && self.recordings.error.is_empty()
     }

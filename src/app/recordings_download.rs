@@ -20,7 +20,7 @@ impl Voxhold {
         }
         let now = now_secs();
         if !recordings::ready(&record, now)
-            || self.recordings.confirmed_epoch != self.recording_access_epoch
+            || self.recordings.confirmed_epoch != Some(self.recording_access_epoch)
         {
             return;
         }

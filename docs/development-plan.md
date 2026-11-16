@@ -965,6 +965,46 @@ PR [#13](https://github.com/LoonEman1/voxhold-native-rust/pull/13); сверен
 
 Дополнение третьего раунда — [`0b57d56`](https://github.com/LoonEman1/voxhold-native-rust/commit/0b57d56): `channels.changed` в ЛС освобождает и слот `/channels`-проверки после `403`, поэтому старый ответ не может снова разрешить поиск; запрос проверки переведён на tokio без блокировки UI. Возврат ЛС → канал при неподтверждённом снимке запускает свежий `/channels`, и только его callback синхронизирует права и загружает закрепы. Добавлены регрессии на удержание обоих GET и на DM → канал с закрепом 42. Проверки: `cargo fmt --all -- --check`, `cargo test --workspace --locked` (173 теста приложения: 172 passed, 1 `ignored`; 6 API; 6 media), размеры (137 файлов). Release, GUI и живой backend не перезапускались.
 
+### R05 · Участники, личные и административные настройки — журнал PR #14
+
+Ветка `codex/r05-settings`, база `origin/dev` `47f977c`, PR
+[#14](https://github.com/LoonEman1/voxhold-native-rust/pull/14); сверены
+backend `9b29fdd`, frontend `ed7cb00`, Go `09c82b9`.
+
+- `members.rs`, `members_view.rs`: единый снимок участников, присутствие,
+  аватары/инициалы, роли, контекстное меню и подтверждённые destructive
+  действия.
+- `settings.rs`, `settings_view.rs`: модальное дерево с поколением диалога,
+  scope, ленивыми вкладками и `FormValue`; профиль, приватность, тема,
+  уведомления, пароль, сессии и удаление аккаунта.
+- `server_ops.rs`, `server_settings.rs`: owner-only общие настройки/CORS,
+  роли и grants, хранилище/квоты/очистка, баны и диагностика.
+- `channel_ops.rs`, `channel_settings.rs`: текстовые/новостные/голосовые
+  формы, доступ, slow mode, E2EE и отдельный диалог уведомлений канала.
+- `realtime.rs`: `presence.*`, `avatar.updated`, `server.member_*`,
+  уведомления и `notification.settings_updated` в существующем WS.
+
+Раунд ревью: монотонное поколение на каждом reopen всех четырёх форм и
+проверка поколения/вкладки/scope в `settle` не дают старому `/access`
+заполнить форму другого или заново открытого канала; кнопка уведомлений
+канала вынесена из `can_manage`, форма закрывается при потере
+`has_history()`; вкладка профиля хранит `idle/loading/loaded/error` и
+перезапускает отменённый GET при возврате, а у сессий свой retry; PATCH
+профиля блокирует только кнопку и получает свой request id; WS-настройка
+уведомлений не стирает несохранённый выбор и отменяет старый GET; DELETE
+аккаунта завершает сессию даже после закрытия формы, но проверяет
+`session_generation`; декодирование аватара вынесено в
+`background_spawn` и отбрасывается по поколению/сессии/ID выбора; PTT
+передаётся в `VoicePanel` при создании, закрывает микрофон до первого
+`join` и применяется к уже открытой панели.
+
+Проверки после правок: `cargo fmt --all -- --check`,
+`cargo test --workspace --locked` (218 тестов приложения: 217 passed,
+1 `ignored`; 6 API; 6 media), `cargo build --release --locked
+-p voxhold-native-rust`, `scripts/check-file-sizes.ps1`. Живой backend,
+ручной GUI owner/admin/member, два аккаунта, кадры/DPI и фактический
+balloon не проверялись. См. [status.md](status.md).
+
 ### Что обязательно приложить к PR
 
 ```text

@@ -586,9 +586,19 @@ impl Voxhold {
                         && panel.channel == channel.unwrap_or_default()
                         && !mode.is_empty()
                     {
-                        panel.mode = mode.to_owned();
+                        // Keep an unsaved local choice. The confirmed value is
+                        // always replaced, and the local editor follows it only
+                        // when it still matched the old confirmed value.
+                        let edited = panel.mode != panel.saved;
                         panel.saved = mode.to_owned();
+                        if !edited {
+                            panel.mode = mode.to_owned();
+                        }
                         panel.loaded = true;
+                        panel.error.clear();
+                        // A GET that started before this event carries an
+                        // older snapshot and must not overwrite the event.
+                        panel.epoch = panel.epoch.wrapping_add(1);
                     }
                 }
             }

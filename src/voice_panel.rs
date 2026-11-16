@@ -44,6 +44,7 @@ impl VoicePanel {
         client: Client,
         server: i64,
         channel: i64,
+        push_to_talk: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -63,6 +64,12 @@ impl VoicePanel {
             }
         })
         .detach();
+        // Push-to-talk starts muted: the first `VoiceHandle::join` must not
+        // open the microphone before Space is held.
+        let controls = Controls {
+            muted: push_to_talk,
+            ..Controls::default()
+        };
         Self {
             focus,
             _focus_subscriptions: vec![blur, activation],
@@ -70,9 +77,9 @@ impl VoicePanel {
             server,
             channel,
             handle: None,
-            controls: Controls::default(),
+            controls,
             self_muted: false,
-            push_to_talk: false,
+            push_to_talk,
             ptt_held: false,
             participants: Vec::new(),
             speaking: HashMap::new(),
@@ -236,6 +243,16 @@ impl VoicePanel {
             handle.local_mute(id, muted);
         }
         cx.notify();
+    }
+
+    #[cfg(test)]
+    pub fn test_controls_muted(&self) -> bool {
+        self.controls.muted
+    }
+
+    #[cfg(test)]
+    pub fn test_push_to_talk(&self) -> bool {
+        self.push_to_talk
     }
 }
 impl Render for VoicePanel {

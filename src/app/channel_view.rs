@@ -322,6 +322,7 @@ impl Voxhold {
         let mode = panel.mode.clone();
         let saved = panel.saved.clone();
         let loaded = panel.loaded;
+        let saving = panel.saving;
         let error = panel.error.clone();
         let notifications = self.notifications.enabled;
         let mut root = div().flex().flex_col().gap(px(10.)).child(self.heading(
@@ -387,7 +388,7 @@ impl Voxhold {
                 "Сохранить",
                 ButtonKind::Primary,
                 false,
-                mode == saved,
+                saving || mode == saved,
                 SettingsAct::Notifications(channel_settings::NotifAction::Save),
                 window,
                 cx,

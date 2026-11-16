@@ -6,6 +6,7 @@
 //! in flight. The rules here are unit tested; the views in `src/app` only
 //! render and start requests.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const ABOUT_LIMIT: usize = 512;
@@ -98,6 +99,27 @@ impl Tab {
     }
 }
 
+/// Lazy tab lifecycle. A tab that was left while its request was still in
+/// flight returns to `Idle`, so activating it again starts the request anew
+/// instead of leaving the form on a permanent "Загрузка…" line.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LoadState {
+    #[default]
+    Idle,
+    Loading,
+    Loaded,
+    Error,
+}
+
+/// Every new dialog instance takes a fresh value from this counter. Reopening
+/// a form therefore never reuses the generation of an older answer, even when
+/// the scope and the active tab are identical.
+static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+fn next_generation() -> u64 {
+    NEXT_GENERATION.fetch_add(1, Ordering::Relaxed)
+}
+
 /// One lazily opened dialog. `generation` invalidates every answer that was
 /// started for a previous tab, scope or lifetime of the dialog.
 #[derive(Debug)]
@@ -106,7 +128,7 @@ pub struct Dialog {
     pub scope: Scope,
     pub tabs: Vec<Tab>,
     pub active: usize,
-    pub opened: Vec<bool>,
+    pub loads: Vec<LoadState>,
     pub generation: u64,
     pub pending: usize,
     pub error: String,
@@ -115,41 +137,41 @@ pub struct Dialog {
 
 impl Dialog {
     pub fn new(title: impl Into<String>, scope: Scope, tabs: Vec<Tab>) -> Self {
-        let opened = vec![false; tabs.len()];
-        let mut dialog = Self {
+        let loads = vec![LoadState::Idle; tabs.len()];
+        Self {
             title: title.into(),
             scope,
             tabs,
             active: 0,
-            opened,
-            generation: 1,
+            loads,
+            generation: next_generation(),
             pending: 0,
             error: String::new(),
             closed: false,
-        };
-        let _ = dialog.activate(0);
-        dialog
+        }
     }
 
     /// Switch to a tab. Returns `true` when the tab must run its lazy `open`
-    /// request for the first time. The scroll position and request error are
-    /// reset, and all older answers are discarded.
+    /// request. Leaving a tab with an unfinished request resets it to `Idle`
+    /// so returning starts the request again. All older answers are discarded.
     pub fn activate(&mut self, index: usize) -> bool {
         if self.closed || index >= self.tabs.len() {
             return false;
         }
-        if self.active == index && self.opened.get(index).copied().unwrap_or(false) {
+        if self.active == index {
             return false;
         }
+        if self.loads[self.active] == LoadState::Loading {
+            self.loads[self.active] = LoadState::Idle;
+        }
         self.active = index;
-        self.generation = self.generation.wrapping_add(1);
+        self.generation = next_generation();
         self.pending = 0;
         self.error.clear();
-        let first = !self.opened.get(index).copied().unwrap_or(false);
-        if let Some(slot) = self.opened.get_mut(index) {
-            *slot = true;
+        match self.loads[index] {
+            LoadState::Loaded | LoadState::Loading => false,
+            LoadState::Idle | LoadState::Error => true,
         }
-        first
     }
 
     pub fn close(&mut self) -> bool {
@@ -157,7 +179,7 @@ impl Dialog {
             return false;
         }
         self.closed = true;
-        self.generation = self.generation.wrapping_add(1);
+        self.generation = next_generation();
         self.pending = 0;
         true
     }
@@ -168,6 +190,9 @@ impl Dialog {
     }
 
     pub fn begin(&mut self) -> RequestToken {
+        if let Some(slot) = self.loads.get_mut(self.active) {
+            *slot = LoadState::Loading;
+        }
         self.pending = self.pending.saturating_add(1);
         RequestToken {
             generation: self.generation,
@@ -178,10 +203,23 @@ impl Dialog {
     }
 
     /// Finish one request. Returns `false` for an answer of a closed dialog or
-    /// of a tab that is no longer active; such an answer must not touch state.
+    /// of a tab/scope that is no longer current; such an answer must not touch
+    /// state.
     pub fn settle(&mut self, token: RequestToken) -> bool {
-        if token.pending && token.generation == self.generation && token.tab == self.active {
+        if !self.closed
+            && token.pending
+            && token.generation == self.generation
+            && token.tab == self.active
+            && token.scope == self.scope
+        {
             self.pending = self.pending.saturating_sub(1);
+            // The tab is complete only after every request it started has
+            // settled; a save or preview answer must not hide a pending load.
+            if self.pending == 0 {
+                if let Some(slot) = self.loads.get_mut(token.tab) {
+                    *slot = LoadState::Loaded;
+                }
+            }
             true
         } else {
             false
@@ -855,15 +893,62 @@ mod tests {
     #[test]
     fn tabs_open_lazily_and_invalidate_older_requests() {
         let mut dialog = dialog();
-        assert!(dialog.opened[0]);
-        assert!(!dialog.opened[1]);
+        assert_eq!(dialog.loads[0], LoadState::Idle);
+        assert_eq!(dialog.loads[1], LoadState::Idle);
         let profile = dialog.begin();
+        assert_eq!(dialog.loads[0], LoadState::Loading);
         assert!(dialog.settle(profile));
+        assert_eq!(dialog.loads[0], LoadState::Loaded);
         assert!(dialog.activate(1));
         assert!(!dialog.settle(profile), "old tab answer is discarded");
         assert_eq!(dialog.pending, 0);
-        assert!(!dialog.activate(1), "already opened");
-        assert!(dialog.opened[1]);
+        assert!(!dialog.activate(1), "already active");
+        assert_eq!(dialog.loads[1], LoadState::Idle);
+        let privacy = dialog.begin();
+        assert!(dialog.settle(privacy));
+        assert_eq!(dialog.loads[1], LoadState::Loaded);
+        assert!(!dialog.activate(1), "loaded tab is not reopened");
+    }
+
+    #[test]
+    fn leaving_a_loading_tab_makes_the_return_reload_it() {
+        let mut dialog = dialog();
+        let profile = dialog.begin();
+        assert_eq!(dialog.loads[0], LoadState::Loading);
+        assert!(dialog.activate(1));
+        assert_eq!(
+            dialog.loads[0],
+            LoadState::Idle,
+            "unfinished request is reset on leave"
+        );
+        assert!(dialog.activate(0), "returning starts the request again");
+        assert!(
+            !dialog.settle(profile),
+            "the interrupted answer is discarded"
+        );
+    }
+
+    #[test]
+    fn a_reopened_dialog_never_reuses_a_generation_or_accepts_another_scope() {
+        let mut first = Dialog::new(
+            "Настройки",
+            Scope::channel(4, 9),
+            vec![Tab::new("Доступ", "lock")],
+        );
+        let old = first.begin();
+        first.close();
+        let mut second = Dialog::new(
+            "Настройки",
+            Scope::channel(4, 9),
+            vec![Tab::new("Доступ", "lock")],
+        );
+        assert_ne!(first.generation, second.generation);
+        assert!(!second.settle(old), "an old dialog instance is rejected");
+
+        let mut other = dialog();
+        let token = other.begin();
+        other.scope = Scope::channel(4, 10);
+        assert!(!other.settle(token), "a foreign scope is rejected");
     }
 
     #[test]

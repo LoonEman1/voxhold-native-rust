@@ -232,23 +232,27 @@ impl Voxhold {
                     })),
             );
         }
-        if can_manage && self.channel != 0 && self.conversation.is_none() {
-            panel = panel.child(
-                div()
-                    .id("channel-settings-open")
-                    .px(px(16.))
-                    .py(px(6.))
-                    .cursor_pointer()
-                    .text_size(px(12.))
-                    .text_color(ink(p.muted))
-                    .track_focus(&self.channel_entry_focus)
-                    .tab_index(0)
-                    .child("Настройки канала")
-                    .on_click(cx.listener(|s, _, window, cx| {
-                        let focus = s.channel_entry_focus.clone();
-                        s.open_settings(SettingsKind::Channel, focus, window, cx);
-                    })),
-            );
+        if self.channel != 0 && self.conversation.is_none() {
+            if can_manage {
+                panel = panel.child(
+                    div()
+                        .id("channel-settings-open")
+                        .px(px(16.))
+                        .py(px(6.))
+                        .cursor_pointer()
+                        .text_size(px(12.))
+                        .text_color(ink(p.muted))
+                        .track_focus(&self.channel_entry_focus)
+                        .tab_index(0)
+                        .child("Настройки канала")
+                        .on_click(cx.listener(|s, _, window, cx| {
+                            let focus = s.channel_entry_focus.clone();
+                            s.open_settings(SettingsKind::Channel, focus, window, cx);
+                        })),
+                );
+            }
+            // Notifications are a per-account preference; a regular member
+            // sees this action without the channel administration form.
             let notification_channel = self
                 .channels
                 .iter()

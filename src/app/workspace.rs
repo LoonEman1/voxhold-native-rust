@@ -288,8 +288,10 @@ impl Voxhold {
                 voice.update(cx, |voice, cx| voice.leave_in_window(window, cx));
             }
             let server = self.server;
-            self.voice =
-                Some(cx.new(|cx| voice_panel::VoicePanel::new(client, server, id, window, cx)));
+            let push_to_talk = self.voice_settings.prefs.input_mode == "push_to_talk";
+            self.voice = Some(cx.new(|cx| {
+                voice_panel::VoicePanel::new(client, server, id, push_to_talk, window, cx)
+            }));
             self.voice_channel = id;
         }
         if let Some(search) = &self.search {
@@ -472,6 +474,10 @@ impl Voxhold {
                 match result {
                     Ok((channels, members)) => {
                         s.channels = channels;
+                        // A notification form follows the account, not the
+                        // administration role, but it still needs a readable
+                        // text/news channel. Revoking access closes it.
+                        s.close_stale_settings(server, s.channel, window, cx);
                         let channel_missing = s
                             .channel_settings
                             .as_ref()

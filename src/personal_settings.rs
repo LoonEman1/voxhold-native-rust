@@ -10,12 +10,13 @@ use gpui::{AppContext, Context, Entity, RenderImage, Window};
 use gpui_component::input::InputState;
 use voxhold_api::{AccountSession, MessagePrivacy, Profile};
 
-use crate::settings::{self, Crop, Dialog, Scope, Tab};
+use crate::settings::{self, Crop, Dialog, LoadState, Scope, Tab};
 use crate::theme::ThemeMode;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Action {
     Retry,
+    RetrySessions,
     SaveProfile,
     CancelProfile,
     OpenCountry,
@@ -95,10 +96,18 @@ pub struct PersonalSettings {
     pub about_form: settings::FormValue<String>,
     pub country_form: settings::FormValue<Option<String>>,
     pub profile_loading: bool,
+    /// A PATCH is in flight. Editors stay enabled; only the save button and a
+    /// repeated `save_profile` call are blocked, and every PATCH gets its own
+    /// request id so one answer cannot settle another request.
+    pub profile_saving: bool,
+    pub profile_request: u64,
     pub avatar: Option<Arc<RenderImage>>,
     pub avatar_version: Option<String>,
     pub avatar_loading: bool,
     pub avatar_missing: bool,
+    /// Identifies the chosen file. A decode that finishes after a newer choice
+    /// is discarded instead of replacing the newer crop draft.
+    pub avatar_pick: u64,
     pub crop: Option<CropDraft>,
     pub sessions: Vec<AccountSession>,
     pub sessions_loading: bool,
@@ -148,10 +157,13 @@ impl PersonalSettings {
             about_form: settings::FormValue::new(String::new()),
             country_form: settings::FormValue::new(None),
             profile_loading: false,
+            profile_saving: false,
+            profile_request: 0,
             avatar: None,
             avatar_version: None,
             avatar_loading: false,
             avatar_missing: false,
+            avatar_pick: 0,
             crop: None,
             sessions: Vec::new(),
             sessions_loading: false,
@@ -175,6 +187,9 @@ impl PersonalSettings {
     pub fn reopen(&mut self, theme: ThemeMode, notifications: bool) {
         self.dialog = Dialog::new("Настройки", Scope::default(), TABS.to_vec());
         self.profile_loading = false;
+        self.profile_saving = false;
+        self.profile_request = self.profile_request.wrapping_add(1);
+        self.avatar_pick = self.avatar_pick.wrapping_add(1);
         self.sessions_loading = false;
         self.sessions_error.clear();
         self.validation.clear();
@@ -191,6 +206,39 @@ impl PersonalSettings {
 
     pub fn tab(&self) -> usize {
         self.dialog.active
+    }
+
+    /// The profile tab owns two independent requests. The tab counts as
+    /// loaded only after both have finished, so leaving while either one is in
+    /// flight cannot mark the tab as complete.
+    pub fn sync_profile_load(&mut self) {
+        if self.dialog.active != 0 {
+            return;
+        }
+        if self.profile_loading || self.sessions_loading {
+            if let Some(slot) = self.dialog.loads.get_mut(0) {
+                *slot = LoadState::Loading;
+            }
+        } else if let Some(slot) = self.dialog.loads.get_mut(0) {
+            *slot = if self.profile.is_some() {
+                LoadState::Loaded
+            } else {
+                LoadState::Error
+            };
+        }
+    }
+
+    /// Drop the request bookkeeping of a profile tab that is being left. The
+    /// dialog generation already rejects its late answers; clearing the flags
+    /// lets the return start a fresh GET instead of keeping "Загрузка…".
+    pub fn cancel_profile_loads(&mut self) {
+        self.profile_loading = false;
+        self.sessions_loading = false;
+    }
+
+    pub fn next_profile_request(&mut self) -> u64 {
+        self.profile_request = self.profile_request.wrapping_add(1);
+        self.profile_request
     }
 
     pub fn about_value(&self, cx: &gpui::App) -> String {

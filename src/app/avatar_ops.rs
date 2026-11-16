@@ -72,6 +72,7 @@ impl Voxhold {
         let Some(generation) = self.personal.as_ref().map(|panel| panel.dialog.generation) else {
             return;
         };
+        let session = self.session_generation;
         let prompt = cx.prompt_for_paths(gpui::PathPromptOptions {
             files: true,
             directories: false,
@@ -84,34 +85,88 @@ impl Voxhold {
                 _ => None,
             };
             let Some(path) = path else { return };
-            let _ = this.update_in(window, |s, window, cx| {
+            let _ = this.update_in(window, move |s, window, cx| {
                 let Some(panel) = &mut s.personal else { return };
-                if panel.dialog.generation != generation
+                if s.session_generation != session
+                    || panel.dialog.generation != generation
                     || s.active_settings != Some(SettingsKind::Personal)
                     || panel.tab() != 0
                 {
                     return;
                 }
-                match super::avatar_ops::decode_avatar(&path) {
-                    Ok((data, source, width, height)) => {
-                        panel.crop = Some(crate::personal_settings::CropDraft {
-                            data,
-                            source,
-                            width,
-                            height,
-                            crop: settings::Crop::default(),
-                            preview: None,
-                            preview_token: 1,
-                        });
-                        panel.local_error.clear();
-                        s.refresh_crop_preview(window, cx);
-                    }
-                    Err(error) => panel.local_error = error,
-                }
-                cx.notify();
+                panel.avatar_pick = panel.avatar_pick.wrapping_add(1);
+                let selection = panel.avatar_pick;
+                let path = path.clone();
+                // Reading, EXIF rotation and downscaling happen off the UI
+                // thread, exactly like the crop preview.
+                let task =
+                    cx.background_spawn(async move { super::avatar_ops::decode_avatar(&path) });
+                cx.spawn_in(window, async move |this, window| {
+                    let result = task.await;
+                    let _ = this.update_in(window, |s, window, cx| {
+                        s.apply_avatar_decoded(session, generation, selection, result, window, cx);
+                    });
+                })
+                .detach();
             });
         })
         .detach();
+    }
+
+    /// Apply a finished decode only when it still belongs to the current
+    /// session, dialog and file choice.
+    pub(super) fn apply_avatar_decoded(
+        &mut self,
+        session: u64,
+        generation: u64,
+        selection: u64,
+        result: Result<
+            (
+                std::sync::Arc<Vec<u8>>,
+                std::sync::Arc<image::DynamicImage>,
+                u32,
+                u32,
+            ),
+            String,
+        >,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.session_generation != session
+            || self.active_settings != Some(SettingsKind::Personal)
+        {
+            return;
+        }
+        let Some(panel) = &mut self.personal else {
+            return;
+        };
+        if panel.dialog.generation != generation
+            || panel.tab() != 0
+            || panel.avatar_pick != selection
+        {
+            return;
+        }
+        let mut refresh = false;
+        match result {
+            Ok((data, source, width, height)) => {
+                panel.crop = Some(crate::personal_settings::CropDraft {
+                    data,
+                    source,
+                    width,
+                    height,
+                    crop: settings::Crop::default(),
+                    preview: None,
+                    preview_token: 1,
+                });
+                panel.local_error.clear();
+                refresh = true;
+            }
+            Err(error) => panel.local_error = error,
+        }
+        if refresh {
+            self.refresh_crop_preview(window, cx);
+        }
+        cx.notify();
     }
 
     fn refresh_crop_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {

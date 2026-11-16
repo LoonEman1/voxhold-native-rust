@@ -16,6 +16,7 @@ impl Voxhold {
         };
         let profile = panel.profile.clone();
         let loading = panel.profile_loading;
+        let profile_saving = panel.profile_saving;
         let avatar = panel.avatar.clone();
         let crop = panel
             .crop
@@ -295,7 +296,7 @@ impl Voxhold {
                         "Сохранить",
                         ButtonKind::Primary,
                         false,
-                        false,
+                        profile_saving,
                         SettingsAct::Personal(personal_settings::Action::SaveProfile),
                         window,
                         cx,
@@ -370,7 +371,7 @@ impl Voxhold {
                     ButtonKind::Secondary,
                     false,
                     false,
-                    SettingsAct::Personal(personal_settings::Action::Retry),
+                    SettingsAct::Personal(personal_settings::Action::RetrySessions),
                     window,
                     cx,
                 ));

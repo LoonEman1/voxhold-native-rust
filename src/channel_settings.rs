@@ -192,6 +192,13 @@ pub struct ChannelNotifications {
     pub mode: String,
     pub saved: String,
     pub loaded: bool,
+    pub saving: bool,
+    /// Bumped whenever a realtime event supersedes an in-flight GET. The GET
+    /// started before the event must not overwrite the newer confirmed value.
+    pub epoch: u64,
+    /// Identifies the active PUT so an answer from a replaced form cannot
+    /// release the lock of a newer save.
+    pub save_request: u64,
     pub error: String,
 }
 
@@ -205,6 +212,9 @@ impl ChannelNotifications {
             mode: String::new(),
             saved: String::new(),
             loaded: false,
+            saving: false,
+            epoch: 0,
+            save_request: 0,
             error: String::new(),
         }
     }
@@ -221,6 +231,9 @@ impl ChannelNotifications {
         self.mode.clear();
         self.saved.clear();
         self.loaded = false;
+        self.saving = false;
+        self.epoch = self.epoch.wrapping_add(1);
+        self.save_request = self.save_request.wrapping_add(1);
         self.error.clear();
     }
 }

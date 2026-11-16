@@ -76,15 +76,18 @@ impl Voxhold {
                 .server_settings
                 .as_ref()
                 .is_some_and(|panel| panel.dialog.stale(server, channel)),
-            Some(SettingsKind::Channel) | Some(SettingsKind::ChannelNotifications) => {
-                let dialog = if self.active_settings == Some(SettingsKind::Channel) {
-                    self.channel_settings.as_ref().map(|panel| &panel.dialog)
-                } else {
-                    self.channel_notifications
-                        .as_ref()
-                        .map(|panel| &panel.dialog)
-                };
-                dialog.is_some_and(|dialog| dialog.stale(server, channel))
+            Some(SettingsKind::Channel) => self
+                .channel_settings
+                .as_ref()
+                .is_some_and(|panel| panel.dialog.stale(server, channel)),
+            Some(SettingsKind::ChannelNotifications) => {
+                self.channel_notifications.as_ref().is_some_and(|panel| {
+                    panel.dialog.stale(server, channel)
+                        || !self
+                            .channels
+                            .iter()
+                            .any(|row| row.id == panel.channel && row.has_history())
+                })
             }
             _ => false,
         };
@@ -179,7 +182,7 @@ impl Voxhold {
                 let Some(channel) = self
                     .channels
                     .iter()
-                    .find(|channel| channel.id == self.channel)
+                    .find(|channel| channel.id == self.channel && channel.has_history())
                     .cloned()
                 else {
                     self.active_settings = None;
@@ -213,10 +216,16 @@ impl Voxhold {
     ) {
         match self.active_settings {
             Some(SettingsKind::Personal) => {
+                let previous = self.personal.as_ref().map(|panel| panel.tab());
                 let first = self
                     .personal
                     .as_mut()
                     .is_some_and(|panel| panel.dialog.activate(index));
+                if previous == Some(0) && index != 0 {
+                    if let Some(panel) = &mut self.personal {
+                        panel.cancel_profile_loads();
+                    }
+                }
                 if first {
                     match index {
                         0 => {
@@ -307,9 +316,6 @@ impl Voxhold {
         let Some(client) = self.client.clone() else {
             return;
         };
-        let Some(token) = self.personal_token() else {
-            return;
-        };
         if self
             .personal
             .as_ref()
@@ -317,6 +323,9 @@ impl Voxhold {
         {
             return;
         }
+        let Some(token) = self.personal_token() else {
+            return;
+        };
         if let Some(panel) = &mut self.personal {
             panel.profile_loading = true;
             panel.local_error.clear();
@@ -340,6 +349,7 @@ impl Voxhold {
                         Ok(profile) => panel.set_profile(profile, window, cx),
                         Err(error) => panel.local_error = error,
                     }
+                    panel.sync_profile_load();
                 }
                 cx.notify();
             });
@@ -352,9 +362,6 @@ impl Voxhold {
         let Some(client) = self.client.clone() else {
             return;
         };
-        let Some(token) = self.personal_token() else {
-            return;
-        };
         if self
             .personal
             .as_ref()
@@ -362,6 +369,9 @@ impl Voxhold {
         {
             return;
         }
+        let Some(token) = self.personal_token() else {
+            return;
+        };
         if let Some(panel) = &mut self.personal {
             panel.sessions_loading = true;
             panel.sessions_error.clear();
@@ -386,6 +396,7 @@ impl Voxhold {
                             Ok(sessions) => panel.sessions = sessions,
                             Err(error) => panel.sessions_error = error,
                         }
+                        panel.sync_profile_load();
                     }
                     cx.notify();
                 })
@@ -492,6 +503,7 @@ impl Voxhold {
                     self.load_personal_privacy(cx);
                 }
             }
+            Action::RetrySessions => self.load_personal_sessions(cx),
             Action::SaveProfile => self.save_profile(window, cx),
             Action::CancelProfile => {
                 let confirmed = self
@@ -638,12 +650,20 @@ impl Voxhold {
                 cx.notify();
             }
             Action::SetInputMode(index) => {
-                self.voice_settings.prefs.input_mode = if index == 1 {
+                let push_to_talk = index == 1;
+                self.voice_settings.prefs.input_mode = if push_to_talk {
                     "push_to_talk".into()
                 } else {
                     "voice_activity".into()
                 };
                 self.voice_settings.persist();
+                #[cfg(feature = "voxhold-media")]
+                if let Some(voice) = &self.voice {
+                    voice.update(cx, |voice, cx| {
+                        voice.set_push_to_talk(push_to_talk);
+                        cx.notify();
+                    });
+                }
                 cx.notify();
             }
             Action::ResetVoice => {
@@ -652,6 +672,13 @@ impl Voxhold {
                 prefs.output = self.voice_settings.prefs.output.clone();
                 self.voice_settings.prefs = prefs;
                 self.voice_settings.persist();
+                #[cfg(feature = "voxhold-media")]
+                if let Some(voice) = &self.voice {
+                    voice.update(cx, |voice, cx| {
+                        voice.set_push_to_talk(false);
+                        cx.notify();
+                    });
+                }
                 cx.notify();
             }
             Action::CropZoom(value) => self.edit_crop(window, cx, 0, value),
@@ -662,6 +689,9 @@ impl Voxhold {
 
     pub(super) fn save_profile(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(panel) = &self.personal else { return };
+        if panel.profile_saving {
+            return;
+        }
         let about = panel.about_value(cx);
         let country_code = panel.country_code();
         let country = country_code.clone().unwrap_or_default();
@@ -678,14 +708,18 @@ impl Voxhold {
         let Some(token) = self.personal_token() else {
             return;
         };
+        let request = self
+            .personal
+            .as_mut()
+            .map(|panel| panel.next_profile_request())
+            .unwrap_or_default();
         if let Some(panel) = &mut self.personal {
             panel.validation.clear();
             panel.notice.clear();
             panel.local_error.clear();
-        }
-        if let Some(panel) = &mut self.personal {
-            panel.about_form.begin(token.generation, about.clone());
-            panel.country_form.begin(token.generation, country_code);
+            panel.profile_saving = true;
+            panel.about_form.begin(request, about.clone());
+            panel.country_form.begin(request, country_code);
         }
         let runtime = self.runtime.clone();
         let session = self.session_generation;
@@ -697,49 +731,54 @@ impl Voxhold {
         cx.spawn_in(window, async move |this, window| {
             let result = task.await;
             let _ = this.update_in(window, |s, window, cx| {
-                if s.session_generation != session || !s.personal_settle(token) {
+                if s.session_generation != session {
+                    return;
+                }
+                let accepted = s.personal_settle(token);
+                let Some(panel) = &mut s.personal else {
+                    return;
+                };
+                if panel.profile_request == request {
+                    panel.profile_saving = false;
+                }
+                if !accepted {
+                    // The PATCH still completed, but its form was replaced or
+                    // another tab was opened. Only the save lock is released.
+                    cx.notify();
                     return;
                 }
                 match result {
                     Ok(profile) => {
-                        let current_about = s
-                            .personal
-                            .as_ref()
-                            .map(|panel| panel.about_value(cx))
-                            .unwrap_or_default();
-                        let current_country =
-                            s.personal.as_ref().and_then(|panel| panel.country_code());
+                        let current_about = panel.about_value(cx);
+                        let current_country = panel.country_code();
                         let reply_about = profile.about.clone();
                         let reply_country = profile.country_code.clone();
-                        if let Some(panel) = &mut s.personal {
-                            // A local edit made after dispatch stays in the
-                            // editor; only the confirmed snapshot is replaced.
-                            let apply_about = panel.about_form.settle(
-                                token.generation,
-                                reply_about.clone(),
-                                &current_about,
-                            );
-                            let apply_country = panel.country_form.settle(
-                                token.generation,
-                                reply_country.clone(),
-                                &current_country,
-                            );
-                            panel.profile = Some(profile);
-                            if apply_about {
-                                panel.about.update(cx, |input, cx| {
-                                    input.set_value(reply_about.clone(), window, cx)
-                                });
-                            }
-                            if apply_country {
-                                panel.country_index = crate::settings::country_index(
-                                    &panel.countries,
-                                    reply_country.as_deref(),
-                                );
-                            }
-                            panel.notice = "Профиль обновлён.".into();
+                        // A local edit made after dispatch stays in the
+                        // editor; only the confirmed snapshot is replaced.
+                        let apply_about =
+                            panel
+                                .about_form
+                                .settle(request, reply_about.clone(), &current_about);
+                        let apply_country = panel.country_form.settle(
+                            request,
+                            reply_country.clone(),
+                            &current_country,
+                        );
+                        panel.profile = Some(profile);
+                        if apply_about {
+                            panel.about.update(cx, |input, cx| {
+                                input.set_value(reply_about.clone(), window, cx)
+                            });
                         }
+                        if apply_country {
+                            panel.country_index = crate::settings::country_index(
+                                &panel.countries,
+                                reply_country.as_deref(),
+                            );
+                        }
+                        panel.notice = "Профиль обновлён.".into();
                     }
-                    Err(error) => s.personal_error(error),
+                    Err(error) => panel.local_error = error,
                 }
                 cx.notify();
             });
@@ -994,7 +1033,10 @@ impl Voxhold {
         cx.spawn_in(window, async move |this, window| {
             let result = task.await;
             let _ = this.update_in(window, |s, window, cx| {
-                if s.session_generation != session || !s.personal_settle(token) {
+                // The account is already gone on the server. A closed form
+                // must not swallow the success; only the dialog token decides
+                // where an error can still be shown.
+                if s.session_generation != session {
                     return;
                 }
                 match result {
@@ -1003,8 +1045,10 @@ impl Voxhold {
                         s.logout(window, cx);
                     }
                     Err(error) => {
-                        s.personal_error(error);
-                        cx.notify();
+                        if s.personal_settle(token) {
+                            s.personal_error(error);
+                            cx.notify();
+                        }
                     }
                 }
             });

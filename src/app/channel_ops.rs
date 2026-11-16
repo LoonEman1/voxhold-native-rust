@@ -335,6 +335,11 @@ impl Voxhold {
         let Some(panel) = &self.channel_settings else {
             return;
         };
+        // The form is only editable after its own GET answered; this also
+        // keeps a stale editor from posting defaults to a newer scope.
+        if panel.access.is_none() {
+            return;
+        }
         let (server, channel) = (panel.server, panel.channel);
         let access = panel.access_value();
         let saved_access = access.clone();
@@ -528,6 +533,7 @@ impl Voxhold {
             return;
         };
         let (server, channel) = (panel.server, panel.channel);
+        let epoch = panel.epoch;
         let Some(client) = self.client.clone() else {
             return;
         };
@@ -549,14 +555,18 @@ impl Voxhold {
                         return;
                     }
                     if let Some(panel) = &mut s.channel_notifications {
-                        match result {
-                            Ok(mode) => {
-                                panel.mode = mode.clone();
-                                panel.saved = mode;
-                                panel.loaded = true;
-                                panel.error.clear();
+                        // A realtime setting arrived after this GET started.
+                        // Its value is newer than the snapshot on the wire.
+                        if panel.epoch == epoch {
+                            match result {
+                                Ok(mode) => {
+                                    panel.mode = mode.clone();
+                                    panel.saved = mode;
+                                    panel.loaded = true;
+                                    panel.error.clear();
+                                }
+                                Err(error) => panel.error = error,
                             }
-                            Err(error) => panel.error = error,
                         }
                     }
                     cx.notify();
@@ -610,7 +620,7 @@ impl Voxhold {
             return;
         };
         let (server, channel, mode) = (panel.server, panel.channel, panel.mode.clone());
-        if mode == panel.saved {
+        if panel.saving || mode == panel.saved {
             return;
         }
         let Some(client) = self.client.clone() else {
@@ -619,6 +629,16 @@ impl Voxhold {
         let Some(token) = self.notifications_token() else {
             return;
         };
+        let request = self
+            .channel_notifications
+            .as_mut()
+            .map(|panel| {
+                panel.saving = true;
+                panel.error.clear();
+                panel.save_request = panel.save_request.wrapping_add(1);
+                panel.save_request
+            })
+            .unwrap_or_default();
         let runtime = self.runtime.clone();
         let session = self.session_generation;
         let request_mode = mode.clone();
@@ -630,21 +650,31 @@ impl Voxhold {
         cx.spawn_in(window, async move |this, window| {
             let result = task.await;
             let _ = this.update_in(window, |s, window, cx| {
-                if s.session_generation != session || !s.notifications_settle(token) {
+                if s.session_generation != session {
                     return;
                 }
-                match result {
-                    Ok(()) => {
-                        if let Some(panel) = &mut s.channel_notifications {
+                let accepted = s.notifications_settle(token);
+                if let Some(panel) = &mut s.channel_notifications {
+                    if panel.save_request == request {
+                        panel.saving = false;
+                    }
+                    if !accepted {
+                        cx.notify();
+                        return;
+                    }
+                    match result {
+                        Ok(()) => {
                             panel.saved = mode.clone();
                         }
-                        s.close_settings(true, window, cx);
-                    }
-                    Err(error) => {
-                        if let Some(panel) = &mut s.channel_notifications {
+                        Err(error) => {
                             panel.error = error;
+                            cx.notify();
+                            return;
                         }
                     }
+                }
+                if accepted {
+                    s.close_settings(true, window, cx);
                 }
                 cx.notify();
             });

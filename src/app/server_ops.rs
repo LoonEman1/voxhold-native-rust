@@ -243,6 +243,15 @@ impl Voxhold {
         cx: &mut Context<Self>,
     ) {
         use server_settings::Action;
+        let owner = self
+            .servers
+            .iter()
+            .find(|server| server.id == self.server)
+            .is_some_and(|server| crate::settings::Role::parse(&server.role).can_manage_server());
+        if !owner {
+            self.close_settings(false, window, cx);
+            return;
+        }
         match action {
             Action::Retry(tab) => match tab {
                 0 => self.load_server_general(window, cx),

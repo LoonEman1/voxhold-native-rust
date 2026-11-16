@@ -158,6 +158,13 @@ impl Voxhold {
         }
         cx.notify();
     }
+    fn can_manage_channel_now(&self) -> bool {
+        self.servers
+            .iter()
+            .find(|server| server.id == self.server)
+            .is_some_and(|server| crate::settings::Role::parse(&server.role).can_manage_channels())
+    }
+
     pub(super) fn channel_action(
         &mut self,
         action: channel_settings::Action,
@@ -165,6 +172,10 @@ impl Voxhold {
         cx: &mut Context<Self>,
     ) {
         use channel_settings::Action;
+        if !self.can_manage_channel_now() {
+            self.close_settings(false, window, cx);
+            return;
+        }
         match action {
             Action::Retry(tab) => self.load_channel_tab(tab, window, cx),
             Action::SaveName => self.save_channel_name(cx),

@@ -411,7 +411,9 @@ pending POST переоткрытой ветки, пустую последню�
 ## Срез R05 (16 ноября 2026)
 
 База — `origin/dev` `47f977ccddea269ad0fe2923a2d7db2a78869ddf` (merge PR
-#13), ветка `codex/r05-settings`. Контракты сверены с Go-клиентом
+#13), ветка `codex/r05-settings`, PR
+[#14](https://github.com/LoonEman1/voxhold-native-rust/pull/14). Контракты
+сверены с Go-клиентом
 `09c82b983d5d842af0627289655b11c37ae56e1d`, backend
 `9b29fdd6d5dc818b7408e4892b8e68b27d123831` и frontend
 `ed7cb00ae12398753a8ef48a5a33b864e20cb04c`.

@@ -274,6 +274,17 @@ impl Voxhold {
             card = card.child(retry);
         }
 
+        card = card.on_mouse_up(
+            MouseButton::Left,
+            cx.listener(|s, _: &gpui::MouseUpEvent, _, cx| {
+                if let Some(dialog) = s.recordings_dialog.as_mut() {
+                    if dialog.pressed.take().is_some() {
+                        cx.notify();
+                    }
+                }
+            }),
+        );
+
         let close_ring = ring.clone();
         let weak = cx.entity().downgrade();
         card = card.capture_key_down(cx.listener(
@@ -347,6 +358,23 @@ impl Voxhold {
                         if !inside {
                             s.close_recordings(true, window, cx);
                         }
+                        // The backdrop is a full input barrier: the search and
+                        // every other control below the modal never see this
+                        // press, even when the click lands outside the card.
+                        cx.stop_propagation();
+                    }),
+                )
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(|s, _event: &gpui::MouseUpEvent, _window, cx| {
+                        // Any release that did not activate a card action
+                        // clears the press, including a release outside the
+                        // button or in the clipped part of the list.
+                        if let Some(dialog) = s.recordings_dialog.as_mut() {
+                            dialog.pressed = None;
+                        }
+                        cx.stop_propagation();
+                        cx.notify();
                     }),
                 )
                 .child(card)
@@ -627,6 +655,10 @@ impl Voxhold {
             ring.push((focus.clone(), id.to_string()));
         }
         let key = id.to_string();
+        let card_action = key.starts_with("rec-download-")
+            || key.starts_with("rec-delete-")
+            || key.starts_with("rec-confirm-")
+            || key.starts_with("rec-cancel-");
         let down_key = key.clone();
         let down_focus = focus.clone();
         let up_key = key.clone();
@@ -682,8 +714,20 @@ impl Voxhold {
                         cx.listener(move |s, event: &gpui::MouseDownEvent, window, cx| {
                             let point = (event.position.x.into(), event.position.y.into());
                             if let Some(dialog) = s.recordings_dialog.as_mut() {
-                                if dialog.action_hit(&down_key, point) {
+                                let hit = if card_action {
+                                    dialog.action_hit(&down_key, point)
+                                } else {
+                                    let bounds = Rect::new(
+                                        dialog.bounds.x + rect.x,
+                                        dialog.bounds.y + rect.y,
+                                        rect.w,
+                                        rect.h,
+                                    );
+                                    bounds.contains(point)
+                                };
+                                if hit {
                                     dialog.focus_action(&down_key);
+                                    dialog.focused_key = Some(down_key.clone());
                                     dialog.pressed = Some(down_key.clone());
                                     window.focus(&down_focus);
                                     cx.notify();
@@ -697,8 +741,20 @@ impl Voxhold {
                             let point = (event.position.x.into(), event.position.y.into());
                             let fire = s.recordings_dialog.as_mut().is_some_and(|dialog| {
                                 let pressed = dialog.pressed.take();
-                                pressed.as_deref() == Some(up_key.as_str())
-                                    && dialog.action_hit(&up_key, point)
+                                if pressed.as_deref() != Some(up_key.as_str()) {
+                                    return false;
+                                }
+                                if card_action {
+                                    dialog.action_hit(&up_key, point)
+                                } else {
+                                    let bounds = Rect::new(
+                                        dialog.bounds.x + rect.x,
+                                        dialog.bounds.y + rect.y,
+                                        rect.w,
+                                        rect.h,
+                                    );
+                                    bounds.contains(point)
+                                }
                             });
                             if fire {
                                 s.run_recording_action(&up_key, window, cx);

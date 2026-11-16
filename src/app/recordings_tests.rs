@@ -10,7 +10,7 @@ use voxhold_api::{Recording, RECORDING_DELETED, RECORDING_READY, RECORDING_START
 
 const ID: &str = "0123456789abcdef0123456789abcdef";
 
-fn recording_json(id: &str, status: &str, updated: i64) -> serde_json::Value {
+pub(super) fn recording_json(id: &str, status: &str, updated: i64) -> serde_json::Value {
     serde_json::json!({
         "id": id,
         "server_id": 1,
@@ -28,7 +28,7 @@ fn recording_json(id: &str, status: &str, updated: i64) -> serde_json::Value {
     })
 }
 
-fn list_json(rows: &[serde_json::Value]) -> String {
+pub(super) fn list_json(rows: &[serde_json::Value]) -> String {
     serde_json::json!({
         "recordings": rows,
         "quota_bytes": (6i64 << 30),
@@ -42,7 +42,7 @@ fn record(id: &str, status: &str, updated: i64) -> Recording {
     serde_json::from_value(recording_json(id, status, updated)).unwrap()
 }
 
-fn recording_without_preview(id: &str, status: &str, updated: i64) -> serde_json::Value {
+pub(super) fn recording_without_preview(id: &str, status: &str, updated: i64) -> serde_json::Value {
     let mut row = recording_json(id, status, updated);
     row["preview_version"] = serde_json::Value::Null;
     row
@@ -60,13 +60,13 @@ fn jpeg(width: u32, height: u32) -> Vec<u8> {
     out
 }
 
-fn client(base: &str) -> voxhold_api::Client {
+pub(super) fn client(base: &str) -> voxhold_api::Client {
     let mut client = voxhold_api::Client::new(base).unwrap();
     client.set_token("token".into());
     client
 }
 
-fn calls(server: &TestServer, suffix: &str) -> usize {
+pub(super) fn calls(server: &TestServer, suffix: &str) -> usize {
     server
         .requests()
         .iter()
@@ -94,6 +94,17 @@ fn wait_arrival(visual: &mut VisualTestContext, gate: &Gate) {
         std::thread::sleep(Duration::from_millis(5));
     }
     panic!("the gated request never arrived");
+}
+
+fn at(x: f32, y: f32) -> gpui::Point<gpui::Pixels> {
+    gpui::point(gpui::px(x), gpui::px(y))
+}
+
+fn draw(visual: &mut VisualTestContext) {
+    visual.update(|window, app| {
+        window.draw(app).clear();
+    });
+    visual.run_until_parked();
 }
 
 #[test]
@@ -331,17 +342,65 @@ async fn recordings_hide_metadata_while_access_is_unconfirmed(cx: &mut TestAppCo
 }
 
 #[gpui::test]
-async fn recording_overflow_unconfirms_the_snapshot_in_a_direct_chat(cx: &mut TestAppContext) {
+async fn recording_modal_close_buttons_respond_to_real_mouse(cx: &mut TestAppContext) {
     cx.update(|cx| gpui_component::init(cx));
-    let mut ready = recording_json(&"1".repeat(32), RECORDING_READY, 1);
-    let mut live = recording_json(&"2".repeat(32), RECORDING_STARTED, 2);
-    ready["preview_version"] = serde_json::Value::Null;
-    live["preview_version"] = serde_json::Value::Null;
-    let both = list_json(&[ready, live]);
-    let gate = Gate::new();
+    let ready = list_json(&[recording_without_preview(ID, RECORDING_READY, 1)]);
+    let server = TestServer::spawn(vec![Reply::new(200, &ready), Reply::new(200, &ready)]);
+    let (window, view) = make_app(cx, client(&server.base));
+    let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
+    visual.update(|window, app| {
+        view.update(app, |v, cx| v.toggle_recordings("header", window, cx));
+    });
+    wait_for(&mut visual, &view, |v| !v.recordings.loading);
+    draw(&mut visual);
+    let (x, y) = view.read_with(&*visual, |v, _| {
+        let dialog = v.recordings_dialog.as_ref().unwrap();
+        (
+            dialog.bounds.x + dialog.bounds.w - dialog.padding - 32. + 16.,
+            dialog.bounds.y + 17. + 16.,
+        )
+    });
+    visual.simulate_mouse_down(at(x, y), MouseButton::Left, gpui::Modifiers::default());
+    view.read_with(&*visual, |v, _| {
+        assert_eq!(
+            v.recordings_dialog
+                .as_ref()
+                .and_then(|dialog| dialog.pressed.as_deref()),
+            Some("rec-close"),
+            "the close press did not register at {x},{y}"
+        );
+    });
+    visual.simulate_mouse_up(at(x, y), MouseButton::Left, gpui::Modifiers::default());
+    view.read_with(&*visual, |v, _| assert!(v.recordings_dialog.is_none()));
+
+    // The footer "Закрыть" button has its own bounds as well.
+    visual.update(|window, app| {
+        view.update(app, |v, cx| v.toggle_recordings("header", window, cx));
+    });
+    wait_for(&mut visual, &view, |v| {
+        !v.recordings.loading && v.recordings_dialog.is_some()
+    });
+    draw(&mut visual);
+    let (x, y) = view.read_with(&*visual, |v, _| {
+        let dialog = v.recordings_dialog.as_ref().unwrap();
+        (
+            dialog.bounds.x + dialog.bounds.w
+                - dialog.padding
+                - crate::recordings::DISMISS_WIDTH / 2.,
+            dialog.footer_top + 15. + crate::recordings::DISMISS_HEIGHT / 2.,
+        )
+    });
+    visual.simulate_click(at(x, y), gpui::Modifiers::default());
+    view.read_with(&*visual, |v, _| assert!(v.recordings_dialog.is_none()));
+}
+
+#[gpui::test]
+async fn recording_retry_click_sends_exactly_one_list_request(cx: &mut TestAppContext) {
+    cx.update(|cx| gpui_component::init(cx));
+    let ready = list_json(&[recording_without_preview(ID, RECORDING_READY, 1)]);
     let server = TestServer::spawn(vec![
-        Reply::new(200, &both),
-        Reply::new(503, "{\"error\":\"unavailable\"}").with_gate(gate.clone()),
+        Reply::new(503, "{\"error\":\"unavailable\"}"),
+        Reply::new(200, &ready),
     ]);
     let (window, view) = make_app(cx, client(&server.base));
     let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
@@ -349,149 +408,34 @@ async fn recording_overflow_unconfirms_the_snapshot_in_a_direct_chat(cx: &mut Te
         view.update(app, |v, cx| v.toggle_recordings("header", window, cx));
     });
     wait_for(&mut visual, &view, |v| {
-        !v.recordings.loading && v.recordings.confirmed_epoch == Some(v.recordings.access_epoch)
+        !v.recordings.loading && !v.recordings.error.is_empty()
     });
-    let previews_before = calls(&server, "/preview");
-
-    // The queue overflowed, so `channels.changed` may be gone. A personal
-    // conversation must still unconfirm the server snapshot as soon as the
-    // batch is processed, and the next list is held open.
-    gate.arm();
-    visual.update(|window, app| {
-        view.update(app, |v, cx| {
-            v.conversation = Some(voxhold_api::Conversation {
-                id: 99,
-                direct: true,
-                ..Default::default()
-            });
-            v.access_pending = true;
-            v.events_overflow
-                .store(true, std::sync::atomic::Ordering::SeqCst);
-            v.process_realtime_batch(window, cx);
-        });
+    assert_eq!(calls(&server, "/recordings"), 1);
+    draw(&mut visual);
+    let (x, y) = view.read_with(&*visual, |v, _| {
+        let dialog = v.recordings_dialog.as_ref().unwrap();
+        (
+            dialog.bounds.x + dialog.bounds.w
+                - dialog.padding
+                - crate::recordings::DISMISS_WIDTH
+                - 96.
+                + crate::recordings::RETRY_WIDTH / 2.,
+            dialog.footer_top + 18. + crate::recordings::RETRY_HEIGHT / 2.,
+        )
     });
-    view.read_with(&*visual, |v, _| {
-        assert!(v.recordings.sorted(1_700_000_100).is_empty());
-        assert!(v.recordings.live(7, 1_700_000_100).is_none());
-    });
-
-    // While the new GET is held no card, live marker or preview may appear.
-    visual.update(|window, app| {
-        view.update(app, |v, _| {
-            v.conversation = None;
-            v.access_pending = false;
-        });
-        window.draw(app).clear();
+    visual.simulate_click(at(x, y), gpui::Modifiers::default());
+    wait_for(&mut visual, &view, |v| {
+        !v.recordings.loading && v.recordings.error.is_empty()
     });
     assert_eq!(
-        calls(&server, "/preview"),
-        previews_before,
-        "an unconfirmed snapshot started a preview"
+        calls(&server, "/recordings"),
+        2,
+        "one click must start exactly one retry"
     );
-    gate.release();
-
-    // A 503 does not re-confirm what the access change already invalidated.
-    wait_for(&mut visual, &view, |v| {
-        !v.recordings.loading && !v.recordings.error.is_empty()
-    });
-    view.read_with(&*visual, |v, _| {
-        assert!(v.recordings.sorted(1_700_000_100).is_empty());
-        assert!(v.recordings.live(7, 1_700_000_100).is_none());
-    });
 }
 
 #[gpui::test]
-async fn recording_tombstone_survives_a_404_and_an_old_ready(cx: &mut TestAppContext) {
-    cx.update(|cx| gpui_component::init(cx));
-    let deleted_id = "1".repeat(32);
-    let kept_id = "2".repeat(32);
-    let mut deleted = recording_json(&deleted_id, RECORDING_READY, 1);
-    let mut kept = recording_json(&kept_id, RECORDING_READY, 2);
-    deleted["preview_version"] = serde_json::Value::Null;
-    kept["preview_version"] = serde_json::Value::Null;
-    let both = list_json(&[deleted.clone(), kept.clone()]);
-    let tombstone = serde_json::to_string(&serde_json::json!({
-        "id": deleted_id,
-        "server_id": 1,
-        "channel_id": 7,
-        "owner_user_id": 1,
-        "owner_username": "owner",
-        "status": RECORDING_DELETED,
-        "updated_at": 3,
-        "expires_at": 1_800_000_000,
-    }))
-    .unwrap();
-    let server = TestServer::spawn(vec![
-        Reply::new(200, &both),
-        Reply::new(200, &tombstone),
-        Reply::new(404, "{\"error\":\"not found\"}"),
-        Reply::new(200, &both),
-    ]);
-    let (window, view) = make_app(cx, client(&server.base));
-    let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
-    visual.update(|window, app| {
-        view.update(app, |v, cx| v.toggle_recordings("header", window, cx));
-    });
-    wait_for(&mut visual, &view, |v| {
-        !v.recordings.loading && v.recordings.records.len() == 2
-    });
-    let row = view.read_with(&*visual, |v, _| {
-        v.recordings
-            .records
-            .iter()
-            .find(|row| row.id == deleted_id)
-            .cloned()
-            .unwrap()
-    });
-    visual.update(|window, app| {
-        view.update(app, |v, cx| v.delete_recording(row, window, cx));
-    });
-    wait_for(&mut visual, &view, |v| v.recordings.tombstones.contains(&deleted_id));
-
-    visual.update(|window, app| {
-        view.update(app, |v, cx| v.refresh_recordings(0, window, cx));
-    });
-    wait_for(&mut visual, &view, |v| {
-        !v.recordings.loading && !v.recordings.error.is_empty()
-    });
-    view.read_with(&*visual, |v, _| {
-        assert_eq!(v.recordings.confirmed_epoch, None);
-        assert!(v.recordings.sorted(1_700_000_100).is_empty());
-        assert!(v.recordings.tombstones.contains(&deleted_id));
-    });
-
-    // An old ready event unconfirms again but must not drop the tombstone; the
-    // successful list still hides the deleted row instead of resurrecting it.
-    visual.update(|window, app| {
-        view.update(app, |v, cx| {
-            let (tx, rx) = std::sync::mpsc::sync_channel(1);
-            tx.send(voxhold_api::RealtimeEvent {
-                kind: "ready".into(),
-                ..Default::default()
-            })
-            .unwrap();
-            v.events = Some(std::sync::Arc::new(std::sync::Mutex::new(rx)));
-            v.events_overflow = Default::default();
-            v.process_realtime_batch(window, cx);
-        });
-    });
-    wait_for(&mut visual, &view, |v| {
-        !v.recordings.loading && v.recordings.confirmed_epoch == Some(v.recordings.access_epoch)
-    });
-    view.read_with(&*visual, |v, _| {
-        let ids: Vec<String> = v
-            .recordings
-            .sorted(1_700_000_100)
-            .into_iter()
-            .map(|row| row.id)
-            .collect();
-        assert_eq!(ids, vec![kept_id.clone()]);
-        assert!(v.recordings.tombstones.contains(&deleted_id));
-    });
-}
-
-#[gpui::test]
-async fn late_recording_pick_cannot_clear_another_attempt(cx: &mut TestAppContext) {
+async fn recording_backdrop_blocks_the_search_button_below(cx: &mut TestAppContext) {
     cx.update(|cx| gpui_component::init(cx));
     let ready = list_json(&[recording_without_preview(ID, RECORDING_READY, 1)]);
     let server = TestServer::spawn(vec![Reply::new(200, &ready)]);
@@ -500,173 +444,73 @@ async fn late_recording_pick_cannot_clear_another_attempt(cx: &mut TestAppContex
     visual.update(|window, app| {
         view.update(app, |v, cx| v.toggle_recordings("header", window, cx));
     });
-    wait_for(&mut visual, &view, |v| {
-        !v.recordings.loading && v.recordings.records.len() == 1
+    wait_for(&mut visual, &view, |v| !v.recordings.loading);
+    draw(&mut visual);
+    let search = visual
+        .debug_bounds("toggle-search")
+        .expect("the header search button is rendered");
+    let point = search.center();
+    visual.simulate_click(point, gpui::Modifiers::default());
+    view.read_with(&*visual, |v, _| {
+        assert!(v.recordings_dialog.is_none(), "the modal stayed open");
+        assert!(
+            !v.show_search,
+            "the click went through the backdrop to the search button"
+        );
     });
-    let path = std::env::temp_dir().join("voxhold-late-recording-pick.mp4");
-    visual.update(|window, app| {
-        view.update(app, |v, cx| {
-            let first = v.next_recording_op(ID).unwrap();
-            let second = v.next_recording_op(ID).unwrap();
-            if let Some(dialog) = v.recordings_dialog.as_mut() {
-                dialog.busy = ID.into();
-                dialog.busy_attempt = second.attempt;
-                dialog.confirm = ID.into();
-                dialog.error = "operation B".into();
-            }
-            // Both answers belong to A; neither may clear B's busy state, its
-            // confirmation, its error, or request a ticket.
-            v.resolve_recording_pick(first.clone(), None, cx);
-            v.resolve_recording_pick(first, Some(path), cx);
-            let dialog = v.recordings_dialog.as_ref().unwrap();
-            assert_eq!(dialog.busy, ID);
-            assert_eq!(dialog.busy_attempt, second.attempt);
-            assert_eq!(dialog.confirm, ID);
-            assert_eq!(dialog.error, "operation B");
-            let _ = window;
-        });
-    });
-    assert_eq!(calls(&server, "/download"), 0);
 }
 
 #[gpui::test]
-async fn recording_delete_closed_dialog_still_applies_the_tombstone(cx: &mut TestAppContext) {
+async fn recording_release_outside_the_list_clears_the_press(cx: &mut TestAppContext) {
     cx.update(|cx| gpui_component::init(cx));
-    let deleted_id = "1".repeat(32);
-    let kept_id = "2".repeat(32);
-    let both = list_json(&[
-        recording_without_preview(&deleted_id, RECORDING_READY, 1),
-        recording_without_preview(&kept_id, RECORDING_READY, 2),
-    ]);
-    let remaining = list_json(&[recording_without_preview(&kept_id, RECORDING_READY, 2)]);
-    let tombstone = serde_json::to_string(&serde_json::json!({
-        "id": deleted_id,
-        "server_id": 1,
-        "channel_id": 7,
-        "owner_user_id": 1,
-        "owner_username": "owner",
-        "status": RECORDING_DELETED,
-        "updated_at": 3,
-        "expires_at": 1_800_000_000,
-    }))
-    .unwrap();
-    let server = TestServer::spawn(vec![
-        Reply::new(200, &both),
-        Reply::new(200, &tombstone).with_delay(Duration::from_millis(300)),
-        Reply::new(200, &remaining),
-    ]);
+    let rows = [
+        recording_without_preview(&"1".repeat(32), RECORDING_READY, 1),
+        recording_without_preview(&"2".repeat(32), RECORDING_READY, 2),
+        recording_without_preview(&"3".repeat(32), RECORDING_READY, 3),
+    ];
+    let list = list_json(&rows);
+    let server = TestServer::spawn(vec![Reply::new(200, &list)]);
     let (window, view) = make_app(cx, client(&server.base));
     let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
+    visual.simulate_resize(gpui::size(gpui::px(390.), gpui::px(760.)));
     visual.update(|window, app| {
         view.update(app, |v, cx| v.toggle_recordings("header", window, cx));
     });
-    wait_for(&mut visual, &view, |v| {
-        !v.recordings.loading && v.recordings.records.len() == 2
+    wait_for(&mut visual, &view, |v| !v.recordings.loading);
+    draw(&mut visual);
+    let (point, key, list_y) = view.read_with(&*visual, |v, _| {
+        let dialog = v.recordings_dialog.as_ref().unwrap();
+        assert!(dialog.max_scroll > 0.);
+        let row = &dialog.rows[0];
+        assert!(dialog.list.contains(row.download.center()));
+        (
+            row.download.center(),
+            row.record.id.clone(),
+            dialog.list.y,
+        )
     });
-    let row = view.read_with(&*visual, |v, _| {
-        v.recordings
-            .records
-            .iter()
-            .find(|row| row.id == deleted_id)
-            .cloned()
-            .unwrap()
-    });
-    visual.update(|window, app| {
-        view.update(app, |v, cx| {
-            v.delete_recording(row, window, cx);
-            assert_eq!(
-                v.recordings_dialog
-                    .as_ref()
-                    .map(|dialog| dialog.busy.as_str()),
-                Some(deleted_id.as_str()),
-                "delete did not start"
-            );
-        });
-    });
-    visual.update(|window, app| {
-        view.update(app, |v, cx| v.close_recordings(true, window, cx));
-    });
-    wait_for(&mut visual, &view, |v| {
-        v.recordings.tombstones.contains(&deleted_id)
-    });
-    view.read_with(&*visual, |v, _| {
-        assert!(!v.recordings.records.iter().any(|row| row.id == deleted_id));
-    });
-
-    // Reopening starts from a fresh attempt, not the closed one's busy row.
-    visual.update(|window, app| {
-        view.update(app, |v, cx| v.toggle_recordings("header", window, cx));
-    });
-    wait_for(&mut visual, &view, |v| {
-        !v.recordings.loading
-            && v.recordings_dialog
-                .as_ref()
-                .is_some_and(|dialog| dialog.rows.len() == 1)
-    });
+    visual.simulate_mouse_down(at(point.0, point.1), MouseButton::Left, Default::default());
     view.read_with(&*visual, |v, _| {
         let dialog = v.recordings_dialog.as_ref().unwrap();
-        assert!(dialog.busy.is_empty());
-        assert_eq!(dialog.busy_attempt, 0);
-        assert!(dialog.confirm.is_empty());
-        assert_eq!(dialog.rows[0].record.id, kept_id);
+        assert_eq!(
+            dialog.pressed.as_deref(),
+            Some(format!("rec-download-{key}").as_str())
+        );
     });
-}
 
-#[gpui::test]
-async fn recording_delete_from_an_old_server_is_discarded(cx: &mut TestAppContext) {
-    cx.update(|cx| gpui_component::init(cx));
-    let ready = list_json(&[recording_without_preview(ID, RECORDING_READY, 1)]);
-    let tombstone = serde_json::to_string(&serde_json::json!({
-        "id": ID,
-        "server_id": 1,
-        "channel_id": 7,
-        "owner_user_id": 1,
-        "owner_username": "owner",
-        "status": RECORDING_DELETED,
-        "updated_at": 3,
-        "expires_at": 1_800_000_000,
-    }))
-    .unwrap();
-    let server = TestServer::spawn(vec![
-        Reply::new(200, &ready),
-        Reply::new(200, &tombstone).with_delay(Duration::from_millis(300)),
-    ]);
-    let (window, view) = make_app(cx, client(&server.base));
-    let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
-    visual.update(|window, app| {
-        view.update(app, |v, cx| v.toggle_recordings("header", window, cx));
-    });
-    wait_for(&mut visual, &view, |v| {
-        !v.recordings.loading && v.recordings.records.len() == 1
-    });
-    let row = view.read_with(&*visual, |v, _| {
-        v.recordings.records[0].clone()
-    });
-    visual.update(|window, app| {
-        view.update(app, |v, cx| {
-            v.delete_recording(row, window, cx);
-            assert!(
-                v.recordings_dialog
-                    .as_ref()
-                    .is_some_and(|dialog| !dialog.busy.is_empty()),
-                "delete did not start"
-            );
-        });
-    });
-    visual.update(|window, app| {
-        view.update(app, |v, cx| {
-            v.reset_recordings(window, cx);
-            v.server = 2;
-            v.recordings.server_id = 2;
-        });
-    });
-    visual.run_until_parked();
-    std::thread::sleep(Duration::from_millis(450));
-    visual.run_until_parked();
+    // Release above the list: the press must be dropped without running the
+    // card action.
+    visual.simulate_mouse_up(
+        at(point.0, list_y - 10.),
+        MouseButton::Left,
+        Default::default(),
+    );
     view.read_with(&*visual, |v, _| {
-        assert!(!v.recordings.tombstones.contains(ID));
-        assert!(v.recordings.records.is_empty());
+        let dialog = v.recordings_dialog.as_ref().unwrap();
+        assert!(dialog.pressed.is_none(), "the outside release kept pressed");
+        assert!(dialog.busy.is_empty(), "the outside release ran the action");
     });
+    assert_eq!(calls(&server, "/download"), 0);
 }
 
 #[gpui::test]

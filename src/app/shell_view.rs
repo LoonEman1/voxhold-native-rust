@@ -268,6 +268,7 @@ impl Render for Voxhold {
                     .child(
                         div()
                             .id("toggle-search")
+                            .debug_selector(|| "toggle-search".into())
                             .flex()
                             .items_center()
                             .gap_2()

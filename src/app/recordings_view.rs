@@ -306,7 +306,9 @@ impl Voxhold {
             MouseButton::Left,
             cx.listener(|s, _: &gpui::MouseUpEvent, _, cx| {
                 if let Some(dialog) = s.recordings_dialog.as_mut() {
-                    if dialog.pressed.take().is_some() {
+                    let pressed = dialog.pressed.take().is_some();
+                    let backdrop = std::mem::replace(&mut dialog.backdrop_pressed, false);
+                    if pressed || backdrop {
                         cx.notify();
                     }
                 }

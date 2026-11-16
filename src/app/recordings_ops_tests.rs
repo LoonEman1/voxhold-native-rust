@@ -540,3 +540,74 @@ async fn recording_voice_close_falls_back_when_the_call_panel_is_hidden(cx: &mut
         });
     });
 }
+
+#[gpui::test]
+async fn recording_backdrop_requires_one_completed_outside_click(cx: &mut TestAppContext) {
+    cx.update(|cx| gpui_component::init(cx));
+    let ready = list_json(&[recording_without_preview(ID, RECORDING_READY, 1)]);
+    let server = TestServer::spawn(vec![Reply::new(200, &ready)]);
+    let (window, view) = make_app(cx, client(&server.base));
+    let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
+    visual.simulate_resize(gpui::size(gpui::px(1440.), gpui::px(900.)));
+    visual.update(|window, app| {
+        view.update(app, |v, cx| v.toggle_recordings("header", window, cx));
+    });
+    wait_for(&mut visual, &view, |v| !v.recordings.loading);
+    draw(&mut visual);
+    let (outside, inside) = view.read_with(&*visual, |v, _| {
+        let dialog = v.recordings_dialog.as_ref().unwrap();
+        let outside = (dialog.bounds.x - 20., dialog.bounds.y + 30.);
+        let inside = (dialog.bounds.x + 12., dialog.bounds.y + 12.);
+        assert!(!dialog.bounds.contains(outside));
+        assert!(dialog.bounds.contains(inside));
+        (outside, inside)
+    });
+
+    // Press outside, release inside: the card consumes the release and must
+    // also drop the backdrop press, or the next gesture closes the modal.
+    visual.simulate_mouse_down(
+        at(outside.0, outside.1),
+        MouseButton::Left,
+        Default::default(),
+    );
+    view.read_with(&*visual, |v, _| {
+        assert!(v
+            .recordings_dialog
+            .as_ref()
+            .is_some_and(|dialog| dialog.backdrop_pressed));
+    });
+    visual.simulate_mouse_up(
+        at(inside.0, inside.1),
+        MouseButton::Left,
+        Default::default(),
+    );
+    view.read_with(&*visual, |v, _| {
+        assert!(v.recordings_dialog.is_some());
+        assert!(v
+            .recordings_dialog
+            .as_ref()
+            .is_some_and(|dialog| !dialog.backdrop_pressed));
+    });
+
+    // A second gesture starting inside and ending outside must not complete the
+    // first press either.
+    visual.simulate_mouse_down(
+        at(inside.0, inside.1),
+        MouseButton::Left,
+        Default::default(),
+    );
+    visual.simulate_mouse_up(
+        at(outside.0, outside.1),
+        MouseButton::Left,
+        Default::default(),
+    );
+    view.read_with(&*visual, |v, _| {
+        assert!(v.recordings_dialog.is_some());
+    });
+
+    // One click fully outside still closes the dialog.
+    visual.simulate_click(at(outside.0, outside.1), gpui::Modifiers::default());
+    view.read_with(&*visual, |v, _| {
+        assert!(v.recordings_dialog.is_none());
+    });
+}

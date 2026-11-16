@@ -7,3 +7,8 @@
 #
 # There are currently no exceptions.
 src/app/history_view.rs|1200|The row painter keeps hover actions, quote/link identity, inline edit and delete confirmation in one closure over the same row snapshot; extracting it would duplicate a dozen scope captures and make the two-click targets harder to audit.
+src/app/server_ops.rs|1200|Server administration handlers share one request token/settle/error path across roles, storage, cleanup and bans; splitting the file would duplicate the same dialog generation checks and make late-answer review harder.
+src/settings.rs|1200|The pure settings model keeps dialog generations, form snapshots, role/action rules, cleanup selection, country data and avatar crop math together so every view and test uses one source for scope and permission checks.
+src/app/personal_ops.rs|1200|Personal settings requests share one dialog generation/settle path and the profile, privacy, password, session and account flows depend on the same form state; splitting would scatter the late-answer checks.
+src/app/settings_tests.rs|1200|The settings race tests share one TestServer/Gate setup and the helper window builder; splitting by dialog would duplicate the same request-release choreography that the late-answer cases rely on.
+docs/development-plan.md|1200|The task descriptions, acceptance criteria, status table and per-PR execution journal are one plan that reviewers read together; splitting them would break the mapping between a task and its recorded result.

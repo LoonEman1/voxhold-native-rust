@@ -89,25 +89,10 @@ impl Voxhold {
                 })
                 .detach();
                 s.attachments = Some(attachments);
-                let runtime = s.runtime.clone();
-                let settings_client = c.clone();
-                s.settings = Some(cx.new(|cx| {
-                    personal_settings::PersonalSettings::new(settings_client, runtime, window, cx)
-                }));
-                let runtime = s.runtime.clone();
-                let server_admin_client = c.clone();
-                s.server_settings = Some(cx.new(|cx| {
-                    server_settings::ServerSettings::new(
-                        server_admin_client,
-                        runtime.clone(),
-                        window,
-                        cx,
-                    )
-                }));
-                let admin_client = c.clone();
-                s.channel_settings = Some(cx.new(|cx| {
-                    channel_settings::ChannelSettings::new(admin_client, runtime, window, cx)
-                }));
+                s.personal = Some(personal_settings::PersonalSettings::new(window, cx));
+                s.server_settings = Some(server_settings::ServerSettings::new(window, cx));
+                s.channel_settings = Some(channel_settings::ChannelSettings::new(window, cx));
+                s.channel_notifications = Some(channel_settings::ChannelNotifications::new());
                 s.inbox = Some(cx.new(|_| inbox::Inbox::new()));
                 let inbox = s.inbox.clone().expect("inbox");
                 let weak = cx.entity().downgrade();
@@ -136,9 +121,15 @@ impl Voxhold {
                     }));
                 });
                 s.self_user_id = self_user_id;
+                s.active_profile_save = None;
+                s.notification_saves.clear();
                 s.client = Some(c.clone());
                 s.start_realtime(c, window, cx);
                 s.servers = servers;
+                s.personal = Some(personal_settings::PersonalSettings::new(window, cx));
+                s.server_settings = Some(server_settings::ServerSettings::new(window, cx));
+                s.channel_settings = Some(channel_settings::ChannelSettings::new(window, cx));
+                s.channel_notifications = Some(channel_settings::ChannelNotifications::new());
                 s.auth.status = "Choose a server".into();
                 // Go selects the first server after login; an empty list leaves
                 // the workspace on its empty state. This also gives narrow
@@ -160,6 +151,8 @@ impl Voxhold {
             pending.abort.abort();
         }
         self.session_generation = self.session_generation.wrapping_add(1);
+        self.active_profile_save = None;
+        self.notification_saves.clear();
         #[cfg(feature = "voxhold-media")]
         if let Some(voice) = self.voice.take() {
             voice.update(cx, |voice, cx| voice.leave_in_window(window, cx));
@@ -242,15 +235,16 @@ impl Voxhold {
         self.recents_again = false;
         self.channel_snapshot_request = None;
         self.attachments = None;
-        self.settings = None;
+        self.personal = None;
         self.server_settings = None;
         self.channel_settings = None;
+        self.channel_notifications = None;
+        self.active_settings = None;
+        self.settings_return_focus = None;
+        self.settings_ring.clear();
         self.inbox = None;
         self.search = None;
         self.show_inbox = false;
-        self.show_settings = false;
-        self.show_server_settings = false;
-        self.show_channel_settings = false;
         self.show_search = false;
         self.show_servers = false;
         self.auth = {

@@ -92,6 +92,7 @@ impl Voxhold {
                 let mut conversation_reactions = Vec::new();
                 for event in &events {
                     s.forward_thread_event(event, window, cx);
+                    s.deliver_notification(event, window);
                     let effect = s.apply_realtime_event(&event.kind, &event.data);
                     resync |= effect.resync;
                     access |= effect.access;
@@ -176,6 +177,24 @@ impl Voxhold {
         })
         .detach();
     }
+    /// A native notification is offered only while the setting is enabled and
+    /// the window is not focused. A failed tray call does not remember the key,
+    /// so the next identical event can retry.
+    fn deliver_notification(&mut self, event: &voxhold_api::RealtimeEvent, window: &Window) {
+        let active = window.is_window_active() || self.window_active;
+        let Some((key, title, body)) =
+            self.notifications
+                .offer(&event.kind, &event.data, &self.auth.username, active)
+        else {
+            return;
+        };
+        let hwnd = super::personal_ops::hwnd(window);
+        match self.notification_tray.show(hwnd, &title, &body) {
+            Ok(()) => self.notifications.shown(&key),
+            Err(error) => self.notifications.failed(error),
+        }
+    }
+
     pub(super) fn message_in_scope(&self, message: &Message) -> bool {
         if self.in_conversation() {
             message.conversation_id == self.channel && message.thread_root_id.is_none()
@@ -315,6 +334,7 @@ impl Voxhold {
                     self.members
                         .retain(|current| current.user_id != member.user_id);
                     self.members.push(member);
+                    crate::members::sort_members(&mut self.members);
                 }
                 effect.access = true;
             }
@@ -554,6 +574,31 @@ impl Voxhold {
                                 *entry = update;
                             }
                         }
+                    }
+                }
+            }
+            "notification.settings_updated" => {
+                let server = data["server_id"].as_i64();
+                let channel = data["channel_id"].as_i64();
+                let mode = data["mode"].as_str().unwrap_or_default();
+                if let Some(panel) = &mut self.channel_notifications {
+                    if panel.server == server.unwrap_or_default()
+                        && panel.channel == channel.unwrap_or_default()
+                        && !mode.is_empty()
+                    {
+                        // Keep an unsaved local choice. The confirmed value is
+                        // always replaced, and the local editor follows it only
+                        // when it still matched the old confirmed value.
+                        let edited = panel.mode != panel.saved;
+                        panel.saved = mode.to_owned();
+                        if !edited {
+                            panel.mode = mode.to_owned();
+                        }
+                        panel.loaded = true;
+                        panel.error.clear();
+                        // A GET that started before this event carries an
+                        // older snapshot and must not overwrite the event.
+                        panel.epoch = panel.epoch.wrapping_add(1);
                     }
                 }
             }

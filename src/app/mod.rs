@@ -1,5 +1,9 @@
 mod action_io;
+mod admin_view;
 mod auth_view;
+mod avatar_ops;
+mod channel_ops;
+mod channel_view;
 mod composer;
 mod history_actions;
 mod history_ops;
@@ -9,8 +13,16 @@ mod media_ops;
 mod members_view;
 mod navigation_view;
 mod overlays_view;
+mod personal_ops;
+mod profile_view;
 mod realtime;
+mod server_ops;
 mod session;
+#[cfg(test)]
+mod settings_review;
+#[cfg(test)]
+mod settings_tests;
+mod settings_view;
 mod shell_view;
 #[cfg(test)]
 mod tests;
@@ -20,8 +32,8 @@ pub(crate) mod ui;
 mod workspace;
 
 use gpui::{
-    div, list, prelude::*, px, rgba, AnyElement, Context, Entity, ListAlignment, ListState,
-    MouseButton, Render, Window,
+    div, list, prelude::*, px, rgba, AnyElement, Context, Entity, FocusHandle, ListAlignment,
+    ListState, MouseButton, Render, Window,
 };
 use gpui_component::input::{InputState, TextInput};
 use layout::{SplitterDrag, SplitterSide};
@@ -60,6 +72,18 @@ struct ScrollbarDrag {
     grab: f32,
 }
 
+/// One open member context menu (`openMemberMenu` in Go). Every paint re-reads
+/// the member and the current server role before enabling an action.
+#[derive(Clone, Debug)]
+struct MemberMenu {
+    user_id: i64,
+    x: f32,
+    y: f32,
+    profile: bool,
+    confirm_block: bool,
+    confirm_ban: bool,
+}
+
 /// One open context menu. Only the id is authoritative: every paint re-reads
 /// the row and its permissions from the current snapshot.
 #[derive(Clone, Debug)]
@@ -86,6 +110,28 @@ struct ActionRequest {
 struct ConversationReactionRequest {
     request: u64,
     again: bool,
+}
+
+/// One settings surface at a time, like the Go client's single `settings`
+/// dialog. Opening another surface closes the current one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SettingsKind {
+    Personal,
+    Server,
+    Channel,
+    ChannelNotifications,
+}
+
+/// A visible settings control reachable by Tab. `None` keeps text inputs in
+/// the traversal ring without giving them a mouse action.
+#[derive(Clone, Debug)]
+enum SettingsAct {
+    Close,
+    Tab(usize),
+    Personal(personal_settings::Action),
+    Server(server_settings::Action),
+    Channel(channel_settings::Action),
+    Notifications(channel_settings::NotifAction),
 }
 
 #[derive(Clone, Debug)]
@@ -116,6 +162,7 @@ pub(crate) struct Voxhold {
     thread: Option<Entity<thread_panel::ThreadPanel>>,
     show_thread: bool,
     message_menu: Option<MessageMenu>,
+    member_menu: Option<MemberMenu>,
     forward: Option<ForwardState>,
     action_requests: std::collections::HashMap<String, ActionRequest>,
     action_seq: u64,
@@ -138,12 +185,23 @@ pub(crate) struct Voxhold {
     recents_again: bool,
     channel_snapshot_request: Option<u64>,
     attachments: Option<Entity<attachments::Attachments>>,
-    settings: Option<Entity<personal_settings::PersonalSettings>>,
-    show_settings: bool,
-    channel_settings: Option<Entity<channel_settings::ChannelSettings>>,
-    show_channel_settings: bool,
-    server_settings: Option<Entity<server_settings::ServerSettings>>,
-    show_server_settings: bool,
+    personal: Option<personal_settings::PersonalSettings>,
+    server_settings: Option<server_settings::ServerSettings>,
+    channel_settings: Option<channel_settings::ChannelSettings>,
+    channel_notifications: Option<channel_settings::ChannelNotifications>,
+    voice_settings: crate::voice_settings::VoiceSettings,
+    notifications: crate::notifications::NotificationCenter,
+    notification_tray: crate::notifications::Tray,
+    active_settings: Option<SettingsKind>,
+    settings_return_focus: Option<FocusHandle>,
+    settings_ring: Vec<(FocusHandle, Option<SettingsAct>)>,
+    settings_scroll: gpui::ScrollHandle,
+    settings_close_focus: FocusHandle,
+    settings_entry_focus: FocusHandle,
+    server_entry_focus: FocusHandle,
+    channel_entry_focus: FocusHandle,
+    notifications_entry_focus: FocusHandle,
+    window_active: bool,
     inbox: Option<Entity<inbox::Inbox>>,
     show_inbox: bool,
     show_members: bool,
@@ -237,6 +295,12 @@ pub(crate) struct Voxhold {
     /// Changes on login and logout; a send result from another session is
     /// discarded even when it arrives after the channel was switched.
     session_generation: u64,
+    /// PATCH in flight for the personal profile. The lock belongs to the
+    /// session, not to one dialog instance, so reopening the form cannot start
+    /// a second write to the same resource.
+    active_profile_save: Option<u64>,
+    /// PUT in flight per notification channel; same session-level rule.
+    notification_saves: std::collections::HashMap<(i64, i64), u64>,
     busy: bool,
     generation: u64,
     drafts: draft::Shared,
@@ -316,6 +380,12 @@ impl Voxhold {
         let recent_reactions = reactions::SharedRecents::default();
         let reaction_picker =
             cx.new(|cx| reactions::ReactionPicker::new(recent_reactions.clone(), window, cx));
+        let notification_path = shell_path
+            .as_deref()
+            .map(crate::notifications::path_from_layout);
+        let voice_path = shell_path
+            .as_deref()
+            .map(crate::voice_settings::path_from_layout);
         let view = Self {
             runtime: std::sync::Arc::new(tokio::runtime::Runtime::new().expect("Tokio runtime")),
             instance: cx.new(|cx| InputState::new(window, cx).placeholder("https://example.com")),
@@ -339,6 +409,7 @@ impl Voxhold {
             thread: None,
             show_thread: false,
             message_menu: None,
+            member_menu: None,
             forward: None,
             action_requests: Default::default(),
             action_seq: 0,
@@ -365,12 +436,23 @@ impl Voxhold {
             recents_again: false,
             channel_snapshot_request: None,
             attachments: None,
-            settings: None,
-            show_settings: false,
-            channel_settings: None,
-            show_channel_settings: false,
+            personal: None,
             server_settings: None,
-            show_server_settings: false,
+            channel_settings: None,
+            channel_notifications: None,
+            voice_settings: crate::voice_settings::VoiceSettings::with_path(voice_path),
+            notifications: crate::notifications::NotificationCenter::with_path(notification_path),
+            notification_tray: crate::notifications::Tray::default(),
+            active_settings: None,
+            settings_return_focus: None,
+            settings_ring: Vec::new(),
+            settings_scroll: gpui::ScrollHandle::new(),
+            settings_close_focus: cx.focus_handle(),
+            settings_entry_focus: cx.focus_handle(),
+            server_entry_focus: cx.focus_handle(),
+            channel_entry_focus: cx.focus_handle(),
+            notifications_entry_focus: cx.focus_handle(),
+            window_active: true,
             inbox: None,
             show_inbox: false,
             show_members: false,
@@ -438,6 +520,8 @@ impl Voxhold {
             pending_sends: Default::default(),
             send_attempt: 0,
             session_generation: 0,
+            active_profile_save: None,
+            notification_saves: Default::default(),
             busy: false,
             generation: 0,
             drafts: draft::Drafts::shared(),
@@ -456,6 +540,7 @@ impl Voxhold {
             pending_anchor: None,
             deleted_ids: Default::default(),
             _activation_subscription: cx.observe_window_activation(window, |s, window, cx| {
+                s.window_active = window.is_window_active();
                 s.sync_system_theme(window, cx);
                 cx.notify();
             }),

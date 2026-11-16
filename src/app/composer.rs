@@ -222,12 +222,7 @@ impl Voxhold {
 
     /// OS file drop. Go ignores drops while another overlay owns the screen.
     pub(super) fn drop_files(&mut self, paths: Vec<std::path::PathBuf>, cx: &mut Context<Self>) {
-        if !self.composer_writable()
-            || self.show_settings
-            || self.show_server_settings
-            || self.show_channel_settings
-            || self.show_inbox
-        {
+        if !self.composer_writable() || self.active_settings.is_some() || self.show_inbox {
             return;
         }
         if let Some(attachments) = &self.attachments {

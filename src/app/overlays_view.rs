@@ -4,6 +4,7 @@ use crate::message_tools::{self, Action};
 impl Voxhold {
     pub(super) fn dismiss_overlays(&mut self, cx: &mut Context<Self>) {
         self.message_menu = None;
+        self.member_menu = None;
         self.forward = None;
         self.show_search = false;
         self.show_inbox = false;

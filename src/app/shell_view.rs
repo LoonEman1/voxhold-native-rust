@@ -26,14 +26,26 @@ impl Render for Voxhold {
                             cx.stop_propagation();
                             return;
                         }
+                        if s.member_menu.take().is_some() {
+                            cx.notify();
+                            cx.stop_propagation();
+                            return;
+                        }
+                        if s.show_members && s.viewport.0 <= layout::COMPACT_MAX_WIDTH {
+                            s.set_members_open(false, cx);
+                            cx.stop_propagation();
+                            return;
+                        }
+                        if s.active_settings.is_some() {
+                            s.close_settings(true, window, cx);
+                            cx.stop_propagation();
+                            return;
+                        }
                         s.show_search = false;
                         s.message_menu = None;
                         s.forward = None;
                         s.editing = None;
                         s.confirm_delete = None;
-                        s.show_settings = false;
-                        s.show_channel_settings = false;
-                        s.show_server_settings = false;
                         s.show_inbox = false;
                         s.show_channels = false;
                         s.show_servers = false;
@@ -501,66 +513,6 @@ impl Render for Voxhold {
                 chat = chat.child(div().h(px(400.)).child(voice.clone()));
             }
         }
-        if self.show_server_settings {
-            if let Some(settings) = &self.server_settings {
-                chat = chat.child(
-                    div()
-                        .h(px(500.))
-                        .child(
-                            div()
-                                .id("server-settings-close")
-                                .cursor_pointer()
-                                .text_size(px(12.))
-                                .on_click(cx.listener(|s, _, _, cx| {
-                                    s.show_server_settings = false;
-                                    cx.notify();
-                                }))
-                                .child("Закрыть"),
-                        )
-                        .child(settings.clone()),
-                );
-            }
-        }
-        if self.show_channel_settings {
-            if let Some(settings) = &self.channel_settings {
-                chat = chat.child(
-                    div()
-                        .h(px(500.))
-                        .child(
-                            div()
-                                .id("channel-settings-close")
-                                .cursor_pointer()
-                                .text_size(px(12.))
-                                .on_click(cx.listener(|s, _, _, cx| {
-                                    s.show_channel_settings = false;
-                                    cx.notify();
-                                }))
-                                .child("Закрыть"),
-                        )
-                        .child(settings.clone()),
-                );
-            }
-        }
-        if self.show_settings {
-            if let Some(settings) = &self.settings {
-                chat = chat.child(
-                    div()
-                        .h(px(500.))
-                        .child(
-                            div()
-                                .id("settings-close")
-                                .cursor_pointer()
-                                .text_size(px(12.))
-                                .on_click(cx.listener(|s, _, _, cx| {
-                                    s.show_settings = false;
-                                    cx.notify();
-                                }))
-                                .child("Закрыть"),
-                        )
-                        .child(settings.clone()),
-                );
-            }
-        }
         root = root.child(
             div()
                 .absolute()
@@ -620,14 +572,11 @@ impl Render for Voxhold {
                             .items_center()
                             .justify_center()
                             .cursor_pointer()
-                            .on_click(cx.listener(|s, _, _, cx| {
-                                s.show_settings = !s.show_settings;
-                                if s.show_settings {
-                                    if let Some(settings) = &s.settings {
-                                        settings.update(cx, |settings, cx| settings.load(cx));
-                                    }
-                                }
-                                cx.notify();
+                            .track_focus(&self.settings_entry_focus)
+                            .tab_index(0)
+                            .on_click(cx.listener(|s, _, window, cx| {
+                                let focus = s.settings_entry_focus.clone();
+                                s.open_settings(SettingsKind::Personal, focus, window, cx);
                             }))
                             .child("Настройки"),
                     )
@@ -723,6 +672,7 @@ impl Render for Voxhold {
         let popup_open = self.show_search
             || self.show_inbox
             || self.message_menu.is_some()
+            || self.member_menu.is_some()
             || self.forward.is_some();
         if popup_open {
             root = root.child(
@@ -745,8 +695,14 @@ impl Render for Voxhold {
         if let Some(overlay) = self.message_menu_overlay(window, cx) {
             root = root.child(overlay);
         }
+        if let Some(overlay) = self.member_menu_overlay(cx) {
+            root = root.child(overlay);
+        }
         if let Some(notice) = self.notice_overlay() {
             root = root.child(notice);
+        }
+        if let Some(layer) = self.settings_overlay(window, cx) {
+            root = root.child(layer);
         }
         if let Some(layer) = self.viewer_layer(window, cx) {
             root = root.child(layer);

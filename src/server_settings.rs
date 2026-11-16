@@ -1,320 +1,279 @@
-use gpui::{div, prelude::*, px, rgb, Context, Entity, Window};
-use gpui_component::input::{InputState, TextInput};
-use std::sync::Arc;
-use voxhold_api::{Client, ServerBan};
+//! Owner-only server administration: general settings, custom roles, storage
+//! and bans. Async work lives in `src/app/admin_ops.rs`.
 
-/// Server and instance settings; only the owner may open this panel.
-pub struct ServerSettings {
-    client: Client,
-    runtime: Arc<tokio::runtime::Runtime>,
-    server: i64,
-    owner: bool,
-    name: Entity<InputState>,
-    cors: Entity<InputState>,
-    bans: Vec<ServerBan>,
-    loaded: bool,
-    busy: bool,
-    generation: u64,
-    confirm_unban: Option<i64>,
-    error: String,
-    notice: String,
+use std::collections::HashSet;
+
+use gpui::{AppContext, Context, Entity, Window};
+use gpui_component::input::InputState;
+use voxhold_api::{CustomRole, RolePreview, ServerBan, StorageState};
+
+use crate::settings::{self, CleanupSelection, Dialog, Scope, Tab};
+
+pub const TABS: [Tab; 4] = [
+    Tab::new("Основное", "settings"),
+    Tab::new("Роли", "people"),
+    Tab::new("Хранилище", "inbox"),
+    Tab::new("Баны", "lock"),
+];
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Action {
+    Retry(usize),
+    SaveName,
+    SaveCors,
+    Diagnostics,
+    RoleCreate,
+    RoleEdit(i64),
+    RoleSave,
+    RolePreview(i64),
+    RoleDelete(i64),
+    RoleDeleteConfirm,
+    RoleDeleteCancel,
+    RoleCancel,
+    RoleToggle(i32),
+    RoleTarget(usize),
+    AssignToggle(i64),
+    AssignSave,
+    GrantChannel(usize),
+    GrantToggle(i64),
+    GrantsSave,
+    StorageSave,
+    CleanupCategory(usize),
+    CleanupPeriod(usize),
+    CleanupPreview,
+    CleanupConfirm,
+    Unban(i64),
+    UnbanConfirm,
+    UnbanCancel,
 }
-impl ServerSettings {
-    pub fn new(
-        client: Client,
-        runtime: Arc<tokio::runtime::Runtime>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Self {
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RoleEdit {
+    pub id: i64,
+    pub name: String,
+    pub color: String,
+    pub permissions: i32,
+}
+
+impl RoleEdit {
+    pub fn new_role() -> Self {
         Self {
-            client,
-            runtime,
+            id: 0,
+            name: String::new(),
+            color: "#8b93a7".into(),
+            permissions: 15,
+        }
+    }
+
+    pub fn from_role(role: &CustomRole) -> Self {
+        Self {
+            id: role.id,
+            name: role.name.clone(),
+            color: role.color.clone(),
+            permissions: role.permissions & 255,
+        }
+    }
+}
+
+pub struct ServerSettings {
+    pub dialog: Dialog,
+    pub server: i64,
+    pub name: Entity<InputState>,
+    pub cors: Entity<InputState>,
+    pub general_loaded: bool,
+    pub general_notice: String,
+
+    pub roles: Vec<CustomRole>,
+    pub roles_loaded: bool,
+    pub roles_error: String,
+    pub role_edit: Option<RoleEdit>,
+    pub role_name: Entity<InputState>,
+    pub role_color: Entity<InputState>,
+    pub role_preview: Option<Vec<RolePreview>>,
+    pub role_preview_for: i64,
+    pub role_delete: Option<i64>,
+    pub members: Vec<voxhold_api::Member>,
+    pub role_target: usize,
+    pub assigned: HashSet<i64>,
+    pub restricted_channels: Vec<(i64, String)>,
+    pub grant_channel: usize,
+    pub grants: HashSet<i64>,
+    pub grants_loaded: bool,
+
+    pub storage: Option<StorageState>,
+    pub storage_loaded: bool,
+    pub storage_error: String,
+    pub quotas: [Entity<InputState>; 3],
+    pub quota_text: [String; 3],
+    pub quota_bytes: [i64; 3],
+    pub cleanup: CleanupSelection,
+    pub storage_result: String,
+
+    pub bans: Vec<ServerBan>,
+    pub bans_loaded: bool,
+    pub bans_error: String,
+    pub confirm_unban: Option<i64>,
+}
+
+impl ServerSettings {
+    pub fn new(window: &mut Window, cx: &mut Context<crate::app::Voxhold>) -> Self {
+        let field =
+            |cx: &mut Context<crate::app::Voxhold>, window: &mut Window, text: &'static str| {
+                cx.new(|cx| InputState::new(window, cx).placeholder(text))
+            };
+        Self {
+            dialog: Dialog::new("Настройки сервера", Scope::default(), TABS.to_vec()),
             server: 0,
-            owner: false,
-            name: cx.new(|cx| InputState::new(window, cx).placeholder("Название сервера")),
+            name: field(cx, window, "Название сервера"),
             cors: cx.new(|cx| {
                 InputState::new(window, cx)
                     .multi_line()
                     .placeholder("По одному origin на строку")
             }),
-            bans: vec![],
-            loaded: false,
-            busy: false,
-            generation: 0,
+            general_loaded: false,
+            general_notice: String::new(),
+            roles: Vec::new(),
+            roles_loaded: false,
+            roles_error: String::new(),
+            role_edit: None,
+            role_name: field(cx, window, "Название роли"),
+            role_color: field(cx, window, "Цвет (#RRGGBB)"),
+            role_preview: None,
+            role_preview_for: 0,
+            role_delete: None,
+            members: Vec::new(),
+            role_target: 0,
+            assigned: HashSet::new(),
+            restricted_channels: Vec::new(),
+            grant_channel: 0,
+            grants: HashSet::new(),
+            grants_loaded: false,
+            storage: None,
+            storage_loaded: false,
+            storage_error: String::new(),
+            quotas: [
+                field(cx, window, "0.000"),
+                field(cx, window, "0.000"),
+                field(cx, window, "0.000"),
+            ],
+            quota_text: Default::default(),
+            quota_bytes: [0; 3],
+            cleanup: CleanupSelection::default(),
+            storage_result: String::new(),
+            bans: Vec::new(),
+            bans_loaded: false,
+            bans_error: String::new(),
             confirm_unban: None,
-            error: String::new(),
-            notice: String::new(),
         }
     }
-    pub fn set_scope(
+
+    pub fn reopen(
         &mut self,
         server: i64,
         name: &str,
-        owner: bool,
         window: &mut Window,
-        cx: &mut Context<Self>,
+        cx: &mut Context<crate::app::Voxhold>,
     ) {
+        self.dialog = Dialog::new("Настройки сервера", Scope::server(server), TABS.to_vec());
+        self.dialog.activate(0);
         self.server = server;
-        self.owner = owner;
-        self.loaded = false;
-        self.busy = false;
-        self.generation += 1;
+        self.general_loaded = false;
+        self.general_notice.clear();
+        self.roles.clear();
+        self.roles_loaded = false;
+        self.roles_error.clear();
+        self.role_edit = None;
+        self.role_preview = None;
+        self.role_delete = None;
+        self.restricted_channels.clear();
+        self.grants.clear();
+        self.grants_loaded = false;
+        self.storage = None;
+        self.storage_loaded = false;
+        self.storage_error.clear();
+        self.storage_result.clear();
+        self.cleanup = CleanupSelection::default();
         self.bans.clear();
+        self.bans_loaded = false;
+        self.bans_error.clear();
         self.confirm_unban = None;
-        self.error.clear();
-        self.notice.clear();
         self.name
-            .update(cx, |v, cx| v.set_value(name.to_owned(), window, cx));
-        self.cors.update(cx, |v, cx| v.set_value("", window, cx));
-        cx.notify();
+            .update(cx, |input, cx| input.set_value(name.to_owned(), window, cx));
+        self.cors
+            .update(cx, |input, cx| input.set_value(String::new(), window, cx));
     }
-    pub fn load(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.owner || self.server <= 0 || self.busy {
-            return;
-        }
-        self.busy = true;
-        self.error.clear();
-        let generation = self.generation;
-        let server = self.server;
-        let client = self.client.clone();
-        let runtime = self.runtime.clone();
-        cx.notify();
-        let task = cx.background_spawn(async move {
-            runtime
-                .block_on(async move {
-                    Ok::<_, voxhold_api::Error>((
-                        client.cors_origins().await?,
-                        client.bans(server).await?,
-                    ))
-                })
-                .map_err(|e| e.to_string())
-        });
-        cx.spawn_in(window, async move |this, window| {
-            let result = task.await;
-            let _ = this.update_in(window, |s, window, cx| {
-                if s.generation != generation {
-                    return;
-                }
-                s.busy = false;
-                match result {
-                    Ok((cors, bans)) => {
-                        s.cors
-                            .update(cx, |v, cx| v.set_value(cors.join("\n"), window, cx));
-                        s.bans = bans;
-                        s.loaded = true
-                    }
-                    Err(e) => s.error = e,
-                };
-                cx.notify();
-            });
-        })
-        .detach();
-    }
-    fn diagnostics(&mut self, cx: &mut Context<Self>) {
-        if !self.owner || !self.loaded || self.busy {
-            return;
-        }
-        let directory = std::env::var_os("USERPROFILE")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(std::env::temp_dir);
-        let prompt = cx.prompt_for_new_path(&directory, Some("voxhold-diagnostics.json"));
-        let generation = self.generation;
-        cx.spawn(async move |this, cx| {
-            let path = match prompt.await {
-                Ok(Ok(Some(path))) => path,
-                _ => return,
-            };
-            let Some(entity) = this.upgrade() else { return };
-            let task = entity
-                .update(cx, |s, cx| {
-                    if s.generation != generation || !s.owner || s.busy {
-                        return None;
-                    }
-                    s.busy = true;
-                    s.error.clear();
-                    s.notice.clear();
-                    cx.notify();
-                    let client = s.client.clone();
-                    let runtime = s.runtime.clone();
-                    Some(cx.background_spawn(async move {
-                        let value = runtime
-                            .block_on(client.client_diagnostics())
-                            .map_err(|e| e.to_string())?;
-                        std::fs::write(path, value.to_string()).map_err(|e| e.to_string())
-                    }))
-                })
-                .ok()
-                .flatten();
-            let Some(task) = task else { return };
-            let result = task.await;
-            let _ = entity.update(cx, |s, cx| {
-                if s.generation != generation {
-                    return;
-                }
-                s.busy = false;
-                match result {
-                    Ok(()) => s.notice = "Диагностика сохранена".into(),
-                    Err(e) => s.error = e,
-                }
-                cx.notify();
-            });
-        })
-        .detach();
-    }
-    fn action(&mut self, op: Op, cx: &mut Context<Self>) {
-        if !self.owner || self.server <= 0 || self.busy || !self.loaded {
-            return;
-        }
-        if let Op::Unban(id) = op {
-            if self.confirm_unban != Some(id) {
-                self.confirm_unban = Some(id);
-                cx.notify();
-                return;
-            }
-        }
-        let name = self.name.read(cx).value().trim().to_string();
-        if matches!(op, Op::Rename) && name.is_empty() {
-            self.error = "Введите название сервера".into();
-            cx.notify();
-            return;
-        }
-        let origins: Vec<String> = self
-            .cors
-            .read(cx)
-            .value()
-            .lines()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_owned)
+
+    pub fn set_members(
+        &mut self,
+        members: &[voxhold_api::Member],
+        channels: &[voxhold_api::Channel],
+    ) {
+        self.members = members
+            .iter()
+            .filter(|member| member.role != "owner")
+            .cloned()
             .collect();
-        self.busy = true;
-        self.error.clear();
-        self.notice.clear();
-        self.confirm_unban = None;
-        let generation = self.generation;
-        let server = self.server;
-        let client = self.client.clone();
-        let runtime = self.runtime.clone();
-        cx.notify();
-        let task = cx.background_spawn(async move {
-            runtime.block_on(async move {
-                match op {
-                    Op::Rename => client.rename_server(server, &name).await,
-                    Op::Cors => client.set_cors_origins(&origins).await,
-                    Op::Unban(id) => client.unban(server, id).await,
-                }
-                .map_err(|e| e.to_string())
-            })
-        });
-        cx.spawn(async move |this, cx| {
-            let result = task.await;
-            if let Some(this) = this.upgrade() {
-                this.update(cx, |s, cx| {
-                    if s.generation != generation {
-                        return;
-                    }
-                    s.busy = false;
-                    match result {
-                        Ok(()) => {
-                            if let Op::Unban(id) = op {
-                                s.bans.retain(|b| b.user_id != id);
-                            }
-                            s.notice = "Сохранено".into()
-                        }
-                        Err(e) => s.error = e,
-                    };
-                    cx.notify();
-                })
-                .ok();
-            }
-        })
-        .detach();
+        self.restricted_channels = channels
+            .iter()
+            .filter(|channel| channel.access_restricted)
+            .map(|channel| (channel.id, channel.name.clone()))
+            .collect();
+        self.role_target = self.role_target.min(self.members.len().saturating_sub(1));
+        self.grant_channel = self
+            .grant_channel
+            .min(self.restricted_channels.len().saturating_sub(1));
     }
-}
-#[derive(Clone, Copy)]
-enum Op {
-    Rename,
-    Cors,
-    Unban(i64),
-}
-impl Render for ServerSettings {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut root = div()
-            .id("server-settings")
-            .w(px(440.))
-            .h_full()
-            .overflow_y_scroll()
-            .p_4()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .bg(rgb(0x202323))
-            .text_color(rgb(0xf3f4eb))
-            .child("Настройки сервера");
-        if !self.owner {
-            return root.child("Только владелец сервера").into_any_element();
+
+    pub fn selected_member(&self) -> Option<&voxhold_api::Member> {
+        self.members.get(self.role_target)
+    }
+
+    pub fn selected_channel(&self) -> Option<i64> {
+        self.restricted_channels
+            .get(self.grant_channel)
+            .map(|(id, _)| *id)
+    }
+
+    pub fn sync_assigned(&mut self) {
+        self.assigned.clear();
+        let Some(user_id) = self.selected_member().map(|member| member.user_id) else {
+            return;
+        };
+        let assigned: HashSet<i64> = self
+            .roles
+            .iter()
+            .filter(|role| role.user_ids.contains(&user_id))
+            .map(|role| role.id)
+            .collect();
+        self.assigned = assigned;
+    }
+
+    pub fn quota_values(&self, cx: &gpui::App) -> [String; 3] {
+        [
+            self.quotas[0].read(cx).value().to_string(),
+            self.quotas[1].read(cx).value().to_string(),
+            self.quotas[2].read(cx).value().to_string(),
+        ]
+    }
+
+    pub fn apply_storage(
+        &mut self,
+        state: StorageState,
+        window: &mut Window,
+        cx: &mut Context<crate::app::Voxhold>,
+    ) {
+        for (index, category) in settings::CLEANUP_CATEGORIES.iter().enumerate() {
+            let bytes = state
+                .categories
+                .get(*category)
+                .map(|value| value.quota_bytes)
+                .unwrap_or(0);
+            self.quota_bytes[index] = bytes;
+            let text = format!("{:.3}", bytes as f64 / 1_073_741_824.0);
+            self.quota_text[index] = text.clone();
+            self.quotas[index].update(cx, |input, cx| input.set_value(text, window, cx));
         }
-        if !self.loaded {
-            return root
-                .child(
-                    div()
-                        .id("server-settings-load")
-                        .cursor_pointer()
-                        .on_click(cx.listener(|s, _, window, cx| s.load(window, cx)))
-                        .child("Загрузить настройки"),
-                )
-                .child(self.error.clone())
-                .into_any_element();
-        }
-        root = root
-            .child(TextInput::new(&self.name))
-            .child(
-                div()
-                    .id("server-rename")
-                    .cursor_pointer()
-                    .on_click(cx.listener(|s, _, _, cx| s.action(Op::Rename, cx)))
-                    .child("Сохранить название"),
-            )
-            .child("Разрешённые origin")
-            .child(TextInput::new(&self.cors))
-            .child(
-                div()
-                    .id("cors-save")
-                    .cursor_pointer()
-                    .on_click(cx.listener(|s, _, _, cx| s.action(Op::Cors, cx)))
-                    .child("Сохранить CORS"),
-            )
-            .child(
-                div()
-                    .id("diagnostics-save")
-                    .cursor_pointer()
-                    .on_click(cx.listener(|s, _, _, cx| s.diagnostics(cx)))
-                    .child("Скачать диагностику JSON"),
-            )
-            .child("Блокировки");
-        for ban in &self.bans {
-            let id = ban.user_id;
-            root = root.child(
-                div()
-                    .flex()
-                    .gap_2()
-                    .child(format!("{} · {}", ban.username, ban.reason))
-                    .child(
-                        div()
-                            .id(("unban", id as u64))
-                            .cursor_pointer()
-                            .on_click(cx.listener(move |s, _, _, cx| s.action(Op::Unban(id), cx)))
-                            .child(if self.confirm_unban == Some(id) {
-                                "Подтвердить"
-                            } else {
-                                "Разблокировать"
-                            }),
-                    ),
-            );
-        }
-        root.child(if self.busy { "Загрузка…" } else { "" })
-            .child(self.notice.clone())
-            .child(div().text_color(rgb(0xff7777)).child(self.error.clone()))
-            .into_any_element()
+        self.storage = Some(state);
+        self.storage_loaded = true;
     }
 }

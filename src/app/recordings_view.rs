@@ -41,6 +41,7 @@ impl Voxhold {
             let dialog = self.recordings_dialog.as_mut()?;
             dialog.layout(&self.recordings, vw, vh, now, self.self_user_id);
         }
+        self.ensure_recording_dialog_focus(window, cx);
         self.request_visible_recording_previews(window, cx);
 
         let p = self.palette;
@@ -283,6 +284,24 @@ impl Voxhold {
             card = card.child(retry);
         }
 
+        let focus_request = self
+            .recordings_dialog
+            .as_mut()
+            .and_then(|dialog| dialog.focus_request.take());
+        if let Some(key) = focus_request {
+            if let Some((handle, _)) = ring.iter().find(|(_, action)| action == &key) {
+                if let Some(dialog) = self.recordings_dialog.as_mut() {
+                    dialog.focused_key = Some(key);
+                }
+                window.focus(handle);
+            } else {
+                if let Some(dialog) = self.recordings_dialog.as_mut() {
+                    dialog.focused_key = None;
+                }
+                window.focus(&self.recordings_close_focus);
+            }
+        }
+
         card = card.on_mouse_up(
             MouseButton::Left,
             cx.listener(|s, _: &gpui::MouseUpEvent, _, cx| {
@@ -319,6 +338,7 @@ impl Voxhold {
                     };
                     if let Some(dialog) = s.recordings_dialog.as_mut() {
                         dialog.focus_action(&close_ring[next].1);
+                        dialog.focused_key = Some(close_ring[next].1.clone());
                     }
                     window.focus(&close_ring[next].0);
                     cx.stop_propagation();
@@ -815,9 +835,12 @@ impl Voxhold {
         }
         if let Some(id) = key.strip_prefix("rec-delete-") {
             if self.record_by_id(id).is_some() {
+                let cancel = format!("rec-cancel-{id}");
                 if let Some(dialog) = self.recordings_dialog.as_mut() {
                     dialog.confirm = id.to_string();
                     dialog.error.clear();
+                    dialog.focused_key = Some(cancel.clone());
+                    dialog.focus_request = Some(cancel);
                 }
                 cx.notify();
             }
@@ -829,9 +852,12 @@ impl Voxhold {
             }
             return;
         }
-        if key.starts_with("rec-cancel-") {
+        if let Some(id) = key.strip_prefix("rec-cancel-") {
+            let delete = format!("rec-delete-{id}");
             if let Some(dialog) = self.recordings_dialog.as_mut() {
                 dialog.confirm.clear();
+                dialog.focused_key = Some(delete.clone());
+                dialog.focus_request = Some(delete);
             }
             cx.notify();
         }

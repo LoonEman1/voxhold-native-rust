@@ -221,6 +221,9 @@ pub struct DialogState {
     pub pressed: Option<String>,
     /// The card action that currently owns the keyboard focus.
     pub focused_key: Option<String>,
+    /// A one-shot focus move for the next rendered action ring. The handle is
+    /// created during render, so an action handler cannot focus it directly.
+    pub focus_request: Option<String>,
     pub previews: ImageCache<String>,
     pub preview_pending: HashSet<String>,
     pub preview_retry: HashMap<String, Instant>,
@@ -255,6 +258,7 @@ impl DialogState {
             scroll_to: None,
             pressed: None,
             focused_key: None,
+            focus_request: None,
             previews: ImageCache::new(PREVIEW_BUDGET),
             preview_pending: HashSet::new(),
             preview_retry: HashMap::new(),
@@ -445,10 +449,11 @@ impl DialogState {
         self.scroll_to = Some(key.to_owned());
     }
 
-    /// The user takes over scrolling: drop a pending focus jump.
-    pub fn wheel(&mut self, delta_y: f32) {
+    /// The user takes over scrolling: drop a pending focus jump. `delta_pixels`
+    /// is already in logical pixels; the GPUI handler converts line deltas.
+    pub fn wheel(&mut self, delta_pixels: f32) {
         self.scroll_to = None;
-        self.scroll = (self.scroll + delta_y * 42.).clamp(0., self.max_scroll);
+        self.scroll = (self.scroll + delta_pixels).clamp(0., self.max_scroll);
     }
 
     /// `Enter`/`Space` on a clipped action asks for a scroll and returns false.

@@ -142,11 +142,14 @@ impl Voxhold {
         if restore_focus {
             #[cfg(feature = "voxhold-media")]
             if self.recordings_voice_entry {
+                let voice_focus = self.voice.as_ref().and_then(|voice| {
+                    let voice = voice.read(cx);
+                    voice
+                        .recordings_button_mounted()
+                        .then(|| voice.recordings_focus())
+                });
                 self.recordings_return_focus = Some(
-                    self.voice
-                        .as_ref()
-                        .map(|voice| voice.read(cx).recordings_focus())
-                        .unwrap_or_else(|| self.recordings_entry_focus.clone()),
+                    voice_focus.unwrap_or_else(|| self.recordings_entry_focus.clone()),
                 );
             }
             if let Some(focus) = self.recordings_return_focus.take() {

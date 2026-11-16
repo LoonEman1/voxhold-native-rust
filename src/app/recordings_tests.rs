@@ -567,6 +567,132 @@ async fn recording_preview_waits_for_access_confirmation(cx: &mut TestAppContext
 }
 
 #[gpui::test]
+async fn recording_delete_confirmation_keeps_focus_inside_the_modal(cx: &mut TestAppContext) {
+    cx.update(|cx| gpui_component::init(cx));
+    let ready = list_json(&[recording_without_preview(ID, RECORDING_READY, 1)]);
+    let server = TestServer::spawn(vec![Reply::new(200, &ready)]);
+    let (window, view) = make_app(cx, client(&server.base));
+    let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
+    visual.update(|window, app| {
+        view.update(app, |v, cx| v.toggle_recordings("header", window, cx));
+    });
+    wait_for(&mut visual, &view, |v| !v.recordings.loading);
+    draw(&mut visual);
+    let delete = format!("rec-delete-{ID}");
+    let cancel = format!("rec-cancel-{ID}");
+    visual.update(|window, app| {
+        view.update(app, |v, cx| v.run_recording_action(&delete, window, cx));
+    });
+    draw(&mut visual);
+    view.read_with(&*visual, |v, _| {
+        let dialog = v.recordings_dialog.as_ref().unwrap();
+        assert_eq!(dialog.confirm, ID);
+        assert_eq!(dialog.focused_key.as_deref(), Some(cancel.as_str()));
+    });
+    // Enter reaches the newly focused "Отмена", which also returns focus to
+    // "Удалить с сервера" without leaving the modal.
+    visual.simulate_keystrokes("enter");
+    draw(&mut visual);
+    view.read_with(&*visual, |v, _| {
+        let dialog = v.recordings_dialog.as_ref().unwrap();
+        assert!(dialog.confirm.is_empty());
+        assert_eq!(dialog.focused_key.as_deref(), Some(delete.as_str()));
+    });
+}
+
+#[gpui::test]
+async fn recording_focus_falls_back_to_close_when_the_action_disappears(cx: &mut TestAppContext) {
+    cx.update(|cx| gpui_component::init(cx));
+    let ready = list_json(&[recording_without_preview(ID, RECORDING_READY, 1)]);
+    let server = TestServer::spawn(vec![Reply::new(200, &ready)]);
+    let (window, view) = make_app(cx, client(&server.base));
+    let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
+    visual.update(|window, app| {
+        view.update(app, |v, cx| v.toggle_recordings("header", window, cx));
+    });
+    wait_for(&mut visual, &view, |v| !v.recordings.loading);
+    draw(&mut visual);
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            v.run_recording_action(&format!("rec-delete-{ID}"), window, cx)
+        });
+    });
+    draw(&mut visual);
+    visual.update(|window, app| {
+        view.update(app, |v, _| {
+            let event = recording_json(ID, RECORDING_DELETED, 2);
+            assert!(
+                v.apply_realtime_event("recording.updated", &event)
+                    .recording_event
+            );
+        });
+        window.draw(app).clear();
+        let close = view.read(app).recordings_close_focus.clone();
+        assert!(close.is_focused(window));
+        let dialog = view.read(app).recordings_dialog.as_ref().unwrap();
+        assert!(dialog.focused_key.is_none());
+    });
+}
+
+#[gpui::test]
+async fn recording_wheel_uses_pixels_not_double_scaled_lines(cx: &mut TestAppContext) {
+    cx.update(|cx| gpui_component::init(cx));
+    let rows = [
+        recording_without_preview(&"1".repeat(32), RECORDING_READY, 1),
+        recording_without_preview(&"2".repeat(32), RECORDING_READY, 2),
+        recording_without_preview(&"3".repeat(32), RECORDING_READY, 3),
+    ];
+    let list = list_json(&rows);
+    let server = TestServer::spawn(vec![Reply::new(200, &list)]);
+    let (window, view) = make_app(cx, client(&server.base));
+    let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
+    visual.simulate_resize(gpui::size(gpui::px(390.), gpui::px(760.)));
+    visual.update(|window, app| {
+        view.update(app, |v, cx| v.toggle_recordings("header", window, cx));
+    });
+    wait_for(&mut visual, &view, |v| !v.recordings.loading);
+    draw(&mut visual);
+    let point = view.read_with(&*visual, |v, _| {
+        let dialog = v.recordings_dialog.as_ref().unwrap();
+        assert!(dialog.max_scroll > 200.);
+        dialog.list.center()
+    });
+    visual.update(|window, app| {
+        view.update(app, |v, _| {
+            let dialog = v.recordings_dialog.as_mut().unwrap();
+            dialog.scroll = 100.;
+        });
+        window.draw(app).clear();
+    });
+    visual.run_until_parked();
+    visual.update(|_, app| {
+        view.update(app, |v, _| {
+            let dialog = v.recordings_dialog.as_mut().unwrap();
+            dialog.scroll_to = Some(format!("rec-delete-{}", "1".repeat(32)));
+        });
+    });
+    visual.simulate_event(gpui::ScrollWheelEvent {
+        position: at(point.0, point.1),
+        delta: gpui::ScrollDelta::Lines(gpui::point(0., 1.)),
+        ..Default::default()
+    });
+    view.read_with(&*visual, |v, _| {
+        let dialog = v.recordings_dialog.as_ref().unwrap();
+        assert_eq!(dialog.scroll, 58., "Lines(1) must move 42 px");
+        assert!(dialog.scroll_to.is_none(), "the wheel kept a pending jump");
+    });
+    visual.simulate_event(gpui::ScrollWheelEvent {
+        position: at(point.0, point.1),
+        delta: gpui::ScrollDelta::Pixels(gpui::point(gpui::px(0.), gpui::px(3.))),
+        ..Default::default()
+    });
+    view.read_with(&*visual, |v, _| {
+        let dialog = v.recordings_dialog.as_ref().unwrap();
+        assert_eq!(dialog.scroll, 55., "Pixels(3) must move exactly 3 px");
+    });
+}
+
+#[gpui::test]
 async fn recording_preview_cache_is_hidden_during_refresh_and_after_503(cx: &mut TestAppContext) {
     cx.update(|cx| gpui_component::init(cx));
     let ready = list_json(&[recording_json(ID, RECORDING_READY, 1)]);

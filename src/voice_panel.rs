@@ -110,6 +110,11 @@ impl VoicePanel {
     pub fn recordings_focus(&self) -> FocusHandle {
         self.recordings_focus.clone()
     }
+
+    /// The call panel renders the "Записи" button only while connected.
+    pub fn recordings_button_mounted(&self) -> bool {
+        self.handle.is_some()
+    }
     fn join(&mut self, cx: &mut Context<Self>) {
         if self.handle.is_some() {
             return;

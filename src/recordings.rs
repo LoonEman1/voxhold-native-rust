@@ -728,9 +728,13 @@ mod tests {
         // the pending jump so a later layout cannot pull the list back.
         let key = format!("rec-delete-{}", "1".repeat(32));
         dialog.scroll_to = Some(key);
-        dialog.wheel(20.);
+        dialog.scroll = 0.;
+        dialog.wheel(42.);
         assert!(dialog.scroll_to.is_none());
-        assert_eq!(dialog.scroll, dialog.max_scroll);
+        assert_eq!(dialog.scroll, 42.);
+        let max = dialog.max_scroll;
+        dialog.wheel(max);
+        assert_eq!(dialog.scroll, max);
         dialog.layout(&state, 390., 760., 1_700_000_100, 3);
         assert_eq!(dialog.scroll, dialog.max_scroll);
     }

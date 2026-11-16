@@ -1002,11 +1002,13 @@ backend `9b29fdd`, frontend `ed7cb00`, Go `09c82b9`.
 активный PUT уведомлений — по паре `(server_id, channel_id)`, поэтому
 `reopen` не снимает блокировку; режимы уведомлений отключены и не
 принимаются обработчиком, пока PUT не ответил; расчёт превью аватара
-захватывает `avatar_pick` и не применяет результат старого файла при
-совпавшем `preview_token`.
+захватывает ID файла из самого `CropDraft` и не применяет результат
+старого файла при совпавшем `preview_token`. Успешный PATCH обновляет
+снимок переоткрытого профиля, сохраняя поля, отредактированные в новой
+форме, а GET профиля, начатый до ответа PATCH, отбрасывается по epoch.
 
 Проверки после правок: `cargo fmt --all -- --check`,
-`cargo test --workspace --locked` (222 теста приложения: 221 passed,
+`cargo test --workspace --locked` (225 тестов приложения: 224 passed,
 1 `ignored`; 6 API; 6 media), `cargo build --release --locked
 -p voxhold-native-rust`, `scripts/check-file-sizes.ps1`. Живой backend,
 ручной GUI owner/admin/member, два аккаунта, кадры/DPI и фактический

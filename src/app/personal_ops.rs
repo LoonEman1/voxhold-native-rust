@@ -326,6 +326,11 @@ impl Voxhold {
         let Some(token) = self.personal_token() else {
             return;
         };
+        let epoch = self
+            .personal
+            .as_ref()
+            .map(|panel| panel.profile_epoch)
+            .unwrap_or_default();
         if let Some(panel) = &mut self.personal {
             panel.profile_loading = true;
             panel.local_error.clear();
@@ -345,9 +350,13 @@ impl Voxhold {
                 }
                 if let Some(panel) = &mut s.personal {
                     panel.profile_loading = false;
-                    match result {
-                        Ok(profile) => panel.set_profile(profile, window, cx),
-                        Err(error) => panel.local_error = error,
+                    // A successful PATCH answered after this GET started. Its
+                    // confirmed snapshot is newer than the page on the wire.
+                    if panel.profile_epoch == epoch {
+                        match result {
+                            Ok(profile) => panel.set_profile(profile, window, cx),
+                            Err(error) => panel.local_error = error,
+                        }
                     }
                     panel.sync_profile_load();
                 }
@@ -694,6 +703,8 @@ impl Voxhold {
         }
         let about = panel.about_value(cx);
         let country_code = panel.country_code();
+        let sent_about = about.clone();
+        let sent_country = country_code.clone();
         let country = country_code.clone().unwrap_or_default();
         if let Err(message) = settings::validate_about(&about) {
             if let Some(panel) = &mut self.personal {
@@ -740,48 +751,76 @@ impl Voxhold {
                 if s.active_profile_save == Some(request) {
                     s.active_profile_save = None;
                 }
+                let open_profile = s.active_settings == Some(SettingsKind::Personal);
                 let accepted = s.personal_settle(token);
                 let Some(panel) = &mut s.personal else {
                     return;
                 };
-                if !accepted {
-                    // The PATCH still completed, but its form was replaced or
-                    // another tab was opened.
-                    cx.notify();
-                    return;
-                }
                 match result {
                     Ok(profile) => {
+                        panel.profile_epoch = panel.profile_epoch.wrapping_add(1);
                         let current_about = panel.about_value(cx);
                         let current_country = panel.country_code();
                         let reply_about = profile.about.clone();
                         let reply_country = profile.country_code.clone();
-                        // A local edit made after dispatch stays in the
-                        // editor; only the confirmed snapshot is replaced.
-                        let apply_about =
-                            panel
-                                .about_form
-                                .settle(request, reply_about.clone(), &current_about);
-                        let apply_country = panel.country_form.settle(
-                            request,
-                            reply_country.clone(),
-                            &current_country,
-                        );
-                        panel.profile = Some(profile);
-                        if apply_about {
-                            panel.about.update(cx, |input, cx| {
-                                input.set_value(reply_about.clone(), window, cx)
-                            });
-                        }
-                        if apply_country {
-                            panel.country_index = crate::settings::country_index(
-                                &panel.countries,
-                                reply_country.as_deref(),
+                        let profile_open = open_profile && panel.tab() == 0;
+                        if accepted {
+                            // A local edit made after dispatch stays in the
+                            // editor; only the confirmed snapshot is replaced.
+                            let apply_about = panel.about_form.settle(
+                                request,
+                                reply_about.clone(),
+                                &current_about,
                             );
+                            let apply_country = panel.country_form.settle(
+                                request,
+                                reply_country.clone(),
+                                &current_country,
+                            );
+                            if apply_about {
+                                panel.about.update(cx, |input, cx| {
+                                    input.set_value(reply_about.clone(), window, cx)
+                                });
+                            }
+                            if apply_country {
+                                panel.country_index = crate::settings::country_index(
+                                    &panel.countries,
+                                    reply_country.as_deref(),
+                                );
+                            }
+                        } else if profile_open {
+                            // The PATCH came from a form that was closed and
+                            // reopened. The new form may already hold an older
+                            // GET snapshot; replace the confirmed values but
+                            // keep fields the user edited in the new form.
+                            let about_edited = current_about != panel.about_form.snapshot
+                                && current_about != sent_about;
+                            let country_edited = current_country != panel.country_form.snapshot
+                                && current_country != sent_country;
+                            panel.about_form.load(reply_about.clone());
+                            panel.country_form.load(reply_country.clone());
+                            if !about_edited {
+                                panel.about.update(cx, |input, cx| {
+                                    input.set_value(reply_about.clone(), window, cx)
+                                });
+                            }
+                            if !country_edited {
+                                panel.country_index = crate::settings::country_index(
+                                    &panel.countries,
+                                    reply_country.as_deref(),
+                                );
+                            }
                         }
-                        panel.notice = "Профиль обновлён.".into();
+                        if accepted || profile_open {
+                            panel.profile = Some(profile);
+                            panel.notice = "Профиль обновлён.".into();
+                        }
                     }
-                    Err(error) => panel.local_error = error,
+                    Err(error) => {
+                        if accepted {
+                            panel.local_error = error;
+                        }
+                    }
                 }
                 cx.notify();
             });

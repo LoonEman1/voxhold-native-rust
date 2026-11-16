@@ -152,6 +152,7 @@ impl Voxhold {
                 panel.crop = Some(crate::personal_settings::CropDraft {
                     data,
                     source,
+                    pick: selection,
                     width,
                     height,
                     crop: settings::Crop::default(),
@@ -177,7 +178,10 @@ impl Voxhold {
         let crop = draft.crop;
         let (width, height) = (draft.width, draft.height);
         let generation = panel.dialog.generation;
-        let pick = panel.avatar_pick;
+        // The pixels and the file id must come from the same draft. Reading the
+        // panel-wide `avatar_pick` here would pair draft A's pixels with a newer
+        // selection B when the slider moves before B is decoded.
+        let pick = draft.pick;
         let task = cx.background_spawn(async move {
             let (x, y) = crop.origin(width, height);
             let side = crop.size(width, height).max(1);

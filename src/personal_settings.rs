@@ -62,6 +62,10 @@ pub const TABS: [Tab; 3] = [
 pub struct CropDraft {
     pub data: Arc<Vec<u8>>,
     pub source: Arc<image::DynamicImage>,
+    /// File choice that produced these pixels. A preview task captures this
+    /// value together with the draft, so a newer selection cannot lend its ID
+    /// to an older image.
+    pub pick: u64,
     pub width: u32,
     pub height: u32,
     pub crop: Crop,
@@ -99,6 +103,9 @@ pub struct PersonalSettings {
     /// Identifies the latest PATCH. The in-flight lock itself lives on the
     /// session, so a reopened form cannot start a second write.
     pub profile_request: u64,
+    /// Bumped by a successful PATCH. A profile GET that started before that
+    /// answer is older than the confirmed write and must not overwrite it.
+    pub profile_epoch: u64,
     pub avatar: Option<Arc<RenderImage>>,
     pub avatar_version: Option<String>,
     pub avatar_loading: bool,
@@ -156,6 +163,7 @@ impl PersonalSettings {
             country_form: settings::FormValue::new(None),
             profile_loading: false,
             profile_request: 0,
+            profile_epoch: 0,
             avatar: None,
             avatar_version: None,
             avatar_loading: false,
@@ -185,6 +193,7 @@ impl PersonalSettings {
         self.dialog = Dialog::new("Настройки", Scope::default(), TABS.to_vec());
         self.profile_loading = false;
         self.profile_request = self.profile_request.wrapping_add(1);
+        self.profile_epoch = self.profile_epoch.wrapping_add(1);
         self.avatar_pick = self.avatar_pick.wrapping_add(1);
         self.sessions_loading = false;
         self.sessions_error.clear();

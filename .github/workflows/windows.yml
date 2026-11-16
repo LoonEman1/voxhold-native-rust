@@ -63,8 +63,9 @@ jobs:
             Select-Object -Unique)
           if ($webrtcLicenses.Count -ne 1) { throw 'Expected one license file for the linked WebRTC build' }
 
-          $bundle = 'target/voxhold-windows'
-          New-Item -ItemType Directory -Force $bundle | Out-Null
+          # Stage outside Cargo's cached target directory in a fresh folder.
+          $bundle = Join-Path $env:RUNNER_TEMP ('voxhold-windows-' + [guid]::NewGuid())
+          New-Item -ItemType Directory -Path $bundle | Out-Null
           Copy-Item target/release/voxhold-native-rust.exe $bundle
           Copy-Item -LiteralPath LICENSE, THIRD_PARTY_NOTICES.md -Destination $bundle
           Copy-Item -Recurse assets $bundle
@@ -74,10 +75,11 @@ jobs:
               throw "Missing asset $file"
             }
           }
-          Compress-Archive -Path "$bundle/*" -DestinationPath target/voxhold-windows.zip -Force
+          $archive = Join-Path $env:RUNNER_TEMP 'voxhold-windows.zip'
+          Compress-Archive -Path "$bundle/*" -DestinationPath $archive -Force
       - uses: actions/upload-artifact@v4
         with:
           name: voxhold-windows
-          path: target/voxhold-windows.zip
+          path: ${{ runner.temp }}/voxhold-windows.zip
           compression-level: 0
           if-no-files-found: error

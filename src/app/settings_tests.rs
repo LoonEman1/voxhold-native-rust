@@ -10,7 +10,7 @@ use gpui::{TestAppContext, VisualTestContext};
 use gpui_component::Root;
 use std::time::Duration;
 
-fn profile(about: &str) -> voxhold_api::Profile {
+pub(super) fn profile(about: &str) -> voxhold_api::Profile {
     voxhold_api::Profile {
         user_id: 1,
         username: "owner".into(),
@@ -20,7 +20,7 @@ fn profile(about: &str) -> voxhold_api::Profile {
     }
 }
 
-fn make_app(
+pub(super) fn make_app(
     cx: &mut TestAppContext,
     client: voxhold_api::Client,
 ) -> (gpui::WindowHandle<Root>, Entity<Voxhold>) {
@@ -57,7 +57,7 @@ fn make_app(
 
 /// Release the gate as soon as the request reaches the server, without
 /// blocking the GPUI test thread that has to drive the background task.
-fn release_on_arrival(gate: std::sync::Arc<Gate>) -> std::thread::JoinHandle<bool> {
+pub(super) fn release_on_arrival(gate: std::sync::Arc<Gate>) -> std::thread::JoinHandle<bool> {
     std::thread::spawn(move || {
         let arrived = gate.wait_arrived(Duration::from_secs(5));
         gate.release();
@@ -65,7 +65,7 @@ fn release_on_arrival(gate: std::sync::Arc<Gate>) -> std::thread::JoinHandle<boo
     })
 }
 
-fn wait_for(
+pub(super) fn wait_for(
     visual: &mut VisualTestContext,
     view: &Entity<Voxhold>,
     mut done: impl FnMut(&Voxhold) -> bool,
@@ -717,7 +717,7 @@ async fn a_second_profile_save_is_blocked_until_the_first_patch_answers(cx: &mut
                 input.set_value("typed during request", window, cx)
             });
             v.save_profile(window, cx);
-            assert!(v.personal.as_ref().unwrap().profile_saving);
+            assert!(v.active_profile_save.is_some());
         });
     });
     let waiter = release_on_arrival(gate.clone());
@@ -729,9 +729,10 @@ async fn a_second_profile_save_is_blocked_until_the_first_patch_answers(cx: &mut
         "the second handler call must not send a PATCH"
     );
     wait_for(&mut visual, &view, |v| {
-        v.personal
-            .as_ref()
-            .is_some_and(|panel| !panel.profile_saving && panel.dialog.pending == 0)
+        v.active_profile_save.is_none()
+            && v.personal
+                .as_ref()
+                .is_some_and(|panel| panel.dialog.pending == 0)
     });
     view.read_with(&*visual, |v, cx| {
         let panel = v.personal.as_ref().unwrap();
@@ -835,7 +836,7 @@ async fn a_notification_save_cannot_be_repeated_before_the_put_answers(cx: &mut 
     view.read_with(&*visual, |v, _| {
         let panel = v.channel_notifications.as_ref().unwrap();
         assert_eq!(panel.saved, "all");
-        assert!(!panel.saving);
+        assert!(!v.notification_saves.contains_key(&(1, 9)));
     });
 }
 

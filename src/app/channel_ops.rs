@@ -587,6 +587,15 @@ impl Voxhold {
         match action {
             NotifAction::Retry => self.load_channel_notifications(cx),
             NotifAction::Choose(index) => {
+                let key = self
+                    .channel_notifications
+                    .as_ref()
+                    .map(|panel| (panel.server, panel.channel));
+                if key.is_some_and(|key| self.notification_saves.contains_key(&key)) {
+                    // The PUT owns the confirmed value until it answers; a
+                    // local change now could be overwritten by that answer.
+                    return;
+                }
                 if let Some(panel) = &mut self.channel_notifications {
                     if let Some(mode) = settings::NOTIFICATION_MODES.get(index) {
                         panel.mode = (*mode).to_owned();
@@ -619,8 +628,13 @@ impl Voxhold {
         let Some(panel) = &self.channel_notifications else {
             return;
         };
-        let (server, channel, mode) = (panel.server, panel.channel, panel.mode.clone());
-        if panel.saving || mode == panel.saved {
+        let (server, channel, mode, saved) = (
+            panel.server,
+            panel.channel,
+            panel.mode.clone(),
+            panel.saved.clone(),
+        );
+        if mode == saved || self.notification_saves.contains_key(&(server, channel)) {
             return;
         }
         let Some(client) = self.client.clone() else {
@@ -633,12 +647,14 @@ impl Voxhold {
             .channel_notifications
             .as_mut()
             .map(|panel| {
-                panel.saving = true;
                 panel.error.clear();
                 panel.save_request = panel.save_request.wrapping_add(1);
                 panel.save_request
             })
             .unwrap_or_default();
+        // Session-level lock for this exact channel. A reopened dialog must
+        // not be able to send a second PUT while this one is pending.
+        self.notification_saves.insert((server, channel), request);
         let runtime = self.runtime.clone();
         let session = self.session_generation;
         let request_mode = mode.clone();
@@ -653,11 +669,11 @@ impl Voxhold {
                 if s.session_generation != session {
                     return;
                 }
+                if s.notification_saves.get(&(server, channel)) == Some(&request) {
+                    s.notification_saves.remove(&(server, channel));
+                }
                 let accepted = s.notifications_settle(token);
                 if let Some(panel) = &mut s.channel_notifications {
-                    if panel.save_request == request {
-                        panel.saving = false;
-                    }
                     if !accepted {
                         cx.notify();
                         return;

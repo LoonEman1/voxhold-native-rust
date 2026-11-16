@@ -689,7 +689,7 @@ impl Voxhold {
 
     pub(super) fn save_profile(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(panel) = &self.personal else { return };
-        if panel.profile_saving {
+        if self.active_profile_save.is_some() {
             return;
         }
         let about = panel.about_value(cx);
@@ -713,11 +713,11 @@ impl Voxhold {
             .as_mut()
             .map(|panel| panel.next_profile_request())
             .unwrap_or_default();
+        self.active_profile_save = Some(request);
         if let Some(panel) = &mut self.personal {
             panel.validation.clear();
             panel.notice.clear();
             panel.local_error.clear();
-            panel.profile_saving = true;
             panel.about_form.begin(request, about.clone());
             panel.country_form.begin(request, country_code);
         }
@@ -734,16 +734,19 @@ impl Voxhold {
                 if s.session_generation != session {
                     return;
                 }
+                // The lock belongs to the session, not to the dialog. Release
+                // it on the answer of the request that owns it, even when the
+                // form was closed and reopened meanwhile.
+                if s.active_profile_save == Some(request) {
+                    s.active_profile_save = None;
+                }
                 let accepted = s.personal_settle(token);
                 let Some(panel) = &mut s.personal else {
                     return;
                 };
-                if panel.profile_request == request {
-                    panel.profile_saving = false;
-                }
                 if !accepted {
                     // The PATCH still completed, but its form was replaced or
-                    // another tab was opened. Only the save lock is released.
+                    // another tab was opened.
                     cx.notify();
                     return;
                 }

@@ -96,10 +96,8 @@ pub struct PersonalSettings {
     pub about_form: settings::FormValue<String>,
     pub country_form: settings::FormValue<Option<String>>,
     pub profile_loading: bool,
-    /// A PATCH is in flight. Editors stay enabled; only the save button and a
-    /// repeated `save_profile` call are blocked, and every PATCH gets its own
-    /// request id so one answer cannot settle another request.
-    pub profile_saving: bool,
+    /// Identifies the latest PATCH. The in-flight lock itself lives on the
+    /// session, so a reopened form cannot start a second write.
     pub profile_request: u64,
     pub avatar: Option<Arc<RenderImage>>,
     pub avatar_version: Option<String>,
@@ -157,7 +155,6 @@ impl PersonalSettings {
             about_form: settings::FormValue::new(String::new()),
             country_form: settings::FormValue::new(None),
             profile_loading: false,
-            profile_saving: false,
             profile_request: 0,
             avatar: None,
             avatar_version: None,
@@ -187,7 +184,6 @@ impl PersonalSettings {
     pub fn reopen(&mut self, theme: ThemeMode, notifications: bool) {
         self.dialog = Dialog::new("Настройки", Scope::default(), TABS.to_vec());
         self.profile_loading = false;
-        self.profile_saving = false;
         self.profile_request = self.profile_request.wrapping_add(1);
         self.avatar_pick = self.avatar_pick.wrapping_add(1);
         self.sessions_loading = false;

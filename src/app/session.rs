@@ -121,6 +121,8 @@ impl Voxhold {
                     }));
                 });
                 s.self_user_id = self_user_id;
+                s.active_profile_save = None;
+                s.notification_saves.clear();
                 s.client = Some(c.clone());
                 s.start_realtime(c, window, cx);
                 s.servers = servers;
@@ -149,6 +151,8 @@ impl Voxhold {
             pending.abort.abort();
         }
         self.session_generation = self.session_generation.wrapping_add(1);
+        self.active_profile_save = None;
+        self.notification_saves.clear();
         #[cfg(feature = "voxhold-media")]
         if let Some(voice) = self.voice.take() {
             voice.update(cx, |voice, cx| voice.leave_in_window(window, cx));

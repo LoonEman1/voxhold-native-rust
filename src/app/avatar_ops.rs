@@ -177,6 +177,7 @@ impl Voxhold {
         let crop = draft.crop;
         let (width, height) = (draft.width, draft.height);
         let generation = panel.dialog.generation;
+        let pick = panel.avatar_pick;
         let task = cx.background_spawn(async move {
             let (x, y) = crop.origin(width, height);
             let side = crop.size(width, height).max(1);
@@ -207,22 +208,40 @@ impl Voxhold {
         cx.spawn_in(window, async move |this, window| {
             let image = task.await;
             let _ = this.update_in(window, |s, _window, cx| {
-                if s.active_settings != Some(SettingsKind::Personal) {
-                    return;
-                }
-                let Some(panel) = &mut s.personal else { return };
-                if panel.dialog.generation != generation {
-                    return;
-                }
-                let Some(draft) = &mut panel.crop else { return };
-                if draft.preview_token != token {
-                    return;
-                }
-                draft.preview = Some(image);
-                cx.notify();
+                s.apply_crop_preview(generation, pick, token, image, cx);
             });
         })
         .detach();
+        cx.notify();
+    }
+
+    /// Apply a finished crop preview only to the draft that requested it. The
+    /// file choice is checked as well as the dialog generation and the slider
+    /// token, because a new draft starts again at `preview_token = 1`.
+    pub(super) fn apply_crop_preview(
+        &mut self,
+        generation: u64,
+        pick: u64,
+        token: u64,
+        image: std::sync::Arc<gpui::RenderImage>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.active_settings != Some(SettingsKind::Personal) {
+            return;
+        }
+        let Some(panel) = &mut self.personal else {
+            return;
+        };
+        if panel.dialog.generation != generation || panel.avatar_pick != pick {
+            return;
+        }
+        let Some(draft) = &mut panel.crop else {
+            return;
+        };
+        if draft.preview_token != token {
+            return;
+        }
+        draft.preview = Some(image);
         cx.notify();
     }
 

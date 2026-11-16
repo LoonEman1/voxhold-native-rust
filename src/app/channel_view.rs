@@ -322,7 +322,9 @@ impl Voxhold {
         let mode = panel.mode.clone();
         let saved = panel.saved.clone();
         let loaded = panel.loaded;
-        let saving = panel.saving;
+        let saving = self
+            .notification_saves
+            .contains_key(&(panel.server, panel.channel));
         let error = panel.error.clone();
         let notifications = self.notifications.enabled;
         let mut root = div().flex().flex_col().gap(px(10.)).child(self.heading(
@@ -361,7 +363,7 @@ impl Voxhold {
                 label,
                 crate::settings::NOTIFICATION_DESCRIPTIONS[index],
                 mode == *value,
-                false,
+                saving,
                 SettingsAct::Notifications(channel_settings::NotifAction::Choose(index)),
                 window,
                 cx,

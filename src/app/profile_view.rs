@@ -16,7 +16,7 @@ impl Voxhold {
         };
         let profile = panel.profile.clone();
         let loading = panel.profile_loading;
-        let profile_saving = panel.profile_saving;
+        let profile_saving = self.active_profile_save.is_some();
         let avatar = panel.avatar.clone();
         let crop = panel
             .crop

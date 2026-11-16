@@ -19,6 +19,8 @@ mod realtime;
 mod server_ops;
 mod session;
 #[cfg(test)]
+mod settings_review;
+#[cfg(test)]
 mod settings_tests;
 mod settings_view;
 mod shell_view;
@@ -293,6 +295,12 @@ pub(crate) struct Voxhold {
     /// Changes on login and logout; a send result from another session is
     /// discarded even when it arrives after the channel was switched.
     session_generation: u64,
+    /// PATCH in flight for the personal profile. The lock belongs to the
+    /// session, not to one dialog instance, so reopening the form cannot start
+    /// a second write to the same resource.
+    active_profile_save: Option<u64>,
+    /// PUT in flight per notification channel; same session-level rule.
+    notification_saves: std::collections::HashMap<(i64, i64), u64>,
     busy: bool,
     generation: u64,
     drafts: draft::Shared,
@@ -512,6 +520,8 @@ impl Voxhold {
             pending_sends: Default::default(),
             send_attempt: 0,
             session_generation: 0,
+            active_profile_save: None,
+            notification_saves: Default::default(),
             busy: false,
             generation: 0,
             drafts: draft::Drafts::shared(),

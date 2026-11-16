@@ -998,8 +998,15 @@ backend `9b29fdd`, frontend `ed7cb00`, Go `09c82b9`.
 передаётся в `VoicePanel` при создании, закрывает микрофон до первого
 `join` и применяется к уже открытой панели.
 
+Повторный раунд: активный PATCH профиля хранится на уровне сессии, а
+активный PUT уведомлений — по паре `(server_id, channel_id)`, поэтому
+`reopen` не снимает блокировку; режимы уведомлений отключены и не
+принимаются обработчиком, пока PUT не ответил; расчёт превью аватара
+захватывает `avatar_pick` и не применяет результат старого файла при
+совпавшем `preview_token`.
+
 Проверки после правок: `cargo fmt --all -- --check`,
-`cargo test --workspace --locked` (218 тестов приложения: 217 passed,
+`cargo test --workspace --locked` (222 теста приложения: 221 passed,
 1 `ignored`; 6 API; 6 media), `cargo build --release --locked
 -p voxhold-native-rust`, `scripts/check-file-sizes.ps1`. Живой backend,
 ручной GUI owner/admin/member, два аккаунта, кадры/DPI и фактический

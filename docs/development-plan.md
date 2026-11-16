@@ -899,7 +899,7 @@ http_active,thumb_bytes,link_bytes,recording_bytes,workers,peers,live_textures
 | `R02` | Первый срез и ревью в dev · PR [#4](https://github.com/LoonEman1/voxhold-native-rust/pull/4), [#6](https://github.com/LoonEman1/voxhold-native-rust/pull/6) | [`ef72a63`](https://github.com/LoonEman1/voxhold-native-rust/commit/ef72a63) (merge/access/read/backoff); реальный стенд и детальная вёрстка ленты впереди | — |
 | `R03` | Первый срез и три раунда ревью в PR [#12](https://github.com/LoonEman1/voxhold-native-rust/pull/12) · ветка `codex/r03-composer-media` | [`6f044fd`](https://github.com/LoonEman1/voxhold-native-rust/commit/6f044fdce10831d4f485b51b2c9147467a90f3d1); композер/черновики/идемпотентная отправка, потоковая загрузка, атомарное сохранение, кеши и viewer, границы доступа и tombstone-маркеры; живой стенд, кадры и DPI не проверены | — |
 | `R04` | Первый срез и два раунда правок ревью в PR [#13](https://github.com/LoonEman1/voxhold-native-rust/pull/13) · ветка `codex/r04-message-actions` | [`4d8cac1`](https://github.com/LoonEman1/voxhold-native-rust/commit/4d8cac1) поверх [`9f450e7`](https://github.com/LoonEman1/voxhold-native-rust/commit/9f450e7b380491dbbdd457e10bd1a94f8201c8b0); действия сообщений, ветки, поиск/закрепы, ЛС в workspace, `ChatKey`-изоляция, 12+4 правки ревью; GUI-пары кадров, DPI и два аккаунта не проверены | — |
-| `R05` | PR [#14](https://github.com/LoonEman1/voxhold-native-rust/pull/14) · ветка `codex/r05-settings` | Участники/присутствие, модальное дерево настроек, профиль/приватность, тема и уведомления, роли/хранилище/баны/CORS/диагностика, настройки канала и уведомления; тесты и release-сборка локально, живой backend/кадры/два аккаунта не проверены | — |
+| `R05` | В dev · PR [#14](https://github.com/LoonEman1/voxhold-native-rust/pull/14) · ветка `codex/r05-settings` | [`bf421cc`](https://github.com/LoonEman1/voxhold-native-rust/commit/bf421ccf386fb392d3f166a0d11b96d9e7ea2731) (merge `33d9a7a`): участники/присутствие, модальное дерево настроек, профиль/приватность, тема и уведомления, роли/хранилище/баны/CORS/диагностика, настройки канала и уведомления; Windows CI на `33d9a7a` успешен (run 43930378048), живой backend/кадры/два аккаунта не проверены | — |
 | `R06` | К выполнению | — | — |
 | `R07a` | К выполнению | — | — |
 | `R07b` | К выполнению | — | — |
@@ -1023,6 +1023,17 @@ PATCH, поэтому не сбрасывает редактор и `dispatched`
 -p voxhold-native-rust`, `scripts/check-file-sizes.ps1`. Живой backend,
 ручной GUI owner/admin/member, два аккаунта, кадры/DPI и фактический
 balloon не проверялись. См. [status.md](status.md).
+
+Интеграция: PR [#14](https://github.com/LoonEman1/voxhold-native-rust/pull/14)
+слит в `dev` коммитом
+[`bf421cc`](https://github.com/LoonEman1/voxhold-native-rust/commit/bf421ccf386fb392d3f166a0d11b96d9e7ea2731)
+поверх `47f977c`; Windows CI на `33d9a7a` завершился успешно
+([run 43930378048](https://github.com/LoonEman1/voxhold-native-rust/actions/runs/43930378048)).
+После merge ручной прогон R05 не выполнялся: на локальной машине не было
+запущенного backend и тестовых owner/admin/member, поэтому вход, вкладки,
+поздние ответы, `403`, отзыв сессии и восстановление настроек после
+перезапуска остаются непроверенными вживую. Следующее задание по плану —
+`R06`.
 
 ### Что обязательно приложить к PR
 

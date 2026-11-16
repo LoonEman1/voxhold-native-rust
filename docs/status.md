@@ -412,7 +412,10 @@ pending POST переоткрытой ветки, пустую последню�
 
 База — `origin/dev` `47f977ccddea269ad0fe2923a2d7db2a78869ddf` (merge PR
 #13), ветка `codex/r05-settings`, PR
-[#14](https://github.com/LoonEman1/voxhold-native-rust/pull/14). Контракты
+[#14](https://github.com/LoonEman1/voxhold-native-rust/pull/14). PR слит в
+`dev` коммитом
+[`bf421cc`](https://github.com/LoonEman1/voxhold-native-rust/commit/bf421ccf386fb392d3f166a0d11b96d9e7ea2731)
+(head `33d9a7a`, Windows CI успешен, run 43930378048). Контракты
 сверены с Go-клиентом
 `09c82b983d5d842af0627289655b11c37ae56e1d`, backend
 `9b29fdd6d5dc818b7408e4892b8e68b27d123831` и frontend
@@ -499,3 +502,9 @@ destructive cleanup на одноразовой БД, повторная дос�
 клик по balloon не восстанавливает окно. Даты профиля/сессий считаются
 по UTC. Иконки вкладок не рисуются. Роль `moderator` разобрана защитно,
 но backend 9b29fdd её не выдаёт.
+
+После merge в `dev` ручная приёмка R05 не выполнялась: локальный backend
+не запущен, тестовых owner/admin/member нет. Поэтому сценарии входа,
+профиля/приватности/уведомлений, позднего ответа после закрытия вкладки,
+`403` при смене роли, отзыва сессии и сохранения настроек после
+перезапуска остаются непроверенными вживую.

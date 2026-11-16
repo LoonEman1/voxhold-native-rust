@@ -161,6 +161,11 @@ impl ThreadPanel {
     }
 
     #[cfg(test)]
+    pub fn anchored(&self) -> bool {
+        self.anchored
+    }
+
+    #[cfg(test)]
     pub fn sending(&self) -> bool {
         self.sending
     }
@@ -378,6 +383,18 @@ impl ThreadPanel {
             }
             next.sort_by_key(|message| message.id);
             self.messages = next;
+            // "К последним" starts while the old anchored window is still on
+            // screen, so this branch replaces that window. Comments that
+            // arrived over WS during the GET are not in the server page; put
+            // them back from the pending set. Rows already present in the page
+            // were removed from `current` above.
+            if before == 0 && target.is_none() && !anchored {
+                for id in new_ids {
+                    if let Some(row) = current.remove(id) {
+                        self.apply_change(row);
+                    }
+                }
+            }
         }
         if before == 0 {
             self.anchored = anchored;
@@ -572,6 +589,7 @@ impl ThreadPanel {
         key: ChatKey,
         result: &Result<Message, voxhold_api::Error>,
         clear: bool,
+        apply_message: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -585,8 +603,13 @@ impl ThreadPanel {
                     self.composer
                         .update(cx, |input, cx| input.set_value("", window, cx));
                 }
-                self.apply_change(message.clone());
-                self.mark_visible(self.messages.last().map_or(0, |row| row.id), cx);
+                // A reopened panel settles its own send even when the channel
+                // switch moved the access generation. Only a row produced by
+                // the current generation may enter the timeline and mark read.
+                if apply_message {
+                    self.apply_change(message.clone());
+                    self.mark_visible(self.messages.last().map_or(0, |row| row.id), cx);
+                }
             }
             Err(error) => self.send_error = error.to_string(),
         }

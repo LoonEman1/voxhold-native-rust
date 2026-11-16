@@ -118,9 +118,21 @@ impl Voxhold {
                     s.remove_current_server(window, cx);
                 } else {
                     if access {
-                        // Access changed: hide confirmed data first, then take
-                        // a new authoritative channel snapshot and history.
-                        if s.access_reload_in_flight {
+                        // A personal conversation keeps its history, composer
+                        // and selection, but the server channel ACL may still
+                        // have changed. Drop the confirmed search snapshot and
+                        // every answer started under it before asking again.
+                        if s.in_conversation() {
+                            s.search_permissions_request = None;
+                            s.search_permissions_ready = false;
+                            s.sync_search_permissions(cx);
+                            if s.show_search {
+                                s.refresh_search_permissions(window, cx);
+                            }
+                        } else if s.access_reload_in_flight {
+                            // Access changed: hide confirmed data first, then
+                            // take a new authoritative channel snapshot and
+                            // history.
                             s.access_refresh_again = true;
                         } else {
                             s.invalidate_access(window, cx);

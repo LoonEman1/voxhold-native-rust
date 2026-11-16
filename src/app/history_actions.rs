@@ -635,6 +635,10 @@ impl Voxhold {
                         s.channels = channels;
                         s.search_permissions_ready = true;
                         s.sync_search_permissions(cx);
+                        // A pin refresh started while the snapshot was
+                        // unconfirmed returned immediately. Run it now so the
+                        // row menu and popup see the confirmed pin set.
+                        s.refresh_pins(cx);
                     }
                     Ok(Err(voxhold_api::Error::Http(403 | 404))) => {
                         s.search_permissions_ready = false;
@@ -750,6 +754,7 @@ impl Voxhold {
                     s.channels = channels;
                     s.search_permissions_ready = true;
                     s.sync_search_permissions(cx);
+                    s.refresh_pins(cx);
                     let readable = s
                         .channels
                         .iter()
@@ -782,12 +787,15 @@ impl Voxhold {
         let Some(client) = self.client.clone() else {
             return;
         };
-        if self.server <= 0 {
+        if self.server <= 0 || self.channel_snapshot_request.is_some() {
             return;
         }
+        self.action_seq = self.action_seq.wrapping_add(1);
+        let request = self.action_seq;
+        self.channel_snapshot_request = Some(request);
         self.search_permissions_ready = false;
         self.sync_search_permissions(cx);
-        let (server, generation) = (self.server, self.generation);
+        let (server, generation, access) = (self.server, self.generation, self.access_generation);
         let runtime = self.runtime.clone();
         cx.spawn(async move |this, cx| {
             let task =
@@ -795,14 +803,26 @@ impl Voxhold {
             let result = task.await;
             if let Some(this) = this.upgrade() {
                 this.update(cx, |s, cx| {
-                    if s.server != server || s.generation != generation {
+                    // Only the request that still owns the slot may confirm
+                    // its answer. A late reply from an older screen must not
+                    // turn search back on.
+                    if !s.release_channel_snapshot(request) {
+                        return;
+                    }
+                    if s.server != server
+                        || s.generation != generation
+                        || s.access_generation != access
+                    {
                         return;
                     }
                     if let Ok(channels) = result {
                         s.channels = channels;
                         s.search_permissions_ready = true;
+                        s.sync_search_permissions(cx);
+                        s.refresh_pins(cx);
+                    } else {
+                        s.sync_search_permissions(cx);
                     }
-                    s.sync_search_permissions(cx);
                     cx.notify();
                 })
                 .ok();
@@ -856,7 +876,11 @@ impl Voxhold {
         } else {
             search::Mode::Search
         };
-        if self.in_conversation() {
+        if self.in_conversation() || !self.search_permissions_ready {
+            // A personal chat always re-reads before a query. A channel opens
+            // with the confirmed snapshot when it has one; after a revoke or a
+            // `403` the next opening starts the fresh read that was deferred
+            // while the popup was closed.
             self.refresh_search_permissions(window, cx);
         } else {
             self.sync_search_permissions(cx);

@@ -247,7 +247,6 @@ impl Voxhold {
         self.conversation_reaction_requests.clear();
         self.channel_snapshot_request = None;
         self.search_permissions_request = None;
-        self.search_permissions_ready = true;
         self.context_request = None;
         self.pending_jump = None;
         self.history_reset_pending = false;
@@ -314,6 +313,10 @@ impl Voxhold {
         if let Some(search) = &self.search {
             search.update(cx, |panel, cx| panel.set_scope(self.server, id, cx));
         }
+        // `set_scope` drops the popup's confirmed permissions. Reinstall the
+        // already-confirmed snapshot before the pin refresh, otherwise that
+        // refresh exits and the row menu keeps showing "Закрепить".
+        self.sync_search_permissions(cx);
         self.messages.clear();
         self.history_keys.clear();
         let alignment = if kind == "news" {

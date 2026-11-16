@@ -451,6 +451,18 @@ impl SearchPanel {
     }
 
     #[cfg(test)]
+    pub(crate) fn set_query_for_test(
+        &mut self,
+        text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let text = text.to_string();
+        self.query
+            .update(cx, move |input, cx| input.set_value(text, window, cx));
+    }
+
+    #[cfg(test)]
     pub(crate) fn submit_for_test(&mut self, cx: &mut Context<Self>) {
         self.submit(cx);
     }

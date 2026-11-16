@@ -136,8 +136,8 @@ impl Voxhold {
 
     /// Confirmation for a thread POST owned by the workspace. Only the attempt
     /// that still owns `pending_sends` may change the draft or retry key. The
-    /// draft is finished even when the panel was closed in the meantime; the
-    /// panel is repainted only for the same key and current access scope.
+    /// panel for the same key settles even after a channel switch changed the
+    /// access generation; only the POST row itself is gated by that generation.
     pub(crate) fn finish_thread_send(
         &mut self,
         plan: draft::SendPlan,
@@ -159,14 +159,14 @@ impl Voxhold {
             return;
         }
         self.pending_sends.remove(&plan.key);
-        let active = self.access_generation == access
-            && self
-                .thread
-                .as_ref()
-                .is_some_and(|panel| panel.read(cx).key() == plan.key);
+        let panel_open = self
+            .thread
+            .as_ref()
+            .is_some_and(|panel| panel.read(cx).key() == plan.key);
+        let apply_message = self.access_generation == access && !self.access_pending;
         let mut clear = false;
         if result.is_ok() {
-            let composer_now = if active {
+            let composer_now = if panel_open {
                 self.thread
                     .as_ref()
                     .map(|panel| panel.read(cx).composer_text(cx))
@@ -179,14 +179,22 @@ impl Voxhold {
                 plan.revision,
                 &plan.composer_text,
                 &[],
-                active.then_some(composer_now.as_str()),
+                panel_open.then_some(composer_now.as_str()),
             );
-            clear = active && finished == draft::Finish::Cleared;
+            clear = panel_open && finished == draft::Finish::Cleared;
         }
-        if active {
+        if panel_open {
             if let Some(panel) = &self.thread {
                 panel.update(cx, |panel, cx| {
-                    panel.apply_send_result(attempt, plan.key, &result, clear, window, cx)
+                    panel.apply_send_result(
+                        attempt,
+                        plan.key,
+                        &result,
+                        clear,
+                        apply_message,
+                        window,
+                        cx,
+                    )
                 });
             }
         }

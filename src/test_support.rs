@@ -19,6 +19,7 @@ pub struct Gate {
     armed: AtomicBool,
     arrived: (Mutex<bool>, Condvar),
     released: (Mutex<bool>, Condvar),
+    closed: (Mutex<bool>, Condvar),
 }
 
 impl Gate {
@@ -29,6 +30,7 @@ impl Gate {
     pub fn arm(&self) {
         *self.arrived.0.lock().unwrap() = false;
         *self.released.0.lock().unwrap() = false;
+        *self.closed.0.lock().unwrap() = false;
         self.armed.store(true, Ordering::SeqCst);
     }
 
@@ -36,6 +38,29 @@ impl Gate {
         self.armed.store(false, Ordering::SeqCst);
         *self.released.0.lock().unwrap() = true;
         self.released.1.notify_all();
+    }
+
+    /// Wait until a gated body detected that the client closed the connection.
+    pub fn wait_closed(&self, timeout: Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut closed = self.closed.0.lock().unwrap();
+        while !*closed {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                return false;
+            }
+            let (next, result) = self.closed.1.wait_timeout(closed, left).unwrap();
+            closed = next;
+            if result.timed_out() && !*closed {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn mark_closed(&self) {
+        *self.closed.0.lock().unwrap() = true;
+        self.closed.1.notify_all();
     }
 
     /// Wait until a gated request reached the server.
@@ -75,6 +100,54 @@ impl Gate {
             }
         }
     }
+
+    /// Hold the body after the headers and watch the socket while waiting.
+    /// Returns false after the client closed the connection.
+    fn block_body_if_armed(&self, stream: &mut std::net::TcpStream) -> bool {
+        if !self.armed.load(Ordering::SeqCst) {
+            return true;
+        }
+        *self.arrived.0.lock().unwrap() = true;
+        self.arrived.1.notify_all();
+        loop {
+            let mut released = self.released.0.lock().unwrap();
+            if *released {
+                return true;
+            }
+            let (next, _) = self
+                .released
+                .1
+                .wait_timeout(released, Duration::from_millis(20))
+                .unwrap();
+            released = next;
+            if *released {
+                return true;
+            }
+            drop(released);
+            stream
+                .set_read_timeout(Some(Duration::from_millis(20)))
+                .ok();
+            let mut byte = [0u8; 1];
+            match stream.peek(&mut byte) {
+                Ok(0) => {
+                    self.mark_closed();
+                    return false;
+                }
+                Ok(_) => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock
+                            | std::io::ErrorKind::TimedOut
+                            | std::io::ErrorKind::Interrupted
+                    ) => {}
+                Err(_) => {
+                    self.mark_closed();
+                    return false;
+                }
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -108,6 +181,11 @@ pub struct Reply {
     pub body: ReplyBody,
     pub content_type: &'static str,
     pub gate: Option<Arc<Gate>>,
+    /// Hold after the headers and signal when the client closes the socket.
+    pub body_gate: Option<Arc<Gate>>,
+    /// Hold the response for a while before writing headers. Used by the
+    /// long-recording test that must outlive the eight-second JSON timeout.
+    pub delay: Option<Duration>,
 }
 
 impl Reply {
@@ -117,6 +195,8 @@ impl Reply {
             body: ReplyBody::Bytes(body.as_bytes().to_vec()),
             content_type: "application/json",
             gate: None,
+            body_gate: None,
+            delay: None,
         }
     }
 
@@ -127,6 +207,8 @@ impl Reply {
             body: ReplyBody::Bytes(body),
             content_type: "image/png",
             gate: None,
+            body_gate: None,
+            delay: None,
         }
     }
 
@@ -137,11 +219,23 @@ impl Reply {
             body: ReplyBody::File(path),
             content_type,
             gate: None,
+            body_gate: None,
+            delay: None,
         }
     }
 
     pub fn with_gate(mut self, gate: Arc<Gate>) -> Self {
         self.gate = Some(gate);
+        self
+    }
+
+    pub fn with_body_gate(mut self, gate: Arc<Gate>) -> Self {
+        self.body_gate = Some(gate);
+        self
+    }
+
+    pub fn with_delay(mut self, delay: Duration) -> Self {
+        self.delay = Some(delay);
         self
     }
 
@@ -226,6 +320,9 @@ impl TestServer {
 /// Write one queued answer. Called on the accept thread for the deterministic
 /// server and on a connection thread for the concurrent one.
 fn write_reply(stream: &mut std::net::TcpStream, reply: &Reply) {
+    if let Some(delay) = reply.delay {
+        std::thread::sleep(delay);
+    }
     if let Some(gate) = &reply.gate {
         gate.block_if_armed();
     }
@@ -237,6 +334,11 @@ fn write_reply(stream: &mut std::net::TcpStream, reply: &Reply) {
     )
     .into_bytes();
     let _ = stream.write_all(&response);
+    if let Some(gate) = &reply.body_gate {
+        if !gate.block_body_if_armed(stream) {
+            return;
+        }
+    }
     match &reply.body {
         ReplyBody::Bytes(bytes) => {
             let _ = stream.write_all(bytes);

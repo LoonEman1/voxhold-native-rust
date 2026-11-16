@@ -20,6 +20,8 @@ mod notifications;
 mod open_url;
 mod personal_settings;
 mod reactions;
+mod recordings;
+mod recordings_dialog;
 mod search;
 mod server_settings;
 mod settings;

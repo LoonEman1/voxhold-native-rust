@@ -38,6 +38,9 @@ pub struct VoicePanel {
     owns_fullscreen: bool,
     local_mutes: HashSet<String>,
     status: String,
+    recordings_focus: FocusHandle,
+    recordings_handler: Option<Box<dyn Fn(&mut Window, &mut gpui::App)>>,
+    recordings_live: Option<std::rc::Rc<std::cell::RefCell<Option<String>>>>,
 }
 impl VoicePanel {
     pub fn new(
@@ -93,7 +96,24 @@ impl VoicePanel {
             owns_fullscreen: false,
             local_mutes: HashSet::new(),
             status: String::new(),
+            recordings_focus: cx.focus_handle(),
+            recordings_handler: None,
+            recordings_live: None,
         }
+    }
+    pub fn set_recordings_handler(&mut self, handler: Box<dyn Fn(&mut Window, &mut gpui::App)>) {
+        self.recordings_handler = Some(handler);
+    }
+    pub fn set_recordings_live(&mut self, live: std::rc::Rc<std::cell::RefCell<Option<String>>>) {
+        self.recordings_live = Some(live);
+    }
+    pub fn recordings_focus(&self) -> FocusHandle {
+        self.recordings_focus.clone()
+    }
+
+    /// The call panel renders the "Записи" button only while connected.
+    pub fn recordings_button_mounted(&self) -> bool {
+        self.handle.is_some()
     }
     fn join(&mut self, cx: &mut Context<Self>) {
         if self.handle.is_some() {
@@ -484,6 +504,19 @@ impl Render for VoicePanel {
                 )
                 .child(
                     div()
+                        .id("voice-recordings")
+                        .cursor_pointer()
+                        .track_focus(&self.recordings_focus)
+                        .tab_index(0)
+                        .on_click(cx.listener(|s, _, window, cx| {
+                            if let Some(handler) = &s.recordings_handler {
+                                handler(window, cx);
+                            }
+                        }))
+                        .child("Записи"),
+                )
+                .child(
+                    div()
                         .id("voice-leave")
                         .cursor_pointer()
                         .on_click(cx.listener(|s, _, window, cx| s.leave_in_window(window, cx)))
@@ -498,6 +531,10 @@ impl Render for VoicePanel {
                     .child("Подключиться"),
             );
         }
+        let live_recording = self
+            .recordings_live
+            .as_ref()
+            .and_then(|slot| slot.borrow().clone());
         div()
             .id("voice-panel")
             .track_focus(&self.focus)
@@ -518,6 +555,17 @@ impl Render for VoicePanel {
             .text_color(rgb(0xf3f4eb))
             .child(div().text_size(px(18.)).child("Голосовой канал"))
             .child(self.status.clone())
+            .when(live_recording.is_some(), |panel| {
+                panel.child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(rgb(0xff6b6b))
+                        .child(format!(
+                            "Идёт запись · {}",
+                            live_recording.unwrap_or_default()
+                        )),
+                )
+            })
             .child(controls)
             .child(devices)
             .child(roster)

@@ -161,6 +161,11 @@ impl Voxhold {
         {
             self.voice_channel = 0;
         }
+        self.close_recordings(false, window, cx);
+        self.recording_access_epoch = self.recording_access_epoch.wrapping_add(1);
+        self.recordings.reset();
+        self.recordings
+            .set_access_epoch(self.recording_access_epoch);
         self.client = None;
         self.servers.clear();
         self.channels.clear();

@@ -16,6 +16,13 @@ mod overlays_view;
 mod personal_ops;
 mod profile_view;
 mod realtime;
+mod recordings_download;
+mod recordings_ops;
+#[cfg(test)]
+mod recordings_ops_tests;
+#[cfg(test)]
+mod recordings_tests;
+mod recordings_view;
 mod server_ops;
 mod session;
 #[cfg(test)]
@@ -43,8 +50,8 @@ use voxhold_api::{Channel, ChannelSubscription, Client, Member, Message, Server}
 use crate::voice_panel;
 use crate::{
     attachments, auth, background, channel_settings, draft, inbox, layout, links, media, members,
-    message_tools, personal_settings, reactions, search, server_settings, theme, thread_panel,
-    window_chrome,
+    message_tools, personal_settings, reactions, recordings, recordings_dialog, search,
+    server_settings, theme, thread_panel, window_chrome,
 };
 use ui::{icon, ink};
 
@@ -57,6 +64,16 @@ type HistoryKey = (i64, i64, i64, String, bool, bool, u64);
 /// of the same chat; the abort handle stops the runtime task on logout.
 struct PendingSend {
     attempt: u64,
+    abort: tokio::task::AbortHandle,
+}
+
+/// One runtime preview request. The generation is the dialog preview scope; an
+/// answer from a previous scope may not clear or replace the next request's
+/// pending entry.
+struct PreviewAbort {
+    key: String,
+    dialog: u64,
+    generation: u64,
     abort: tokio::task::AbortHandle,
 }
 
@@ -189,6 +206,22 @@ pub(crate) struct Voxhold {
     server_settings: Option<server_settings::ServerSettings>,
     channel_settings: Option<channel_settings::ChannelSettings>,
     channel_notifications: Option<channel_settings::ChannelNotifications>,
+    /// Server recordings snapshot and the one open dialog.
+    recordings: recordings::RecordingsState,
+    recording_access_epoch: u64,
+    /// Monotonic id of one open recordings modal. It stays stable until close.
+    recordings_dialog_seq: u64,
+    /// Monotonic attempt id for download/delete operations.
+    recordings_op_seq: u64,
+    recordings_dialog: Option<recordings_dialog::DialogState>,
+    recordings_return_focus: Option<FocusHandle>,
+    recordings_entry_focus: FocusHandle,
+    recordings_close_focus: FocusHandle,
+    recordings_voice_entry: bool,
+    recordings_preview_aborts: Vec<PreviewAbort>,
+    /// Owner name of the active recording in the open voice channel; shared
+    /// with the voice panel so the red marker and label read one snapshot.
+    recordings_live: std::rc::Rc<std::cell::RefCell<Option<String>>>,
     voice_settings: crate::voice_settings::VoiceSettings,
     notifications: crate::notifications::NotificationCenter,
     notification_tray: crate::notifications::Tray,
@@ -243,7 +276,7 @@ pub(crate) struct Voxhold {
     read_retry_at: Option<std::time::Instant>,
     painted_read: std::rc::Rc<std::cell::Cell<i64>>,
     /// The last confirmed read id per `(server, channel)`, used to place the
-    /// "Новые сообщения" divider when a channel is opened again.
+    /// "РќРѕРІС‹Рµ СЃРѕРѕР±С‰РµРЅРёСЏ" divider when a channel is opened again.
     channel_reads: std::collections::HashMap<(i64, i64), i64>,
     unread_after: i64,
     /// One request per `(message, emoji)` so a double click cannot toggle twice.
@@ -260,7 +293,7 @@ pub(crate) struct Voxhold {
     /// Scroll to this id after the spliced list has the matching row.
     pending_jump: Option<i64>,
     /// The next successful refresh replaces the window instead of merging it.
-    /// Used by "К последним" after a quote opened a bounded context page.
+    /// Used by "Рљ РїРѕСЃР»РµРґРЅРёРј" after a quote opened a bounded context page.
     history_reset_pending: bool,
     hovered_message: i64,
     /// Bumped when `attachments.changed` confirms a deletion, so the row
@@ -389,16 +422,17 @@ impl Voxhold {
         let view = Self {
             runtime: std::sync::Arc::new(tokio::runtime::Runtime::new().expect("Tokio runtime")),
             instance: cx.new(|cx| InputState::new(window, cx).placeholder("https://example.com")),
-            username: cx.new(|cx| InputState::new(window, cx).placeholder("например, neva")),
+            username: cx
+                .new(|cx| InputState::new(window, cx).placeholder("РЅР°РїСЂРёРјРµСЂ, neva")),
             password: cx.new(|cx| {
                 InputState::new(window, cx)
-                    .placeholder("Минимум 8 символов")
+                    .placeholder("РњРёРЅРёРјСѓРј 8 СЃРёРјРІРѕР»РѕРІ")
                     .masked(true)
             }),
             composer: cx.new(|cx| {
                 InputState::new(window, cx)
                     .multi_line()
-                    .placeholder("Написать сообщение")
+                    .placeholder("РќР°РїРёСЃР°С‚СЊ СЃРѕРѕР±С‰РµРЅРёРµ")
             }),
             client: None,
             self_user_id: 0,
@@ -419,7 +453,7 @@ impl Voxhold {
             edit_input: cx.new(|cx| {
                 InputState::new(window, cx)
                     .multi_line()
-                    .placeholder("Изменить сообщение")
+                    .placeholder("РР·РјРµРЅРёС‚СЊ СЃРѕРѕР±С‰РµРЅРёРµ")
             }),
             reaction_picker,
             confirm_delete: None,
@@ -440,6 +474,17 @@ impl Voxhold {
             server_settings: None,
             channel_settings: None,
             channel_notifications: None,
+            recordings: recordings::RecordingsState::default(),
+            recording_access_epoch: 0,
+            recordings_dialog_seq: 0,
+            recordings_op_seq: 0,
+            recordings_dialog: None,
+            recordings_return_focus: None,
+            recordings_entry_focus: cx.focus_handle(),
+            recordings_close_focus: cx.focus_handle(),
+            recordings_voice_entry: false,
+            recordings_preview_aborts: Vec::new(),
+            recordings_live: std::rc::Rc::new(std::cell::RefCell::new(None)),
             voice_settings: crate::voice_settings::VoiceSettings::with_path(voice_path),
             notifications: crate::notifications::NotificationCenter::with_path(notification_path),
             notification_tray: crate::notifications::Tray::default(),

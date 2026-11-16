@@ -269,6 +269,13 @@ impl PersonalSettings {
     /// Merge a GET answer without discarding a local edit or the `dispatched`
     /// value of a PATCH that is still in flight. `set_profile` remains the
     /// force-reset used by "Отмена".
+    ///
+    /// While a PATCH is in flight the page on the wire may still describe the
+    /// state before that write. Only the confirmed snapshot follows the GET;
+    /// both editor fields keep their values. Otherwise a GET country could
+    /// replace an untouched editor value that the PATCH had just sent, and
+    /// `FormValue::settle` would then treat the page value as a newer local
+    /// edit instead of applying the confirmed answer.
     pub fn apply_profile_snapshot(
         &mut self,
         profile: Profile,
@@ -285,15 +292,15 @@ impl PersonalSettings {
         if !keep_dispatched {
             self.about_form.dispatched = None;
             self.country_form.dispatched = None;
-        }
-        if !about_edited {
-            self.about.update(cx, |input, cx| {
-                input.set_value(profile.about.clone(), window, cx)
-            });
-        }
-        if !country_edited {
-            self.country_index =
-                settings::country_index(&self.countries, profile.country_code.as_deref());
+            if !about_edited {
+                self.about.update(cx, |input, cx| {
+                    input.set_value(profile.about.clone(), window, cx)
+                });
+            }
+            if !country_edited {
+                self.country_index =
+                    settings::country_index(&self.countries, profile.country_code.as_deref());
+            }
         }
         self.profile = Some(profile);
     }

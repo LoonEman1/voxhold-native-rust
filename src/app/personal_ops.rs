@@ -518,6 +518,12 @@ impl Voxhold {
             Action::RetrySessions => self.load_personal_sessions(cx),
             Action::SaveProfile => self.save_profile(window, cx),
             Action::CancelProfile => {
+                // "Отмена" must not roll the form back while a PATCH owns the
+                // editor values: that would clear `dispatched`, and the
+                // successful answer would no longer update the fields.
+                if self.active_profile_save.is_some() {
+                    return;
+                }
                 let confirmed = self
                     .personal
                     .as_ref()

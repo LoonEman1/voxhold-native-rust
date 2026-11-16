@@ -462,7 +462,7 @@ pending POST переоткрытой ветки, пустую последню�
   второго сокета нет.
 
 Проверено локально: `cargo fmt --all -- --check`,
-`cargo test --workspace --locked` (227 тестов приложения: 226 passed,
+`cargo test --workspace --locked` (230 тестов приложения: 229 passed,
 1 `ignored`; 6 API; 6 media), `cargo build --release --locked
 -p voxhold-native-rust`, проверка размеров (151 файл; исключение
 1200 строк для `src/app/history_view.rs`, `src/app/server_ops.rs`,

@@ -306,7 +306,7 @@ impl Voxhold {
                         "Отмена",
                         ButtonKind::Secondary,
                         false,
-                        false,
+                        profile_saving,
                         SettingsAct::Personal(personal_settings::Action::CancelProfile),
                         window,
                         cx,

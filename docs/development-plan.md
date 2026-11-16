@@ -1009,8 +1009,16 @@ backend `9b29fdd`, frontend `ed7cb00`, Go `09c82b9`.
 PATCH, отбрасывается по epoch, а GET во время PATCH сохраняет локальные
 поля и `dispatched` активного запроса.
 
+Третий раунд: пока PATCH профиля активен, GET обновляет только
+подтверждённый снимок и сохраняет оба поля редактора, поэтому страна из
+ответа GET не подменяет отправленную и не принимается `settle` за правку
+пользователя; «Отмена» заблокирована и в кнопке, и в обработчике до ответа
+PATCH, поэтому не сбрасывает редактор и `dispatched`. Регрессии: разные
+страны в ответах GET и PATCH с проверкой редактора и следующего PATCH,
+прямой тест слияния снимка, задержанный PATCH с нажатием «Отмены».
+
 Проверки после правок: `cargo fmt --all -- --check`,
-`cargo test --workspace --locked` (227 тестов приложения: 226 passed,
+`cargo test --workspace --locked` (230 тестов приложения: 229 passed,
 1 `ignored`; 6 API; 6 media), `cargo build --release --locked
 -p voxhold-native-rust`, `scripts/check-file-sizes.ps1`. Живой backend,
 ручной GUI owner/admin/member, два аккаунта, кадры/DPI и фактический

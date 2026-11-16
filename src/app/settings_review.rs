@@ -399,6 +399,226 @@ async fn a_get_answer_keeps_an_inflight_patch_edit(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn a_get_country_does_not_replace_the_country_a_pending_patch_sent(cx: &mut TestAppContext) {
+    cx.update(|cx| gpui_component::init(cx));
+    let get_gate = Gate::new();
+    let patch_gate = Gate::new();
+    // The page on the wire still holds another country than the PATCH that is
+    // being confirmed.
+    let get_profile = voxhold_api::Profile {
+        about: "old".into(),
+        country_code: Some("KZ".into()),
+        ..profile("old")
+    };
+    let patched = voxhold_api::Profile {
+        about: "old".into(),
+        country_code: Some("RU".into()),
+        ..profile("old")
+    };
+    let get_server = TestServer::spawn_concurrent(vec![Reply::new(
+        200,
+        &serde_json::to_string(&get_profile).unwrap(),
+    )
+    .with_gate(get_gate.clone())]);
+    let patch_server = TestServer::spawn_concurrent(vec![
+        Reply::new(200, &serde_json::to_string(&patched).unwrap()).with_gate(patch_gate.clone()),
+        Reply::new(200, &serde_json::to_string(&patched).unwrap()),
+    ]);
+    let mut get_client = voxhold_api::Client::new(&get_server.base).unwrap();
+    get_client.set_token("token".into());
+    let mut patch_client = voxhold_api::Client::new(&patch_server.base).unwrap();
+    patch_client.set_token("token".into());
+    let (window, view) = make_app(cx, patch_client.clone());
+    let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
+    let (get_gate, patch_gate, view_a) = (get_gate, patch_gate, view.clone());
+    visual.update(|window, app| {
+        view_a.update(app, |v, cx| {
+            v.active_settings = Some(SettingsKind::Personal);
+            let panel = v.personal.as_mut().unwrap();
+            panel.reopen(v.theme_mode, false);
+            panel.profile = Some(profile("old"));
+            panel.about_form.load("old".into());
+            panel.country_form.load(Some("RU".into()));
+            panel.country_index = crate::settings::country_index(&panel.countries, Some("RU"));
+            panel
+                .about
+                .update(cx, |input, cx| input.set_value("old", window, cx));
+            v.client = Some(get_client.clone());
+            get_gate.arm();
+            v.load_personal_profile(window, cx);
+            // The country is not a local edit: the editor value and the
+            // confirmed snapshot both say RU. The GET page says KZ.
+            v.client = Some(patch_client.clone());
+            patch_gate.arm();
+            v.save_profile(window, cx);
+        });
+    });
+    // Let the GET answer while the PATCH is still held by its gate, then
+    // release the PATCH.
+    let (get_gate, patch_gate) = (get_gate, patch_gate);
+    let release = std::thread::spawn(move || {
+        let get = get_gate.wait_arrived(Duration::from_secs(5));
+        get_gate.release();
+        let patch = patch_gate.wait_arrived(Duration::from_secs(5));
+        std::thread::sleep(Duration::from_millis(200));
+        patch_gate.release();
+        (get, patch)
+    });
+    visual.run_until_parked();
+    let (get, patch) = release.join().unwrap();
+    assert!(get, "the GET reached the server");
+    assert!(patch, "the PATCH reached the server");
+    wait_for(&mut visual, &view, |v| v.active_profile_save.is_none());
+    view.read_with(&*visual, |v, cx| {
+        let panel = v.personal.as_ref().unwrap();
+        assert_eq!(
+            panel.country_code().as_deref(),
+            Some("RU"),
+            "the confirmed PATCH answer stays in the country editor"
+        );
+        assert_eq!(
+            panel.about.read(cx).value().to_string(),
+            "old",
+            "the confirmed PATCH answer stays in the about editor"
+        );
+        assert_eq!(
+            panel.profile.as_ref().unwrap().country_code.as_deref(),
+            Some("RU")
+        );
+        assert!(panel.about_form.dispatched.is_none());
+        assert!(panel.country_form.dispatched.is_none());
+    });
+    // The next save must send the confirmed RU, not the KZ page value.
+    visual.update(|window, app| {
+        view.update(app, |v, cx| v.save_profile(window, cx));
+    });
+    wait_for(&mut visual, &view, |v| v.active_profile_save.is_none());
+    let requests = patch_server.requests();
+    let patch = requests
+        .iter()
+        .filter(|request| request.method == "PATCH")
+        .nth(1)
+        .expect("the second save sends one PATCH");
+    let body = String::from_utf8_lossy(&patch.body);
+    assert!(
+        body.contains(r#""country_code":"RU""#),
+        "the next PATCH must keep the confirmed country: {body}"
+    );
+}
+
+#[gpui::test]
+async fn a_get_during_a_pending_patch_updates_only_the_confirmed_snapshot(cx: &mut TestAppContext) {
+    cx.update(|cx| gpui_component::init(cx));
+    let (window, view) = make_app(cx, voxhold_api::Client::new("http://127.0.0.1:1").unwrap());
+    let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            v.active_settings = Some(SettingsKind::Personal);
+            let panel = v.personal.as_mut().unwrap();
+            panel.about_form.load("old".into());
+            panel.country_form.load(Some("RU".into()));
+            panel.country_index = crate::settings::country_index(&panel.countries, Some("RU"));
+            panel
+                .about
+                .update(cx, |input, cx| input.set_value("old", window, cx));
+            // The PATCH is in flight with the values currently in the editors.
+            panel.about_form.begin(1, "old".into());
+            panel.country_form.begin(1, Some("RU".into()));
+            // The GET page still shows another country.
+            let get = voxhold_api::Profile {
+                about: "old".into(),
+                country_code: Some("KZ".into()),
+                ..profile("old")
+            };
+            panel.apply_profile_snapshot(get, true, window, cx);
+            assert_eq!(
+                panel.about.read(cx).value().to_string(),
+                "old",
+                "both editor fields keep their values"
+            );
+            assert_eq!(panel.country_code().as_deref(), Some("RU"));
+            assert_eq!(panel.about_form.snapshot, "old");
+            assert_eq!(panel.country_form.snapshot.as_deref(), Some("KZ"));
+
+            // Settling the PATCH must still see the dispatched values, not the
+            // page value, so it writes the confirmed answer into the editors.
+            let current_about = panel.about.read(cx).value().to_string();
+            let current_country = panel.country_code();
+            assert!(panel.about_form.settle(1, "old".into(), &current_about));
+            assert!(panel
+                .country_form
+                .settle(1, Some("RU".into()), &current_country));
+            assert_eq!(panel.country_form.snapshot.as_deref(), Some("RU"));
+            assert!(panel.country_form.dispatched.is_none());
+        });
+    });
+}
+
+#[gpui::test]
+async fn cancel_is_ignored_while_a_profile_patch_is_in_flight(cx: &mut TestAppContext) {
+    cx.update(|cx| gpui_component::init(cx));
+    let gate = Gate::new();
+    let reply = serde_json::to_string(&profile("server answer")).unwrap();
+    let server = TestServer::spawn(vec![Reply::new(200, &reply).with_gate(gate.clone())]);
+    let mut client = voxhold_api::Client::new(&server.base).unwrap();
+    client.set_token("token".into());
+    let (window, view) = make_app(cx, client);
+    let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            v.active_settings = Some(SettingsKind::Personal);
+            let panel = v.personal.as_mut().unwrap();
+            panel.profile = Some(profile("old"));
+            panel.about_form.load("old".into());
+            panel.country_form.load(Some("RU".into()));
+            panel.country_index = crate::settings::country_index(&panel.countries, Some("RU"));
+            panel
+                .about
+                .update(cx, |input, cx| input.set_value("sent", window, cx));
+            gate.arm();
+            v.save_profile(window, cx);
+        });
+    });
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            v.settings_action(
+                SettingsAct::Personal(personal_settings::Action::CancelProfile),
+                window,
+                cx,
+            );
+            assert!(
+                v.active_profile_save.is_some(),
+                "the PATCH keeps its session lock"
+            );
+            let panel = v.personal.as_ref().unwrap();
+            assert_eq!(
+                panel.about.read(cx).value().to_string(),
+                "sent",
+                "cancel must not roll the editor back to the old snapshot"
+            );
+            assert!(
+                panel.about_form.dispatched.is_some(),
+                "cancel must not clear the pending PATCH dispatch"
+            );
+            assert_eq!(panel.profile.as_ref().unwrap().about, "old");
+        });
+    });
+    let waiter = release_on_arrival(gate.clone());
+    visual.run_until_parked();
+    assert!(waiter.join().unwrap(), "the PATCH reached the server");
+    wait_for(&mut visual, &view, |v| v.active_profile_save.is_none());
+    view.read_with(&*visual, |v, cx| {
+        let panel = v.personal.as_ref().unwrap();
+        assert_eq!(
+            panel.about.read(cx).value().to_string(),
+            "server answer",
+            "the successful PATCH still updates the editor after the ignored cancel"
+        );
+        assert_eq!(panel.profile.as_ref().unwrap().about, "server answer");
+    });
+}
+
+#[gpui::test]
 async fn a_patch_answer_updates_the_profile_while_privacy_is_active(cx: &mut TestAppContext) {
     cx.update(|cx| gpui_component::init(cx));
     let gate = Gate::new();

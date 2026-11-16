@@ -58,12 +58,13 @@ impl Voxhold {
                     .justify_center()
                     .cursor_pointer()
                     .child(icon("icons/inbox.svg", 18., ink(p.muted)))
-                    .on_click(cx.listener(|s, _, window, cx| {
+                    .on_click(cx.listener(|s, _, _, cx| {
                         s.show_inbox = !s.show_inbox;
                         if s.show_inbox {
-                            if let Some(inbox) = &s.inbox {
-                                inbox.update(cx, |inbox, cx| inbox.load(window, cx));
-                            }
+                            s.show_search = false;
+                            s.message_menu = None;
+                            s.forward = None;
+                            s.refresh_recents(cx);
                         }
                         cx.notify();
                     })),
@@ -97,7 +98,11 @@ impl Voxhold {
         self.show_servers = false;
         self.show_inbox = false;
         self.show_settings = false;
-        if self.server != id || self.access_pending || self.channels.is_empty() {
+        if self.server != id
+            || self.access_pending
+            || self.channels.is_empty()
+            || self.conversation.is_some()
+        {
             self.select_server(id, window, cx);
         }
         cx.notify();
@@ -231,7 +236,7 @@ impl Voxhold {
                     })),
             );
         }
-        if can_manage && self.channel != 0 {
+        if can_manage && self.channel != 0 && self.conversation.is_none() {
             panel = panel.child(
                 div()
                     .id("channel-settings-open")
@@ -276,7 +281,7 @@ impl Voxhold {
             );
             for channel in items {
                 let id = channel.id;
-                let active = id == self.channel;
+                let active = id == self.channel && self.conversation.is_none();
                 let locked = channel.kind == "news" && !channel.writable() || !channel.readable();
                 let color = if active { ink(p.fg) } else { ink(p.muted) };
                 panel = panel.child(

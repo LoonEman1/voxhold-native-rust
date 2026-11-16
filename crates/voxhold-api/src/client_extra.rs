@@ -147,6 +147,33 @@ impl Client {
         )
         .await
     }
+    /// A thread comment. The backend dispatches news comments from
+    /// `reply_to_message_id` before it looks at `thread_root_id`, so the news
+    /// payload carries both; a text-channel comment keeps its original shape.
+    pub async fn send_thread_message(
+        &self,
+        sid: i64,
+        cid: i64,
+        root: i64,
+        content: &str,
+        key: &str,
+        news: bool,
+    ) -> Result<Message> {
+        let mut body = json!({
+            "content": content,
+            "thread_root_id": root,
+            "client_message_id": key
+        });
+        if news {
+            body["reply_to_message_id"] = json!(root);
+        }
+        self.request(
+            Method::POST,
+            &format!("{}/messages", channel_path(sid, cid)),
+            Some(body),
+        )
+        .await
+    }
     pub async fn forward_message(
         &self,
         s: i64,
@@ -158,10 +185,96 @@ impl Client {
         self.request(Method::POST,&format!("{}/messages/forward",channel_path(s,destination)),Some(json!({"source_server_id":s,"source_channel_id":source,"source_message_id":id,"client_message_id":key}))).await
     }
     pub async fn save_favorite(&self, id: i64, key: &str) -> Result<()> {
+        self.save_favorite_source("channel", id, key).await
+    }
+    /// Go `SaveFavorite`: a channel message or a personal message is forwarded
+    /// into the caller's own favorites conversation.
+    pub async fn save_favorite_source(&self, kind: &str, id: i64, key: &str) -> Result<()> {
+        if !(kind == "channel" || kind == "conversation") || id <= 0 || key.is_empty() {
+            return Err(Error::InvalidResponse("Некорректный источник."));
+        }
         let v: Value = self
             .request(Method::GET, "/api/v1/me/favorites", None)
             .await?;
-        self.action(Method::POST,"/api/v1/me/forward",Some(json!({"source":{"kind":"channel","id":id},"destination":{"kind":"conversation","id":v["id"]},"client_message_id":key}))).await
+        let favorite = v["id"]
+            .as_i64()
+            .filter(|id| *id > 0)
+            .ok_or(Error::InvalidResponse("Сервер не вернул избранное."))?;
+        self.action(
+            Method::POST,
+            "/api/v1/me/forward",
+            Some(json!({
+                "source": {"kind": kind, "id": id},
+                "destination": {"kind": "conversation", "id": favorite},
+                "client_message_id": key
+            })),
+        )
+        .await
+    }
+    pub async fn set_conversation_reaction(
+        &self,
+        cid: i64,
+        mid: i64,
+        emoji: &str,
+        active: bool,
+    ) -> Result<DirectReactions> {
+        if cid <= 0 || mid <= 0 || emoji.trim().is_empty() {
+            return Err(Error::InvalidResponse("Некорректная реакция."));
+        }
+        let segment: String = url::form_urlencoded::byte_serialize(emoji.as_bytes()).collect();
+        let result: DirectReactions = self
+            .request(
+                if active { Method::PUT } else { Method::DELETE },
+                &format!("/api/v1/conversations/{cid}/messages/{mid}/reactions/{segment}"),
+                None,
+            )
+            .await?;
+        if result.revision < 0 {
+            return Err(Error::InvalidResponse("Некорректная ревизия реакции."));
+        }
+        Ok(result)
+    }
+    /// Channel and personal destinations allowed by the current ACL.
+    pub async fn forward_destinations(&self) -> Result<Vec<ForwardDestination>> {
+        let mut values: Vec<ForwardDestination> = self
+            .request(Method::GET, "/api/v1/me/forward-destinations", None)
+            .await?;
+        values.retain(|value| {
+            value.id > 0 && (value.kind == "channel" || value.kind == "conversation")
+        });
+        Ok(values)
+    }
+    pub async fn forward_message_to(
+        &self,
+        source_kind: &str,
+        source_id: i64,
+        destination_kind: &str,
+        destination_id: i64,
+        key: &str,
+    ) -> Result<Message> {
+        if !(source_kind == "channel" || source_kind == "conversation")
+            || !(destination_kind == "channel" || destination_kind == "conversation")
+            || source_id <= 0
+            || destination_id <= 0
+            || key.is_empty()
+        {
+            return Err(Error::InvalidResponse("Некорректная пересылка."));
+        }
+        let message: Message = self
+            .request(
+                Method::POST,
+                "/api/v1/me/forward",
+                Some(json!({
+                    "source": {"kind": source_kind, "id": source_id},
+                    "destination": {"kind": destination_kind, "id": destination_id},
+                    "client_message_id": key
+                })),
+            )
+            .await?;
+        if message.id <= 0 {
+            return Err(Error::InvalidResponse("Некорректный ответ пересылки."));
+        }
+        Ok(message)
     }
     pub async fn link_preview(&self, href: &str) -> Result<LinkPreview> {
         let q: String = url::form_urlencoded::byte_serialize(href.as_bytes()).collect();

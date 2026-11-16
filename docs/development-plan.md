@@ -898,7 +898,7 @@ http_active,thumb_bytes,link_bytes,recording_bytes,workers,peers,live_textures
 | `R01a` | В работе | Пикер и каталог эмодзи ещё не перенесены; SVG подключены, `AssetSource` есть | — |
 | `R02` | Первый срез и ревью в dev · PR [#4](https://github.com/LoonEman1/voxhold-native-rust/pull/4), [#6](https://github.com/LoonEman1/voxhold-native-rust/pull/6) | [`ef72a63`](https://github.com/LoonEman1/voxhold-native-rust/commit/ef72a63) (merge/access/read/backoff); реальный стенд и детальная вёрстка ленты впереди | — |
 | `R03` | Первый срез и три раунда ревью в PR [#12](https://github.com/LoonEman1/voxhold-native-rust/pull/12) · ветка `codex/r03-composer-media` | [`6f044fd`](https://github.com/LoonEman1/voxhold-native-rust/commit/6f044fdce10831d4f485b51b2c9147467a90f3d1); композер/черновики/идемпотентная отправка, потоковая загрузка, атомарное сохранение, кеши и viewer, границы доступа и tombstone-маркеры; живой стенд, кадры и DPI не проверены | — |
-| `R04` | К выполнению | — | — |
+| `R04` | Первый срез и два раунда правок ревью в PR [#13](https://github.com/LoonEman1/voxhold-native-rust/pull/13) · ветка `codex/r04-message-actions` | [`4d8cac1`](https://github.com/LoonEman1/voxhold-native-rust/commit/4d8cac1) поверх [`9f450e7`](https://github.com/LoonEman1/voxhold-native-rust/commit/9f450e7b380491dbbdd457e10bd1a94f8201c8b0); действия сообщений, ветки, поиск/закрепы, ЛС в workspace, `ChatKey`-изоляция, 12+4 правки ревью; GUI-пары кадров, DPI и два аккаунта не проверены | — |
 | `R05` | К выполнению | — | — |
 | `R06` | К выполнению | — | — |
 | `R07a` | К выполнению | — | — |
@@ -936,6 +936,34 @@ PR [#12](https://github.com/LoonEman1/voxhold-native-rust/pull/12) в `dev`.
 1 `ignored`; 5 API; 6 media), проверка размеров (124 файла). Осталось до
 merge/релиза: CI на PR, живой backend и веб-пары, кадры и DPI, ручной сценарий
 двух аккаунтов; подробности в [status.md](status.md).
+
+### R04 · Действия сообщений, обсуждения, поиск и ЛС — журнал PR #13
+Ветка `codex/r04-message-actions`, база `origin/dev` `88a7bad`, коммит
+[`9f450e7`](https://github.com/LoonEman1/voxhold-native-rust/commit/9f450e7b380491dbbdd457e10bd1a94f8201c8b0),
+PR [#13](https://github.com/LoonEman1/voxhold-native-rust/pull/13); сверены backend `9b29fdd`, frontend `ed7cb00`, Go `09c82b9`.
+
+- `message_tools.rs`, `history_actions.rs`, `action_io.rs`, `history_view.rs`,
+  `overlays_view.rs`: hover/меню, один диспетчер с `(ChatKey, access_generation,
+  request_id)`, повторная проверка строки/прав, ответ/правка/удаление/реакции/
+  пересылка/избранное/закреп/блокировка, копирование строк, `scroll_epoch`, `403`.
+- `thread_panel.rs`, `thread_ops.rs`: отдельная лента, якорь, composer и черновик
+  `ChatKey::thread`, comments/thread read, закрытие при удалении root.
+- `search.rs`, `overlays_view.rs`: popup с `limit=25`/`before_id`, состояния и
+  отмена старого запроса, проверка доступного канала, якорь/подсветка, pin list.
+- `inbox.rs`, `inbox_ops.rs`, `voxhold-api`: недавние ЛС `limit=13` без `saved`,
+  direct/group, peer/аватар, история/отправка/read/вложения/действия в workspace,
+  изоляция числовых ID через `ChatKey`.
+- `tests/r04.rs`, `message_tools.rs`: права по роли, stale search page, закрытый
+  канал, одинаковые URL/цитаты, edit/delete в ветке, канал ↔ ЛС ↔ сервер, порядок
+  копирования, ревизии реакций/закрепов, старый клик, поздний ответ.
+
+До правок ревью прошли fmt, тесты (147: 146 passed, 1 `ignored`; 6 API; 6 media), release, размеры и smoke; на `9b29fdd` — вход, канал/ЛС, поиск, закреп, ветка, read, recents и `403`.
+
+Первый раунд ревью — [`57184ae`](https://github.com/LoonEman1/voxhold-native-rust/commit/57184ae): пересылка по `message_id`, отложенный переход из поиска, удаление корня ветки по WebSocket, отдельная попытка отправки и закрытие панели, tombstone/слияние страницы, новостные комментарии, ACL-фильтр поиска, реакция старого сообщения ЛС, reconnect ЛС, раздельные состояния закрепов, слот прав после `403`, единый hover-диспетчер. Второй раунд — [`4d8cac1`](https://github.com/LoonEman1/voxhold-native-rust/commit/4d8cac1): поиск (включая ЛС) ждёт подтверждённого снимка каналов; POST ветки хранится в `pending_sends` по `ChatKey::thread` и виден переоткрытой панели; пустая последняя страница ветки сохраняет WS/POST-строки и отсекает tombstone; два события реакции дают один активный GET и один повтор по `(ChatKey, message_id)`. После правок: `cargo fmt --check`, `cargo test --workspace --locked` (167: 166 passed, 1 `ignored`; 6 API; 6 media), размеры. Release, GUI и живой backend после правок не перезапускались; осталось: два аккаунта, кадры/DPI, живые новостные роли и закрепы/реакции ЛС, E2EE. См. [status.md](status.md).
+
+Третий раунд — [`4057c7a`](https://github.com/LoonEman1/voxhold-native-rust/commit/4057c7a): отзыв доступа в ЛС сбрасывает подтверждённый поисковый снимок и старые страницы, а при закрытом popup свежий `/channels` запускается следующим открытием; `403` без окна подтверждает права только через владельца слота снимка. Выбор канала переустанавливает уже подтверждённые права до загрузки закрепов и дозагружает их после нового подтверждения. Подтверждение POST ветки снимает «Отправка…» и очищает/сохраняет живой черновик по `plan.key` даже после смены канала, а вставку строки и read ограничивает `access_generation`. «К последним» заменяет старое окно, но возвращает комментарии, пришедшие по WS во время GET, и соблюдает tombstone. После правок: `cargo fmt --all -- --check`, `cargo test --workspace --locked` (173 теста приложения: 172 passed, 1 `ignored`; 6 API; 6 media), размеры (137 файлов). Release, GUI и живой backend после правок не перезапускались; осталось: два аккаунта, кадры/DPI, живые новостные роли и закрепы/реакции ЛС, E2EE. См. [status.md](status.md).
+
+Дополнение третьего раунда — [`0b57d56`](https://github.com/LoonEman1/voxhold-native-rust/commit/0b57d56): `channels.changed` в ЛС освобождает и слот `/channels`-проверки после `403`, поэтому старый ответ не может снова разрешить поиск; запрос проверки переведён на tokio без блокировки UI. Возврат ЛС → канал при неподтверждённом снимке запускает свежий `/channels`, и только его callback синхронизирует права и загружает закрепы. Добавлены регрессии на удержание обоих GET и на DM → канал с закрепом 42. Проверки: `cargo fmt --all -- --check`, `cargo test --workspace --locked` (173 теста приложения: 172 passed, 1 `ignored`; 6 API; 6 media), размеры (137 файлов). Release, GUI и живой backend не перезапускались.
 
 ### Что обязательно приложить к PR
 

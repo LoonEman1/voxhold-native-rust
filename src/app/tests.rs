@@ -218,7 +218,7 @@ async fn access_change_hides_confirmed_history(cx: &mut TestAppContext) {
             assert!(v.messages.is_empty());
             assert!(v.history_keys.is_empty());
             assert_eq!(v.access_generation, before + 1);
-            assert!(!v.show_tools && !v.show_search);
+            assert!(!v.show_search);
         });
     });
 }
@@ -534,11 +534,10 @@ async fn context_replacement_invalidates_the_old_older_page(cx: &mut TestAppCont
 }
 
 #[gpui::test]
-async fn reaction_on_old_row_keeps_selection_and_skips_history_reload(cx: &mut TestAppContext) {
+async fn reaction_on_old_row_keeps_the_window_and_revision_order(cx: &mut TestAppContext) {
     cx.update(|cx| gpui_component::init(cx));
-    let (window, view) = add_auth_window(cx);
-    let mut visual = VisualTestContext::from_window(window.into(), cx);
-    visual.update(|window, app| {
+    let (_window, view) = add_auth_window(cx);
+    cx.update(|app| {
         view.update(app, |v, _| {
             v.server = 1;
             v.channel = 7;
@@ -547,43 +546,7 @@ async fn reaction_on_old_row_keeps_selection_and_skips_history_reload(cx: &mut T
                     serde_json::from_value::<Message>(message_json(id, 1, "row")).unwrap();
                 v.merge_message(true, message);
             }
-        });
-        let runtime = view.read_with(app, |v, _| v.runtime.clone());
-        let recents = view.read_with(app, |v, _| v.recent_reactions.clone());
-        let client = Client::new("http://127.0.0.1:1").unwrap();
-        let tools =
-            app.new(|cx| message_tools::MessageTools::new(client, runtime, recents, window, cx));
-        let weak = view.downgrade();
-        tools.update(app, |tools, _| {
-            tools.set_reaction_handler(Some(Box::new(move |update, cx| {
-                if let Some(view) = weak.upgrade() {
-                    view.update(cx, |view, cx| {
-                        view.apply_reaction_update(update);
-                        cx.notify();
-                    });
-                }
-            })));
-        });
-        view.update(app, |v, _| v.message_tools = Some(tools.clone()));
-        let old = view.read_with(app, |v, _| v.messages[0].clone());
-        tools.update(app, |tools, cx| {
-            tools.select(
-                1,
-                7,
-                Some(old),
-                message_tools::MessagePermissions {
-                    react: true,
-                    ..Default::default()
-                },
-                cx,
-            );
-        });
-
-        tools.update(app, |tools, cx| {
-            assert_eq!(tools.selected_id(), Some(1));
-            assert_eq!(tools.revision(), 0, "a reaction must not reload history");
-            assert!(tools.reaction_request_active("🔥"), "first click is PUT");
-            let update = voxhold_api::ReactionsUpdate {
+            let added = voxhold_api::ReactionsUpdate {
                 channel_id: 7,
                 message_id: 1,
                 revision: 1,
@@ -593,25 +556,32 @@ async fn reaction_on_old_row_keeps_selection_and_skips_history_reload(cx: &mut T
                     me: true,
                 }],
             };
-            assert!(tools.handle_reaction_result(update, "🔥", cx));
-            assert_eq!(tools.revision(), 0);
-            assert_eq!(tools.selected_id(), Some(1));
-            assert!(
-                !tools.reaction_request_active("🔥"),
-                "second click is DELETE"
-            );
-            let removed = voxhold_api::ReactionsUpdate {
+            v.apply_reaction_update(added.clone());
+            assert_eq!(v.messages[0].reactions_revision, 1);
+            assert!(v.messages[0].reactions[0].me);
+            // Same revision and a foreign row must not overwrite the accepted
+            // reaction, and the old window stays loaded.
+            v.apply_reaction_update(voxhold_api::ReactionsUpdate {
+                reactions: Vec::new(),
+                ..added
+            });
+            v.apply_reaction_update(voxhold_api::ReactionsUpdate {
+                channel_id: 7,
+                message_id: 41,
+                revision: 9,
+                reactions: Vec::new(),
+            });
+            assert_eq!(v.messages[0].reactions_revision, 1);
+            assert!(v.messages[0].reactions[0].me);
+            assert_eq!(v.messages.len(), 60);
+            assert_eq!(v.messages[0].id, 1);
+
+            v.apply_reaction_update(voxhold_api::ReactionsUpdate {
                 channel_id: 7,
                 message_id: 1,
                 revision: 2,
                 reactions: Vec::new(),
-            };
-            assert!(tools.handle_reaction_result(removed, "🔥", cx));
-            assert!(tools.reaction_request_active("🔥"));
-        });
-        view.read_with(app, |v, _| {
-            assert_eq!(v.messages.len(), 60, "the old window stays loaded");
-            assert_eq!(v.messages[0].id, 1);
+            });
             assert_eq!(v.messages[0].reactions_revision, 2);
             assert!(!v.messages[0].reactions.iter().any(|reaction| reaction.me));
         });
@@ -870,7 +840,7 @@ async fn a_late_send_keeps_the_edited_draft_and_does_not_duplicate_ws_rows(
             // The user edits the composer during the request.
             v.drafts.borrow_mut().set_text(key, "текст и ещё");
             let message = serde_json::from_value::<Message>(message_json(5, 1, "текст")).unwrap();
-            let clear = v.apply_send_success(plan.clone(), message, "текст и ещё");
+            let clear = v.apply_send_success(plan.clone(), message, "текст и ещё", cx);
             assert!(!clear, "an edited draft must not be cleared");
             assert_eq!(v.messages.len(), 1, "WS and HTTP converge to one row");
             assert_eq!(
@@ -883,7 +853,7 @@ async fn a_late_send_keeps_the_edited_draft_and_does_not_duplicate_ws_rows(
             v.drafts.borrow_mut().set_text(key, "второй");
             let plan = v.drafts.borrow_mut().begin_send(key, "второй").unwrap();
             let message = serde_json::from_value::<Message>(message_json(6, 1, "второй")).unwrap();
-            assert!(v.apply_send_success(plan, message, "второй"));
+            assert!(v.apply_send_success(plan, message, "второй", cx));
             assert_eq!(v.drafts.borrow().text(key), "");
             assert_eq!(v.messages.len(), 2);
             cx.notify();
@@ -935,5 +905,9 @@ async fn paste_and_drop_add_only_metadata_to_the_draft(cx: &mut TestAppContext) 
     std::fs::remove_file(path).unwrap();
 }
 
+mod fixes;
+mod followup;
+mod followup2;
 mod media;
+mod r04;
 mod review;

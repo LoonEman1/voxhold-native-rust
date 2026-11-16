@@ -2,10 +2,14 @@
 name = "voxhold-native-rust"
 version = "0.1.0"
 edition = "2021"
+license.workspace = true
 
 [workspace]
 resolver = "2"
 members = ["crates/voxhold-api", "crates/voxhold-media"]
+
+[workspace.package]
+license = "Apache-2.0"
 
 [features]
 default = ["voxhold-media"]

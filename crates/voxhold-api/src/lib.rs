@@ -242,32 +242,26 @@ impl Client {
         root: i64,
         before: i64,
     ) -> Result<MessagePage> {
-        self.page(
-            &format!("{}/comments", message_path(sid, cid, root)),
-            before,
-        )
-        .await
+        let page = self
+            .page(
+                &format!("{}/comments", message_path(sid, cid, root)),
+                before,
+            )
+            .await?;
+        // Comments must belong to the requested root and channel; a responder
+        // that mixes the main timeline into a thread is rejected.
+        if page.messages.iter().any(|message| {
+            message.id <= 0 || message.channel_id != cid || message.thread_root_id != Some(root)
+        }) {
+            return Err(Error::InvalidResponse("Некорректный ответ обсуждения."));
+        }
+        Ok(page)
     }
     pub async fn send_message(&self, sid: i64, cid: i64, content: &str) -> Result<Message> {
         self.request(
             Method::POST,
             &format!("{}/messages", channel_path(sid, cid)),
             Some(json!({"content":content})),
-        )
-        .await
-    }
-    pub async fn send_thread_message(
-        &self,
-        sid: i64,
-        cid: i64,
-        root: i64,
-        content: &str,
-        key: &str,
-    ) -> Result<Message> {
-        self.request(
-            Method::POST,
-            &format!("{}/messages", channel_path(sid, cid)),
-            Some(json!({"content":content,"thread_root_id":root,"client_message_id":key})),
         )
         .await
     }
@@ -330,7 +324,12 @@ impl Client {
             .take(12)
             .collect())
     }
+    /// Personal history. The backend returns the newest 50 rows first; the
+    /// client keeps an ascending window so merge/anchor rules match channels.
     pub async fn conversation_messages(&self, id: i64, before: i64) -> Result<MessagePage> {
+        if id <= 0 || before < 0 {
+            return Err(Error::InvalidResponse("Некорректный диалог."));
+        }
         let v: Value = self
             .request(
                 Method::GET,
@@ -345,13 +344,23 @@ impl Client {
                 None,
             )
             .await?;
-        let messages: Vec<Message> = serde_json::from_value(v["messages"].clone())?;
-        let next_before_id = messages.iter().map(|m| m.id).min();
+        let mut messages: Vec<Message> = serde_json::from_value(v["messages"].clone())?;
+        if messages.iter().any(|message| {
+            message.id <= 0 || message.conversation_id != id || message.channel_id != 0
+        }) {
+            return Err(Error::InvalidResponse("Некорректный ответ истории."));
+        }
+        messages.sort_by_key(|message| message.id);
+        let next_before_id = messages.first().map(|message| message.id);
+        let has_more = v["has_more"].as_bool().unwrap_or(false);
+        if has_more && (next_before_id.is_none_or(|id| id <= 0) || messages.is_empty()) {
+            return Err(Error::InvalidResponse("Некорректный курсор истории."));
+        }
         Ok(MessagePage {
             messages,
             pagination: Pagination {
                 next_before_id,
-                has_more: v["has_more"].as_bool().unwrap_or(false),
+                has_more,
             },
         })
     }
@@ -378,6 +387,9 @@ impl Client {
         .await
     }
     pub async fn search_messages(&self, sid: i64, query: &str, before: i64) -> Result<SearchPage> {
+        if sid <= 0 || query.trim().is_empty() || query.chars().count() > 200 {
+            return Err(Error::InvalidResponse("Введите корректный запрос."));
+        }
         let mut u = self.url(&format!("/api/v1/servers/{sid}/messages/search"))?;
         {
             let mut q = u.query_pairs_mut();
@@ -386,12 +398,31 @@ impl Client {
                 q.append_pair("before_id", &before.to_string());
             }
         }
-        self.request(
-            Method::GET,
-            &format!("{}?{}", u.path(), u.query().unwrap_or("")),
-            None,
-        )
-        .await
+        let page: SearchPage = self
+            .request(
+                Method::GET,
+                &format!("{}?{}", u.path(), u.query().unwrap_or("")),
+                None,
+            )
+            .await?;
+        if page
+            .messages
+            .iter()
+            .any(|hit| hit.message.id <= 0 || hit.message.channel_id <= 0)
+        {
+            // Search answers are channel rows; a comment or a foreign row is
+            // not a valid jump target.
+            return Err(Error::InvalidResponse("Некорректный ответ поиска."));
+        }
+        if page.pagination.has_more
+            && page
+                .pagination
+                .next_before_id
+                .is_none_or(|id| id <= 0 || (before > 0 && id >= before))
+        {
+            return Err(Error::InvalidResponse("Некорректный курсор поиска."));
+        }
+        Ok(page)
     }
     pub async fn webrtc_config(&self) -> Result<WebRtcConfig> {
         let v: WebRtcConfig = self
@@ -478,7 +509,7 @@ dto!(Message { id:i64, channel_id:i64, conversation_id:i64, content:String, auth
 dto!(Pagination { next_before_id:Option<i64>, has_more:bool });
 dto!(MessagePage { messages:Vec<Message>, pagination:Pagination });
 dto!(Member { avatar_version:Option<String>, country_code:Option<String>, user_id:i64, username:String, role:String, last_seen_at:Option<i64> });
-dto!(Conversation { id:i64, name:String, direct:bool, members:Vec<Author>, unread_count:i64, saved:bool });
+dto!(Conversation { id:i64, name:String, direct:bool, members:Vec<Author>, unread_count:i64, saved:bool, muted:bool, last_message_id:i64 });
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SearchResult {
     #[serde(flatten)]
@@ -493,6 +524,13 @@ dto!(PinnedMessage {
     pinned_at: i64
 });
 dto!(ReactionsUpdate { channel_id:i64, message_id:i64, revision:i64, reactions:Vec<Reaction> });
+dto!(DirectReactions { revision:i64, reactions:Vec<Reaction> });
+dto!(ForwardDestination {
+    kind: String,
+    id: i64,
+    name: String,
+    server_id: i64
+});
 dto!(MessageContext { messages:Vec<Message>, target_message_id:i64, target_index:usize });
 dto!(Profile { user_id:i64, username:String, about:String, country_code:Option<String>, created_at:i64 });
 dto!(AccountSession { id:i64, user_agent:String, client_ip:String, current:bool, created_at:i64, last_used_at:Option<i64> });
@@ -944,15 +982,4 @@ mod tests {
     }
 }
 #[cfg(test)]
-mod compatibility_tests {
-    use super::*;
-    #[test]
-    fn null_arrays_match_go_zero_values() {
-        let message: Message =
-            serde_json::from_str(r#"{"id":1,"attachments":null,"reactions":null}"#).unwrap();
-        assert!(message.attachments.is_empty());
-        assert!(message.reactions.is_empty());
-        let channel: Channel = serde_json::from_str(r#"{"id":1,"name":null}"#).unwrap();
-        assert!(channel.name.is_empty());
-    }
-}
+mod compat_tests;

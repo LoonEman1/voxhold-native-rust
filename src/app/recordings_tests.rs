@@ -8,7 +8,7 @@ use gpui::{TestAppContext, VisualTestContext};
 use std::time::{Duration, Instant};
 use voxhold_api::{Recording, RECORDING_DELETED, RECORDING_READY, RECORDING_STARTED};
 
-const ID: &str = "0123456789abcdef0123456789abcdef";
+pub(super) const ID: &str = "0123456789abcdef0123456789abcdef";
 
 pub(super) fn recording_json(id: &str, status: &str, updated: i64) -> serde_json::Value {
     serde_json::json!({
@@ -176,6 +176,7 @@ fn recording_preview_requires_jpeg_and_bounds() {
         body: ReplyBody::Bytes(valid.clone()),
         content_type: "image/jpeg",
         gate: None,
+        body_gate: None,
         delay: None,
     };
     let server = TestServer::spawn(vec![jpeg_reply()]);
@@ -190,6 +191,7 @@ fn recording_preview_requires_jpeg_and_bounds() {
         body: ReplyBody::Bytes(vec![0; (128 << 10) + 1]),
         content_type: "image/jpeg",
         gate: None,
+        body_gate: None,
         delay: None,
     }]);
     assert!(run(client(&server.base).recording_preview(ID, "etag-1234")).is_err());
@@ -525,6 +527,7 @@ async fn recording_preview_waits_for_access_confirmation(cx: &mut TestAppContext
             body: ReplyBody::Bytes(jpeg(320, 180)),
             content_type: "image/jpeg",
             gate: None,
+            body_gate: None,
             delay: None,
         },
     ]);
@@ -564,6 +567,135 @@ async fn recording_preview_waits_for_access_confirmation(cx: &mut TestAppContext
 }
 
 #[gpui::test]
+async fn recording_preview_cache_is_hidden_during_refresh_and_after_503(cx: &mut TestAppContext) {
+    cx.update(|cx| gpui_component::init(cx));
+    let ready = list_json(&[recording_json(ID, RECORDING_READY, 1)]);
+    let gate = Gate::new();
+    let server = TestServer::spawn(vec![
+        Reply::new(200, &ready),
+        Reply {
+            status: 200,
+            body: ReplyBody::Bytes(jpeg(320, 180)),
+            content_type: "image/jpeg",
+            gate: None,
+            body_gate: None,
+            delay: None,
+        },
+        Reply::new(503, "{\"error\":\"unavailable\"}").with_gate(gate.clone()),
+    ]);
+    let (window, view) = make_app(cx, client(&server.base));
+    let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
+    visual.update(|window, app| {
+        view.update(app, |v, cx| v.toggle_recordings("header", window, cx));
+    });
+    wait_for(&mut visual, &view, |v| !v.recordings.loading);
+    draw(&mut visual);
+    let key = format!("{ID}@etag-1234");
+    wait_for(&mut visual, &view, |v| {
+        v.recordings_dialog
+            .as_ref()
+            .is_some_and(|dialog| dialog.previews.contains(&key))
+    });
+    view.read_with(&*visual, |v, _| {
+        assert!(v.recording_preview_allowed(ID, "etag-1234"));
+        assert_eq!(v.recordings.sorted(1_700_000_100).len(), 1);
+    });
+
+    gate.arm();
+    visual.update(|window, app| {
+        view.update(app, |v, cx| v.refresh_recordings(0, window, cx));
+    });
+    wait_arrival(&mut visual, &gate);
+    view.read_with(&*visual, |v, _| {
+        assert!(!v.recordings_visible_for_preview());
+        assert!(!v.recording_preview_allowed(ID, "etag-1234"));
+        assert!(
+            v.recordings_dialog
+                .as_ref()
+                .is_some_and(|dialog| dialog.previews.contains(&key)),
+            "the loaded picture should stay in the bounded cache"
+        );
+    });
+    draw(&mut visual);
+    assert_eq!(
+        calls(&server, "/preview"),
+        1,
+        "a held refresh started another preview"
+    );
+    gate.release();
+    wait_for(&mut visual, &view, |v| {
+        !v.recordings.loading && !v.recordings.error.is_empty()
+    });
+    view.read_with(&*visual, |v, _| {
+        assert!(!v.recordings_visible_for_preview());
+        assert!(
+            !v.recording_preview_allowed(ID, "etag-1234"),
+            "the cached picture was reused after a 503"
+        );
+    });
+}
+
+#[gpui::test]
+async fn late_recording_preview_keeps_the_new_pending_entry(cx: &mut TestAppContext) {
+    cx.update(|cx| gpui_component::init(cx));
+    let ready = list_json(&[recording_json(ID, RECORDING_READY, 1)]);
+    let server = TestServer::spawn(vec![Reply::new(200, &ready)]);
+    let (window, view) = make_app(cx, client(&server.base));
+    let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
+    visual.update(|window, app| {
+        view.update(app, |v, cx| v.toggle_recordings("header", window, cx));
+    });
+    wait_for(&mut visual, &view, |v| {
+        !v.recordings.loading && v.recordings.confirmed_epoch == Some(v.recordings.access_epoch)
+    });
+    let key = format!("{ID}@etag-1234");
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            let (generation, epoch) = {
+                let dialog = v.recordings_dialog.as_mut().unwrap();
+                dialog.preview_generation = 7;
+                dialog.preview_pending.insert(key.clone());
+                (dialog.generation, dialog.epoch)
+            };
+            let image = || {
+                image::DynamicImage::ImageRgba8(image::RgbaImage::new(4, 4))
+            };
+            // Generation 6 is stale: it must not clear generation 7's pending
+            // entry or write its picture into the current cache.
+            v.finish_recording_preview(
+                key.clone(),
+                generation,
+                6,
+                epoch,
+                ID.into(),
+                "etag-1234".into(),
+                Some(Ok(image())),
+                window,
+                cx,
+            );
+            let dialog = v.recordings_dialog.as_ref().unwrap();
+            assert!(dialog.preview_pending.contains(&key));
+            assert!(!dialog.previews.contains(&key));
+
+            v.finish_recording_preview(
+                key.clone(),
+                generation,
+                7,
+                epoch,
+                ID.into(),
+                "etag-1234".into(),
+                Some(Ok(image())),
+                window,
+                cx,
+            );
+            let dialog = v.recordings_dialog.as_ref().unwrap();
+            assert!(!dialog.preview_pending.contains(&key));
+            assert!(dialog.previews.contains(&key));
+        });
+    });
+}
+
+#[gpui::test]
 async fn recording_preview_stops_when_dialog_closes(cx: &mut TestAppContext) {
     cx.update(|cx| gpui_component::init(cx));
     let ready = list_json(&[recording_json(ID, RECORDING_READY, 1)]);
@@ -574,7 +706,8 @@ async fn recording_preview_stops_when_dialog_closes(cx: &mut TestAppContext) {
             status: 200,
             body: ReplyBody::Bytes(jpeg(320, 180)),
             content_type: "image/jpeg",
-            gate: Some(gate.clone()),
+            gate: None,
+            body_gate: Some(gate.clone()),
             delay: None,
         },
     ]);
@@ -598,7 +731,17 @@ async fn recording_preview_stops_when_dialog_closes(cx: &mut TestAppContext) {
             v.recordings_preview_tasks.is_empty(),
             "closing did not cancel the preview task"
         );
+        assert!(
+            v.recordings_preview_aborts.is_empty(),
+            "closing did not abort the preview HTTP task"
+        );
     });
+    // The server must see the client close the body before its own deadline,
+    // not merely an empty GPUI task list.
+    assert!(
+        gate.wait_closed(Duration::from_secs(2)),
+        "the preview HTTP kept reading the body after the dialog closed"
+    );
     gate.release();
     visual.run_until_parked();
     std::thread::sleep(Duration::from_millis(50));

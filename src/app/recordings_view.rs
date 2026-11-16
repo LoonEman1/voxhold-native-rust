@@ -63,10 +63,19 @@ impl Voxhold {
         let rows = dialog.rows.clone();
         let loading = self.recordings.loading;
         let hint = self.recordings.hint();
+        let previews_visible = self.recordings_visible_for_preview();
         let mut previews = std::collections::HashMap::new();
         if let Some(dialog) = self.recordings_dialog.as_mut() {
             for row in &rows {
-                let Some(version) = row.record.preview_version.as_ref() else {
+                if !previews_visible || !row.ready {
+                    continue;
+                }
+                let Some(version) = row
+                    .record
+                    .preview_version
+                    .as_ref()
+                    .filter(|version| !version.is_empty())
+                else {
                     continue;
                 };
                 let key = format!("{}@{version}", row.record.id);
@@ -867,7 +876,9 @@ impl Voxhold {
                 })
                 .filter_map(|row| {
                     let version = row.record.preview_version.clone()?;
-                    if version.is_empty() {
+                    if version.is_empty()
+                        || !self.recording_preview_allowed(&row.record.id, &version)
+                    {
                         return None;
                     }
                     let key = format!("{}@{version}", row.record.id);
@@ -894,72 +905,48 @@ impl Voxhold {
                 break;
             }
             let key = format!("{id}@{version}");
-            let generation = self
-                .recordings_dialog
-                .as_ref()
-                .map(|dialog| dialog.generation)
-                .unwrap_or(0);
+            let (generation, preview_generation) = match self.recordings_dialog.as_ref() {
+                Some(dialog) => (dialog.generation, dialog.preview_generation),
+                None => break,
+            };
             let epoch = self.recording_access_epoch;
             if let Some(dialog) = self.recordings_dialog.as_mut() {
                 dialog.preview_pending.insert(key.clone());
             }
             let runtime = self.runtime.clone();
             let client = client.clone();
-            let background = cx.background_spawn(async move {
-                runtime.block_on(client.recording_preview(&id, &version))
+            let request_id = id.clone();
+            let request_version = version.clone();
+            let handle = runtime.spawn(async move {
+                client
+                    .recording_preview(&request_id, &request_version)
+                    .await
+            });
+            self.recordings_preview_aborts.retain(|request| {
+                !(request.key == key && request.generation == preview_generation)
+            });
+            self.recordings_preview_aborts.push(super::PreviewAbort {
+                key: key.clone(),
+                generation: preview_generation,
+                abort: handle.abort_handle(),
             });
             let task = cx.spawn_in(window, async move |this, window| {
-                let result = background.await;
+                let result = handle.await;
                 let _ = this.update_in(window, |s, window, cx| {
-                    let Some(dialog) = s.recordings_dialog.as_mut() else {
-                        return;
-                    };
-                    if dialog.generation != generation
-                        || dialog.epoch != epoch
-                        || s.recording_access_epoch != epoch
-                    {
-                        return;
-                    }
-                    dialog.preview_pending.remove(&key);
-                    match result {
-                        Ok(image) => {
-                            let image = if image.width() > recordings::PREVIEW_WIDTH as u32
-                                || image.height() > recordings::PREVIEW_HEIGHT as u32
-                            {
-                                image.resize(
-                                    recordings::PREVIEW_WIDTH as u32,
-                                    recordings::PREVIEW_HEIGHT as u32,
-                                    image::imageops::FilterType::CatmullRom,
-                                )
-                            } else {
-                                image
-                            };
-                            let bytes = (image.width() * image.height() * 4) as usize;
-                            let frame = crate::members::avatar_frame(image);
-                            let image =
-                                Arc::new(gpui::RenderImage::new(smallvec::smallvec![frame]));
-                            for old in dialog.previews.put(key.clone(), image, bytes) {
-                                let _ = window.drop_image(old);
-                            }
-                            dialog.preview_retry.remove(&key);
-                        }
-                        Err(error) => {
-                            let delay = if error.status() == Some(429) {
-                                std::time::Duration::from_secs(15)
-                            } else {
-                                std::time::Duration::from_secs(5)
-                            };
-                            let delay = if dialog.preview_retry.contains_key(&key) {
-                                delay * 2
-                            } else {
-                                delay
-                            };
-                            dialog
-                                .preview_retry
-                                .insert(key.clone(), std::time::Instant::now() + delay);
-                        }
-                    }
-                    cx.notify();
+                    s.recordings_preview_aborts.retain(|request| {
+                        !(request.key == key && request.generation == preview_generation)
+                    });
+                    s.finish_recording_preview(
+                        key,
+                        generation,
+                        preview_generation,
+                        epoch,
+                        id,
+                        version,
+                        result.ok(),
+                        window,
+                        cx,
+                    );
                 });
             });
             self.recordings_preview_tasks.push(task);
@@ -967,6 +954,84 @@ impl Voxhold {
                 let _ = self.recordings_preview_tasks.remove(0);
             }
         }
+    }
+
+    /// Apply one preview answer only while the request still owns the current
+    /// dialog preview scope. A late image from the previous generation must not
+    /// clear the new request's pending entry or replace its cache.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn finish_recording_preview(
+        &mut self,
+        key: String,
+        generation: u64,
+        preview_generation: u64,
+        epoch: u64,
+        id: String,
+        version: String,
+        result: Option<std::result::Result<image::DynamicImage, voxhold_api::Error>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let allowed = self.recording_preview_allowed(&id, &version);
+        let owns = self.recordings_dialog.as_ref().is_some_and(|dialog| {
+            dialog.generation == generation
+                && dialog.preview_generation == preview_generation
+                && dialog.epoch == epoch
+                && self.recording_access_epoch == epoch
+                && dialog.preview_pending.contains(&key)
+        });
+        if !owns {
+            return;
+        }
+        let Some(dialog) = self.recordings_dialog.as_mut() else {
+            return;
+        };
+        dialog.preview_pending.remove(&key);
+        if !allowed {
+            cx.notify();
+            return;
+        }
+        match result {
+            Some(Ok(image)) => {
+                let image = if image.width() > recordings::PREVIEW_WIDTH as u32
+                    || image.height() > recordings::PREVIEW_HEIGHT as u32
+                {
+                    image.resize(
+                        recordings::PREVIEW_WIDTH as u32,
+                        recordings::PREVIEW_HEIGHT as u32,
+                        image::imageops::FilterType::CatmullRom,
+                    )
+                } else {
+                    image
+                };
+                let bytes = (image.width() * image.height() * 4) as usize;
+                let frame = crate::members::avatar_frame(image);
+                let image = Arc::new(gpui::RenderImage::new(smallvec::smallvec![frame]));
+                for old in dialog.previews.put(key.clone(), image, bytes) {
+                    let _ = window.drop_image(old);
+                }
+                dialog.preview_retry.remove(&key);
+            }
+            Some(Err(error)) => {
+                let delay = if error.status() == Some(429) {
+                    std::time::Duration::from_secs(15)
+                } else {
+                    std::time::Duration::from_secs(5)
+                };
+                let delay = if dialog.preview_retry.contains_key(&key) {
+                    delay * 2
+                } else {
+                    delay
+                };
+                dialog
+                    .preview_retry
+                    .insert(key.clone(), std::time::Instant::now() + delay);
+            }
+            // Aborted by close or a newer preview scope: pending and cache
+            // already belong to that newer scope.
+            None => return,
+        }
+        cx.notify();
     }
 }
 

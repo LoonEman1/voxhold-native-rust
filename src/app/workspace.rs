@@ -495,6 +495,7 @@ impl Voxhold {
                             cx.notify();
                             return;
                         }
+                        let mut close_settings = false;
                         if let Some(server) = s.servers.iter_mut().find(|item| item.id == server) {
                             if let Some(member) = s
                                 .members
@@ -503,6 +504,14 @@ impl Voxhold {
                             {
                                 server.role = member.role.clone();
                             }
+                            let role = crate::settings::Role::parse(&server.role);
+                            close_settings = (s.active_settings == Some(SettingsKind::Server)
+                                && !role.can_manage_server())
+                                || (s.active_settings == Some(SettingsKind::Channel)
+                                    && !role.can_manage_channels());
+                        }
+                        if close_settings {
+                            s.close_settings(false, window, cx);
                         }
                         let channel = s
                             .channels

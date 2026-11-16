@@ -12,7 +12,9 @@ impl Voxhold {
             return;
         };
         let Some(version) = panel.avatar_version.clone() else {
-            panel.avatar = None;
+            if let Some(image) = panel.avatar.take() {
+                let _ = window.drop_image(image);
+            }
             panel.avatar_missing = true;
             return;
         };

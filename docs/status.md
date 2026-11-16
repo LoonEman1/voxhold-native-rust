@@ -464,8 +464,9 @@ pending POST переоткрытой ветки, пустую последню�
 Проверено локально: `cargo fmt --all -- --check`,
 `cargo test --workspace --locked` (205 тестов приложения: 204 passed,
 1 `ignored`; 6 API; 6 media), `cargo build --release --locked
--p voxhold-native-rust`, проверка размеров (137 файлов, исключение
-1200 строк только для `src/app/server_ops.rs`). Новые регрессии гоняют
+-p voxhold-native-rust`, проверка размеров (150 файлов; исключение
+1200 строк для `src/app/server_ops.rs`, `src/app/personal_ops.rs` и
+`src/settings.rs`). Новые регрессии гоняют
 настоящий HTTP через `TestServer`/`Gate`: поздний ответ профиля после
 закрытия вкладки, локальная правка во время PUT, 403 без отката
 редактора, позднее сохранение уведомлений после закрытия диалога, роль по

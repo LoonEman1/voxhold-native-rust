@@ -907,7 +907,7 @@ http_active,thumb_bytes,link_bytes,recording_bytes,workers,peers,live_textures
 | `R06` | PR [#16](https://github.com/LoonEman1/voxhold-native-rust/pull/16) · ветка `codex/r06-recordings` | API list/get/preview/ticket/stream/delete, серверный снимок с `access_epoch`/tombstone/`recording.updated`, одна модалка из шапки и звонка, Windows save, клавиатура/клиппинг; тесты, release и размеры локально; живой backend, кадры/DPI и ручной GUI не проверены | — |
 | `R07a` | PR [#18](https://github.com/LoonEman1/voxhold-native-rust/pull/18) · ветка `codex/r07-voice-viewer` | Медиаслой: каталог/`viewer` с попытками, bounded `Requests`/`Updates`, BGRA и тесты кадра; UI: комната/док/плеер Go, PTT и устройства, GPUI-регрессии; живой backend, кадры и DPI не проверены | — |
 | `R07b` | К выполнению | — | — |
-| `W02b`–`W12` | Один пакет расширений, к выполнению | [Порядок работы](w-workflow.md) | — |
+| `W02b`–`W12` | В работе: `W02b` в ветке `codex/w-extensions` (`644fbb9`), ожидает ревью и PR; `W02c`–`W12` к выполнению | [Порядок работы](w-workflow.md) | — |
 | `W13` (`R08`) | Итоговая приёмка после всех этапов реализации | — | — |
 
 ### R03 · Композер, вложения и медиа — журнал PR #12

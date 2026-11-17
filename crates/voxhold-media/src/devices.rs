@@ -77,6 +77,14 @@ mod windows {
         let id = String::from_utf16_lossy(&buffer[..end]);
         (!id.is_empty()).then_some(id)
     }
+
+    /// WinMM display name for a saved endpoint interface id.
+    pub fn endpoint_name(id: &str) -> Option<String> {
+        list()
+            .into_iter()
+            .find(|device| device.id == id)
+            .map(|device| device.name)
+    }
     fn label(name: &[u16]) -> String {
         String::from_utf16_lossy(&name[..name.iter().position(|c| *c == 0).unwrap_or(name.len())])
     }
@@ -131,7 +139,17 @@ pub(crate) fn endpoint_id(index: u32) -> Option<String> {
     windows::endpoint_id(index)
 }
 
+#[cfg(windows)]
+pub(crate) fn endpoint_name(id: &str) -> Option<String> {
+    windows::endpoint_name(id)
+}
+
 #[cfg(not(windows))]
 pub(crate) fn endpoint_id(_index: u32) -> Option<String> {
+    None
+}
+
+#[cfg(not(windows))]
+pub(crate) fn endpoint_name(_id: &str) -> Option<String> {
     None
 }

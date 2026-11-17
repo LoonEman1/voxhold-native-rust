@@ -6,6 +6,22 @@ use super::*;
 
 pub(super) struct PlatformAudio(pub(super) PeerConnectionFactory);
 
+/// Core Audio names may be longer than the WinMM label, so either side being
+/// a prefix counts. Ambiguity returns `None` instead of opening another mic.
+pub(super) fn unique_name_match(
+    saved: &str,
+    names: impl Iterator<Item = (u16, String)>,
+) -> Option<u16> {
+    let matches: Vec<u16> = names
+        .filter(|(_, name)| name.starts_with(saved) || saved.starts_with(name))
+        .map(|(index, _)| index)
+        .collect();
+    match matches.as_slice() {
+        [index] => Some(*index),
+        _ => None,
+    }
+}
+
 impl PlatformAudio {
     pub(super) fn new(recording: bool) -> Result<Self, &'static str> {
         let factory = PeerConnectionFactory::default();
@@ -48,6 +64,20 @@ impl PlatformAudio {
             return default
                 .and_then(|default| (0..count.max(0) as u16).find(|&index| guid(index) == default))
                 .or_else(|| (count > 0).then_some(0));
+        }
+        if input {
+            // WinMM endpoint interface ids and Core Audio endpoint ids are
+            // different formats. Map the saved WinMM endpoint to its device
+            // name and use a unique Core Audio name match.
+            if let Some(saved) = crate::devices::endpoint_name(id) {
+                let matched = unique_name_match(
+                    &saved,
+                    (0..count.max(0) as u16).map(|index| (index, name(index))),
+                );
+                if let Some(index) = matched {
+                    return Some(index);
+                }
+            }
         }
         if let Some((_, old_name)) = id
             .split_once(':')

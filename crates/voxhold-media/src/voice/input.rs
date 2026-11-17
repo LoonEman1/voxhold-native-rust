@@ -129,6 +129,7 @@ impl Session {
         if !retry && self.controls.input == requested {
             return Ok(());
         }
+        self.input_recovery_failed = false;
         if self
             .install_software_input(requested.clone(), events)
             .is_ok()
@@ -157,23 +158,33 @@ impl Session {
     }
 
     /// WinMM stopped delivering or requeueing buffers (USB unplug, driver
-    /// reset). Keep the call alive on the system input.
+    /// reset). First retry the selected id, then the system WinMM input, then
+    /// the platform ADM. Keep the call alive.
     pub(super) fn recover_input(&mut self, events: &Events) {
         self.input_progress_at = std::time::Instant::now();
+        if let Some(id) = self.controls.input.clone() {
+            if self.install_software_input(Some(id), events).is_ok() {
+                events.push(Event::DeviceError {
+                    message: "Микрофон перезапущен.",
+                });
+                return;
+            }
+        }
         if self.install_software_input(None, events).is_ok() {
             events.push(Event::DeviceError {
-                message: "Микрофон отключён, используется системный.",
+                message: "Микрофон недоступен, используется системный.",
             });
             return;
         }
         if self.install_platform_input(None, events).is_ok() {
             events.push(Event::DeviceError {
-                message: "Микрофон отключён, звук переведён на системный ADM.",
+                message: "Микрофон недоступен, звук переведён на системный ADM.",
             });
             return;
         }
+        self.input_recovery_failed = true;
         events.push(Event::DeviceError {
-            message: "Микрофон отключён, звук не восстановлен.",
+            message: "Микрофон недоступен, звук не восстановлен.",
         });
     }
 }

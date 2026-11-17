@@ -143,7 +143,9 @@ impl Session {
             return;
         }
         if failed || self.input_progress_at.elapsed() >= Duration::from_secs(2) {
-            self.recover_input(events);
+            if !self.input_recovery_failed {
+                self.recover_input(events);
+            }
         }
     }
 }

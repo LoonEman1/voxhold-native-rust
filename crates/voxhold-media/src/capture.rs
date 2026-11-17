@@ -3,11 +3,11 @@
 //! Ported from the local Go `media/src/capture.rs` (blob
 //! `eac53c0e9883cc53c262815ae971fc1366d3d37e`, base `09c82b9`).
 //!
-//! Windows is captured with `waveIn` at 48 kHz mono 16-bit. The same device
-//! list (WinMM index + display name) feeds the settings dialog, so the index in
-//! the saved preference is used directly. WebRTC's platform ADM keeps only the
-//! playout side here: capture is ours so the gate, gain and mute are provable
-//! over the exact PCM that reaches Opus.
+//! Windows is captured with `waveIn` at 48 kHz mono 16-bit. The settings list
+//! stores the stable Windows endpoint interface id; a legacy `index:name` is
+//! resolved by a unique name. WebRTC's platform ADM keeps only the playout side
+//! here: capture is ours so the gate, gain and mute are provable over the exact
+//! PCM that reaches Opus. Platform ADM is used only when no WinMM input opens.
 
 use std::{
     collections::VecDeque,
@@ -297,6 +297,16 @@ fn capture_loop(
             break;
         }
         loop {
+            let block_epoch = epoch.load(Ordering::Acquire);
+            if !pending.pop_block(&mut block) {
+                break;
+            }
+            if epoch.load(Ordering::Acquire) != block_epoch {
+                pending.clear();
+                source.clear_buffer();
+                processor.reset();
+                continue;
+            }
             let current = params
                 .lock()
                 .map(|value| value.clone())
@@ -305,10 +315,6 @@ fn capture_loop(
                     muted: true,
                     ..AudioParams::default()
                 });
-            if !pending.pop_block(&mut block) {
-                break;
-            }
-            let block_epoch = epoch.load(Ordering::Acquire);
             let (level, muted) = processor.process(&mut block, &current);
             // A transition in the middle of a block (or a stale buffer that
             // slipped through) must not reach Opus as live audio.
@@ -799,6 +805,10 @@ mod tests {
             "an empty preference is the Windows default"
         );
         assert!(winmm::choose_device(Some("0:Gone"), &devices).is_err());
+        assert!(
+            winmm::choose_device(Some("0:"), &devices).is_err(),
+            "a legacy id without a name must not open a reused index"
+        );
         let same_name = vec![
             winmm::DeviceInfo {
                 index: 3,

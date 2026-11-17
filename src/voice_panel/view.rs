@@ -512,7 +512,12 @@ impl VoicePanel {
                 let label = if applied.capture == "platform" {
                     "Обработка: ADM · NS/AGC".to_owned()
                 } else {
-                    format!("Обработка: software · {}", applied.noise_mode)
+                    let mode = if applied.noise_mode == "auto" {
+                        "Авто"
+                    } else {
+                        "Порог"
+                    };
+                    format!("Обработка: микрофон · {mode}")
                 };
                 body = body.child(
                     div()

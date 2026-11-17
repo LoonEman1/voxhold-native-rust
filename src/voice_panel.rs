@@ -914,7 +914,9 @@ impl VoicePanel {
                 self.stream_connected = connected;
             }
             VoiceUpdate::DeviceError(error) => {
-                if error.starts_with("Выбранный микрофон") || error.starts_with("Микрофон отключён")
+                if error.starts_with("Выбранный микрофон")
+                    || error.starts_with("Микрофон отключён")
+                    || error.starts_with("Микрофон недоступен")
                 {
                     // The engine fell back to the system input; stop sending
                     // the dead saved id with every mute/PTT update. An explicit

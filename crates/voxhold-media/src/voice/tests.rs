@@ -176,6 +176,41 @@ fn a_missing_saved_microphone_does_not_fail_the_join() {
 }
 
 #[test]
+fn platform_device_names_are_matched_only_when_unique() {
+    let unique = platform::unique_name_match(
+        "USB Headset",
+        [(0, "Speakers".into()), (1, "USB Headset".into())].into_iter(),
+    );
+    assert_eq!(unique, Some(1));
+    let truncated = platform::unique_name_match(
+        "USB Head",
+        [(0, "Speakers".into()), (1, "USB Headset".into())].into_iter(),
+    );
+    assert_eq!(truncated, Some(1));
+    let duplicate = platform::unique_name_match(
+        "USB Mic",
+        [(0, "USB Mic".into()), (1, "USB Mic".into())].into_iter(),
+    );
+    assert_eq!(duplicate, None);
+}
+
+#[test]
+#[cfg(windows)]
+#[ignore = "opens the Windows audio device; run manually"]
+fn platform_adm_resolves_a_saved_endpoint_id() {
+    let device = crate::devices::list_devices()
+        .into_iter()
+        .find(|device| device.input)
+        .expect("an input device");
+    let audio = PlatformAudio::new(false).expect("platform ADM");
+    assert!(
+        audio.resolve(&device.id, true).is_some(),
+        "the selected WinMM endpoint must map to a Core Audio input: {}",
+        device.id
+    );
+}
+
+#[test]
 fn a_failed_rollback_keeps_the_output_request_pending() {
     let mut output = OutputState::new(Some("A".into()));
     assert!(!output.needs_switch(&Some("A".into())));

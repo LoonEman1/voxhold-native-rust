@@ -481,6 +481,8 @@ mod tests {
     fn every_permission_mutation_advances_the_capture_epoch() {
         let gate = CaptureGate::default();
         let epoch = gate.permission_epoch();
+        gate.set_joined(true);
+        gate.set_server_allowed(true);
         let before = epoch.load(std::sync::atomic::Ordering::SeqCst);
         gate.set_local(true);
         gate.set_local(false);
@@ -488,11 +490,31 @@ mod tests {
             epoch.load(std::sync::atomic::Ordering::SeqCst) >= before + 2,
             "fast PTT press/release must advance the epoch even when muted returns true"
         );
-        let before = epoch.load(std::sync::atomic::Ordering::SeqCst);
+        let after_toggle = epoch.load(std::sync::atomic::Ordering::SeqCst);
+        gate.set_local(false);
         gate.set_joined(true);
         gate.set_server_allowed(true);
+        assert_eq!(
+            epoch.load(std::sync::atomic::Ordering::SeqCst),
+            after_toggle,
+            "an unchanged permission must not restart WinMM"
+        );
+        gate.set_local(true);
         gate.latch();
-        assert!(epoch.load(std::sync::atomic::Ordering::SeqCst) >= before + 3);
+        assert!(
+            epoch.load(std::sync::atomic::Ordering::SeqCst) >= after_toggle + 2,
+            "opening and latching the capture must advance the epoch"
+        );
+        let after_latch = epoch.load(std::sync::atomic::Ordering::SeqCst);
+        gate.set_params(crate::dsp::AudioParams {
+            gate_percent: 42,
+            ..crate::dsp::AudioParams::default()
+        });
+        assert_eq!(
+            epoch.load(std::sync::atomic::Ordering::SeqCst),
+            after_latch,
+            "moving DSP sliders must not restart WinMM"
+        );
     }
 
     #[test]

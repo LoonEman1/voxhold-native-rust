@@ -155,14 +155,10 @@ pub(super) fn choose_device(saved: Option<&str>, devices: &[DeviceInfo]) -> Resu
                 ),
             }
         }
-        Some((index, _)) => index
-            .parse::<u32>()
-            .map(|index| Chosen {
-                index,
-                expected_endpoint: None,
-                expected_name: None,
-            })
-            .map_err(|_| "Выбранное устройство ввода недоступно.".to_owned()),
+        Some((_, _)) => Err(
+            "В сохранённых настройках нет имени микрофона; выберите устройство ввода повторно."
+                .into(),
+        ),
         None => devices
             .iter()
             .find(|device| device.endpoint.as_deref() == Some(saved))
@@ -395,15 +391,13 @@ impl WinIn {
             return;
         }
         self.queued.clear();
-        let mut unprepared = 0;
         for index in 0..self.prepared {
             let header = &mut self.headers[index];
             if unsafe { waveInUnprepareHeader(self.handle, header, self.size) } != 0 {
                 self.failed = true;
-                self.prepared -= unprepared;
+                self.prepared = 0;
                 return;
             }
-            unprepared += 1;
         }
         if unsafe { waveInClose(self.handle) } != 0 {
             self.failed = true;

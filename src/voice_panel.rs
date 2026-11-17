@@ -20,7 +20,8 @@ use std::{
 };
 use voxhold_api::Client;
 use voxhold_media::{
-    controller::{Participant, Publication},
+    controller::{AppliedAudio, Participant, Publication},
+    dsp::NoiseMode,
     runtime::{VoiceHandle, VoiceUpdate},
     Controls,
 };
@@ -74,6 +75,9 @@ pub struct VoicePanel {
     status: String,
     error: String,
     controls: Controls,
+    /// Applied capture chain reported by the engine; the settings hint uses
+    /// this instead of assuming the software path accepted the toggles.
+    applied_audio: Option<AppliedAudio>,
     self_muted: bool,
     push_to_talk: bool,
     ptt_held: bool,
@@ -186,6 +190,7 @@ impl VoicePanel {
             status: String::new(),
             error: String::new(),
             controls,
+            applied_audio: None,
             self_muted: false,
             push_to_talk,
             ptt_held: false,
@@ -681,6 +686,31 @@ impl VoicePanel {
         }
     }
 
+    /// Microphone DSP from the settings tab. Ranges match the web sliders and
+    /// are clamped again in the media crate.
+    pub fn set_dsp(
+        &mut self,
+        noise_mode: &str,
+        noise_gate: i64,
+        input_volume: i64,
+        echo_cancellation: bool,
+        auto_gain: bool,
+    ) {
+        self.controls.noise_mode = NoiseMode::parse(noise_mode);
+        self.controls.noise_gate_percent = noise_gate.clamp(0, 100) as u8;
+        self.controls.input_gain = input_volume.clamp(0, 200) as f32 / 100.0;
+        self.controls.echo_cancellation = echo_cancellation;
+        self.controls.auto_gain_control = auto_gain;
+        if let Some(handle) = &self.handle {
+            handle.controls(self.controls.clone(), self.self_muted);
+        }
+    }
+
+    #[cfg(test)]
+    pub fn applied_audio(&self) -> Option<&AppliedAudio> {
+        self.applied_audio.as_ref()
+    }
+
     /// Room output gain from the settings tab (0–200 %).
     pub fn set_output_volume(&mut self, percent: i64) {
         self.controls.output_gain = Some(percent.clamp(0, 200) as f64 / 100.0);
@@ -940,6 +970,9 @@ impl VoicePanel {
                 self.stream_connected = connected;
             }
             VoiceUpdate::DeviceError(error) => self.device_error = error,
+            VoiceUpdate::AudioMode(applied) => {
+                self.applied_audio = Some(applied);
+            }
             VoiceUpdate::Ended(error) => {
                 self.handle.take();
                 self.controls.muted = true;

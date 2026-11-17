@@ -650,8 +650,20 @@ impl Voxhold {
             Action::SetVolume(which, value) => {
                 match which {
                     "input" => {
-                        // Input gain is applied by the DSP capture path (R07b).
-                        self.voice_settings.prefs.input_volume = value.clamp(0, 200)
+                        self.voice_settings.prefs.input_volume = value.clamp(0, 200);
+                        #[cfg(feature = "voxhold-media")]
+                        if let Some(voice) = &self.voice {
+                            let prefs = self.voice_settings.prefs.clone();
+                            voice.update(cx, |panel, _| {
+                                panel.set_dsp(
+                                    &prefs.noise_mode,
+                                    prefs.noise_gate,
+                                    prefs.input_volume,
+                                    prefs.echo_cancellation,
+                                    prefs.auto_gain,
+                                );
+                            });
+                        }
                     }
                     "output" => {
                         self.voice_settings.prefs.output_volume = value.clamp(0, 200);
@@ -660,7 +672,22 @@ impl Voxhold {
                             voice.update(cx, |panel, _| panel.set_output_volume(value));
                         }
                     }
-                    "noise" => self.voice_settings.prefs.noise_gate = value.clamp(0, 100),
+                    "noise" => {
+                        self.voice_settings.prefs.noise_gate = value.clamp(0, 100);
+                        #[cfg(feature = "voxhold-media")]
+                        if let Some(voice) = &self.voice {
+                            let prefs = self.voice_settings.prefs.clone();
+                            voice.update(cx, |panel, _| {
+                                panel.set_dsp(
+                                    &prefs.noise_mode,
+                                    prefs.noise_gate,
+                                    prefs.input_volume,
+                                    prefs.echo_cancellation,
+                                    prefs.auto_gain,
+                                );
+                            });
+                        }
+                    }
                     _ => self.voice_settings.prefs.sound_volume = value.clamp(0, 100),
                 }
                 self.voice_settings.persist();
@@ -689,6 +716,19 @@ impl Voxhold {
                     "auto".into()
                 };
                 self.voice_settings.persist();
+                #[cfg(feature = "voxhold-media")]
+                if let Some(voice) = &self.voice {
+                    let prefs = self.voice_settings.prefs.clone();
+                    voice.update(cx, |panel, _| {
+                        panel.set_dsp(
+                            &prefs.noise_mode,
+                            prefs.noise_gate,
+                            prefs.input_volume,
+                            prefs.echo_cancellation,
+                            prefs.auto_gain,
+                        );
+                    });
+                }
                 cx.notify();
             }
             Action::SetInputMode(index) => {
@@ -716,8 +756,16 @@ impl Voxhold {
                 self.voice_settings.persist();
                 #[cfg(feature = "voxhold-media")]
                 if let Some(voice) = &self.voice {
+                    let prefs = self.voice_settings.prefs.clone();
                     voice.update(cx, |voice, cx| {
                         voice.set_push_to_talk(false);
+                        voice.set_dsp(
+                            &prefs.noise_mode,
+                            prefs.noise_gate,
+                            prefs.input_volume,
+                            prefs.echo_cancellation,
+                            prefs.auto_gain,
+                        );
                         cx.notify();
                     });
                 }

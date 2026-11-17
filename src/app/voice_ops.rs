@@ -129,6 +129,13 @@ impl Voxhold {
                 panel.set_devices(Some(prefs.input.clone()), Some(prefs.output.clone()));
                 panel.set_bitrate(prefs.bitrate as u32);
                 panel.set_output_volume(prefs.output_volume);
+                panel.set_dsp(
+                    &prefs.noise_mode,
+                    prefs.noise_gate,
+                    prefs.input_volume,
+                    prefs.echo_cancellation,
+                    prefs.auto_gain,
+                );
                 panel.set_room_state(channel, roster, streams);
                 panel.set_palette(palette);
                 cx.notify();
@@ -154,6 +161,13 @@ impl Voxhold {
                 panel.set_devices(Some(prefs.input.clone()), Some(prefs.output.clone()));
                 panel.set_bitrate(prefs.bitrate as u32);
                 panel.set_output_volume(prefs.output_volume);
+                panel.set_dsp(
+                    &prefs.noise_mode,
+                    prefs.noise_gate,
+                    prefs.input_volume,
+                    prefs.echo_cancellation,
+                    prefs.auto_gain,
+                );
                 panel.set_room_state(channel, roster, streams);
                 panel.set_palette(palette);
                 panel

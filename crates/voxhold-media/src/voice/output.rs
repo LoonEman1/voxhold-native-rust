@@ -67,6 +67,12 @@ impl Session {
             let Some(id) = selected.filter(|id| !id.is_empty()) else {
                 continue;
             };
+            if input && self.mic.is_some() {
+                // The software WinMM path is not enumerated by Core Audio, so
+                // a name-prefix miss would restart a working microphone every
+                // second. Hot-unplug recovery for this path belongs to W02c.
+                continue;
+            }
             if self.audio.resolve(id, input).is_some() {
                 continue;
             }

@@ -9,7 +9,7 @@
 
 use crate::{
     Command, Controls, Event, IceServer, Media, VideoFrame,
-    controller::{Action, Participant, Publication, Signal, VoiceController},
+    controller::{Action, AppliedAudio, Participant, Publication, Signal, VoiceController},
     stream::{EngineUpdate, StreamViewer},
     viewer::{Outcome as ViewerOutcome, Viewer},
     voice::CaptureGate,
@@ -67,6 +67,9 @@ pub enum VoiceUpdate {
         error: Option<String>,
     },
     DeviceError(String),
+    /// The capture chain actually applied by the media engine, including the
+    /// platform-ADM fallback and its forced NS/AGC.
+    AudioMode(AppliedAudio),
     /// The attempt finished. An error reason is carried together with the end
     /// so the UI can never lose it to a coalesced terminal `Left`.
     Ended(Option<String>),
@@ -92,6 +95,7 @@ impl VoiceUpdate {
                     | (Self::LocalLevel(_), Self::LocalLevel(_))
                     | (Self::Tracks(_), Self::Tracks(_))
                     | (Self::Streams(_), Self::Streams(_))
+                    | (Self::AudioMode(_), Self::AudioMode(_))
             ),
         }
     }
@@ -560,9 +564,15 @@ impl Live {
             }
             let speaking = controller.speaking.clone();
             let tracks = controller.connections_with_audio();
+            let applied = controller.applied_audio.clone();
             let actions = controller.media_event(event);
             if !self.execute(actions).await? {
                 return Ok(false);
+            }
+            if controller.applied_audio != applied {
+                if let Some(applied) = controller.applied_audio.clone() {
+                    self.updates.push(VoiceUpdate::AudioMode(applied));
+                }
             }
             if controller.speaking != speaking {
                 self.updates

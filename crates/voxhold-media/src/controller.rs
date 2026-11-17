@@ -47,6 +47,16 @@ pub enum Action {
     Closed(&'static str),
 }
 
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct AppliedAudio {
+    /// `software` for the WinMM 48 kHz path or `platform` for ADM fallback.
+    pub capture: &'static str,
+    /// Effective noise mode. Platform fallback always reports `auto`.
+    pub noise_mode: &'static str,
+    pub echo_cancellation: bool,
+    pub auto_gain_control: bool,
+}
+
 pub struct VoiceController {
     pub server_id: i64,
     pub channel_id: i64,
@@ -60,6 +70,11 @@ pub struct VoiceController {
     pub server_muted: bool,
     /// Pre-gate local microphone level of the real capture track.
     pub local_level: f64,
+    /// Whole 10 ms blocks discarded by the bounded PCM queue or the source.
+    pub input_dropped: u64,
+    pub input_muted: bool,
+    /// Last applied capture chain reported by the media engine.
+    pub applied_audio: Option<AppliedAudio>,
     owners: HashMap<String, String>,
     /// Last known mid for every receiver track. Renegotiation replaces the
     /// mid -> owner map; without this link an existing receiver whose
@@ -81,6 +96,9 @@ impl VoiceController {
             self_muted,
             server_muted: false,
             local_level: 0.0,
+            input_dropped: 0,
+            input_muted: true,
+            applied_audio: None,
             owners: HashMap::new(),
             track_mids: HashMap::new(),
             tracks: HashMap::new(),
@@ -191,6 +209,32 @@ impl VoiceController {
                 level,
             } => {
                 self.local_level = level;
+                vec![]
+            }
+            Event::InputLevel {
+                level,
+                muted,
+                dropped,
+            } => {
+                // Pre-gate software meter: it must show a quiet background
+                // while the gate transmits nothing.
+                self.local_level = level;
+                self.input_muted = muted;
+                self.input_dropped = dropped;
+                vec![]
+            }
+            Event::Audio {
+                capture,
+                noise_mode,
+                echo_cancellation,
+                auto_gain_control,
+            } => {
+                self.applied_audio = Some(AppliedAudio {
+                    capture,
+                    noise_mode,
+                    echo_cancellation,
+                    auto_gain_control,
+                });
                 vec![]
             }
             Event::State {
@@ -443,6 +487,55 @@ mod tests {
             actions.first(),
             Some(Action::Media(Command::Offer { .. }))
         ));
+    }
+
+    #[test]
+    fn input_level_reports_the_pre_gate_meter_and_dropped_blocks() {
+        let mut controller = VoiceController::new(1, 2, Controls::default(), false);
+        controller.media_event(Event::InputLevel {
+            level: 0.42,
+            muted: false,
+            dropped: 7,
+        });
+        assert!((controller.local_level - 0.42).abs() < f64::EPSILON);
+        assert!(!controller.input_muted);
+        assert_eq!(controller.input_dropped, 7);
+    }
+
+    #[test]
+    fn applied_audio_carries_the_actual_fallback_mode() {
+        let mut controller = VoiceController::new(1, 2, Controls::default(), false);
+        controller.media_event(Event::Audio {
+            capture: "platform",
+            noise_mode: "auto",
+            echo_cancellation: true,
+            auto_gain_control: true,
+        });
+        let applied = controller.applied_audio.as_ref().unwrap();
+        assert_eq!(applied.capture, "platform");
+        assert_eq!(applied.noise_mode, "auto");
+        assert!(applied.echo_cancellation);
+    }
+
+    #[test]
+    fn controls_to_audio_params_keep_wire_ranges() {
+        let controls = Controls {
+            noise_mode: crate::dsp::NoiseMode::parse("threshold"),
+            noise_gate_percent: 250,
+            input_gain: 9.0,
+            echo_cancellation: false,
+            auto_gain_control: false,
+            muted: false,
+            deafened: true,
+            ..Controls::default()
+        };
+        let params = controls.audio_params();
+        assert_eq!(params.mode, crate::dsp::NoiseMode::Threshold);
+        assert_eq!(params.gate_percent, 100);
+        assert!((params.input_gain - 2.0).abs() < f32::EPSILON);
+        assert!(!params.echo_cancellation);
+        assert!(!params.auto_gain_control);
+        assert!(params.muted, "deafen opens no microphone");
     }
 
     #[test]

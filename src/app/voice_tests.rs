@@ -739,6 +739,35 @@ async fn an_app_opened_room_wakes_the_sidebar_on_speech(cx: &mut TestAppContext)
     panel.read_with(&*visual, |panel, _| assert!(panel.speaking("alice")));
 }
 
+#[gpui::test]
+async fn dsp_controls_accept_the_web_ranges(cx: &mut TestAppContext) {
+    let (mut visual, _view, voice) = fixture(cx);
+    draw(&mut visual);
+    voice.update(&mut *visual, |panel, _| {
+        panel.set_dsp("threshold", 250, 999, false, false);
+    });
+    voice.read_with(&*visual, |panel, _| {
+        let controls = panel.test_controls();
+        assert_eq!(
+            controls.noise_mode,
+            voxhold_media::dsp::NoiseMode::Threshold
+        );
+        assert_eq!(controls.noise_gate_percent, 100);
+        assert!((controls.input_gain - 2.0).abs() < f32::EPSILON);
+        assert!(!controls.echo_cancellation);
+        assert!(!controls.auto_gain_control);
+    });
+    voice.update(&mut *visual, |panel, _| {
+        panel.set_dsp("auto", 15, 0, true, true);
+    });
+    voice.read_with(&*visual, |panel, _| {
+        let controls = panel.test_controls();
+        assert_eq!(controls.noise_mode, voxhold_media::dsp::NoiseMode::Auto);
+        assert_eq!(controls.noise_gate_percent, 15);
+        assert_eq!(controls.input_gain, 0.0);
+    });
+}
+
 #[test]
 fn voice_room_colors_follow_the_theme() {
     let dark_palette = crate::theme::dark_palette();

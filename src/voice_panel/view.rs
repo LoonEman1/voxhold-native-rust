@@ -167,7 +167,7 @@ impl VoicePanel {
                     .h(px(34.))
                     .rounded(px(9.))
                     .border_1()
-                    .border_color(rgb(c.accent))
+                    .border_color(rgb(c.accent_text))
                     .text_color(rgb(c.accent_text))
                     .text_size(px(13.))
                     .flex()
@@ -251,7 +251,9 @@ impl VoicePanel {
             .rounded(px(12.))
             .bg(rgb(c.surface))
             .when(c.light, |card| card.border_1().border_color(rgb(c.line)))
-            .when(speaking, |card| card.border_3().border_color(rgb(c.accent)))
+            .when(speaking, |card| {
+                card.border_2().border_color(rgb(c.accent_text))
+            })
             .child(
                 div()
                     .absolute()
@@ -261,9 +263,6 @@ impl VoicePanel {
                     .h(px(avatar))
                     .rounded_full()
                     .bg(rgb(c.avatar_bg))
-                    .when(speaking, |avatar| {
-                        avatar.border_3().border_color(rgb(c.accent))
-                    })
                     .flex()
                     .items_center()
                     .justify_center()

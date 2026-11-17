@@ -315,6 +315,7 @@ impl Voxhold {
                 let active = id == self.channel && self.conversation.is_none();
                 let locked = channel.kind == "news" && !channel.writable() || !channel.readable();
                 let color = if active { ink(p.fg) } else { ink(p.muted) };
+                #[cfg(feature = "voxhold-media")]
                 let roster = if channel.kind == "voice" {
                     self.voice_roster(self.server, id)
                 } else {
@@ -372,14 +373,16 @@ impl Voxhold {
                         .when(locked, |row| row.text_color(ink(p.muted)))
                         .on_click(cx.listener(move |s, _, w, cx| s.select_channel(id, w, cx))),
                 );
+                #[cfg(feature = "voxhold-media")]
                 for participant in &roster {
-                    list = list.child(self.voice_participant_row(participant, window, cx));
+                    list = list.child(self.voice_participant_row(participant, id, window, cx));
                 }
             }
         }
         panel = panel.child(
             div()
                 .id("channel-list")
+                .debug_selector(|| "channel-list".into())
                 .flex_1()
                 .min_h(px(0.))
                 .overflow_y_scroll()
@@ -393,6 +396,7 @@ impl Voxhold {
             .child(
                 div()
                     .h(px(58.))
+                    .debug_selector(|| "account-footer".into())
                     .px(px(16.))
                     .flex()
                     .items_center()
@@ -447,20 +451,52 @@ impl Voxhold {
     }
 
     /// One row under a voice channel: the same avatar cache as the members
-    /// panel, the display name and a connection dot. Muted members keep their
-    /// name muted instead of a second icon so the sidebar stays compact.
+    /// panel, the display name and the participant state. Like Go, rooms other
+    /// than the active call are dimmed and the local user is highlighted;
+    /// speech uses the same green as the room card.
+    #[cfg(feature = "voxhold-media")]
     fn voice_participant_row(
         &mut self,
         participant: &voxhold_media::controller::Participant,
+        channel: i64,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let p = self.palette;
         let voice = crate::voice_panel::VoiceColors::resolve(p);
-        let speaking = self
-            .voice
-            .as_ref()
-            .is_some_and(|panel| panel.read(cx).speaking(&participant.connection_id));
+        // Only the active call is analysed for speech; the local mutes live in
+        // the panel too.
+        let (reports_speaking, local_muted) = self.voice.as_ref().map_or((false, false), |panel| {
+            let panel = panel.read(cx);
+            (
+                panel.speaking(&participant.connection_id),
+                panel.is_local_muted(&participant.connection_id),
+            )
+        });
+        let self_user = self.self_user_id != 0 && self.self_user_id == participant.user_id;
+        let active_room = self.voice_channel != 0 && self.voice_channel == channel;
+        let muted = participant.self_mute
+            || participant.server_mute
+            || participant.self_deaf
+            || local_muted;
+        // A muted or reconnecting member keeps the badge instead of a stale
+        // speaking ring.
+        let speaking = reports_speaking
+            && !participant.reconnecting
+            && !participant.self_mute
+            && !participant.server_mute;
+        let state = crate::voice_room::voice_state_icon(
+            participant.reconnecting,
+            participant.self_deaf,
+            muted,
+        );
+        let name_color = if speaking || self_user {
+            voice.accent_text
+        } else if muted || !active_room {
+            p.muted
+        } else {
+            p.fg
+        };
         let member = self
             .members
             .iter()
@@ -470,8 +506,6 @@ impl Voxhold {
             .as_ref()
             .map(|member| member.username.clone())
             .unwrap_or_else(|| format!("Участник {}", participant.user_id));
-        let muted = participant.self_mute || participant.server_mute || participant.self_deaf;
-        let user_id = participant.user_id;
         let avatar = member
             .as_ref()
             .and_then(|member| member.avatar_version.clone())
@@ -508,9 +542,35 @@ impl Voxhold {
                 .font_weight(gpui::FontWeight::BOLD)
                 .child(crate::members::initials(&name))
         };
+        let badge = if state.is_some() {
+            let (path, color) = if participant.reconnecting {
+                ("icons/wifi-off.svg", p.danger)
+            } else if participant.self_deaf {
+                ("icons/headphones-off.svg", p.muted)
+            } else {
+                ("icons/mic-off.svg", p.muted)
+            };
+            icon(path, 12., ink(color))
+        } else {
+            div()
+                .w(px(7.))
+                .h(px(7.))
+                .flex_shrink_0()
+                .rounded_full()
+                .bg(ink(if active_room {
+                    voice.accent_text
+                } else {
+                    p.muted
+                }))
+                .into_any_element()
+        };
+        let connection = participant.connection_id.clone();
         div()
-            .id(("voice-member", user_id as u64))
-            .debug_selector(move || format!("voice-member-{user_id}").into())
+            .id(gpui::ElementId::named_usize(
+                connection.clone(),
+                channel.max(0) as usize,
+            ))
+            .debug_selector(move || format!("voice-member-{connection}").into())
             .h(px(32.))
             .pl(px(42.))
             .pr(px(16.))
@@ -525,7 +585,7 @@ impl Voxhold {
                     .rounded_full()
                     .border_2()
                     .border_color(if speaking {
-                        ink(voice.accent)
+                        ink(voice.accent_text)
                     } else {
                         rgba(0x00000000)
                     })
@@ -537,25 +597,12 @@ impl Voxhold {
             .child(
                 div()
                     .flex_1()
-                    .overflow_hidden()
+                    .truncate()
                     .text_size(px(13.))
-                    .text_color(ink(if speaking {
-                        voice.accent_text
-                    } else if muted {
-                        p.muted
-                    } else {
-                        p.fg
-                    }))
+                    .text_color(ink(name_color))
                     .child(name),
             )
-            .child(
-                div()
-                    .w(px(7.))
-                    .h(px(7.))
-                    .flex_shrink_0()
-                    .rounded_full()
-                    .bg(ink(if muted { p.muted } else { p.lime })),
-            )
+            .child(badge)
             .into_any_element()
     }
 }

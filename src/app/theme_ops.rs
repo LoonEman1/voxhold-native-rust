@@ -20,12 +20,14 @@ impl Voxhold {
         self.system_light = theme::system_light();
         self.palette = theme::Palette::resolve(mode, self.system_light);
         theme::save_mode(self.theme_path.as_deref(), mode);
+        #[cfg(feature = "voxhold-media")]
         self.sync_voice_palette(cx);
         cx.notify();
     }
 
     /// The voice room is a separate entity; hand it the new palette so its
     /// fixed surfaces follow the workspace theme.
+    #[cfg(feature = "voxhold-media")]
     pub(super) fn sync_voice_palette(&mut self, cx: &mut Context<Self>) {
         let Some(panel) = self.voice.clone() else {
             return;
@@ -46,6 +48,7 @@ impl Voxhold {
                 self.auth_background = None;
                 gpui_component::Theme::change(component_theme_mode(light), Some(window), cx);
                 window_chrome::set_theme(window, light);
+                #[cfg(feature = "voxhold-media")]
                 self.sync_voice_palette(cx);
                 cx.notify();
             }

@@ -581,34 +581,140 @@ async fn voice_participants_are_listed_under_their_channel(cx: &mut TestAppConte
         view.update(app, |v, cx| {
             v.voice_rooms
                 .insert((1, 7), vec![participant("alice", 1), participant("bob", 2)]);
+            let mut dave = participant("dave", 4);
+            dave.reconnecting = true;
+            v.voice_rooms
+                .insert((1, 8), vec![participant("carol", 3), dave]);
             cx.notify();
         });
     });
     draw(&mut visual);
+    let alice = visual
+        .debug_bounds("voice-member-alice")
+        .expect("alice row");
+    let bob = visual.debug_bounds("voice-member-bob").expect("bob row");
+    let carol = visual
+        .debug_bounds("voice-member-carol")
+        .expect("carol row");
+    let dave = visual
+        .debug_bounds("voice-member-dave")
+        .expect("a reconnecting member still has a row");
+    assert!(alice.origin.y < bob.origin.y);
     assert!(
-        visual.debug_bounds("voice-member-1").is_some(),
-        "alice is listed under the channel she sits in"
+        bob.origin.y < carol.origin.y,
+        "channel 8 rows follow channel 7 rows"
     );
-    assert!(visual.debug_bounds("voice-member-2").is_some());
+    assert!(carol.origin.y < dave.origin.y);
+    assert!(visual.debug_bounds("voice-member-nobody").is_none());
+}
+
+#[gpui::test]
+async fn the_room_keeps_the_current_palette(cx: &mut TestAppContext) {
+    let (visual, view, voice) = fixture(cx);
+    // A theme switch reaches an already running panel.
+    visual.update(|_, app| {
+        view.update(app, |v, cx| {
+            v.palette = crate::theme::light_palette();
+            v.sync_voice_palette(cx);
+        });
+    });
+    voice.read_with(&*visual, |panel, _| assert!(panel.test_palette().light));
+
+    // A room opened later starts with the same palette.
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            v.voice = None;
+            v.open_voice_room(7, window, cx);
+        });
+    });
+    let panel = view
+        .read_with(&*visual, |v, _| v.voice.clone())
+        .expect("a new panel");
+    panel.read_with(&*visual, |panel, _| assert!(panel.test_palette().light));
+}
+
+#[gpui::test]
+async fn many_voice_members_keep_the_account_footer_visible(cx: &mut TestAppContext) {
+    let (mut visual, view, _voice) = fixture(cx);
+    let roster: Vec<_> = (0..80)
+        .map(|index| participant(&format!("member-{index}"), 100 + index))
+        .collect();
+    visual.update(|_, app| {
+        view.update(app, |v, cx| {
+            v.voice_rooms.insert((1, 7), roster);
+            cx.notify();
+        });
+    });
+    draw(&mut visual);
+    let list = visual.debug_bounds("channel-list").expect("channel list");
+    let footer = visual
+        .debug_bounds("account-footer")
+        .expect("account footer");
+    let (_, viewport_h) = visual.update(|window, _| {
+        let size = window.viewport_size();
+        (f32::from(size.width), f32::from(size.height))
+    });
+    let list_bottom: f32 = (list.origin.y + list.size.height).into();
+    let footer_bottom: f32 = (footer.origin.y + footer.size.height).into();
     assert!(
-        visual.debug_bounds("voice-member-3").is_none(),
-        "only confirmed room members are listed"
+        list_bottom <= f32::from(footer.origin.y) + 0.5,
+        "the member rows scroll instead of covering the footer"
+    );
+    assert!(
+        footer_bottom <= viewport_h + 0.5,
+        "the footer stays inside the window"
+    );
+}
+
+#[gpui::test]
+async fn speaking_changes_wake_the_parent_once(cx: &mut TestAppContext) {
+    let (visual, _view, voice) = fixture(cx);
+    let calls = std::rc::Rc::new(std::cell::Cell::new(0_usize));
+    let counter = calls.clone();
+    visual.update(|window, app| {
+        voice.update(app, |panel, cx| {
+            panel.set_speaking_handler(Box::new(move |_window, _cx| {
+                counter.set(counter.get() + 1);
+            }));
+            let mut speaking = std::collections::HashMap::new();
+            speaking.insert("alice".to_string(), true);
+            panel.test_apply_update(
+                voxhold_media::runtime::VoiceUpdate::Speaking(speaking.clone()),
+                window,
+                cx,
+            );
+            // The runtime resends the same set while it is unchanged.
+            panel.test_apply_update(
+                voxhold_media::runtime::VoiceUpdate::Speaking(speaking),
+                window,
+                cx,
+            );
+        });
+    });
+    assert_eq!(
+        calls.get(),
+        1,
+        "only an actual speech change repaints the sidebar"
     );
 }
 
 #[test]
 fn voice_room_colors_follow_the_theme() {
-    let dark = crate::voice_panel::VoiceColors::resolve(crate::theme::dark_palette());
-    let light = crate::voice_panel::VoiceColors::resolve(crate::theme::light_palette());
-    // The dark room keeps the Go literals; the light room uses light surfaces
-    // and text instead of the fixed black card.
+    let dark_palette = crate::theme::dark_palette();
+    let light_palette = crate::theme::light_palette();
+    let dark = crate::voice_panel::VoiceColors::resolve(dark_palette);
+    let light = crate::voice_panel::VoiceColors::resolve(light_palette);
+    // The dark room keeps its fixed surfaces; the light room uses the light
+    // workspace surfaces and text instead of the black card.
     assert_eq!(dark.surface, 0x1e1e1b);
     assert_eq!(light.surface, 0xe8e8e0);
     assert_eq!(dark.fg, 0xf3f4eb);
     assert_eq!(light.fg, 0x20211d);
     assert_ne!(dark.danger_bg, light.danger_bg);
     assert_ne!(dark.avatar_bg, light.avatar_bg);
-    // The speaking accent keeps its hue in both themes.
+    // The fill keeps its hue; the text accent reuses the theme ink so the
+    // ring stays readable on a light surface.
     assert_eq!(dark.accent, light.accent);
-    assert_ne!(dark.accent_text, light.accent_text);
+    assert_eq!(dark.accent_text, 0x72b790);
+    assert_eq!(light.accent_text, light_palette.story_accent);
 }

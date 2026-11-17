@@ -160,16 +160,29 @@ impl Voxhold {
             });
             let weak_view = cx.entity().downgrade();
             let recordings_live = self.recordings_live.clone();
+            let recordings_view = weak_view.clone();
             panel.update(cx, |panel, _| {
                 panel.set_recordings_live(recordings_live);
                 panel.set_recordings_handler(Box::new(move |window, cx| {
-                    let Some(_view) = weak_view.upgrade() else {
+                    let Some(_view) = recordings_view.upgrade() else {
                         return;
                     };
-                    let weak = weak_view.clone();
+                    let weak = recordings_view.clone();
                     window.defer(cx, move |window, cx| {
                         if let Some(view) = weak.upgrade() {
                             view.update(cx, |view, cx| view.toggle_recordings("voice", window, cx));
+                        }
+                    });
+                }));
+                let speaking_view = weak_view.clone();
+                panel.set_speaking_handler(Box::new(move |window, cx| {
+                    let weak = speaking_view.clone();
+                    if weak.upgrade().is_none() {
+                        return;
+                    }
+                    window.defer(cx, move |_window, cx| {
+                        if let Some(view) = weak.upgrade() {
+                            view.update(cx, |_, cx| cx.notify());
                         }
                     });
                 }));

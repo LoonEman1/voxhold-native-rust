@@ -693,7 +693,7 @@ async fn old_conversation_reaction_keeps_the_loaded_window(cx: &mut TestAppConte
     reaction_row["conversation_id"] = 5.into();
     reaction_row["reactions_revision"] = 2.into();
     reaction_row["reactions"] = serde_json::json!([
-        {"emoji": "рџ”Ґ", "count": 1, "me": true}
+        {"emoji": "🔥", "count": 1, "me": true}
     ]);
     let page = serde_json::json!({
         "messages": [reaction_row],

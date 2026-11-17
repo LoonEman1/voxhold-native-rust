@@ -61,7 +61,7 @@ impl Voxhold {
             .any(|item| item.id == channel && item.kind == "voice" && item.readable())
     }
 
-    fn voice_roster(
+    pub(super) fn voice_roster(
         &self,
         server: i64,
         channel: i64,
@@ -120,6 +120,7 @@ impl Voxhold {
         let prefs = self.voice_settings.prefs.clone();
         if let Some(panel) = &self.voice {
             let self_user = self.self_user_id;
+            let palette = self.palette;
             panel.update(cx, |panel, cx| {
                 panel.set_access_confirmed(!self.voice_unconfirmed.contains(&self.server));
                 panel.set_rooms(rooms);
@@ -129,12 +130,14 @@ impl Voxhold {
                 panel.set_bitrate(prefs.bitrate as u32);
                 panel.set_output_volume(prefs.output_volume);
                 panel.set_room_state(channel, roster, streams);
+                panel.set_palette(palette);
                 cx.notify();
             });
         } else {
             let self_user = self.self_user_id;
             let access_confirmed = !self.voice_unconfirmed.contains(&self.server);
             let push_to_talk = prefs.input_mode == "push_to_talk";
+            let palette = self.palette;
             let panel = cx.new(|cx| {
                 let mut panel = voice_panel::VoicePanel::new(
                     client,
@@ -152,20 +155,34 @@ impl Voxhold {
                 panel.set_bitrate(prefs.bitrate as u32);
                 panel.set_output_volume(prefs.output_volume);
                 panel.set_room_state(channel, roster, streams);
+                panel.set_palette(palette);
                 panel
             });
             let weak_view = cx.entity().downgrade();
             let recordings_live = self.recordings_live.clone();
+            let recordings_view = weak_view.clone();
             panel.update(cx, |panel, _| {
                 panel.set_recordings_live(recordings_live);
                 panel.set_recordings_handler(Box::new(move |window, cx| {
-                    let Some(_view) = weak_view.upgrade() else {
+                    let Some(_view) = recordings_view.upgrade() else {
                         return;
                     };
-                    let weak = weak_view.clone();
+                    let weak = recordings_view.clone();
                     window.defer(cx, move |window, cx| {
                         if let Some(view) = weak.upgrade() {
                             view.update(cx, |view, cx| view.toggle_recordings("voice", window, cx));
+                        }
+                    });
+                }));
+                let speaking_view = weak_view.clone();
+                panel.set_speaking_handler(Box::new(move |cx| {
+                    let weak = speaking_view.clone();
+                    if weak.upgrade().is_none() {
+                        return;
+                    }
+                    cx.defer(move |cx| {
+                        if let Some(view) = weak.upgrade() {
+                            view.update(cx, |_, cx| cx.notify());
                         }
                     });
                 }));
@@ -213,12 +230,14 @@ impl Voxhold {
         let streams = self.voice_stream_list(self.server, room);
         let self_user = self.self_user_id;
         let access_confirmed = !self.voice_unconfirmed.contains(&self.server);
+        let palette = self.palette;
         panel.update(cx, |panel, cx| {
             panel.set_access_confirmed(access_confirmed);
             panel.set_rooms(rooms);
             panel.set_self_user(self_user);
             panel.set_members(members);
             panel.set_room_state(room, roster, streams);
+            panel.set_palette(palette);
             cx.notify();
         });
     }
@@ -295,10 +314,11 @@ impl Voxhold {
             .map(|action| panel.action_icon_for(action.id))
             .collect();
         voice.update(cx, |panel, _| panel.set_dock_visible(true));
+        let colors = crate::voice_panel::VoiceColors::resolve(self.palette);
         let color = match tone {
-            crate::voice_room::Tone::Lime => 0x72b790,
-            crate::voice_room::Tone::Danger => 0xe06b5f,
-            crate::voice_room::Tone::Muted => 0x9a9a90,
+            crate::voice_room::Tone::Lime => colors.accent_text,
+            crate::voice_room::Tone::Danger => colors.danger,
+            crate::voice_room::Tone::Muted => colors.muted,
         };
         let mut actions = div().h(px(31.)).flex().gap(px(5.));
         for (index, action) in crate::voice_room::VOICE_ACTIONS.iter().enumerate() {
@@ -313,9 +333,17 @@ impl Voxhold {
                     .justify_center()
                     .rounded(px(9.))
                     .cursor_pointer()
-                    .bg(rgb(if active[index] { 0x2a1c1a } else { 0x1e1e1b }))
+                    .bg(rgb(if active[index] {
+                        colors.danger_bg
+                    } else {
+                        colors.surface
+                    }))
                     .border_1()
-                    .border_color(rgb(if active[index] { 0xe06b5f } else { 0x363630 }))
+                    .border_color(rgb(if active[index] {
+                        colors.danger
+                    } else {
+                        colors.line
+                    }))
                     .track_focus(&focuses[index])
                     .child(img(icons[index]).w(px(15.)).h(px(15.)))
                     .on_click(cx.listener(move |view, _, window, cx| {
@@ -338,9 +366,12 @@ impl Voxhold {
             .key_context("VoiceRoom")
             .h(px(crate::voice_room::DOCK_HEIGHT))
             .w_full()
-            .bg(rgb(0x1a1a17))
+            .bg(rgb(crate::theme::workspace_color(
+                self.palette.light,
+                0x1a1a17,
+            )))
             .border_t_1()
-            .border_color(rgb(0x363630))
+            .border_color(rgb(colors.line))
             .px(px(10.))
             .flex()
             .flex_col()
@@ -368,7 +399,7 @@ impl Voxhold {
                     .child(
                         div()
                             .text_size(px(12.))
-                            .text_color(rgb(0x9a9a90))
+                            .text_color(rgb(colors.muted))
                             .truncate()
                             .child(name),
                     ),
@@ -379,7 +410,7 @@ impl Voxhold {
             dock = dock.child(
                 div()
                     .text_size(px(10.))
-                    .text_color(rgb(0xe06b5f))
+                    .text_color(rgb(colors.danger))
                     .truncate()
                     .child(format!("Идёт запись · {record}")),
             );

@@ -137,8 +137,14 @@ impl Voxhold {
             .into_any_element()
     }
 
-    pub(super) fn channels_panel(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn channels_panel(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let p = self.palette;
+        #[cfg(feature = "voxhold-media")]
+        let voice_colors = crate::voice_panel::VoiceColors::resolve(p);
         let can_manage = self
             .servers
             .iter()
@@ -278,6 +284,10 @@ impl Voxhold {
             }
         }
         let now = super::recordings_ops::now_secs();
+        // The list grows with the participants of every voice channel, so it
+        // scrolls inside its own area and never pushes the account footer off
+        // the panel.
+        let mut list = div().flex().flex_col();
         for (kind, title) in [
             ("news", "НОВОСТНЫЕ КАНАЛЫ"),
             ("text", "ТЕКСТОВЫЕ КАНАЛЫ"),
@@ -292,7 +302,7 @@ impl Voxhold {
             if items.is_empty() {
                 continue;
             }
-            panel = panel.child(
+            list = list.child(
                 div()
                     .px(px(16.))
                     .pt(px(10.))
@@ -307,9 +317,16 @@ impl Voxhold {
                 let active = id == self.channel && self.conversation.is_none();
                 let locked = channel.kind == "news" && !channel.writable() || !channel.readable();
                 let color = if active { ink(p.fg) } else { ink(p.muted) };
-                panel = panel.child(
+                #[cfg(feature = "voxhold-media")]
+                let roster = if channel.kind == "voice" {
+                    self.voice_roster(self.server, id)
+                } else {
+                    Vec::new()
+                };
+                list = list.child(
                     div()
                         .id(("channel", id as u64))
+                        .debug_selector(move || format!("channel-{id}").into())
                         .h(px(35.))
                         .px(px(16.))
                         .flex()
@@ -359,9 +376,27 @@ impl Voxhold {
                         .when(locked, |row| row.text_color(ink(p.muted)))
                         .on_click(cx.listener(move |s, _, w, cx| s.select_channel(id, w, cx))),
                 );
+                #[cfg(feature = "voxhold-media")]
+                for participant in &roster {
+                    list = list.child(self.voice_participant_row(
+                        participant,
+                        id,
+                        voice_colors,
+                        window,
+                        cx,
+                    ));
+                }
             }
         }
-        panel = panel.child(div().flex_1());
+        panel = panel.child(
+            div()
+                .id("channel-list")
+                .debug_selector(|| "channel-list".into())
+                .flex_1()
+                .min_h(px(0.))
+                .overflow_y_scroll()
+                .child(list),
+        );
         #[cfg(feature = "voxhold-media")]
         if let Some(dock) = self.voice_dock(cx) {
             panel = panel.child(dock);
@@ -370,6 +405,7 @@ impl Voxhold {
             .child(
                 div()
                     .h(px(58.))
+                    .debug_selector(|| "account-footer".into())
                     .px(px(16.))
                     .flex()
                     .items_center()
@@ -420,6 +456,171 @@ impl Voxhold {
                             .child(icon("icons/logout.svg", 15., ink(p.muted))),
                     ),
             )
+            .into_any_element()
+    }
+
+    /// One row under a voice channel: the same avatar cache as the members
+    /// panel, the display name and the participant state. Like Go, rooms other
+    /// than the active call are dimmed and the local user is highlighted;
+    /// speech uses the same green as the room card.
+    #[cfg(feature = "voxhold-media")]
+    fn voice_participant_row(
+        &mut self,
+        participant: &voxhold_media::controller::Participant,
+        channel: i64,
+        voice: crate::voice_panel::VoiceColors,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let p = self.palette;
+        // Only the active call is analysed for speech; the local mutes live in
+        // the panel too.
+        let (reports_speaking, local_muted) = self.voice.as_ref().map_or((false, false), |panel| {
+            let panel = panel.read(cx);
+            (
+                panel.speaking(&participant.connection_id),
+                panel.is_local_muted(&participant.connection_id),
+            )
+        });
+        let self_user = self.self_user_id != 0 && self.self_user_id == participant.user_id;
+        let active_room = self.voice_channel != 0 && self.voice_channel == channel;
+        let muted = participant.self_mute
+            || participant.server_mute
+            || participant.self_deaf
+            || local_muted;
+        // A muted or reconnecting member keeps the badge instead of a stale
+        // speaking ring.
+        let speaking = reports_speaking
+            && !participant.reconnecting
+            && !participant.self_mute
+            && !participant.server_mute;
+        let state = crate::voice_room::voice_state_icon(
+            participant.reconnecting,
+            participant.self_deaf,
+            muted,
+        );
+        let name_color = if speaking || self_user {
+            voice.accent_text
+        } else if muted || !active_room {
+            p.muted
+        } else {
+            p.fg
+        };
+        let member = self
+            .members
+            .iter()
+            .find(|member| member.user_id == participant.user_id)
+            .cloned();
+        let name = member
+            .as_ref()
+            .map(|member| member.username.clone())
+            .unwrap_or_else(|| format!("Участник {}", participant.user_id));
+        let avatar = member
+            .as_ref()
+            .and_then(|member| member.avatar_version.clone())
+            .filter(|version| !version.is_empty())
+            .and_then(|version| {
+                let key = (participant.user_id, version.clone());
+                if let Some((image, used)) = self.roster.avatars.get_mut(&key) {
+                    *used = std::time::Instant::now();
+                    return Some(image.clone());
+                }
+                self.request_avatar(participant.user_id, version, window, cx);
+                None
+            });
+        let circle = div()
+            .w(px(22.))
+            .h(px(22.))
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_full();
+        let face = if let Some(image) = avatar {
+            circle.child(
+                gpui::img(image)
+                    .size_full()
+                    .rounded_full()
+                    .object_fit(gpui::ObjectFit::Cover),
+            )
+        } else {
+            circle
+                .bg(ink(crate::members::avatar_color(&name)))
+                .text_color(ink(0x151510))
+                .text_size(px(10.))
+                .font_weight(gpui::FontWeight::BOLD)
+                .child(crate::members::initials(&name))
+        };
+        let connection = participant.connection_id.clone();
+        // The badge mirrors the room card: any non-healthy state uses the
+        // danger tone, the healthy dot uses the accent ink.
+        let badge = if state.is_some() {
+            let path = if participant.reconnecting {
+                "icons/wifi-off.svg"
+            } else if participant.self_deaf {
+                "icons/headphones-off.svg"
+            } else {
+                "icons/mic-off.svg"
+            };
+            div()
+                .flex_shrink_0()
+                .debug_selector({
+                    let connection = connection.clone();
+                    move || format!("voice-state-{connection}").into()
+                })
+                .child(icon(path, 12., ink(p.danger)))
+                .into_any_element()
+        } else {
+            div()
+                .w(px(7.))
+                .h(px(7.))
+                .flex_shrink_0()
+                .rounded_full()
+                .bg(ink(if active_room {
+                    voice.accent_text
+                } else {
+                    p.muted
+                }))
+                .into_any_element()
+        };
+        div()
+            .id(gpui::ElementId::named_usize(
+                connection.clone(),
+                channel.max(0) as usize,
+            ))
+            .debug_selector(move || format!("voice-member-{connection}").into())
+            .h(px(32.))
+            .pl(px(42.))
+            .pr(px(16.))
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(
+                div()
+                    .w(px(26.))
+                    .h(px(26.))
+                    .flex_shrink_0()
+                    .rounded_full()
+                    .border_2()
+                    .border_color(if speaking {
+                        ink(voice.accent_text)
+                    } else {
+                        rgba(0x00000000)
+                    })
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(face),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .truncate()
+                    .text_size(px(13.))
+                    .text_color(ink(name_color))
+                    .child(name),
+            )
+            .child(badge)
             .into_any_element()
     }
 }

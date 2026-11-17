@@ -5,6 +5,7 @@
 //! and being in a call are separate: the room can show another channel while
 //! the call keeps running in the dock.
 
+use crate::theme::Palette;
 use crate::voice_room::{
     self, CallPhase, Hotkey, Rect, Tone, VoiceAction, PLAYER_DEFAULT_WIDTH, VOICE_ACTIONS,
 };
@@ -23,14 +24,6 @@ use voxhold_media::{
     runtime::{VoiceHandle, VoiceUpdate},
     Controls,
 };
-
-const SURFACE: u32 = 0x1e1e1b;
-const LINE: u32 = 0x363630;
-const FG: u32 = 0xf3f4eb;
-const MUTED: u32 = 0x9a9a90;
-const LIME: u32 = 0x72b790;
-const DANGER: u32 = 0xe06b5f;
-const DARK: u32 = 0x10100f;
 
 gpui::actions!(voice_keys, [VoiceTab, VoiceTabPrev]);
 
@@ -137,6 +130,12 @@ pub struct VoicePanel {
     recordings_focus: FocusHandle,
     recordings_handler: Option<Box<dyn Fn(&mut Window, &mut gpui::App)>>,
     recordings_live: Option<std::rc::Rc<std::cell::RefCell<Option<String>>>>,
+    /// Called when the detected speech set changes. The channel sidebar is
+    /// drawn by the parent view; GPUI repaints ancestors while the panel is
+    /// mounted, but the dock-only case and the sidebar rings need an explicit
+    /// wake-up.
+    speaking_handler: Option<Box<dyn Fn(&mut gpui::App)>>,
+    palette: Palette,
 }
 
 impl VoicePanel {
@@ -236,11 +235,45 @@ impl VoicePanel {
             recordings_focus: cx.focus_handle(),
             recordings_handler: None,
             recordings_live: None,
+            speaking_handler: None,
+            palette: crate::theme::dark_palette(),
         }
+    }
+
+    /// Theme switch: the room repaints with the new tokens on the next frame.
+    pub fn set_palette(&mut self, palette: Palette) {
+        self.palette = palette;
+    }
+
+    fn colors(&self) -> VoiceColors {
+        VoiceColors::resolve(self.palette)
     }
 
     pub fn set_recordings_handler(&mut self, handler: Box<dyn Fn(&mut Window, &mut gpui::App)>) {
         self.recordings_handler = Some(handler);
+    }
+
+    /// The parent view owns the channel sidebar; it repaints when the speech
+    /// set changes so the speaking rings track the call.
+    pub fn set_speaking_handler(&mut self, handler: Box<dyn Fn(&mut gpui::App)>) {
+        self.speaking_handler = Some(handler);
+    }
+
+    /// Replace the detected speech set. Returns whether anything changed; the
+    /// parent is woken only for a real change.
+    fn set_speaking(&mut self, speaking: HashMap<String, bool>, cx: &mut gpui::App) -> bool {
+        if self.speaking == speaking {
+            return false;
+        }
+        self.speaking = speaking;
+        if let Some(handler) = &self.speaking_handler {
+            handler(cx);
+        }
+        true
+    }
+
+    fn clear_speaking(&mut self, cx: &mut gpui::App) {
+        self.set_speaking(HashMap::new(), cx);
     }
 
     pub fn set_recordings_live(&mut self, live: std::rc::Rc<std::cell::RefCell<Option<String>>>) {
@@ -335,9 +368,21 @@ impl VoicePanel {
         self.call_channel != 0
     }
 
+    /// Whether the media runtime currently detects speech on this connection.
+    /// Only the room of the active call is analysed, so other rooms answer
+    /// false; the sidebar uses this for the same ring as the room cards.
+    pub fn speaking(&self, connection_id: &str) -> bool {
+        self.speaking.get(connection_id).copied().unwrap_or(false)
+    }
+
     #[cfg(test)]
     pub fn attempt(&self) -> u64 {
         self.attempt
+    }
+
+    #[cfg(test)]
+    pub fn test_palette(&self) -> Palette {
+        self.palette
     }
 
     pub fn phase(&self) -> CallPhase {
@@ -421,7 +466,7 @@ impl VoicePanel {
                 self.status = "Подключение…".into();
                 self.error.clear();
                 self.participants.clear();
-                self.speaking.clear();
+                self.clear_speaking(cx);
                 self.tracks.clear();
                 self.local_mutes.clear();
                 self.close_player();
@@ -458,7 +503,7 @@ impl VoicePanel {
         // confirms `voice.joined`, even if the previous call was unmuted.
         self.controls.muted = true;
         self.participants.clear();
-        self.speaking.clear();
+        self.clear_speaking(cx);
         self.tracks.clear();
         self.local_mutes.clear();
         self.streams.clear();
@@ -601,7 +646,7 @@ impl VoicePanel {
         cx.notify();
     }
 
-    #[cfg(test)]
+    /// Whether the local user muted this participant on their own device.
     pub fn is_local_muted(&self, connection: &str) -> bool {
         self.local_mutes.contains(connection)
     }
@@ -809,7 +854,7 @@ impl VoicePanel {
         &mut self,
         update: VoiceUpdate,
         window: &mut Window,
-        _cx: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) -> bool {
         let mut repaint = true;
         match update {
@@ -835,7 +880,7 @@ impl VoicePanel {
                 // stale list must not look like a live call during a
                 // reconnect.
                 self.participants.clear();
-                self.speaking.clear();
+                self.clear_speaking(cx);
                 self.tracks.clear();
             }
             VoiceUpdate::Participants(participants) => {
@@ -846,7 +891,9 @@ impl VoicePanel {
                         .any(|participant| &participant.connection_id == connection)
                 });
             }
-            VoiceUpdate::Speaking(speaking) => self.speaking = speaking,
+            VoiceUpdate::Speaking(speaking) => {
+                repaint = self.set_speaking(speaking, cx);
+            }
             VoiceUpdate::LocalLevel(level) => {
                 // Repaint the meter only for a visible step, not for every
                 // 20 Hz sample of the capture track.
@@ -908,7 +955,7 @@ impl VoicePanel {
                 self.error = error.unwrap_or_default();
                 self.status.clear();
                 self.participants.clear();
-                self.speaking.clear();
+                self.clear_speaking(cx);
                 self.tracks.clear();
                 self.streams.clear();
             }
@@ -922,8 +969,8 @@ impl VoicePanel {
         update: VoiceUpdate,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
-        self.apply_update(update, window, cx);
+    ) -> bool {
+        self.apply_update(update, window, cx)
     }
 
     // ---- focus ring -----------------------------------------------------
@@ -1110,5 +1157,8 @@ impl VoicePanel {
     }
 }
 
+mod colors;
 mod player;
 mod view;
+
+pub(crate) use colors::VoiceColors;

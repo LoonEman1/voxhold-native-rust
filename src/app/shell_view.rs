@@ -697,7 +697,7 @@ impl Render for Voxhold {
                     .w(px(l.channels.w))
                     .h(px(l.channels.h))
                     .shadow_lg()
-                    .child(self.channels_panel(cx)),
+                    .child(self.channels_panel(window, cx)),
             );
         }
         if l.is_members_open() {

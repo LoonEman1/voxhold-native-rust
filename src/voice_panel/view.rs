@@ -39,8 +39,9 @@ impl VoicePanel {
         labels: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        let c = self.colors();
         let active = self.action_active(action);
-        let color = if active { DANGER } else { MUTED };
+        let color = if active { c.danger } else { c.muted };
         let action_id = action.id;
         div()
             .id(("voice-action", index))
@@ -53,9 +54,9 @@ impl VoicePanel {
             .gap_2()
             .rounded(px(10.))
             .cursor_pointer()
-            .bg(rgb(if active { 0x2a1c1a } else { SURFACE }))
+            .bg(rgb(if active { c.danger_bg } else { c.surface }))
             .border_1()
-            .border_color(rgb(if active { DANGER } else { LINE }))
+            .border_color(rgb(if active { c.danger } else { c.line }))
             .text_color(rgb(color))
             .track_focus(&self.action_focus[index])
             .child(img(self.action_icon(action)).w(px(16.)).h(px(16.)))
@@ -86,6 +87,7 @@ impl VoicePanel {
         active: bool,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
+        let c = self.colors();
         let name = self.member_name(publication.publisher_user_id);
         let watching = self.watching.as_ref().is_some_and(|current| {
             current.publisher_connection_id == publication.publisher_connection_id
@@ -108,9 +110,9 @@ impl VoicePanel {
             .w(px(rect.w))
             .h(px(rect.h))
             .rounded(px(12.))
-            .bg(rgb(SURFACE))
+            .bg(rgb(c.surface))
             .border_1()
-            .border_color(rgb(LINE))
+            .border_color(rgb(c.line))
             .child(
                 div()
                     .absolute()
@@ -119,9 +121,9 @@ impl VoicePanel {
                     .px(px(8.))
                     .py(px(2.))
                     .rounded(px(5.))
-                    .bg(rgb(0x39201d))
+                    .bg(rgb(c.live_bg))
                     .text_size(px(10.))
-                    .text_color(rgb(DANGER))
+                    .text_color(rgb(c.danger))
                     .child("LIVE"),
             )
             .child(
@@ -151,7 +153,7 @@ impl VoicePanel {
                     .top(px(rect.h - 72.))
                     .w(px(rect.w - 28.))
                     .text_size(px(11.))
-                    .text_color(rgb(MUTED))
+                    .text_color(rgb(c.muted))
                     .child(status),
             );
         if watching {
@@ -165,8 +167,8 @@ impl VoicePanel {
                     .h(px(34.))
                     .rounded(px(9.))
                     .border_1()
-                    .border_color(rgb(LIME))
-                    .text_color(rgb(LIME))
+                    .border_color(rgb(c.accent_text))
+                    .text_color(rgb(c.accent_text))
                     .text_size(px(13.))
                     .flex()
                     .items_center()
@@ -188,8 +190,8 @@ impl VoicePanel {
                     .w(px(rect.w - 28.))
                     .h(px(34.))
                     .rounded(px(9.))
-                    .bg(rgb(LIME))
-                    .text_color(rgb(DARK))
+                    .bg(rgb(c.accent))
+                    .text_color(rgb(c.ink))
                     .font_weight(gpui::FontWeight::BOLD)
                     .text_size(px(13.))
                     .flex()
@@ -214,6 +216,7 @@ impl VoicePanel {
         active: bool,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
+        let c = self.colors();
         let speaking = active
             && !participant.reconnecting
             && !participant.self_mute
@@ -235,9 +238,9 @@ impl VoicePanel {
         let local_muted = self.local_mutes.contains(&participant.connection_id);
         let connection = participant.connection_id.clone();
         let dot = if muted || participant.self_deaf {
-            DANGER
+            c.danger
         } else {
-            LIME
+            c.accent_text
         };
         let mut card = div()
             .absolute()
@@ -246,8 +249,11 @@ impl VoicePanel {
             .w(px(rect.w))
             .h(px(rect.h))
             .rounded(px(12.))
-            .bg(rgb(SURFACE))
-            .when(speaking, |card| card.border_2().border_color(rgb(LIME)))
+            .bg(rgb(c.surface))
+            .when(c.light, |card| card.border_1().border_color(rgb(c.line)))
+            .when(speaking, |card| {
+                card.border_2().border_color(rgb(c.accent_text))
+            })
             .child(
                 div()
                     .absolute()
@@ -256,12 +262,13 @@ impl VoicePanel {
                     .w(px(avatar))
                     .h(px(avatar))
                     .rounded_full()
-                    .bg(rgb(0x2b2b26))
+                    .bg(rgb(c.avatar_bg))
                     .flex()
                     .items_center()
                     .justify_center()
                     .text_size(px(avatar * 0.34))
                     .font_weight(gpui::FontWeight::BOLD)
+                    .text_color(rgb(c.fg))
                     .child(initials(&name)),
             )
             .child(
@@ -290,7 +297,7 @@ impl VoicePanel {
                             .truncate()
                             .text_size(px(14.))
                             .font_weight(gpui::FontWeight::BOLD)
-                            .text_color(rgb(if self_user { LIME } else { FG }))
+                            .text_color(rgb(if self_user { c.accent_text } else { c.fg }))
                             .child(name),
                     )
                     .when(self_user, |row| {
@@ -299,8 +306,8 @@ impl VoicePanel {
                                 .px(px(4.))
                                 .py(px(1.))
                                 .rounded(px(4.))
-                                .bg(rgb(LIME))
-                                .text_color(rgb(DARK))
+                                .bg(rgb(c.accent))
+                                .text_color(rgb(c.ink))
                                 .text_size(px(10.))
                                 .font_weight(gpui::FontWeight::BOLD)
                                 .child("ВЫ"),
@@ -316,9 +323,9 @@ impl VoicePanel {
                     .px(px(6.))
                     .py(px(3.))
                     .rounded(px(6.))
-                    .bg(rgb(0x2a1c1a))
+                    .bg(rgb(c.danger_bg))
                     .text_size(px(10.))
-                    .text_color(rgb(DANGER))
+                    .text_color(rgb(c.danger))
                     .child(label),
             );
         }
@@ -338,7 +345,11 @@ impl VoicePanel {
                         .items_center()
                         .justify_center()
                         .cursor_pointer()
-                        .bg(rgb(if local_muted { 0x2a1c1a } else { 0x2b2b26 }))
+                        .bg(rgb(if local_muted {
+                            c.danger_bg
+                        } else {
+                            c.avatar_bg
+                        }))
                         .track_focus(focus)
                         .on_click(cx.listener(move |panel, _, _, cx| {
                             panel.local_mute(connection.clone(), cx)
@@ -395,11 +406,12 @@ impl VoicePanel {
     pub(super) fn room_body(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let active = self.call_channel != 0 && self.call_channel == self.room;
         let phase = self.room_phase();
+        let c = self.colors();
         let (title, tone) = voice_room::room_status(phase);
         let color = match tone {
-            Tone::Lime => LIME,
-            Tone::Danger => DANGER,
-            Tone::Muted => MUTED,
+            Tone::Lime => c.accent_text,
+            Tone::Danger => c.danger,
+            Tone::Muted => c.muted,
         };
         let cards = self.room_cards(cx);
         let (width, height) = self.room_size;
@@ -432,7 +444,7 @@ impl VoicePanel {
             .recordings_live
             .as_ref()
             .and_then(|slot| slot.borrow().clone());
-        let mut body = div().relative().size_full().text_color(rgb(FG)).child(
+        let mut body = div().relative().size_full().text_color(rgb(c.fg)).child(
             div()
                 .absolute()
                 .left(px(24.))
@@ -451,7 +463,7 @@ impl VoicePanel {
                     .left(px(24.))
                     .top(px(34.))
                     .text_size(px(12.))
-                    .text_color(rgb(DANGER))
+                    .text_color(rgb(c.danger))
                     .child(self.error.clone()),
             );
         }
@@ -463,7 +475,7 @@ impl VoicePanel {
                     .top(px(9.))
                     .text_size(px(12.))
                     .font_weight(gpui::FontWeight::BOLD)
-                    .text_color(rgb(DANGER))
+                    .text_color(rgb(c.danger))
                     .child(format!("Идёт запись · {live}")),
             );
         }
@@ -479,21 +491,21 @@ impl VoicePanel {
                     .items_center()
                     .gap_2()
                     .text_size(px(10.))
-                    .text_color(rgb(MUTED))
+                    .text_color(rgb(c.muted))
                     .child("Микрофон")
                     .child(
                         div()
                             .w(px(90.))
                             .h(px(5.))
                             .rounded(px(3.))
-                            .bg(rgb(0x2b2b26))
-                            .child(
-                                div()
-                                    .h(px(5.))
-                                    .w(px(90. * level))
-                                    .rounded(px(3.))
-                                    .bg(rgb(if self.controls.muted { MUTED } else { LIME })),
-                            ),
+                            .bg(rgb(c.avatar_bg))
+                            .child(div().h(px(5.)).w(px(90. * level)).rounded(px(3.)).bg(rgb(
+                                if self.controls.muted {
+                                    c.muted
+                                } else {
+                                    c.accent
+                                },
+                            ))),
                     ),
             );
         }
@@ -504,7 +516,7 @@ impl VoicePanel {
                     .left(px(24.))
                     .top(px(64.))
                     .text_size(px(14.))
-                    .text_color(rgb(MUTED))
+                    .text_color(rgb(c.muted))
                     .child("В канале пока никого нет"),
             );
         }
@@ -530,9 +542,9 @@ impl VoicePanel {
                 .w(px(toolbar.w))
                 .h(px(toolbar.h))
                 .rounded(px(14.))
-                .bg(rgb(SURFACE))
+                .bg(rgb(c.surface))
                 .border_1()
-                .border_color(rgb(LINE))
+                .border_color(rgb(c.line))
                 .flex()
                 .gap(px(5.))
                 .p(px(7.));
@@ -552,8 +564,8 @@ impl VoicePanel {
                     .w(px(join.w))
                     .h(px(40.))
                     .rounded(px(11.))
-                    .bg(rgb(LIME))
-                    .text_color(rgb(DARK))
+                    .bg(rgb(c.accent))
+                    .text_color(rgb(c.ink))
                     .font_weight(gpui::FontWeight::BOLD)
                     .text_size(px(14.))
                     .flex()
@@ -572,7 +584,7 @@ impl VoicePanel {
                     .left(px(24.))
                     .top(px(52.))
                     .text_size(px(11.))
-                    .text_color(rgb(DANGER))
+                    .text_color(rgb(c.danger))
                     .child(self.device_error.clone()),
             );
         }

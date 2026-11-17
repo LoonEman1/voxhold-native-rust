@@ -295,7 +295,7 @@ pub(crate) struct Voxhold {
     read_retry_at: Option<std::time::Instant>,
     painted_read: std::rc::Rc<std::cell::Cell<i64>>,
     /// The last confirmed read id per `(server, channel)`, used to place the
-    /// "РќРѕРІС‹Рµ СЃРѕРѕР±С‰РµРЅРёСЏ" divider when a channel is opened again.
+    /// "Новые сообщения" divider when a channel is opened again.
     channel_reads: std::collections::HashMap<(i64, i64), i64>,
     unread_after: i64,
     /// One request per `(message, emoji)` so a double click cannot toggle twice.
@@ -312,7 +312,7 @@ pub(crate) struct Voxhold {
     /// Scroll to this id after the spliced list has the matching row.
     pending_jump: Option<i64>,
     /// The next successful refresh replaces the window instead of merging it.
-    /// Used by "Рљ РїРѕСЃР»РµРґРЅРёРј" after a quote opened a bounded context page.
+    /// Used by "К последним" after a quote opened a bounded context page.
     history_reset_pending: bool,
     hovered_message: i64,
     /// Bumped when `attachments.changed` confirms a deletion, so the row
@@ -450,17 +450,16 @@ impl Voxhold {
         let view = Self {
             runtime: std::sync::Arc::new(tokio::runtime::Runtime::new().expect("Tokio runtime")),
             instance: cx.new(|cx| InputState::new(window, cx).placeholder("https://example.com")),
-            username: cx
-                .new(|cx| InputState::new(window, cx).placeholder("РЅР°РїСЂРёРјРµСЂ, neva")),
+            username: cx.new(|cx| InputState::new(window, cx).placeholder("например, neva")),
             password: cx.new(|cx| {
                 InputState::new(window, cx)
-                    .placeholder("РњРёРЅРёРјСѓРј 8 СЃРёРјРІРѕР»РѕРІ")
+                    .placeholder("Минимум 8 символов")
                     .masked(true)
             }),
             composer: cx.new(|cx| {
                 InputState::new(window, cx)
                     .multi_line()
-                    .placeholder("РќР°РїРёСЃР°С‚СЊ СЃРѕРѕР±С‰РµРЅРёРµ")
+                    .placeholder("Написать сообщение")
             }),
             client: None,
             self_user_id: 0,
@@ -481,7 +480,7 @@ impl Voxhold {
             edit_input: cx.new(|cx| {
                 InputState::new(window, cx)
                     .multi_line()
-                    .placeholder("РР·РјРµРЅРёС‚СЊ СЃРѕРѕР±С‰РµРЅРёРµ")
+                    .placeholder("Изменить сообщение")
             }),
             reaction_picker,
             confirm_delete: None,

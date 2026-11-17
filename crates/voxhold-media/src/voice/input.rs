@@ -28,7 +28,7 @@ impl Session {
     /// Replace the outgoing track with the software capture. The new device is
     /// opened and the peer sender is switched before the old capture stops, so
     /// a failed selection leaves the working path untouched.
-    fn install_software_input(
+    pub(super) fn install_software_input(
         &mut self,
         input: Option<String>,
         events: &Events,
@@ -62,6 +62,12 @@ impl Session {
         if let Some(mut old) = self.mic.take() {
             old.stop();
         }
+        // The ADM fallback may still hold the microphone; software capture is
+        // now the only owner.
+        if self.audio.running(true) {
+            self.audio.stop(true);
+        }
+        self.audio.set_recording(false);
         self.capture.attach_source(track, source);
         self.input_progress = mic.progress();
         self.input_progress_at = std::time::Instant::now();
@@ -75,7 +81,7 @@ impl Session {
 
     /// Switch to the platform ADM capture path (used when WinMM cannot open
     /// any microphone, or when the software driver reports a failure).
-    fn install_platform_input(
+    pub(super) fn install_platform_input(
         &mut self,
         input: Option<String>,
         events: &Events,
@@ -93,6 +99,9 @@ impl Session {
             self.input_index = None;
         }
         self.audio.set_recording(true);
+        if !self.audio.running(true) {
+            let _ = self.audio.start(true);
+        }
         let track = self.audio.0.create_device_audio_track("voxhold-microphone");
         if let Some(sender) = &self.sender {
             if sender
@@ -130,6 +139,7 @@ impl Session {
             return Ok(());
         }
         self.input_recovery_failed = false;
+        self.input_reopen_attempted = false;
         if self
             .install_software_input(requested.clone(), events)
             .is_ok()
@@ -163,11 +173,14 @@ impl Session {
     pub(super) fn recover_input(&mut self, events: &Events) {
         self.input_progress_at = std::time::Instant::now();
         if let Some(id) = self.controls.input.clone() {
-            if self.install_software_input(Some(id), events).is_ok() {
-                events.push(Event::DeviceError {
-                    message: "Микрофон перезапущен.",
-                });
-                return;
+            if !self.input_reopen_attempted {
+                self.input_reopen_attempted = true;
+                if self.install_software_input(Some(id), events).is_ok() {
+                    events.push(Event::DeviceError {
+                        message: "Микрофон перезапущен.",
+                    });
+                    return;
+                }
             }
         }
         if self.install_software_input(None, events).is_ok() {

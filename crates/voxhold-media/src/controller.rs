@@ -244,6 +244,12 @@ impl VoiceController {
                 echo_cancellation,
                 auto_gain_control,
             } => {
+                if capture == "platform" {
+                    // The platform path has no InputLevel; let MediaSource level
+                    // drive the meter again instead of freezing the last
+                    // software value.
+                    self.input_level_seen = false;
+                }
                 self.applied_audio = Some(AppliedAudio {
                     capture,
                     noise_mode,
@@ -542,6 +548,27 @@ mod tests {
             level: 0.4,
         });
         assert!((platform.local_level - 0.4).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn platform_fallback_restores_the_source_level_meter() {
+        let mut controller = VoiceController::new(1, 2, Controls::default(), false);
+        controller.media_event(Event::InputLevel {
+            level: 0.2,
+            muted: false,
+            dropped: 0,
+        });
+        controller.media_event(Event::Audio {
+            capture: "platform",
+            noise_mode: "auto",
+            echo_cancellation: true,
+            auto_gain_control: true,
+        });
+        controller.media_event(Event::Level {
+            track_id: None,
+            level: 0.4,
+        });
+        assert!((controller.local_level - 0.4).abs() < f64::EPSILON);
     }
 
     #[test]

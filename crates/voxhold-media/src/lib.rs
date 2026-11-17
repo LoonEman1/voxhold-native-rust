@@ -478,7 +478,7 @@ mod tests {
     }
 
     #[test]
-    fn every_permission_mutation_advances_the_capture_epoch() {
+    fn only_a_permission_change_advances_the_capture_epoch() {
         let gate = CaptureGate::default();
         let epoch = gate.permission_epoch();
         gate.set_joined(true);

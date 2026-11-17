@@ -49,6 +49,34 @@ fn trickle_ice_is_matched_to_the_offer_generation() {
 #[test]
 #[cfg(windows)]
 #[ignore = "opens the Windows audio device; run manually"]
+fn switching_back_to_software_stops_the_adm_recording() {
+    let capture = Arc::new(CaptureGate::default());
+    let events = Arc::new(Events::default());
+    let mut session = Session::new(
+        Vec::new(),
+        "all",
+        Controls::default(),
+        &events,
+        capture,
+        None,
+    )
+    .expect("default microphone");
+    session
+        .install_platform_input(None, &events)
+        .expect("platform ADM");
+    assert!(session.audio.running(true));
+    session
+        .install_software_input(None, &events)
+        .expect("software capture");
+    assert!(
+        !session.audio.running(true),
+        "software capture must be the only microphone owner"
+    );
+}
+
+#[test]
+#[cfg(windows)]
+#[ignore = "opens the Windows audio device; run manually"]
 fn a_failed_software_capture_recovers_on_the_system_input() {
     let capture = Arc::new(CaptureGate::default());
     let events = Arc::new(Events::default());

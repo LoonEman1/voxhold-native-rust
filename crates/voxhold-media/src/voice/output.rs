@@ -140,6 +140,8 @@ impl Session {
         if progress != self.input_progress {
             self.input_progress = progress;
             self.input_progress_at = std::time::Instant::now();
+            self.input_reopen_attempted = false;
+            self.input_recovery_failed = false;
             return;
         }
         if failed || self.input_progress_at.elapsed() >= Duration::from_secs(2) {

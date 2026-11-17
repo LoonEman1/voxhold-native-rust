@@ -136,6 +136,9 @@ struct Session {
     /// Both software and platform fallbacks failed. Retry only on an explicit
     /// device selection, not every two seconds.
     input_recovery_failed: bool,
+    /// The selected id was already reopened once in this failure episode. If
+    /// it stays silent, the next recovery must use the system input.
+    input_reopen_attempted: bool,
     output: OutputState,
     device_check: std::time::Instant,
 }
@@ -372,6 +375,7 @@ impl Session {
             input_progress,
             input_progress_at: std::time::Instant::now(),
             input_recovery_failed: false,
+            input_reopen_attempted: false,
             output,
             device_check: std::time::Instant::now(),
         };

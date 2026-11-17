@@ -3,9 +3,9 @@ use super::*;
 /// Permission to transmit is tracked independently of the socket worker, so a
 /// blocked `send` cannot keep the microphone open. Transmission requires all
 /// of: no leave latch, a confirmed join, server permission and the local
-/// mute/deafen/push-to-talk decision. Every permission mutation bumps the
-/// epoch so the capture thread flushes WinMM buffers even when a fast PTT
-/// press/release returns to the same boolean between two polls.
+/// mute/deafen/push-to-talk decision. The epoch advances only when the actual
+/// transmit permission changes, so the capture thread flushes WinMM buffers on
+/// mute/PTT edges (including a fast press/release) but not on DSP slider moves.
 pub struct CaptureGate {
     state: Mutex<CaptureState>,
     epoch: Arc<AtomicU64>,

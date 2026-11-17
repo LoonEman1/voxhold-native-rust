@@ -75,8 +75,8 @@ pub struct VoicePanel {
     status: String,
     error: String,
     controls: Controls,
-    /// Applied capture chain reported by the engine. Diagnostic for W02b;
-    /// nothing is rendered from it yet.
+    /// Applied capture chain reported by the engine. Rendered as a diagnostic
+    /// label in the active room; not part of the Go room layout.
     applied_audio: Option<AppliedAudio>,
     self_muted: bool,
     push_to_talk: bool,

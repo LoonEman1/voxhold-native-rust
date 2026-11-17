@@ -419,6 +419,7 @@ impl VoicePanel {
         self.call_channel = 0;
         self.phase = CallPhase::Idle;
         self.status.clear();
+        self.error.clear();
         self.ptt_held = false;
         // The next join starts with a closed microphone until the server
         // confirms `voice.joined`, even if the previous call was unmuted.
@@ -683,6 +684,12 @@ impl VoicePanel {
                     self.phase = CallPhase::Reconnecting;
                     self.status = "Восстанавливаем соединение…".into();
                     self.controls.muted = true;
+                    // Go drops the confirmed roster until the fresh join; a
+                    // stale list must not look like a live call during a
+                    // reconnect.
+                    self.participants.clear();
+                    self.speaking.clear();
+                    self.tracks.clear();
                 }
                 VoiceUpdate::Participants(participants) => {
                     self.participants = participants;

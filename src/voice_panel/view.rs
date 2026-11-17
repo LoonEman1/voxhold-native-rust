@@ -444,7 +444,7 @@ impl VoicePanel {
                 .child(div().w(px(8.)).h(px(8.)).rounded_full().bg(rgb(color)))
                 .child(div().text_size(px(12.)).text_color(rgb(color)).child(title)),
         );
-        if !self.error.is_empty() && self.call_channel == self.room {
+        if !active && !self.error.is_empty() {
             body = body.child(
                 div()
                     .absolute()

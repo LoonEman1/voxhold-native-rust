@@ -660,6 +660,10 @@ async fn run_session(
         while let Some(pending) = requests.take() {
             match pending {
                 Pending::Leave => {
+                    // Silence the capture before the asynchronous leave
+                    // handshake so no audio remains on the old lease while the
+                    // server acknowledgement is pending.
+                    let _ = live.media.command(Command::Stop);
                     let outcomes = viewer.leave(Instant::now());
                     let _ = live.apply(outcomes, viewer).await;
                     let _ = live

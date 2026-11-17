@@ -524,6 +524,7 @@ impl VoicePanel {
     pub fn set_devices(&mut self, input: Option<String>, output: Option<String>) {
         self.controls.input = input;
         self.controls.output = output;
+        self.device_error.clear();
         if let Some(handle) = &self.handle {
             handle.controls(self.controls.clone(), self.self_muted);
         }

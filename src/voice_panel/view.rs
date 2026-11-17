@@ -565,7 +565,7 @@ impl VoicePanel {
                     .child("Подключиться"),
             );
         }
-        if !self.device_error.is_empty() {
+        if active && !self.device_error.is_empty() {
             body = body.child(
                 div()
                     .absolute()

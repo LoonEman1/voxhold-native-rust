@@ -184,7 +184,7 @@ impl VoicePanel {
             &self.stream_status,
             &self.stream_error,
             self.frame.is_some(),
-            self.phase == CallPhase::Connected,
+            self.frame.is_some(),
         )
     }
 

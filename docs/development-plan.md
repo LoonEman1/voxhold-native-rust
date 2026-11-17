@@ -1146,22 +1146,18 @@ frontend `ed7cb00ae12398753a8ef48a5a33b864e20cb04c` и Go
   не подтверждён. Потеря WS до `voice.joined` публикует восстановление для
   текущего выбора, а `Ended` закрывает плеер через путь с `Window` и
   возвращает обычный режим, если fullscreen включал сам плеер.
-- Регрессии: детерминированный A→B→C, `stream.stopped(A)` при B, повторная
-  публикация с новым `connection_id`, закрытый звонок/`request_id`/stale
-  ICE/reconnect/revoke, leave-timeout, snapshot/event/stop/re-entry, границы
-  `Requests`/`Updates`, BGRA/ориентация/scale, GPUI Tab/Shift+Tab, Esc/F,
-  PTT, модалка, dock и координаты. Добавлены PTT/State, drop Media и leave,
-  Watch(B)→Close(B), tagged offer/close, P2P, ICE до SDP, reconnect до join,
-  полный отказ и unplug выхода, ACL-скрытие и revoke в fullscreen.
+- Регрессии: A→B→C, `stream.stopped(A)`, повторная публикация, закрытый
+  звонок/`request_id`/stale ICE, reconnect/revoke, leave-timeout,
+  snapshot/stop/re-entry, `Requests`/`Updates`, BGRA, Tab/Shift+Tab, Esc/F,
+  PTT, dock. Добавлены PTT/State, drop Media, Watch→Close, tagged events, P2P,
+  ICE, reconnect, rollback/unplug выхода, ACL и fullscreen.
 - Wire: `stream.watch` несёт `watch_id`; клиент строго проверяет метку, если
   backend её прислал. Закреплённый backend не размечает push offer/ICE/close:
-  первый немаркированный close после смены попытки игнорируется, а offer с
-  неизвестным ufrag неотличим от ICE-поколения. Строгая гарантия требует id
-  просмотра на каждом сигнале и буферизации ранних сигналов до ACK.
+  первый немаркированный close после смены попытки игнорируется; offer с неизвестным ufrag и строгая гарантия требуют watch id и буферизации до ACK.
 Проверки: `cargo fmt --all -- --check`, `cargo test --workspace --locked`
 (296 тестов приложения: 296 passed, 1 `ignored`; 11 API; 54 media),
 `cargo build --release --locked -p voxhold-native-rust`,
-`scripts/check-file-sizes.ps1` (170 файлов), `git diff --check`, smoke
+`scripts/check-file-sizes.ps1` (172 файлов), `git diff --check`, smoke
 release (процесс активен через 5 с).
 
 Не проверено: живой backend/два клиента, реальный SFU/P2P с Chromium,

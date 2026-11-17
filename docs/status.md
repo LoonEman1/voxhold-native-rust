@@ -633,7 +633,7 @@ ICE-поколения. Строгая гарантия требует согл�
 Проверено: `cargo fmt --all -- --check`, `cargo test --workspace --locked`
 (296 тестов приложения: 296 passed, 1 `ignored`; 11 API; 54 media),
 `cargo build --release --locked -p voxhold-native-rust`,
-`scripts/check-file-sizes.ps1` (170 файлов), `git diff --check` и smoke
+`scripts/check-file-sizes.ps1` (172 файлов), `git diff --check` и smoke
 release (процесс активен через 5 с).
 
 Не проверено: живой backend и два клиента, реальный SFU/P2P с Chromium,

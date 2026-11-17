@@ -573,3 +573,42 @@ async fn ended_in_fullscreen_restores_the_window_and_closes_the_player(cx: &mut 
         assert!(!panel.call_active(), "the call is released");
     });
 }
+
+#[gpui::test]
+async fn voice_participants_are_listed_under_their_channel(cx: &mut TestAppContext) {
+    let (mut visual, view, _voice) = fixture(cx);
+    visual.update(|_, app| {
+        view.update(app, |v, cx| {
+            v.voice_rooms
+                .insert((1, 7), vec![participant("alice", 1), participant("bob", 2)]);
+            cx.notify();
+        });
+    });
+    draw(&mut visual);
+    assert!(
+        visual.debug_bounds("voice-member-1").is_some(),
+        "alice is listed under the channel she sits in"
+    );
+    assert!(visual.debug_bounds("voice-member-2").is_some());
+    assert!(
+        visual.debug_bounds("voice-member-3").is_none(),
+        "only confirmed room members are listed"
+    );
+}
+
+#[test]
+fn voice_room_colors_follow_the_theme() {
+    let dark = crate::voice_panel::VoiceColors::resolve(crate::theme::dark_palette());
+    let light = crate::voice_panel::VoiceColors::resolve(crate::theme::light_palette());
+    // The dark room keeps the Go literals; the light room uses light surfaces
+    // and text instead of the fixed black card.
+    assert_eq!(dark.surface, 0x1e1e1b);
+    assert_eq!(light.surface, 0xe8e8e0);
+    assert_eq!(dark.fg, 0xf3f4eb);
+    assert_eq!(light.fg, 0x20211d);
+    assert_ne!(dark.danger_bg, light.danger_bg);
+    assert_ne!(dark.avatar_bg, light.avatar_bg);
+    // The speaking accent keeps its hue in both themes.
+    assert_eq!(dark.accent, light.accent);
+    assert_ne!(dark.accent_text, light.accent_text);
+}

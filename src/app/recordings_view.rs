@@ -1,4 +1,4 @@
-//! В«Р—Р°РїРёСЃРё СЃРµСЂРІРµСЂР°В» modal. One container for the header and the call panel,
+//! «Записи сервера» modal. One container for the header and the call panel,
 //! fixed chrome around a clipped card list. Geometry comes from
 //! [`crate::recordings`], so the list height, scrollbar, Tab ring and hit tests
 //! all use one source.
@@ -104,7 +104,7 @@ impl Voxhold {
 
         card = card
             .child(rec_text(
-                "Р—РђРџРРЎР Р—Р’РћРќРљРћР’",
+                "ЗАПИСИ ЗВОНКОВ",
                 padding,
                 18.,
                 inner - 40.,
@@ -114,7 +114,7 @@ impl Voxhold {
                 true,
             ))
             .child(rec_text(
-                "Р—Р°РїРёСЃРё СЃРµСЂРІРµСЂР°",
+                "Записи сервера",
                 padding,
                 33.,
                 inner - 40.,
@@ -146,7 +146,7 @@ impl Voxhold {
         if rows.is_empty() {
             if loading {
                 list_children.push(rec_text(
-                    "Р—Р°РіСЂСѓР¶Р°РµРј Р·Р°РїРёСЃРёвЂ¦",
+                    "Загружаем записи…",
                     0.,
                     40.,
                     list.w,
@@ -165,7 +165,7 @@ impl Voxhold {
                         .into_any_element(),
                 );
                 list_children.push(rec_text(
-                    "Р—Р°РїРёСЃРµР№ РїРѕРєР° РЅРµС‚",
+                    "Записей пока нет",
                     0.,
                     58.,
                     list.w,
@@ -175,7 +175,7 @@ impl Voxhold {
                     true,
                 ));
                 list_children.push(rec_text(
-                    "РћРЅРё РїРѕСЏРІСЏС‚СЃСЏ Р·РґРµСЃСЊ РїРѕСЃР»Рµ Р·Р°РїРёСЃРё Р·РІРѕРЅРєР°.",
+                    "Они появятся здесь после записи звонка.",
                     10.,
                     84.,
                     (list.w - 20.).max(40.),
@@ -251,7 +251,7 @@ impl Voxhold {
         }
         let dismiss = self.rec_button(
             "rec-dismiss",
-            "Р—Р°РєСЂС‹С‚СЊ",
+            "Закрыть",
             Rect::new(
                 bounds.w - padding - recordings::DISMISS_WIDTH,
                 footer_top - bounds.y + 15.,
@@ -268,7 +268,7 @@ impl Voxhold {
         if !self.recordings.error.is_empty() && !self.recordings.loading {
             let retry = self.rec_button(
                 "rec-retry",
-                "РџРѕРІС‚РѕСЂРёС‚СЊ",
+                "Повторить",
                 Rect::new(
                     bounds.w - padding - recordings::DISMISS_WIDTH - 96.,
                     footer_top - bounds.y + 18.,
@@ -486,9 +486,9 @@ impl Voxhold {
             );
         } else {
             let label = if row.live {
-                "РРґС‘С‚ Р·Р°РїРёСЃСЊ"
+                "Идёт запись"
             } else {
-                "Р‘РµР· РїСЂРµРІСЊСЋ"
+                "Без превью"
             };
             picture = picture
                 .child(
@@ -551,7 +551,7 @@ impl Voxhold {
                 false,
             ));
         let meta = format!(
-            "{} В· {} В· {}",
+            "{} · {} · {}",
             row.record.owner_username,
             recordings::duration(row.record.duration_ms),
             recordings::size(row.record.size_bytes)
@@ -594,7 +594,7 @@ impl Voxhold {
         }
         if row.confirm {
             let question =
-                "РЈРґР°Р»РёС‚СЊ РІРёРґРµРѕ Рё РїСЂРµРІСЊСЋ СЃ СЃРµСЂРІРµСЂР° РґР»СЏ РІСЃРµС… СѓС‡Р°СЃС‚РЅРёРєРѕРІ? РЎРєР°С‡Р°РЅРЅС‹Рµ РєРѕРїРёРё РѕСЃС‚Р°РЅСѓС‚СЃСЏ.";
+                "Удалить видео и превью с сервера для всех участников? Скачанные копии останутся.";
             let lines = recordings_dialog::wrap_lines(question, details_w, 11.);
             let top = card.h - recordings::CARD_PADDING - 30. - 8. - 32.;
             for (index, line) in lines.iter().take(2).enumerate() {
@@ -616,9 +616,9 @@ impl Voxhold {
         let download = row.download;
         if download.w > 0. {
             let label = if busy == id {
-                "РџРѕРґРѕР¶РґРёС‚РµвЂ¦".to_string()
+                "Подождите…".to_string()
             } else {
-                "РЎРєР°С‡Р°С‚СЊ".to_string()
+                "Скачать".to_string()
             };
             let disabled = !row.ready || !busy.is_empty();
             let button = self.rec_button(
@@ -637,7 +637,7 @@ impl Voxhold {
             let key = format!("rec-delete-{id}");
             let button = self.rec_button(
                 &key,
-                "РЈРґР°Р»РёС‚СЊ СЃ СЃРµСЂРІРµСЂР°",
+                "Удалить с сервера",
                 Rect::new(delete.x - card.x, delete.y - card.y, delete.w, 24.),
                 RecButton::Link,
                 !busy.is_empty(),
@@ -651,7 +651,7 @@ impl Voxhold {
             let key = format!("rec-confirm-{id}");
             let button = self.rec_button(
                 &key,
-                "РЈРґР°Р»РёС‚СЊ СЃ СЃРµСЂРІРµСЂР°",
+                "Удалить с сервера",
                 Rect::new(yes.x - card.x, yes.y - card.y, yes.w, 30.),
                 RecButton::Danger,
                 !busy.is_empty(),
@@ -665,7 +665,7 @@ impl Voxhold {
             let key = format!("rec-cancel-{id}");
             let button = self.rec_button(
                 &key,
-                "РћС‚РјРµРЅР°",
+                "Отмена",
                 Rect::new(no.x - card.x, no.y - card.y, no.w, 30.),
                 RecButton::Secondary,
                 !busy.is_empty(),
@@ -825,7 +825,7 @@ impl Voxhold {
             .iter()
             .find(|channel| channel.id == id)
             .map(|channel| channel.name.clone())
-            .unwrap_or_else(|| format!("РљР°РЅР°Р» #{id}"))
+            .unwrap_or_else(|| format!("Канал #{id}"))
     }
 
     pub(super) fn run_recording_action(

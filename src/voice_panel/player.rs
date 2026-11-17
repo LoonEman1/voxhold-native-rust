@@ -239,6 +239,7 @@ impl VoicePanel {
             return Some(self.fullscreen_overlay(cx));
         }
         let player = self.player_box()?;
+        let c = self.colors();
         let (title, codec, publisher) = self.player_labels();
         let status = self.player_status_line();
         let geometry = voice_room::player_geometry(self.player_area, player, self.has_audio());
@@ -300,9 +301,9 @@ impl VoicePanel {
             .w(px(player.w))
             .h(px(player.h))
             .rounded(px(12.))
-            .bg(rgb(SURFACE))
+            .bg(rgb(c.surface))
             .border_1()
-            .border_color(rgb(LINE))
+            .border_color(rgb(c.line))
             .child(picture_div)
             .child(
                 div()
@@ -382,7 +383,7 @@ impl VoicePanel {
                     .left(px(13.))
                     .top(px(player.h - 17.))
                     .text_size(px(10.))
-                    .text_color(rgb(MUTED))
+                    .text_color(rgb(c.muted))
                     .child(codec),
             )
             .child(
@@ -408,6 +409,7 @@ impl VoicePanel {
     }
 
     fn fullscreen_overlay(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let c = self.colors();
         let area = self.player_area;
         let status = self.player_status_line();
         let geometry = voice_room::player_geometry(area, area, self.has_audio());
@@ -468,9 +470,9 @@ impl VoicePanel {
                 .w(px(exit.w))
                 .h(px(exit.h))
                 .rounded(px(10.))
-                .bg(rgb(SURFACE))
+                .bg(rgb(c.surface))
                 .border_1()
-                .border_color(rgb(LINE))
+                .border_color(rgb(c.line))
                 .flex()
                 .items_center()
                 .justify_center()

@@ -137,7 +137,11 @@ impl Voxhold {
             .into_any_element()
     }
 
-    pub(super) fn channels_panel(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn channels_panel(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let p = self.palette;
         let can_manage = self
             .servers
@@ -278,6 +282,10 @@ impl Voxhold {
             }
         }
         let now = super::recordings_ops::now_secs();
+        // The list grows with the participants of every voice channel, so it
+        // scrolls inside its own area and never pushes the account footer off
+        // the panel.
+        let mut list = div().flex().flex_col();
         for (kind, title) in [
             ("news", "НОВОСТНЫЕ КАНАЛЫ"),
             ("text", "ТЕКСТОВЫЕ КАНАЛЫ"),
@@ -292,7 +300,7 @@ impl Voxhold {
             if items.is_empty() {
                 continue;
             }
-            panel = panel.child(
+            list = list.child(
                 div()
                     .px(px(16.))
                     .pt(px(10.))
@@ -307,7 +315,12 @@ impl Voxhold {
                 let active = id == self.channel && self.conversation.is_none();
                 let locked = channel.kind == "news" && !channel.writable() || !channel.readable();
                 let color = if active { ink(p.fg) } else { ink(p.muted) };
-                panel = panel.child(
+                let roster = if channel.kind == "voice" {
+                    self.voice_roster(self.server, id)
+                } else {
+                    Vec::new()
+                };
+                list = list.child(
                     div()
                         .id(("channel", id as u64))
                         .h(px(35.))
@@ -359,9 +372,19 @@ impl Voxhold {
                         .when(locked, |row| row.text_color(ink(p.muted)))
                         .on_click(cx.listener(move |s, _, w, cx| s.select_channel(id, w, cx))),
                 );
+                for participant in &roster {
+                    list = list.child(self.voice_participant_row(participant, window, cx));
+                }
             }
         }
-        panel = panel.child(div().flex_1());
+        panel = panel.child(
+            div()
+                .id("channel-list")
+                .flex_1()
+                .min_h(px(0.))
+                .overflow_y_scroll()
+                .child(list),
+        );
         #[cfg(feature = "voxhold-media")]
         if let Some(dock) = self.voice_dock(cx) {
             panel = panel.child(dock);
@@ -419,6 +442,119 @@ impl Voxhold {
                             .on_click(cx.listener(|s, _, w, cx| s.logout(w, cx)))
                             .child(icon("icons/logout.svg", 15., ink(p.muted))),
                     ),
+            )
+            .into_any_element()
+    }
+
+    /// One row under a voice channel: the same avatar cache as the members
+    /// panel, the display name and a connection dot. Muted members keep their
+    /// name muted instead of a second icon so the sidebar stays compact.
+    fn voice_participant_row(
+        &mut self,
+        participant: &voxhold_media::controller::Participant,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let p = self.palette;
+        let voice = crate::voice_panel::VoiceColors::resolve(p);
+        let speaking = self
+            .voice
+            .as_ref()
+            .is_some_and(|panel| panel.read(cx).speaking(&participant.connection_id));
+        let member = self
+            .members
+            .iter()
+            .find(|member| member.user_id == participant.user_id)
+            .cloned();
+        let name = member
+            .as_ref()
+            .map(|member| member.username.clone())
+            .unwrap_or_else(|| format!("Участник {}", participant.user_id));
+        let muted = participant.self_mute || participant.server_mute || participant.self_deaf;
+        let user_id = participant.user_id;
+        let avatar = member
+            .as_ref()
+            .and_then(|member| member.avatar_version.clone())
+            .filter(|version| !version.is_empty())
+            .and_then(|version| {
+                let key = (participant.user_id, version.clone());
+                if let Some((image, used)) = self.roster.avatars.get_mut(&key) {
+                    *used = std::time::Instant::now();
+                    return Some(image.clone());
+                }
+                self.request_avatar(participant.user_id, version, window, cx);
+                None
+            });
+        let circle = div()
+            .w(px(22.))
+            .h(px(22.))
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_full();
+        let face = if let Some(image) = avatar {
+            circle.child(
+                gpui::img(image)
+                    .size_full()
+                    .rounded_full()
+                    .object_fit(gpui::ObjectFit::Cover),
+            )
+        } else {
+            circle
+                .bg(ink(crate::members::avatar_color(&name)))
+                .text_color(ink(0x151510))
+                .text_size(px(10.))
+                .font_weight(gpui::FontWeight::BOLD)
+                .child(crate::members::initials(&name))
+        };
+        div()
+            .id(("voice-member", user_id as u64))
+            .debug_selector(move || format!("voice-member-{user_id}").into())
+            .h(px(32.))
+            .pl(px(42.))
+            .pr(px(16.))
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(
+                div()
+                    .w(px(26.))
+                    .h(px(26.))
+                    .flex_shrink_0()
+                    .rounded_full()
+                    .border_2()
+                    .border_color(if speaking {
+                        ink(voice.accent)
+                    } else {
+                        rgba(0x00000000)
+                    })
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(face),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .overflow_hidden()
+                    .text_size(px(13.))
+                    .text_color(ink(if speaking {
+                        voice.accent_text
+                    } else if muted {
+                        p.muted
+                    } else {
+                        p.fg
+                    }))
+                    .child(name),
+            )
+            .child(
+                div()
+                    .w(px(7.))
+                    .h(px(7.))
+                    .flex_shrink_0()
+                    .rounded_full()
+                    .bg(ink(if muted { p.muted } else { p.lime })),
             )
             .into_any_element()
     }

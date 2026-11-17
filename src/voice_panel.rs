@@ -5,6 +5,7 @@
 //! and being in a call are separate: the room can show another channel while
 //! the call keeps running in the dock.
 
+use crate::theme::{self, Palette};
 use crate::voice_room::{
     self, CallPhase, Hotkey, Rect, Tone, VoiceAction, PLAYER_DEFAULT_WIDTH, VOICE_ACTIONS,
 };
@@ -31,6 +32,64 @@ const MUTED: u32 = 0x9a9a90;
 const LIME: u32 = 0x72b790;
 const DANGER: u32 = 0xe06b5f;
 const DARK: u32 = 0x10100f;
+
+/// Resolved colors for the voice room. The dark values are the Go literals;
+/// the light theme maps the fixed surfaces through the same table as the rest
+/// of the workspace and darkens the accents that carry text.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct VoiceColors {
+    pub light: bool,
+    pub surface: u32,
+    pub line: u32,
+    pub fg: u32,
+    pub muted: u32,
+    /// Dots, borders and fills (kept saturated in both themes).
+    pub accent: u32,
+    /// Accent used as text; needs a darker green on a light surface.
+    pub accent_text: u32,
+    /// Text drawn on top of an accent fill.
+    pub ink: u32,
+    pub danger: u32,
+    pub danger_bg: u32,
+    pub avatar_bg: u32,
+    pub live_bg: u32,
+}
+
+impl VoiceColors {
+    pub(crate) fn resolve(p: Palette) -> Self {
+        if p.light {
+            Self {
+                light: true,
+                surface: theme::workspace_color(true, SURFACE),
+                line: theme::workspace_color(true, LINE),
+                fg: p.fg,
+                muted: p.muted,
+                accent: LIME,
+                accent_text: 0x3f6b52,
+                ink: DARK,
+                danger: p.danger,
+                danger_bg: 0xf7e2df,
+                avatar_bg: 0xe3e4d9,
+                live_bg: 0xf3dedb,
+            }
+        } else {
+            Self {
+                light: false,
+                surface: SURFACE,
+                line: LINE,
+                fg: FG,
+                muted: MUTED,
+                accent: LIME,
+                accent_text: LIME,
+                ink: DARK,
+                danger: DANGER,
+                danger_bg: 0x2a1c1a,
+                avatar_bg: 0x2b2b26,
+                live_bg: 0x39201d,
+            }
+        }
+    }
+}
 
 gpui::actions!(voice_keys, [VoiceTab, VoiceTabPrev]);
 
@@ -137,6 +196,7 @@ pub struct VoicePanel {
     recordings_focus: FocusHandle,
     recordings_handler: Option<Box<dyn Fn(&mut Window, &mut gpui::App)>>,
     recordings_live: Option<std::rc::Rc<std::cell::RefCell<Option<String>>>>,
+    palette: Palette,
 }
 
 impl VoicePanel {
@@ -236,7 +296,17 @@ impl VoicePanel {
             recordings_focus: cx.focus_handle(),
             recordings_handler: None,
             recordings_live: None,
+            palette: crate::theme::dark_palette(),
         }
+    }
+
+    /// Theme switch: the room repaints with the new tokens on the next frame.
+    pub fn set_palette(&mut self, palette: Palette) {
+        self.palette = palette;
+    }
+
+    fn colors(&self) -> VoiceColors {
+        VoiceColors::resolve(self.palette)
     }
 
     pub fn set_recordings_handler(&mut self, handler: Box<dyn Fn(&mut Window, &mut gpui::App)>) {
@@ -333,6 +403,13 @@ impl VoicePanel {
 
     pub fn call_active(&self) -> bool {
         self.call_channel != 0
+    }
+
+    /// Whether the media runtime currently detects speech on this connection.
+    /// Only the room of the active call is analysed, so other rooms answer
+    /// false; the sidebar uses this for the same ring as the room cards.
+    pub fn speaking(&self, connection_id: &str) -> bool {
+        self.speaking.get(connection_id).copied().unwrap_or(false)
     }
 
     #[cfg(test)]

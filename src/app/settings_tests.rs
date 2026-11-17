@@ -994,7 +994,7 @@ async fn a_late_delete_answer_from_an_old_session_does_not_log_out_the_new_one(
 
 #[cfg(feature = "voxhold-media")]
 #[gpui::test]
-async fn push_to_talk_is_muted_before_join_and_follows_the_live_panel(cx: &mut TestAppContext) {
+async fn push_to_talk_stays_closed_until_the_join_is_confirmed(cx: &mut TestAppContext) {
     cx.update(|cx| gpui_component::init(cx));
     let client = voxhold_api::Client::new("http://127.0.0.1:1").unwrap();
     let (window, view) = make_app(cx, client.clone());
@@ -1005,6 +1005,7 @@ async fn push_to_talk_is_muted_before_join_and_follows_the_live_panel(cx: &mut T
     voice.read_with(&*visual, |panel, _| {
         assert!(panel.test_push_to_talk());
         assert!(panel.test_controls_muted(), "PTT starts with a closed mic");
+        assert!(!panel.test_ptt_held());
     });
     visual.update(|_window, app| {
         view.update(app, |v, cx| {
@@ -1018,7 +1019,9 @@ async fn push_to_talk_is_muted_before_join_and_follows_the_live_panel(cx: &mut T
     });
     voice.read_with(&*visual, |panel, _| {
         assert!(!panel.test_push_to_talk());
-        assert!(!panel.test_controls_muted());
+        // No confirmed join yet: the microphone stays closed even in the
+        // voice-activity mode.
+        assert!(panel.test_controls_muted());
     });
     visual.update(|_window, app| {
         view.update(app, |v, cx| {
@@ -1039,14 +1042,23 @@ async fn push_to_talk_is_muted_before_join_and_follows_the_live_panel(cx: &mut T
             cx.notify();
         });
     });
-    voice.read_with(&*visual, |panel, _| assert!(!panel.test_controls_muted()));
+    // The hold is recorded, but an unconfirmed call still keeps the capture
+    // closed: `microphone_open` requires a joined call.
+    voice.read_with(&*visual, |panel, _| {
+        assert!(panel.test_ptt_held());
+        assert!(panel.test_controls_muted());
+    });
     visual.update(|_window, app| {
         voice.update(app, |panel, cx| {
             panel.set_push_to_talk_held(false);
+            panel.release_push_to_talk();
             cx.notify();
         });
     });
-    voice.read_with(&*visual, |panel, _| assert!(panel.test_controls_muted()));
+    voice.read_with(&*visual, |panel, _| {
+        assert!(!panel.test_ptt_held());
+        assert!(panel.test_controls_muted());
+    });
 }
 
 #[gpui::test]

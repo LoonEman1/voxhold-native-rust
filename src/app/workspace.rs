@@ -24,10 +24,7 @@ impl Voxhold {
             .update(cx, |input, cx| input.set_value("", window, cx));
         #[cfg(feature = "voxhold-media")]
         if self.server != id {
-            if let Some(voice) = self.voice.take() {
-                voice.update(cx, |voice, cx| voice.leave_in_window(window, cx));
-            }
-            self.voice_channel = 0;
+            self.abandon_voice(window, cx);
         }
         self.server = id;
         self.reset_recordings(window, cx);
@@ -282,38 +279,21 @@ impl Voxhold {
         self.show_channels = false;
         self.close_stale_settings(self.server, id, window, cx);
         #[cfg(feature = "voxhold-media")]
-        if let Some(client) = self.client.clone().filter(|_| {
-            self.voice_channel != id
-                && self.channels.iter().any(|ch| {
-                    ch.id == id && ch.kind == "voice" && ch.readable() && !ch.e2ee_required
-                })
-        }) {
-            if let Some(voice) = self.voice.take() {
-                voice.update(cx, |voice, cx| voice.leave_in_window(window, cx));
+        if let Some(client) = self.client.clone() {
+            // A voice channel opens its room even before joining; the call in
+            // another room stays alive and moves to the sidebar dock.
+            if self
+                .channels
+                .iter()
+                .any(|channel| channel.id == id && channel.kind == "voice")
+            {
+                if let Some(panel) = &self.voice {
+                    let panel = panel.read(cx);
+                    self.voice_channel = panel.call_channel();
+                }
+                self.open_voice_room(id, window, cx);
+                let _ = client;
             }
-            let server = self.server;
-            let push_to_talk = self.voice_settings.prefs.input_mode == "push_to_talk";
-            let panel = cx.new(|cx| {
-                voice_panel::VoicePanel::new(client, server, id, push_to_talk, window, cx)
-            });
-            let weak_view = cx.entity().downgrade();
-            let recordings_live = self.recordings_live.clone();
-            panel.update(cx, |panel, _| {
-                panel.set_recordings_live(recordings_live);
-                panel.set_recordings_handler(Box::new(move |window, cx| {
-                    let Some(_view) = weak_view.upgrade() else {
-                        return;
-                    };
-                    let weak = weak_view.clone();
-                    window.defer(cx, move |window, cx| {
-                        if let Some(view) = weak.upgrade() {
-                            view.update(cx, |view, cx| view.toggle_recordings("voice", window, cx));
-                        }
-                    });
-                }));
-            });
-            self.voice = Some(panel);
-            self.voice_channel = id;
         }
         if let Some(search) = &self.search {
             search.update(cx, |panel, cx| panel.set_scope(self.server, id, cx));
@@ -426,6 +406,11 @@ impl Voxhold {
         self.hovered_message = 0;
         self.busy = false;
         self.composer_error.clear();
+        #[cfg(feature = "voxhold-media")]
+        {
+            self.voice_rooms.clear();
+            self.voice_streams.clear();
+        }
         self.clear_media(window);
         self.roster.reset_channel();
         self.roster.loading.clear();
@@ -546,16 +531,9 @@ impl Voxhold {
                             .find(|c| c.id == s.channel && c.readable() && !c.e2ee_required)
                             .map(|c| c.id);
                         #[cfg(feature = "voxhold-media")]
-                        if !s.channels.iter().any(|c| {
-                            c.id == s.voice_channel
-                                && c.kind == "voice"
-                                && c.readable()
-                                && !c.e2ee_required
-                        }) {
-                            if let Some(voice) = s.voice.take() {
-                                voice.update(cx, |voice, cx| voice.leave_in_window(window, cx));
-                            }
-                            s.voice_channel = 0;
+                        {
+                            s.sync_voice_panel(cx);
+                            s.refresh_voice_call(window, cx);
                         }
                         s.access_pending = false;
                         s.error.clear();

@@ -633,13 +633,29 @@ impl Voxhold {
                         self.voice_settings.prefs.output = id;
                     }
                     self.voice_settings.persist();
+                    #[cfg(feature = "voxhold-media")]
+                    if let Some(voice) = &self.voice {
+                        let prefs = self.voice_settings.prefs.clone();
+                        voice.update(cx, |panel, _| {
+                            panel.set_devices(Some(prefs.input), Some(prefs.output))
+                        });
+                    }
                 }
                 cx.notify();
             }
             Action::SetVolume(which, value) => {
                 match which {
-                    "input" => self.voice_settings.prefs.input_volume = value.clamp(0, 200),
-                    "output" => self.voice_settings.prefs.output_volume = value.clamp(0, 200),
+                    "input" => {
+                        // Input gain is applied by the DSP capture path (R07b).
+                        self.voice_settings.prefs.input_volume = value.clamp(0, 200)
+                    }
+                    "output" => {
+                        self.voice_settings.prefs.output_volume = value.clamp(0, 200);
+                        #[cfg(feature = "voxhold-media")]
+                        if let Some(voice) = &self.voice {
+                            voice.update(cx, |panel, _| panel.set_output_volume(value));
+                        }
+                    }
                     "noise" => self.voice_settings.prefs.noise_gate = value.clamp(0, 100),
                     _ => self.voice_settings.prefs.sound_volume = value.clamp(0, 100),
                 }
@@ -650,6 +666,10 @@ impl Voxhold {
                 if crate::voice_settings::BITRATES.contains(&bitrate) {
                     self.voice_settings.prefs.bitrate = bitrate;
                     self.voice_settings.persist();
+                    #[cfg(feature = "voxhold-media")]
+                    if let Some(voice) = &self.voice {
+                        voice.update(cx, |panel, _| panel.set_bitrate(bitrate as u32));
+                    }
                     cx.notify();
                 }
             }

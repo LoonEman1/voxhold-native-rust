@@ -31,6 +31,8 @@ mod theme;
 mod thread_panel;
 #[cfg(feature = "voxhold-media")]
 mod voice_panel;
+#[cfg(feature = "voxhold-media")]
+mod voice_room;
 mod voice_settings;
 mod window_chrome;
 

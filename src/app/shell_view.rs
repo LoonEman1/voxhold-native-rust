@@ -13,6 +13,11 @@ impl Render for Voxhold {
             .bg(ink(p.bg))
             .text_color(ink(p.fg))
             .capture_key_down(cx.listener(|s, event: &gpui::KeyDownEvent, window, cx| {
+                #[cfg(feature = "voxhold-media")]
+                if s.voice_key_down(event, window, cx) {
+                    cx.stop_propagation();
+                    return;
+                }
                 match event.keystroke.key.as_str() {
                     "escape" => {
                         if s.media.viewer.is_some() {
@@ -71,7 +76,15 @@ impl Render for Voxhold {
             .on_drop(cx.listener(|s, paths: &gpui::ExternalPaths, _window, cx| {
                 s.drop_files(paths.paths().to_vec(), cx);
             }))
+            .capture_key_up(cx.listener(|s, event: &gpui::KeyUpEvent, window, cx| {
+                #[cfg(feature = "voxhold-media")]
+                if s.voice_key_up(event, window, cx) {
+                    cx.stop_propagation();
+                }
+            }))
             .on_mouse_move(cx.listener(|s, event: &gpui::MouseMoveEvent, _, cx| {
+                #[cfg(feature = "voxhold-media")]
+                s.voice_pointer_moved(event.position, cx);
                 if let Some(drag) = s.scrollbar_drag {
                     if event.pressed_button != Some(MouseButton::Left) {
                         s.scrollbar_drag = None;
@@ -119,6 +132,8 @@ impl Render for Voxhold {
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|s, _, _, cx| {
+                    #[cfg(feature = "voxhold-media")]
+                    s.voice_pointer_released(cx);
                     if s.scrollbar_drag.take().is_some() {
                         s.history_list.scrollbar_drag_ended();
                         cx.notify();
@@ -129,6 +144,26 @@ impl Render for Voxhold {
                     }
                 }),
             );
+        #[cfg(feature = "voxhold-media")]
+        {
+            root = root
+                .on_action(cx.listener(|s, _: &voice_panel::VoiceTab, window, cx| {
+                    if let Some(voice) = &s.voice {
+                        voice.update(cx, |panel, cx| {
+                            panel.cycle_focus(false, window, cx);
+                        });
+                    }
+                    cx.stop_propagation();
+                }))
+                .on_action(cx.listener(|s, _: &voice_panel::VoiceTabPrev, window, cx| {
+                    if let Some(voice) = &s.voice {
+                        voice.update(cx, |panel, cx| {
+                            panel.cycle_focus(true, window, cx);
+                        });
+                    }
+                    cx.stop_propagation();
+                }));
+        }
         if self.client.is_none() {
             if !self.initial_focus_done {
                 self.initial_focus_done = true;
@@ -172,6 +207,10 @@ impl Render for Voxhold {
         };
         let channels_open = !mobile || self.show_channels;
         let l = layout::compute_layout(vw, vh, self.shell, channels_open, self.show_members);
+        #[cfg(feature = "voxhold-media")]
+        self.sync_push_to_talk_block(cx);
+        #[cfg(feature = "voxhold-media")]
+        self.refresh_voice_call(window, cx);
         if !mobile {
             root = root.child(
                 div()
@@ -189,7 +228,10 @@ impl Render for Voxhold {
         let writable = self.conversation.is_some()
             || (!self.access_pending && selected.as_ref().is_some_and(|c| c.writable()));
         let thread_active = self.show_thread && self.thread.is_some();
-        let history = if thread_active {
+        let voice_room = self.voice_room_visible();
+        let history = if voice_room {
+            div().into_any_element()
+        } else if thread_active {
             div()
                 .flex_1()
                 .min_h(px(0.))
@@ -538,9 +580,24 @@ impl Render for Voxhold {
             );
         }
         #[cfg(feature = "voxhold-media")]
-        if self.recordings_voice_panel_visible() {
+        if voice_room {
             if let Some(voice) = &self.voice {
-                chat = chat.child(div().h(px(400.)).child(voice.clone()));
+                let header_height = if mobile { 58. } else { 67. };
+                let room_width = l.chat.w;
+                let room_height = (l.chat.h - header_height).max(120.);
+                voice.update(cx, |panel, cx| {
+                    panel.set_room_size(room_width, room_height);
+                    cx.notify();
+                });
+                chat = chat.child(
+                    div()
+                        .absolute()
+                        .left(px(0.))
+                        .top(px(header_height))
+                        .w(px(room_width))
+                        .h(px(room_height))
+                        .child(voice.clone()),
+                );
             }
         }
         root = root.child(
@@ -736,6 +793,19 @@ impl Render for Voxhold {
         }
         if let Some(layer) = self.recordings_overlay(window, cx) {
             root = root.child(layer);
+        }
+        #[cfg(feature = "voxhold-media")]
+        if let Some(voice) = self.voice.clone() {
+            let area =
+                crate::voice_room::Rect::new(0., 0., vw, if mobile { l.bottom.y } else { vh });
+            let scale = window.scale_factor();
+            voice.update(cx, |panel, _| {
+                panel.set_scale(scale);
+                panel.set_player_area_and_place(area);
+            });
+            if let Some(overlay) = voice.update(cx, |panel, cx| panel.player_overlay(window, cx)) {
+                root = root.child(overlay);
+            }
         }
         if let Some(layer) = self.viewer_layer(window, cx) {
             root = root.child(layer);

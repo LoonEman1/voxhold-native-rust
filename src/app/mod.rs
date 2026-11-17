@@ -36,6 +36,9 @@ mod tests;
 mod theme_ops;
 mod thread_ops;
 pub(crate) mod ui;
+mod voice_ops;
+#[cfg(test)]
+mod voice_tests;
 mod workspace;
 
 use gpui::{
@@ -242,8 +245,18 @@ pub(crate) struct Voxhold {
     show_servers: bool,
     #[cfg(feature = "voxhold-media")]
     voice: Option<Entity<voice_panel::VoicePanel>>,
+    /// Channel shown in the room pane; independent from the call channel.
+    #[cfg(feature = "voxhold-media")]
+    voice_room: i64,
+    /// Channel of the active call, mirrored from the panel for the dock.
     #[cfg(feature = "voxhold-media")]
     voice_channel: i64,
+    /// Confirmed rosters of visible voice rooms from `voice.*` events.
+    #[cfg(feature = "voxhold-media")]
+    voice_rooms: std::collections::HashMap<i64, Vec<voxhold_media::controller::Participant>>,
+    /// Screen publications of visible voice rooms from `stream.*` events.
+    #[cfg(feature = "voxhold-media")]
+    voice_streams: std::collections::HashMap<i64, Vec<voxhold_media::controller::Publication>>,
     servers: Vec<Server>,
     channels: Vec<Channel>,
     members: Vec<Member>,
@@ -402,6 +415,15 @@ impl Voxhold {
         prefill: &str,
         shell_path: Option<std::path::PathBuf>,
     ) -> Self {
+        #[cfg(feature = "voxhold-media")]
+        cx.bind_keys([
+            gpui::KeyBinding::new("tab", crate::voice_panel::VoiceTab, Some("VoiceRoom")),
+            gpui::KeyBinding::new(
+                "shift-tab",
+                crate::voice_panel::VoiceTabPrev,
+                Some("VoiceRoom"),
+            ),
+        ]);
         let history_list = Self::new_history_list(ListAlignment::Bottom, cx);
         let system_light = theme::system_light();
         let theme_path = theme::theme_path();
@@ -506,7 +528,13 @@ impl Voxhold {
             #[cfg(feature = "voxhold-media")]
             voice: None,
             #[cfg(feature = "voxhold-media")]
+            voice_room: 0,
+            #[cfg(feature = "voxhold-media")]
             voice_channel: 0,
+            #[cfg(feature = "voxhold-media")]
+            voice_rooms: std::collections::HashMap::new(),
+            #[cfg(feature = "voxhold-media")]
+            voice_streams: std::collections::HashMap::new(),
             servers: vec![],
             channels: vec![],
             members: vec![],

@@ -154,13 +154,7 @@ impl Voxhold {
         self.active_profile_save = None;
         self.notification_saves.clear();
         #[cfg(feature = "voxhold-media")]
-        if let Some(voice) = self.voice.take() {
-            voice.update(cx, |voice, cx| voice.leave_in_window(window, cx));
-        }
-        #[cfg(feature = "voxhold-media")]
-        {
-            self.voice_channel = 0;
-        }
+        self.abandon_voice(window, cx);
         self.close_recordings(false, window, cx);
         self.recording_access_epoch = self.recording_access_epoch.wrapping_add(1);
         self.recordings.reset();

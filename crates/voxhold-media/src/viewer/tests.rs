@@ -580,3 +580,229 @@ fn closing_the_player_releases_the_attempt_but_keeps_the_selection_empty() {
     assert!(viewer.watching().is_none());
     assert!(viewer.intent().is_none());
 }
+
+#[test]
+fn a_tagged_close_from_the_previous_attempt_is_rejected_after_the_new_ack() {
+    let now = Instant::now();
+    let a = publication("a", 1);
+    let b = publication("b", 2);
+    let mut viewer = Viewer::new(1, 10);
+    snapshot(&mut viewer, &[a.clone(), b.clone()], now);
+    viewer.set_joined(true, now);
+    let (watch_a, _) = start_of(&viewer.select(&a, 1, now));
+    let switching = viewer.select(&b, 2, now);
+    let leave = sends(&switching, "stream.leave");
+    let ack = viewer.on_server_event("stream.left", &leave[0], &json!({}), now);
+    let (watch_b, _) = start_of(&ack);
+    let watching = viewer.on_server_event("stream.watching", &watch_b, &json!({"stream": b}), now);
+    assert!(watching.is_empty());
+    // A's offer was never seen, so the ufrag is unknown; only the explicit
+    // watch id can reject it.
+    let stale_offer = viewer.on_server_event(
+        "stream.webrtc_offer",
+        "",
+        &json!({"watch_id": watch_a, "sdp":"v=0\r\na=ice-ufrag:unknown\r\n"}),
+        now,
+    );
+    assert!(stale_offer.is_empty(), "old tagged offer: {stale_offer:?}");
+    let stale_close = viewer.on_server_event("stream.webrtc_closed", &watch_a, &json!({}), now);
+    assert!(
+        stale_close.is_empty(),
+        "old top-level request_id with empty data must still be rejected"
+    );
+    assert_eq!(
+        viewer
+            .watching()
+            .unwrap()
+            .publication
+            .publisher_connection_id,
+        "b"
+    );
+}
+
+#[test]
+fn an_untagged_close_right_after_the_new_watch_ack_is_ambiguous() {
+    let now = Instant::now();
+    let a = publication("a", 1);
+    let b = publication("b", 2);
+    let mut viewer = Viewer::new(1, 10);
+    snapshot(&mut viewer, &[a.clone(), b.clone()], now);
+    viewer.set_joined(true, now);
+    start_of(&viewer.select(&a, 1, now));
+    let switching = viewer.select(&b, 2, now);
+    let leave = sends(&switching, "stream.leave");
+    let ack = viewer.on_server_event("stream.left", &leave[0], &json!({}), now);
+    let (watch_b, _) = start_of(&ack);
+    viewer.on_server_event("stream.watching", &watch_b, &json!({"stream": b}), now);
+    // The pinned backend cannot tag this close. Ignoring the first one keeps a
+    // late close from A from ending B; a compatible backend must send watch_id.
+    let ambiguous = viewer.on_server_event(
+        "stream.webrtc_closed",
+        "",
+        &json!({"reason":"disconnected"}),
+        now,
+    );
+    assert!(ambiguous.is_empty(), "ambiguous close: {ambiguous:?}");
+    assert_eq!(
+        viewer
+            .watching()
+            .unwrap()
+            .publication
+            .publisher_connection_id,
+        "b"
+    );
+    // B's own offer attributes the next close to this attempt.
+    let current = viewer.on_server_event(
+        "stream.webrtc_offer",
+        "",
+        &json!({"sdp":"v=0\r\na=ice-ufrag:b\r\n"}),
+        now,
+    );
+    assert!(!current.is_empty());
+    let current_close = viewer.on_server_event(
+        "stream.webrtc_closed",
+        "",
+        &json!({"reason":"disconnected"}),
+        now,
+    );
+    assert!(!current_close.is_empty());
+}
+
+#[test]
+fn an_early_close_tagged_with_the_new_attempt_is_accepted() {
+    let now = Instant::now();
+    let a = publication("a", 1);
+    let mut viewer = Viewer::new(1, 10);
+    snapshot(&mut viewer, &[a.clone()], now);
+    viewer.set_joined(true, now);
+    let (watch, _) = start_of(&viewer.select(&a, 1, now));
+    let early = viewer.on_server_event(
+        "stream.webrtc_closed",
+        "",
+        &json!({"watch_id": watch, "reason":"viewer permission was revoked"}),
+        now,
+    );
+    assert!(early.iter().any(
+        |outcome| matches!(outcome, Outcome::Failed { message, .. } if message == "Трансляция завершена")
+    ));
+    assert!(viewer.watching().is_none());
+}
+
+#[test]
+fn two_views_of_the_same_p2p_publisher_use_separate_watch_ids() {
+    let now = Instant::now();
+    let mut a = publication("same-publisher", 1);
+    a.mode = "p2p".into();
+    let mut viewer = Viewer::new(1, 10);
+    snapshot(&mut viewer, &[a.clone()], now);
+    viewer.set_joined(true, now);
+    let (watch_a, _) = start_of(&viewer.select(&a, 1, now));
+    let switching = viewer.select(&a, 2, now);
+    let leave = sends(&switching, "stream.leave");
+    let ack = viewer.on_server_event("stream.left", &leave[0], &json!({}), now);
+    let (watch_b, _) = start_of(&ack);
+    assert_ne!(watch_a, watch_b);
+    let offer = viewer.on_server_event(
+        "stream.p2p_offer",
+        "",
+        &json!({"from_connection_id":"same-publisher","sdp":"v=0\r\na=ice-ufrag:b\r\n"}),
+        now,
+    );
+    assert!(
+        !offer.is_empty(),
+        "B's own offer must start the new attempt"
+    );
+    let old_close = viewer.on_server_event(
+        "stream.webrtc_closed",
+        "",
+        &json!({"watch_id": watch_a, "reason":"disconnected"}),
+        now,
+    );
+    assert!(
+        old_close.is_empty(),
+        "the first run's close must not end the repeat view"
+    );
+    assert!(viewer.watching().is_some());
+    let current_close = viewer.on_server_event(
+        "stream.webrtc_closed",
+        "",
+        &json!({"watch_id": watch_b, "reason":"disconnected"}),
+        now,
+    );
+    assert!(!current_close.is_empty(), "B's tagged close must apply");
+}
+
+#[test]
+fn an_unknown_next_ice_generation_reaches_the_engine_buffer() {
+    let now = Instant::now();
+    let a = publication("a", 1);
+    let mut viewer = Viewer::new(1, 10);
+    snapshot(&mut viewer, &[a.clone()], now);
+    viewer.set_joined(true, now);
+    start_of(&viewer.select(&a, 1, now));
+    let old = viewer.on_server_event(
+        "stream.webrtc_offer",
+        "",
+        &json!({"sdp":"v=0\r\na=ice-ufrag:old\r\n"}),
+        now,
+    );
+    assert!(!old.is_empty());
+    let next = viewer.on_server_event(
+        "stream.ice_candidate",
+        "",
+        &json!({"candidate":"candidate:1 1 udp 1 127.0.0.1 9 typ host ufrag new"}),
+        now,
+    );
+    assert!(
+        next.iter()
+            .any(|outcome| matches!(outcome, Outcome::Ice(_))),
+        "the first candidate of a restart must be kept for the engine: {next:?}"
+    );
+    let restarted = viewer.on_server_event(
+        "stream.webrtc_offer",
+        "",
+        &json!({"sdp":"v=0\r\na=ice-ufrag:new\r\n"}),
+        now,
+    );
+    assert!(!restarted.is_empty());
+    let old_generation = viewer.on_server_event(
+        "stream.ice_candidate",
+        "",
+        &json!({"candidate":"candidate:1 1 udp 1 127.0.0.1 9 typ host ufrag old"}),
+        now,
+    );
+    assert!(
+        old_generation.is_empty(),
+        "after the new SDP the previous generation is retired"
+    );
+}
+
+#[test]
+fn transport_end_before_join_still_publishes_recovery_for_the_selection() {
+    let now = Instant::now();
+    let a = publication("a", 1);
+    let mut viewer = Viewer::new(1, 10);
+    snapshot(&mut viewer, &[a.clone()], now);
+    viewer.select_intent(a.clone(), 7);
+    let ended = viewer.transport_ended(now);
+    assert!(ended.iter().any(|outcome| matches!(
+        outcome,
+        Outcome::Connected {
+            selection: 7,
+            connected: false
+        }
+    )));
+    assert!(ended.iter().any(|outcome| matches!(
+        outcome,
+        Outcome::Status { selection: 7, text } if text.contains("Восстанавливаем")
+    )));
+    // The next socket must wait for its own snapshot even if voice.joined
+    // arrives first.
+    assert!(viewer.set_joined(true, now).is_empty());
+    let fresh = snapshot(&mut viewer, &[a], now);
+    assert!(
+        fresh
+            .iter()
+            .any(|outcome| matches!(outcome, Outcome::Start { selection: 7, .. }))
+    );
+}

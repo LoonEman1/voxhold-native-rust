@@ -1,6 +1,31 @@
 use super::*;
 
 impl Voxhold {
+    /// Install an authoritative channel list for the current server. Both the
+    /// initial server selection and an ACL reload use this path so a successful
+    /// answer always confirms voice access again, clears closed rooms from the
+    /// panel and re-evaluates an active call.
+    pub(super) fn apply_confirmed_channels(
+        &mut self,
+        server: i64,
+        channels: Vec<Channel>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.channels = channels;
+        if !self.in_conversation() {
+            self.search_permissions_ready = true;
+            self.sync_search_permissions(cx);
+        }
+        #[cfg(feature = "voxhold-media")]
+        {
+            self.voice_unconfirmed.remove(&server);
+            self.sync_voice_panel(cx);
+            self.refresh_voice_call(window, cx);
+        }
+        let _ = (server, window);
+    }
+
     pub(super) fn select_server(&mut self, id: i64, window: &mut Window, cx: &mut Context<Self>) {
         let Some(c) = self.client.clone() else { return };
         let previous = self.chat_key();
@@ -170,20 +195,18 @@ impl Voxhold {
                 Ok::<_, String>((channels, members))
             })
         });
-        cx.spawn(async move |this, cx| {
+        cx.spawn_in(window, async move |this, cx| {
             let result = task.await;
             if let Some(this) = this.upgrade() {
-                this.update(cx, |s, cx| {
+                this.update_in(cx, |s, window, cx| {
                     if s.generation != generation || s.access_pending {
                         return;
                     }
                     match result {
                         Ok((channels, mut members)) => {
                             crate::members::sort_members(&mut members);
-                            s.channels = channels;
                             s.members = members;
-                            s.search_permissions_ready = true;
-                            s.sync_search_permissions(cx);
+                            s.apply_confirmed_channels(id, channels, window, cx);
                         }
                         Err(e) => s.error = e,
                     }
@@ -481,9 +504,11 @@ impl Voxhold {
                 }
                 match result {
                     Ok((channels, members)) => {
-                        s.channels = channels;
-                        #[cfg(feature = "voxhold-media")]
-                        s.voice_unconfirmed.remove(&server);
+                        if let Ok(mut members) = members {
+                            crate::members::sort_members(&mut members);
+                            s.members = members;
+                        }
+                        s.apply_confirmed_channels(server, channels, window, cx);
                         // A notification form follows the account, not the
                         // administration role, but it still needs a readable
                         // text/news channel. Revoking access closes it.
@@ -497,12 +522,6 @@ impl Voxhold {
                             });
                         if channel_missing {
                             s.close_settings(false, window, cx);
-                        }
-                        s.search_permissions_ready = true;
-                        s.sync_search_permissions(cx);
-                        if let Ok(mut members) = members {
-                            crate::members::sort_members(&mut members);
-                            s.members = members;
                         }
                         if s.in_conversation() {
                             s.access_pending = false;
@@ -534,11 +553,6 @@ impl Voxhold {
                             .iter()
                             .find(|c| c.id == s.channel && c.readable() && !c.e2ee_required)
                             .map(|c| c.id);
-                        #[cfg(feature = "voxhold-media")]
-                        {
-                            s.sync_voice_panel(cx);
-                            s.refresh_voice_call(window, cx);
-                        }
                         s.access_pending = false;
                         s.error.clear();
                         let channel = channel.unwrap_or_default();

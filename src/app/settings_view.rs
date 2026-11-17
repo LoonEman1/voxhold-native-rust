@@ -834,6 +834,10 @@ impl Voxhold {
                 window,
                 cx,
             ))
+            .child(self.form_text(
+                "0–200 %: сейчас отличимо только выключение (0 %). Числовая громкость комнаты появится с PCM-трактом R07b; системный микшер Windows не изменяется.",
+                false,
+            ))
             .child(self.form_text(&format!("Качество передачи · {} Кбит/с", prefs.bitrate), false));
         for bitrate in crate::voice_settings::BITRATES {
             root = root.child(self.settings_button(

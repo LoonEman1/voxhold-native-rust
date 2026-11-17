@@ -492,3 +492,84 @@ async fn the_room_and_player_use_the_real_layout_coordinates(cx: &mut TestAppCon
     assert!(f32::from(player.origin.x) >= area.x + 8.0 - 0.5);
     assert!(f32::from(player.origin.y) >= area.y + 8.0 - 0.5);
 }
+
+#[gpui::test]
+async fn unconfirmed_access_hides_the_active_room_and_blocks_join(cx: &mut TestAppContext) {
+    let (mut visual, view, voice) = fixture(cx);
+    visual.update(|_, app| {
+        voice.update(app, |panel, _| {
+            panel.test_set_streams(vec![publication(7, "alice", 1)]);
+        });
+    });
+    draw(&mut visual);
+    voice.read_with(&*visual, |panel, _| {
+        assert_eq!(panel.test_visible_roster_len(), 2);
+        assert_eq!(panel.test_visible_streams_len(), 1);
+        assert!(panel.test_audio_for("alice"));
+    });
+
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            v.voice_unconfirmed.insert(1);
+            v.sync_voice_panel(cx);
+        });
+        let _ = window;
+    });
+    draw(&mut visual);
+    voice.read_with(&*visual, |panel, _| {
+        assert_eq!(
+            panel.test_visible_roster_len(),
+            0,
+            "the active call roster must follow the ACL gate"
+        );
+        assert_eq!(panel.test_visible_streams_len(), 0);
+        assert!(!panel.test_audio_for("alice"));
+    });
+    visual.update(|_, app| {
+        voice.update(app, |panel, cx| {
+            panel.join(cx);
+            assert!(panel.error().contains("не подтверждены"));
+        });
+    });
+
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            v.apply_confirmed_channels(1, vec![channel(7, "Room A", "voice")], window, cx);
+        });
+    });
+    draw(&mut visual);
+    view.read_with(&*visual, |v, _| {
+        assert!(!v.voice_unconfirmed.contains(&1));
+    });
+    voice.read_with(&*visual, |panel, _| {
+        assert_eq!(panel.test_visible_roster_len(), 2);
+        assert_eq!(panel.test_visible_streams_len(), 1);
+        assert!(panel.test_audio_for("alice"));
+    });
+}
+
+#[gpui::test]
+async fn ended_in_fullscreen_restores_the_window_and_closes_the_player(cx: &mut TestAppContext) {
+    let (mut visual, _view, voice) = fixture(cx);
+    draw(&mut visual);
+    visual.update(|window, app| {
+        voice.update(app, |panel, cx| {
+            panel.test_open_player(publication(7, "alice", 1));
+            panel.player_toggle_fullscreen(window);
+            assert!(panel.player_fullscreen());
+            panel.test_apply_update(
+                voxhold_media::runtime::VoiceUpdate::Ended(Some(
+                    "Голосовое соединение завершено сервером".into(),
+                )),
+                window,
+                cx,
+            );
+        });
+    });
+    draw(&mut visual);
+    voice.read_with(&*visual, |panel, _| {
+        assert!(!panel.player_fullscreen(), "revoke must leave fullscreen");
+        assert!(!panel.player_open(), "the player is closed");
+        assert!(!panel.call_active(), "the call is released");
+    });
+}

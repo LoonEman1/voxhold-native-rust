@@ -60,6 +60,12 @@ pub enum VoiceUpdate {
         selection: u64,
         connected: bool,
     },
+    /// A stream-audio device notice. It must not close the viewer: on a
+    /// successful rollback the video and the previous output stay alive.
+    StreamAudio {
+        selection: u64,
+        error: Option<String>,
+    },
     DeviceError(String),
     /// The attempt finished. An error reason is carried together with the end
     /// so the UI can never lose it to a coalesced terminal `Left`.
@@ -71,6 +77,7 @@ impl VoiceUpdate {
         match (self, other) {
             (Self::StreamStatus { selection: a, .. }, Self::StreamStatus { selection: b, .. })
             | (Self::StreamError { selection: a, .. }, Self::StreamError { selection: b, .. })
+            | (Self::StreamAudio { selection: a, .. }, Self::StreamAudio { selection: b, .. })
             | (
                 Self::StreamConnected { selection: a, .. },
                 Self::StreamConnected { selection: b, .. },
@@ -151,22 +158,46 @@ impl StreamCommand {
     }
 }
 
-/// Install a stream intent only if it is not older than the queued one.
-/// Selection ids are monotonic, so a late close for A cannot erase a newer
-/// watch for B (and vice versa).
+/// Install a stream intent only if it is not older than the queued or already
+/// applied command. Selection ids are monotonic, so a late close for A cannot
+/// erase a newer watch for B (and vice versa).
 fn set_stream_command(requests: &Requests, command: StreamCommand) -> bool {
     let selection = command.selection();
-    let Ok(mut slot) = requests.stream.lock() else {
+    let Ok(mut queue) = requests.stream.lock() else {
         return false;
     };
-    if slot
-        .as_ref()
-        .is_some_and(|current| current.selection() > selection)
+    if queue.last_applied > selection
+        || queue
+            .pending
+            .as_ref()
+            .is_some_and(|current| current.selection() > selection)
     {
         return false;
     }
-    *slot = Some(command);
+    queue.pending = Some(command);
     true
+}
+
+/// The last-value slot plus the newest command the worker has already taken.
+/// Keeping the applied number after the slot is empty is what lets a newer
+/// Close(B) close the still-running A when the intermediate Watch(B) was
+/// displaced by the close.
+#[derive(Default)]
+struct StreamRequests {
+    pending: Option<StreamCommand>,
+    last_applied: u64,
+}
+
+impl StreamRequests {
+    fn take(&mut self) -> Option<StreamCommand> {
+        let command = self.pending.take()?;
+        self.last_applied = self.last_applied.max(command.selection());
+        Some(command)
+    }
+
+    fn clear(&mut self) {
+        self.pending = None;
+    }
 }
 
 /// Latest-value request slots shared by the handle and the worker.
@@ -174,8 +205,12 @@ fn set_stream_command(requests: &Requests, command: StreamCommand) -> bool {
 struct Requests {
     controls: Mutex<Option<(Controls, bool)>>,
     local_mutes: Mutex<VecDeque<(String, bool)>>,
-    stream: Mutex<Option<StreamCommand>>,
+    stream: Mutex<StreamRequests>,
     stream_mute: Mutex<Option<(u64, bool)>>,
+    /// Explicit output selection from settings. This is separate from generic
+    /// control updates so it always reaches the media engine even when the
+    /// runtime cache still describes the pre-unplug device.
+    output: Mutex<Option<Option<String>>>,
     viewport: Mutex<Option<(u32, u32)>>,
     leave: AtomicBool,
     notify: Notify,
@@ -184,6 +219,7 @@ struct Requests {
 enum Pending {
     Leave,
     Stream(StreamCommand),
+    Output(Option<String>),
     Controls(Controls, bool),
     StreamMute(u64, bool),
     LocalMute(String, bool),
@@ -202,6 +238,11 @@ impl Requests {
         if let Ok(mut stream) = self.stream.lock() {
             if let Some(command) = stream.take() {
                 return Some(Pending::Stream(command));
+            }
+        }
+        if let Ok(mut output) = self.output.lock() {
+            if let Some(output) = output.take() {
+                return Some(Pending::Output(output));
             }
         }
         if let Ok(mut controls) = self.controls.lock() {
@@ -317,6 +358,17 @@ impl VoiceHandle {
         self.requests.wake();
     }
 
+    /// An explicit output choice from settings. Generic control updates may
+    /// skip an unchanged value, but this request is always forwarded to the
+    /// media engine, whose own output state decides whether it is a no-op.
+    pub fn select_output(&self, output: Option<String>) {
+        let output = output.filter(|id| !id.is_empty());
+        if let Ok(mut slot) = self.requests.output.lock() {
+            *slot = Some(output);
+        }
+        self.requests.wake();
+    }
+
     pub fn local_mute(&self, connection: String, muted: bool) {
         if let Ok(mut queue) = self.requests.local_mutes.lock() {
             if queue.len() >= LOCAL_MUTE_CAPACITY {
@@ -380,7 +432,7 @@ impl VoiceHandle {
         self.capture.latch();
         self.requests.leave.store(true, Ordering::SeqCst);
         if let Ok(mut stream) = self.requests.stream.lock() {
-            stream.take();
+            stream.clear();
         }
         self.requests.wake();
     }
@@ -429,6 +481,7 @@ struct Live {
     servers: Vec<IceServer>,
     policy: String,
     output: Option<String>,
+    output_working: bool,
     stream: Option<StreamViewer>,
     stream_selection: Option<u64>,
     render: VideoFrame,
@@ -557,6 +610,23 @@ impl Live {
                 EngineUpdate::Ice(candidate) => viewer.on_ice(candidate),
                 EngineUpdate::State(state) => viewer.on_engine_state(state, now),
                 EngineUpdate::Error(message) => viewer.on_engine_error(&message, now),
+                EngineUpdate::Output {
+                    applied,
+                    audible: _,
+                    working,
+                    error,
+                } => {
+                    // The applied endpoint may be the previous one after a
+                    // rollback. Updating both values lets a repeated request
+                    // retry instead of being skipped as unchanged.
+                    self.output = applied;
+                    self.output_working = working;
+                    if let Some(selection) = viewer.watching().map(|watching| watching.selection) {
+                        self.updates
+                            .push(VoiceUpdate::StreamAudio { selection, error });
+                    }
+                    Vec::new()
+                }
             };
             if !self.apply(outcomes, viewer).await? {
                 return Ok(false);
@@ -784,6 +854,7 @@ async fn run_session(
         servers,
         policy: config.ice_transport_policy,
         output: controller.controls.output.clone(),
+        output_working: true,
         stream: None,
         stream_selection: None,
         render: VideoFrame::default(),
@@ -825,6 +896,10 @@ async fn run_session(
                     return SessionEnd::Leave;
                 }
                 Pending::Stream(StreamCommand::Close { selection }) => {
+                    // The queue has already rejected a close older than the
+                    // newest applied command. A newer close therefore means the
+                    // current picture, even when an intermediate Watch(B) was
+                    // displaced before the worker read it.
                     let outcomes = viewer.leave_selection(selection, Instant::now());
                     if live.stream_selection == Some(selection) {
                         live.stream = None;
@@ -844,6 +919,17 @@ async fn run_session(
                         return end;
                     }
                 }
+                Pending::Output(output) => {
+                    live.output = output.clone();
+                    if let Some(stream) = &mut live.stream {
+                        if let Err(message) = stream.select_output(output) {
+                            live.updates.push(VoiceUpdate::StreamStatus {
+                                selection: live.stream_selection.unwrap_or_default(),
+                                status: message,
+                            });
+                        }
+                    }
+                }
                 Pending::StreamMute(selection, muted) => {
                     let outcomes = viewer.set_muted(selection, muted);
                     if let Err(end) = live.apply(outcomes, viewer).await {
@@ -853,7 +939,7 @@ async fn run_session(
                 Pending::Controls(controls, self_muted) => {
                     let output = controls.output.clone();
                     let actions = controller.update_controls(controls, self_muted);
-                    if output != live.output {
+                    if output != live.output || !live.output_working {
                         live.output.clone_from(&output);
                         if let Some(stream) = &mut live.stream {
                             if let Err(message) = stream.set_output(output.clone()) {
@@ -990,7 +1076,32 @@ fn run(
             capture.clone(),
         ));
         controller.joined = false;
-        let _ = viewer.set_joined(false, Instant::now());
+        let outcomes = viewer.transport_ended(Instant::now());
+        for outcome in outcomes {
+            match outcome {
+                ViewerOutcome::Status { selection, text } => {
+                    updates.push(VoiceUpdate::StreamStatus {
+                        selection,
+                        status: text,
+                    });
+                }
+                ViewerOutcome::Connected {
+                    selection,
+                    connected,
+                } => {
+                    updates.push(VoiceUpdate::StreamConnected {
+                        selection,
+                        connected,
+                    });
+                }
+                ViewerOutcome::Close => {
+                    if let Ok(mut frame) = frame.lock() {
+                        frame.take();
+                    }
+                }
+                _ => {}
+            }
+        }
         updates.push(VoiceUpdate::Streams(Vec::new()));
         if let Ok(mut frame) = frame.lock() {
             frame.take();
@@ -1026,6 +1137,9 @@ fn run(
                     Pending::Controls(controls, self_muted) => {
                         controller.controls = controls;
                         controller.self_muted = self_muted;
+                    }
+                    Pending::Output(output) => {
+                        controller.controls.output = output;
                     }
                     Pending::LocalMute(connection, muted) => {
                         controller.set_local_mute(&connection, muted);

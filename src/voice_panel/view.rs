@@ -70,7 +70,7 @@ impl VoicePanel {
             }))
     }
 
-    fn visible_streams(&self) -> Vec<Publication> {
+    pub(super) fn visible_streams(&self) -> Vec<Publication> {
         self.room_streams()
             .iter()
             .filter(|publication| publication.channel_id == self.room)

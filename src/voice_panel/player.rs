@@ -180,9 +180,14 @@ impl VoicePanel {
     }
 
     fn player_status_line(&self) -> String {
+        let error = if self.stream_audio_error.is_empty() {
+            &self.stream_error
+        } else {
+            &self.stream_audio_error
+        };
         voice_room::player_status(
             &self.stream_status,
-            &self.stream_error,
+            error,
             self.frame.is_some(),
             self.stream_connected,
         )

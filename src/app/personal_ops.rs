@@ -636,8 +636,12 @@ impl Voxhold {
                     #[cfg(feature = "voxhold-media")]
                     if let Some(voice) = &self.voice {
                         let prefs = self.voice_settings.prefs.clone();
+                        let output_selected = !input;
                         voice.update(cx, |panel, _| {
-                            panel.set_devices(Some(prefs.input), Some(prefs.output))
+                            panel.set_devices(Some(prefs.input), Some(prefs.output.clone()));
+                            if output_selected {
+                                panel.select_output(Some(prefs.output));
+                            }
                         });
                     }
                 }

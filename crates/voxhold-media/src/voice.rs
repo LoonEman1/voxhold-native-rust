@@ -25,7 +25,11 @@ use tokio::{
 
 use crate::{Candidate, Command, Controls, Event, Events, IceServer, video::VideoStore};
 
+mod output;
+use output::{OutputState, SwitchResult};
+
 const ICE_CAPACITY: usize = 64;
+const COMPLETED_UFRAG_CAPACITY: usize = 16;
 const SIGNAL_TIMEOUT: Duration = Duration::from_secs(8);
 const SPEAKING_THRESHOLD: f64 = 0.018;
 
@@ -64,13 +68,25 @@ impl CaptureGate {
         Self::apply(&state);
     }
 
-    /// A new media session starts closed until its own `voice.joined`.
-    pub fn reset(&self) {
+    /// A new transport starts unconfirmed without server permission. The leave
+    /// latch and local PTT decision belong to the handle, so a reconnect keeps
+    /// both and a late `Start` after `leave` can never reopen the microphone.
+    pub fn reset_transport(&self) {
         let mut state = self.0.lock().unwrap();
-        state.latched = false;
         state.joined = false;
         state.server_allowed = false;
-        state.local_allowed = false;
+        Self::apply(&state);
+    }
+
+    /// One transport ended. Clear only join/server permission and detach the
+    /// track; the local decision and leave latch belong to the handle.
+    pub fn end_transport(&self) {
+        let mut state = self.0.lock().unwrap();
+        state.joined = false;
+        state.server_allowed = false;
+        if let Some(track) = state.track.take() {
+            track.set_enabled(false);
+        }
         Self::apply(&state);
     }
 
@@ -179,7 +195,9 @@ impl PlatformAudio {
 
     /// Resolve a persisted device id to a current Core Audio index. The legacy
     /// WinMM UI stores `index:name`, so a unique name prefix is accepted; a GUID
-    /// from the engine is matched exactly.
+    /// from the engine is matched exactly. An empty id means the Windows
+    /// default endpoint, resolved to its current GUID rather than assuming
+    /// index 0 after a device-order change.
     fn resolve(&self, id: &str, input: bool) -> Option<u16> {
         let factory = &self.0;
         let count = if input {
@@ -202,7 +220,10 @@ impl PlatformAudio {
             }
         };
         if id.is_empty() {
-            return (count > 0).then_some(0);
+            let default = default_endpoint_guid(input);
+            return default
+                .and_then(|default| (0..count.max(0) as u16).find(|&index| guid(index) == default))
+                .or_else(|| (count > 0).then_some(0));
         }
         if let Some((_, old_name)) = id
             .split_once(':')
@@ -275,42 +296,63 @@ impl Drop for PlatformAudio {
     }
 }
 
+#[cfg(windows)]
+fn default_endpoint_guid(input: bool) -> Option<String> {
+    use windows::Win32::Media::Audio::{
+        IMMDeviceEnumerator, MMDeviceEnumerator, eCapture, eConsole, eRender,
+    };
+    use windows::Win32::System::Com::{
+        CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoTaskMemFree,
+        CoUninitialize,
+    };
+    unsafe {
+        let initialized = CoInitializeEx(None, COINIT_MULTITHREADED).is_ok();
+        let result = (|| -> windows::core::Result<String> {
+            let enumerator: IMMDeviceEnumerator =
+                CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
+            let flow = if input { eCapture } else { eRender };
+            let device = enumerator.GetDefaultAudioEndpoint(flow, eConsole)?;
+            let id = device.GetId()?;
+            let value = id.to_string().unwrap_or_default();
+            CoTaskMemFree(Some(id.0 as *const core::ffi::c_void));
+            Ok(value)
+        })();
+        if initialized {
+            CoUninitialize();
+        }
+        result.ok().filter(|value| !value.is_empty())
+    }
+}
+
+#[cfg(not(windows))]
+fn default_endpoint_guid(_input: bool) -> Option<String> {
+    None
+}
+
 struct Session {
     peer: PeerConnection,
     sender: Option<RtpSender>,
     viewer: Option<(Arc<VideoStore>, JoinHandle<()>)>,
     capture: Arc<CaptureGate>,
     audio: PlatformAudio,
-    /// Only the voice session owns the room output coefficient; the stream
-    /// player is a separate engine with its own mute.
-    control_playout_gain: bool,
     controls: Controls,
     volumes: HashMap<String, f64>,
     /// last effective coefficient applied per receiver.
     gains: HashMap<String, f64>,
-    /// Last room coefficient accepted by the process playout session and when
-    /// it was applied. A new WASAPI session is re-applied on the stats tick.
-    applied_playout_gain: Option<f64>,
-    playout_applied_at: Option<std::time::Instant>,
     speaking: HashMap<String, bool>,
     local_speaking: bool,
     remote_sdp: Option<RemoteSdp>,
-    last_ufrags: Vec<String>,
+    /// ICE generations already replaced by a newer remote description. Kept
+    /// bounded so a late candidate from an old restart is discarded.
+    completed_ufrags: Vec<String>,
     pending_ice: VecDeque<Candidate>,
     input_index: Option<u16>,
     output_index: Option<u16>,
     /// The id of the device that is actually open, not merely selected. A
     /// hot-unplugged device index can be reused by another device.
     input_opened: Option<String>,
-    output_opened: Option<String>,
+    output: OutputState,
     device_check: std::time::Instant,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct SwitchResult {
-    switched: bool,
-    /// Whether the previous (or default) path was restored after a failure.
-    audible: bool,
 }
 
 impl Session {
@@ -322,14 +364,12 @@ impl Session {
         capture: Arc<CaptureGate>,
         viewer: Option<Arc<VideoStore>>,
     ) -> Result<Self, &'static str> {
-        let control_playout_gain = viewer.is_none();
-        let audio = PlatformAudio::new(control_playout_gain)?;
+        let audio = PlatformAudio::new(viewer.is_none())?;
         // A saved device that is gone at join time must not fail the call:
         // keep the default path and report it once.
         let mut input_index = None;
         let mut output_index = None;
         let mut input_opened = None;
-        let mut output_opened = None;
         if let Some(id) = controls.input.clone().filter(|id| !id.is_empty()) {
             if let Some(index) = audio
                 .resolve(&id, true)
@@ -351,14 +391,22 @@ impl Session {
                 .filter(|index| audio.activate(*index, false))
             {
                 output_index = Some(index);
-                output_opened = Some(id);
             } else {
                 controls.output = None;
                 events.push(Event::DeviceError {
                     message: "Выбранное устройство воспроизведения недоступно, используется системное.",
                 });
+                events.push(Event::Output {
+                    applied: None,
+                    audible: true,
+                    working: true,
+                    error: Some(
+                        "Выбранное устройство воспроизведения недоступно, используется системное.",
+                    ),
+                });
             }
         }
+        let output = OutputState::new(controls.output.clone());
         let factory = &audio.0;
         let mut config = RtcConfiguration::default();
         config.ice_transport_type = match transport_policy {
@@ -436,21 +484,18 @@ impl Session {
             viewer,
             capture,
             audio,
-            control_playout_gain,
             controls,
             volumes: HashMap::new(),
             gains: HashMap::new(),
-            applied_playout_gain: None,
-            playout_applied_at: None,
             speaking: HashMap::new(),
             local_speaking: false,
             remote_sdp: None,
-            last_ufrags: Vec::new(),
+            completed_ufrags: Vec::new(),
             pending_ice: VecDeque::new(),
             input_index,
             output_index,
             input_opened,
-            output_opened,
+            output,
             device_check: std::time::Instant::now(),
         };
         session.apply_audio_controls();
@@ -487,32 +532,38 @@ impl Session {
                 Ok(())
             }
             Command::ViewOutput { output } => {
-                if self.controls.output == output {
+                if !self.output.needs_switch(&output) {
                     return Ok(());
                 }
-                let result = match output {
-                    Some(id) if !id.is_empty() => {
-                        let result = self.switch_device(&id, false);
-                        if result.switched {
-                            self.controls.output = Some(id);
-                        }
-                        result
-                    }
-                    _ => {
-                        let result = self.switch_device("", false);
-                        if result.switched {
-                            self.controls.output = None;
-                        }
-                        result
-                    }
+                // The preference is recorded even when the switch fails. The
+                // applied endpoint and working flag stay separate, so a later
+                // repeat of the same device still starts the path again.
+                self.output.request(output.clone());
+                self.controls.output = output.clone();
+                let result = match &output {
+                    Some(id) if !id.is_empty() => self.switch_device(id, false),
+                    _ => self.switch_device("", false),
                 };
-                if result.switched {
-                    Ok(())
-                } else if result.audible {
-                    Err("Не удалось переключить устройство воспроизведения, прежнее работает.")
+                if result.switched || result.audible {
+                    self.output.confirmed(result.applied.clone());
                 } else {
-                    Err("Не удалось переключить звук и восстановить прежнее устройство.")
+                    self.output.failed();
+                    self.output_index = None;
                 }
+                let error = if result.switched {
+                    None
+                } else if result.audible {
+                    Some("Не удалось переключить устройство воспроизведения, прежнее работает.")
+                } else {
+                    Some("Не удалось переключить звук и восстановить прежнее устройство.")
+                };
+                events.push(Event::Output {
+                    applied: result.applied,
+                    audible: result.audible,
+                    working: result.switched || result.audible,
+                    error,
+                });
+                Ok(())
             }
             Command::Volume { track_id, gain } => {
                 if self.volumes.len() < 64 || self.volumes.contains_key(&track_id) {
@@ -532,9 +583,13 @@ impl Session {
     fn update_controls(&mut self, controls: Controls, events: &Events) -> Result<(), &'static str> {
         let deafen_changed = self.controls.deafened != controls.deafened;
         let gain_changed = self.controls.output_gain != controls.output_gain;
+        let requested_output = controls.output.clone();
+        let output_needs_switch = self.output.needs_switch(&requested_output);
         self.controls.muted = controls.muted;
         self.controls.deafened = controls.deafened;
         self.controls.output_gain = controls.output_gain;
+        self.output.request(requested_output.clone());
+        self.controls.output = requested_output.clone();
         if let Some(bitrate) = controls
             .bitrate_kbps
             .filter(|value| Some(*value) != self.controls.bitrate_kbps)
@@ -562,14 +617,18 @@ impl Session {
                 });
             }
         }
-        if let Some(output) = controls
-            .output
-            .filter(|id| self.controls.output.as_ref() != Some(id))
-        {
-            let result = self.switch_device(&output, false);
-            if result.switched {
-                self.controls.output = Some(output);
+        if output_needs_switch {
+            let result = match requested_output.as_deref() {
+                Some(id) if !id.is_empty() => self.switch_device(id, false),
+                _ => self.switch_device("", false),
+            };
+            if result.switched || result.audible {
+                self.output.confirmed(result.applied.clone());
             } else {
+                self.output.failed();
+                self.output_index = None;
+            }
+            if !result.switched {
                 events.push(Event::DeviceError {
                     message: if result.audible {
                         "Не удалось переключить устройство воспроизведения, прежнее работает."
@@ -583,10 +642,16 @@ impl Session {
     }
 
     fn switch_device(&mut self, id: &str, input: bool) -> SwitchResult {
+        let opened_id = if input {
+            self.input_opened.clone()
+        } else {
+            self.output.applied.clone()
+        };
         let Some(index) = self.audio.resolve(id, input) else {
             return SwitchResult {
                 switched: false,
                 audible: self.audio.running(input),
+                applied: opened_id,
             };
         };
         let previous = if input {
@@ -594,107 +659,60 @@ impl Session {
         } else {
             self.output_index
         };
-        let running = self.audio.running(input);
-        let opened = if input {
-            self.input_opened.as_deref()
-        } else {
-            self.output_opened.as_deref()
-        };
+        // A completed rollback may have stopped the old path. The next switch
+        // must start playout again even though Core Audio reports it stopped.
+        let running = self.audio.running(input) || (!input && !self.output.working);
         // The index alone is not identity: after an unplug the same numeric
-        // index can belong to another device, and the system default is often
-        // index 0. Re-apply unless the same opened id is requested.
+        // index can belong to another device, and the system default is
+        // resolved from Windows, not fixed at index 0. Re-apply unless the same
+        // opened id is requested and that path is still known to work.
         let same_device = if id.is_empty() {
-            opened.is_none()
+            opened_id.is_none()
         } else {
-            opened == Some(id)
+            opened_id.as_deref() == Some(id)
         };
-        if previous == Some(index) && same_device {
+        let confirmed = input || self.output.working;
+        if previous == Some(index) && same_device && confirmed {
             return SwitchResult {
                 switched: true,
                 audible: running,
+                applied: opened_id,
             };
         }
         if self.audio.apply(index, input, running) {
+            let applied = (!id.is_empty()).then(|| id.to_owned());
             if input {
                 self.input_index = Some(index);
-                self.input_opened = (!id.is_empty()).then(|| id.to_owned());
+                self.input_opened = applied.clone();
             } else {
                 self.output_index = Some(index);
-                self.output_opened = (!id.is_empty()).then(|| id.to_owned());
             }
             return SwitchResult {
                 switched: true,
                 audible: running,
+                applied,
             };
         }
-        // Restore the previous device, or the system default when nothing was
-        // selected. A successful set is not enough: the previous running state
-        // must start again, otherwise the call stays silent.
-        let fallback = previous.unwrap_or(0);
-        let audible = self.audio.apply(fallback, input, running);
-        if audible {
+        // Restore the previous device by its GUID/name, not the saved numeric
+        // index: after re-enumeration that index may belong to another device.
+        // Empty means the fresh Windows default endpoint.
+        let fallback_id = opened_id.as_deref().unwrap_or("");
+        let fallback = self
+            .audio
+            .resolve(fallback_id, input)
+            .filter(|index| self.audio.apply(*index, input, running));
+        let audible = fallback.is_some();
+        if let Some(index) = fallback {
             if input {
-                self.input_index = Some(fallback);
+                self.input_index = Some(index);
             } else {
-                self.output_index = Some(fallback);
+                self.output_index = Some(index);
             }
         }
         SwitchResult {
             switched: false,
             audible,
-        }
-    }
-
-    /// A hot-unplugged device cannot be reported by WebRTC; poll the Core
-    /// Audio list once a second and fall back to the default path.
-    fn check_devices(&mut self, events: &Events) {
-        if self.device_check.elapsed() < Duration::from_secs(1) {
-            return;
-        }
-        self.device_check = std::time::Instant::now();
-        for input in [true, false] {
-            let selected = if input {
-                self.input_opened.as_deref()
-            } else {
-                self.output_opened.as_deref()
-            };
-            let Some(id) = selected.filter(|id| !id.is_empty()) else {
-                continue;
-            };
-            if self.audio.resolve(id, input).is_some() {
-                continue;
-            }
-            // The old index may now point at another device. Resolve the
-            // system default from scratch instead of reusing it.
-            let result = self.switch_device("", input);
-            if result.switched {
-                if input {
-                    self.controls.input = None;
-                } else {
-                    self.controls.output = None;
-                }
-                events.push(Event::DeviceError {
-                    message: if input {
-                        "Микрофон отключён, используется системный."
-                    } else {
-                        "Устройство воспроизведения отключено, используется системное."
-                    },
-                });
-            } else {
-                events.push(Event::DeviceError {
-                    message: if result.audible {
-                        if input {
-                            "Микрофон отключён, прежний путь восстановлен."
-                        } else {
-                            "Устройство воспроизведения отключено, прежний путь восстановлен."
-                        }
-                    } else if input {
-                        "Микрофон отключён, звук не восстановлен."
-                    } else {
-                        "Устройство воспроизведения отключено, звук не восстановлен."
-                    },
-                });
-            }
+            applied: audible.then_some(opened_id.clone()).flatten(),
         }
     }
 
@@ -714,23 +732,21 @@ impl Session {
 
     fn apply_audio_controls(&mut self) {
         let master = if self.controls.deafened { 0.0 } else { 1.0 };
-        if self.control_playout_gain {
-            let room = self.controls.output_gain.unwrap_or(1.0).clamp(0.0, 2.0);
-            if crate::playout_volume::set_process_gain(room * master) {
-                self.applied_playout_gain = Some(room * master);
-                self.playout_applied_at = Some(std::time::Instant::now());
-            }
-        }
+        // The pinned libwebrtc wrapper exposes no PCM render callback or
+        // per-track volume, so the numeric 0–200 % room coefficient cannot yet
+        // be applied without touching the Windows process mixer (forbidden).
+        // Zero still silences the room immediately; the full gain path belongs
+        // to the R07b audio pipeline. Stream audio has its own engine and mute.
+        let room_audible = self.controls.output_gain.unwrap_or(1.0) > 0.0;
         self.gains.clear();
         for receiver in self.peer.receivers() {
             if let Some(MediaStreamTrack::Audio(track)) = receiver.track() {
                 let id = track.id();
-                // Keep the numeric coefficient: 1 %, 50 %, 100 % and 200 %
-                // are distinct settings, not a boolean "audible" flag. Zero
-                // disables the track so a mute is immediate.
+                // Keep the numeric coefficient for the future PCM path: 1 %,
+                // 50 %, 100 % and 200 % are distinct settings, not a boolean.
                 let gain = (self.volumes.get(&id).copied().unwrap_or(1.0) * master).clamp(0.0, 2.0);
                 self.gains.insert(id, gain);
-                track.set_enabled(gain > 0.0);
+                track.set_enabled(room_audible && gain > 0.0);
             }
         }
     }
@@ -742,11 +758,6 @@ impl Session {
         self.gains.get(track_id).copied().unwrap_or(1.0)
     }
 
-    #[cfg(test)]
-    fn test_gain_for_track(&self, track_id: &str) -> f64 {
-        self.gain_for_track(track_id)
-    }
-
     async fn answer(&mut self, sdp: &str, events: &Events) -> Result<(), &'static str> {
         let offer = SessionDescription::parse(sdp, SdpType::Offer)
             .map_err(|_| "Сервер прислал некорректное предложение WebRTC.")?;
@@ -756,7 +767,19 @@ impl Session {
             .map_err(|_| "Не удалось применить предложение WebRTC.")?;
         let remote = RemoteSdp::new(sdp);
         if let Some(old) = self.remote_sdp.replace(remote) {
-            self.last_ufrags = old.ufrags;
+            for ufrag in old.ufrags {
+                let current = self
+                    .remote_sdp
+                    .as_ref()
+                    .is_some_and(|remote| remote.ufrags.iter().any(|value| value == &ufrag));
+                if !current && !self.completed_ufrags.iter().any(|value| value == &ufrag) {
+                    self.completed_ufrags.push(ufrag);
+                }
+            }
+            if self.completed_ufrags.len() > COMPLETED_UFRAG_CAPACITY {
+                let excess = self.completed_ufrags.len() - COMPLETED_UFRAG_CAPACITY;
+                self.completed_ufrags.drain(..excess);
+            }
         }
         let answer = self
             .peer
@@ -789,9 +812,11 @@ impl Session {
     }
 
     fn is_old_candidate(&self, candidate: &Candidate) -> bool {
-        candidate
-            .ufrag()
-            .is_some_and(|ufrag| self.last_ufrags.iter().any(|old| old == ufrag))
+        candidate.ufrag().is_some_and(|ufrag| {
+            self.completed_ufrags
+                .iter()
+                .any(|old| old.as_str() == ufrag)
+        })
     }
 
     async fn add_candidate(&self, candidate: Candidate) {
@@ -803,25 +828,6 @@ impl Session {
     }
 
     async fn sample_levels(&mut self, events: &Events) {
-        // A new WASAPI session may appear after the first control command.
-        // Re-apply the room coefficient until the endpoint accepts it, then
-        // refresh periodically in case the session was recreated.
-        if self.control_playout_gain {
-            let room = if self.controls.deafened {
-                0.0
-            } else {
-                self.controls.output_gain.unwrap_or(1.0).clamp(0.0, 2.0)
-            };
-            let stale = self
-                .playout_applied_at
-                .is_none_or(|at| at.elapsed() >= Duration::from_secs(2));
-            if self.applied_playout_gain != Some(room) || stale {
-                if crate::playout_volume::set_process_gain(room) {
-                    self.applied_playout_gain = Some(room);
-                    self.playout_applied_at = Some(std::time::Instant::now());
-                }
-            }
-        }
         if self.peer.connection_state() != PeerConnectionState::Connected {
             return;
         }
@@ -875,10 +881,6 @@ impl Session {
 
 impl Drop for Session {
     fn drop(&mut self) {
-        if self.control_playout_gain {
-            // Do not leave the process audio session scaled after the call.
-            crate::playout_volume::set_process_gain(1.0);
-        }
         if let Some((video, task)) = self.viewer.take() {
             task.abort();
             video.clear();
@@ -935,53 +937,4 @@ fn candidate_ufrag(candidate: &str) -> Option<&str> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use libwebrtc::{MediaType, rtp_sender::VideoEncoderBackend, video_codec::VideoCodec};
-
-    #[test]
-    fn installed_webrtc_build_has_voxhold_web_codecs() {
-        let factory = PeerConnectionFactory::default();
-        let video = factory.video_encoder_codecs(VideoEncoderBackend::Auto);
-        let receive_video = factory.get_rtp_receiver_capabilities(MediaType::Video);
-        for (codec, name) in [
-            (VideoCodec::VP8, "VP8"),
-            (VideoCodec::VP9, "VP9"),
-            (VideoCodec::H264, "H264"),
-            (VideoCodec::AV1, "AV1"),
-        ] {
-            assert!(video.contains(&codec), "no {name} encoder: {video:?}");
-            let mime = format!("video/{name}");
-            assert!(
-                receive_video
-                    .codecs
-                    .iter()
-                    .any(|codec| codec.mime_type.eq_ignore_ascii_case(&mime)),
-                "no {name} decoder"
-            );
-        }
-        for capabilities in [
-            factory.get_rtp_sender_capabilities(MediaType::Audio),
-            factory.get_rtp_receiver_capabilities(MediaType::Audio),
-        ] {
-            assert!(capabilities.codecs.iter().any(|codec| {
-                codec.mime_type.eq_ignore_ascii_case("audio/opus")
-                    && codec.clock_rate == Some(48_000)
-            }));
-        }
-    }
-
-    #[test]
-    fn trickle_ice_is_matched_to_the_offer_generation() {
-        let mut candidate = Candidate {
-            candidate: "candidate:1 1 udp 1 127.0.0.1 9999 typ host ufrag old".into(),
-            sdp_mid: Some("0".into()),
-            sdp_mline_index: Some(0),
-            username_fragment: None,
-        };
-        let offer = RemoteSdp::new("v=0\r\na=ice-ufrag:new\r\n");
-        assert!(!offer.accepts(&candidate));
-        candidate.username_fragment = Some("new".into());
-        assert!(offer.accepts(&candidate));
-    }
-}
+mod tests;

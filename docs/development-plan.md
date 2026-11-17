@@ -1110,9 +1110,13 @@ frontend `ed7cb00ae12398753a8ef48a5a33b864e20cb04c` и Go
 - `controller.rs`, `voice.rs`: join attempt, server mute, roster по
   `connection_id`, `connections_with_audio` для локального mute; смена
   устройства сначала поднимает новый тракт, при отказе восстанавливает
-  прежний индекс и отдаёт `Event::DeviceError`; раз в секунду проверяется
-  hot-unplug и выполняется fallback; output gain из настроек применяется к
-  трекам комнаты, локальный mute всё равно даёт 0.
+  прежний GUID/имя и отдаёт `Event::DeviceError`; default-resolve идёт через
+  Windows endpoint, а не индекс 0; раз в секунду проверяется hot-unplug и
+  выполняется fallback. Local принадлежит `VoiceHandle`, join/server mute —
+  worker; `State` не перезаписывает local. Drop старого `Media` закрывает
+  только транспорт, а защёлку ставит `VoiceHandle::leave`; выбранный выход
+  отделён от применённого; отказ, unplug и явный выбор идут через Session.
+  Громкость 0–200 % ждёт PCM `R07b`; микшер Windows не меняется, 0 %/deafen закрывают треки.
 - `video.rs`: libyuv пишет BGRA напрямую (`I420ToARGB` на little-endian), UI
   больше не меняет каналы на каждый пиксель; синтетический I420 с
   известными красным/синим проверяет порядок каналов, отсутствие
@@ -1132,17 +1136,28 @@ frontend `ed7cb00ae12398753a8ef48a5a33b864e20cb04c` и Go
   публикаций из account WS, PTT по сохранённой клавише с release на key-up,
   потере фокуса, модалке и уходе из комнаты; hotkey mute/deafen; устройства,
   качество и громкость из вкладки «Голос и звук» доходят до живого тракта.
+  Подтверждение каналов после `select_server` и ACL-reload идёт через один
+  переход: снимает `voice_unconfirmed`, чистит закрытые комнаты и
+  синхронизирует панель; активная комната скрывает roster/streams, пока ACL
+  не подтверждён. Потеря WS до `voice.joined` публикует восстановление для
+  текущего выбора, а `Ended` закрывает плеер через путь с `Window` и
+  возвращает обычный режим, если fullscreen включал сам плеер.
 - Регрессии: детерминированный A→B→C, `stream.stopped(A)` при B, повторная
   публикация с новым `connection_id`, закрытый звонок/`request_id`/stale
   ICE/reconnect/revoke, leave-timeout, snapshot/event/stop/re-entry, границы
-  `Requests`/`Updates`, синтетические BGRA/ориентация/scale, GPUI
-  Tab/Shift+Tab, Esc/F, press/release PTT, блокировка модалкой, dock и
-  реальные координаты карточек/плеера.
-
+  `Requests`/`Updates`, BGRA/ориентация/scale, GPUI Tab/Shift+Tab, Esc/F,
+  PTT, модалка, dock и координаты. Добавлены PTT/State, drop Media и leave,
+  Watch(B)→Close(B), tagged offer/close, P2P, ICE до SDP, reconnect до join,
+  полный отказ и unplug выхода, ACL-скрытие и revoke в fullscreen.
+- Wire: `stream.watch` несёт `watch_id`; клиент строго проверяет метку, если
+  backend её прислал. Закреплённый backend не размечает push offer/ICE/close:
+  первый немаркированный close после смены попытки игнорируется, а offer с
+  неизвестным ufrag неотличим от ICE-поколения. Строгая гарантия требует id
+  просмотра на каждом сигнале и буферизации ранних сигналов до ACK.
 Проверки: `cargo fmt --all -- --check`, `cargo test --workspace --locked`
-(292 теста приложения: 292 passed, 1 `ignored`; 11 API; 32 media),
+(296 тестов приложения: 296 passed, 1 `ignored`; 11 API; 54 media),
 `cargo build --release --locked -p voxhold-native-rust`,
-`scripts/check-file-sizes.ps1` (169 файлов), `git diff --check`, smoke
+`scripts/check-file-sizes.ps1` (170 файлов), `git diff --check`, smoke
 release (процесс активен через 5 с).
 
 Не проверено: живой backend/два клиента, реальный SFU/P2P с Chromium,

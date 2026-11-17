@@ -11,7 +11,7 @@ use crate::catalog::StreamCatalog;
 use crate::controller::{Publication, Signal};
 use serde_json::{Value, json};
 use std::{
-    collections::HashSet,
+    collections::{HashSet, VecDeque},
     time::{Duration, Instant},
 };
 
@@ -24,6 +24,10 @@ pub const MAX_RETRIES: u8 = 2;
 /// A close from the attempt we just left can arrive late. Until the new
 /// attempt has produced a signal of its own, one untagged close is ignored.
 const STALE_CLOSE_GRACE: Duration = Duration::from_secs(5);
+/// Completed ICE generations are remembered long enough to reject stragglers,
+/// but the set stays bounded across a long viewing session.
+const RETIRED_UFRAG_TTL: Duration = Duration::from_secs(600);
+const RETIRED_UFRAG_CAPACITY: usize = 64;
 
 #[derive(Clone, Debug)]
 struct Intent {
@@ -116,7 +120,7 @@ pub struct Viewer {
     /// cannot end the new one before it has its own signaling.
     stale_close_until: Option<Instant>,
     stale_close_available: bool,
-    retired_ufrags: HashSet<String>,
+    retired_ufrags: VecDeque<(String, Instant)>,
 }
 
 impl Viewer {
@@ -136,7 +140,7 @@ impl Viewer {
             sequence: 0,
             stale_close_until: None,
             stale_close_available: false,
-            retired_ufrags: HashSet::new(),
+            retired_ufrags: VecDeque::new(),
         }
     }
 
@@ -175,37 +179,45 @@ impl Viewer {
     /// and leave request are gone; the selected publication stays and is
     /// watched again only after both a fresh snapshot and the join confirm.
     pub fn set_joined(&mut self, joined: bool, now: Instant) -> Vec<Outcome> {
+        if !joined {
+            return self.transport_ended(now);
+        }
         if self.joined == joined {
             return Vec::new();
         }
         self.joined = joined;
-        if !joined {
-            self.pending_leave = None;
-            self.deadline = None;
-            self.snapshot_ready = false;
-            self.retired_ufrags.clear();
-            self.catalog.replace(std::iter::empty());
-            let mut out = Vec::new();
-            if let Some(active) = self.active.take() {
-                self.retire(&active);
-                out.push(Outcome::Close);
-            }
-            if let Some(intent) = &self.intent {
-                out.push(Outcome::Status {
-                    selection: intent.selection,
-                    text: "Восстанавливаем трансляцию…".into(),
-                });
-                out.push(Outcome::Connected {
-                    selection: intent.selection,
-                    connected: false,
-                });
-            }
-            return out;
-        }
         if self.snapshot_ready {
             return self.start_if_ready(now);
         }
         Vec::new()
+    }
+
+    /// End of one WebSocket session, even before `voice.joined`. The fresh
+    /// snapshot is no longer authoritative and the panel must show recovery
+    /// for the retained selection while the last decoded frame stays visible.
+    pub fn transport_ended(&mut self, now: Instant) -> Vec<Outcome> {
+        self.joined = false;
+        self.pending_leave = None;
+        self.deadline = None;
+        self.snapshot_ready = false;
+        self.retired_ufrags.clear();
+        self.catalog.replace(std::iter::empty());
+        let mut out = Vec::new();
+        if let Some(active) = self.active.take() {
+            self.retire(&active, now);
+            out.push(Outcome::Close);
+        }
+        if let Some(intent) = &self.intent {
+            out.push(Outcome::Status {
+                selection: intent.selection,
+                text: "Восстанавливаем трансляцию…".into(),
+            });
+            out.push(Outcome::Connected {
+                selection: intent.selection,
+                connected: false,
+            });
+        }
+        out
     }
 
     /// The user picked a publication. The previous attempt is closed and left,
@@ -269,28 +281,31 @@ impl Viewer {
     }
 
     /// Close only the attempt that the command names. A delayed close for A
-    /// must not end B after the user has already selected it.
+    /// must not end B after the user has already selected it. A close newer
+    /// than the current view still closes the picture that is actually
+    /// running, because an intermediate watch may have been displaced.
     pub fn leave_selection(&mut self, selection: u64, now: Instant) -> Vec<Outcome> {
-        let matches = self.selection() == Some(selection)
-            || self
-                .active
-                .as_ref()
-                .is_some_and(|active| active.selection == selection);
-        if !matches {
+        let current = self
+            .selection()
+            .or_else(|| self.active.as_ref().map(|active| active.selection));
+        if current.is_some_and(|current| selection < current) {
             return Vec::new();
         }
-        self.leave(now)
+        self.leave_with(Some(selection), now)
     }
 
     /// The user closed the player. Voice stays joined.
     pub fn leave(&mut self, now: Instant) -> Vec<Outcome> {
-        let selection = self.selection();
+        self.leave_with(self.selection(), now)
+    }
+
+    fn leave_with(&mut self, clear_selection: Option<u64>, now: Instant) -> Vec<Outcome> {
         if self.intent.is_none() && self.active.is_none() {
             return Vec::new();
         }
         self.intent = None;
         let mut out = self.close_active(now);
-        if let Some(selection) = selection {
+        if let Some(selection) = clear_selection {
             out.push(Outcome::Clear { selection });
         }
         out
@@ -356,9 +371,11 @@ impl Viewer {
                 out
             }
             "stream.watching" => self.on_watching(request_id, data, now),
-            "stream.webrtc_offer" | "stream.p2p_offer" => self.on_offer(kind, request_id, data),
+            "stream.webrtc_offer" | "stream.p2p_offer" => {
+                self.on_offer(kind, request_id, data, now)
+            }
             "stream.ice_candidate" | "stream.p2p_ice_candidate" => {
-                self.on_ice_event(kind, request_id, data)
+                self.on_ice_event(kind, request_id, data, now)
             }
             "stream.left" => {
                 if self
@@ -452,7 +469,9 @@ impl Viewer {
         let Some(active) = &self.active else {
             return Vec::new();
         };
-        if request_id != active.watch_request {
+        if explicit_watch_tag(request_id, data) != Some(active.watch_request.as_str())
+            || !watch_tags_match(request_id, data, &active.watch_request)
+        {
             return Vec::new();
         }
         let Ok(publication) = serde_json::from_value::<Publication>(data["stream"].clone()) else {
@@ -463,11 +482,10 @@ impl Viewer {
         }
         if let Some(active) = &mut self.active {
             active.publication = publication.clone();
-            // The new attempt now has its own server confirmation. A close
-            // from the attempt we left can no longer be mistaken for this one.
-            active.received_signal = true;
-            self.stale_close_until = None;
-            self.stale_close_available = false;
+            // The ACK does not attribute later untagged pushes. Leave
+            // `received_signal` false until an offer/ICE/frame belongs to this
+            // attempt, so the first ambiguous close after a switch stays
+            // ignored.
         }
         if let Some(intent) = &mut self.intent {
             intent.publication = publication.clone();
@@ -480,11 +498,19 @@ impl Viewer {
         }
     }
 
-    fn on_offer(&mut self, kind: &str, request_id: &str, data: &Value) -> Vec<Outcome> {
+    fn on_offer(
+        &mut self,
+        kind: &str,
+        request_id: &str,
+        data: &Value,
+        now: Instant,
+    ) -> Vec<Outcome> {
         let Some(active) = &self.active else {
             return Vec::new();
         };
-        if !request_matches(request_id, &active.watch_request) {
+        if explicit_watch_tag(request_id, data).is_some()
+            && !watch_tags_match(request_id, data, &active.watch_request)
+        {
             return Vec::new();
         }
         let p2p = kind == "stream.p2p_offer";
@@ -502,12 +528,18 @@ impl Viewer {
             return Vec::new();
         }
         let ufrags = sdp_ufrags(sdp);
-        if !ufrags.is_empty()
-            && ufrags
-                .iter()
-                .all(|ufrag| self.retired_ufrags.contains(ufrag))
-        {
+        if !ufrags.is_empty() && ufrags.iter().all(|ufrag| self.retired(now, ufrag)) {
             return Vec::new();
+        }
+        let previous = self
+            .active
+            .as_mut()
+            .map(|active| std::mem::take(&mut active.remote_ufrags))
+            .unwrap_or_default();
+        for ufrag in previous {
+            if !ufrags.contains(&ufrag) {
+                self.retire_ufrag(ufrag, now);
+            }
         }
         if let Some(active) = &mut self.active {
             active.remote_ufrags = ufrags;
@@ -518,11 +550,19 @@ impl Viewer {
         vec![Outcome::Offer(sdp.to_owned())]
     }
 
-    fn on_ice_event(&mut self, kind: &str, request_id: &str, data: &Value) -> Vec<Outcome> {
+    fn on_ice_event(
+        &mut self,
+        kind: &str,
+        request_id: &str,
+        data: &Value,
+        now: Instant,
+    ) -> Vec<Outcome> {
         let Some(active) = &self.active else {
             return Vec::new();
         };
-        if !request_matches(request_id, &active.watch_request) {
+        if explicit_watch_tag(request_id, data).is_some()
+            && !watch_tags_match(request_id, data, &active.watch_request)
+        {
             return Vec::new();
         }
         let p2p = kind == "stream.p2p_ice_candidate";
@@ -549,14 +589,13 @@ impl Viewer {
             .as_deref()
             .or_else(|| candidate_ufrag(&candidate.candidate));
         if let Some(ufrag) = ufrag {
-            if self.retired_ufrags.contains(ufrag) {
+            if self.retired(now, ufrag) {
                 return Vec::new();
             }
-            if !active.remote_ufrags.is_empty()
-                && !active.remote_ufrags.iter().any(|current| current == ufrag)
-            {
-                return Vec::new();
-            }
+            // An unknown next generation is not stale: Pion may emit the first
+            // ICE candidate after SetLocalDescription but before the restarted
+            // offer reaches this client. The engine keeps it in its bounded
+            // pending buffer until an offer with that ufrag is accepted.
         }
         let Some(active) = &mut self.active else {
             return Vec::new();
@@ -571,20 +610,12 @@ impl Viewer {
         let Some(active) = &self.active else {
             return Vec::new();
         };
-        // A backend that can attribute the close is always trusted. Older
-        // payloads have no attempt id, so one close immediately after our own
-        // leave is treated as the tail of the previous attempt until the new
-        // one has its own offer or watching acknowledgement.
-        let tagged = data["watch_id"]
-            .as_str()
-            .or_else(|| data["request_id"].as_str())
-            .or_else(|| data["publisher_connection_id"].as_str())
-            .or_else(|| data["from_connection_id"].as_str());
-        let tagged = tagged.filter(|value| !value.is_empty());
-        if let Some(tag) = tagged {
+        // A tag that identifies the watch is authoritative. Publisher and
+        // sender ids are not watch ids: a repeated P2P view of the same
+        // publisher has the same `from_connection_id` but a new attempt.
+        if let Some(tag) = explicit_watch_tag(request_id, data) {
             if tag != active.watch_request
-                && tag != active.publication.publisher_connection_id
-                && request_id != active.watch_request
+                || !watch_tags_match(request_id, data, &active.watch_request)
             {
                 return Vec::new();
             }
@@ -594,6 +625,9 @@ impl Viewer {
                 .stale_close_until
                 .is_some_and(|deadline| now < deadline)
         {
+            // The pinned backend does not tag pushed closes. One untagged close
+            // immediately after a switch is ambiguous; keep the new attempt and
+            // document that a strict attribution needs the backend watch id.
             self.stale_close_available = false;
             return Vec::new();
         }
@@ -669,6 +703,8 @@ impl Viewer {
         active.recovering = false;
         active.received_signal = true;
         self.deadline = None;
+        self.stale_close_until = None;
+        self.stale_close_available = false;
         let selection = active.selection;
         vec![
             Outcome::Status {
@@ -809,7 +845,7 @@ impl Viewer {
     fn start(&mut self, intent: Intent, publication: Publication, now: Instant) -> Vec<Outcome> {
         let selection = intent.selection;
         let muted = intent.muted;
-        let request = self.signal(
+        let mut request = self.signal(
             "stream.watch",
             json!({
                 "server_id": publication.server_id,
@@ -819,6 +855,10 @@ impl Viewer {
             }),
         );
         let watch_request = request.request_id.clone().unwrap_or_default();
+        // Give a compatible backend the attempt id it must echo on every
+        // offer/ICE/close. The pinned backend ignores the field, so the client
+        // keeps the compatibility heuristics documented in docs/status.md.
+        request.data["watch_id"] = json!(watch_request);
         self.active = Some(Active {
             selection,
             attempt: intent.attempt,
@@ -856,7 +896,7 @@ impl Viewer {
     fn close_active(&mut self, now: Instant) -> Vec<Outcome> {
         let mut out = Vec::new();
         if let Some(active) = self.active.take() {
-            self.retire(&active);
+            self.retire(&active, now);
             out.push(Outcome::Close);
             self.stale_close_until = Some(now + STALE_CLOSE_GRACE);
             self.stale_close_available = true;
@@ -866,10 +906,24 @@ impl Viewer {
         out
     }
 
-    fn retire(&mut self, active: &Active) {
+    fn retire(&mut self, active: &Active, now: Instant) {
         for ufrag in &active.remote_ufrags {
-            self.retired_ufrags.insert(ufrag.clone());
+            self.retire_ufrag(ufrag.clone(), now);
         }
+    }
+
+    fn retire_ufrag(&mut self, ufrag: String, now: Instant) {
+        self.retired_ufrags.retain(|(value, _)| value != &ufrag);
+        self.retired_ufrags.push_back((ufrag, now));
+        while self.retired_ufrags.len() > RETIRED_UFRAG_CAPACITY {
+            self.retired_ufrags.pop_front();
+        }
+    }
+
+    fn retired(&self, now: Instant, ufrag: &str) -> bool {
+        self.retired_ufrags
+            .iter()
+            .any(|(value, at)| value == ufrag && now.duration_since(*at) < RETIRED_UFRAG_TTL)
     }
 
     fn request_leave(&mut self, now: Instant) -> Vec<Outcome> {
@@ -934,10 +988,33 @@ pub fn same_identity(left: &Publication, right: &Publication) -> bool {
         && left.publisher_connection_id == right.publisher_connection_id
 }
 
-/// An empty id means the older backend could not attribute the event; a
-/// non-empty id must exactly match this attempt.
-fn request_matches(request_id: &str, watch_request: &str) -> bool {
-    request_id.is_empty() || request_id == watch_request
+/// A push event may carry an explicit watch id either inside its data or as
+/// the top-level request id. Publisher connection ids are deliberately not
+/// accepted: they identify a publisher, not one viewing attempt.
+fn explicit_watch_tag<'a>(request_id: &'a str, data: &'a Value) -> Option<&'a str> {
+    data.get("watch_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            data.get("request_id")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+        })
+        .or_else(|| (!request_id.is_empty()).then_some(request_id))
+}
+
+/// Every tag that is present must name the current attempt. A conflicting old
+/// top-level id cannot be hidden by an empty `data`.
+fn watch_tags_match(request_id: &str, data: &Value, watch_request: &str) -> bool {
+    let tags = [
+        data.get("watch_id").and_then(Value::as_str),
+        data.get("request_id").and_then(Value::as_str),
+        (!request_id.is_empty()).then_some(request_id),
+    ];
+    tags.into_iter()
+        .flatten()
+        .filter(|value| !value.is_empty())
+        .all(|tag| tag == watch_request)
 }
 
 fn sdp_ufrags(sdp: &str) -> Vec<String> {

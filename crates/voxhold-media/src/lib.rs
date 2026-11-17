@@ -1,6 +1,5 @@
 pub mod catalog;
 pub mod controller;
-mod playout_volume;
 mod video;
 pub mod viewer;
 mod voice;
@@ -113,6 +112,18 @@ pub enum Event {
     DeviceError {
         message: &'static str,
     },
+    /// Result of a stream-player output switch. `applied` is the device that is
+    /// actually open after the attempt, which may be the previous one after a
+    /// successful rollback. This is not a stream failure and must not close the
+    /// peer or drop the video.
+    Output {
+        applied: Option<String>,
+        audible: bool,
+        /// The applied endpoint is selected and the playout path was started or
+        /// restored. The player only skips a repeat when this is true.
+        working: bool,
+        error: Option<&'static str>,
+    },
 }
 
 #[derive(Default)]
@@ -219,14 +230,16 @@ impl Media {
     pub fn command(&self, command: Command) -> Result<(), MediaError> {
         // The microphone starts closed and only a confirmed media state opens
         // it. `Start` alone must never open the device: the join may still be
-        // refused, and push-to-talk may hold the key.
+        // refused, and push-to-talk may hold the key. A reconnect resets only
+        // the transport flags; the leave latch and the local PTT decision stay
+        // with `VoiceHandle`.
         match &command {
-            Command::Start { .. } | Command::ViewStart { .. } => self.capture.reset(),
+            Command::Start { .. } | Command::ViewStart { .. } => self.capture.reset_transport(),
             Command::Stop => self.capture.latch(),
-            Command::State(controls) => {
-                self.capture
-                    .set_local(!controls.muted && !controls.deafened);
-            }
+            // `State` carries device and codec parameters. Local permission is
+            // owned by `VoiceHandle::controls` only, so an older queued State
+            // can never reopen a capture that PTT already released.
+            Command::State(_) => {}
             _ => {}
         }
         self.commands.try_send(command).map_err(|err| match err {
@@ -264,7 +277,10 @@ impl Media {
 
 impl Drop for Media {
     fn drop(&mut self) {
-        self.capture.latch();
+        // This is one transport ending, not a user leave. Keep the shared gate
+        // reusable for the next media session on reconnect; only
+        // `VoiceHandle::leave`/`Drop` sets the irreversible latch.
+        self.capture.end_transport();
         // Close the channel before joining the worker.
         let (replacement, _) = mpsc::channel(1);
         drop(std::mem::replace(&mut self.commands, replacement));
@@ -336,6 +352,7 @@ mod tests {
         );
         media.set_joined(true);
         media.set_server_allowed(true);
+        capture.set_local(true);
         media
             .command(Command::State(Controls {
                 muted: false,
@@ -343,15 +360,20 @@ mod tests {
             }))
             .unwrap();
         assert!(capture.enabled());
+        capture.set_local(false);
         media
             .command(Command::State(Controls {
-                muted: true,
+                muted: false,
                 ..Controls::default()
             }))
             .unwrap();
-        assert!(!capture.enabled());
+        assert!(
+            !capture.enabled(),
+            "a queued State must not override the local PTT decision"
+        );
         // A late unmute after Stop must not reopen the attempt.
         media.command(Command::Stop).unwrap();
+        capture.set_local(true);
         media
             .command(Command::State(Controls {
                 muted: false,
@@ -359,6 +381,104 @@ mod tests {
             }))
             .unwrap();
         assert!(!capture.enabled());
+    }
+
+    #[test]
+    fn a_late_state_after_push_to_talk_release_keeps_the_capture_closed() {
+        let (media, capture, _commands) = headless_media();
+        media
+            .command(Command::Start {
+                ice_servers: Vec::new(),
+                ice_transport_policy: "all".into(),
+                controls: Controls::default(),
+            })
+            .unwrap();
+        media.set_joined(true);
+        media.set_server_allowed(true);
+        // The worker has already read the State from the PTT key-down but has
+        // not applied it yet. The handle then releases the key.
+        capture.set_local(false);
+        media
+            .command(Command::State(Controls {
+                muted: false,
+                ..Controls::default()
+            }))
+            .unwrap();
+        assert!(
+            !capture.enabled(),
+            "the stale State must not reopen a released PTT hold"
+        );
+    }
+
+    #[test]
+    fn leave_start_and_a_late_join_stay_latched_until_the_handle_dies() {
+        let (media, capture, _commands) = headless_media();
+        media.command(Command::Stop).unwrap();
+        assert!(!capture.enabled());
+        // A reconnect starts a fresh transport session on the same handle.
+        media
+            .command(Command::Start {
+                ice_servers: Vec::new(),
+                ice_transport_policy: "all".into(),
+                controls: Controls::default(),
+            })
+            .unwrap();
+        media.set_joined(true);
+        media.set_server_allowed(true);
+        capture.set_local(true);
+        assert!(
+            !capture.enabled(),
+            "reset_transport must preserve the leave latch"
+        );
+        // A completely new call gets a new gate and starts closed until its
+        // own join and local decision.
+        let fresh = CaptureGate::default();
+        fresh.set_joined(true);
+        fresh.set_server_allowed(true);
+        fresh.set_local(true);
+        assert!(fresh.enabled());
+    }
+
+    #[test]
+    fn dropping_one_media_transport_allows_the_next_join_but_a_leave_latches_it() {
+        let capture = Arc::new(CaptureGate::default());
+        let first = Media::new_with_capture(capture.clone()).unwrap();
+        first.set_joined(true);
+        first.set_server_allowed(true);
+        capture.set_local(true);
+        assert!(capture.enabled());
+        // A real Media drop must detach the transport, not latch the handle.
+        drop(first);
+        assert!(
+            !capture.enabled(),
+            "the old transport is closed after its media worker dies"
+        );
+
+        let second = Media::new_with_capture(capture.clone()).unwrap();
+        capture.set_local(true);
+        assert!(
+            !capture.enabled(),
+            "the next transport starts closed before its own voice.joined"
+        );
+        second.set_joined(true);
+        second.set_server_allowed(true);
+        assert!(
+            capture.enabled(),
+            "a reconnect must be able to open the microphone again"
+        );
+
+        // An explicit leave is irreversible for the whole handle.
+        second.command(Command::Stop).unwrap();
+        assert!(!capture.enabled());
+        drop(second);
+        let after_leave = Media::new_with_capture(capture.clone()).unwrap();
+        after_leave.set_joined(true);
+        after_leave.set_server_allowed(true);
+        capture.set_local(true);
+        assert!(
+            !capture.enabled(),
+            "the next transport must not clear an explicit leave latch"
+        );
     }
 }
 pub mod devices;

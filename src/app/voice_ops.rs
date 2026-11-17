@@ -121,6 +121,7 @@ impl Voxhold {
         if let Some(panel) = &self.voice {
             let self_user = self.self_user_id;
             panel.update(cx, |panel, cx| {
+                panel.set_access_confirmed(!self.voice_unconfirmed.contains(&self.server));
                 panel.set_rooms(rooms);
                 panel.set_self_user(self_user);
                 panel.set_members(members);
@@ -132,6 +133,7 @@ impl Voxhold {
             });
         } else {
             let self_user = self.self_user_id;
+            let access_confirmed = !self.voice_unconfirmed.contains(&self.server);
             let push_to_talk = prefs.input_mode == "push_to_talk";
             let panel = cx.new(|cx| {
                 let mut panel = voice_panel::VoicePanel::new(
@@ -142,6 +144,7 @@ impl Voxhold {
                     window,
                     cx,
                 );
+                panel.set_access_confirmed(access_confirmed);
                 panel.set_rooms(rooms);
                 panel.set_self_user(self_user);
                 panel.set_members(members);
@@ -209,7 +212,9 @@ impl Voxhold {
         let roster = self.voice_roster(self.server, room);
         let streams = self.voice_stream_list(self.server, room);
         let self_user = self.self_user_id;
+        let access_confirmed = !self.voice_unconfirmed.contains(&self.server);
         panel.update(cx, |panel, cx| {
+            panel.set_access_confirmed(access_confirmed);
             panel.set_rooms(rooms);
             panel.set_self_user(self_user);
             panel.set_members(members);

@@ -578,8 +578,24 @@ HTTP и 24 МиБ поток с задержкой >8 с, проверяют б�
   ориентацию и растяжение.
 - `controller.rs`, `voice.rs` — попытка join, server mute, roster по
   `connection_id`, локальный mute по реальным трекам; смена устройства
-  сначала поднимает новый тракт, при отказе восстанавливает прежний; раз в
-  секунду проверяется hot-unplug; output gain применяется к трекам.
+  сначала поднимает новый тракт, при отказе восстанавливает прежний по
+  GUID/имени (default берётся из Windows, не из индекса 0); раз в секунду
+  проверяется hot-unplug. Захват имеет одного владельца разрешения:
+  `VoiceHandle` меняет local/PTT, worker — `voice.joined` и server mute;
+  `Command::State` больше не переоткрывает микрофон. Уничтожение старого
+  `Media` закрывает только транспорт и отсоединяет трек, поэтому reconnect
+  снова открывает микрофон после нового `voice.joined`; необратимую защёлку
+  ставит только явный `VoiceHandle::leave`/`Drop`. Выбранный выход хранится
+  отдельно от применённого: после полного отказа отката следующая команда
+  снова запускает воспроизведение, даже если id совпадает. Hot-unplug
+  публикует тот же `Event::Output` с фактическим fallback-выходом, поэтому
+  после возврата USB повторный выбор снова доходит до движка. Явный выбор
+  выхода в настройках всегда идёт отдельным запросом в `Session::ViewOutput`
+  и не отбрасывается кэшем runtime до чтения уведомления об unplug. Числовая
+  громкость комнаты 0–200 % пока не применяется к PCM: закреплённый
+  `libwebrtc` не даёт render callback, а системный WASAPI-микшер не трогается.
+  0 % и deafen закрывают треки; полный коэффициент относится к аудиотракту
+  `R07b`, и в настройках показано это ограничение.
 - `src/voice_room.rs`, `src/voice_panel.rs`, `voice_panel/{view,player}.rs` —
   комната по `voice_room.go` (статус, карточки, индикатор речи, toolbar
   микрофон/звук/записи/выход, dock 98 px) и плеер по `stream_player.go`
@@ -595,12 +611,29 @@ HTTP и 24 МиБ поток с задержкой >8 с, проверяют б�
   reconnect, revoke, leave-timeout, snapshot/event/stop/re-entry, границы
   `Requests`/`Updates`, синтетический BGRA, GPUI Tab/Shift+Tab, Esc/F,
   press/release PTT, блокировка модалкой, dock и реальные координаты
-  карточек/плеера.
+  карточек/плеера. Добавлены гонки PTT/State, реальный drop старого Media до
+  нового join и leave-latch, Watch(B)→Close(B), поздние tagged offer/close,
+  два просмотра одного P2P-публикатора, ICE нового поколения до SDP,
+  reconnect до `voice.joined`, полный отказ отката выхода, ACL-скрытие
+  активной комнаты и revoke в fullscreen.
+
+**Ограничение wire для viewer.** `stream.watch` теперь содержит `watch_id`
+(номер попытки) и клиент строго сверяет его, если backend присылает
+`watch_id` или `request_id` у offer/ICE/close. Закреплённый backend
+`9b29fdd` не размечает push-события и не присылает `watch_id` у
+`stream.webrtc_closed`; `from_connection_id`/`publisher_connection_id`
+идентифицируют публикатора, а не повторный просмотр. Поэтому для текущего
+формата первый немаркированный close после смены попытки игнорируется, а
+немаркированный offer с неизвестным ufrag нельзя отличить от следующего
+ICE-поколения. Строгая гарантия требует согласованного расширения backend:
+каждый offer/ICE/close несёт id просмотра, а ранние сигналы до ACK либо
+маркированы, либо ограниченно буферизуются по этому id. Таймер эту
+неоднозначность не разрешает.
 
 Проверено: `cargo fmt --all -- --check`, `cargo test --workspace --locked`
-(292 теста приложения: 292 passed, 1 `ignored`; 11 API; 32 media),
+(296 тестов приложения: 296 passed, 1 `ignored`; 11 API; 54 media),
 `cargo build --release --locked -p voxhold-native-rust`,
-`scripts/check-file-sizes.ps1` (169 файлов), `git diff --check` и smoke
+`scripts/check-file-sizes.ps1` (170 файлов), `git diff --check` и smoke
 release (процесс активен через 5 с).
 
 Не проверено: живой backend и два клиента, реальный SFU/P2P с Chromium,

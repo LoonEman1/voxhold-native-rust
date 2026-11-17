@@ -45,11 +45,11 @@ fn control_slots_keep_only_the_latest_value() {
 #[test]
 fn watch_and_close_share_one_last_value_slot() {
     let requests = Requests::default();
-    *requests.stream.lock().unwrap() = Some(StreamCommand::Watch {
+    requests.stream.lock().unwrap().pending = Some(StreamCommand::Watch {
         selection: 1,
         publication: publication("b"),
     });
-    *requests.stream.lock().unwrap() = Some(StreamCommand::Watch {
+    requests.stream.lock().unwrap().pending = Some(StreamCommand::Watch {
         selection: 2,
         publication: publication("c"),
     });
@@ -63,26 +63,25 @@ fn watch_and_close_share_one_last_value_slot() {
         }
         _ => panic!("the last selection wins"),
     }
-    *requests.stream.lock().unwrap() = Some(StreamCommand::Watch {
+    requests.stream.lock().unwrap().pending = Some(StreamCommand::Watch {
         selection: 3,
         publication: publication("d"),
     });
     // A close from a stale caller must not erase the newer watch.
-    *requests.stream.lock().unwrap() = Some(StreamCommand::Close { selection: 1 });
-    *requests.stream.lock().unwrap() = Some(StreamCommand::Watch {
-        selection: 3,
-        publication: publication("d"),
-    });
+    assert!(!set_stream_command(
+        &requests,
+        StreamCommand::Close { selection: 1 }
+    ));
     assert!(matches!(
         requests.take(),
         Some(Pending::Stream(StreamCommand::Watch { selection: 3, .. }))
     ));
-    *requests.stream.lock().unwrap() = Some(StreamCommand::Close { selection: 3 });
+    set_stream_command(&requests, StreamCommand::Close { selection: 3 });
     assert!(matches!(
         requests.take(),
         Some(Pending::Stream(StreamCommand::Close { selection: 3 }))
     ));
-    assert!(requests.stream.lock().unwrap().is_none());
+    assert!(requests.stream.lock().unwrap().pending.is_none());
 
     // A delayed close for the previous selection cannot erase B.
     assert!(set_stream_command(
@@ -100,6 +99,105 @@ fn watch_and_close_share_one_last_value_slot() {
         requests.take(),
         Some(Pending::Stream(StreamCommand::Watch { selection: 5, .. }))
     ));
+}
+
+#[test]
+fn a_close_newer_than_a_displaced_watch_closes_the_running_view() {
+    let requests = Requests::default();
+    // A is already running and the worker has recorded its command number.
+    set_stream_command(
+        &requests,
+        StreamCommand::Watch {
+            selection: 1,
+            publication: publication("a"),
+        },
+    );
+    assert!(matches!(
+        requests.take(),
+        Some(Pending::Stream(StreamCommand::Watch { selection: 1, .. }))
+    ));
+    let mut viewer = Viewer::new(1, 10);
+    let now = Instant::now();
+    viewer.on_server_event(
+        "stream.snapshot",
+        "",
+        &serde_json::json!({"streams": [publication("a")]}),
+        now,
+    );
+    viewer.set_joined(true, now);
+    let started = viewer.select(&publication("a"), 1, now);
+    assert!(
+        started
+            .iter()
+            .any(|outcome| matches!(outcome, ViewerOutcome::Start { selection: 1, .. }))
+    );
+
+    // Watch(B) and Close(B) both land in the slot before the worker reads it.
+    set_stream_command(
+        &requests,
+        StreamCommand::Watch {
+            selection: 2,
+            publication: publication("b"),
+        },
+    );
+    set_stream_command(&requests, StreamCommand::Close { selection: 2 });
+    let command = match requests.take() {
+        Some(Pending::Stream(command)) => command,
+        _ => panic!("the close replaces the watch"),
+    };
+    assert!(matches!(command, StreamCommand::Close { selection: 2 }));
+
+    let outcomes = viewer.leave_selection(2, now);
+    assert!(
+        outcomes.contains(&ViewerOutcome::Close),
+        "A must stop: {outcomes:?}"
+    );
+    assert!(outcomes.contains(&ViewerOutcome::Clear { selection: 2 }));
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, ViewerOutcome::Send(signal) if signal.kind == "stream.leave"))
+            .count(),
+        1
+    );
+    assert!(
+        !outcomes
+            .iter()
+            .any(|outcome| matches!(outcome, ViewerOutcome::Start { publication, .. } if publication.publisher_connection_id == "b")),
+        "the displaced watch B must never start"
+    );
+    assert!(viewer.watching().is_none());
+
+    // Once the worker has taken B, a delayed close for A is still rejected.
+    assert!(set_stream_command(
+        &requests,
+        StreamCommand::Watch {
+            selection: 4,
+            publication: publication("b"),
+        }
+    ));
+    assert!(matches!(
+        requests.take(),
+        Some(Pending::Stream(StreamCommand::Watch { selection: 4, .. }))
+    ));
+    assert!(!set_stream_command(
+        &requests,
+        StreamCommand::Close { selection: 3 }
+    ));
+    assert!(requests.stream.lock().unwrap().pending.is_none());
+}
+
+#[test]
+fn explicit_output_selection_is_never_coalesced_into_controls() {
+    let requests = Requests::default();
+    *requests.output.lock().unwrap() = Some(Some("usb-a".into()));
+    assert!(matches!(
+        requests.take(),
+        Some(Pending::Output(Some(output))) if output == "usb-a"
+    ));
+    // Selecting the system default is a real request, not an empty slot.
+    *requests.output.lock().unwrap() = Some(None);
+    assert!(matches!(requests.take(), Some(Pending::Output(None))));
 }
 
 #[test]

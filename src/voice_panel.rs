@@ -99,9 +99,16 @@ pub struct VoicePanel {
     /// Publications of the displayed room from the account WebSocket; the
     /// call's runtime owns `streams` for the room it is in.
     room_streams: Vec<Publication>,
+    /// False while the authoritative channel ACL is being reloaded. Both the
+    /// room roster and the call worker's roster/streams stay hidden until the
+    /// fresh channel list confirms access again.
+    access_confirmed: bool,
     frame: Option<Arc<RenderImage>>,
     stream_status: String,
     stream_error: String,
+    /// Audio-output notice for the player. Unlike a stream failure it keeps the
+    /// decoded picture and the call alive.
+    stream_audio_error: String,
     stream_muted: bool,
     /// Monotonic selection id. Every frame and status is tagged with it so a
     /// late update from A can never touch the player showing B.
@@ -149,10 +156,13 @@ impl VoicePanel {
             }
         });
         let executor = cx.background_executor().clone();
-        cx.spawn(async move |this, cx| loop {
+        cx.spawn_in(window, async move |this, cx| loop {
             executor.timer(Duration::from_millis(100)).await;
             let Some(entity) = this.upgrade() else { break };
-            if entity.update(cx, |panel, cx| panel.poll(cx)).is_err() {
+            if entity
+                .update_in(cx, |panel, window, cx| panel.poll(window, cx))
+                .is_err()
+            {
                 break;
             }
         })
@@ -191,9 +201,11 @@ impl VoicePanel {
             device_error: String::new(),
             streams: Vec::new(),
             room_streams: Vec::new(),
+            access_confirmed: true,
             frame: None,
             stream_status: String::new(),
             stream_error: String::new(),
+            stream_audio_error: String::new(),
             stream_muted: false,
             stream_selection: 0,
             watching_selection: None,
@@ -261,6 +273,12 @@ impl VoicePanel {
         self.rooms = rooms;
     }
 
+    /// Confirmed ACL for the selected server. A reload hides room data instead
+    /// of letting a stale roster or the active call bypass the check.
+    pub fn set_access_confirmed(&mut self, confirmed: bool) {
+        self.access_confirmed = confirmed;
+    }
+
     pub fn set_self_user(&mut self, user_id: i64) {
         self.self_user_id = user_id;
     }
@@ -287,6 +305,9 @@ impl VoicePanel {
     }
 
     pub fn room_streams(&self) -> &[Publication] {
+        if !self.access_confirmed {
+            return &[];
+        }
         if self.call_channel != 0 && self.call_channel == self.room {
             &self.streams
         } else {
@@ -359,6 +380,11 @@ impl VoicePanel {
     /// Join the displayed room. Joining another room leaves the current call
     /// first, so no audio or video stays on the old lease.
     pub fn join(&mut self, cx: &mut Context<Self>) {
+        if !self.access_confirmed {
+            self.error = "Права на голосовой канал ещё не подтверждены.".into();
+            cx.notify();
+            return;
+        }
         let Some(access) = self.rooms.get(&self.room) else {
             self.error = "Нет доступа к голосовому каналу.".into();
             cx.notify();
@@ -591,6 +617,17 @@ impl VoicePanel {
         }
     }
 
+    /// Explicit output selection from the settings tab. This is forwarded even
+    /// when the cached value looks unchanged, because a hot-unplug may have
+    /// moved the engine to a fallback endpoint before its notice was applied.
+    pub fn select_output(&mut self, output: Option<String>) {
+        self.controls.output = output.clone();
+        self.device_error.clear();
+        if let Some(handle) = &self.handle {
+            handle.select_output(output);
+        }
+    }
+
     /// Encoder bitrate from the settings tab.
     pub fn set_bitrate(&mut self, kbps: u32) {
         self.controls.bitrate_kbps = Some(kbps);
@@ -620,7 +657,10 @@ impl VoicePanel {
     /// Start watching the selected publication. The runtime leaves the previous
     /// attempt and waits for its acknowledgement.
     pub fn watch(&mut self, publication: Publication, cx: &mut Context<Self>) {
-        if self.call_channel == 0 || publication.channel_id != self.call_channel {
+        if !self.access_confirmed
+            || self.call_channel == 0
+            || publication.channel_id != self.call_channel
+        {
             return;
         }
         self.stream_selection = self.stream_selection.wrapping_add(1).max(1);
@@ -656,9 +696,17 @@ impl VoicePanel {
         self.player_open = false;
         self.stream_status.clear();
         self.stream_error.clear();
+        self.stream_audio_error.clear();
         self.stream_connected = false;
         self.stream_muted = false;
         self.player_drag = None;
+    }
+
+    fn close_player_in_window(&mut self, window: &mut Window) {
+        if self.player_fullscreen || self.owns_fullscreen {
+            self.exit_fullscreen(window);
+        }
+        self.close_player();
     }
 
     pub fn toggle_stream_mute(&mut self, cx: &mut Context<Self>) {
@@ -717,7 +765,7 @@ impl VoicePanel {
         self.watching.as_ref()
     }
 
-    fn poll(&mut self, cx: &mut Context<Self>) {
+    fn poll(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(player) = self.player_box() {
             let geometry = voice_room::player_geometry(self.player_area, player, self.has_audio());
             let picture = geometry.picture;
@@ -737,101 +785,7 @@ impl VoicePanel {
         }
         let frame = handle.take_frame();
         for update in updates {
-            let mut repaint = true;
-            match update {
-                VoiceUpdate::Connecting => {
-                    self.phase = CallPhase::Connecting;
-                    self.status = "Подключение…".into();
-                    self.controls.muted = true;
-                    self.release_push_to_talk();
-                }
-                VoiceUpdate::Connected => {
-                    if self.phase != CallPhase::Connected {
-                        self.phase = CallPhase::Connected;
-                        self.status = "Подключено".into();
-                        self.refresh_capture();
-                    }
-                }
-                VoiceUpdate::Reconnecting => {
-                    self.phase = CallPhase::Reconnecting;
-                    self.status = "Восстанавливаем соединение…".into();
-                    self.controls.muted = true;
-                    self.release_push_to_talk();
-                    // Go drops the confirmed roster until the fresh join; a
-                    // stale list must not look like a live call during a
-                    // reconnect.
-                    self.participants.clear();
-                    self.speaking.clear();
-                    self.tracks.clear();
-                }
-                VoiceUpdate::Participants(participants) => {
-                    self.participants = participants;
-                    self.local_mutes.retain(|connection| {
-                        self.participants
-                            .iter()
-                            .any(|participant| &participant.connection_id == connection)
-                    });
-                }
-                VoiceUpdate::Speaking(speaking) => self.speaking = speaking,
-                VoiceUpdate::LocalLevel(level) => {
-                    // Repaint the meter only for a visible step, not for every
-                    // 20 Hz sample of the capture track.
-                    repaint = (self.local_level - level).abs() > 0.04;
-                    self.local_level = level;
-                }
-                VoiceUpdate::Tracks(tracks) => self.tracks = tracks,
-                VoiceUpdate::Streams(streams) => self.streams = streams,
-                VoiceUpdate::StreamStatus { selection, status } => {
-                    if self.watching_selection != Some(selection) {
-                        continue;
-                    }
-                    if status.is_empty() {
-                        self.close_player();
-                    } else {
-                        self.stream_status = status;
-                        self.stream_error.clear();
-                    }
-                }
-                VoiceUpdate::StreamError { selection, error } => {
-                    if self.watching_selection != Some(selection) {
-                        continue;
-                    }
-                    self.stream_error = error;
-                    self.stream_status.clear();
-                    self.stream_connected = false;
-                    self.frame = None;
-                }
-                VoiceUpdate::StreamConnected {
-                    selection,
-                    connected,
-                } => {
-                    if self.watching_selection != Some(selection) {
-                        continue;
-                    }
-                    self.stream_connected = connected;
-                }
-                VoiceUpdate::DeviceError(error) => self.device_error = error,
-                VoiceUpdate::Ended(error) => {
-                    self.handle.take();
-                    self.controls.muted = true;
-                    self.ptt_held = false;
-                    self.ptt_combo = None;
-                    self.close_player();
-                    self.call_channel = 0;
-                    self.phase = if error.is_some() {
-                        CallPhase::Failed
-                    } else {
-                        CallPhase::Idle
-                    };
-                    self.error = error.unwrap_or_default();
-                    self.status.clear();
-                    self.participants.clear();
-                    self.speaking.clear();
-                    self.tracks.clear();
-                    self.streams.clear();
-                }
-            }
-            changed |= repaint;
+            changed |= self.apply_update(update, window, cx);
         }
         if let Some(frame) = frame {
             if self.watching_selection != Some(frame.selection) {
@@ -849,6 +803,127 @@ impl VoicePanel {
         if changed {
             cx.notify();
         }
+    }
+
+    fn apply_update(
+        &mut self,
+        update: VoiceUpdate,
+        window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> bool {
+        let mut repaint = true;
+        match update {
+            VoiceUpdate::Connecting => {
+                self.phase = CallPhase::Connecting;
+                self.status = "Подключение…".into();
+                self.controls.muted = true;
+                self.release_push_to_talk();
+            }
+            VoiceUpdate::Connected => {
+                if self.phase != CallPhase::Connected {
+                    self.phase = CallPhase::Connected;
+                    self.status = "Подключено".into();
+                    self.refresh_capture();
+                }
+            }
+            VoiceUpdate::Reconnecting => {
+                self.phase = CallPhase::Reconnecting;
+                self.status = "Восстанавливаем соединение…".into();
+                self.controls.muted = true;
+                self.release_push_to_talk();
+                // Go drops the confirmed roster until the fresh join; a
+                // stale list must not look like a live call during a
+                // reconnect.
+                self.participants.clear();
+                self.speaking.clear();
+                self.tracks.clear();
+            }
+            VoiceUpdate::Participants(participants) => {
+                self.participants = participants;
+                self.local_mutes.retain(|connection| {
+                    self.participants
+                        .iter()
+                        .any(|participant| &participant.connection_id == connection)
+                });
+            }
+            VoiceUpdate::Speaking(speaking) => self.speaking = speaking,
+            VoiceUpdate::LocalLevel(level) => {
+                // Repaint the meter only for a visible step, not for every
+                // 20 Hz sample of the capture track.
+                repaint = (self.local_level - level).abs() > 0.04;
+                self.local_level = level;
+            }
+            VoiceUpdate::Tracks(tracks) => self.tracks = tracks,
+            VoiceUpdate::Streams(streams) => self.streams = streams,
+            VoiceUpdate::StreamStatus { selection, status } => {
+                if self.watching_selection != Some(selection) {
+                    return false;
+                }
+                if status.is_empty() {
+                    self.close_player_in_window(window);
+                } else {
+                    self.stream_status = status;
+                    self.stream_error.clear();
+                }
+            }
+            VoiceUpdate::StreamError { selection, error } => {
+                if self.watching_selection != Some(selection) {
+                    return false;
+                }
+                self.stream_error = error;
+                self.stream_status.clear();
+                self.stream_connected = false;
+                self.frame = None;
+            }
+            VoiceUpdate::StreamAudio { selection, error } => {
+                if self.watching_selection != Some(selection) {
+                    return false;
+                }
+                // Keep the frame and the peer: the previous output may still be
+                // playing after a successful rollback.
+                self.stream_audio_error = error.unwrap_or_default();
+            }
+            VoiceUpdate::StreamConnected {
+                selection,
+                connected,
+            } => {
+                if self.watching_selection != Some(selection) {
+                    return false;
+                }
+                self.stream_connected = connected;
+            }
+            VoiceUpdate::DeviceError(error) => self.device_error = error,
+            VoiceUpdate::Ended(error) => {
+                self.handle.take();
+                self.controls.muted = true;
+                self.ptt_held = false;
+                self.ptt_combo = None;
+                self.close_player_in_window(window);
+                self.call_channel = 0;
+                self.phase = if error.is_some() {
+                    CallPhase::Failed
+                } else {
+                    CallPhase::Idle
+                };
+                self.error = error.unwrap_or_default();
+                self.status.clear();
+                self.participants.clear();
+                self.speaking.clear();
+                self.tracks.clear();
+                self.streams.clear();
+            }
+        }
+        repaint
+    }
+
+    #[cfg(test)]
+    pub fn test_apply_update(
+        &mut self,
+        update: VoiceUpdate,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.apply_update(update, window, cx);
     }
 
     // ---- focus ring -----------------------------------------------------
@@ -994,7 +1069,25 @@ impl VoicePanel {
         self.room_size
     }
 
+    #[cfg(test)]
+    pub fn test_visible_roster_len(&self) -> usize {
+        self.visible_roster().len()
+    }
+
+    #[cfg(test)]
+    pub fn test_visible_streams_len(&self) -> usize {
+        self.visible_streams().len()
+    }
+
+    #[cfg(test)]
+    pub fn test_audio_for(&self, connection: &str) -> bool {
+        self.audio_for(connection)
+    }
+
     fn visible_roster(&self) -> Vec<Participant> {
+        if !self.access_confirmed {
+            return Vec::new();
+        }
         if self.call_channel != 0 && self.call_channel == self.room {
             self.participants.clone()
         } else {
@@ -1003,7 +1096,10 @@ impl VoicePanel {
     }
 
     fn audio_for(&self, connection: &str) -> bool {
-        self.call_channel != 0 && self.call_channel == self.room && self.tracks.contains(connection)
+        self.access_confirmed
+            && self.call_channel != 0
+            && self.call_channel == self.room
+            && self.tracks.contains(connection)
     }
 
     fn member_name(&self, user_id: i64) -> String {

@@ -170,6 +170,18 @@ impl Voxhold {
                     if self.show_search {
                         self.refresh_search_permissions(window, cx);
                     }
+                    // The open dialogue keeps its history and composer, but
+                    // the server ACL still has to be refreshed: leaving
+                    // `voice_unconfirmed` set would hide every room until an
+                    // unrelated forced reload.
+                    #[cfg(feature = "voxhold-media")]
+                    if self.voice_unconfirmed.contains(&self.server) {
+                        if self.access_reload_in_flight {
+                            self.access_refresh_again = true;
+                        } else {
+                            self.reload_channels(window, cx);
+                        }
+                    }
                 } else if self.access_reload_in_flight {
                     // Access changed: hide confirmed data first, then
                     // take a new authoritative channel snapshot and
@@ -356,8 +368,12 @@ impl Voxhold {
                 effect.recording_access = true;
                 // Snapshots precede this event. Hide them until the fresh
                 // channel list confirms the rooms that are still readable.
+                // Without any voice surface there is nothing to hide; a later
+                // room open still uses the confirmed channel list.
                 #[cfg(feature = "voxhold-media")]
-                self.voice_unconfirmed.insert(self.server);
+                if self.voice.is_some() || self.voice_channel != 0 || self.voice_room != 0 {
+                    self.voice_unconfirmed.insert(self.server);
+                }
             }
             "server.member_joined" | "server.member_role_updated"
                 if data["server_id"].as_i64() == Some(self.server) =>

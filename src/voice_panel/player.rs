@@ -184,7 +184,7 @@ impl VoicePanel {
             &self.stream_status,
             &self.stream_error,
             self.frame.is_some(),
-            self.frame.is_some(),
+            self.stream_connected,
         )
     }
 

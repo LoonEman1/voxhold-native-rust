@@ -371,6 +371,35 @@ impl Hotkey {
             && self.alt == alt
             && self.platform == platform
     }
+
+    pub fn uses(&self, modifier: ModifierKey) -> bool {
+        match modifier {
+            ModifierKey::Ctrl => self.ctrl,
+            ModifierKey::Shift => self.shift,
+            ModifierKey::Alt => self.alt,
+            ModifierKey::Platform => self.platform,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModifierKey {
+    Ctrl,
+    Shift,
+    Alt,
+    Platform,
+}
+
+/// Map a released key name to a modifier, so `Ctrl+Space` closes when either
+/// key comes up while the other is still held.
+pub fn modifier_key(key: &str) -> Option<ModifierKey> {
+    match key {
+        "control" | "ctrl" => Some(ModifierKey::Ctrl),
+        "shift" => Some(ModifierKey::Shift),
+        "alt" => Some(ModifierKey::Alt),
+        "super" | "win" | "cmd" | "meta" | "platform" => Some(ModifierKey::Platform),
+        _ => None,
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

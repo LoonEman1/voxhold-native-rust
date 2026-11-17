@@ -29,29 +29,78 @@ const ICE_CAPACITY: usize = 64;
 const SIGNAL_TIMEOUT: Duration = Duration::from_secs(8);
 const SPEAKING_THRESHOLD: f64 = 0.018;
 
+/// Permission to transmit is tracked independently of the socket worker, so a
+/// blocked `send` cannot keep the microphone open. Transmission requires all
+/// of: no leave latch, a confirmed join, server permission and the local
+/// mute/deafen/push-to-talk decision.
 #[derive(Default)]
-pub struct CaptureGate(Mutex<(bool, Option<RtcAudioTrack>)>);
+pub struct CaptureGate(Mutex<CaptureState>);
+
+#[derive(Default)]
+struct CaptureState {
+    latched: bool,
+    joined: bool,
+    server_allowed: bool,
+    local_allowed: bool,
+    track: Option<RtcAudioTrack>,
+}
 
 impl CaptureGate {
-    pub fn set_enabled(&self, enabled: bool) {
-        let mut state = self.0.lock().unwrap();
-        if state.0 != enabled {
-            state.0 = enabled;
-            if let Some(track) = &state.1 {
-                track.set_enabled(enabled);
-            }
+    fn is_enabled(state: &CaptureState) -> bool {
+        !state.latched && state.joined && state.server_allowed && state.local_allowed
+    }
+
+    fn apply(state: &CaptureState) {
+        if let Some(track) = &state.track {
+            track.set_enabled(Self::is_enabled(state));
         }
+    }
+
+    /// Leave/logout/PTT release for the whole attempt: a late `State` command
+    /// can never reopen the capture because the latch outranks every flag.
+    pub fn latch(&self) {
+        let mut state = self.0.lock().unwrap();
+        state.latched = true;
+        Self::apply(&state);
+    }
+
+    /// A new media session starts closed until its own `voice.joined`.
+    pub fn reset(&self) {
+        let mut state = self.0.lock().unwrap();
+        state.latched = false;
+        state.joined = false;
+        state.server_allowed = false;
+        state.local_allowed = false;
+        Self::apply(&state);
+    }
+
+    pub fn set_joined(&self, joined: bool) {
+        let mut state = self.0.lock().unwrap();
+        state.joined = joined;
+        Self::apply(&state);
+    }
+
+    pub fn set_server_allowed(&self, allowed: bool) {
+        let mut state = self.0.lock().unwrap();
+        state.server_allowed = allowed;
+        Self::apply(&state);
+    }
+
+    pub fn set_local(&self, allowed: bool) {
+        let mut state = self.0.lock().unwrap();
+        state.local_allowed = allowed;
+        Self::apply(&state);
     }
 
     fn attach(&self, track: RtcAudioTrack) {
         let mut state = self.0.lock().unwrap();
-        track.set_enabled(state.0);
-        state.1 = Some(track);
+        track.set_enabled(Self::is_enabled(&state));
+        state.track = Some(track);
     }
 
     fn detach(&self) {
         let mut state = self.0.lock().unwrap();
-        if let Some(track) = state.1.take() {
+        if let Some(track) = state.track.take() {
             track.set_enabled(false);
         }
     }
@@ -59,7 +108,8 @@ impl CaptureGate {
     /// Test hook: the gate state is the one applied to the capture track.
     #[cfg(test)]
     pub fn enabled(&self) -> bool {
-        self.0.lock().unwrap().0
+        let state = self.0.lock().unwrap();
+        Self::is_enabled(&state)
     }
 }
 
@@ -167,28 +217,55 @@ impl PlatformAudio {
         }
     }
 
-    /// Point the ADM at one index and restart only what was already running.
-    fn activate(&self, index: u16, input: bool) -> bool {
-        let factory = &self.0;
+    fn running(&self, input: bool) -> bool {
         if input {
-            let restart = factory.recording_is_initialized();
-            if restart && !factory.stop_recording() {
-                return false;
-            }
-            if !factory.set_recording_device(index) {
-                return false;
-            }
-            !restart || (factory.init_recording() && factory.start_recording())
+            self.0.recording_is_initialized()
         } else {
-            let restart = factory.playout_is_initialized();
-            if restart && !factory.stop_playout() {
-                return false;
-            }
-            if !factory.set_playout_device(index) {
-                return false;
-            }
-            !restart || (factory.init_playout() && factory.start_playout())
+            self.0.playout_is_initialized()
         }
+    }
+
+    fn stop(&self, input: bool) -> bool {
+        if input {
+            self.0.stop_recording()
+        } else {
+            self.0.stop_playout()
+        }
+    }
+
+    fn start(&self, input: bool) -> bool {
+        if input {
+            self.0.init_recording() && self.0.start_recording()
+        } else {
+            self.0.init_playout() && self.0.start_playout()
+        }
+    }
+
+    /// Point the ADM at one index and restore the requested running state.
+    /// The previous device is only released after the new station is set; a
+    /// failed set or start leaves the caller able to roll back explicitly.
+    fn apply(&self, index: u16, input: bool, running: bool) -> bool {
+        let factory = &self.0;
+        let was_running = self.running(input);
+        if was_running && !self.stop(input) {
+            return false;
+        }
+        let selected = if input {
+            factory.set_recording_device(index)
+        } else {
+            factory.set_playout_device(index)
+        };
+        if !selected {
+            return false;
+        }
+        !running || self.start(input)
+    }
+
+    /// Initial join: choose a device and start the path only if the platform
+    /// path is expected to run. Used by `Session::new`.
+    fn activate(&self, index: u16, input: bool) -> bool {
+        let running = self.running(input);
+        self.apply(index, input, running)
     }
 }
 
@@ -204,8 +281,17 @@ struct Session {
     viewer: Option<(Arc<VideoStore>, JoinHandle<()>)>,
     capture: Arc<CaptureGate>,
     audio: PlatformAudio,
+    /// Only the voice session owns the room output coefficient; the stream
+    /// player is a separate engine with its own mute.
+    control_playout_gain: bool,
     controls: Controls,
     volumes: HashMap<String, f64>,
+    /// last effective coefficient applied per receiver.
+    gains: HashMap<String, f64>,
+    /// Last room coefficient accepted by the process playout session and when
+    /// it was applied. A new WASAPI session is re-applied on the stats tick.
+    applied_playout_gain: Option<f64>,
+    playout_applied_at: Option<std::time::Instant>,
     speaking: HashMap<String, bool>,
     local_speaking: bool,
     remote_sdp: Option<RemoteSdp>,
@@ -213,42 +299,61 @@ struct Session {
     pending_ice: VecDeque<Candidate>,
     input_index: Option<u16>,
     output_index: Option<u16>,
+    /// The id of the device that is actually open, not merely selected. A
+    /// hot-unplugged device index can be reused by another device.
+    input_opened: Option<String>,
+    output_opened: Option<String>,
     device_check: std::time::Instant,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SwitchResult {
+    switched: bool,
+    /// Whether the previous (or default) path was restored after a failure.
+    audible: bool,
 }
 
 impl Session {
     fn new(
         servers: Vec<IceServer>,
         transport_policy: &str,
-        controls: Controls,
+        mut controls: Controls,
         events: &Arc<Events>,
         capture: Arc<CaptureGate>,
         viewer: Option<Arc<VideoStore>>,
     ) -> Result<Self, &'static str> {
-        let audio = PlatformAudio::new(viewer.is_none())?;
+        let control_playout_gain = viewer.is_none();
+        let audio = PlatformAudio::new(control_playout_gain)?;
         // A saved device that is gone at join time must not fail the call:
         // keep the default path and report it once.
         let mut input_index = None;
         let mut output_index = None;
-        if let Some(id) = controls.input.as_deref().filter(|id| !id.is_empty()) {
+        let mut input_opened = None;
+        let mut output_opened = None;
+        if let Some(id) = controls.input.clone().filter(|id| !id.is_empty()) {
             if let Some(index) = audio
-                .resolve(id, true)
+                .resolve(&id, true)
                 .filter(|index| audio.activate(*index, true))
             {
                 input_index = Some(index);
+                input_opened = Some(id);
             } else {
+                // Report the actual result: the saved id is not open.
+                controls.input = None;
                 events.push(Event::DeviceError {
                     message: "Выбранный микрофон недоступен, используется системный.",
                 });
             }
         }
-        if let Some(id) = controls.output.as_deref().filter(|id| !id.is_empty()) {
+        if let Some(id) = controls.output.clone().filter(|id| !id.is_empty()) {
             if let Some(index) = audio
-                .resolve(id, false)
+                .resolve(&id, false)
                 .filter(|index| audio.activate(*index, false))
             {
                 output_index = Some(index);
+                output_opened = Some(id);
             } else {
+                controls.output = None;
                 events.push(Event::DeviceError {
                     message: "Выбранное устройство воспроизведения недоступно, используется системное.",
                 });
@@ -331,8 +436,12 @@ impl Session {
             viewer,
             capture,
             audio,
+            control_playout_gain,
             controls,
             volumes: HashMap::new(),
+            gains: HashMap::new(),
+            applied_playout_gain: None,
+            playout_applied_at: None,
             speaking: HashMap::new(),
             local_speaking: false,
             remote_sdp: None,
@@ -340,6 +449,8 @@ impl Session {
             pending_ice: VecDeque::new(),
             input_index,
             output_index,
+            input_opened,
+            output_opened,
             device_check: std::time::Instant::now(),
         };
         session.apply_audio_controls();
@@ -375,6 +486,34 @@ impl Session {
                 self.apply_audio_controls();
                 Ok(())
             }
+            Command::ViewOutput { output } => {
+                if self.controls.output == output {
+                    return Ok(());
+                }
+                let result = match output {
+                    Some(id) if !id.is_empty() => {
+                        let result = self.switch_device(&id, false);
+                        if result.switched {
+                            self.controls.output = Some(id);
+                        }
+                        result
+                    }
+                    _ => {
+                        let result = self.switch_device("", false);
+                        if result.switched {
+                            self.controls.output = None;
+                        }
+                        result
+                    }
+                };
+                if result.switched {
+                    Ok(())
+                } else if result.audible {
+                    Err("Не удалось переключить устройство воспроизведения, прежнее работает.")
+                } else {
+                    Err("Не удалось переключить звук и восстановить прежнее устройство.")
+                }
+            }
             Command::Volume { track_id, gain } => {
                 if self.volumes.len() < 64 || self.volumes.contains_key(&track_id) {
                     self.volumes.insert(track_id, gain.clamp(0.0, 2.0));
@@ -392,8 +531,10 @@ impl Session {
     /// non-fatal notice.
     fn update_controls(&mut self, controls: Controls, events: &Events) -> Result<(), &'static str> {
         let deafen_changed = self.controls.deafened != controls.deafened;
+        let gain_changed = self.controls.output_gain != controls.output_gain;
         self.controls.muted = controls.muted;
         self.controls.deafened = controls.deafened;
+        self.controls.output_gain = controls.output_gain;
         if let Some(bitrate) = controls
             .bitrate_kbps
             .filter(|value| Some(*value) != self.controls.bitrate_kbps)
@@ -401,18 +542,23 @@ impl Session {
             self.controls.bitrate_kbps = Some(bitrate);
             self.update_bitrate();
         }
-        if deafen_changed {
+        if deafen_changed || gain_changed {
             self.apply_audio_controls();
         }
         if let Some(input) = controls
             .input
             .filter(|id| self.controls.input.as_ref() != Some(id))
         {
-            if self.switch_device(&input, true) {
+            let result = self.switch_device(&input, true);
+            if result.switched {
                 self.controls.input = Some(input);
             } else {
                 events.push(Event::DeviceError {
-                    message: "Не удалось переключить микрофон, прежний работает.",
+                    message: if result.audible {
+                        "Не удалось переключить микрофон, прежний работает."
+                    } else {
+                        "Не удалось переключить микрофон и восстановить прежний."
+                    },
                 });
             }
         }
@@ -420,48 +566,83 @@ impl Session {
             .output
             .filter(|id| self.controls.output.as_ref() != Some(id))
         {
-            if self.switch_device(&output, false) {
+            let result = self.switch_device(&output, false);
+            if result.switched {
                 self.controls.output = Some(output);
             } else {
                 events.push(Event::DeviceError {
-                    message: "Не удалось переключить устройство воспроизведения, прежнее работает.",
+                    message: if result.audible {
+                        "Не удалось переключить устройство воспроизведения, прежнее работает."
+                    } else {
+                        "Не удалось переключить звук и восстановить прежнее устройство."
+                    },
                 });
             }
         }
         Ok(())
     }
 
-    fn switch_device(&mut self, id: &str, input: bool) -> bool {
+    fn switch_device(&mut self, id: &str, input: bool) -> SwitchResult {
         let Some(index) = self.audio.resolve(id, input) else {
-            return false;
+            return SwitchResult {
+                switched: false,
+                audible: self.audio.running(input),
+            };
         };
         let previous = if input {
             self.input_index
         } else {
             self.output_index
         };
-        if previous == Some(index) {
-            return true;
+        let running = self.audio.running(input);
+        let opened = if input {
+            self.input_opened.as_deref()
+        } else {
+            self.output_opened.as_deref()
+        };
+        // The index alone is not identity: after an unplug the same numeric
+        // index can belong to another device, and the system default is often
+        // index 0. Re-apply unless the same opened id is requested.
+        let same_device = if id.is_empty() {
+            opened.is_none()
+        } else {
+            opened == Some(id)
+        };
+        if previous == Some(index) && same_device {
+            return SwitchResult {
+                switched: true,
+                audible: running,
+            };
         }
-        if self.audio.activate(index, input) {
+        if self.audio.apply(index, input, running) {
             if input {
                 self.input_index = Some(index);
+                self.input_opened = (!id.is_empty()).then(|| id.to_owned());
             } else {
                 self.output_index = Some(index);
+                self.output_opened = (!id.is_empty()).then(|| id.to_owned());
             }
-            return true;
+            return SwitchResult {
+                switched: true,
+                audible: running,
+            };
         }
-        // Restore the previous index, or the system default when nothing was
-        // selected, so a failed switch never leaves the call silent.
+        // Restore the previous device, or the system default when nothing was
+        // selected. A successful set is not enough: the previous running state
+        // must start again, otherwise the call stays silent.
         let fallback = previous.unwrap_or(0);
-        if self.audio.activate(fallback, input) {
+        let audible = self.audio.apply(fallback, input, running);
+        if audible {
             if input {
                 self.input_index = Some(fallback);
             } else {
                 self.output_index = Some(fallback);
             }
         }
-        false
+        SwitchResult {
+            switched: false,
+            audible,
+        }
     }
 
     /// A hot-unplugged device cannot be reported by WebRTC; poll the Core
@@ -473,9 +654,9 @@ impl Session {
         self.device_check = std::time::Instant::now();
         for input in [true, false] {
             let selected = if input {
-                self.controls.input.as_deref()
+                self.input_opened.as_deref()
             } else {
-                self.controls.output.as_deref()
+                self.output_opened.as_deref()
             };
             let Some(id) = selected.filter(|id| !id.is_empty()) else {
                 continue;
@@ -483,27 +664,37 @@ impl Session {
             if self.audio.resolve(id, input).is_some() {
                 continue;
             }
-            let fallback = if input {
-                self.input_index
-            } else {
-                self.output_index
-            };
-            if self.audio.activate(fallback.unwrap_or(0), input) {
+            // The old index may now point at another device. Resolve the
+            // system default from scratch instead of reusing it.
+            let result = self.switch_device("", input);
+            if result.switched {
                 if input {
-                    self.input_index = Some(fallback.unwrap_or(0));
                     self.controls.input = None;
                 } else {
-                    self.output_index = Some(fallback.unwrap_or(0));
                     self.controls.output = None;
                 }
+                events.push(Event::DeviceError {
+                    message: if input {
+                        "Микрофон отключён, используется системный."
+                    } else {
+                        "Устройство воспроизведения отключено, используется системное."
+                    },
+                });
+            } else {
+                events.push(Event::DeviceError {
+                    message: if result.audible {
+                        if input {
+                            "Микрофон отключён, прежний путь восстановлен."
+                        } else {
+                            "Устройство воспроизведения отключено, прежний путь восстановлен."
+                        }
+                    } else if input {
+                        "Микрофон отключён, звук не восстановлен."
+                    } else {
+                        "Устройство воспроизведения отключено, звук не восстановлен."
+                    },
+                });
             }
-            events.push(Event::DeviceError {
-                message: if input {
-                    "Микрофон отключён, используется системный."
-                } else {
-                    "Устройство воспроизведения отключено, используется системное."
-                },
-            });
         }
     }
 
@@ -522,12 +713,38 @@ impl Session {
     }
 
     fn apply_audio_controls(&mut self) {
-        for receiver in self.peer.receivers() {
-            if let Some(MediaStreamTrack::Audio(track)) = receiver.track() {
-                let audible = self.volumes.get(&track.id()).copied().unwrap_or(1.0) > 0.0;
-                track.set_enabled(!self.controls.deafened && audible);
+        let master = if self.controls.deafened { 0.0 } else { 1.0 };
+        if self.control_playout_gain {
+            let room = self.controls.output_gain.unwrap_or(1.0).clamp(0.0, 2.0);
+            if crate::playout_volume::set_process_gain(room * master) {
+                self.applied_playout_gain = Some(room * master);
+                self.playout_applied_at = Some(std::time::Instant::now());
             }
         }
+        self.gains.clear();
+        for receiver in self.peer.receivers() {
+            if let Some(MediaStreamTrack::Audio(track)) = receiver.track() {
+                let id = track.id();
+                // Keep the numeric coefficient: 1 %, 50 %, 100 % and 200 %
+                // are distinct settings, not a boolean "audible" flag. Zero
+                // disables the track so a mute is immediate.
+                let gain = (self.volumes.get(&id).copied().unwrap_or(1.0) * master).clamp(0.0, 2.0);
+                self.gains.insert(id, gain);
+                track.set_enabled(gain > 0.0);
+            }
+        }
+    }
+
+    /// Effective coefficient used by the PCM path for one receiver. Reapplied
+    /// whenever a track reappears or the SDP is renegotiated.
+    #[allow(dead_code)]
+    pub fn gain_for_track(&self, track_id: &str) -> f64 {
+        self.gains.get(track_id).copied().unwrap_or(1.0)
+    }
+
+    #[cfg(test)]
+    fn test_gain_for_track(&self, track_id: &str) -> f64 {
+        self.gain_for_track(track_id)
     }
 
     async fn answer(&mut self, sdp: &str, events: &Events) -> Result<(), &'static str> {
@@ -586,6 +803,25 @@ impl Session {
     }
 
     async fn sample_levels(&mut self, events: &Events) {
+        // A new WASAPI session may appear after the first control command.
+        // Re-apply the room coefficient until the endpoint accepts it, then
+        // refresh periodically in case the session was recreated.
+        if self.control_playout_gain {
+            let room = if self.controls.deafened {
+                0.0
+            } else {
+                self.controls.output_gain.unwrap_or(1.0).clamp(0.0, 2.0)
+            };
+            let stale = self
+                .playout_applied_at
+                .is_none_or(|at| at.elapsed() >= Duration::from_secs(2));
+            if self.applied_playout_gain != Some(room) || stale {
+                if crate::playout_volume::set_process_gain(room) {
+                    self.applied_playout_gain = Some(room);
+                    self.playout_applied_at = Some(std::time::Instant::now());
+                }
+            }
+        }
         if self.peer.connection_state() != PeerConnectionState::Connected {
             return;
         }
@@ -639,6 +875,10 @@ impl Session {
 
 impl Drop for Session {
     fn drop(&mut self) {
+        if self.control_playout_gain {
+            // Do not leave the process audio session scaled after the call.
+            crate::playout_volume::set_process_gain(1.0);
+        }
         if let Some((video, task)) = self.viewer.take() {
             task.abort();
             video.clear();

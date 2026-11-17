@@ -6927,6 +6927,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "voxhold-api",
+ "windows 0.61.3",
 ]
 
 [[package]]

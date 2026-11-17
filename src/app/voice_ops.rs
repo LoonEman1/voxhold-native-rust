@@ -38,9 +38,18 @@ impl Voxhold {
             .collect()
     }
 
-    pub(super) fn visible_voice_room(&self, channel: i64) -> bool {
-        if channel <= 0 {
+    /// Snapshot data is only shown for rooms the confirmed channel list still
+    /// allows. While an ACL reload is in flight the server's data is hidden;
+    /// other servers keep their cache until they become current.
+    pub(super) fn voice_channel_visible(&self, server: i64, channel: i64) -> bool {
+        if server <= 0 || channel <= 0 {
             return false;
+        }
+        if self.voice_unconfirmed.contains(&server) {
+            return false;
+        }
+        if server != self.server && self.server != 0 {
+            return true;
         }
         // The account snapshot may arrive before the channel list; keep the
         // already-filtered events until the authoritative list prunes them.
@@ -52,15 +61,41 @@ impl Voxhold {
             .any(|item| item.id == channel && item.kind == "voice" && item.readable())
     }
 
+    fn voice_roster(
+        &self,
+        server: i64,
+        channel: i64,
+    ) -> Vec<voxhold_media::controller::Participant> {
+        if !self.voice_channel_visible(server, channel) {
+            return Vec::new();
+        }
+        self.voice_rooms
+            .get(&(server, channel))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn voice_stream_list(
+        &self,
+        server: i64,
+        channel: i64,
+    ) -> Vec<voxhold_media::controller::Publication> {
+        if !self.voice_channel_visible(server, channel) {
+            return Vec::new();
+        }
+        self.voice_streams
+            .get(&(server, channel))
+            .cloned()
+            .unwrap_or_default()
+    }
+
     /// Badge count from the confirmed roster of a visible room.
     pub(super) fn voice_count(&self, channel: i64) -> usize {
-        self.voice_rooms.get(&channel).map_or(0, Vec::len)
+        self.voice_roster(self.server, channel).len()
     }
 
     pub(super) fn voice_has_stream(&self, channel: i64) -> bool {
-        self.voice_streams
-            .get(&channel)
-            .is_some_and(|streams| !streams.is_empty())
+        !self.voice_stream_list(self.server, channel).is_empty()
     }
 
     /// Display a voice channel's room. The call panel entity is reused so the
@@ -80,12 +115,8 @@ impl Voxhold {
             .iter()
             .map(|member| (member.user_id, member.username.clone()))
             .collect();
-        let roster = self.voice_rooms.get(&channel).cloned().unwrap_or_default();
-        let streams = self
-            .voice_streams
-            .get(&channel)
-            .cloned()
-            .unwrap_or_default();
+        let roster = self.voice_roster(self.server, channel);
+        let streams = self.voice_stream_list(self.server, channel);
         let prefs = self.voice_settings.prefs.clone();
         if let Some(panel) = &self.voice {
             let self_user = self.self_user_id;
@@ -96,8 +127,7 @@ impl Voxhold {
                 panel.set_devices(Some(prefs.input.clone()), Some(prefs.output.clone()));
                 panel.set_bitrate(prefs.bitrate as u32);
                 panel.set_output_volume(prefs.output_volume);
-                panel.set_room_streams(channel, streams);
-                panel.set_room(channel, roster);
+                panel.set_room_state(channel, roster, streams);
                 cx.notify();
             });
         } else {
@@ -118,8 +148,7 @@ impl Voxhold {
                 panel.set_devices(Some(prefs.input.clone()), Some(prefs.output.clone()));
                 panel.set_bitrate(prefs.bitrate as u32);
                 panel.set_output_volume(prefs.output_volume);
-                panel.set_room_streams(channel, streams);
-                panel.set_room(channel, roster);
+                panel.set_room_state(channel, roster, streams);
                 panel
             });
             let weak_view = cx.entity().downgrade();
@@ -151,17 +180,22 @@ impl Voxhold {
     /// Push a roster and fresh room access into the panel. Called after
     /// `voice.*` events and channel reloads.
     pub(super) fn sync_voice_panel(&mut self, cx: &mut Context<Self>) {
-        let rooms: Vec<i64> = self
+        // Keep caches for other servers, but drop every room this client can
+        // no longer read after the authoritative channel list arrived.
+        let allowed: std::collections::HashSet<(i64, i64)> = self
             .voice_rooms
             .keys()
             .chain(self.voice_streams.keys())
             .copied()
-            .filter(|channel| self.visible_voice_room(*channel))
+            .filter(|(server, channel)| {
+                // An unconfirmed server is hidden, not deleted: its fresh
+                // channel list decides later whether the room still exists.
+                self.voice_unconfirmed.contains(server)
+                    || self.voice_channel_visible(*server, *channel)
+            })
             .collect();
-        self.voice_rooms
-            .retain(|channel, _| rooms.contains(channel));
-        self.voice_streams
-            .retain(|channel, _| rooms.contains(channel));
+        self.voice_rooms.retain(|key, _| allowed.contains(key));
+        self.voice_streams.retain(|key, _| allowed.contains(key));
         let Some(panel) = &self.voice else {
             return;
         };
@@ -172,15 +206,14 @@ impl Voxhold {
             .map(|member| (member.user_id, member.username.clone()))
             .collect();
         let room = panel.read(cx).room();
-        let roster = self.voice_rooms.get(&room).cloned().unwrap_or_default();
-        let streams = self.voice_streams.get(&room).cloned().unwrap_or_default();
+        let roster = self.voice_roster(self.server, room);
+        let streams = self.voice_stream_list(self.server, room);
         let self_user = self.self_user_id;
         panel.update(cx, |panel, cx| {
             panel.set_rooms(rooms);
             panel.set_self_user(self_user);
             panel.set_members(members);
-            panel.set_room_streams(room, streams);
-            panel.set_room_roster(room, roster);
+            panel.set_room_state(room, roster, streams);
             cx.notify();
         });
     }
@@ -218,8 +251,6 @@ impl Voxhold {
         }
         self.voice_channel = 0;
         self.voice_room = 0;
-        self.voice_rooms.clear();
-        self.voice_streams.clear();
     }
 
     /// Sidebar dock while the call runs in another channel or conversation.
@@ -423,10 +454,14 @@ impl Voxhold {
                 modifiers.platform,
             ) && !editor_focused
             {
-                panel.update(cx, |panel, cx| {
-                    panel.set_push_to_talk_held(true);
-                    cx.notify();
-                });
+                // Windows sets `is_held` on an auto-repeat. Only a fresh press
+                // may open the hold; the repeat is consumed but ignored.
+                if !event.is_held {
+                    panel.update(cx, |panel, cx| {
+                        panel.activate_push_to_talk(hotkey.clone());
+                        cx.notify();
+                    });
+                }
                 return true;
             }
         }
@@ -489,13 +524,28 @@ impl Voxhold {
         if prefs.input_mode != "push_to_talk" {
             return false;
         }
-        let hotkey = Hotkey::parse(&prefs.push_to_talk);
-        if event.keystroke.key.to_lowercase() == hotkey.key {
-            let _ = window;
-            panel.update(cx, |panel, _| panel.release_push_to_talk());
-            return true;
-        }
-        false
+        let key = event.keystroke.key.to_lowercase();
+        let _ = window;
+        panel.update(cx, |panel, _| panel.release_push_to_talk_key(&key))
+    }
+
+    /// A required modifier was released while the main key is still down.
+    pub(super) fn voice_modifiers_changed(
+        &mut self,
+        modifiers: gpui::Modifiers,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(panel) = &self.voice else {
+            return false;
+        };
+        panel.update(cx, |panel, _| {
+            panel.release_push_to_talk_modifiers(
+                modifiers.control,
+                modifiers.shift,
+                modifiers.alt,
+                modifiers.platform,
+            )
+        })
     }
 
     /// Mouse forwarding for the player drag/resize. The player can leave its

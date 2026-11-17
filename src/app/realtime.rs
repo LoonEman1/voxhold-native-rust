@@ -354,6 +354,10 @@ impl Voxhold {
             {
                 effect.access = true;
                 effect.recording_access = true;
+                // Snapshots precede this event. Hide them until the fresh
+                // channel list confirms the rooms that are still readable.
+                #[cfg(feature = "voxhold-media")]
+                self.voice_unconfirmed.insert(self.server);
             }
             "server.member_joined" | "server.member_role_updated"
                 if data["server_id"].as_i64() == Some(self.server) =>
@@ -407,8 +411,11 @@ impl Voxhold {
             }
             #[cfg(feature = "voxhold-media")]
             "stream.snapshot" => {
+                // The account socket covers every available server. Keep all
+                // of them scoped by server and channel; visibility is applied
+                // when a room is read.
                 let mut rooms: std::collections::HashMap<
-                    i64,
+                    (i64, i64),
                     Vec<voxhold_media::controller::Publication>,
                 > = std::collections::HashMap::new();
                 if let Some(streams) = data["streams"].as_array() {
@@ -418,14 +425,14 @@ impl Voxhold {
                         >(value.clone()) else {
                             continue;
                         };
-                        if publication.server_id != self.server
+                        if publication.server_id <= 0
+                            || publication.channel_id <= 0
                             || publication.publisher_connection_id.is_empty()
-                            || !self.visible_voice_room(publication.channel_id)
                         {
                             continue;
                         }
                         rooms
-                            .entry(publication.channel_id)
+                            .entry((publication.server_id, publication.channel_id))
                             .or_default()
                             .push(publication);
                     }
@@ -440,16 +447,14 @@ impl Voxhold {
                 else {
                     return effect;
                 };
-                if publication.server_id != self.server
+                if publication.server_id <= 0
+                    || publication.channel_id <= 0
                     || publication.publisher_connection_id.is_empty()
-                    || !self.visible_voice_room(publication.channel_id)
                 {
                     return effect;
                 }
-                let list = self
-                    .voice_streams
-                    .entry(publication.channel_id)
-                    .or_default();
+                let key = (publication.server_id, publication.channel_id);
+                let list = self.voice_streams.entry(key).or_default();
                 if let Some(existing) = list
                     .iter_mut()
                     .find(|old| old.publisher_connection_id == publication.publisher_connection_id)
@@ -462,20 +467,21 @@ impl Voxhold {
             }
             #[cfg(feature = "voxhold-media")]
             "stream.stopped" => {
-                let server = data["server_id"].as_i64();
+                let server = data["server_id"].as_i64().unwrap_or_default();
                 let channel = data["channel_id"].as_i64().unwrap_or_default();
                 let publisher = data["publisher_connection_id"].as_str().unwrap_or_default();
-                if server != Some(self.server) || !self.visible_voice_room(channel) {
+                if server <= 0 || channel <= 0 {
                     return effect;
                 }
-                if let Some(list) = self.voice_streams.get_mut(&channel) {
+                let key = (server, channel);
+                if let Some(list) = self.voice_streams.get_mut(&key) {
                     if publisher.is_empty() {
                         list.clear();
                     } else {
                         list.retain(|old| old.publisher_connection_id != publisher);
                     }
                     if list.is_empty() {
-                        self.voice_streams.remove(&channel);
+                        self.voice_streams.remove(&key);
                     }
                 }
                 effect.voice_rooms = true;
@@ -483,7 +489,7 @@ impl Voxhold {
             #[cfg(feature = "voxhold-media")]
             "voice.snapshot" => {
                 let mut rooms: std::collections::HashMap<
-                    i64,
+                    (i64, i64),
                     Vec<voxhold_media::controller::Participant>,
                 > = std::collections::HashMap::new();
                 if let Some(participants) = data["participants"].as_array() {
@@ -493,14 +499,14 @@ impl Voxhold {
                         >(value.clone()) else {
                             continue;
                         };
-                        if participant.server_id != self.server
+                        if participant.server_id <= 0
+                            || participant.channel_id <= 0
                             || participant.connection_id.is_empty()
-                            || !self.visible_voice_room(participant.channel_id)
                         {
                             continue;
                         }
                         rooms
-                            .entry(participant.channel_id)
+                            .entry((participant.server_id, participant.channel_id))
                             .or_default()
                             .push(participant);
                     }
@@ -516,20 +522,20 @@ impl Voxhold {
                     return effect;
                 };
                 if participant.connection_id.is_empty()
-                    || participant.server_id != self.server
-                    || !self.visible_voice_room(participant.channel_id)
+                    || participant.server_id <= 0
+                    || participant.channel_id <= 0
                 {
                     return effect;
                 }
-                // A connection may move between rooms: remove its old copy
-                // from every room before inserting it into the new one.
+                // A connection may move between rooms or servers: remove its
+                // old copy from every cached roster before inserting it.
                 for roster in self.voice_rooms.values_mut() {
                     roster.retain(|old| old.connection_id != participant.connection_id);
                 }
                 self.voice_rooms.retain(|_, roster| !roster.is_empty());
                 if kind != "voice.participant_left" {
                     self.voice_rooms
-                        .entry(participant.channel_id)
+                        .entry((participant.server_id, participant.channel_id))
                         .or_default()
                         .push(participant);
                 }

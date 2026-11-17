@@ -82,6 +82,14 @@ impl Render for Voxhold {
                     cx.stop_propagation();
                 }
             }))
+            .on_modifiers_changed(
+                cx.listener(|s, event: &gpui::ModifiersChangedEvent, _, cx| {
+                    #[cfg(feature = "voxhold-media")]
+                    if s.voice_modifiers_changed(event.modifiers, cx) {
+                        cx.stop_propagation();
+                    }
+                }),
+            )
             .on_mouse_move(cx.listener(|s, event: &gpui::MouseMoveEvent, _, cx| {
                 #[cfg(feature = "voxhold-media")]
                 s.voice_pointer_moved(event.position, cx);

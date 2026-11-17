@@ -43,23 +43,63 @@ fn control_slots_keep_only_the_latest_value() {
 }
 
 #[test]
-fn a_pending_watch_is_replaced_and_cleared_by_close() {
+fn watch_and_close_share_one_last_value_slot() {
     let requests = Requests::default();
-    *requests.watch.lock().unwrap() = Some(publication("b"));
-    *requests.watch.lock().unwrap() = Some(publication("c"));
+    *requests.stream.lock().unwrap() = Some(StreamCommand::Watch {
+        selection: 1,
+        publication: publication("b"),
+    });
+    *requests.stream.lock().unwrap() = Some(StreamCommand::Watch {
+        selection: 2,
+        publication: publication("c"),
+    });
     match requests.take() {
-        Some(Pending::Watch(publication)) => {
-            assert_eq!(publication.publisher_connection_id, "c")
+        Some(Pending::Stream(StreamCommand::Watch {
+            selection,
+            publication,
+        })) => {
+            assert_eq!(selection, 2);
+            assert_eq!(publication.publisher_connection_id, "c");
         }
         _ => panic!("the last selection wins"),
     }
-    *requests.watch.lock().unwrap() = Some(publication("d"));
-    requests.leave_stream.store(true, Ordering::SeqCst);
-    assert!(matches!(requests.take(), Some(Pending::LeaveStream)));
-    assert!(
-        requests.watch.lock().unwrap().is_none(),
-        "closing drops the queued selection"
-    );
+    *requests.stream.lock().unwrap() = Some(StreamCommand::Watch {
+        selection: 3,
+        publication: publication("d"),
+    });
+    // A close from a stale caller must not erase the newer watch.
+    *requests.stream.lock().unwrap() = Some(StreamCommand::Close { selection: 1 });
+    *requests.stream.lock().unwrap() = Some(StreamCommand::Watch {
+        selection: 3,
+        publication: publication("d"),
+    });
+    assert!(matches!(
+        requests.take(),
+        Some(Pending::Stream(StreamCommand::Watch { selection: 3, .. }))
+    ));
+    *requests.stream.lock().unwrap() = Some(StreamCommand::Close { selection: 3 });
+    assert!(matches!(
+        requests.take(),
+        Some(Pending::Stream(StreamCommand::Close { selection: 3 }))
+    ));
+    assert!(requests.stream.lock().unwrap().is_none());
+
+    // A delayed close for the previous selection cannot erase B.
+    assert!(set_stream_command(
+        &requests,
+        StreamCommand::Watch {
+            selection: 5,
+            publication: publication("b"),
+        }
+    ));
+    assert!(!set_stream_command(
+        &requests,
+        StreamCommand::Close { selection: 4 }
+    ));
+    assert!(matches!(
+        requests.take(),
+        Some(Pending::Stream(StreamCommand::Watch { selection: 5, .. }))
+    ));
 }
 
 #[test]
@@ -80,17 +120,22 @@ fn local_mutes_are_bounded() {
 }
 
 #[test]
-fn updates_coalesce_high_frequency_values_and_keep_terminal_events() {
+fn updates_coalesce_high_frequency_values_and_keep_the_terminal_reason() {
     let updates = Updates::new();
     let mut speaking = HashMap::new();
     speaking.insert("a".to_string(), true);
     updates.push(VoiceUpdate::Speaking(speaking.clone()));
     speaking.insert("a".to_string(), false);
     updates.push(VoiceUpdate::Speaking(speaking));
-    updates.push(VoiceUpdate::StreamStatus("first".into()));
-    updates.push(VoiceUpdate::StreamStatus("second".into()));
-    updates.push(VoiceUpdate::Error("failed".into()));
-    updates.push(VoiceUpdate::Left);
+    updates.push(VoiceUpdate::StreamStatus {
+        selection: 4,
+        status: "first".into(),
+    });
+    updates.push(VoiceUpdate::StreamStatus {
+        selection: 4,
+        status: "second".into(),
+    });
+    updates.push(VoiceUpdate::Ended(Some("failed".into())));
     let mut kinds = Vec::new();
     while let Some(update) = updates.poll() {
         kinds.push(match update {
@@ -98,16 +143,22 @@ fn updates_coalesce_high_frequency_values_and_keep_terminal_events() {
                 assert!(!map["a"]);
                 "speaking"
             }
-            VoiceUpdate::StreamStatus(status) => {
+            VoiceUpdate::StreamStatus { status, .. } => {
                 assert_eq!(status, "second");
                 "status"
             }
-            VoiceUpdate::Left => "left",
-            VoiceUpdate::Error(_) => "error",
+            VoiceUpdate::Ended(Some(reason)) => {
+                assert_eq!(reason, "failed");
+                "ended"
+            }
             _ => "other",
         });
     }
-    assert_eq!(kinds, vec!["speaking", "status", "left"]);
+    assert_eq!(
+        kinds,
+        vec!["speaking", "status", "ended"],
+        "the end must keep the error reason"
+    );
 }
 
 #[test]

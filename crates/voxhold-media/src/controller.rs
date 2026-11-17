@@ -61,6 +61,10 @@ pub struct VoiceController {
     /// Pre-gate local microphone level of the real capture track.
     pub local_level: f64,
     owners: HashMap<String, String>,
+    /// Last known mid for every receiver track. Renegotiation replaces the
+    /// mid -> owner map; without this link an existing receiver whose
+    /// `on_track` is not repeated would lose its owner and its gain.
+    track_mids: HashMap<String, String>,
     tracks: HashMap<String, String>,
 }
 impl VoiceController {
@@ -78,6 +82,7 @@ impl VoiceController {
             server_muted: false,
             local_level: 0.0,
             owners: HashMap::new(),
+            track_mids: HashMap::new(),
             tracks: HashMap::new(),
         }
     }
@@ -142,7 +147,7 @@ impl VoiceController {
     /// Audible gain of one participant: the configured output volume, zero for
     /// a local mute. Stream audio is a separate engine and is not affected.
     fn gain_for(&self, owner: &str) -> f64 {
-        if self.local_mutes.contains(owner) {
+        if self.controls.deafened || self.local_mutes.contains(owner) {
             0.0
         } else {
             self.controls.output_gain.unwrap_or(1.0).clamp(0.0, 2.0)
@@ -162,6 +167,7 @@ impl VoiceController {
                 mid: Some(mid),
                 ..
             } => {
+                self.track_mids.insert(track_id.clone(), mid.clone());
                 if let Some(owner) = self.owners.get(&mid) {
                     self.tracks.insert(track_id.clone(), owner.clone());
                     return vec![Action::Media(Command::Volume {
@@ -237,9 +243,30 @@ impl VoiceController {
             }
             "voice.webrtc_offer" if self.joined => {
                 if let Some(sdp) = data["sdp"].as_str().filter(|s| !s.is_empty()) {
-                    self.owners = track_owners(sdp);
-                    self.tracks.clear();
-                    vec![Action::Media(Command::Offer { sdp: sdp.into() })]
+                    let owners = track_owners(sdp);
+                    let known: Vec<_> = self
+                        .track_mids
+                        .iter()
+                        .map(|(track, mid)| (track.clone(), mid.clone()))
+                        .collect();
+                    for (track, mid) in known {
+                        if let Some(owner) = owners.get(&mid) {
+                            self.tracks.insert(track, owner.clone());
+                        } else {
+                            self.tracks.remove(&track);
+                        }
+                    }
+                    self.owners = owners;
+                    let mut actions = vec![Action::Media(Command::Offer { sdp: sdp.into() })];
+                    // Apply the configured gain again to receivers that
+                    // survived the renegotiation without another on_track.
+                    for (track, owner) in &self.tracks {
+                        actions.push(Action::Media(Command::Volume {
+                            track_id: track.clone(),
+                            gain: self.gain_for(owner),
+                        }));
+                    }
+                    actions
                 } else {
                     vec![Action::Closed("Некорректное предложение WebRTC")]
                 }
@@ -375,6 +402,47 @@ mod tests {
         assert!(state.muted);
         controller.server_muted = false;
         assert!(!controller.effective().muted);
+    }
+
+    #[test]
+    fn a_renegotiation_keeps_receiver_owners_and_reapplies_gain() {
+        let mut controller = VoiceController::new(1, 2, Controls::default(), false);
+        controller.joined = true;
+        controller.owners.insert("0".into(), "alice".into());
+        let track = controller.media_event(Event::Track {
+            track_id: "track-alice".into(),
+            stream_id: None,
+            mid: Some("0".into()),
+        });
+        assert!(matches!(
+            track.first(),
+            Some(Action::Media(Command::Volume { gain, .. })) if (*gain - 1.0).abs() < f64::EPSILON
+        ));
+        controller.update_controls(
+            Controls {
+                output_gain: Some(0.5),
+                ..Controls::default()
+            },
+            false,
+        );
+        let actions = controller.on_signal(
+            "voice.webrtc_offer",
+            &json!({
+                "sdp": "m=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=mid:0\r\na=msid:x audio-alice\r\n"
+            }),
+        );
+        assert!(
+            actions.iter().any(|action| matches!(
+                action,
+                Action::Media(Command::Volume { track_id, gain })
+                    if track_id == "track-alice" && (*gain - 0.5).abs() < f64::EPSILON
+            )),
+            "the surviving receiver keeps its owner and numeric gain: {actions:?}"
+        );
+        assert!(matches!(
+            actions.first(),
+            Some(Action::Media(Command::Offer { .. }))
+        ));
     }
 
     #[test]

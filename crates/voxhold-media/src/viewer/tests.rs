@@ -61,7 +61,7 @@ fn switching_to_b_then_c_starts_only_c_after_the_leave_ack() {
     snapshot(&mut viewer, &[a.clone(), b.clone(), c.clone()], now);
     assert!(viewer.set_joined(true, now).is_empty());
 
-    let started = viewer.select(&a, now);
+    let started = viewer.select(&a, 1, now);
     let (watch_a, current) = start_of(&started);
     assert_eq!(current.publisher_connection_id, "a");
     assert_eq!(
@@ -74,10 +74,10 @@ fn switching_to_b_then_c_starts_only_c_after_the_leave_ack() {
     );
 
     // A is running; the user picks B and immediately C.
-    let to_b = viewer.select(&b, now);
+    let to_b = viewer.select(&b, 1, now);
     let leave = sends(&to_b, "stream.leave");
     assert_eq!(leave.len(), 1, "the first switch must leave A: {to_b:?}");
-    let to_c = viewer.select(&c, now);
+    let to_c = viewer.select(&c, 1, now);
     assert!(
         sends(&to_c, "stream.leave").is_empty(),
         "leave is already in flight"
@@ -130,9 +130,9 @@ fn stopping_a_does_not_stop_the_active_b() {
     let mut viewer = Viewer::new(1, 10);
     snapshot(&mut viewer, &[a.clone(), b.clone()], now);
     viewer.set_joined(true, now);
-    start_of(&viewer.select(&a, now));
+    start_of(&viewer.select(&a, 1, now));
     // Switch to B and let A leave.
-    let switching = viewer.select(&b, now);
+    let switching = viewer.select(&b, 1, now);
     let leave = sends(&switching, "stream.leave");
     let ack = viewer.on_server_event("stream.left", &leave[0], &json!({}), now);
     start_of(&ack);
@@ -172,7 +172,7 @@ fn stopping_a_does_not_stop_the_active_b() {
     );
     assert!(viewer.watching().is_none());
     assert!(outcomes.iter().any(
-        |outcome| matches!(outcome, Outcome::Failed(message) if message == "Трансляция завершена")
+        |outcome| matches!(outcome, Outcome::Failed { message, .. } if message == "Трансляция завершена")
     ));
 }
 
@@ -208,13 +208,17 @@ fn a_closed_call_keeps_the_selection_but_not_the_engine() {
     let mut viewer = Viewer::new(1, 10);
     snapshot(&mut viewer, &[a.clone()], now);
     viewer.set_joined(true, now);
-    let (_, _) = start_of(&viewer.select(&a, now));
+    let (_, _) = start_of(&viewer.select(&a, 1, now));
     let gone = viewer.set_joined(false, now);
     assert!(gone.contains(&Outcome::Close));
     assert!(viewer.watching().is_none());
     assert_eq!(viewer.intent().unwrap().publisher_connection_id, "a");
-    // A fresh join restarts the selected publication with a new attempt.
-    let back = viewer.set_joined(true, now);
+    // Neither the stale selection nor the old catalog may start before the
+    // fresh snapshot arrives, in either order.
+    assert!(viewer.set_joined(true, now).is_empty());
+    let without_snapshot = viewer.tick(now + START_TIMEOUT);
+    assert!(without_snapshot.is_empty());
+    let back = snapshot(&mut viewer, &[a.clone()], now);
     let (watch, publication) = start_of(&back);
     assert!(watch.starts_with("native-stream-"));
     assert_eq!(publication.publisher_connection_id, "a");
@@ -227,7 +231,7 @@ fn request_errors_and_stale_requests_are_separated_by_id() {
     let mut viewer = Viewer::new(1, 10);
     snapshot(&mut viewer, &[a.clone()], now);
     viewer.set_joined(true, now);
-    let (watch, _) = start_of(&viewer.select(&a, now));
+    let (watch, _) = start_of(&viewer.select(&a, 1, now));
     // An error that is not a stream request belongs to the voice join.
     let ignored =
         viewer.on_server_event("error", "voice-join-1", &json!({"code":"forbidden"}), now);
@@ -235,7 +239,7 @@ fn request_errors_and_stale_requests_are_separated_by_id() {
     // The real watch request failing ends the viewer with its own text.
     let failed = viewer.on_server_event("error", &watch, &json!({"code":"forbidden"}), now);
     assert!(failed.iter().any(
-        |outcome| matches!(outcome, Outcome::Failed(message) if message.contains("просмотр"))
+        |outcome| matches!(outcome, Outcome::Failed { message, .. } if message.contains("просмотр"))
     ));
     assert!(viewer.watching().is_none());
     assert!(viewer.intent().is_none());
@@ -251,7 +255,7 @@ fn revocation_and_server_leave_end_the_viewer_with_their_reason() {
     let mut viewer = Viewer::new(1, 10);
     snapshot(&mut viewer, &[a.clone()], now);
     viewer.set_joined(true, now);
-    start_of(&viewer.select(&a, now));
+    start_of(&viewer.select(&a, 1, now));
     let revoked = viewer.on_server_event(
         "stream.webrtc_closed",
         "",
@@ -259,17 +263,17 @@ fn revocation_and_server_leave_end_the_viewer_with_their_reason() {
         now,
     );
     assert!(revoked.iter().any(
-        |outcome| matches!(outcome, Outcome::Failed(message) if message == "Трансляция завершена")
+        |outcome| matches!(outcome, Outcome::Failed { message, .. } if message == "Трансляция завершена")
     ));
 
     let mut viewer = Viewer::new(1, 10);
     snapshot(&mut viewer, &[a.clone()], now);
     viewer.set_joined(true, now);
-    start_of(&viewer.select(&a, now));
+    start_of(&viewer.select(&a, 1, now));
     let left = viewer.on_server_event("stream.left", "", &json!({}), now);
     assert!(
         left.iter()
-            .any(|outcome| matches!(outcome, Outcome::Failed(message) if message.contains("завершён сервером")))
+            .any(|outcome| matches!(outcome, Outcome::Failed { message, .. } if message.contains("завершён сервером")))
     );
     assert!(viewer.intent().is_none());
 }
@@ -282,7 +286,7 @@ fn recovery_is_bounded_and_always_targets_the_active_publisher() {
     let mut viewer = Viewer::new(1, 10);
     snapshot(&mut viewer, &[a.clone()], now);
     viewer.set_joined(true, now);
-    start_of(&viewer.select(&a, now));
+    start_of(&viewer.select(&a, 1, now));
     let first = viewer.on_engine_state("disconnected", now);
     let restart = sends(&first, "stream.p2p_restart");
     assert_eq!(restart.len(), 1);
@@ -293,7 +297,7 @@ fn recovery_is_bounded_and_always_targets_the_active_publisher() {
     assert!(sends(&third, "stream.p2p_restart").is_empty());
     let deadline = viewer.tick(now + START_TIMEOUT + Duration::from_millis(1));
     assert!(deadline.iter().any(
-        |outcome| matches!(outcome, Outcome::Failed(message) if message.contains("восстановить"))
+        |outcome| matches!(outcome, Outcome::Failed { message, .. } if message.contains("восстановить"))
     ));
 }
 
@@ -305,8 +309,8 @@ fn a_leave_without_ack_is_abandoned_after_the_deadline() {
     let mut viewer = Viewer::new(1, 10);
     snapshot(&mut viewer, &[a.clone(), b.clone()], now);
     viewer.set_joined(true, now);
-    start_of(&viewer.select(&a, now));
-    viewer.select(&b, now);
+    start_of(&viewer.select(&a, 1, now));
+    viewer.select(&b, 1, now);
     assert!(
         viewer
             .tick(now + LEAVE_TIMEOUT - Duration::from_millis(1))
@@ -315,7 +319,7 @@ fn a_leave_without_ack_is_abandoned_after_the_deadline() {
     );
     let expired = viewer.tick(now + LEAVE_TIMEOUT + Duration::from_millis(1));
     assert!(expired.iter().any(
-        |outcome| matches!(outcome, Outcome::Failed(message) if message.contains("предыдущий"))
+        |outcome| matches!(outcome, Outcome::Failed { message, .. } if message.contains("предыдущий"))
     ));
     assert!(viewer.intent().is_none());
 }
@@ -327,11 +331,234 @@ fn mute_only_changes_the_stream_attempt() {
     let mut viewer = Viewer::new(1, 10);
     snapshot(&mut viewer, &[a.clone()], now);
     viewer.set_joined(true, now);
-    start_of(&viewer.select(&a, now));
-    assert_eq!(viewer.set_muted(true), vec![Outcome::Mute(true)]);
+    start_of(&viewer.select(&a, 1, now));
+    assert_eq!(
+        viewer.set_muted(1, true),
+        vec![Outcome::Mute {
+            selection: 1,
+            muted: true
+        }]
+    );
     assert!(viewer.muted());
     viewer.leave(now);
     assert!(!viewer.muted());
+}
+
+#[test]
+fn late_signaling_and_an_untagged_close_from_a_do_not_touch_b() {
+    let now = Instant::now();
+    let a = publication("a", 1);
+    let b = publication("b", 2);
+    let mut viewer = Viewer::new(1, 10);
+    snapshot(&mut viewer, &[a.clone(), b.clone()], now);
+    viewer.set_joined(true, now);
+    let (watch_a, _) = start_of(&viewer.select(&a, 1, now));
+    // A's accepted offer establishes the gereration that must be retired.
+    let accepted = viewer.on_server_event(
+        "stream.webrtc_offer",
+        "",
+        &json!({"sdp":"v=0\r\na=ice-ufrag:a-ufrag\r\n"}),
+        now,
+    );
+    assert_eq!(
+        accepted,
+        vec![Outcome::Offer("v=0\r\na=ice-ufrag:a-ufrag\r\n".into())]
+    );
+
+    let switching = viewer.select(&b, 2, now);
+    let leave = sends(&switching, "stream.leave");
+    let ack = viewer.on_server_event("stream.left", &leave[0], &json!({}), now);
+    start_of(&ack);
+
+    let stale_offer = viewer.on_server_event(
+        "stream.webrtc_offer",
+        "",
+        &json!({"sdp":"v=0\r\na=ice-ufrag:a-ufrag\r\n"}),
+        now,
+    );
+    assert!(stale_offer.is_empty(), "retired offer: {stale_offer:?}");
+    let stale_ice = viewer.on_server_event(
+        "stream.ice_candidate",
+        "",
+        &json!({"candidate":"candidate:1 1 udp 1 127.0.0.1 9 typ host ufrag a-ufrag"}),
+        now,
+    );
+    assert!(stale_ice.is_empty(), "retired ICE: {stale_ice:?}");
+    let stale_close = viewer.on_server_event(
+        "stream.webrtc_closed",
+        "",
+        &json!({"reason":"disconnected"}),
+        now,
+    );
+    assert!(stale_close.is_empty(), "stale close: {stale_close:?}");
+    let tagged_stale = viewer.on_server_event(
+        "stream.webrtc_closed",
+        "",
+        &json!({"watch_id":watch_a,"reason":"permission revoked"}),
+        now,
+    );
+    assert!(
+        tagged_stale.is_empty(),
+        "a close tagged with A's watch id must not end B: {tagged_stale:?}"
+    );
+    assert_eq!(
+        viewer
+            .watching()
+            .unwrap()
+            .publication
+            .publisher_connection_id,
+        "b"
+    );
+
+    // B's own offer is accepted and ends the stale-close grace.
+    let current = viewer.on_server_event(
+        "stream.webrtc_offer",
+        "",
+        &json!({"sdp":"v=0\r\na=ice-ufrag:b-ufrag\r\n"}),
+        now,
+    );
+    assert_eq!(
+        current,
+        vec![Outcome::Offer("v=0\r\na=ice-ufrag:b-ufrag\r\n".into())]
+    );
+    let close_b = viewer.on_server_event(
+        "stream.webrtc_closed",
+        "",
+        &json!({"reason":"disconnected"}),
+        now,
+    );
+    assert!(
+        !close_b.is_empty(),
+        "a close after B's own signaling belongs to B"
+    );
+}
+
+#[test]
+fn an_offer_before_the_watching_ack_is_kept_for_that_attempt() {
+    let now = Instant::now();
+    let a = publication("a", 1);
+    let mut viewer = Viewer::new(1, 10);
+    snapshot(&mut viewer, &[a.clone()], now);
+    viewer.set_joined(true, now);
+    start_of(&viewer.select(&a, 1, now));
+    let early = viewer.on_server_event(
+        "stream.webrtc_offer",
+        "",
+        &json!({"sdp":"v=0\r\na=ice-ufrag:early\r\n"}),
+        now,
+    );
+    assert_eq!(
+        early,
+        vec![Outcome::Offer("v=0\r\na=ice-ufrag:early\r\n".into())]
+    );
+}
+
+#[test]
+fn reconnect_never_substitutes_another_connection_of_the_same_user() {
+    let now = Instant::now();
+    let a = publication("a", 1);
+    let b = publication("b", 1);
+    let mut viewer = Viewer::new(1, 10);
+    snapshot(&mut viewer, &[a.clone(), b.clone()], now);
+    viewer.set_joined(true, now);
+    start_of(&viewer.select(&a, 7, now));
+
+    viewer.set_joined(false, now);
+    // The fresh snapshot has only B, owned by the same user.
+    let fresh = snapshot(&mut viewer, &[b], now);
+    assert!(
+        !fresh
+            .iter()
+            .any(|outcome| matches!(outcome, Outcome::Start { .. })),
+        "the stale connection must not be re-targeted"
+    );
+    let joined = viewer.set_joined(true, now);
+    assert!(
+        !joined
+            .iter()
+            .any(|outcome| matches!(outcome, Outcome::Start { .. })),
+        "only an exact publication can be watched"
+    );
+    assert!(joined.iter().any(|outcome| matches!(
+        outcome,
+        Outcome::Failed { selection: 7, message } if message.contains("недоступна")
+    )));
+    assert!(viewer.intent().is_none());
+}
+
+#[test]
+fn a_first_frame_after_recovery_disarms_the_old_deadline() {
+    let now = Instant::now();
+    let a = publication("a", 1);
+    let mut viewer = Viewer::new(1, 10);
+    snapshot(&mut viewer, &[a.clone()], now);
+    viewer.set_joined(true, now);
+    start_of(&viewer.select(&a, 1, now));
+    assert!(!viewer.on_frame().is_empty());
+    let left = viewer.on_engine_state("disconnected", now);
+    assert!(left.iter().any(|outcome| matches!(
+        outcome,
+        Outcome::Connected {
+            selection: 1,
+            connected: false
+        }
+    )));
+    let back = viewer.on_frame();
+    assert!(back.iter().any(|outcome| matches!(
+        outcome,
+        Outcome::Status { selection: 1, text } if text == "Подключено"
+    )));
+    assert!(
+        viewer
+            .tick(now + START_TIMEOUT + Duration::from_millis(1))
+            .is_empty(),
+        "a working picture must not be closed by the old recovery deadline"
+    );
+    assert!(viewer.watching().is_some());
+}
+
+#[test]
+fn a_close_for_the_previous_selection_does_not_end_the_new_one() {
+    let now = Instant::now();
+    let a = publication("a", 1);
+    let b = publication("b", 2);
+    let mut viewer = Viewer::new(1, 10);
+    snapshot(&mut viewer, &[a.clone(), b.clone()], now);
+    viewer.set_joined(true, now);
+    start_of(&viewer.select(&a, 1, now));
+    let switching = viewer.select(&b, 2, now);
+    let leave = sends(&switching, "stream.leave");
+    viewer.on_server_event("stream.left", &leave[0], &json!({}), now);
+    let stale = viewer.leave_selection(1, now);
+    assert!(stale.is_empty(), "close A must not close B: {stale:?}");
+    assert_eq!(
+        viewer
+            .watching()
+            .unwrap()
+            .publication
+            .publisher_connection_id,
+        "b"
+    );
+    let current = viewer.leave_selection(2, now);
+    assert!(current.contains(&Outcome::Close));
+    assert!(viewer.watching().is_none());
+}
+
+#[test]
+fn a_publication_missing_before_the_watch_command_is_rejected_explicitly() {
+    let now = Instant::now();
+    let a = publication("a", 1);
+    let mut viewer = Viewer::new(1, 10);
+    snapshot(&mut viewer, &[a.clone()], now);
+    viewer.set_joined(true, now);
+    let mut missing = publication("gone", 2);
+    missing.channel_id = 10;
+    let rejected = viewer.select(&missing, 9, now);
+    assert!(rejected.iter().any(|outcome| matches!(
+        outcome,
+        Outcome::Failed { selection: 9, message } if message.contains("недоступна")
+    )));
+    assert!(viewer.watching().is_none());
 }
 
 #[test]
@@ -341,11 +568,15 @@ fn closing_the_player_releases_the_attempt_but_keeps_the_selection_empty() {
     let mut viewer = Viewer::new(1, 10);
     snapshot(&mut viewer, &[a.clone()], now);
     viewer.set_joined(true, now);
-    start_of(&viewer.select(&a, now));
+    start_of(&viewer.select(&a, 1, now));
     let closed = viewer.leave(now);
     assert!(closed.contains(&Outcome::Close));
     assert_eq!(sends(&closed, "stream.leave").len(), 1);
-    assert!(closed.contains(&Outcome::Clear));
+    assert!(
+        closed
+            .iter()
+            .any(|outcome| matches!(outcome, Outcome::Clear { selection: 1 }))
+    );
     assert!(viewer.watching().is_none());
     assert!(viewer.intent().is_none());
 }

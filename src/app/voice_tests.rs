@@ -111,7 +111,7 @@ fn fixture(
         panel.update(cx, |panel, _| {
             panel.set_rooms(rooms);
             panel.set_self_user(2);
-            panel.set_room(7, Vec::new());
+            panel.set_room_state(7, Vec::new(), Vec::new());
             panel.test_set_call(
                 7,
                 CallPhase::Connected,
@@ -297,7 +297,7 @@ async fn push_to_talk_press_and_release_reach_the_panel(cx: &mut TestAppContext)
     draw(&mut visual);
     visual.simulate_event(gpui::KeyDownEvent {
         keystroke: Keystroke::parse("space").unwrap(),
-        is_held: true,
+        is_held: false,
     });
     voice.read_with(&*visual, |panel, _| {
         assert!(panel.test_ptt_held(), "the configured key opens the hold");
@@ -312,7 +312,7 @@ async fn push_to_talk_press_and_release_reach_the_panel(cx: &mut TestAppContext)
     // Losing focus releases the hold too.
     visual.simulate_event(gpui::KeyDownEvent {
         keystroke: Keystroke::parse("space").unwrap(),
-        is_held: true,
+        is_held: false,
     });
     visual.update(|window, app| {
         voice.update(app, |panel, _| panel.release_push_to_talk());
@@ -330,10 +330,125 @@ async fn push_to_talk_press_and_release_reach_the_panel(cx: &mut TestAppContext)
     });
     visual.simulate_event(gpui::KeyDownEvent {
         keystroke: Keystroke::parse("space").unwrap(),
-        is_held: true,
+        is_held: false,
     });
     voice.read_with(&*visual, |panel, _| {
         assert!(!panel.test_ptt_held(), "a modal owns the keyboard");
+    });
+}
+
+#[gpui::test]
+async fn room_snapshots_follow_the_server_and_open_with_their_streams(cx: &mut TestAppContext) {
+    let (mut visual, view, voice) = fixture(cx);
+    draw(&mut visual);
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            v.voice_rooms.insert((1, 8), vec![participant("carol", 3)]);
+            v.voice_streams
+                .insert((1, 8), vec![publication(8, "carol-screen", 3)]);
+            assert_eq!(v.voice_count(8), 1, "the cached room is counted");
+            assert!(v.voice_has_stream(8));
+            v.channel = 8;
+            v.open_voice_room(8, window, cx);
+        });
+    });
+    draw(&mut visual);
+    voice.read_with(&*visual, |panel, _| {
+        assert_eq!(panel.room(), 8);
+        assert_eq!(
+            panel.room_streams().len(),
+            1,
+            "room and streams move together"
+        );
+        assert_eq!(
+            panel.room_streams()[0].publisher_connection_id,
+            "carol-screen"
+        );
+    });
+
+    // Another server keeps its own (server, channel) snapshot, so switching
+    // does not need a new media event.
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            v.server = 2;
+            v.channels = vec![channel(30, "Server B voice", "voice")];
+            v.channel = 30;
+            v.voice_rooms.insert((2, 30), vec![participant("dave", 4)]);
+            v.voice_streams
+                .insert((2, 30), vec![publication(30, "dave-screen", 4)]);
+            v.open_voice_room(30, window, cx);
+        });
+    });
+    draw(&mut visual);
+    voice.read_with(&*visual, |panel, _| {
+        assert_eq!(panel.room(), 30);
+        assert_eq!(panel.room_streams().len(), 1);
+        assert_eq!(
+            panel.room_streams()[0].publisher_connection_id,
+            "dave-screen"
+        );
+    });
+}
+
+#[gpui::test]
+async fn push_to_talk_closes_when_a_required_modifier_is_released(cx: &mut TestAppContext) {
+    let (mut visual, view, voice) = fixture(cx);
+    draw(&mut visual);
+    focus_room(&mut visual, &voice);
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            v.voice_settings.prefs.input_mode = "push_to_talk".into();
+            v.voice_settings.prefs.push_to_talk = "Ctrl+Space".into();
+            voice.update(cx, |panel, cx| {
+                panel.set_push_to_talk(true);
+                cx.notify();
+            });
+        });
+        let _ = window;
+    });
+    draw(&mut visual);
+
+    // A fresh combination opens the hold.
+    visual.simulate_event(gpui::KeyDownEvent {
+        keystroke: Keystroke::parse("ctrl-space").unwrap(),
+        is_held: false,
+    });
+    voice.read_with(&*visual, |panel, _| assert!(panel.test_ptt_held()));
+
+    // Releasing only Ctrl breaks Ctrl+Space even though Space is still down.
+    visual.simulate_event(gpui::KeyUpEvent {
+        keystroke: Keystroke::parse("control").unwrap(),
+    });
+    voice.read_with(&*visual, |panel, _| {
+        assert!(
+            !panel.test_ptt_held(),
+            "the released modifier closes the hold"
+        )
+    });
+
+    // An auto-repeat of the main key must not reopen it.
+    visual.simulate_event(gpui::KeyDownEvent {
+        keystroke: Keystroke::parse("ctrl-space").unwrap(),
+        is_held: true,
+    });
+    voice.read_with(&*visual, |panel, _| {
+        assert!(!panel.test_ptt_held(), "auto-repeat never opens the hold")
+    });
+
+    // A modifier transition reported on its own also closes the hold.
+    visual.simulate_event(gpui::KeyDownEvent {
+        keystroke: Keystroke::parse("ctrl-space").unwrap(),
+        is_held: false,
+    });
+    visual.simulate_event(gpui::ModifiersChangedEvent {
+        modifiers: gpui::Modifiers {
+            control: false,
+            ..Default::default()
+        },
+        capslock: Default::default(),
+    });
+    voice.read_with(&*visual, |panel, _| {
+        assert!(!panel.test_ptt_held(), "ModifiersChanged releases the hold")
     });
 }
 

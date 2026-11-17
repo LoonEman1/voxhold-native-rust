@@ -45,10 +45,20 @@ impl StreamCatalog {
             && (publication.mode == "server" || publication.mode == "p2p")
     }
 
-    pub fn get(&self, publisher_connection_id: &str) -> Option<&Publication> {
-        self.streams
-            .iter()
-            .find(|publication| publication.publisher_connection_id == publisher_connection_id)
+    /// Exact identity lookup. A server may carry several publications for the
+    /// same user from different connections, so the connection id is part of
+    /// the key and is never replaced by a "same user" fallback.
+    pub fn get(
+        &self,
+        server_id: i64,
+        channel_id: i64,
+        publisher_connection_id: &str,
+    ) -> Option<&Publication> {
+        self.streams.iter().find(|publication| {
+            publication.server_id == server_id
+                && publication.channel_id == channel_id
+                && publication.publisher_connection_id == publisher_connection_id
+        })
     }
 
     /// Replace the list with a snapshot. Returns whether the visible list
@@ -111,19 +121,6 @@ impl StreamCatalog {
             }
         });
         before != self.streams.len()
-    }
-
-    /// After a reconnect the same publisher may have a new connection. The
-    /// caller keeps the user id, never the stale connection, so the selected
-    /// publication is re-targeted only to an existing stream.
-    pub fn retarget(&self, publisher_user_id: i64, connection_id: &str) -> Option<Publication> {
-        if let Some(exact) = self.get(connection_id) {
-            return Some(exact.clone());
-        }
-        self.streams
-            .iter()
-            .find(|publication| publication.publisher_user_id == publisher_user_id)
-            .cloned()
     }
 }
 
@@ -196,18 +193,18 @@ mod tests {
     }
 
     #[test]
-    fn a_republication_gets_its_own_entry() {
+    fn a_republication_gets_its_own_entry_and_an_unknown_connection_is_not_retargeted() {
         let mut catalog = StreamCatalog::new(1, 10);
         catalog.replace([publication("old", 3)]);
         assert!(catalog.upsert(publication("new", 3)));
         assert_eq!(catalog.list().len(), 2);
         assert_eq!(
-            catalog.retarget(3, "old").unwrap().publisher_connection_id,
+            catalog.get(1, 10, "old").unwrap().publisher_connection_id,
             "old"
         );
-        assert_eq!(
-            catalog.retarget(3, "gone").unwrap().publisher_connection_id,
-            "old"
+        assert!(
+            catalog.get(1, 10, "gone").is_none(),
+            "another connection of the same user must never be substituted"
         );
     }
 }

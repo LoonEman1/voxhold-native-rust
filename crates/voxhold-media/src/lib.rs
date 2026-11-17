@@ -1,5 +1,6 @@
 pub mod catalog;
 pub mod controller;
+mod playout_volume;
 mod video;
 pub mod viewer;
 mod voice;
@@ -68,6 +69,10 @@ pub enum Command {
     },
     ViewAudio {
         muted: bool,
+    },
+    /// Switch the playout device of an already running stream player.
+    ViewOutput {
+        output: Option<String>,
     },
     Offer {
         sdp: String,
@@ -182,13 +187,18 @@ pub enum MediaError {
 
 impl Media {
     pub fn new() -> Result<Self, MediaError> {
+        Self::new_with_capture(Arc::new(CaptureGate::default()))
+    }
+
+    /// The voice session shares its capture gate with `VoiceHandle`, so leave
+    /// and push-to-talk release can silence the track without the worker.
+    pub fn new_with_capture(capture: Arc<CaptureGate>) -> Result<Self, MediaError> {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_time()
             .build()
             .map_err(|_| MediaError::Runtime)?;
         let (commands, rx) = mpsc::channel(COMMAND_CAPACITY);
         let events = Arc::new(Events::default());
-        let capture = Arc::new(CaptureGate::default());
         let video = Arc::new(VideoStore::default());
         let (worker_events, worker_capture, worker_video) =
             (events.clone(), capture.clone(), video.clone());
@@ -210,18 +220,31 @@ impl Media {
         // The microphone starts closed and only a confirmed media state opens
         // it. `Start` alone must never open the device: the join may still be
         // refused, and push-to-talk may hold the key.
-        if matches!(command, Command::Stop) {
-            self.capture.set_enabled(false);
-        }
-        if let Command::State(controls) = &command {
-            self.capture
-                .set_enabled(!controls.muted && !controls.deafened);
+        match &command {
+            Command::Start { .. } | Command::ViewStart { .. } => self.capture.reset(),
+            Command::Stop => self.capture.latch(),
+            Command::State(controls) => {
+                self.capture
+                    .set_local(!controls.muted && !controls.deafened);
+            }
+            _ => {}
         }
         self.commands.try_send(command).map_err(|err| match err {
             mpsc::error::TrySendError::Full(_) => MediaError::CommandQueueFull,
             mpsc::error::TrySendError::Closed(_) => MediaError::CommandQueueClosed,
         })
     }
+    /// Confirmed join. Separate from `State` so a late local control command
+    /// cannot open the microphone on its own.
+    pub fn set_joined(&self, joined: bool) {
+        self.capture.set_joined(joined);
+    }
+
+    /// Server mute/deafen folded into the media permission.
+    pub fn set_server_allowed(&self, allowed: bool) {
+        self.capture.set_server_allowed(allowed);
+    }
+
     pub fn poll(&self, wait: Duration) -> Option<Event> {
         self.events.poll(wait)
     }
@@ -241,7 +264,7 @@ impl Media {
 
 impl Drop for Media {
     fn drop(&mut self) {
-        self.capture.set_enabled(false);
+        self.capture.latch();
         // Close the channel before joining the worker.
         let (replacement, _) = mpsc::channel(1);
         drop(std::mem::replace(&mut self.commands, replacement));
@@ -311,6 +334,8 @@ mod tests {
             !capture.enabled(),
             "joining must not open the microphone before voice.joined"
         );
+        media.set_joined(true);
+        media.set_server_allowed(true);
         media
             .command(Command::State(Controls {
                 muted: false,
@@ -325,7 +350,14 @@ mod tests {
             }))
             .unwrap();
         assert!(!capture.enabled());
+        // A late unmute after Stop must not reopen the attempt.
         media.command(Command::Stop).unwrap();
+        media
+            .command(Command::State(Controls {
+                muted: false,
+                ..Controls::default()
+            }))
+            .unwrap();
         assert!(!capture.enabled());
     }
 }

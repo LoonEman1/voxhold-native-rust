@@ -408,8 +408,10 @@ impl Voxhold {
         self.composer_error.clear();
         #[cfg(feature = "voxhold-media")]
         {
-            self.voice_rooms.clear();
-            self.voice_streams.clear();
+            // The backend sends snapshots before `channels.changed`. Hide them
+            // until the fresh ACL list confirms which rooms still exist.
+            self.voice_unconfirmed.insert(self.server);
+            self.sync_voice_panel(cx);
         }
         self.clear_media(window);
         self.roster.reset_channel();
@@ -480,6 +482,8 @@ impl Voxhold {
                 match result {
                     Ok((channels, members)) => {
                         s.channels = channels;
+                        #[cfg(feature = "voxhold-media")]
+                        s.voice_unconfirmed.remove(&server);
                         // A notification form follows the account, not the
                         // administration role, but it still needs a readable
                         // text/news channel. Revoking access closes it.

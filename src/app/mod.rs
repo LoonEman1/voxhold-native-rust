@@ -251,12 +251,18 @@ pub(crate) struct Voxhold {
     /// Channel of the active call, mirrored from the panel for the dock.
     #[cfg(feature = "voxhold-media")]
     voice_channel: i64,
-    /// Confirmed rosters of visible voice rooms from `voice.*` events.
+    /// Confirmed rosters keyed by `(server_id, channel_id)`, so browsing
+    /// another server does not discard its cached room.
     #[cfg(feature = "voxhold-media")]
-    voice_rooms: std::collections::HashMap<i64, Vec<voxhold_media::controller::Participant>>,
-    /// Screen publications of visible voice rooms from `stream.*` events.
+    voice_rooms: std::collections::HashMap<(i64, i64), Vec<voxhold_media::controller::Participant>>,
+    /// Screen publications keyed by `(server_id, channel_id)`.
     #[cfg(feature = "voxhold-media")]
-    voice_streams: std::collections::HashMap<i64, Vec<voxhold_media::controller::Publication>>,
+    voice_streams:
+        std::collections::HashMap<(i64, i64), Vec<voxhold_media::controller::Publication>>,
+    /// While an ACL reload is pending, cached room data is hidden until the
+    /// fresh channel list confirms it again.
+    #[cfg(feature = "voxhold-media")]
+    voice_unconfirmed: std::collections::HashSet<i64>,
     servers: Vec<Server>,
     channels: Vec<Channel>,
     members: Vec<Member>,
@@ -532,6 +538,7 @@ impl Voxhold {
             #[cfg(feature = "voxhold-media")]
             voice_channel: 0,
             #[cfg(feature = "voxhold-media")]
+            voice_unconfirmed: std::collections::HashSet::new(),
             voice_rooms: std::collections::HashMap::new(),
             #[cfg(feature = "voxhold-media")]
             voice_streams: std::collections::HashMap::new(),

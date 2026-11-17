@@ -51,6 +51,14 @@ impl StreamViewer {
         Ok(())
     }
 
+    /// The output device setting is shared with the voice session, so a
+    /// running player must follow it too.
+    pub fn set_output(&mut self, output: Option<String>) -> Result<(), String> {
+        self.media
+            .command(Command::ViewOutput { output })
+            .map_err(|error| format!("{error:?}"))
+    }
+
     pub fn offer(&self, sdp: String) -> Result<(), String> {
         self.media
             .command(Command::Offer { sdp })

@@ -6,7 +6,7 @@
 //! the call keeps running in the dock.
 
 use crate::voice_room::{
-    self, CallPhase, Rect, Tone, VoiceAction, PLAYER_DEFAULT_WIDTH, VOICE_ACTIONS,
+    self, CallPhase, Hotkey, Rect, Tone, VoiceAction, PLAYER_DEFAULT_WIDTH, VOICE_ACTIONS,
 };
 use gpui::{
     div, img, prelude::*, px, rgb, Context, FocusHandle, MouseButton, RenderImage, Subscription,
@@ -85,6 +85,9 @@ pub struct VoicePanel {
     push_to_talk: bool,
     ptt_held: bool,
     ptt_blocked: bool,
+    /// Combination that opened the current hold. Releasing its main key or a
+    /// required modifier closes the capture; auto-repeat cannot reopen it.
+    ptt_combo: Option<Hotkey>,
     participants: Vec<Participant>,
     room_roster: Vec<Participant>,
     speaking: HashMap<String, bool>,
@@ -100,6 +103,11 @@ pub struct VoicePanel {
     stream_status: String,
     stream_error: String,
     stream_muted: bool,
+    /// Monotonic selection id. Every frame and status is tagged with it so a
+    /// late update from A can never touch the player showing B.
+    stream_selection: u64,
+    watching_selection: Option<u64>,
+    stream_connected: bool,
     watching: Option<Publication>,
     player_open: bool,
     player_area: Rect,
@@ -173,6 +181,7 @@ impl VoicePanel {
             push_to_talk,
             ptt_held: false,
             ptt_blocked: false,
+            ptt_combo: None,
             participants: Vec::new(),
             room_roster: Vec::new(),
             speaking: HashMap::new(),
@@ -186,6 +195,9 @@ impl VoicePanel {
             stream_status: String::new(),
             stream_error: String::new(),
             stream_muted: false,
+            stream_selection: 0,
+            watching_selection: None,
+            stream_connected: false,
             watching: None,
             player_open: false,
             player_area: Rect::default(),
@@ -257,27 +269,21 @@ impl VoicePanel {
         self.members = members;
     }
 
-    /// Switch the displayed room without touching the active call.
-    pub fn set_room(&mut self, room: i64, roster: Vec<Participant>) {
+    /// Switch the displayed room without touching the active call. Room,
+    /// roster and publications are one operation: a setter must never validate
+    /// against the old room and drop the new room's data.
+    pub fn set_room_state(
+        &mut self,
+        room: i64,
+        roster: Vec<Participant>,
+        streams: Vec<Publication>,
+    ) {
         if self.room != room {
             self.room = room;
             self.room_scroll = 0.0;
         }
         self.room_roster = roster;
-    }
-
-    pub fn set_room_roster(&mut self, room: i64, roster: Vec<Participant>) {
-        if self.room == room {
-            self.room_roster = roster;
-        }
-    }
-
-    /// Publications of the displayed room, from the account WebSocket. They
-    /// are informational until the user joins: watching requires the call.
-    pub fn set_room_streams(&mut self, room: i64, streams: Vec<Publication>) {
-        if self.room == room {
-            self.room_streams = streams;
-        }
+        self.room_streams = streams;
     }
 
     pub fn room_streams(&self) -> &[Publication] {
@@ -409,8 +415,8 @@ impl VoicePanel {
     /// the room falls back to the join button.
     pub fn leave_call(&mut self, cx: &mut Context<Self>) {
         if let Some(handle) = &self.handle {
-            if self.player_open {
-                handle.leave_stream();
+            if let Some(selection) = self.watching_selection {
+                handle.leave_stream(selection);
             }
             handle.leave();
         }
@@ -421,6 +427,7 @@ impl VoicePanel {
         self.status.clear();
         self.error.clear();
         self.ptt_held = false;
+        self.ptt_combo = None;
         // The next join starts with a closed microphone until the server
         // confirms `voice.joined`, even if the previous call was unmuted.
         self.controls.muted = true;
@@ -445,21 +452,74 @@ impl VoicePanel {
         if self.push_to_talk != enabled {
             self.push_to_talk = enabled;
             self.ptt_held = false;
+            self.ptt_combo = None;
             self.refresh_capture();
         }
     }
 
-    pub fn set_push_to_talk_held(&mut self, held: bool) {
-        if self.ptt_blocked && held {
+    /// A fresh key-down with all required modifiers opens the hold and records
+    /// the combination. Auto-repeat is rejected by the caller.
+    pub fn activate_push_to_talk(&mut self, combo: Hotkey) {
+        if self.ptt_blocked || !self.push_to_talk || self.ptt_held {
             return;
         }
-        self.ptt_held = held;
+        self.ptt_combo = Some(combo);
+        self.ptt_held = true;
         self.refresh_capture();
     }
 
+    /// Test entry point: a bare hold without a recorded combo.
+    #[cfg(test)]
+    pub fn set_push_to_talk_held(&mut self, held: bool) {
+        if held {
+            self.activate_push_to_talk(Hotkey::default());
+        } else {
+            self.release_push_to_talk();
+        }
+    }
+
+    /// Close the hold when either the main key or a required modifier is
+    /// released. Returns whether the event belonged to the active combination.
+    pub fn release_push_to_talk_key(&mut self, key: &str) -> bool {
+        let Some(combo) = self.ptt_combo.clone() else {
+            return false;
+        };
+        if key.eq_ignore_ascii_case(&combo.key)
+            || voice_room::modifier_key(key).is_some_and(|m| combo.uses(m))
+        {
+            self.release_push_to_talk();
+            return true;
+        }
+        false
+    }
+
+    /// Windows reports a modifier transition even when the main key is still
+    /// down. If a required modifier is gone, the combination is broken.
+    pub fn release_push_to_talk_modifiers(
+        &mut self,
+        ctrl: bool,
+        shift: bool,
+        alt: bool,
+        platform: bool,
+    ) -> bool {
+        let Some(combo) = self.ptt_combo.clone() else {
+            return false;
+        };
+        if (combo.ctrl && !ctrl)
+            || (combo.shift && !shift)
+            || (combo.alt && !alt)
+            || (combo.platform && !platform)
+        {
+            self.release_push_to_talk();
+            return true;
+        }
+        false
+    }
+
     pub fn release_push_to_talk(&mut self) {
-        if self.ptt_held {
+        if self.ptt_held || self.ptt_combo.is_some() {
             self.ptt_held = false;
+            self.ptt_combo = None;
             self.refresh_capture();
         }
     }
@@ -478,7 +538,7 @@ impl VoicePanel {
     }
 
     fn refresh_capture(&mut self) {
-        let joined = self.handle.is_some() && self.phase != CallPhase::Connecting;
+        let joined = self.handle.is_some() && self.phase == CallPhase::Connected;
         self.controls.muted = !voice_room::microphone_open(
             joined && self.call_channel != 0,
             self.self_muted,
@@ -563,22 +623,28 @@ impl VoicePanel {
         if self.call_channel == 0 || publication.channel_id != self.call_channel {
             return;
         }
+        self.stream_selection = self.stream_selection.wrapping_add(1).max(1);
+        let selection = self.stream_selection;
         self.player_open = true;
         self.stream_error.clear();
         self.stream_status = "Подключение…".into();
+        self.stream_connected = false;
         self.frame = None;
         self.watching = Some(publication.clone());
+        self.watching_selection = Some(selection);
         self.stream_muted = false;
         if let Some(handle) = &self.handle {
-            handle.watch_stream(publication);
+            handle.watch_stream(selection, publication);
         }
         cx.notify();
     }
 
     pub fn leave_stream(&mut self, cx: &mut Context<Self>) {
+        let selection = self.stream_selection;
         if let Some(handle) = &self.handle {
-            handle.leave_stream();
+            handle.leave_stream(selection);
         }
+        self.watching_selection = None;
         self.close_player();
         cx.notify();
     }
@@ -586,17 +652,22 @@ impl VoicePanel {
     fn close_player(&mut self) {
         self.frame = None;
         self.watching = None;
+        self.watching_selection = None;
         self.player_open = false;
         self.stream_status.clear();
         self.stream_error.clear();
+        self.stream_connected = false;
         self.stream_muted = false;
         self.player_drag = None;
     }
 
     pub fn toggle_stream_mute(&mut self, cx: &mut Context<Self>) {
+        let Some(selection) = self.watching_selection else {
+            return;
+        };
         self.stream_muted = !self.stream_muted;
         if let Some(handle) = &self.handle {
-            handle.stream_mute(self.stream_muted);
+            handle.stream_mute(selection, self.stream_muted);
         }
         cx.notify();
     }
@@ -672,6 +743,7 @@ impl VoicePanel {
                     self.phase = CallPhase::Connecting;
                     self.status = "Подключение…".into();
                     self.controls.muted = true;
+                    self.release_push_to_talk();
                 }
                 VoiceUpdate::Connected => {
                     if self.phase != CallPhase::Connected {
@@ -684,6 +756,7 @@ impl VoicePanel {
                     self.phase = CallPhase::Reconnecting;
                     self.status = "Восстанавливаем соединение…".into();
                     self.controls.muted = true;
+                    self.release_push_to_talk();
                     // Go drops the confirmed roster until the fresh join; a
                     // stale list must not look like a live call during a
                     // reconnect.
@@ -708,7 +781,10 @@ impl VoicePanel {
                 }
                 VoiceUpdate::Tracks(tracks) => self.tracks = tracks,
                 VoiceUpdate::Streams(streams) => self.streams = streams,
-                VoiceUpdate::StreamStatus(status) => {
+                VoiceUpdate::StreamStatus { selection, status } => {
+                    if self.watching_selection != Some(selection) {
+                        continue;
+                    }
                     if status.is_empty() {
                         self.close_player();
                     } else {
@@ -716,24 +792,38 @@ impl VoicePanel {
                         self.stream_error.clear();
                     }
                 }
-                VoiceUpdate::StreamError(error) => {
+                VoiceUpdate::StreamError { selection, error } => {
+                    if self.watching_selection != Some(selection) {
+                        continue;
+                    }
                     self.stream_error = error;
                     self.stream_status.clear();
+                    self.stream_connected = false;
                     self.frame = None;
                 }
-                VoiceUpdate::DeviceError(error) => self.device_error = error,
-                VoiceUpdate::Error(error) => {
-                    self.error = error;
-                    self.phase = CallPhase::Failed;
-                    self.controls.muted = true;
-                    self.close_player();
+                VoiceUpdate::StreamConnected {
+                    selection,
+                    connected,
+                } => {
+                    if self.watching_selection != Some(selection) {
+                        continue;
+                    }
+                    self.stream_connected = connected;
                 }
-                VoiceUpdate::Left => {
+                VoiceUpdate::DeviceError(error) => self.device_error = error,
+                VoiceUpdate::Ended(error) => {
                     self.handle.take();
                     self.controls.muted = true;
+                    self.ptt_held = false;
+                    self.ptt_combo = None;
                     self.close_player();
                     self.call_channel = 0;
-                    self.phase = CallPhase::Idle;
+                    self.phase = if error.is_some() {
+                        CallPhase::Failed
+                    } else {
+                        CallPhase::Idle
+                    };
+                    self.error = error.unwrap_or_default();
                     self.status.clear();
                     self.participants.clear();
                     self.speaking.clear();
@@ -744,7 +834,11 @@ impl VoicePanel {
             changed |= repaint;
         }
         if let Some(frame) = frame {
-            if let Some(buffer) = image::RgbaImage::from_raw(frame.width, frame.height, frame.bgra)
+            if self.watching_selection != Some(frame.selection) {
+                // A frame that was already in the last-value slot when the
+                // user switched selections belongs to the old player.
+            } else if let Some(buffer) =
+                image::RgbaImage::from_raw(frame.width, frame.height, frame.bgra)
             {
                 self.frame = Some(Arc::new(RenderImage::new(smallvec::smallvec![
                     image::Frame::new(buffer)

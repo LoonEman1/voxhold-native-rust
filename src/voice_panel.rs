@@ -131,9 +131,10 @@ pub struct VoicePanel {
     recordings_handler: Option<Box<dyn Fn(&mut Window, &mut gpui::App)>>,
     recordings_live: Option<std::rc::Rc<std::cell::RefCell<Option<String>>>>,
     /// Called when the detected speech set changes. The channel sidebar is
-    /// drawn by the parent view, which does not repaint on the panel's own
-    /// `cx.notify()`, so the parent needs an explicit wake-up.
-    speaking_handler: Option<Box<dyn Fn(&mut Window, &mut gpui::App)>>,
+    /// drawn by the parent view; GPUI repaints ancestors while the panel is
+    /// mounted, but the dock-only case and the sidebar rings need an explicit
+    /// wake-up.
+    speaking_handler: Option<Box<dyn Fn(&mut gpui::App)>>,
     palette: Palette,
 }
 
@@ -254,8 +255,25 @@ impl VoicePanel {
 
     /// The parent view owns the channel sidebar; it repaints when the speech
     /// set changes so the speaking rings track the call.
-    pub fn set_speaking_handler(&mut self, handler: Box<dyn Fn(&mut Window, &mut gpui::App)>) {
+    pub fn set_speaking_handler(&mut self, handler: Box<dyn Fn(&mut gpui::App)>) {
         self.speaking_handler = Some(handler);
+    }
+
+    /// Replace the detected speech set. Returns whether anything changed; the
+    /// parent is woken only for a real change.
+    fn set_speaking(&mut self, speaking: HashMap<String, bool>, cx: &mut gpui::App) -> bool {
+        if self.speaking == speaking {
+            return false;
+        }
+        self.speaking = speaking;
+        if let Some(handler) = &self.speaking_handler {
+            handler(cx);
+        }
+        true
+    }
+
+    fn clear_speaking(&mut self, cx: &mut gpui::App) {
+        self.set_speaking(HashMap::new(), cx);
     }
 
     pub fn set_recordings_live(&mut self, live: std::rc::Rc<std::cell::RefCell<Option<String>>>) {
@@ -448,7 +466,7 @@ impl VoicePanel {
                 self.status = "Подключение…".into();
                 self.error.clear();
                 self.participants.clear();
-                self.speaking.clear();
+                self.clear_speaking(cx);
                 self.tracks.clear();
                 self.local_mutes.clear();
                 self.close_player();
@@ -485,7 +503,7 @@ impl VoicePanel {
         // confirms `voice.joined`, even if the previous call was unmuted.
         self.controls.muted = true;
         self.participants.clear();
-        self.speaking.clear();
+        self.clear_speaking(cx);
         self.tracks.clear();
         self.local_mutes.clear();
         self.streams.clear();
@@ -862,7 +880,7 @@ impl VoicePanel {
                 // stale list must not look like a live call during a
                 // reconnect.
                 self.participants.clear();
-                self.speaking.clear();
+                self.clear_speaking(cx);
                 self.tracks.clear();
             }
             VoiceUpdate::Participants(participants) => {
@@ -874,12 +892,7 @@ impl VoicePanel {
                 });
             }
             VoiceUpdate::Speaking(speaking) => {
-                if self.speaking != speaking {
-                    self.speaking = speaking;
-                    if let Some(handler) = &self.speaking_handler {
-                        handler(window, cx);
-                    }
-                }
+                repaint = self.set_speaking(speaking, cx);
             }
             VoiceUpdate::LocalLevel(level) => {
                 // Repaint the meter only for a visible step, not for every
@@ -942,7 +955,7 @@ impl VoicePanel {
                 self.error = error.unwrap_or_default();
                 self.status.clear();
                 self.participants.clear();
-                self.speaking.clear();
+                self.clear_speaking(cx);
                 self.tracks.clear();
                 self.streams.clear();
             }
@@ -956,8 +969,8 @@ impl VoicePanel {
         update: VoiceUpdate,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
-        self.apply_update(update, window, cx);
+    ) -> bool {
+        self.apply_update(update, window, cx)
     }
 
     // ---- focus ring -----------------------------------------------------

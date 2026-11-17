@@ -46,7 +46,7 @@ impl VoiceColors {
                 accent: LIME,
                 // The shared accent ink keeps the ring above 3:1 on the light
                 // card and sidebar instead of the 1.9:1 of the raw accent.
-                accent_text: p.story_accent,
+                accent_text: p.accent_ink,
                 ink: DARK,
                 danger: p.danger,
                 danger_bg: 0xf7e2df,

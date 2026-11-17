@@ -240,7 +240,7 @@ impl VoicePanel {
         let dot = if muted || participant.self_deaf {
             c.danger
         } else {
-            c.accent
+            c.accent_text
         };
         let mut card = div()
             .absolute()

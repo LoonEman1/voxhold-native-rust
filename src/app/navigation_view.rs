@@ -324,6 +324,7 @@ impl Voxhold {
                 list = list.child(
                     div()
                         .id(("channel", id as u64))
+                        .debug_selector(move || format!("channel-{id}").into())
                         .h(px(35.))
                         .px(px(16.))
                         .flex()
@@ -542,15 +543,25 @@ impl Voxhold {
                 .font_weight(gpui::FontWeight::BOLD)
                 .child(crate::members::initials(&name))
         };
+        let connection = participant.connection_id.clone();
+        // The badge mirrors the room card: any non-healthy state uses the
+        // danger tone, the healthy dot uses the accent ink.
         let badge = if state.is_some() {
-            let (path, color) = if participant.reconnecting {
-                ("icons/wifi-off.svg", p.danger)
+            let path = if participant.reconnecting {
+                "icons/wifi-off.svg"
             } else if participant.self_deaf {
-                ("icons/headphones-off.svg", p.muted)
+                "icons/headphones-off.svg"
             } else {
-                ("icons/mic-off.svg", p.muted)
+                "icons/mic-off.svg"
             };
-            icon(path, 12., ink(color))
+            div()
+                .flex_shrink_0()
+                .debug_selector({
+                    let connection = connection.clone();
+                    move || format!("voice-state-{connection}").into()
+                })
+                .child(icon(path, 12., ink(p.danger)))
+                .into_any_element()
         } else {
             div()
                 .w(px(7.))
@@ -564,7 +575,6 @@ impl Voxhold {
                 }))
                 .into_any_element()
         };
-        let connection = participant.connection_id.clone();
         div()
             .id(gpui::ElementId::named_usize(
                 connection.clone(),

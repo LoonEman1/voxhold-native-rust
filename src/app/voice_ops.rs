@@ -175,12 +175,12 @@ impl Voxhold {
                     });
                 }));
                 let speaking_view = weak_view.clone();
-                panel.set_speaking_handler(Box::new(move |window, cx| {
+                panel.set_speaking_handler(Box::new(move |cx| {
                     let weak = speaking_view.clone();
                     if weak.upgrade().is_none() {
                         return;
                     }
-                    window.defer(cx, move |_window, cx| {
+                    cx.defer(move |cx| {
                         if let Some(view) = weak.upgrade() {
                             view.update(cx, |_, cx| cx.notify());
                         }

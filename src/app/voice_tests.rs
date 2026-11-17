@@ -110,7 +110,7 @@ fn fixture(
         );
         panel.update(cx, |panel, _| {
             panel.set_rooms(rooms);
-            panel.set_self_user(2);
+            panel.set_self_user(1);
             panel.set_room_state(7, Vec::new(), Vec::new());
             panel.test_set_call(
                 7,
@@ -579,8 +579,10 @@ async fn voice_participants_are_listed_under_their_channel(cx: &mut TestAppConte
     let (mut visual, view, _voice) = fixture(cx);
     visual.update(|_, app| {
         view.update(app, |v, cx| {
+            let mut bob = participant("bob", 2);
+            bob.self_mute = true;
             v.voice_rooms
-                .insert((1, 7), vec![participant("alice", 1), participant("bob", 2)]);
+                .insert((1, 7), vec![participant("alice", 1), bob]);
             let mut dave = participant("dave", 4);
             dave.reconnecting = true;
             v.voice_rooms
@@ -589,6 +591,8 @@ async fn voice_participants_are_listed_under_their_channel(cx: &mut TestAppConte
         });
     });
     draw(&mut visual);
+    let channel7 = visual.debug_bounds("channel-7").expect("channel 7 row");
+    let channel8 = visual.debug_bounds("channel-8").expect("channel 8 row");
     let alice = visual
         .debug_bounds("voice-member-alice")
         .expect("alice row");
@@ -599,25 +603,31 @@ async fn voice_participants_are_listed_under_their_channel(cx: &mut TestAppConte
     let dave = visual
         .debug_bounds("voice-member-dave")
         .expect("a reconnecting member still has a row");
+    // Rows belong to the channel above them, not just to the list.
+    assert!(channel7.origin.y < alice.origin.y);
     assert!(alice.origin.y < bob.origin.y);
-    assert!(
-        bob.origin.y < carol.origin.y,
-        "channel 8 rows follow channel 7 rows"
-    );
+    assert!(bob.origin.y < channel8.origin.y);
+    assert!(channel8.origin.y < carol.origin.y);
     assert!(carol.origin.y < dave.origin.y);
-    assert!(visual.debug_bounds("voice-member-nobody").is_none());
+    // Muted and reconnecting members show the card's state icon; a healthy
+    // member shows only the dot.
+    assert!(visual.debug_bounds("voice-state-bob").is_some());
+    assert!(visual.debug_bounds("voice-state-dave").is_some());
+    assert!(visual.debug_bounds("voice-state-alice").is_none());
+    assert!(visual.debug_bounds("voice-state-carol").is_none());
 }
 
 #[gpui::test]
 async fn the_room_keeps_the_current_palette(cx: &mut TestAppContext) {
     let (visual, view, voice) = fixture(cx);
-    // A theme switch reaches an already running panel.
+    // A real theme switch reaches an already running panel.
     visual.update(|_, app| {
         view.update(app, |v, cx| {
-            v.palette = crate::theme::light_palette();
-            v.sync_voice_palette(cx);
+            v.theme_path = None;
+            v.apply_theme(crate::theme::ThemeMode::Light, cx);
         });
     });
+    assert!(view.read_with(&*visual, |v, _| v.palette.light));
     voice.read_with(&*visual, |panel, _| assert!(panel.test_palette().light));
 
     // A room opened later starts with the same palette.
@@ -673,22 +683,24 @@ async fn speaking_changes_wake_the_parent_once(cx: &mut TestAppContext) {
     let counter = calls.clone();
     visual.update(|window, app| {
         voice.update(app, |panel, cx| {
-            panel.set_speaking_handler(Box::new(move |_window, _cx| {
+            panel.set_speaking_handler(Box::new(move |_cx| {
                 counter.set(counter.get() + 1);
             }));
             let mut speaking = std::collections::HashMap::new();
             speaking.insert("alice".to_string(), true);
-            panel.test_apply_update(
+            let first = panel.test_apply_update(
                 voxhold_media::runtime::VoiceUpdate::Speaking(speaking.clone()),
                 window,
                 cx,
             );
             // The runtime resends the same set while it is unchanged.
-            panel.test_apply_update(
+            let again = panel.test_apply_update(
                 voxhold_media::runtime::VoiceUpdate::Speaking(speaking),
                 window,
                 cx,
             );
+            assert!(first, "a real change repaints the panel");
+            assert!(!again, "an unchanged speech set must not repaint");
         });
     });
     assert_eq!(
@@ -696,6 +708,35 @@ async fn speaking_changes_wake_the_parent_once(cx: &mut TestAppContext) {
         1,
         "only an actual speech change repaints the sidebar"
     );
+}
+
+#[gpui::test]
+async fn an_app_opened_room_wakes_the_sidebar_on_speech(cx: &mut TestAppContext) {
+    let (mut visual, view, _voice) = fixture(cx);
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            v.voice = None;
+            v.open_voice_room(7, window, cx);
+        });
+    });
+    let panel = view
+        .read_with(&*visual, |v, _| v.voice.clone())
+        .expect("panel");
+    visual.update(|window, app| {
+        panel.update(app, |panel, cx| {
+            let mut speaking = std::collections::HashMap::new();
+            speaking.insert("alice".to_string(), true);
+            panel.test_apply_update(
+                voxhold_media::runtime::VoiceUpdate::Speaking(speaking),
+                window,
+                cx,
+            );
+        });
+    });
+    // The production handler defers a parent update; drawing must drain it
+    // without a re-entrant entity update.
+    draw(&mut visual);
+    panel.read_with(&*visual, |panel, _| assert!(panel.speaking("alice")));
 }
 
 #[test]
@@ -715,6 +756,6 @@ fn voice_room_colors_follow_the_theme() {
     // The fill keeps its hue; the text accent reuses the theme ink so the
     // ring stays readable on a light surface.
     assert_eq!(dark.accent, light.accent);
-    assert_eq!(dark.accent_text, 0x72b790);
-    assert_eq!(light.accent_text, light_palette.story_accent);
+    assert_eq!(dark.accent_text, dark_palette.accent_ink);
+    assert_eq!(light.accent_text, light_palette.accent_ink);
 }

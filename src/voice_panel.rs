@@ -87,6 +87,10 @@ pub struct VoicePanel {
     tracks: HashSet<String>,
     local_mutes: HashSet<String>,
     local_level: f64,
+    /// Microphone gain 0–200 %. The value is stored and shown now; the PCM
+    /// capture path that applies 1–200 arrives with R07b, so only 0 % (a
+    /// closed microphone) changes this build's transmission.
+    input_volume: i64,
     device_error: String,
     streams: Vec<Publication>,
     /// Publications of the displayed room from the account WebSocket; the
@@ -197,6 +201,7 @@ impl VoicePanel {
             tracks: HashSet::new(),
             local_mutes: HashSet::new(),
             local_level: 0.0,
+            input_volume: 100,
             device_error: String::new(),
             streams: Vec::new(),
             room_streams: Vec::new(),
@@ -610,6 +615,8 @@ impl VoicePanel {
 
     fn refresh_capture(&mut self) {
         let joined = self.handle.is_some() && self.phase == CallPhase::Connected;
+        // The stored input gain is part of the capture decision: 0 % means a
+        // deliberately closed microphone even when the call is confirmed.
         self.controls.muted = !voice_room::microphone_open(
             joined && self.call_channel != 0,
             self.self_muted,
@@ -617,10 +624,31 @@ impl VoicePanel {
             self.push_to_talk,
             self.ptt_held,
             self.ptt_blocked,
-        );
+        ) || self.input_volume <= 0;
         if let Some(handle) = &self.handle {
             handle.controls(self.controls.clone(), self.self_muted);
         }
+    }
+
+    /// One audio snapshot from the settings tab: devices, bitrate and both
+    /// gain values. It must stay the only State write for a settings change so
+    /// the device/bitrate/gain triple cannot be applied piecemeal. Local mute
+    /// and push-to-talk stay untouched.
+    pub fn apply_voice_prefs(
+        &mut self,
+        input: Option<String>,
+        output: Option<String>,
+        bitrate: u32,
+        input_volume: i64,
+        output_volume: i64,
+    ) {
+        self.controls.input = input;
+        self.controls.output = output;
+        self.controls.bitrate_kbps = Some(bitrate);
+        self.controls.output_gain = Some(output_volume.clamp(0, 200) as f64 / 100.0);
+        self.input_volume = input_volume.clamp(0, 200);
+        self.device_error.clear();
+        self.refresh_capture();
     }
 
     pub fn mute(&mut self, cx: &mut Context<Self>) {
@@ -651,17 +679,6 @@ impl VoicePanel {
         self.local_mutes.contains(connection)
     }
 
-    /// Device selection from the settings tab. The engine switches the live
-    /// path and keeps the previous one if the new device fails.
-    pub fn set_devices(&mut self, input: Option<String>, output: Option<String>) {
-        self.controls.input = input;
-        self.controls.output = output;
-        self.device_error.clear();
-        if let Some(handle) = &self.handle {
-            handle.controls(self.controls.clone(), self.self_muted);
-        }
-    }
-
     /// Explicit output selection from the settings tab. This is forwarded even
     /// when the cached value looks unchanged, because a hot-unplug may have
     /// moved the engine to a fallback endpoint before its notice was applied.
@@ -673,28 +690,14 @@ impl VoicePanel {
         }
     }
 
-    /// Encoder bitrate from the settings tab.
-    pub fn set_bitrate(&mut self, kbps: u32) {
-        self.controls.bitrate_kbps = Some(kbps);
-        if let Some(handle) = &self.handle {
-            handle.controls(self.controls.clone(), self.self_muted);
-        }
-    }
-
-    /// Room output gain from the settings tab (0–200 %).
-    pub fn set_output_volume(&mut self, percent: i64) {
-        self.controls.output_gain = Some(percent.clamp(0, 200) as f64 / 100.0);
-        if let Some(handle) = &self.handle {
-            handle.controls(self.controls.clone(), self.self_muted);
-        }
-    }
-
-    #[cfg(test)]
+    /// Device failure reported by the engine (for example a hot-unplug). The
+    /// settings meter polls this and refreshes the device list.
     pub fn device_error(&self) -> &str {
         &self.device_error
     }
 
-    #[cfg(test)]
+    /// Local speech level from the transmission (0..=1), used by the settings
+    /// meter while the call is active.
     pub fn local_level(&self) -> f64 {
         self.local_level
     }
@@ -1104,6 +1107,11 @@ impl VoicePanel {
     #[cfg(test)]
     pub fn test_controls(&self) -> &Controls {
         &self.controls
+    }
+
+    #[cfg(test)]
+    pub fn test_input_volume(&self) -> i64 {
+        self.input_volume
     }
 
     #[cfg(test)]

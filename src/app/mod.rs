@@ -30,6 +30,7 @@ mod settings_review;
 #[cfg(test)]
 mod settings_tests;
 mod settings_view;
+mod settings_voice_view;
 mod shell_view;
 #[cfg(test)]
 mod tests;
@@ -37,6 +38,7 @@ mod theme_ops;
 mod thread_ops;
 pub(crate) mod ui;
 mod voice_ops;
+mod voice_settings_ops;
 #[cfg(test)]
 mod voice_tests;
 mod workspace;

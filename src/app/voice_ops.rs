@@ -126,10 +126,14 @@ impl Voxhold {
                 panel.set_rooms(rooms);
                 panel.set_self_user(self_user);
                 panel.set_members(members);
-                panel.set_devices(Some(prefs.input.clone()), Some(prefs.output.clone()));
-                panel.set_bitrate(prefs.bitrate as u32);
-                panel.set_output_volume(prefs.output_volume);
                 panel.set_room_state(channel, roster, streams);
+                panel.apply_voice_prefs(
+                    Some(prefs.input.clone()),
+                    Some(prefs.output.clone()),
+                    prefs.bitrate as u32,
+                    prefs.input_volume,
+                    prefs.output_volume,
+                );
                 panel.set_palette(palette);
                 cx.notify();
             });
@@ -151,10 +155,14 @@ impl Voxhold {
                 panel.set_rooms(rooms);
                 panel.set_self_user(self_user);
                 panel.set_members(members);
-                panel.set_devices(Some(prefs.input.clone()), Some(prefs.output.clone()));
-                panel.set_bitrate(prefs.bitrate as u32);
-                panel.set_output_volume(prefs.output_volume);
                 panel.set_room_state(channel, roster, streams);
+                panel.apply_voice_prefs(
+                    Some(prefs.input.clone()),
+                    Some(prefs.output.clone()),
+                    prefs.bitrate as u32,
+                    prefs.input_volume,
+                    prefs.output_volume,
+                );
                 panel.set_palette(palette);
                 panel
             });

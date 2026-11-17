@@ -45,6 +45,8 @@ pub enum Action {
     SetNoiseMode(usize),
     SetInputMode(usize),
     ResetVoice,
+    TestMicrophone,
+    TestTone,
     CropZoom(i32),
     CropX(i32),
     CropY(i32),

@@ -1,5 +1,7 @@
+pub mod capabilities;
 pub mod catalog;
 pub mod controller;
+pub mod preview;
 mod video;
 pub mod viewer;
 mod voice;

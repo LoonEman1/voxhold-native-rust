@@ -28,6 +28,9 @@ impl Voxhold {
         let Some(kind) = self.active_settings.take() else {
             return;
         };
+        // The WinMM preview and the meter belong to the open voice tab only.
+        self.stop_voice_preview();
+        self.stop_voice_meter();
         match kind {
             SettingsKind::Personal => {
                 if let Some(personal) = &mut self.personal {
@@ -226,6 +229,20 @@ impl Voxhold {
                         panel.cancel_profile_loads();
                     }
                 }
+                if previous == Some(1) && index != 1 {
+                    self.stop_voice_preview();
+                    self.stop_voice_meter();
+                }
+                if index == 1 {
+                    // Go `open: refresh`: every entry to the tab re-reads the
+                    // devices, so a device unplugged while the dialog was on
+                    // another tab is not shown under its stale name.
+                    self.load_voice_devices(cx);
+                    if previous != Some(1) {
+                        self.start_voice_preview(cx);
+                        self.start_voice_meter(cx);
+                    }
+                }
                 if first {
                     match index {
                         0 => {
@@ -233,7 +250,6 @@ impl Voxhold {
                             self.load_personal_sessions(cx);
                             self.load_personal_avatar(window, cx);
                         }
-                        1 => self.load_voice_devices(cx),
                         2 => self.load_personal_privacy(cx),
                         _ => {}
                     }
@@ -505,6 +521,9 @@ impl Voxhold {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.voice_settings_action(action.clone(), cx) {
+            return;
+        }
         use personal_settings::Action;
         match action {
             Action::Retry => {
@@ -618,111 +637,19 @@ impl Voxhold {
                 }
                 cx.notify();
             }
-            Action::RefreshDevices => self.load_voice_devices(cx),
-            Action::SelectInput(index) | Action::SelectOutput(index) => {
-                let input = matches!(action, Action::SelectInput(_));
-                let (_, ids, _) = crate::voice_settings::device_choices(
-                    &self.voice_settings.prefs,
-                    &self.voice_settings.devices,
-                    input,
-                );
-                if let Some(id) = ids.get(index).cloned() {
-                    if input {
-                        self.voice_settings.prefs.input = id;
-                    } else {
-                        self.voice_settings.prefs.output = id;
-                    }
-                    self.voice_settings.persist();
-                    #[cfg(feature = "voxhold-media")]
-                    if let Some(voice) = &self.voice {
-                        let prefs = self.voice_settings.prefs.clone();
-                        let output_selected = !input;
-                        voice.update(cx, |panel, _| {
-                            panel.set_devices(Some(prefs.input), Some(prefs.output.clone()));
-                            if output_selected {
-                                panel.select_output(Some(prefs.output));
-                            }
-                        });
-                    }
-                }
-                cx.notify();
-            }
-            Action::SetVolume(which, value) => {
-                match which {
-                    "input" => {
-                        // Input gain is applied by the DSP capture path (R07b).
-                        self.voice_settings.prefs.input_volume = value.clamp(0, 200)
-                    }
-                    "output" => {
-                        self.voice_settings.prefs.output_volume = value.clamp(0, 200);
-                        #[cfg(feature = "voxhold-media")]
-                        if let Some(voice) = &self.voice {
-                            voice.update(cx, |panel, _| panel.set_output_volume(value));
-                        }
-                    }
-                    "noise" => self.voice_settings.prefs.noise_gate = value.clamp(0, 100),
-                    _ => self.voice_settings.prefs.sound_volume = value.clamp(0, 100),
-                }
-                self.voice_settings.persist();
-                cx.notify();
-            }
-            Action::SetBitrate(bitrate) => {
-                if crate::voice_settings::BITRATES.contains(&bitrate) {
-                    self.voice_settings.prefs.bitrate = bitrate;
-                    self.voice_settings.persist();
-                    #[cfg(feature = "voxhold-media")]
-                    if let Some(voice) = &self.voice {
-                        voice.update(cx, |panel, _| panel.set_bitrate(bitrate as u32));
-                    }
-                    cx.notify();
-                }
-            }
-            Action::ToggleSounds => {
-                self.voice_settings.prefs.sounds = !self.voice_settings.prefs.sounds;
-                self.voice_settings.persist();
-                cx.notify();
-            }
-            Action::SetNoiseMode(index) => {
-                self.voice_settings.prefs.noise_mode = if index == 1 {
-                    "threshold".into()
-                } else {
-                    "auto".into()
-                };
-                self.voice_settings.persist();
-                cx.notify();
-            }
-            Action::SetInputMode(index) => {
-                let push_to_talk = index == 1;
-                self.voice_settings.prefs.input_mode = if push_to_talk {
-                    "push_to_talk".into()
-                } else {
-                    "voice_activity".into()
-                };
-                self.voice_settings.persist();
-                #[cfg(feature = "voxhold-media")]
-                if let Some(voice) = &self.voice {
-                    voice.update(cx, |voice, cx| {
-                        voice.set_push_to_talk(push_to_talk);
-                        cx.notify();
-                    });
-                }
-                cx.notify();
-            }
-            Action::ResetVoice => {
-                let mut prefs = crate::voice_settings::VoicePrefs::default();
-                prefs.input = self.voice_settings.prefs.input.clone();
-                prefs.output = self.voice_settings.prefs.output.clone();
-                self.voice_settings.prefs = prefs;
-                self.voice_settings.persist();
-                #[cfg(feature = "voxhold-media")]
-                if let Some(voice) = &self.voice {
-                    voice.update(cx, |voice, cx| {
-                        voice.set_push_to_talk(false);
-                        cx.notify();
-                    });
-                }
-                cx.notify();
-            }
+            // Every voice-tab action returns from `voice_settings_action`
+            // above; these arms only keep this match exhaustive.
+            Action::RefreshDevices
+            | Action::SelectInput(_)
+            | Action::SelectOutput(_)
+            | Action::SetVolume(..)
+            | Action::SetBitrate(_)
+            | Action::ToggleSounds
+            | Action::SetNoiseMode(_)
+            | Action::SetInputMode(_)
+            | Action::ResetVoice
+            | Action::TestMicrophone
+            | Action::TestTone => {}
             Action::CropZoom(value) => self.edit_crop(window, cx, 0, value),
             Action::CropX(value) => self.edit_crop(window, cx, 1, value),
             Action::CropY(value) => self.edit_crop(window, cx, 2, value),

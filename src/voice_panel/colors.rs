@@ -1,9 +1,11 @@
 //! Resolved colors for the voice room, the sidebar dock and the stream player.
 //!
-//! The fixed dark surfaces are the same literals the Go client paints; the
-//! light theme maps them through `theme::workspace_color`, the table Go uses
-//! for its fixed surfaces. Accents that carry text (`accent_text`) switch to
-//! the theme accent ink on a light background so the green stays readable.
+//! `SURFACE`/`LINE` are the fixed room literals that the Go client also
+//! paints, and the light theme maps them through `theme::workspace_color`, the
+//! same table. `FG`/`MUTED`/`LIME`/`DANGER` are the panel's own dark tokens
+//! from the shipped room, not copies of the workspace palette. Accents that
+//! carry text (`accent_text`) switch to `Palette::accent_ink` on a light
+//! background so the green stays readable.
 
 use crate::theme::{self, Palette};
 

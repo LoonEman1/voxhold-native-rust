@@ -143,6 +143,8 @@ impl Voxhold {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let p = self.palette;
+        #[cfg(feature = "voxhold-media")]
+        let voice_colors = crate::voice_panel::VoiceColors::resolve(p);
         let can_manage = self
             .servers
             .iter()
@@ -376,7 +378,13 @@ impl Voxhold {
                 );
                 #[cfg(feature = "voxhold-media")]
                 for participant in &roster {
-                    list = list.child(self.voice_participant_row(participant, id, window, cx));
+                    list = list.child(self.voice_participant_row(
+                        participant,
+                        id,
+                        voice_colors,
+                        window,
+                        cx,
+                    ));
                 }
             }
         }
@@ -460,11 +468,11 @@ impl Voxhold {
         &mut self,
         participant: &voxhold_media::controller::Participant,
         channel: i64,
+        voice: crate::voice_panel::VoiceColors,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let p = self.palette;
-        let voice = crate::voice_panel::VoiceColors::resolve(p);
         // Only the active call is analysed for speech; the local mutes live in
         // the panel too.
         let (reports_speaking, local_muted) = self.voice.as_ref().map_or((false, false), |panel| {

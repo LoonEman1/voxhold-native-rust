@@ -552,3 +552,92 @@ HTTP и 24 МиБ поток с задержкой >8 с, проверяют б�
 `recording.updated` между двумя клиентами, Windows save dialog вручную,
 возврат фокуса из панели звонка, кадры/DPI и пары Go/Rust. `W07`
 (локальные копии, прогресс, «Повторить») остаётся вне R06.
+
+## Срез R07a (17 ноября 2026)
+
+База — `origin/dev` `e6c85bf` (merge PR #16), ветка
+`codex/r07-voice-viewer`. Контракты сверены с backend `9b29fdd`, frontend
+`ed7cb00` и Go `09c82b9`; обработчики `internal/realtime/http/{handler,stream}.go`
+и `docs/{voice,streaming}.md` проверялись отдельно от OpenAPI.
+
+- `crates/voxhold-media/src/viewer.rs`, `catalog.rs` — детерминированная
+  модель просмотра. Публикация — `(server_id, channel_id,
+  publisher_connection_id)` плюс номер попытки. Переключение B→C закрывает A,
+  отправляет `stream.leave` и запускает C только после `stream.left` A или
+  5-секундного таймаута; ICE/offer старой попытки и `stream.stopped(A)`
+  игнорируются/не останавливают B. `stream.watching` и `error` сверяются по
+  `request_id`; reconnect ждёт нового `voice.joined`; revoke завершает просмотр
+  с текстом. 2 восстановления и 15-секундный deadline, затем ошибка.
+- `crates/voxhold-media/src/runtime.rs` — `Requests` хранит только последние
+  controls/watch/mute/viewport и bounded local mute; `Updates` коалесцирует
+  roster/речь/статусы, терминальные `Error`/`Left` не теряются. Leave имеет
+  приоритет, закрытие плеера сбрасывает отложенный выбор. Кадр — bounded
+  last-value, буфер переиспользуется; `StreamError` отделён от статуса.
+- `video.rs` — libyuv пишет BGRA напрямую, без swap на каждый пиксель в UI.
+  Синтетический I420 с известными цветами проверяет порядок каналов,
+  ориентацию и растяжение.
+- `controller.rs`, `voice.rs` — попытка join, server mute, roster по
+  `connection_id`, локальный mute по реальным трекам; смена устройства
+  сначала поднимает новый тракт, при отказе восстанавливает прежний по
+  GUID/имени (default берётся из Windows, не из индекса 0); раз в секунду
+  проверяется hot-unplug. Захват имеет одного владельца разрешения:
+  `VoiceHandle` меняет local/PTT, worker — `voice.joined` и server mute;
+  `Command::State` больше не переоткрывает микрофон. Уничтожение старого
+  `Media` закрывает только транспорт и отсоединяет трек, поэтому reconnect
+  снова открывает микрофон после нового `voice.joined`; необратимую защёлку
+  ставит только явный `VoiceHandle::leave`/`Drop`. Выбранный выход хранится
+  отдельно от применённого: после полного отказа отката следующая команда
+  снова запускает воспроизведение, даже если id совпадает. Hot-unplug
+  публикует тот же `Event::Output` с фактическим fallback-выходом, поэтому
+  после возврата USB повторный выбор снова доходит до движка. Явный выбор
+  выхода в настройках всегда идёт отдельным запросом в `Session::ViewOutput`
+  и не отбрасывается кэшем runtime до чтения уведомления об unplug. Числовая
+  громкость комнаты 0–200 % пока не применяется к PCM: закреплённый
+  `libwebrtc` не даёт render callback, а системный WASAPI-микшер не трогается.
+  0 % и deafen закрывают треки; полный коэффициент относится к аудиотракту
+  `R07b`, и в настройках показано это ограничение.
+- `src/voice_room.rs`, `src/voice_panel.rs`, `voice_panel/{view,player}.rs` —
+  комната по `voice_room.go` (статус, карточки, индикатор речи, toolbar
+  микрофон/звук/записи/выход, dock 98 px) и плеер по `stream_player.go`
+  (360 px, drag/resize, поля 8 px, 260–720, fullscreen, Esc/F/двойной клик,
+  mute только при `has_audio`). Закрытие плеера оставляет голос.
+- `src/app/{voice_ops,realtime,workspace,shell_view,navigation_view}.rs` —
+  отдельные «смотрю комнату» и «я в звонке», roster и публикации из account
+  WS, badge канала, dock при переходе в другой канал/ЛС, PTT по сохранённой
+  клавише с release на key-up/потере фокуса/модалке/уходе, hotkey mute и
+  deafen, устройства/битрейт/громкость из настроек.
+- Регрессии: A→B→C, `stream.stopped(A)` при B, повторная публикация с новым
+  `connection_id`, закрытый звонок, `request_id` ошибки, stale ICE,
+  reconnect, revoke, leave-timeout, snapshot/event/stop/re-entry, границы
+  `Requests`/`Updates`, синтетический BGRA, GPUI Tab/Shift+Tab, Esc/F,
+  press/release PTT, блокировка модалкой, dock и реальные координаты
+  карточек/плеера. Добавлены гонки PTT/State, реальный drop старого Media до
+  нового join и leave-latch, Watch(B)→Close(B), поздние tagged offer/close,
+  два просмотра одного P2P-публикатора, ICE нового поколения до SDP,
+  reconnect до `voice.joined`, полный отказ отката выхода, ACL-скрытие
+  активной комнаты и revoke в fullscreen.
+
+**Ограничение wire для viewer.** `stream.watch` теперь содержит `watch_id`
+(номер попытки) и клиент строго сверяет его, если backend присылает
+`watch_id` или `request_id` у offer/ICE/close. Закреплённый backend
+`9b29fdd` не размечает push-события и не присылает `watch_id` у
+`stream.webrtc_closed`; `from_connection_id`/`publisher_connection_id`
+идентифицируют публикатора, а не повторный просмотр. Поэтому для текущего
+формата первый немаркированный close после смены попытки игнорируется, а
+немаркированный offer с неизвестным ufrag нельзя отличить от следующего
+ICE-поколения. Строгая гарантия требует согласованного расширения backend:
+каждый offer/ICE/close несёт id просмотра, а ранние сигналы до ACK либо
+маркированы, либо ограниченно буферизуются по этому id. Таймер эту
+неоднозначность не разрешает.
+
+Проверено: `cargo fmt --all -- --check`, `cargo test --workspace --locked`
+(296 тестов приложения: 296 passed, 1 `ignored`; 11 API; 54 media),
+`cargo build --release --locked -p voxhold-native-rust`,
+`scripts/check-file-sizes.ps1` (172 файлов), `git diff --check` и smoke
+release (процесс активен через 5 с).
+
+Не проверено: живой backend и два клиента, реальный SFU/P2P с Chromium,
+фактические кодек/разрешение/CPU/задержка, пары кадров Go/Rust, DPI
+100/125/150, ручной GUI, реальная смена/отключение устройств и сон,
+слышимый тест микрофона и звука. Input gain и тест звука относятся к
+`R07b`; peak meter комнаты читает реальный `MediaSource`, но DSP не измерен.

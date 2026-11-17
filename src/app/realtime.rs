@@ -26,6 +26,8 @@ pub(super) struct RealtimeEffect {
     pub(super) recording_access: bool,
     /// One `recording.updated` was merged into the server snapshot.
     pub(super) recording_event: bool,
+    /// A `voice.*` event changed the remote rosters of visible rooms.
+    pub(super) voice_rooms: bool,
 }
 
 impl Voxhold {
@@ -112,6 +114,7 @@ impl Voxhold {
         let mut conversation_reactions = Vec::new();
         let mut recording_access = overflow;
         let mut recording_event = false;
+        let mut voice_rooms = false;
         for event in &events {
             self.forward_thread_event(event, window, cx);
             self.deliver_notification(event, window);
@@ -124,8 +127,13 @@ impl Voxhold {
             pins |= effect.pins;
             recording_access |= effect.recording_access;
             recording_event |= effect.recording_event;
+            voice_rooms |= effect.voice_rooms;
             conversation_reactions.extend(effect.conversation_reactions);
             removed_attachments.extend(effect.attachments);
+        }
+        #[cfg(feature = "voxhold-media")]
+        if voice_rooms {
+            self.sync_voice_panel(cx);
         }
         if recording_access && !server_removed {
             self.invalidate_recordings(window, cx);
@@ -161,6 +169,18 @@ impl Voxhold {
                     self.sync_search_permissions(cx);
                     if self.show_search {
                         self.refresh_search_permissions(window, cx);
+                    }
+                    // The open dialogue keeps its history and composer, but
+                    // the server ACL still has to be refreshed: leaving
+                    // `voice_unconfirmed` set would hide every room until an
+                    // unrelated forced reload.
+                    #[cfg(feature = "voxhold-media")]
+                    if self.voice_unconfirmed.contains(&self.server) {
+                        if self.access_reload_in_flight {
+                            self.access_refresh_again = true;
+                        } else {
+                            self.reload_channels(window, cx);
+                        }
                     }
                 } else if self.access_reload_in_flight {
                     // Access changed: hide confirmed data first, then
@@ -346,6 +366,14 @@ impl Voxhold {
             {
                 effect.access = true;
                 effect.recording_access = true;
+                // Snapshots precede this event. Hide them until the fresh
+                // channel list confirms the rooms that are still readable.
+                // Without any voice surface there is nothing to hide; a later
+                // room open still uses the confirmed channel list.
+                #[cfg(feature = "voxhold-media")]
+                if self.voice.is_some() || self.voice_channel != 0 || self.voice_room != 0 {
+                    self.voice_unconfirmed.insert(self.server);
+                }
             }
             "server.member_joined" | "server.member_role_updated"
                 if data["server_id"].as_i64() == Some(self.server) =>
@@ -396,6 +424,138 @@ impl Voxhold {
                         effect.recording_event = true;
                     }
                 }
+            }
+            #[cfg(feature = "voxhold-media")]
+            "stream.snapshot" => {
+                // The account socket covers every available server. Keep all
+                // of them scoped by server and channel; visibility is applied
+                // when a room is read.
+                let mut rooms: std::collections::HashMap<
+                    (i64, i64),
+                    Vec<voxhold_media::controller::Publication>,
+                > = std::collections::HashMap::new();
+                if let Some(streams) = data["streams"].as_array() {
+                    for value in streams {
+                        let Ok(publication) = serde_json::from_value::<
+                            voxhold_media::controller::Publication,
+                        >(value.clone()) else {
+                            continue;
+                        };
+                        if publication.server_id <= 0
+                            || publication.channel_id <= 0
+                            || publication.publisher_connection_id.is_empty()
+                        {
+                            continue;
+                        }
+                        rooms
+                            .entry((publication.server_id, publication.channel_id))
+                            .or_default()
+                            .push(publication);
+                    }
+                }
+                self.voice_streams = rooms;
+                effect.voice_rooms = true;
+            }
+            #[cfg(feature = "voxhold-media")]
+            "stream.started" | "stream.updated" => {
+                let Ok(publication) =
+                    serde_json::from_value::<voxhold_media::controller::Publication>(data.clone())
+                else {
+                    return effect;
+                };
+                if publication.server_id <= 0
+                    || publication.channel_id <= 0
+                    || publication.publisher_connection_id.is_empty()
+                {
+                    return effect;
+                }
+                let key = (publication.server_id, publication.channel_id);
+                let list = self.voice_streams.entry(key).or_default();
+                if let Some(existing) = list
+                    .iter_mut()
+                    .find(|old| old.publisher_connection_id == publication.publisher_connection_id)
+                {
+                    *existing = publication;
+                } else {
+                    list.push(publication);
+                }
+                effect.voice_rooms = true;
+            }
+            #[cfg(feature = "voxhold-media")]
+            "stream.stopped" => {
+                let server = data["server_id"].as_i64().unwrap_or_default();
+                let channel = data["channel_id"].as_i64().unwrap_or_default();
+                let publisher = data["publisher_connection_id"].as_str().unwrap_or_default();
+                if server <= 0 || channel <= 0 {
+                    return effect;
+                }
+                let key = (server, channel);
+                if let Some(list) = self.voice_streams.get_mut(&key) {
+                    if publisher.is_empty() {
+                        list.clear();
+                    } else {
+                        list.retain(|old| old.publisher_connection_id != publisher);
+                    }
+                    if list.is_empty() {
+                        self.voice_streams.remove(&key);
+                    }
+                }
+                effect.voice_rooms = true;
+            }
+            #[cfg(feature = "voxhold-media")]
+            "voice.snapshot" => {
+                let mut rooms: std::collections::HashMap<
+                    (i64, i64),
+                    Vec<voxhold_media::controller::Participant>,
+                > = std::collections::HashMap::new();
+                if let Some(participants) = data["participants"].as_array() {
+                    for value in participants {
+                        let Ok(participant) = serde_json::from_value::<
+                            voxhold_media::controller::Participant,
+                        >(value.clone()) else {
+                            continue;
+                        };
+                        if participant.server_id <= 0
+                            || participant.channel_id <= 0
+                            || participant.connection_id.is_empty()
+                        {
+                            continue;
+                        }
+                        rooms
+                            .entry((participant.server_id, participant.channel_id))
+                            .or_default()
+                            .push(participant);
+                    }
+                }
+                self.voice_rooms = rooms;
+                effect.voice_rooms = true;
+            }
+            #[cfg(feature = "voxhold-media")]
+            "voice.participant_joined" | "voice.state_updated" | "voice.participant_left" => {
+                let Ok(participant) =
+                    serde_json::from_value::<voxhold_media::controller::Participant>(data.clone())
+                else {
+                    return effect;
+                };
+                if participant.connection_id.is_empty()
+                    || participant.server_id <= 0
+                    || participant.channel_id <= 0
+                {
+                    return effect;
+                }
+                // A connection may move between rooms or servers: remove its
+                // old copy from every cached roster before inserting it.
+                for roster in self.voice_rooms.values_mut() {
+                    roster.retain(|old| old.connection_id != participant.connection_id);
+                }
+                self.voice_rooms.retain(|_, roster| !roster.is_empty());
+                if kind != "voice.participant_left" {
+                    self.voice_rooms
+                        .entry((participant.server_id, participant.channel_id))
+                        .or_default()
+                        .push(participant);
+                }
+                effect.voice_rooms = true;
             }
             "presence.snapshot" => {
                 if let Some(servers) = data["servers"].as_array() {

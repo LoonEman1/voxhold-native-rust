@@ -344,6 +344,18 @@ impl Voxhold {
                                 )
                             },
                         )
+                        .when(
+                            channel.kind == "voice" && self.voice_has_stream(id),
+                            |row| row.child(icon("icons/monitor.svg", 12., ink(p.lime))),
+                        )
+                        .when(channel.kind == "voice" && self.voice_count(id) > 0, |row| {
+                            row.child(
+                                div()
+                                    .text_size(px(11.))
+                                    .text_color(ink(p.muted))
+                                    .child(self.voice_count(id).to_string()),
+                            )
+                        })
                         .when(locked, |row| row.text_color(ink(p.muted)))
                         .on_click(cx.listener(move |s, _, w, cx| s.select_channel(id, w, cx))),
                 );
@@ -351,11 +363,8 @@ impl Voxhold {
         }
         panel = panel.child(div().flex_1());
         #[cfg(feature = "voxhold-media")]
-        if let Some(voice) = &self.voice {
-            if !self.access_pending && self.channel == self.voice_channel && self.voice_channel != 0
-            {
-                panel = panel.child(div().h(px(260.)).child(voice.clone()));
-            }
+        if let Some(dock) = self.voice_dock(cx) {
+            panel = panel.child(dock);
         }
         panel
             .child(

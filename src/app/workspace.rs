@@ -1,6 +1,31 @@
 use super::*;
 
 impl Voxhold {
+    /// Install an authoritative channel list for the current server. Both the
+    /// initial server selection and an ACL reload use this path so a successful
+    /// answer always confirms voice access again, clears closed rooms from the
+    /// panel and re-evaluates an active call.
+    pub(super) fn apply_confirmed_channels(
+        &mut self,
+        server: i64,
+        channels: Vec<Channel>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.channels = channels;
+        if !self.in_conversation() {
+            self.search_permissions_ready = true;
+            self.sync_search_permissions(cx);
+        }
+        #[cfg(feature = "voxhold-media")]
+        {
+            self.voice_unconfirmed.remove(&server);
+            self.sync_voice_panel(cx);
+            self.refresh_voice_call(window, cx);
+        }
+        let _ = (server, window);
+    }
+
     pub(super) fn select_server(&mut self, id: i64, window: &mut Window, cx: &mut Context<Self>) {
         let Some(c) = self.client.clone() else { return };
         let previous = self.chat_key();
@@ -24,10 +49,7 @@ impl Voxhold {
             .update(cx, |input, cx| input.set_value("", window, cx));
         #[cfg(feature = "voxhold-media")]
         if self.server != id {
-            if let Some(voice) = self.voice.take() {
-                voice.update(cx, |voice, cx| voice.leave_in_window(window, cx));
-            }
-            self.voice_channel = 0;
+            self.abandon_voice(window, cx);
         }
         self.server = id;
         self.reset_recordings(window, cx);
@@ -173,20 +195,18 @@ impl Voxhold {
                 Ok::<_, String>((channels, members))
             })
         });
-        cx.spawn(async move |this, cx| {
+        cx.spawn_in(window, async move |this, cx| {
             let result = task.await;
             if let Some(this) = this.upgrade() {
-                this.update(cx, |s, cx| {
+                this.update_in(cx, |s, window, cx| {
                     if s.generation != generation || s.access_pending {
                         return;
                     }
                     match result {
                         Ok((channels, mut members)) => {
                             crate::members::sort_members(&mut members);
-                            s.channels = channels;
                             s.members = members;
-                            s.search_permissions_ready = true;
-                            s.sync_search_permissions(cx);
+                            s.apply_confirmed_channels(id, channels, window, cx);
                         }
                         Err(e) => s.error = e,
                     }
@@ -282,38 +302,21 @@ impl Voxhold {
         self.show_channels = false;
         self.close_stale_settings(self.server, id, window, cx);
         #[cfg(feature = "voxhold-media")]
-        if let Some(client) = self.client.clone().filter(|_| {
-            self.voice_channel != id
-                && self.channels.iter().any(|ch| {
-                    ch.id == id && ch.kind == "voice" && ch.readable() && !ch.e2ee_required
-                })
-        }) {
-            if let Some(voice) = self.voice.take() {
-                voice.update(cx, |voice, cx| voice.leave_in_window(window, cx));
+        if let Some(client) = self.client.clone() {
+            // A voice channel opens its room even before joining; the call in
+            // another room stays alive and moves to the sidebar dock.
+            if self
+                .channels
+                .iter()
+                .any(|channel| channel.id == id && channel.kind == "voice")
+            {
+                if let Some(panel) = &self.voice {
+                    let panel = panel.read(cx);
+                    self.voice_channel = panel.call_channel();
+                }
+                self.open_voice_room(id, window, cx);
+                let _ = client;
             }
-            let server = self.server;
-            let push_to_talk = self.voice_settings.prefs.input_mode == "push_to_talk";
-            let panel = cx.new(|cx| {
-                voice_panel::VoicePanel::new(client, server, id, push_to_talk, window, cx)
-            });
-            let weak_view = cx.entity().downgrade();
-            let recordings_live = self.recordings_live.clone();
-            panel.update(cx, |panel, _| {
-                panel.set_recordings_live(recordings_live);
-                panel.set_recordings_handler(Box::new(move |window, cx| {
-                    let Some(_view) = weak_view.upgrade() else {
-                        return;
-                    };
-                    let weak = weak_view.clone();
-                    window.defer(cx, move |window, cx| {
-                        if let Some(view) = weak.upgrade() {
-                            view.update(cx, |view, cx| view.toggle_recordings("voice", window, cx));
-                        }
-                    });
-                }));
-            });
-            self.voice = Some(panel);
-            self.voice_channel = id;
         }
         if let Some(search) = &self.search {
             search.update(cx, |panel, cx| panel.set_scope(self.server, id, cx));
@@ -426,6 +429,13 @@ impl Voxhold {
         self.hovered_message = 0;
         self.busy = false;
         self.composer_error.clear();
+        #[cfg(feature = "voxhold-media")]
+        {
+            // The backend sends snapshots before `channels.changed`. Hide them
+            // until the fresh ACL list confirms which rooms still exist.
+            self.voice_unconfirmed.insert(self.server);
+            self.sync_voice_panel(cx);
+        }
         self.clear_media(window);
         self.roster.reset_channel();
         self.roster.loading.clear();
@@ -494,7 +504,11 @@ impl Voxhold {
                 }
                 match result {
                     Ok((channels, members)) => {
-                        s.channels = channels;
+                        if let Ok(mut members) = members {
+                            crate::members::sort_members(&mut members);
+                            s.members = members;
+                        }
+                        s.apply_confirmed_channels(server, channels, window, cx);
                         // A notification form follows the account, not the
                         // administration role, but it still needs a readable
                         // text/news channel. Revoking access closes it.
@@ -508,12 +522,6 @@ impl Voxhold {
                             });
                         if channel_missing {
                             s.close_settings(false, window, cx);
-                        }
-                        s.search_permissions_ready = true;
-                        s.sync_search_permissions(cx);
-                        if let Ok(mut members) = members {
-                            crate::members::sort_members(&mut members);
-                            s.members = members;
                         }
                         if s.in_conversation() {
                             s.access_pending = false;
@@ -545,18 +553,6 @@ impl Voxhold {
                             .iter()
                             .find(|c| c.id == s.channel && c.readable() && !c.e2ee_required)
                             .map(|c| c.id);
-                        #[cfg(feature = "voxhold-media")]
-                        if !s.channels.iter().any(|c| {
-                            c.id == s.voice_channel
-                                && c.kind == "voice"
-                                && c.readable()
-                                && !c.e2ee_required
-                        }) {
-                            if let Some(voice) = s.voice.take() {
-                                voice.update(cx, |voice, cx| voice.leave_in_window(window, cx));
-                            }
-                            s.voice_channel = 0;
-                        }
                         s.access_pending = false;
                         s.error.clear();
                         let channel = channel.unwrap_or_default();

@@ -223,7 +223,9 @@ impl Voxhold {
     /// The call panel and its "Записи" button share this visibility rule.
     #[cfg(feature = "voxhold-media")]
     pub(super) fn recordings_voice_panel_visible(&self) -> bool {
-        !self.access_pending && self.channel == self.voice_channel && self.voice_channel != 0
+        !self.access_pending
+            && self.voice_channel != 0
+            && (self.channel == self.voice_channel || self.voice_room == self.voice_channel)
     }
 
     /// Keep the keyboard ring inside the dialog when the focused action was

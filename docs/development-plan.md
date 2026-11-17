@@ -905,7 +905,7 @@ http_active,thumb_bytes,link_bytes,recording_bytes,workers,peers,live_textures
 | `R04` | Первый срез и два раунда правок ревью в PR [#13](https://github.com/LoonEman1/voxhold-native-rust/pull/13) · ветка `codex/r04-message-actions` | [`4d8cac1`](https://github.com/LoonEman1/voxhold-native-rust/commit/4d8cac1) поверх [`9f450e7`](https://github.com/LoonEman1/voxhold-native-rust/commit/9f450e7b380491dbbdd457e10bd1a94f8201c8b0); действия сообщений, ветки, поиск/закрепы, ЛС в workspace, `ChatKey`-изоляция, 12+4 правки ревью; GUI-пары кадров, DPI и два аккаунта не проверены | — |
 | `R05` | В dev · PR [#14](https://github.com/LoonEman1/voxhold-native-rust/pull/14) · ветка `codex/r05-settings` | [`bf421cc`](https://github.com/LoonEman1/voxhold-native-rust/commit/bf421ccf386fb392d3f166a0d11b96d9e7ea2731) (merge `33d9a7a`): участники/присутствие, модальное дерево настроек, профиль/приватность, тема и уведомления, роли/хранилище/баны/CORS/диагностика, настройки канала и уведомления; Windows CI на `33d9a7a` успешен (run 43930378048), живой backend/кадры/два аккаунта не проверены | — |
 | `R06` | PR [#16](https://github.com/LoonEman1/voxhold-native-rust/pull/16) · ветка `codex/r06-recordings` | API list/get/preview/ticket/stream/delete, серверный снимок с `access_epoch`/tombstone/`recording.updated`, одна модалка из шапки и звонка, Windows save, клавиатура/клиппинг; тесты, release и размеры локально; живой backend, кадры/DPI и ручной GUI не проверены | — |
-| `R07a` | К выполнению | — | — |
+| `R07a` | PR [#18](https://github.com/LoonEman1/voxhold-native-rust/pull/18) · ветка `codex/r07-voice-viewer` | Медиаслой: каталог/`viewer` с попытками, bounded `Requests`/`Updates`, BGRA и тесты кадра; UI: комната/док/плеер Go, PTT и устройства, GPUI-регрессии; живой backend, кадры и DPI не проверены | — |
 | `R07b` | К выполнению | — | — |
 | `W02b`–`W12` | Один пакет расширений, к выполнению | [Порядок работы](w-workflow.md) | — |
 | `W13` (`R08`) | Итоговая приёмка после всех этапов реализации | — | — |
@@ -1087,6 +1087,85 @@ smoke release (процесс активен через 4 с). Живой backen
 загрузка/удаление записи, второй клиент для `recording.updated`, ручной
 GUI, Windows save dialog, кадры/DPI и визуальные пары Go/Rust не
 проверялись. См. [status.md](status.md).
+
+### R07a · Голос и просмотр текущего Go — журнал PR #18
+
+Ветка `codex/r07-voice-viewer`, база `origin/dev` `e6c85bf` (merge PR #16),
+PR [#18](https://github.com/LoonEman1/voxhold-native-rust/pull/18); сверены
+backend `9b29fdd6d5dc818b7408e4892b8e68b27d123831`,
+frontend `ed7cb00ae12398753a8ef48a5a33b864e20cb04c` и Go
+`09c82b983d5d842af0627289655b11c37ae56e1d`.
+
+- `crates/voxhold-media/src/catalog.rs`, `viewer.rs`: детерминированная модель
+  просмотра без WebRTC и таймеров. Публикация адресуется
+  `(server_id, channel_id, publisher_connection_id)` и номером попытки;
+  смена B→C ждёт `stream.left` A (5 с), затем запускает ровно C; offer/ICE
+  старой попытки и `stream.stopped(A)` не трогают активный B; `stream.watching`
+  принимается только по своему `request_id`; ошибка `native-stream-N`
+  сравнивается с `request_start`; reconnect сохраняет выбранную публикацию до
+  нового `voice.joined`.
+- `runtime.rs`: ограниченные last-value слоты `Requests` (controls, watch,
+  stream mute, viewport, local mute), коалесцирующая очередь `Updates`
+  (терминальные `Error`/`Left` не сливаются, снимки заменяются), bounded
+  `device notice`; отдельный поток кадра забирает и переиспользует буфер,
+  кадры не копятся. Leave приоритетнее всего, `leave_stream` сбрасывает
+  очередь выбора. Регистрация микрофона закрыта до подтверждённого
+  `voice.joined`; `Media::Start` больше не открывает захват.
+- `controller.rs`, `voice.rs`: join attempt, server mute, roster по
+  `connection_id`, `connections_with_audio` для локального mute; смена
+  устройства сначала поднимает новый тракт, при отказе восстанавливает
+  прежний GUID/имя и отдаёт `Event::DeviceError`; default-resolve идёт через
+  Windows endpoint, а не индекс 0; раз в секунду проверяется hot-unplug и
+  выполняется fallback. Local принадлежит `VoiceHandle`, join/server mute —
+  worker; `State` не перезаписывает local. Drop старого `Media` закрывает
+  только транспорт, а защёлку ставит `VoiceHandle::leave`; выбранный выход
+  отделён от применённого; отказ, unplug и явный выбор идут через Session.
+  Громкость 0–200 % ждёт PCM `R07b`; микшер Windows не меняется, 0 %/deafen закрывают треки.
+- `video.rs`: libyuv пишет BGRA напрямую (`I420ToARGB` на little-endian), UI
+  больше не меняет каналы на каждый пиксель; синтетический I420 с
+  известными красным/синим проверяет порядок каналов, отсутствие
+  вертикального переворота и растяжение при scale.
+- `src/voice_room.rs`, `src/voice_panel.rs`, `voice_panel/{view,player}.rs`:
+  заголовки/статусы комнаты, карточки участников по сетке Go, индикатор
+  речи, roster/badge канала, dock 98 px, порядок действий микрофон → звук →
+  записи → выход, локальный mute только при реальном треке, Tab/Shift+Tab по
+  видимым действиям. Плеер: 360 px, drag за шапку, corner resize, поля 8 px,
+  ограничения 260–720, `width*9/16+76`, внутренные области Go, fullscreen,
+  Esc/F/двойной клик, mute только при `has_audio`, закрытие оставляет голос.
+  Просмотр комнаты и звонок независимы: переход в другой канал/ЛС не
+  завершает звонок, появляется dock, `voice_room` и `call_channel`
+  очищаются при leave/logout/revoke.
+- `src/app/{voice_ops,voice_tests,realtime,workspace,shell_view,navigation_view}.rs`:
+  подтверждённый доступ к комнате, roster всех видимых голосовых комнат и
+  публикаций из account WS, PTT по сохранённой клавише с release на key-up,
+  потере фокуса, модалке и уходе из комнаты; hotkey mute/deafen; устройства,
+  качество и громкость из вкладки «Голос и звук» доходят до живого тракта.
+  Подтверждение каналов после `select_server` и ACL-reload идёт через один
+  переход: снимает `voice_unconfirmed`, чистит закрытые комнаты и
+  синхронизирует панель; активная комната скрывает roster/streams, пока ACL
+  не подтверждён. Потеря WS до `voice.joined` публикует восстановление для
+  текущего выбора, а `Ended` закрывает плеер через путь с `Window` и
+  возвращает обычный режим, если fullscreen включал сам плеер.
+- Регрессии: A→B→C, `stream.stopped(A)`, повторная публикация, закрытый
+  звонок/`request_id`/stale ICE, reconnect/revoke, leave-timeout,
+  snapshot/stop/re-entry, `Requests`/`Updates`, BGRA, Tab/Shift+Tab, Esc/F,
+  PTT, dock. Добавлены PTT/State, drop Media, Watch→Close, tagged events, P2P,
+  ICE, reconnect, rollback/unplug выхода, ACL и fullscreen.
+- Wire: `stream.watch` несёт `watch_id`; клиент строго проверяет метку, если
+  backend её прислал. Закреплённый backend не размечает push offer/ICE/close:
+  первый немаркированный close после смены попытки игнорируется; offer с неизвестным ufrag и строгая гарантия требуют watch id и буферизации до ACK.
+Проверки: `cargo fmt --all -- --check`, `cargo test --workspace --locked`
+(296 тестов приложения: 296 passed, 1 `ignored`; 11 API; 54 media),
+`cargo build --release --locked -p voxhold-native-rust`,
+`scripts/check-file-sizes.ps1` (172 файлов), `git diff --check`, smoke
+release (процесс активен через 5 с).
+
+Не проверено: живой backend/два клиента, реальный SFU/P2P с Chromium,
+фактические кодеки/разрешение/задержка/CPU, пары кадров Go/Rust, DPI
+100/125/150, ручной GUI, реальная смена/отключение устройств и сон,
+слышимый тест микрофона/звука. Тест звука и input gain относятся к
+аудиотракту `R07b`; локальный peak meter показывает реальный `MediaSource`,
+но не является измерением DSP.
 
 ### Что обязательно приложить к PR
 

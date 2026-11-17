@@ -1,227 +1,256 @@
-//! Inbound stream signaling and video-frame access. Drive this alongside the
-//! authenticated voice socket; only accept offers from the selected publisher.
-use crate::{
-    Candidate, Command, Event, IceServer, Media, VideoFrame,
-    controller::{Publication, Signal},
-};
-use serde_json::{Value, json};
-use std::{
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
-    time::Duration,
-};
+//! One WebRTC engine per viewing attempt. The deterministic decisions live in
+//! `viewer`; this file only drives the media engine and reports what it sees.
 
-pub enum ViewerUpdate {
-    Signal(Signal),
+use crate::{Candidate, Command, Event, IceServer, Media, VideoFrame};
+use std::time::Duration;
+
+/// An engine event that belongs to the current attempt. Signaling is returned
+/// without request ids; `viewer` stamps the attempt's ids.
+pub enum EngineUpdate {
     Frame,
-    Status(&'static str),
+    Answer(String),
+    Ice(Candidate),
+    State(&'static str),
     Error(String),
+    /// Audio output switch result. It is not a stream failure: the peer and the
+    /// decoded picture stay alive after a successful rollback.
+    Output {
+        applied: Option<String>,
+        audible: bool,
+        working: bool,
+        error: Option<String>,
+    },
 }
+
 pub struct StreamViewer {
-    pub publication: Publication,
-    pub frame: VideoFrame,
     media: Media,
-    sequence: Arc<AtomicU64>,
-    request_start: u64,
-    watch_request: String,
-    retries: u8,
     muted: bool,
+    /// The last output requested from the player versus the endpoint it has
+    /// actually confirmed. A failed switch leaves `applied` on the previous
+    /// device so the same request can be retried instead of being dropped.
+    requested_output: Option<String>,
+    applied_output: Option<String>,
+    output_working: bool,
 }
+
 impl StreamViewer {
+    /// `mode` was validated by the viewer; unknown modes never reach here.
     pub fn start(
-        publication: Publication,
         servers: Vec<IceServer>,
         policy: String,
         output: Option<String>,
         muted: bool,
-        sequence: Arc<AtomicU64>,
-    ) -> Result<(Self, Signal), String> {
-        if publication.mode != "p2p" && publication.mode != "server" {
-            return Err("Неизвестный режим трансляции".into());
-        }
-        let media = Media::new().map_err(|e| format!("{e:?}"))?;
+    ) -> Result<Self, String> {
+        let media = Media::new().map_err(|error| format!("{error:?}"))?;
         media
             .command(Command::ViewStart {
                 ice_servers: servers,
                 ice_transport_policy: policy,
-                output,
+                output: output.clone(),
             })
-            .map_err(|e| format!("{e:?}"))?;
+            .map_err(|error| format!("{error:?}"))?;
         if muted {
             media
                 .command(Command::ViewAudio { muted: true })
-                .map_err(|e| format!("{e:?}"))?;
+                .map_err(|error| format!("{error:?}"))?;
         }
-        let mut viewer = Self {
-            publication,
-            frame: VideoFrame::default(),
+        Ok(Self {
             media,
-            sequence,
-            request_start: 0,
-            watch_request: String::new(),
-            retries: 0,
             muted,
-        };
-        let request=viewer.signal("stream.watch",json!({"server_id":viewer.publication.server_id,"channel_id":viewer.publication.channel_id,"publisher_connection_id":viewer.publication.publisher_connection_id,"supported_dynamic_ranges":["sdr"]}));
-        viewer.watch_request = request.request_id.clone().unwrap_or_default();
-        viewer.request_start = viewer.sequence.load(Ordering::Relaxed);
-        Ok((viewer, request))
+            requested_output: output.clone(),
+            applied_output: output,
+            output_working: true,
+        })
     }
-    fn signal(&mut self, kind: &'static str, data: Value) -> Signal {
-        let n = self.sequence.fetch_add(1, Ordering::Relaxed) + 1;
-        Signal {
-            kind,
-            data,
-            request_id: Some(format!("native-stream-{n}")),
-        }
-    }
+
     pub fn set_muted(&mut self, muted: bool) -> Result<(), String> {
         self.media
             .command(Command::ViewAudio { muted })
-            .map_err(|e| format!("{e:?}"))?;
+            .map_err(|error| format!("{error:?}"))?;
         self.muted = muted;
         Ok(())
     }
+
+    /// The output device setting is shared with the voice session, so a
+    /// running player must follow it too. A repeat of a request that rolled
+    /// back is sent again because `applied_output` still names the old device.
+    pub fn set_output(&mut self, output: Option<String>) -> Result<(), String> {
+        if self.requested_output == output && self.applied_output == output && self.output_working {
+            return Ok(());
+        }
+        self.command_output(output)
+    }
+
+    /// Explicit selection from settings. The engine's `OutputState` is the
+    /// authority: the viewer cache may still name A while an unplug fallback
+    /// event is queued but not polled yet.
+    pub fn select_output(&mut self, output: Option<String>) -> Result<(), String> {
+        self.command_output(output)
+    }
+
+    fn command_output(&mut self, output: Option<String>) -> Result<(), String> {
+        self.media
+            .command(Command::ViewOutput {
+                output: output.clone(),
+            })
+            .map_err(|error| format!("{error:?}"))?;
+        self.requested_output = output;
+        Ok(())
+    }
+
+    pub fn offer(&self, sdp: String) -> Result<(), String> {
+        self.media
+            .command(Command::Offer { sdp })
+            .map_err(|error| format!("{error:?}"))
+    }
+
+    pub fn ice(&self, candidate: Candidate) -> Result<(), String> {
+        self.media
+            .command(Command::Ice(candidate))
+            .map_err(|error| format!("{error:?}"))
+    }
+
     pub fn muted(&self) -> bool {
         self.muted
     }
-    pub fn leave(&mut self) -> Signal {
-        let _ = self.media.command(Command::Stop);
-        self.signal("stream.leave", json!({}))
-    }
-    pub fn on_signal(&mut self, kind: &str, request_id: &str, data: &Value) -> Result<(), String> {
-        match kind {
-            "stream.watching" if request_id == self.watch_request => {
-                let publication: Publication = serde_json::from_value(data["stream"].clone())
-                    .map_err(|_| "Некорректный ответ сервера")?;
-                if publication.publisher_connection_id != self.publication.publisher_connection_id {
-                    return Err("Сервер выбрал другую трансляцию".into());
-                }
-                self.publication = publication;
-            }
-            "stream.webrtc_offer" | "stream.p2p_offer" => {
-                if !self.accept_sender(kind, data) {
-                    return Ok(());
-                }
-                if let Some(sdp) = data["sdp"].as_str().filter(|s| !s.is_empty()) {
-                    self.media
-                        .command(Command::Offer { sdp: sdp.into() })
-                        .map_err(|e| format!("{e:?}"))?;
-                }
-            }
-            "stream.ice_candidate" | "stream.p2p_ice_candidate" => {
-                if !self.accept_sender(kind, data) {
-                    return Ok(());
-                }
-                let c = Candidate {
-                    candidate: data["candidate"].as_str().unwrap_or_default().into(),
-                    sdp_mid: data["sdp_mid"].as_str().map(str::to_owned),
-                    sdp_mline_index: data["sdp_mline_index"]
-                        .as_u64()
-                        .and_then(|n| u16::try_from(n).ok()),
-                    username_fragment: data["username_fragment"].as_str().map(str::to_owned),
-                };
-                self.media
-                    .command(Command::Ice(c))
-                    .map_err(|e| format!("{e:?}"))?;
-            }
-            "stream.stopped"
-                if data["channel_id"].as_i64() == Some(self.publication.channel_id)
-                    && (data["publisher_connection_id"]
-                        .as_str()
-                        .unwrap_or_default()
-                        .is_empty()
-                        || data["publisher_connection_id"].as_str()
-                            == Some(self.publication.publisher_connection_id.as_str())) =>
-            {
-                return Err("Трансляция завершена".into());
-            }
 
-            "error"
-                if request_id
-                    .strip_prefix("native-stream-")
-                    .and_then(|n| n.parse::<u64>().ok())
-                    .is_some_and(|n| n >= self.request_start) =>
-            {
-                return Err("Сервер отклонил просмотр трансляции".into());
-            }
-            _ => {}
-        }
-        Ok(())
-    }
-    fn accept_sender(&self, kind: &str, data: &Value) -> bool {
-        if kind.starts_with("stream.p2p_") {
-            self.publication.mode == "p2p"
-                && data["from_connection_id"].as_str()
-                    == Some(self.publication.publisher_connection_id.as_str())
-        } else {
-            self.publication.mode == "server"
-        }
-    }
-    pub fn poll(&mut self, width: u32, height: u32) -> Option<ViewerUpdate> {
+    /// Non-blocking: one queued engine event per call, so a burst of frames
+    /// cannot starve signaling or the voice session on the same worker.
+    pub fn poll(
+        &mut self,
+        frame: &mut VideoFrame,
+        width: u32,
+        height: u32,
+    ) -> Option<EngineUpdate> {
         let event = self.media.poll(Duration::ZERO)?;
         match event {
-            Event::Frame => {
-                if self.media.read_video(&mut self.frame, width, height) {
-                    Some(ViewerUpdate::Frame)
-                } else {
-                    None
-                }
+            Event::Frame => self
+                .media
+                .read_video(frame, width, height)
+                .then_some(EngineUpdate::Frame),
+            Event::Answer { sdp } => Some(EngineUpdate::Answer(sdp)),
+            Event::Ice(candidate) => Some(EngineUpdate::Ice(candidate)),
+            Event::State { state } => Some(EngineUpdate::State(state)),
+            Event::Error { message } => Some(EngineUpdate::Error(message.into())),
+            Event::Output {
+                applied,
+                audible,
+                working,
+                error,
+            } => {
+                self.applied_output = applied.clone();
+                self.requested_output = applied.clone();
+                self.output_working = working;
+                Some(EngineUpdate::Output {
+                    applied,
+                    audible,
+                    working,
+                    error: error.map(str::to_owned),
+                })
             }
-            Event::Answer { sdp } => {
-                let p2p = self.publication.mode == "p2p";
-                let mut data = json!({"sdp":sdp});
-                if p2p {
-                    data["target_connection_id"] = json!(self.publication.publisher_connection_id);
-                }
-                Some(ViewerUpdate::Signal(self.signal(
-                    if p2p {
-                        "stream.p2p_answer"
-                    } else {
-                        "stream.webrtc_answer"
-                    },
-                    data,
-                )))
-            }
-            Event::Ice(c) => {
-                let p2p = self.publication.mode == "p2p";
-                let mut data = json!({"candidate":c.candidate,"sdp_mid":c.sdp_mid,"sdp_mline_index":c.sdp_mline_index,"username_fragment":c.username_fragment});
-                if p2p {
-                    data["target_connection_id"] = json!(self.publication.publisher_connection_id);
-                }
-                Some(ViewerUpdate::Signal(self.signal(
-                    if p2p {
-                        "stream.p2p_ice_candidate"
-                    } else {
-                        "stream.ice_candidate"
-                    },
-                    data,
-                )))
-            }
-            Event::State { state: "connected" } => Some(ViewerUpdate::Status("Подключено")),
-            Event::State {
-                state: "failed" | "disconnected",
-            } if self.retries < 2 => {
-                self.retries += 1;
-                let p2p = self.publication.mode == "p2p";
-                let data = if p2p {
-                    json!({"target_connection_id":self.publication.publisher_connection_id})
-                } else {
-                    json!({"server_id":self.publication.server_id,"channel_id":self.publication.channel_id,"action":"ice_restart"})
-                };
-                Some(ViewerUpdate::Signal(self.signal(
-                    if p2p {
-                        "stream.p2p_restart"
-                    } else {
-                        "stream.recovery_request"
-                    },
-                    data,
-                )))
-            }
-            Event::Error { message } => Some(ViewerUpdate::Error(message.into())),
-            _ => None,
+            Event::Track { .. } | Event::Level { .. } | Event::DeviceError { .. } => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Event, Events, Media, VideoFrame, video::VideoStore, voice::CaptureGate};
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+
+    fn headless(output: Option<&str>) -> (StreamViewer, mpsc::Receiver<Command>, Arc<Events>) {
+        let (commands, receiver) = mpsc::channel(8);
+        let events = Arc::new(Events::default());
+        let media = Media {
+            commands,
+            events: events.clone(),
+            capture: Arc::new(CaptureGate::default()),
+            video: Arc::new(VideoStore::default()),
+            worker: None,
+        };
+        let output = output.map(str::to_owned);
+        (
+            StreamViewer {
+                media,
+                muted: false,
+                requested_output: output.clone(),
+                applied_output: output,
+                output_working: true,
+            },
+            receiver,
+            events,
+        )
+    }
+
+    #[test]
+    fn a_rolled_back_output_can_be_requested_again() {
+        let (mut viewer, mut commands, events) = headless(Some("usb"));
+        viewer.set_output(Some("hdmi".into())).unwrap();
+        assert!(matches!(
+            commands.try_recv(),
+            Ok(Command::ViewOutput { output: Some(output) }) if output == "hdmi"
+        ));
+        // The engine could not open HDMI and restored USB. The peer and the
+        // picture stay alive; only the applied endpoint changes.
+        events.push(Event::Output {
+            applied: Some("usb".into()),
+            audible: true,
+            working: true,
+            error: Some("Не удалось переключить устройство воспроизведения, прежнее работает."),
+        });
+        let mut frame = VideoFrame::default();
+        assert!(matches!(
+            viewer.poll(&mut frame, 1, 1),
+            Some(EngineUpdate::Output { applied: Some(applied), .. }) if applied == "usb"
+        ));
+        // Repeating the same preference must reach the engine again instead of
+        // being skipped because the requested slot still said HDMI.
+        viewer.set_output(Some("hdmi".into())).unwrap();
+        assert!(matches!(
+            commands.try_recv(),
+            Ok(Command::ViewOutput { output: Some(output) }) if output == "hdmi"
+        ));
+    }
+
+    #[test]
+    fn an_unplug_fallback_does_not_hide_a_reconnected_device() {
+        let (mut viewer, mut commands, events) = headless(Some("usb-a"));
+        // The hot-plug check switched playback to the default endpoint.
+        events.push(Event::Output {
+            applied: None,
+            audible: true,
+            working: true,
+            error: Some("Устройство воспроизведения отключено, используется системное."),
+        });
+        let mut frame = VideoFrame::default();
+        assert!(matches!(
+            viewer.poll(&mut frame, 1, 1),
+            Some(EngineUpdate::Output {
+                applied: None,
+                working: true,
+                ..
+            })
+        ));
+        // Reconnecting A and selecting it must still reach the engine.
+        viewer.set_output(Some("usb-a".into())).unwrap();
+        assert!(matches!(
+            commands.try_recv(),
+            Ok(Command::ViewOutput { output: Some(output) }) if output == "usb-a"
+        ));
+    }
+
+    #[test]
+    fn an_explicit_selection_bypasses_the_stale_output_cache() {
+        let (mut viewer, mut commands, _events) = headless(Some("usb-a"));
+        // The fallback notice is still queued: the viewer cache says A is
+        // applied and working. An explicit settings selection must still reach
+        // `Session::ViewOutput`, whose own state knows about the unplug.
+        viewer.select_output(Some("usb-a".into())).unwrap();
+        assert!(matches!(
+            commands.try_recv(),
+            Ok(Command::ViewOutput { output: Some(output) }) if output == "usb-a"
+        ));
     }
 }

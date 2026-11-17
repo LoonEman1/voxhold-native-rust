@@ -39,8 +39,10 @@ const BUFFERS: usize = 4;
 const MAX_PENDING_BLOCKS: usize = 20;
 const MAX_PENDING: usize = BLOCK * MAX_PENDING_BLOCKS;
 const LEVEL_INTERVAL: u32 = 5;
-/// The platform ADM has no render reference here, so echo cancellation stays
-/// unsupported until a measured render-reference path exists.
+/// The software WinMM path has no render reference, so it cannot run echo
+/// cancellation and reports `false`. The platform ADM fallback keeps its own
+/// render/playout reference and may apply its default AEC; that value is
+/// reported as the platform default, not as a measured software claim.
 pub const ECHO_CANCELLATION_AVAILABLE: bool = false;
 
 /// Bounded sample queue between the WinMM buffers and the 10 ms DSP blocks.
@@ -231,20 +233,29 @@ fn capture_loop(
 ) {
     let mut processor = BlockProcessor::default();
     let mut pending = PcmBuffer::with_capacity();
+    let mut transition = MuteTransition::default();
     let mut block = [0_i16; BLOCK];
     let mut source_dropped = 0_u64;
     let mut ticks = 0_u32;
-    let mut last_muted = false;
     while !stop.load(Ordering::Acquire) {
         device.completed(|samples| pending.push(samples));
-        while pending.pop_block(&mut block) {
-            let current = params.lock().map(|value| value.clone()).unwrap_or_default();
-            if current.muted != last_muted {
-                // Drop samples captured under the previous control decision
-                // before the next block reaches the encoder.
+        loop {
+            let current = params
+                .lock()
+                .map(|value| value.clone())
+                .unwrap_or_else(|_| AudioParams {
+                    // A poisoned parameter lock must never unmute the mic.
+                    muted: true,
+                    ..AudioParams::default()
+                });
+            // Check the transition before taking a block: on unmute the
+            // already queued pre-mute audio must not reach Opus.
+            if transition.changed(current.muted) {
                 pending.clear();
                 source.clear_buffer();
-                last_muted = current.muted;
+            }
+            if !pending.pop_block(&mut block) {
+                break;
             }
             let (level, muted) = processor.process(&mut block, &current);
             let frame = AudioFrame {
@@ -273,6 +284,23 @@ fn capture_loop(
     device.close();
 }
 
+/// Tracks the last control decision so the capture loop can drop queued audio
+/// *before* the first block of the new state is processed.
+#[derive(Default)]
+struct MuteTransition {
+    muted: bool,
+}
+
+impl MuteTransition {
+    fn changed(&mut self, muted: bool) -> bool {
+        if self.muted == muted {
+            return false;
+        }
+        self.muted = muted;
+        true
+    }
+}
+
 /// `queue_size_ms == 0` makes `capture_frame` synchronous. Polling once keeps
 /// the audio thread free of a runtime and turns an unexpected wait into a
 /// counted drop instead of blocking the sample clock. `Waker::noop` is static,
@@ -291,203 +319,10 @@ fn poll_once<F: std::future::Future>(future: F) -> Option<F::Output> {
 }
 
 #[cfg(windows)]
-mod imp {
-    use std::ptr;
-
-    const WAVE_MAPPER: u32 = 0xFFFF_FFFF;
-    const WAVE_FORMAT_PCM: u16 = 1;
-    const CALLBACK_NULL: usize = 0;
-    const WHDR_DONE: u32 = 0x0000_0001;
-    const WAVERR_BADFORMAT: u32 = 32;
-    const MMSYSERR_BADDEVICEID: u32 = 2;
-    const MMSYSERR_ALLOCATED: u32 = 4;
-
-    #[repr(C)]
-    struct WaveFormatEx {
-        format_tag: u16,
-        channels: u16,
-        samples_per_sec: u32,
-        avg_bytes_per_sec: u32,
-        block_align: u16,
-        bits_per_sample: u16,
-        cb_size: u16,
-    }
-
-    #[repr(C)]
-    struct WaveHdr {
-        data: *mut u8,
-        buffer_length: u32,
-        bytes_recorded: u32,
-        user: usize,
-        flags: u32,
-        loops: u32,
-        next: *mut WaveHdr,
-        reserved: usize,
-    }
-
-    #[link(name = "winmm")]
-    unsafe extern "system" {
-        fn waveInOpen(
-            handle: *mut usize,
-            device: u32,
-            format: *const WaveFormatEx,
-            callback: usize,
-            instance: usize,
-            flags: u32,
-        ) -> u32;
-        fn waveInPrepareHeader(handle: usize, header: *mut WaveHdr, size: u32) -> u32;
-        fn waveInUnprepareHeader(handle: usize, header: *mut WaveHdr, size: u32) -> u32;
-        fn waveInAddBuffer(handle: usize, header: *mut WaveHdr, size: u32) -> u32;
-        fn waveInStart(handle: usize) -> u32;
-        fn waveInReset(handle: usize) -> u32;
-        fn waveInClose(handle: usize) -> u32;
-    }
-
-    pub struct WinIn {
-        handle: usize,
-        buffers: Vec<Box<[i16; super::BLOCK * 2]>>,
-        headers: Box<[WaveHdr]>,
-        prepared: usize,
-        size: u32,
-    }
-
-    // The handle and buffers move from the caller to the capture thread once;
-    // no method can be used from two threads at the same time.
-    unsafe impl Send for WinIn {}
-
-    impl WinIn {
-        pub fn open(input: Option<&str>) -> Result<Self, String> {
-            let device = input
-                .and_then(|id| id.split(':').next())
-                .and_then(|index| index.parse::<u32>().ok())
-                .unwrap_or(WAVE_MAPPER);
-            let format = WaveFormatEx {
-                format_tag: WAVE_FORMAT_PCM,
-                channels: super::CHANNELS as u16,
-                samples_per_sec: super::SAMPLE_RATE,
-                avg_bytes_per_sec: super::SAMPLE_RATE * 2,
-                block_align: 2,
-                bits_per_sample: 16,
-                cb_size: 0,
-            };
-            let mut handle = 0_usize;
-            let code = unsafe { waveInOpen(&mut handle, device, &format, CALLBACK_NULL, 0, 0) };
-            if code != 0 {
-                return Err(device_error(code));
-            }
-            let size = std::mem::size_of::<WaveHdr>() as u32;
-            let buffers = (0..super::BUFFERS)
-                .map(|_| Box::new([0_i16; super::BLOCK * 2]))
-                .collect::<Vec<_>>();
-            let headers = (0..super::BUFFERS)
-                .map(|_| WaveHdr {
-                    data: ptr::null_mut(),
-                    buffer_length: 0,
-                    bytes_recorded: 0,
-                    user: 0,
-                    flags: 0,
-                    loops: 0,
-                    next: ptr::null_mut(),
-                    reserved: 0,
-                })
-                .collect::<Vec<_>>()
-                .into_boxed_slice();
-            let mut device = Self {
-                handle,
-                buffers,
-                headers,
-                prepared: 0,
-                size,
-            };
-            for index in 0..super::BUFFERS {
-                let buffer = device.buffers[index].as_mut_ptr();
-                let header = &mut device.headers[index];
-                header.data = buffer.cast();
-                header.buffer_length = (super::BLOCK * 2 * 2) as u32;
-                header.bytes_recorded = 0;
-                header.flags = 0;
-                if unsafe { waveInPrepareHeader(handle, header, size) } != 0 {
-                    device.close();
-                    return Err("Не удалось подготовить буфер микрофона.".into());
-                }
-                device.prepared += 1;
-                if unsafe { waveInAddBuffer(handle, header, size) } != 0 {
-                    device.close();
-                    return Err("Не удалось передать буфер микрофону.".into());
-                }
-            }
-            if unsafe { waveInStart(handle) } != 0 {
-                device.close();
-                return Err("Не удалось запустить захват микрофона.".into());
-            }
-            Ok(device)
-        }
-
-        /// Polls completed buffers and requeues them. Copies only recorded
-        /// bytes, so a short final buffer is not mistaken for silence. The
-        /// driver writes `dwFlags`/`dwBytesRecorded` asynchronously, so both
-        /// are read volatile. The caller consumes the slice, so no temporary
-        /// `Vec` is allocated on the audio thread.
-        pub fn completed(&mut self, mut sink: impl FnMut(&[i16])) {
-            for header in self.headers.iter_mut() {
-                let flags = unsafe { ptr::read_volatile(&header.flags) };
-                if flags & WHDR_DONE == 0 {
-                    continue;
-                }
-                let recorded = unsafe { ptr::read_volatile(&header.bytes_recorded) } as usize / 2;
-                let data = header.data;
-                if recorded > 0 && !data.is_null() {
-                    let samples =
-                        unsafe { std::slice::from_raw_parts(data.cast::<i16>(), recorded) };
-                    sink(samples);
-                }
-                // The driver clears WHDR_DONE when the buffer is queued again.
-                // Writing flags here would also drop WHDR_PREPARED.
-                let _ = unsafe { waveInAddBuffer(self.handle, header as *mut _, self.size) };
-            }
-        }
-
-        pub fn close(&mut self) {
-            if self.handle == 0 {
-                return;
-            }
-            unsafe {
-                waveInReset(self.handle);
-            }
-            if self.prepared > 0 {
-                for index in 0..self.prepared {
-                    let header = &mut self.headers[index];
-                    unsafe {
-                        waveInUnprepareHeader(self.handle, header, self.size);
-                    }
-                }
-                self.prepared = 0;
-            }
-            unsafe {
-                waveInClose(self.handle);
-            }
-            self.handle = 0;
-        }
-    }
-
-    impl Drop for WinIn {
-        fn drop(&mut self) {
-            self.close();
-        }
-    }
-
-    fn device_error(code: u32) -> String {
-        match code {
-            WAVERR_BADFORMAT => "Микрофон не поддерживает 48 кГц mono 16 бит.".into(),
-            MMSYSERR_BADDEVICEID => "Выбранное устройство ввода недоступно.".into(),
-            MMSYSERR_ALLOCATED => "Микрофон занят другим приложением.".into(),
-            _ => format!("Не удалось открыть микрофон Windows ({code})."),
-        }
-    }
-}
+mod winmm;
 
 #[cfg(windows)]
-use imp::WinIn;
+use winmm::WinIn;
 
 #[cfg(not(windows))]
 struct WinIn;
@@ -811,6 +646,55 @@ mod tests {
         }
         assert!(levels > 0, "capture produced no input_level events");
         println!("input levels {levels}, dropped blocks {dropped}");
+    }
+
+    #[test]
+    fn mute_transition_drops_queued_audio_before_the_first_new_block() {
+        let mut pending = PcmBuffer::with_capacity();
+        let mut transition = MuteTransition::default();
+        pending.push(&vec![9_000_i16; BLOCK]);
+        assert!(transition.changed(true));
+        pending.clear();
+        let mut block = [0_i16; BLOCK];
+        assert!(!pending.pop_block(&mut block), "old audio was discarded");
+        pending.push(&vec![222_i16; BLOCK]);
+        assert!(pending.pop_block(&mut block));
+        assert!(block.iter().all(|sample| *sample == 222));
+        // Unmute: samples captured while muted must not be replayed.
+        pending.push(&vec![9_000_i16; BLOCK]);
+        assert!(transition.changed(false));
+        pending.clear();
+        assert!(!pending.pop_block(&mut block));
+        pending.push(&vec![333_i16; BLOCK]);
+        assert!(pending.pop_block(&mut block));
+        assert!(block.iter().all(|sample| *sample == 333));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn saved_winmm_device_is_resolved_by_name_not_by_index() {
+        let devices = vec![(0, "Speakers".to_owned()), (1, "USB Headset".to_owned())];
+        assert_eq!(
+            winmm::choose_device(Some("0:USB Headset"), &devices).unwrap(),
+            1,
+            "indexes shift; the saved name still identifies the device"
+        );
+        assert_eq!(
+            winmm::choose_device(Some("1:USB"), &devices).unwrap(),
+            1,
+            "legacy truncated names are resolved by a unique prefix"
+        );
+        assert_eq!(
+            winmm::choose_device(None, &devices).unwrap(),
+            winmm::WAVE_MAPPER,
+            "an empty preference is the Windows default"
+        );
+        assert!(winmm::choose_device(Some("0:Gone"), &devices).is_err());
+        let ambiguous = vec![(0, "Mic A".to_owned()), (1, "Mic B".to_owned())];
+        assert!(
+            winmm::choose_device(Some("0:Mic"), &ambiguous).is_err(),
+            "an ambiguous prefix must not open an arbitrary device"
+        );
     }
 
     #[test]

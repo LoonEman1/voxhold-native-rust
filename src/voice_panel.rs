@@ -75,8 +75,8 @@ pub struct VoicePanel {
     status: String,
     error: String,
     controls: Controls,
-    /// Applied capture chain reported by the engine; the settings hint uses
-    /// this instead of assuming the software path accepted the toggles.
+    /// Applied capture chain reported by the engine. Diagnostic for W02b;
+    /// nothing is rendered from it yet.
     applied_audio: Option<AppliedAudio>,
     self_muted: bool,
     push_to_talk: bool,
@@ -504,6 +504,7 @@ impl VoicePanel {
         self.error.clear();
         self.ptt_held = false;
         self.ptt_combo = None;
+        self.applied_audio = None;
         // The next join starts with a closed microphone until the server
         // confirms `voice.joined`, even if the previous call was unmuted.
         self.controls.muted = true;
@@ -710,7 +711,6 @@ impl VoicePanel {
     pub fn applied_audio(&self) -> Option<&AppliedAudio> {
         self.applied_audio.as_ref()
     }
-
     /// Room output gain from the settings tab (0–200 %).
     pub fn set_output_volume(&mut self, percent: i64) {
         self.controls.output_gain = Some(percent.clamp(0, 200) as f64 / 100.0);
@@ -880,7 +880,7 @@ impl VoicePanel {
         }
     }
 
-    fn apply_update(
+    pub(crate) fn apply_update(
         &mut self,
         update: VoiceUpdate,
         window: &mut Window,
@@ -891,6 +891,7 @@ impl VoicePanel {
             VoiceUpdate::Connecting => {
                 self.phase = CallPhase::Connecting;
                 self.status = "Подключение…".into();
+                self.applied_audio = None;
                 self.controls.muted = true;
                 self.release_push_to_talk();
             }
@@ -904,6 +905,7 @@ impl VoicePanel {
             VoiceUpdate::Reconnecting => {
                 self.phase = CallPhase::Reconnecting;
                 self.status = "Восстанавливаем соединение…".into();
+                self.applied_audio = None;
                 self.controls.muted = true;
                 self.release_push_to_talk();
                 // Go drops the confirmed roster until the fresh join; a
@@ -975,6 +977,7 @@ impl VoicePanel {
             }
             VoiceUpdate::Ended(error) => {
                 self.handle.take();
+                self.applied_audio = None;
                 self.controls.muted = true;
                 self.ptt_held = false;
                 self.ptt_combo = None;

@@ -236,6 +236,14 @@ pub async fn run(
     }
 }
 
+fn microphone_switch_error(audible: bool) -> &'static str {
+    if audible {
+        "Не удалось переключить микрофон, прежний работает."
+    } else {
+        "Не удалось переключить микрофон и восстановить прежний."
+    }
+}
+
 struct Session {
     peer: PeerConnection,
     sender: Option<RtpSender>,
@@ -381,50 +389,67 @@ impl Session {
                 0,
             );
             let mut software = MicCapture::new(source.clone(), params, events.clone());
-            let track = match software.start(Some(controls.input.as_deref().unwrap_or_default())) {
+            let mut software_mic = None;
+            let (track, applied) = match software
+                .start(Some(controls.input.as_deref().unwrap_or_default()))
+            {
                 Ok(()) => {
-                    let applied = controls.audio_params();
-                    events.push(Event::Audio {
-                        capture: "software",
-                        noise_mode: applied.mode.as_str(),
-                        echo_cancellation: ECHO_CANCELLATION_AVAILABLE && applied.echo_cancellation,
-                        auto_gain_control: applied.auto_gain_control,
-                    });
-                    input_opened = controls
-                        .input
-                        .clone()
-                        .filter(|id| !id.is_empty() && id != ":");
+                    input_opened = controls.input.clone().filter(|id| !id.is_empty());
                     input_index = None;
+                    software_mic = Some(software);
+                    let applied = controls.audio_params();
                     let track = factory.create_audio_track("voxhold-microphone", source.clone());
-                    capture.attach_source(track.clone(), source);
-                    mic = Some(software);
-                    track
+                    (
+                        track,
+                        (
+                            "software",
+                            applied.mode.as_str(),
+                            ECHO_CANCELLATION_AVAILABLE && applied.echo_cancellation,
+                            applied.auto_gain_control,
+                        ),
+                    )
                 }
                 Err(_) => {
-                    // Its ADM forces NS/AGC on, so the software toggles do not
-                    // apply; the `audio` event reports the exact applied mode.
+                    // Its ADM applies its own NS/AGC and may enable echo
+                    // cancellation on the render reference; the software
+                    // toggles do not apply. The `audio` event reports the
+                    // exact applied mode.
                     if let Some(id) = controls.input.as_deref().filter(|id| !id.is_empty()) {
-                        if !audio.select(id, true) {
-                            return Err("Выбранный микрофон недоступен.");
+                        if audio.select(id, true) {
+                            input_index = audio.resolve(id, true);
+                            input_opened = Some(id.to_owned());
+                        } else {
+                            // A saved device that is gone must not fail the
+                            // call: fall back to the Windows default.
+                            controls.input = None;
+                            input_index = None;
+                            input_opened = None;
+                            audio.select("", true);
+                            events.push(Event::DeviceError {
+                                message: "Выбранный микрофон недоступен, используется системный.",
+                            });
                         }
-                        input_index = audio.resolve(id, true);
-                        input_opened = Some(id.to_owned());
                     }
                     audio.set_recording(true);
-                    events.push(Event::Audio {
-                        capture: "platform",
-                        noise_mode: NoiseMode::Auto.as_str(),
-                        echo_cancellation: true,
-                        auto_gain_control: true,
-                    });
                     let track = factory.create_device_audio_track("voxhold-microphone");
-                    capture.attach(track.clone());
-                    track
+                    (track, ("platform", NoiseMode::Auto.as_str(), true, true))
                 }
             };
             let sender = peer
-                .add_track(MediaStreamTrack::Audio(track), &["voxhold-voice"])
+                .add_track(MediaStreamTrack::Audio(track.clone()), &["voxhold-voice"])
                 .map_err(|_| "Не удалось подключить микрофон к WebRTC.")?;
+            if software_mic.is_some() {
+                capture.attach_source(track, source);
+            } else {
+                capture.attach(track);
+            }
+            mic = software_mic;
+            events.push(Event::Audio {
+                capture: applied.0,
+                noise_mode: applied.1,
+                echo_cancellation: applied.2,
+                auto_gain_control: applied.3,
+            });
             (Some(sender), None)
         };
         let mut session = Self {
@@ -562,30 +587,30 @@ impl Session {
             .input
             .filter(|id| self.controls.input.as_ref() != Some(id))
         {
-            let switched = match self.mic.as_mut() {
+            let (switched, audible) = match self.mic.as_mut() {
                 // The new WinMM device is opened before the old capture stops,
                 // so a bad selection leaves the working microphone untouched.
                 Some(mic) => match mic.start(Some(&input)) {
                     Ok(()) => {
                         self.input_opened = Some(input.clone()).filter(|id| !id.is_empty());
                         self.input_index = None;
-                        true
+                        (true, true)
                     }
-                    Err(_) => false,
+                    Err(_) => (false, true),
                 },
                 None => {
                     let result = self.switch_device(&input, true);
                     if result.switched {
                         self.input_opened = (!input.is_empty()).then(|| input.clone());
                     }
-                    result.switched
+                    (result.switched, result.audible)
                 }
             };
             if switched {
                 self.controls.input = Some(input);
             } else {
                 events.push(Event::DeviceError {
-                    message: "Не удалось переключить микрофон, прежний работает.",
+                    message: microphone_switch_error(audible),
                 });
             }
         }

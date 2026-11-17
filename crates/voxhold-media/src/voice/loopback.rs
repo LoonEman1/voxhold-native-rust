@@ -255,6 +255,10 @@ fn threshold_gate_and_auto_noise_survive_opus_round_trip() {
         auto_tone > -30.0,
         "auto speech did not survive Opus: {auto_tone}"
     );
+    assert!(
+        auto_noise < -55.0,
+        "auto NS must keep the background low, got {auto_noise}"
+    );
     // Auto keeps some background (NS only); threshold transmits nearly nothing.
     assert!(
         auto_noise > threshold_noise + 10.0,

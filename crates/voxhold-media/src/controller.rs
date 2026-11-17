@@ -70,6 +70,9 @@ pub struct VoiceController {
     pub server_muted: bool,
     /// Pre-gate local microphone level of the real capture track.
     pub local_level: f64,
+    /// Once the software capture reports its pre-gate meter, the post-gate
+    /// `MediaSource` level must not overwrite it with a different scale.
+    input_level_seen: bool,
     /// Whole 10 ms blocks discarded by the bounded PCM queue or the source.
     pub input_dropped: u64,
     pub input_muted: bool,
@@ -96,6 +99,7 @@ impl VoiceController {
             self_muted,
             server_muted: false,
             local_level: 0.0,
+            input_level_seen: false,
             input_dropped: 0,
             input_muted: true,
             applied_audio: None,
@@ -208,7 +212,13 @@ impl VoiceController {
                 track_id: None,
                 level,
             } => {
-                self.local_level = level;
+                // The post-gate `MediaSource` level is a fallback for the
+                // platform path. The software path already reports its
+                // pre-gate meter, and mixing the two scales makes the room
+                // indicator jump to zero on every speech-to-silence edge.
+                if !self.input_level_seen {
+                    self.local_level = level;
+                }
                 vec![]
             }
             Event::InputLevel {
@@ -219,6 +229,7 @@ impl VoiceController {
                 // Pre-gate software meter: it must show a quiet background
                 // while the gate transmits nothing.
                 self.local_level = level;
+                self.input_level_seen = true;
                 self.input_muted = muted;
                 self.input_dropped = dropped;
                 vec![]
@@ -273,6 +284,7 @@ impl VoiceController {
                     )];
                 }
                 self.joined = true;
+                self.input_level_seen = false;
                 self.server_muted = p.server_mute;
                 self.resume_connection_id = Some(p.connection_id);
                 self.participants =
@@ -503,6 +515,32 @@ mod tests {
     }
 
     #[test]
+    fn input_level_is_not_overwritten_by_the_post_gate_source_level() {
+        let mut controller = VoiceController::new(1, 2, Controls::default(), false);
+        controller.media_event(Event::InputLevel {
+            level: 0.2,
+            muted: false,
+            dropped: 0,
+        });
+        controller.media_event(Event::Level {
+            track_id: None,
+            level: 0.0,
+        });
+        assert!(
+            (controller.local_level - 0.2).abs() < f64::EPSILON,
+            "the pre-gate meter must keep its own scale"
+        );
+        // Without a software meter (platform fallback) the source level is
+        // still a useful fallback.
+        let mut platform = VoiceController::new(1, 2, Controls::default(), false);
+        platform.media_event(Event::Level {
+            track_id: None,
+            level: 0.4,
+        });
+        assert!((platform.local_level - 0.4).abs() < f64::EPSILON);
+    }
+
+    #[test]
     fn applied_audio_carries_the_actual_fallback_mode() {
         let mut controller = VoiceController::new(1, 2, Controls::default(), false);
         controller.media_event(Event::Audio {
@@ -536,6 +574,29 @@ mod tests {
         assert!(!params.echo_cancellation);
         assert!(!params.auto_gain_control);
         assert!(params.muted, "deafen opens no microphone");
+    }
+
+    #[test]
+    fn state_action_carries_every_dsp_field() {
+        let mut controller = VoiceController::new(1, 2, Controls::default(), false);
+        controller.joined = true;
+        let controls = Controls {
+            noise_mode: crate::dsp::NoiseMode::Threshold,
+            noise_gate_percent: 42,
+            input_gain: 1.25,
+            echo_cancellation: false,
+            auto_gain_control: true,
+            ..Controls::default()
+        };
+        let actions = controller.update_controls(controls, false);
+        let Some(Action::Media(Command::State(state))) = actions.first() else {
+            panic!("expected a State media command: {actions:?}");
+        };
+        assert_eq!(state.noise_mode, crate::dsp::NoiseMode::Threshold);
+        assert_eq!(state.noise_gate_percent, 42);
+        assert!((state.input_gain - 1.25).abs() < f32::EPSILON);
+        assert!(!state.echo_cancellation);
+        assert!(state.auto_gain_control);
     }
 
     #[test]

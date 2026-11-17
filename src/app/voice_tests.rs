@@ -5,7 +5,8 @@
 use super::*;
 use crate::voice_room::CallPhase;
 use gpui::{Keystroke, TestAppContext, VisualTestContext};
-use voxhold_media::controller::{Participant, Publication};
+use voxhold_media::controller::{AppliedAudio, Participant, Publication};
+use voxhold_media::runtime::VoiceUpdate;
 
 fn client() -> voxhold_api::Client {
     let mut client = voxhold_api::Client::new("http://127.0.0.1:1").unwrap();
@@ -765,6 +766,33 @@ async fn dsp_controls_accept_the_web_ranges(cx: &mut TestAppContext) {
         assert_eq!(controls.noise_mode, voxhold_media::dsp::NoiseMode::Auto);
         assert_eq!(controls.noise_gate_percent, 15);
         assert_eq!(controls.input_gain, 0.0);
+    });
+}
+
+#[gpui::test]
+async fn applied_audio_update_reaches_the_panel(cx: &mut TestAppContext) {
+    let (mut visual, _view, voice) = fixture(cx);
+    draw(&mut visual);
+    let applied = AppliedAudio {
+        capture: "platform",
+        noise_mode: "auto",
+        echo_cancellation: true,
+        auto_gain_control: true,
+    };
+    let expected = applied.clone();
+    visual.update(|window, app| {
+        voice.update(app, |panel, cx| {
+            assert!(panel.apply_update(VoiceUpdate::AudioMode(applied), window, cx));
+        });
+    });
+    voice.read_with(&*visual, |panel, _| {
+        assert_eq!(panel.applied_audio(), Some(&expected));
+    });
+    // Leaving the call must clear the diagnostic so a later attempt cannot
+    // show the previous engine's mode.
+    voice.update(&mut *visual, |panel, cx| panel.leave_call(cx));
+    voice.read_with(&*visual, |panel, _| {
+        assert!(panel.applied_audio().is_none());
     });
 }
 

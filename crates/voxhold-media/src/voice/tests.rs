@@ -47,6 +47,80 @@ fn trickle_ice_is_matched_to_the_offer_generation() {
 }
 
 #[test]
+#[cfg(windows)]
+#[ignore = "opens the Windows audio device; run manually"]
+fn platform_adm_and_the_software_source_coexist() {
+    use libwebrtc::audio_frame::AudioFrame;
+
+    let audio = PlatformAudio::new(false).expect("platform ADM");
+    let source = libwebrtc::audio_source::native::NativeAudioSource::new(
+        capture::source_options(),
+        capture::SAMPLE_RATE,
+        1,
+        0,
+    );
+    let track = audio.0.create_audio_track("coexist", source.clone());
+    assert!(track.enabled());
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let block = vec![0_i16; (capture::SAMPLE_RATE / 100) as usize];
+    for _ in 0..10 {
+        let frame = AudioFrame {
+            data: std::borrow::Cow::Borrowed(&block),
+            sample_rate: capture::SAMPLE_RATE,
+            num_channels: 1,
+            samples_per_channel: block.len() as u32,
+        };
+        runtime.block_on(source.capture_frame(&frame)).unwrap();
+    }
+}
+
+#[test]
+#[cfg(windows)]
+#[ignore = "opens the Windows audio device; run manually"]
+fn a_missing_saved_microphone_does_not_fail_the_join() {
+    let capture = Arc::new(CaptureGate::default());
+    let events = Arc::new(Events::default());
+    let controls = Controls {
+        input: Some("9999:Definitely Missing".into()),
+        ..Controls::default()
+    };
+    let session = Session::new(Vec::new(), "all", controls, &events, capture, None)
+        .expect("a stale saved microphone must not abort the join");
+    drop(session);
+    let mut saw_device_error = false;
+    let mut applied = None;
+    while let Some(event) = events.poll(Duration::ZERO) {
+        match event {
+            Event::DeviceError { .. } => saw_device_error = true,
+            Event::Audio {
+                capture,
+                noise_mode,
+                echo_cancellation,
+                auto_gain_control,
+            } => {
+                applied = Some((capture, noise_mode, echo_cancellation, auto_gain_control));
+            }
+            _ => {}
+        }
+    }
+    assert!(saw_device_error, "the fallback must be reported");
+    assert_eq!(
+        applied,
+        Some(("platform", "auto", true, true)),
+        "the exact fallback mode must be reported"
+    );
+}
+
+#[test]
+fn microphone_switch_error_keeps_the_rollback_outcome() {
+    assert!(microphone_switch_error(true).contains("прежний работает"));
+    assert!(microphone_switch_error(false).contains("восстановить прежний"));
+}
+
+#[test]
 fn a_failed_rollback_keeps_the_output_request_pending() {
     let mut output = OutputState::new(Some("A".into()));
     assert!(!output.needs_switch(&Some("A".into())));

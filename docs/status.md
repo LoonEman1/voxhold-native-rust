@@ -600,7 +600,7 @@ HTTP и 24 МиБ поток с задержкой >8 с, проверяют б�
 Проверено: `cargo fmt --all -- --check`, `cargo test --workspace --locked`
 (292 теста приложения: 292 passed, 1 `ignored`; 11 API; 32 media),
 `cargo build --release --locked -p voxhold-native-rust`,
-`scripts/check-file-sizes.ps1` (159 файлов), `git diff --check` и smoke
+`scripts/check-file-sizes.ps1` (169 файлов), `git diff --check` и smoke
 release (процесс активен через 5 с).
 
 Не проверено: живой backend и два клиента, реальный SFU/P2P с Chromium,

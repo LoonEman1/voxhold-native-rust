@@ -1142,7 +1142,7 @@ frontend `ed7cb00ae12398753a8ef48a5a33b864e20cb04c` и Go
 Проверки: `cargo fmt --all -- --check`, `cargo test --workspace --locked`
 (292 теста приложения: 292 passed, 1 `ignored`; 11 API; 32 media),
 `cargo build --release --locked -p voxhold-native-rust`,
-`scripts/check-file-sizes.ps1` (159 файлов), `git diff --check`, smoke
+`scripts/check-file-sizes.ps1` (169 файлов), `git diff --check`, smoke
 release (процесс активен через 5 с).
 
 Не проверено: живой backend/два клиента, реальный SFU/P2P с Chromium,

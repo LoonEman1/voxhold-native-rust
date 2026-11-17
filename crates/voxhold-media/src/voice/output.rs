@@ -133,5 +133,17 @@ impl Session {
                 });
             }
         }
+        let Some((failed, progress)) = self.mic.as_ref().map(|mic| (mic.failed(), mic.progress()))
+        else {
+            return;
+        };
+        if progress != self.input_progress {
+            self.input_progress = progress;
+            self.input_progress_at = std::time::Instant::now();
+            return;
+        }
+        if failed || self.input_progress_at.elapsed() >= Duration::from_secs(2) {
+            self.recover_input(events);
+        }
     }
 }

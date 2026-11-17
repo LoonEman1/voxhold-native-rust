@@ -113,11 +113,23 @@ pub struct NoiseGate {
 impl NoiseGate {
     pub fn process(&mut self, samples: &mut [i16], sample_rate: u32, threshold: f32) -> f32 {
         let level = meter_level(samples);
-        let open = threshold <= 0.0 || level > threshold + HYSTERESIS;
+        if threshold <= 0.0 {
+            // Zero threshold is a true bypass: no attack ramp, the first
+            // sample is already at full level.
+            return level;
+        }
+        let open = level > threshold + HYSTERESIS;
         let hold = (sample_rate as f32 * HOLD_SECONDS).round() as u64;
+        // Below one hysteresis band there is no negative edge to reach. Use a
+        // proportional close threshold so a 1–2 % bar can still release.
+        let close = if threshold > HYSTERESIS {
+            threshold - HYSTERESIS
+        } else {
+            threshold * 0.5
+        };
         if open {
             self.hold_samples = hold;
-        } else if level < (threshold - HYSTERESIS).max(0.0) {
+        } else if level < close {
             self.hold_samples = self.hold_samples.saturating_sub(samples.len() as u64);
         }
         let target = if open || self.hold_samples > 0 {
@@ -266,6 +278,39 @@ mod tests {
         let start = (RATE as f32 * from) as usize;
         let end = (RATE as f32 * to) as usize;
         samples[start..end].to_vec()
+    }
+
+    #[test]
+    fn zero_threshold_passes_the_first_sample_unattenuated() {
+        let mut gate = NoiseGate::default();
+        let input = vec![10_000_i16; BLOCK];
+        let mut block = input.clone();
+        gate.process(&mut block, RATE, 0.0);
+        assert_eq!(block, input, "0 % must bypass the attack ramp");
+    }
+
+    #[test]
+    fn low_threshold_releases_after_speech() {
+        for threshold in [0.01_f32, 0.02] {
+            let mut gate = NoiseGate::default();
+            let speech = vec![8_000_i16; BLOCK];
+            // Meter level is below 0.5 % and below the 1–2 % bar.
+            let background = vec![20_i16; BLOCK];
+            for _ in 0..10 {
+                let mut block = speech.clone();
+                gate.process(&mut block, RATE, threshold);
+            }
+            for _ in 0..90 {
+                let mut block = background.clone();
+                gate.process(&mut block, RATE, threshold);
+            }
+            let mut block = background;
+            gate.process(&mut block, RATE, threshold);
+            assert!(
+                block.iter().all(|sample| *sample == 0),
+                "a {threshold} bar must close after the hold"
+            );
+        }
     }
 
     #[test]

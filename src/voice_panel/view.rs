@@ -508,6 +508,23 @@ impl VoicePanel {
                             ))),
                     ),
             );
+            if let Some(applied) = &self.applied_audio {
+                let label = if applied.capture == "platform" {
+                    "Обработка: ADM · NS/AGC".to_owned()
+                } else {
+                    format!("Обработка: software · {}", applied.noise_mode)
+                };
+                body = body.child(
+                    div()
+                        .debug_selector(|| "voice-audio-mode".into())
+                        .absolute()
+                        .right(px(24.))
+                        .top(px(50.))
+                        .text_size(px(9.))
+                        .text_color(rgb(c.muted))
+                        .child(label),
+                );
+            }
         }
         if !active && self.visible_roster().is_empty() && self.visible_streams().is_empty() {
             body = body.child(

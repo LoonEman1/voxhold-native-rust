@@ -488,7 +488,15 @@ impl Voxhold {
                     if s.active_settings == Some(SettingsKind::Personal)
                         && s.personal.as_ref().map(|panel| panel.dialog.generation) == generation
                     {
+                        let migrated = crate::voice_settings::migrate_legacy_input(
+                            &s.voice_settings.prefs.input,
+                            &devices,
+                        );
                         s.voice_settings.devices = devices;
+                        if let Some(id) = migrated {
+                            s.voice_settings.prefs.input = id;
+                            s.voice_settings.persist();
+                        }
                     }
                     cx.notify();
                 })
@@ -638,9 +646,14 @@ impl Voxhold {
                         let prefs = self.voice_settings.prefs.clone();
                         let output_selected = !input;
                         voice.update(cx, |panel, _| {
-                            panel.set_devices(Some(prefs.input), Some(prefs.output.clone()));
                             if output_selected {
+                                panel.set_devices(
+                                    Some(prefs.input.clone()),
+                                    Some(prefs.output.clone()),
+                                );
                                 panel.select_output(Some(prefs.output));
+                            } else {
+                                panel.select_input(Some(prefs.input));
                             }
                         });
                     }

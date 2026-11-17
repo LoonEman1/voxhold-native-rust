@@ -61,6 +61,9 @@ pub struct Controls {
     pub echo_cancellation: bool,
     /// WebRTC APM automatic gain control in the software capture path.
     pub auto_gain_control: bool,
+    /// One-shot request: retry the input even when the id equals the current
+    /// one. Set by an explicit settings choice, cleared per command.
+    pub retry_input: bool,
 }
 
 impl Default for Controls {
@@ -77,6 +80,7 @@ impl Default for Controls {
             output_gain: None,
             echo_cancellation: true,
             auto_gain_control: true,
+            retry_input: false,
         }
     }
 }
@@ -471,6 +475,24 @@ mod tests {
             !capture.enabled(),
             "the stale State must not reopen a released PTT hold"
         );
+    }
+
+    #[test]
+    fn every_permission_mutation_advances_the_capture_epoch() {
+        let gate = CaptureGate::default();
+        let epoch = gate.permission_epoch();
+        let before = epoch.load(std::sync::atomic::Ordering::SeqCst);
+        gate.set_local(true);
+        gate.set_local(false);
+        assert!(
+            epoch.load(std::sync::atomic::Ordering::SeqCst) >= before + 2,
+            "fast PTT press/release must advance the epoch even when muted returns true"
+        );
+        let before = epoch.load(std::sync::atomic::Ordering::SeqCst);
+        gate.set_joined(true);
+        gate.set_server_allowed(true);
+        gate.latch();
+        assert!(epoch.load(std::sync::atomic::Ordering::SeqCst) >= before + 3);
     }
 
     #[test]

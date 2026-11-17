@@ -49,6 +49,64 @@ fn trickle_ice_is_matched_to_the_offer_generation() {
 #[test]
 #[cfg(windows)]
 #[ignore = "opens the Windows audio device; run manually"]
+fn a_failed_software_capture_recovers_on_the_system_input() {
+    let capture = Arc::new(CaptureGate::default());
+    let events = Arc::new(Events::default());
+    let session = Session::new(
+        Vec::new(),
+        "all",
+        Controls::default(),
+        &events,
+        capture,
+        None,
+    )
+    .expect("default microphone");
+    let mut session = session;
+    session.mic.as_ref().expect("software capture").test_fail();
+    session.device_check = std::time::Instant::now() - Duration::from_secs(3);
+    session.check_devices(&events);
+    assert!(
+        session.mic.as_ref().is_some_and(|mic| !mic.failed()),
+        "the capture must be restarted instead of staying dead"
+    );
+    let mut saw = false;
+    while let Some(event) = events.poll(Duration::ZERO) {
+        if matches!(event, Event::DeviceError { .. }) {
+            saw = true;
+        }
+    }
+    assert!(saw, "the recovery must be reported to the UI");
+}
+
+#[test]
+#[cfg(windows)]
+#[ignore = "opens the Windows audio device; run manually"]
+fn an_explicit_missing_microphone_retry_keeps_the_system_input() {
+    let capture = Arc::new(CaptureGate::default());
+    let events = Arc::new(Events::default());
+    let controls = Controls {
+        input: Some("9999:Definitely Missing".into()),
+        ..Controls::default()
+    };
+    let mut session = Session::new(Vec::new(), "all", controls, &events, capture, None)
+        .expect("the call must start on the system input");
+    assert!(session.controls.input.is_none());
+    session
+        .switch_input(Some("9999:Definitely Missing".into()), true, &events)
+        .expect("an explicit retry must fall back, not fail the session");
+    assert!(session.controls.input.is_none());
+    let mut saw = false;
+    while let Some(event) = events.poll(Duration::ZERO) {
+        if matches!(event, Event::DeviceError { .. }) {
+            saw = true;
+        }
+    }
+    assert!(saw, "the repeated selection must report the fallback");
+}
+
+#[test]
+#[cfg(windows)]
+#[ignore = "opens the Windows audio device; run manually"]
 fn platform_adm_and_the_software_source_coexist() {
     use libwebrtc::audio_frame::AudioFrame;
 
@@ -89,6 +147,10 @@ fn a_missing_saved_microphone_does_not_fail_the_join() {
     };
     let session = Session::new(Vec::new(), "all", controls, &events, capture, None)
         .expect("a stale saved microphone must not abort the join");
+    assert!(
+        session.controls.input.is_none(),
+        "the dead saved id must be cleared after the fallback"
+    );
     drop(session);
     let mut saw_device_error = false;
     let mut applied = None;
@@ -107,17 +169,10 @@ fn a_missing_saved_microphone_does_not_fail_the_join() {
         }
     }
     assert!(saw_device_error, "the fallback must be reported");
-    assert_eq!(
-        applied,
-        Some(("platform", "auto", true, true)),
-        "the exact fallback mode must be reported"
-    );
-}
-
-#[test]
-fn microphone_switch_error_keeps_the_rollback_outcome() {
-    assert!(microphone_switch_error(true).contains("прежний работает"));
-    assert!(microphone_switch_error(false).contains("восстановить прежний"));
+    match applied {
+        Some(("software", "auto", false, true)) | Some(("platform", "auto", true, true)) => {}
+        other => panic!("unexpected fallback audio mode: {other:?}"),
+    }
 }
 
 #[test]

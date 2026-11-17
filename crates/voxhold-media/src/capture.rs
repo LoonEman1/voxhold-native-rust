@@ -130,6 +130,13 @@ impl Default for BlockProcessor {
 }
 
 impl BlockProcessor {
+    /// Capture restart, mute transition or a permission epoch change: the
+    /// gate must not carry a hold from the old state.
+    pub fn reset(&mut self) {
+        self.gate.reset();
+        self.muted = true;
+    }
+
     /// Returns the pre-gate level (0..1) and whether the block was silenced.
     pub fn process(&mut self, block: &mut [i16], params: &AudioParams) -> (f32, bool) {
         let params = params.clone().clamped();
@@ -171,8 +178,11 @@ impl BlockProcessor {
 pub struct MicCapture {
     source: NativeAudioSource,
     params: Arc<Mutex<AudioParams>>,
+    epoch: Arc<std::sync::atomic::AtomicU64>,
     events: Arc<Events>,
     stop: Arc<AtomicBool>,
+    failed: Arc<AtomicBool>,
+    progress: Arc<std::sync::atomic::AtomicU64>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -180,15 +190,35 @@ impl MicCapture {
     pub fn new(
         source: NativeAudioSource,
         params: Arc<Mutex<AudioParams>>,
+        epoch: Arc<std::sync::atomic::AtomicU64>,
         events: Arc<Events>,
     ) -> Self {
         Self {
             source,
             params,
+            epoch,
             events,
             stop: Arc::new(AtomicBool::new(false)),
+            failed: Arc::new(AtomicBool::new(false)),
+            progress: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             thread: None,
         }
+    }
+
+    /// The driver stopped delivering or requeueing buffers. The session polls
+    /// this together with `progress` and switches to the system input.
+    pub fn failed(&self) -> bool {
+        self.failed.load(Ordering::Acquire)
+    }
+
+    /// Monotonic count of processed blocks, used to detect a stalled driver.
+    pub fn progress(&self) -> u64 {
+        self.progress.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub fn test_fail(&self) {
+        self.failed.store(true, Ordering::Release);
     }
 
     /// Opens the requested WinMM device before stopping the previous capture,
@@ -197,14 +227,22 @@ impl MicCapture {
         let device = WinIn::open(input)?;
         self.stop();
         self.stop = Arc::new(AtomicBool::new(false));
+        self.failed = Arc::new(AtomicBool::new(false));
         let source = self.source.clone();
         let params = self.params.clone();
+        let epoch = self.epoch.clone();
         let events = self.events.clone();
         let stop = self.stop.clone();
+        let failed = self.failed.clone();
+        let progress = self.progress.clone();
         self.thread = Some(
             thread::Builder::new()
                 .name("voxhold-mic".into())
-                .spawn(move || capture_loop(device, source, params, events, stop))
+                .spawn(move || {
+                    capture_loop(
+                        device, source, params, epoch, events, stop, failed, progress,
+                    )
+                })
                 .map_err(|_| "Не удалось запустить поток микрофона.".to_owned())?,
         );
         Ok(())
@@ -228,17 +266,36 @@ fn capture_loop(
     mut device: WinIn,
     source: NativeAudioSource,
     params: Arc<Mutex<AudioParams>>,
+    epoch: Arc<std::sync::atomic::AtomicU64>,
     events: Arc<Events>,
     stop: Arc<AtomicBool>,
+    failed: Arc<AtomicBool>,
+    progress: Arc<std::sync::atomic::AtomicU64>,
 ) {
     let mut processor = BlockProcessor::default();
     let mut pending = PcmBuffer::with_capacity();
-    let mut transition = MuteTransition::default();
     let mut block = [0_i16; BLOCK];
     let mut source_dropped = 0_u64;
     let mut ticks = 0_u32;
+    let mut permission = PermissionEpoch::new(&epoch);
     while !stop.load(Ordering::Acquire) {
+        if permission.changed(&epoch) {
+            // The control decision changed (including a fast PTT press that
+            // returned to the same boolean). Throw away Rust and driver
+            // buffers captured under the previous state.
+            pending.clear();
+            source.clear_buffer();
+            processor.reset();
+            if !device.flush() {
+                failed.store(true, Ordering::Release);
+                break;
+            }
+        }
         device.completed(|samples| pending.push(samples));
+        if device.failed() {
+            failed.store(true, Ordering::Release);
+            break;
+        }
         loop {
             let current = params
                 .lock()
@@ -248,16 +305,19 @@ fn capture_loop(
                     muted: true,
                     ..AudioParams::default()
                 });
-            // Check the transition before taking a block: on unmute the
-            // already queued pre-mute audio must not reach Opus.
-            if transition.changed(current.muted) {
-                pending.clear();
-                source.clear_buffer();
-            }
             if !pending.pop_block(&mut block) {
                 break;
             }
+            let block_epoch = epoch.load(Ordering::Acquire);
             let (level, muted) = processor.process(&mut block, &current);
+            // A transition in the middle of a block (or a stale buffer that
+            // slipped through) must not reach Opus as live audio.
+            if epoch.load(Ordering::Acquire) != block_epoch {
+                dsp::silence(&mut block);
+                pending.clear();
+                source.clear_buffer();
+                processor.reset();
+            }
             let frame = AudioFrame {
                 data: std::borrow::Cow::Borrowed(&block),
                 sample_rate: SAMPLE_RATE,
@@ -267,6 +327,7 @@ fn capture_loop(
             if poll_once(source.capture_frame(&frame)).is_none() {
                 source_dropped += 1;
             }
+            progress.fetch_add(1, Ordering::Release);
             ticks += 1;
             if ticks % LEVEL_INTERVAL == 0 {
                 events.push(Event::InputLevel {
@@ -282,21 +343,30 @@ fn capture_loop(
     // a mute that raced with the last capture.
     source.clear_buffer();
     device.close();
+    if device.failed() {
+        failed.store(true, Ordering::Release);
+    }
 }
 
-/// Tracks the last control decision so the capture loop can drop queued audio
-/// *before* the first block of the new state is processed.
-#[derive(Default)]
-struct MuteTransition {
-    muted: bool,
+/// Tracks the last permission epoch so the capture loop can drop queued audio
+/// before the first block of a new control state is processed.
+struct PermissionEpoch {
+    seen: u64,
 }
 
-impl MuteTransition {
-    fn changed(&mut self, muted: bool) -> bool {
-        if self.muted == muted {
+impl PermissionEpoch {
+    fn new(epoch: &std::sync::atomic::AtomicU64) -> Self {
+        Self {
+            seen: epoch.load(Ordering::Acquire),
+        }
+    }
+
+    fn changed(&mut self, epoch: &std::sync::atomic::AtomicU64) -> bool {
+        let current = epoch.load(Ordering::Acquire);
+        if current == self.seen {
             return false;
         }
-        self.muted = muted;
+        self.seen = current;
         true
     }
 }
@@ -632,7 +702,8 @@ mod tests {
         }));
         let events = Arc::new(Events::default());
         let source = NativeAudioSource::new(source_options(), SAMPLE_RATE, CHANNELS, 0);
-        let mut mic = MicCapture::new(source, params, events.clone());
+        let epoch = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let mut mic = MicCapture::new(source, params, epoch, events.clone());
         mic.start(None).expect("default microphone");
         thread::sleep(Duration::from_millis(600));
         mic.stop();
@@ -649,52 +720,126 @@ mod tests {
     }
 
     #[test]
-    fn mute_transition_drops_queued_audio_before_the_first_new_block() {
+    fn permission_epoch_discards_queued_audio_across_fast_ptt() {
+        let epoch = std::sync::atomic::AtomicU64::new(0);
+        let mut permission = PermissionEpoch::new(&epoch);
         let mut pending = PcmBuffer::with_capacity();
-        let mut transition = MuteTransition::default();
         pending.push(&vec![9_000_i16; BLOCK]);
-        assert!(transition.changed(true));
+        // Press and release between two polls restores the boolean state but
+        // still advances the epoch twice.
+        epoch.fetch_add(1, Ordering::SeqCst);
+        epoch.fetch_add(1, Ordering::SeqCst);
+        assert!(permission.changed(&epoch));
         pending.clear();
         let mut block = [0_i16; BLOCK];
         assert!(!pending.pop_block(&mut block), "old audio was discarded");
         pending.push(&vec![222_i16; BLOCK]);
         assert!(pending.pop_block(&mut block));
         assert!(block.iter().all(|sample| *sample == 222));
-        // Unmute: samples captured while muted must not be replayed.
-        pending.push(&vec![9_000_i16; BLOCK]);
-        assert!(transition.changed(false));
-        pending.clear();
-        assert!(!pending.pop_block(&mut block));
-        pending.push(&vec![333_i16; BLOCK]);
-        assert!(pending.pop_block(&mut block));
-        assert!(block.iter().all(|sample| *sample == 333));
+        // End-to-end view of the same transition: the first processed block
+        // after the flush comes from the post-transition buffer, not from the
+        // 9 000-amplitude audio captured before unmute.
+        let mut processor = BlockProcessor::default();
+        processor.reset();
+        for (index, sample) in block.iter_mut().enumerate() {
+            *sample = if index % 2 == 0 { 222 } else { -222 };
+        }
+        let params = AudioParams {
+            mode: NoiseMode::Threshold,
+            gate_percent: 0,
+            auto_gain_control: false,
+            ..AudioParams::default()
+        };
+        processor.process(&mut block, &params);
+        assert!(
+            block.iter().all(|sample| sample.abs() < 400),
+            "stale pre-unmute audio reached the output: {:?}",
+            &block[..4]
+        );
+        assert!(!permission.changed(&epoch));
     }
 
     #[test]
     #[cfg(windows)]
-    fn saved_winmm_device_is_resolved_by_name_not_by_index() {
-        let devices = vec![(0, "Speakers".to_owned()), (1, "USB Headset".to_owned())];
+    fn saved_winmm_device_is_resolved_by_endpoint_or_unique_name() {
+        let devices = vec![
+            winmm::DeviceInfo {
+                index: 0,
+                name: "Speakers".into(),
+                endpoint: Some("endpoint-0".into()),
+            },
+            winmm::DeviceInfo {
+                index: 1,
+                name: "USB Headset".into(),
+                endpoint: Some("endpoint-1".into()),
+            },
+        ];
         assert_eq!(
-            winmm::choose_device(Some("0:USB Headset"), &devices).unwrap(),
+            winmm::choose_device(Some("0:USB Headset"), &devices)
+                .unwrap()
+                .index,
             1,
             "indexes shift; the saved name still identifies the device"
         );
         assert_eq!(
-            winmm::choose_device(Some("1:USB"), &devices).unwrap(),
+            winmm::choose_device(Some("endpoint-1"), &devices)
+                .unwrap()
+                .index,
+            1,
+            "new preferences use the stable endpoint id"
+        );
+        assert_eq!(
+            winmm::choose_device(Some("1:USB"), &devices).unwrap().index,
             1,
             "legacy truncated names are resolved by a unique prefix"
         );
         assert_eq!(
-            winmm::choose_device(None, &devices).unwrap(),
+            winmm::choose_device(None, &devices).unwrap().index,
             winmm::WAVE_MAPPER,
             "an empty preference is the Windows default"
         );
         assert!(winmm::choose_device(Some("0:Gone"), &devices).is_err());
-        let ambiguous = vec![(0, "Mic A".to_owned()), (1, "Mic B".to_owned())];
+        let same_name = vec![
+            winmm::DeviceInfo {
+                index: 3,
+                name: "USB Mic".into(),
+                endpoint: Some("endpoint-3".into()),
+            },
+            winmm::DeviceInfo {
+                index: 0,
+                name: "USB Mic".into(),
+                endpoint: Some("endpoint-0".into()),
+            },
+        ];
         assert!(
-            winmm::choose_device(Some("0:Mic"), &ambiguous).is_err(),
-            "an ambiguous prefix must not open an arbitrary device"
+            winmm::choose_device(Some("3:USB Mic"), &same_name).is_err(),
+            "a legacy duplicate name must ask the user to choose again"
         );
+        assert_eq!(
+            winmm::choose_device(Some("endpoint-0"), &same_name)
+                .unwrap()
+                .index,
+            0,
+            "the endpoint id distinguishes identical names"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    #[ignore = "opens the default Windows microphone; run manually"]
+    fn winmm_flush_restarts_the_driver_queue() {
+        let mut device = WinIn::open(None).expect("default microphone");
+        thread::sleep(Duration::from_millis(120));
+        let mut before = 0;
+        device.completed(|samples| before += samples.len());
+        assert!(before > 0, "the driver returned no samples before flush");
+        assert!(device.flush(), "flush must restart the capture queue");
+        thread::sleep(Duration::from_millis(120));
+        let mut after = 0;
+        device.completed(|samples| after += samples.len());
+        assert!(after > 0, "the driver returned no samples after flush");
+        device.close();
+        assert!(!device.failed(), "a normal close must succeed");
     }
 
     #[test]

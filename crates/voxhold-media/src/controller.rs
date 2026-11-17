@@ -123,12 +123,16 @@ impl VoiceController {
     }
     pub fn update_controls(&mut self, controls: Controls, self_muted: bool) -> Vec<Action> {
         let gain_changed = controls.output_gain != self.controls.output_gain;
+        let retry_input = controls.retry_input;
         self.controls = controls;
+        self.controls.retry_input = false;
         self.self_muted = self_muted;
         // Capture stays closed until the server confirmed `voice.joined`; the
         // panel may update mute/deafen/PTT while the join is still pending.
         let mut a = if self.joined {
-            vec![Action::Media(Command::State(self.effective()))]
+            let mut state = self.effective();
+            state.retry_input = retry_input;
+            vec![Action::Media(Command::State(state))]
         } else {
             Vec::new()
         };
@@ -597,6 +601,30 @@ mod tests {
         assert!((state.input_gain - 1.25).abs() < f32::EPSILON);
         assert!(!state.echo_cancellation);
         assert!(state.auto_gain_control);
+    }
+
+    #[test]
+    fn retry_input_is_forwarded_once_and_cleared() {
+        let mut controller = VoiceController::new(1, 2, Controls::default(), false);
+        controller.joined = true;
+        let actions = controller.update_controls(
+            Controls {
+                input: Some("mic".into()),
+                retry_input: true,
+                ..Controls::default()
+            },
+            false,
+        );
+        assert!(matches!(
+            actions.first(),
+            Some(Action::Media(Command::State(state))) if state.retry_input
+        ));
+        assert!(!controller.controls.retry_input);
+        let actions = controller.update_controls(controller.controls.clone(), false);
+        assert!(matches!(
+            actions.first(),
+            Some(Action::Media(Command::State(state))) if !state.retry_input
+        ));
     }
 
     #[test]

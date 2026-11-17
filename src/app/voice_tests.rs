@@ -761,11 +761,19 @@ async fn dsp_controls_accept_the_web_ranges(cx: &mut TestAppContext) {
     voice.update(&mut *visual, |panel, _| {
         panel.set_dsp("auto", 15, 0, true, true);
     });
+    voice.update(&mut *visual, |panel, _| {
+        panel.select_input(Some("endpoint-x".into()));
+    });
     voice.read_with(&*visual, |panel, _| {
         let controls = panel.test_controls();
         assert_eq!(controls.noise_mode, voxhold_media::dsp::NoiseMode::Auto);
         assert_eq!(controls.noise_gate_percent, 15);
         assert_eq!(controls.input_gain, 0.0);
+        assert_eq!(controls.input.as_deref(), Some("endpoint-x"));
+        assert!(
+            !controls.retry_input,
+            "the retry flag must not leak into later mute/PTT updates"
+        );
     });
 }
 
@@ -788,6 +796,11 @@ async fn applied_audio_update_reaches_the_panel(cx: &mut TestAppContext) {
     voice.read_with(&*visual, |panel, _| {
         assert_eq!(panel.applied_audio(), Some(&expected));
     });
+    draw(&mut visual);
+    assert!(
+        visual.debug_bounds("voice-audio-mode").is_some(),
+        "the applied processing mode must be visible in the active room"
+    );
     // Leaving the call must clear the diagnostic so a later attempt cannot
     // show the previous engine's mode.
     voice.update(&mut *visual, |panel, cx| panel.leave_call(cx));

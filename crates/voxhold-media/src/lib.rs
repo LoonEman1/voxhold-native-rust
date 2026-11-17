@@ -1,5 +1,7 @@
+pub mod catalog;
 pub mod controller;
 mod video;
+pub mod viewer;
 mod voice;
 
 use std::{
@@ -25,7 +27,7 @@ pub struct IceServer {
     pub credential: String,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Candidate {
     pub candidate: String,
 
@@ -43,6 +45,9 @@ pub struct Controls {
     pub input: Option<String>,
     pub output: Option<String>,
     pub bitrate_kbps: Option<u32>,
+    /// Output gain in 0..=2; `None` is unity. Input gain belongs to the DSP
+    /// capture path (R07b), not to this control set.
+    pub output_gain: Option<f64>,
 }
 
 #[derive(Clone, Debug)]
@@ -97,6 +102,10 @@ pub enum Event {
     },
     Frame,
     Error {
+        message: &'static str,
+    },
+    /// A device switch failed but the previous, working path is still live.
+    DeviceError {
         message: &'static str,
     },
 }
@@ -198,24 +207,20 @@ impl Media {
         })
     }
     pub fn command(&self, command: Command) -> Result<(), MediaError> {
-        let enabled = match &command {
-            Command::Start { controls, .. } | Command::State(controls) => {
-                Some(!controls.muted && !controls.deafened)
-            }
-            Command::Stop => Some(false),
-            _ => None,
-        };
-        if enabled == Some(false) {
+        // The microphone starts closed and only a confirmed media state opens
+        // it. `Start` alone must never open the device: the join may still be
+        // refused, and push-to-talk may hold the key.
+        if matches!(command, Command::Stop) {
             self.capture.set_enabled(false);
+        }
+        if let Command::State(controls) = &command {
+            self.capture
+                .set_enabled(!controls.muted && !controls.deafened);
         }
         self.commands.try_send(command).map_err(|err| match err {
             mpsc::error::TrySendError::Full(_) => MediaError::CommandQueueFull,
             mpsc::error::TrySendError::Closed(_) => MediaError::CommandQueueClosed,
-        })?;
-        if enabled == Some(true) {
-            self.capture.set_enabled(true);
-        }
-        Ok(())
+        })
     }
     pub fn poll(&self, wait: Duration) -> Option<Event> {
         self.events.poll(wait)
@@ -223,10 +228,10 @@ impl Media {
     pub fn read_video(&self, frame: &mut VideoFrame, width: u32, height: u32) -> bool {
         frame.request.viewport_width = width;
         frame.request.viewport_height = height;
-        let result = self.video.read(&mut frame.request, &mut frame.rgba);
+        let result = self.video.read(&mut frame.request, &mut frame.bgra);
         let result = if result < 0 {
-            frame.rgba.resize(result.unsigned_abs(), 0);
-            self.video.read(&mut frame.request, &mut frame.rgba)
+            frame.bgra.resize(result.unsigned_abs(), 0);
+            self.video.read(&mut frame.request, &mut frame.bgra)
         } else {
             result
         };
@@ -249,7 +254,8 @@ impl Drop for Media {
 #[derive(Default)]
 pub struct VideoFrame {
     request: video::VideoRead,
-    pub rgba: Vec<u8>,
+    /// BGRA bytes in the layout GPUI uploads without a per-pixel swap.
+    pub bgra: Vec<u8>,
 }
 impl VideoFrame {
     pub fn width(&self) -> u32 {
@@ -270,6 +276,57 @@ mod tests {
         events.push(Event::Frame);
         assert!(matches!(events.poll(Duration::ZERO), Some(Event::Frame)));
         assert!(events.poll(Duration::ZERO).is_none());
+    }
+
+    fn headless_media() -> (Media, Arc<CaptureGate>, mpsc::Receiver<Command>) {
+        let (commands, receiver) = mpsc::channel(8);
+        let capture = Arc::new(CaptureGate::default());
+        (
+            Media {
+                commands,
+                events: Arc::new(Events::default()),
+                capture: capture.clone(),
+                video: Arc::new(VideoStore::default()),
+                worker: None,
+            },
+            capture,
+            receiver,
+        )
+    }
+
+    #[test]
+    fn the_microphone_starts_closed_and_opens_only_on_a_confirmed_state() {
+        let (media, capture, _commands) = headless_media();
+        media
+            .command(Command::Start {
+                ice_servers: Vec::new(),
+                ice_transport_policy: "all".into(),
+                controls: Controls {
+                    muted: false,
+                    ..Controls::default()
+                },
+            })
+            .unwrap();
+        assert!(
+            !capture.enabled(),
+            "joining must not open the microphone before voice.joined"
+        );
+        media
+            .command(Command::State(Controls {
+                muted: false,
+                ..Controls::default()
+            }))
+            .unwrap();
+        assert!(capture.enabled());
+        media
+            .command(Command::State(Controls {
+                muted: true,
+                ..Controls::default()
+            }))
+            .unwrap();
+        assert!(!capture.enabled());
+        media.command(Command::Stop).unwrap();
+        assert!(!capture.enabled());
     }
 }
 pub mod devices;

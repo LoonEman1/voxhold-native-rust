@@ -55,6 +55,12 @@ impl CaptureGate {
             track.set_enabled(false);
         }
     }
+
+    /// Test hook: the gate state is the one applied to the capture track.
+    #[cfg(test)]
+    pub fn enabled(&self) -> bool {
+        self.0.lock().unwrap().0
+    }
 }
 
 pub async fn run(
@@ -98,8 +104,9 @@ pub async fn run(
                     events.push(Event::Error { message });
                 }
             }
-            _ = stats.tick(), if session.as_ref().is_some_and(|session| session.sender.is_some()) => {
+            _ = stats.tick(), if session.is_some() => {
                 if let Some(session) = &mut session {
+                    session.check_devices(&events);
                     session.sample_levels(&events).await;
                 }
             }
@@ -120,7 +127,10 @@ impl PlatformAudio {
         Ok(Self(factory))
     }
 
-    fn select(&self, id: &str, input: bool) -> bool {
+    /// Resolve a persisted device id to a current Core Audio index. The legacy
+    /// WinMM UI stores `index:name`, so a unique name prefix is accepted; a GUID
+    /// from the engine is matched exactly.
+    fn resolve(&self, id: &str, input: bool) -> Option<u16> {
         let factory = &self.0;
         let count = if input {
             factory.recording_devices()
@@ -141,38 +151,43 @@ impl PlatformAudio {
                 factory.playout_device_name(index)
             }
         };
-        let index = if id.is_empty() {
-            (count > 0).then_some(0)
-        } else if let Some((_, old_name)) = id
+        if id.is_empty() {
+            return (count > 0).then_some(0);
+        }
+        if let Some((_, old_name)) = id
             .split_once(':')
             .filter(|(index, _)| index.parse::<u32>().is_ok())
         {
-            // The legacy WinMM UI stores an index and a potentially truncated display name.
-            // Resolve a unique name in the Windows Core Audio list before switching.
             let mut matches =
                 (0..count.max(0) as u16).filter(|&index| name(index).starts_with(old_name));
             let first = matches.next();
             first.filter(|_| matches.next().is_none())
         } else {
             (0..count.max(0) as u16).find(|&index| guid(index) == id)
-        };
-        let Some(index) = index else { return false };
+        }
+    }
+
+    /// Point the ADM at one index and restart only what was already running.
+    fn activate(&self, index: u16, input: bool) -> bool {
+        let factory = &self.0;
         if input {
             let restart = factory.recording_is_initialized();
             if restart && !factory.stop_recording() {
                 return false;
             }
-            let changed = factory.set_recording_device(index);
-            let resumed = !restart || (factory.init_recording() && factory.start_recording());
-            changed && resumed
+            if !factory.set_recording_device(index) {
+                return false;
+            }
+            !restart || (factory.init_recording() && factory.start_recording())
         } else {
             let restart = factory.playout_is_initialized();
             if restart && !factory.stop_playout() {
                 return false;
             }
-            let changed = factory.set_playout_device(index);
-            let resumed = !restart || (factory.init_playout() && factory.start_playout());
-            changed && resumed
+            if !factory.set_playout_device(index) {
+                return false;
+            }
+            !restart || (factory.init_playout() && factory.start_playout())
         }
     }
 }
@@ -196,6 +211,9 @@ struct Session {
     remote_sdp: Option<RemoteSdp>,
     last_ufrags: Vec<String>,
     pending_ice: VecDeque<Candidate>,
+    input_index: Option<u16>,
+    output_index: Option<u16>,
+    device_check: std::time::Instant,
 }
 
 impl Session {
@@ -208,14 +226,32 @@ impl Session {
         viewer: Option<Arc<VideoStore>>,
     ) -> Result<Self, &'static str> {
         let audio = PlatformAudio::new(viewer.is_none())?;
+        // A saved device that is gone at join time must not fail the call:
+        // keep the default path and report it once.
+        let mut input_index = None;
+        let mut output_index = None;
         if let Some(id) = controls.input.as_deref().filter(|id| !id.is_empty()) {
-            if !audio.select(id, true) {
-                return Err("Выбранный микрофон недоступен.");
+            if let Some(index) = audio
+                .resolve(id, true)
+                .filter(|index| audio.activate(*index, true))
+            {
+                input_index = Some(index);
+            } else {
+                events.push(Event::DeviceError {
+                    message: "Выбранный микрофон недоступен, используется системный.",
+                });
             }
         }
         if let Some(id) = controls.output.as_deref().filter(|id| !id.is_empty()) {
-            if !audio.select(id, false) {
-                return Err("Выбранное устройство воспроизведения недоступно.");
+            if let Some(index) = audio
+                .resolve(id, false)
+                .filter(|index| audio.activate(*index, false))
+            {
+                output_index = Some(index);
+            } else {
+                events.push(Event::DeviceError {
+                    message: "Выбранное устройство воспроизведения недоступно, используется системное.",
+                });
             }
         }
         let factory = &audio.0;
@@ -302,6 +338,9 @@ impl Session {
             remote_sdp: None,
             last_ufrags: Vec::new(),
             pending_ice: VecDeque::new(),
+            input_index,
+            output_index,
+            device_check: std::time::Instant::now(),
         };
         session.apply_audio_controls();
         Ok(session)
@@ -330,7 +369,7 @@ impl Session {
                 }
                 Ok(())
             }
-            Command::State(controls) => self.update_controls(controls),
+            Command::State(controls) => self.update_controls(controls, events),
             Command::ViewAudio { muted } => {
                 self.controls.deafened = muted;
                 self.apply_audio_controls();
@@ -347,7 +386,11 @@ impl Session {
         }
     }
 
-    fn update_controls(&mut self, controls: Controls) -> Result<(), &'static str> {
+    /// Apply controls without ever losing the working audio path. A device is
+    /// resolved and the new ADM path is started before the old one is closed;
+    /// if that fails the previous index is restored and the caller gets a
+    /// non-fatal notice.
+    fn update_controls(&mut self, controls: Controls, events: &Events) -> Result<(), &'static str> {
         let deafen_changed = self.controls.deafened != controls.deafened;
         self.controls.muted = controls.muted;
         self.controls.deafened = controls.deafened;
@@ -365,21 +408,103 @@ impl Session {
             .input
             .filter(|id| self.controls.input.as_ref() != Some(id))
         {
-            if !self.audio.select(&input, true) {
-                return Err("Не удалось переключить микрофон.");
+            if self.switch_device(&input, true) {
+                self.controls.input = Some(input);
+            } else {
+                events.push(Event::DeviceError {
+                    message: "Не удалось переключить микрофон, прежний работает.",
+                });
             }
-            self.controls.input = Some(input);
         }
         if let Some(output) = controls
             .output
             .filter(|id| self.controls.output.as_ref() != Some(id))
         {
-            if !self.audio.select(&output, false) {
-                return Err("Не удалось переключить устройство воспроизведения.");
+            if self.switch_device(&output, false) {
+                self.controls.output = Some(output);
+            } else {
+                events.push(Event::DeviceError {
+                    message: "Не удалось переключить устройство воспроизведения, прежнее работает.",
+                });
             }
-            self.controls.output = Some(output);
         }
         Ok(())
+    }
+
+    fn switch_device(&mut self, id: &str, input: bool) -> bool {
+        let Some(index) = self.audio.resolve(id, input) else {
+            return false;
+        };
+        let previous = if input {
+            self.input_index
+        } else {
+            self.output_index
+        };
+        if previous == Some(index) {
+            return true;
+        }
+        if self.audio.activate(index, input) {
+            if input {
+                self.input_index = Some(index);
+            } else {
+                self.output_index = Some(index);
+            }
+            return true;
+        }
+        // Restore the previous index, or the system default when nothing was
+        // selected, so a failed switch never leaves the call silent.
+        let fallback = previous.unwrap_or(0);
+        if self.audio.activate(fallback, input) {
+            if input {
+                self.input_index = Some(fallback);
+            } else {
+                self.output_index = Some(fallback);
+            }
+        }
+        false
+    }
+
+    /// A hot-unplugged device cannot be reported by WebRTC; poll the Core
+    /// Audio list once a second and fall back to the default path.
+    fn check_devices(&mut self, events: &Events) {
+        if self.device_check.elapsed() < Duration::from_secs(1) {
+            return;
+        }
+        self.device_check = std::time::Instant::now();
+        for input in [true, false] {
+            let selected = if input {
+                self.controls.input.as_deref()
+            } else {
+                self.controls.output.as_deref()
+            };
+            let Some(id) = selected.filter(|id| !id.is_empty()) else {
+                continue;
+            };
+            if self.audio.resolve(id, input).is_some() {
+                continue;
+            }
+            let fallback = if input {
+                self.input_index
+            } else {
+                self.output_index
+            };
+            if self.audio.activate(fallback.unwrap_or(0), input) {
+                if input {
+                    self.input_index = Some(fallback.unwrap_or(0));
+                    self.controls.input = None;
+                } else {
+                    self.output_index = Some(fallback.unwrap_or(0));
+                    self.controls.output = None;
+                }
+            }
+            events.push(Event::DeviceError {
+                message: if input {
+                    "Микрофон отключён, используется системный."
+                } else {
+                    "Устройство воспроизведения отключено, используется системное."
+                },
+            });
+        }
     }
 
     fn update_bitrate(&self) {

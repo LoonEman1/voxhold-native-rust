@@ -261,6 +261,9 @@ pub struct VoiceSettings {
     /// Atomic writes that actually reached disk. Rapid slider steps must
     /// collapse into one; the coalescing regression reads this counter.
     pub writes: u64,
+    /// Token of the newest write that reached the disk. A newer token means a
+    /// save is still queued and `flush`/`Drop` must write it.
+    pub saved_generation: u64,
     /// Device error already turned into `device_notice`, so a meter tick can
     /// tell "still broken" from "the engine recovered".
     pub device_error_shown: String,
@@ -287,6 +290,7 @@ impl Default for VoiceSettings {
             meter_epoch: 0,
             store: VoiceStore::default(),
             writes: 0,
+            saved_generation: 0,
             device_error_shown: String::new(),
         }
     }
@@ -294,11 +298,10 @@ impl Default for VoiceSettings {
 
 impl VoiceSettings {
     pub fn with_path(path: Option<PathBuf>) -> Self {
-        Self {
-            prefs: VoicePrefs::load(path.as_deref()),
-            path,
-            ..Self::default()
-        }
+        let mut settings = Self::default();
+        settings.prefs = VoicePrefs::load(path.as_deref());
+        settings.path = path;
+        settings
     }
 
     /// Synchronous save used by the preference tests. The live tab uses
@@ -311,6 +314,33 @@ impl VoiceSettings {
         } else {
             self.saved_error = "Не удалось сохранить настройки звука.".into();
         }
+    }
+
+    /// Write the newest queued snapshot immediately and return whether this
+    /// call wrote. The debounced task cannot run while the view is going away,
+    /// so the close path flushes here; taking the next token also cancels a
+    /// timer that is still pending. `false` means nothing was pending.
+    pub fn flush(&mut self) -> bool {
+        if self.store.is_newest(self.saved_generation) {
+            return false;
+        }
+        let generation = self.store.next();
+        let written = self
+            .store
+            .save(generation, &self.prefs, self.path.as_deref());
+        if written == Some(true) {
+            self.saved_generation = generation;
+            self.writes = self.writes.wrapping_add(1);
+        }
+        written.unwrap_or(false)
+    }
+}
+
+impl Drop for VoiceSettings {
+    /// The view owns this value, so its drop is the application's last chance
+    /// to persist a value whose 150 ms debounce has not fired yet.
+    fn drop(&mut self) {
+        self.flush();
     }
 }
 
@@ -571,7 +601,7 @@ mod tests {
     #[test]
     fn a_superseded_snapshot_never_reaches_the_file() {
         let path = scratch("ordering.voice.json");
-        let settings = VoiceSettings::with_path(Some(path.clone()));
+        let mut settings = VoiceSettings::with_path(Some(path.clone()));
         let generation = settings.store.next();
         let mut newest = VoicePrefs::default();
         newest.input_volume = 140;
@@ -579,6 +609,7 @@ mod tests {
             settings.store.save(generation, &newest, Some(&path)),
             Some(true)
         );
+        settings.saved_generation = generation;
         // A later edit takes the next token before the older write reaches the
         // disk; the older snapshot must not touch the file any more.
         settings.store.next();
@@ -591,6 +622,33 @@ mod tests {
             "the superseded snapshot is dropped"
         );
         assert_eq!(VoicePrefs::load(Some(&path)).input_volume, 140);
+        // The test-specific token bump above is not a pending save: the drop
+        // flush would write the (default) snapshot of this fixture otherwise.
+        settings.prefs = newest.clone();
+        drop(settings);
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn a_queued_save_is_flushed_when_the_settings_are_dropped() {
+        let path = scratch("flush.voice.json");
+        {
+            let mut settings = VoiceSettings::with_path(Some(path.clone()));
+            settings.prefs.input_volume = 170;
+            // A persist_voice call took a newer token but the 150 ms debounce
+            // has not fired; nothing has reached the disk yet.
+            settings.store.next();
+            assert!(!path.exists(), "the debounced write has not run");
+        }
+        assert_eq!(
+            VoicePrefs::load(Some(&path)).input_volume,
+            170,
+            "dropping the settings (and the view with them) flushes the value"
+        );
+        // A second drop of an already saved value does not touch the file.
+        let mut settings = VoiceSettings::with_path(Some(path.clone()));
+        assert!(!settings.flush(), "nothing is pending after a load");
+        drop(settings);
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 

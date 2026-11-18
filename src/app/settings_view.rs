@@ -571,15 +571,10 @@ impl Voxhold {
             )
             .child(header)
             .child(tab_strip)
+            // Moves while the pointer is over the form (the card occludes the
+            // backdrop, so only one of the two receives the event).
             .on_mouse_move(cx.listener(|s, event: &gpui::MouseMoveEvent, window, cx| {
-                if s.slider_drag.is_none() {
-                    return;
-                }
-                if event.pressed_button != Some(MouseButton::Left) {
-                    s.end_slider_drag();
-                    return;
-                }
-                s.drag_slider_to(f32::from(event.position.x), window, cx);
+                s.slider_pointer_moved(event, window, cx)
             }))
             .on_mouse_up(
                 MouseButton::Left,
@@ -613,6 +608,17 @@ impl Voxhold {
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|s, _, window, cx| s.close_settings(true, window, cx)),
+                )
+                // The pointer capture of the Go slider: a drag that leaves the
+                // card keeps updating the value while the button is held, and
+                // the track math clamps it to the row ends. The backdrop covers
+                // the whole window, so moves outside the card still arrive.
+                .on_mouse_move(cx.listener(|s, event: &gpui::MouseMoveEvent, window, cx| {
+                    s.slider_pointer_moved(event, window, cx)
+                }))
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(|s, _, _, _| s.end_slider_drag()),
                 )
                 .child(card)
                 .into_any_element(),

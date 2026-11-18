@@ -222,6 +222,7 @@ impl Voxhold {
                 }
                 if saved {
                     view.voice_settings.writes = view.voice_settings.writes.wrapping_add(1);
+                    view.voice_settings.saved_generation = generation;
                     view.voice_settings.saved_error.clear();
                 } else {
                     view.voice_settings.saved_error =
@@ -309,6 +310,24 @@ impl Voxhold {
         {
             let _ = cx;
             0.0
+        }
+    }
+
+    /// The microphone is closed in the live call: local mute, server mute,
+    /// deafen, push-to-talk release or a blocking modal all fold into
+    /// `Controls::muted`, so the in-call meter can show the same silence the
+    /// transmission sends.
+    fn voice_input_muted(&self, cx: &Context<Self>) -> bool {
+        #[cfg(feature = "voxhold-media")]
+        {
+            self.voice
+                .as_ref()
+                .is_some_and(|panel| panel.read(cx).input_muted())
+        }
+        #[cfg(not(feature = "voxhold-media"))]
+        {
+            let _ = cx;
+            false
         }
     }
 
@@ -492,16 +511,17 @@ impl Voxhold {
                 0.0
             }
         };
-        // The preview is the microphone signal the user is adjusting, so the
-        // stored gain scales it exactly like Go's preview meter. In a call the
-        // number must be the real transmission level: gain 1–200 is not in
-        // that path until R07b.
-        let scaled = if in_call {
-            raw
-        } else {
-            raw * self.voice_settings.prefs.input_volume as f64 / 100.0
-        }
-        .clamp(0.0, 1.0);
+        // The preview is the device signal the user is adjusting, so the stored
+        // gain scales it exactly like Go's `levelMeter` (`level*InputVolume/100`).
+        // In a call the engine reports the pre-gate level of the software chain,
+        // i.e. after the APM but before the gate and the applied gain
+        // (`capture.rs::BlockProcessor::process`), so the meter applies the same
+        // gain here and shows silence while the microphone is closed. The gate
+        // itself stays out of the meter: it is a non-linear on/off, and the
+        // coral riser already shows its threshold.
+        let gain = self.voice_settings.prefs.input_volume as f64 / 100.0;
+        let muted = in_call && self.voice_input_muted(cx);
+        let scaled = if muted { 0.0 } else { raw * gain }.clamp(0.0, 1.0);
         let mut changed = false;
         if (scaled - self.voice_settings.preview_level as f64).abs() > 0.005 {
             self.voice_settings.preview_level = scaled as f32;

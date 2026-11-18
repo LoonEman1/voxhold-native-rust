@@ -159,7 +159,10 @@ fn captured_duration(stats: Vec<RtcStats>) -> f64 {
         .fold(0.0_f64, f64::max)
 }
 
-async fn run(mode: NoiseMode) -> Result<(f32, f32, f32, f64, f64), &'static str> {
+async fn run(
+    params: AudioParams,
+    samples: &[i16],
+) -> Result<(f32, f32, f32, f64, f64), &'static str> {
     let factory = PeerConnectionFactory::default();
     let source = NativeAudioSource::new(
         AudioSourceOptions {
@@ -219,17 +222,9 @@ async fn run(mode: NoiseMode) -> Result<(f32, f32, f32, f64, f64), &'static str>
         }
     });
 
-    // Skip the leading silence and play noise, tone, noise at real time.
-    let fixture = dsp::fixture(RATE);
-    let start = (RATE / 2) as usize;
-    let params = AudioParams {
-        mode,
-        gate_percent: 15,
-        input_gain: 1.0,
-        auto_gain_control: false,
-        ..AudioParams::default()
-    };
-    play(&source, &params, &fixture[start..]).await;
+    // Play the caller's PCM at real time; the gate test starts after the
+    // leading silence, the gain/mute cases use the noise-tone-noise section.
+    play(&source, &params, samples).await;
     sleep(Duration::from_millis(900)).await;
     let captured_after = captured_duration(sender.get_stats().await.map_err(|_| "final stats")?);
     reader.abort();
@@ -250,10 +245,33 @@ fn threshold_gate_and_auto_noise_survive_opus_round_trip() {
         .enable_all()
         .build()
         .unwrap();
-    let (threshold_noise, tone, threshold_tail, threshold_before, threshold_after) =
-        runtime.block_on(run(NoiseMode::Threshold)).unwrap();
-    let (auto_noise, auto_tone, auto_tail, auto_before, auto_after) =
-        runtime.block_on(run(NoiseMode::Auto)).unwrap();
+    // Skip the leading silence; the fixture then starts with noise.
+    let fixture = dsp::fixture(RATE);
+    let samples = &fixture[(RATE / 2) as usize..];
+    let (threshold_noise, tone, threshold_tail, threshold_before, threshold_after) = runtime
+        .block_on(run(
+            AudioParams {
+                mode: NoiseMode::Threshold,
+                gate_percent: 15,
+                input_gain: 1.0,
+                auto_gain_control: false,
+                ..AudioParams::default()
+            },
+            samples,
+        ))
+        .unwrap();
+    let (auto_noise, auto_tone, auto_tail, auto_before, auto_after) = runtime
+        .block_on(run(
+            AudioParams {
+                mode: NoiseMode::Auto,
+                gate_percent: 15,
+                input_gain: 1.0,
+                auto_gain_control: false,
+                ..AudioParams::default()
+            },
+            samples,
+        ))
+        .unwrap();
     println!(
         "threshold noise {threshold_noise:.1} dBFS, tone {tone:.1} dBFS, tail {threshold_tail:.1} dBFS, captured {threshold_before:.3}->{threshold_after:.3} s; auto noise {auto_noise:.1} dBFS, tone {auto_tone:.1} dBFS, tail {auto_tail:.1} dBFS, captured {auto_before:.3}->{auto_after:.3} s"
     );
@@ -282,5 +300,72 @@ fn threshold_gate_and_auto_noise_survive_opus_round_trip() {
     assert!(
         auto_noise > threshold_noise + 10.0,
         "auto noise {auto_noise} vs threshold noise {threshold_noise} (auto tail {auto_tail})"
+    );
+}
+
+/// W02b item 3: the same PCM round trip must also cover mute, input gain and
+/// AGC, not only the gate and NS. The gate is bypassed (`gate_percent: 0`) in
+/// the gain/mute cases so the decoded level difference can only come from the
+/// gain stage, which R07b applies after the gate.
+#[test]
+fn mute_input_gain_and_agc_survive_opus_round_trip() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let fixture = dsp::fixture(RATE);
+    let samples = &fixture[(RATE / 2) as usize..];
+    let bypass = |gain: f32| AudioParams {
+        mode: NoiseMode::Threshold,
+        gate_percent: 0,
+        input_gain: gain,
+        auto_gain_control: false,
+        ..AudioParams::default()
+    };
+    let run_case = |params: AudioParams, samples: &[i16]| {
+        runtime
+            .block_on(run(params, samples))
+            .map(|(_, tone, _, _, _)| tone)
+            .unwrap()
+    };
+    let unity = run_case(bypass(1.0), samples);
+    let silent = run_case(bypass(0.0), samples);
+    let loud = run_case(bypass(2.0), samples);
+    let muted = run_case(
+        AudioParams {
+            muted: true,
+            ..bypass(1.0)
+        },
+        samples,
+    );
+    // A quiet copy needs the AGC make-up gain to come back to a normal level;
+    // without it the same fixture decodes around -35 dBFS (measured on this
+    // pinned engine), below the -30 dB presence bound used above.
+    let quiet: Vec<i16> = samples.iter().map(|sample| sample / 10).collect();
+    let agc = run_case(
+        AudioParams {
+            mode: NoiseMode::Auto,
+            auto_gain_control: true,
+            ..AudioParams::default()
+        },
+        &quiet,
+    );
+    println!(
+        "gain 1 {unity:.1} dBFS, gain 0 {silent:.1} dBFS, gain 2 {loud:.1} dBFS, mute {muted:.1} dBFS, AGC {agc:.1} dBFS"
+    );
+    assert!(unity > -30.0, "the unity reference must survive Opus");
+    assert!(
+        silent < -60.0,
+        "gain 0 % must transmit silence, got {silent}"
+    );
+    assert!(loud > -30.0, "gain 200 % must survive Opus, got {loud}");
+    assert!(
+        loud > unity + 3.0,
+        "gain 200 % must be louder than 100 %: {loud} vs {unity}"
+    );
+    assert!(muted < -60.0, "mute must transmit silence, got {muted}");
+    assert!(
+        agc > -30.0,
+        "AGC must lift the quiet tone above the presence bound, got {agc}"
     );
 }

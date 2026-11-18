@@ -179,6 +179,61 @@ async fn the_keyboard_steps_by_one_and_home_end_hit_the_bounds(cx: &mut TestAppC
 }
 
 #[gpui::test]
+async fn dragging_past_the_card_keeps_updating_and_clamps_to_the_ends(cx: &mut TestAppContext) {
+    let (mut visual, view) = fixture(cx);
+    let measured = track(&view, &*visual, "input-volume");
+    let y = row_center(&mut visual, "input-volume-track");
+    let card = visual
+        .debug_bounds("settings-card")
+        .expect("the card is painted");
+    let start = point(px(measured.origin_x + measured.width * 0.5), px(y));
+    visual.simulate_mouse_move(start, None, Modifiers::default());
+    visual.simulate_mouse_down(start, MouseButton::Left, Modifiers::default());
+    view.read_with(&*visual, |v, _| {
+        assert_eq!(v.voice_settings.prefs.input_volume, 100)
+    });
+
+    // The Go slider captures the pointer: dragging far outside the card keeps
+    // updating the value and clamps at the ends instead of freezing.
+    let outside_right = f32::from(card.origin.x + card.size.width) + 150.0;
+    visual.simulate_mouse_move(
+        point(px(outside_right), px(y)),
+        Some(MouseButton::Left),
+        Modifiers::default(),
+    );
+    view.read_with(&*visual, |v, _| {
+        assert_eq!(
+            v.voice_settings.prefs.input_volume, 200,
+            "a pointer right of the card clamps at 200"
+        )
+    });
+    draw(&mut visual);
+    let outside_left = f32::from(card.origin.x) - 150.0;
+    visual.simulate_mouse_move(
+        point(px(outside_left), px(y)),
+        Some(MouseButton::Left),
+        Modifiers::default(),
+    );
+    view.read_with(&*visual, |v, _| {
+        assert_eq!(
+            v.voice_settings.prefs.input_volume, 0,
+            "a pointer left of the card clamps at 0"
+        )
+    });
+    visual.simulate_mouse_up(
+        point(px(outside_left), px(y)),
+        MouseButton::Left,
+        Modifiers::default(),
+    );
+    // The release outside the card must also end the drag: a later move
+    // without the button cannot keep changing the value.
+    visual.simulate_mouse_move(point(px(outside_right), px(y)), None, Modifiers::default());
+    view.read_with(&*visual, |v, _| {
+        assert_eq!(v.voice_settings.prefs.input_volume, 0)
+    });
+}
+
+#[gpui::test]
 async fn the_fill_tracks_the_measured_width_at_two_card_sizes(cx: &mut TestAppContext) {
     let (mut visual, view) = fixture(cx);
     let wide = track(&view, &*visual, "input-volume");

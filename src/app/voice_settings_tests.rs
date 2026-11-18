@@ -54,6 +54,87 @@ fn voice_call(
     (visual, view, voice)
 }
 
+#[gpui::test]
+async fn closing_the_view_flushes_a_queued_voice_save(cx: &mut TestAppContext) {
+    let (mut visual, view, _voice) = voice_call(cx);
+    let directory = std::env::temp_dir().join(format!(
+        "voxhold-voice-flush-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&directory).unwrap();
+    let path = directory.join("prefs.voice.json");
+    visual.update(|_, app| {
+        view.update(app, |v, cx| {
+            use personal_settings::Action;
+            v.voice_settings.path = Some(path.clone());
+            assert!(v.voice_settings_action(Action::SetVolume("input", 175), cx));
+            assert_eq!(
+                v.voice_settings.writes, 0,
+                "the 150 ms debounce has not fired yet"
+            );
+            assert!(!path.exists(), "nothing has reached the disk yet");
+            // The view is going away: its settings (with the queued save) are
+            // dropped before the timer can run, exactly as on window close.
+            let settings = std::mem::take(&mut v.voice_settings);
+            drop(settings);
+        });
+    });
+    assert_eq!(
+        crate::voice_settings::VoicePrefs::load(Some(&path)).input_volume,
+        175,
+        "the close path must flush the debounced value"
+    );
+    assert!(!path.with_file_name(".prefs.voice.json.tmp").exists());
+    std::fs::remove_dir_all(&directory).unwrap();
+}
+
+#[gpui::test]
+async fn the_in_call_meter_applies_the_input_gain_and_mute(cx: &mut TestAppContext) {
+    let (mut visual, view, voice) = voice_call(cx);
+    visual.update(|window, app| {
+        voice.update(app, |panel, cx| {
+            panel.test_apply_update(VoiceUpdate::LocalLevel(0.5), window, cx);
+        });
+        view.update(app, |v, cx| {
+            use personal_settings::Action;
+            let tick = |v: &mut Voxhold, cx: &mut Context<Voxhold>| {
+                let epoch = v.voice_settings.meter_epoch;
+                let session = v.session_generation;
+                v.voice_meter_tick(epoch, session, cx)
+            };
+            // The engine reports the pre-gate level of the chain (0.5 here);
+            // 0 % gain must show the silence that is actually transmitted.
+            assert!(v.voice_settings_action(Action::SetVolume("input", 0), cx));
+            assert!(tick(v, cx));
+            assert_eq!(
+                v.voice_settings.preview_level, 0.0,
+                "0 % gain shows silence"
+            );
+            assert!(v.voice_settings_action(Action::SetVolume("input", 200), cx));
+            assert!(tick(v, cx));
+            assert!(
+                (v.voice_settings.preview_level - 1.0).abs() < 1e-6,
+                "200 % doubles the level up to the meter ceiling"
+            );
+            assert!(v.voice_settings_action(Action::SetVolume("input", 50), cx));
+            assert!(tick(v, cx));
+            assert!(
+                (v.voice_settings.preview_level - 0.25).abs() < 1e-6,
+                "50 % halves the reported level"
+            );
+            // A closed microphone transmits silence, so the in-call bar is 0.
+            voice.update(cx, |panel, cx| panel.mute(cx));
+            assert!(v.voice_settings.preview_level > 0.0);
+            assert!(tick(v, cx));
+            assert_eq!(
+                v.voice_settings.preview_level, 0.0,
+                "a muted microphone shows no level even with gain 50 %"
+            );
+        });
+    });
+}
+
 /// Every value of the snapshot, taken from the queue the media worker reads.
 #[gpui::test]
 async fn every_settings_change_queues_exactly_one_full_snapshot(cx: &mut TestAppContext) {

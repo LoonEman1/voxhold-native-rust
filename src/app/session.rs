@@ -157,6 +157,9 @@ impl Voxhold {
         for (_, pending) in self.pending_sends.drain() {
             pending.abort.abort();
         }
+        // The pending voice save would be aborted by the generation bump; write
+        // it before the session it belongs to goes away.
+        self.voice_settings.flush();
         self.session_generation = self.session_generation.wrapping_add(1);
         self.active_profile_save = None;
         self.notification_saves.clear();

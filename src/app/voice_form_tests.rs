@@ -310,10 +310,51 @@ fn assert_form_fits(visual: &mut VisualTestContext, scale: f32) {
     }
 }
 
+/// The card geometry must depend on the pinned view scale, not just on the
+/// window: `680.min(vw - 16*scale)` leaves a constant physical margin. A window
+/// narrower than 680+16 makes that observable; ignoring the scale (or pinning
+/// the old 16 px inset) changes the expected width and fails below.
 #[gpui::test]
-async fn the_voice_form_stays_usable_at_125_and_150_percent(cx: &mut TestAppContext) {
-    // The test window has no platform DPI, so the view scale is pinned and the
-    // logical viewport is the size a 1600x900 panel reports at that scale.
+async fn the_settings_card_follows_the_view_scale(cx: &mut TestAppContext) {
+    let (viewport_width, viewport_height) = (690.0_f32, 700.0_f32);
+    let mut widths = Vec::new();
+    for scale in [1.0_f32, 1.25, 1.5] {
+        let (mut visual, view) = voice_tab(cx);
+        visual.update(|window, app| {
+            view.update(app, |v, _| v.test_pin_ui_scale(scale));
+            let _ = window;
+        });
+        visual.simulate_resize(size(px(viewport_width), px(viewport_height)));
+        draw(&mut visual);
+        draw(&mut visual);
+        let card = visual
+            .debug_bounds("settings-card")
+            .expect("the card is painted");
+        let width = f32::from(card.size.width);
+        let expected = 680.0_f32.min(viewport_width - 16.0 * scale).max(260.0);
+        assert!(
+            (width - expected).abs() < 0.5,
+            "scale {scale}: the card must be {expected} px wide, got {width}"
+        );
+        let left = f32::from(card.origin.x);
+        assert!(
+            (left - (viewport_width - width) / 2.0).abs() < 0.5,
+            "scale {scale}: the card stays centered, left {left} width {width}"
+        );
+        widths.push(width);
+        assert_form_fits(&mut visual, scale);
+    }
+    assert!(
+        widths[1] < widths[0] && widths[2] < widths[1],
+        "a larger view scale must shrink the card: {widths:?}"
+    );
+}
+
+#[gpui::test]
+async fn the_voice_form_stays_usable_at_the_125_and_150_logical_viewport(cx: &mut TestAppContext) {
+    // The test window has no platform DPI; this pins the view's scale parameter
+    // and the logical viewport a 1600x900 panel reports at that scale. It is a
+    // layout check, not a physical DPI measurement.
     for (scale, width, height) in [(1.25_f32, 1280.0_f32, 720.0_f32), (1.5, 1067.0, 600.0)] {
         let (mut visual, view) = voice_tab(cx);
         visual.update(|window, app| {

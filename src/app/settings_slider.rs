@@ -228,6 +228,26 @@ impl Voxhold {
         self.slider_drag = None;
     }
 
+    /// One pointer move for an active slider drag. The dialog listens to it on
+    /// the card (pointer over the form) and on the backdrop (pointer outside
+    /// the card), which together reproduce the Go pointer capture without
+    /// losing moves at the card edge.
+    pub(super) fn slider_pointer_moved(
+        &mut self,
+        event: &gpui::MouseMoveEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.slider_drag.is_none() {
+            return;
+        }
+        if event.pressed_button != Some(MouseButton::Left) {
+            self.end_slider_drag();
+            return;
+        }
+        self.drag_slider_to(f32::from(event.position.x), window, cx);
+    }
+
     /// The most recent measurement of one slider, for the layout regressions.
     #[cfg(test)]
     pub(super) fn test_slider_track(&self, id: &str) -> Option<SliderTrack> {

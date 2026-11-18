@@ -4,6 +4,14 @@
 use super::*;
 
 impl VoicePanel {
+    /// The folded capture decision of the last `refresh_capture`: true means
+    /// the microphone is closed (local mute, deafen, push-to-talk release, a
+    /// blocking modal or an unconfirmed join). The in-call meter renders the
+    /// same silence the transmission sends.
+    pub fn input_muted(&self) -> bool {
+        self.controls.muted
+    }
+
     /// Explicit input selection. Even the same saved id is forwarded once, so
     /// a microphone that was missing at join (and fell back to the system
     /// device) can be retried without rejoining. The request has its own slot

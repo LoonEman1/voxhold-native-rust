@@ -405,6 +405,9 @@ pub(crate) struct Voxhold {
 
 impl Drop for Voxhold {
     fn drop(&mut self) {
+        // The window is going away, so the debounced voice save will never get
+        // its timer: write the newest snapshot now (atomic, one small file).
+        self.voice_settings.flush();
         self.stop_realtime();
     }
 }

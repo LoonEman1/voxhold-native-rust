@@ -9,7 +9,7 @@
 
 use crate::{
     Command, Controls, Event, IceServer, Media, VideoFrame,
-    controller::{Action, Participant, Publication, Signal, VoiceController},
+    controller::{Action, AppliedAudio, Participant, Publication, Signal, VoiceController},
     stream::{EngineUpdate, StreamViewer},
     viewer::{Outcome as ViewerOutcome, Viewer},
     voice::CaptureGate,
@@ -67,6 +67,16 @@ pub enum VoiceUpdate {
         error: Option<String>,
     },
     DeviceError(String),
+    /// Applied input device for an explicit selection or an engine fallback.
+    /// `generation` is zero for engine-initiated changes.
+    InputApplied {
+        generation: u64,
+        input: Option<String>,
+        error: Option<String>,
+    },
+    /// The capture chain actually applied by the media engine, including the
+    /// platform-ADM fallback and its forced NS/AGC.
+    AudioMode(AppliedAudio),
     /// The attempt finished. An error reason is carried together with the end
     /// so the UI can never lose it to a coalesced terminal `Left`.
     Ended(Option<String>),
@@ -92,6 +102,8 @@ impl VoiceUpdate {
                     | (Self::LocalLevel(_), Self::LocalLevel(_))
                     | (Self::Tracks(_), Self::Tracks(_))
                     | (Self::Streams(_), Self::Streams(_))
+                    | (Self::InputApplied { .. }, Self::InputApplied { .. })
+                    | (Self::AudioMode(_), Self::AudioMode(_))
             ),
         }
     }
@@ -137,137 +149,10 @@ impl Updates {
     }
 }
 
-/// Selecting and closing a stream share one last-value slot. A stale close can
-/// therefore never overtake a newer watch intent.
-#[derive(Clone, Debug)]
-enum StreamCommand {
-    Watch {
-        selection: u64,
-        publication: Publication,
-    },
-    Close {
-        selection: u64,
-    },
-}
-
-impl StreamCommand {
-    fn selection(&self) -> u64 {
-        match self {
-            Self::Watch { selection, .. } | Self::Close { selection } => *selection,
-        }
-    }
-}
-
-/// Install a stream intent only if it is not older than the queued or already
-/// applied command. Selection ids are monotonic, so a late close for A cannot
-/// erase a newer watch for B (and vice versa).
-fn set_stream_command(requests: &Requests, command: StreamCommand) -> bool {
-    let selection = command.selection();
-    let Ok(mut queue) = requests.stream.lock() else {
-        return false;
-    };
-    if queue.last_applied > selection
-        || queue
-            .pending
-            .as_ref()
-            .is_some_and(|current| current.selection() > selection)
-    {
-        return false;
-    }
-    queue.pending = Some(command);
-    true
-}
-
-/// The last-value slot plus the newest command the worker has already taken.
-/// Keeping the applied number after the slot is empty is what lets a newer
-/// Close(B) close the still-running A when the intermediate Watch(B) was
-/// displaced by the close.
-#[derive(Default)]
-struct StreamRequests {
-    pending: Option<StreamCommand>,
-    last_applied: u64,
-}
-
-impl StreamRequests {
-    fn take(&mut self) -> Option<StreamCommand> {
-        let command = self.pending.take()?;
-        self.last_applied = self.last_applied.max(command.selection());
-        Some(command)
-    }
-
-    fn clear(&mut self) {
-        self.pending = None;
-    }
-}
-
-/// Latest-value request slots shared by the handle and the worker.
-#[derive(Default)]
-struct Requests {
-    controls: Mutex<Option<(Controls, bool)>>,
-    local_mutes: Mutex<VecDeque<(String, bool)>>,
-    stream: Mutex<StreamRequests>,
-    stream_mute: Mutex<Option<(u64, bool)>>,
-    /// Explicit output selection from settings. This is separate from generic
-    /// control updates so it always reaches the media engine even when the
-    /// runtime cache still describes the pre-unplug device.
-    output: Mutex<Option<Option<String>>>,
-    viewport: Mutex<Option<(u32, u32)>>,
-    leave: AtomicBool,
-    notify: Notify,
-}
-
-enum Pending {
-    Leave,
-    Stream(StreamCommand),
-    Output(Option<String>),
-    Controls(Controls, bool),
-    StreamMute(u64, bool),
-    LocalMute(String, bool),
-}
-
-impl Requests {
-    fn wake(&self) {
-        self.notify.notify_waiters();
-    }
-
-    /// Drain one action by priority. Called in a loop until it returns `None`.
-    fn take(&self) -> Option<Pending> {
-        if self.leave.swap(false, Ordering::SeqCst) {
-            return Some(Pending::Leave);
-        }
-        if let Ok(mut stream) = self.stream.lock() {
-            if let Some(command) = stream.take() {
-                return Some(Pending::Stream(command));
-            }
-        }
-        if let Ok(mut output) = self.output.lock() {
-            if let Some(output) = output.take() {
-                return Some(Pending::Output(output));
-            }
-        }
-        if let Ok(mut controls) = self.controls.lock() {
-            if let Some((controls, self_muted)) = controls.take() {
-                return Some(Pending::Controls(controls, self_muted));
-            }
-        }
-        if let Ok(mut mute) = self.stream_mute.lock() {
-            if let Some((selection, muted)) = mute.take() {
-                return Some(Pending::StreamMute(selection, muted));
-            }
-        }
-        let item = self.local_mutes.lock().ok()?.pop_front();
-        item.map(|(connection, muted)| Pending::LocalMute(connection, muted))
-    }
-
-    fn viewport(&self) -> (u32, u32) {
-        self.viewport
-            .lock()
-            .ok()
-            .and_then(|viewport| *viewport)
-            .filter(|(width, height)| *width > 0 && *height > 0)
-            .unwrap_or(DEFAULT_VIEWPORT)
-    }
-}
+mod requests;
+use requests::{
+    InputRequest, Pending, Requests, StreamCommand, set_input_request, set_stream_command,
+};
 
 pub struct StreamFrame {
     /// Selection that produced this frame. The panel ignores a frame from an
@@ -367,6 +252,21 @@ impl VoiceHandle {
             *slot = Some(output);
         }
         self.requests.wake();
+    }
+
+    /// Explicit input selection. The request travels in its own slot with a
+    /// monotonically increasing generation, so a later PTT/DSP `controls`
+    /// update cannot displace it and a late result cannot outrank a newer
+    /// choice in the UI.
+    pub fn select_input(&self, input: Option<String>) -> u64 {
+        static GENERATION: AtomicU64 = AtomicU64::new(1);
+        let generation = GENERATION.fetch_add(1, Ordering::SeqCst);
+        let input = input.filter(|id| !id.is_empty());
+        if let Ok(mut slot) = self.requests.input.lock() {
+            set_input_request(&mut slot, InputRequest { input, generation });
+        }
+        self.requests.wake();
+        generation
     }
 
     pub fn local_mute(&self, connection: String, muted: bool) {
@@ -558,11 +458,29 @@ impl Live {
             if matches!(event, Event::State { state: "connected" }) {
                 self.updates.push(VoiceUpdate::Connected);
             }
+            if let Event::InputApplied {
+                generation,
+                input,
+                error,
+            } = &event
+            {
+                self.updates.push(VoiceUpdate::InputApplied {
+                    generation: *generation,
+                    input: input.clone(),
+                    error: error.map(str::to_owned),
+                });
+            }
             let speaking = controller.speaking.clone();
             let tracks = controller.connections_with_audio();
+            let applied = controller.applied_audio.clone();
             let actions = controller.media_event(event);
             if !self.execute(actions).await? {
                 return Ok(false);
+            }
+            if controller.applied_audio != applied {
+                if let Some(applied) = controller.applied_audio.clone() {
+                    self.updates.push(VoiceUpdate::AudioMode(applied));
+                }
             }
             if controller.speaking != speaking {
                 self.updates
@@ -930,6 +848,28 @@ async fn run_session(
                         }
                     }
                 }
+                Pending::Input(request) => {
+                    // The media engine owns the device switch and reports the
+                    // applied input through `InputApplied`. Keep the controller
+                    // in sync so a reconnect or the next PTT State does not
+                    // revert to the previous selection.
+                    let previous = controller.controls.input.clone();
+                    let generation = request.generation;
+                    if let Err(error) = live.media.command(Command::SelectInput {
+                        input: request.input.clone(),
+                        generation,
+                    }) {
+                        live.updates.push(VoiceUpdate::InputApplied {
+                            generation,
+                            input: previous,
+                            error: Some(format!(
+                                "Не удалось передать выбор микрофона медиадвижку: {error:?}"
+                            )),
+                        });
+                    } else {
+                        controller.controls.input = request.input;
+                    }
+                }
                 Pending::StreamMute(selection, muted) => {
                     let outcomes = viewer.set_muted(selection, muted);
                     if let Err(end) = live.apply(outcomes, viewer).await {
@@ -1135,11 +1075,18 @@ fn run(
                         break;
                     }
                     Pending::Controls(controls, self_muted) => {
+                        // A control snapshot queued before `SelectInput` must
+                        // not replace the device for the next connection.
+                        let input = controller.controls.input.clone();
                         controller.controls = controls;
+                        controller.controls.input = input;
                         controller.self_muted = self_muted;
                     }
                     Pending::Output(output) => {
                         controller.controls.output = output;
+                    }
+                    Pending::Input(request) => {
+                        controller.controls.input = request.input;
                     }
                     Pending::LocalMute(connection, muted) => {
                         controller.set_local_mute(&connection, muted);

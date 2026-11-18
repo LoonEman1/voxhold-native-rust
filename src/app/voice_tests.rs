@@ -5,7 +5,8 @@
 use super::*;
 use crate::voice_room::CallPhase;
 use gpui::{Keystroke, TestAppContext, VisualTestContext};
-use voxhold_media::controller::{Participant, Publication};
+use voxhold_media::controller::{AppliedAudio, Participant, Publication};
+use voxhold_media::runtime::VoiceUpdate;
 
 fn client() -> voxhold_api::Client {
     let mut client = voxhold_api::Client::new("http://127.0.0.1:1").unwrap();
@@ -737,6 +738,71 @@ async fn an_app_opened_room_wakes_the_sidebar_on_speech(cx: &mut TestAppContext)
     // without a re-entrant entity update.
     draw(&mut visual);
     panel.read_with(&*visual, |panel, _| assert!(panel.speaking("alice")));
+}
+
+#[gpui::test]
+async fn dsp_controls_accept_the_web_ranges(cx: &mut TestAppContext) {
+    let (mut visual, _view, voice) = fixture(cx);
+    draw(&mut visual);
+    voice.update(&mut *visual, |panel, _| {
+        panel.set_dsp("threshold", 250, 999, false, false);
+    });
+    voice.read_with(&*visual, |panel, _| {
+        let controls = panel.test_controls();
+        assert_eq!(
+            controls.noise_mode,
+            voxhold_media::dsp::NoiseMode::Threshold
+        );
+        assert_eq!(controls.noise_gate_percent, 100);
+        assert!((controls.input_gain - 2.0).abs() < f32::EPSILON);
+        assert!(!controls.echo_cancellation);
+        assert!(!controls.auto_gain_control);
+    });
+    voice.update(&mut *visual, |panel, _| {
+        panel.set_dsp("auto", 15, 0, true, true);
+    });
+    voice.update(&mut *visual, |panel, _| {
+        panel.select_input(Some("endpoint-x".into()));
+    });
+    voice.read_with(&*visual, |panel, _| {
+        let controls = panel.test_controls();
+        assert_eq!(controls.noise_mode, voxhold_media::dsp::NoiseMode::Auto);
+        assert_eq!(controls.noise_gate_percent, 15);
+        assert_eq!(controls.input_gain, 0.0);
+        assert_eq!(controls.input.as_deref(), Some("endpoint-x"));
+    });
+}
+
+#[gpui::test]
+async fn applied_audio_update_reaches_the_panel(cx: &mut TestAppContext) {
+    let (mut visual, _view, voice) = fixture(cx);
+    draw(&mut visual);
+    let applied = AppliedAudio {
+        capture: "platform",
+        noise_mode: "auto",
+        echo_cancellation: true,
+        auto_gain_control: true,
+    };
+    let expected = applied.clone();
+    visual.update(|window, app| {
+        voice.update(app, |panel, cx| {
+            assert!(panel.apply_update(VoiceUpdate::AudioMode(applied), window, cx));
+        });
+    });
+    voice.read_with(&*visual, |panel, _| {
+        assert_eq!(panel.applied_audio(), Some(&expected));
+    });
+    draw(&mut visual);
+    assert!(
+        visual.debug_bounds("voice-audio-mode").is_some(),
+        "the applied processing mode must be visible in the active room"
+    );
+    // Leaving the call must clear the diagnostic so a later attempt cannot
+    // show the previous engine's mode.
+    voice.update(&mut *visual, |panel, cx| panel.leave_call(cx));
+    voice.read_with(&*visual, |panel, _| {
+        assert!(panel.applied_audio().is_none());
+    });
 }
 
 #[test]

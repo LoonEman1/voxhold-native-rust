@@ -1,5 +1,7 @@
+mod capture;
 pub mod catalog;
 pub mod controller;
+pub mod dsp;
 mod video;
 pub mod viewer;
 mod voice;
@@ -38,16 +40,61 @@ pub struct Candidate {
     pub username_fragment: Option<String>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct Controls {
     pub muted: bool,
     pub deafened: bool,
     pub input: Option<String>,
     pub output: Option<String>,
     pub bitrate_kbps: Option<u32>,
-    /// Output gain in 0..=2; `None` is unity. Input gain belongs to the DSP
-    /// capture path (R07b), not to this control set.
+    /// Wire enum `noise_mode`: `auto` (APM NS only) or `threshold` (APM NS
+    /// off, software gate on). The engine parses unknown values as `auto`.
+    pub noise_mode: dsp::NoiseMode,
+    /// Bottom bar of the threshold gate, 0..=100 %. Zero bypasses the gate.
+    pub noise_gate_percent: u8,
+    /// Microphone gain, 0..=2 (0..200 %). Applied after the gate and clamped.
+    pub input_gain: f32,
+    /// Output gain in 0..=2; `None` is unity.
     pub output_gain: Option<f64>,
+    /// Echo cancellation is only claimed when a render reference exists. The
+    /// pinned engine exposes none, so the capture path reports `false`.
+    pub echo_cancellation: bool,
+    /// WebRTC APM automatic gain control in the software capture path.
+    pub auto_gain_control: bool,
+}
+
+impl Default for Controls {
+    fn default() -> Self {
+        Self {
+            muted: false,
+            deafened: false,
+            input: None,
+            output: None,
+            bitrate_kbps: None,
+            noise_mode: dsp::NoiseMode::Auto,
+            noise_gate_percent: 15,
+            input_gain: 1.0,
+            output_gain: None,
+            echo_cancellation: true,
+            auto_gain_control: true,
+        }
+    }
+}
+
+impl Controls {
+    /// The DSP snapshot shared with the capture thread. Defaults describe the
+    /// web client: automatic noise suppression, a 15 % bar and unity gain.
+    pub fn audio_params(&self) -> dsp::AudioParams {
+        dsp::AudioParams {
+            mode: self.noise_mode,
+            gate_percent: self.noise_gate_percent,
+            input_gain: self.input_gain,
+            echo_cancellation: self.echo_cancellation,
+            auto_gain_control: self.auto_gain_control,
+            muted: self.muted || self.deafened,
+        }
+        .clamped()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -78,6 +125,12 @@ pub enum Command {
     },
     Ice(Candidate),
     State(Controls),
+    /// Explicit input selection. Kept outside `State` so a later PTT or DSP
+    /// update cannot displace it. `generation` is echoed in `InputApplied`.
+    SelectInput {
+        input: Option<String>,
+        generation: u64,
+    },
     Volume {
         track_id: String,
         gain: f64,
@@ -104,6 +157,22 @@ pub enum Event {
         track_id: Option<String>,
         level: f64,
     },
+    /// Pre-gate software-capture meter. `dropped` counts whole 10 ms blocks
+    /// discarded by the bounded PCM queue or a stalled `NativeAudioSource`.
+    InputLevel {
+        level: f64,
+        muted: bool,
+        dropped: u64,
+    },
+    /// The applied capture path, reported once per session. `capture` is
+    /// `software` for the WinMM 48 kHz path or `platform` for the ADM fallback;
+    /// the latter forces NS/AGC and cannot honour the software toggles.
+    Audio {
+        capture: &'static str,
+        noise_mode: &'static str,
+        echo_cancellation: bool,
+        auto_gain_control: bool,
+    },
     Frame,
     Error {
         message: &'static str,
@@ -111,6 +180,15 @@ pub enum Event {
     /// A device switch failed but the previous, working path is still live.
     DeviceError {
         message: &'static str,
+    },
+    /// The input device actually open after an explicit selection, a fallback
+    /// or a recovery. `generation` is the explicit request id, or zero for an
+    /// engine-initiated change. A late result for an older generation must not
+    /// overwrite a newer selection in the UI.
+    InputApplied {
+        generation: u64,
+        input: Option<String>,
+        error: Option<&'static str>,
     },
     /// Result of a stream-player output switch. `applied` is the device that is
     /// actually open after the attempt, which may be the previous one after a
@@ -152,7 +230,7 @@ impl Events {
             queue.frame_pending = true;
         }
         if queue.items.len() == EVENT_CAPACITY {
-            if matches!(event, Event::Level { .. }) {
+            if matches!(event, Event::Level { .. } | Event::InputLevel { .. }) {
                 return;
             }
             queue.items.clear();
@@ -407,6 +485,74 @@ mod tests {
         assert!(
             !capture.enabled(),
             "the stale State must not reopen a released PTT hold"
+        );
+    }
+
+    #[test]
+    fn only_a_permission_change_advances_the_capture_epoch() {
+        let gate = CaptureGate::default();
+        let epoch = gate.permission_epoch();
+        gate.set_joined(true);
+        gate.set_server_allowed(true);
+        let before = epoch.load(std::sync::atomic::Ordering::SeqCst);
+        gate.set_local(true);
+        gate.set_local(false);
+        assert!(
+            epoch.load(std::sync::atomic::Ordering::SeqCst) >= before + 2,
+            "fast PTT press/release must advance the epoch even when muted returns true"
+        );
+        let after_toggle = epoch.load(std::sync::atomic::Ordering::SeqCst);
+        gate.set_local(false);
+        gate.set_joined(true);
+        gate.set_server_allowed(true);
+        assert_eq!(
+            epoch.load(std::sync::atomic::Ordering::SeqCst),
+            after_toggle,
+            "an unchanged permission must not restart WinMM"
+        );
+        gate.set_local(true);
+        gate.latch();
+        assert!(
+            epoch.load(std::sync::atomic::Ordering::SeqCst) >= after_toggle + 2,
+            "opening and latching the capture must advance the epoch"
+        );
+        let after_latch = epoch.load(std::sync::atomic::Ordering::SeqCst);
+        gate.set_params(crate::dsp::AudioParams {
+            gate_percent: 42,
+            ..crate::dsp::AudioParams::default()
+        });
+        assert_eq!(
+            epoch.load(std::sync::atomic::Ordering::SeqCst),
+            after_latch,
+            "moving DSP sliders must not restart WinMM"
+        );
+    }
+
+    #[test]
+    fn the_dsp_mute_bit_follows_the_permission_flags_not_a_stale_state() {
+        let gate = CaptureGate::default();
+        gate.set_params(crate::dsp::AudioParams::default());
+        assert!(
+            gate.params().lock().unwrap().muted,
+            "an unconfirmed join is silent"
+        );
+        gate.set_joined(true);
+        gate.set_server_allowed(true);
+        gate.set_local(true);
+        gate.set_params(crate::dsp::AudioParams::default());
+        assert!(!gate.params().lock().unwrap().muted);
+        gate.set_params(crate::dsp::AudioParams {
+            muted: true,
+            ..crate::dsp::AudioParams::default()
+        });
+        assert!(
+            !gate.params().lock().unwrap().muted,
+            "a queued State cannot override the live local decision"
+        );
+        gate.set_local(false);
+        assert!(
+            gate.params().lock().unwrap().muted,
+            "PTT release/deafen silences the PCM path immediately"
         );
     }
 

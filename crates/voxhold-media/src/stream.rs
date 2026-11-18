@@ -148,7 +148,12 @@ impl StreamViewer {
                     error: error.map(str::to_owned),
                 })
             }
-            Event::Track { .. } | Event::Level { .. } | Event::DeviceError { .. } => None,
+            Event::Track { .. }
+            | Event::Level { .. }
+            | Event::InputLevel { .. }
+            | Event::Audio { .. }
+            | Event::InputApplied { .. }
+            | Event::DeviceError { .. } => None,
         }
     }
 }

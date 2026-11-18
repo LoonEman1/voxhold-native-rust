@@ -201,6 +201,80 @@ fn explicit_output_selection_is_never_coalesced_into_controls() {
 }
 
 #[test]
+fn explicit_input_selection_outlives_a_later_control_update() {
+    let requests = Requests::default();
+    *requests.input.lock().unwrap() = Some(InputRequest {
+        input: Some("usb".into()),
+        generation: 7,
+    });
+    // The PTT/DSP update arrives after the explicit request but must not
+    // replace it.
+    *requests.controls.lock().unwrap() = Some((
+        Controls {
+            muted: true,
+            ..Controls::default()
+        },
+        false,
+    ));
+    match requests.take() {
+        Some(Pending::Input(request)) => {
+            assert_eq!(request.generation, 7);
+            assert_eq!(request.input.as_deref(), Some("usb"));
+        }
+        _ => panic!("the explicit input request must be drained first"),
+    }
+    assert!(matches!(requests.take(), Some(Pending::Controls(..))));
+}
+
+#[test]
+fn a_newer_explicit_input_replaces_the_pending_one() {
+    let requests = Requests::default();
+    *requests.input.lock().unwrap() = Some(InputRequest {
+        input: Some("first".into()),
+        generation: 1,
+    });
+    *requests.input.lock().unwrap() = Some(InputRequest {
+        input: Some("second".into()),
+        generation: 2,
+    });
+    match requests.take() {
+        Some(Pending::Input(request)) => {
+            assert_eq!(request.generation, 2);
+            assert_eq!(request.input.as_deref(), Some("second"));
+        }
+        _ => panic!("the last explicit selection wins"),
+    }
+}
+
+#[test]
+fn an_older_input_generation_cannot_replace_a_newer_pending_one() {
+    let mut slot = Some(InputRequest {
+        input: Some("newer".into()),
+        generation: 5,
+    });
+    set_input_request(
+        &mut slot,
+        InputRequest {
+            input: Some("older".into()),
+            generation: 4,
+        },
+    );
+    let request = slot
+        .as_ref()
+        .expect("the newer selection must stay pending");
+    assert_eq!(request.generation, 5);
+    assert_eq!(request.input.as_deref(), Some("newer"));
+    set_input_request(
+        &mut slot,
+        InputRequest {
+            input: Some("newest".into()),
+            generation: 6,
+        },
+    );
+    assert_eq!(slot.unwrap().input.as_deref(), Some("newest"));
+}
+
+#[test]
 fn local_mutes_are_bounded() {
     let requests = Requests::default();
     for index in 0..(LOCAL_MUTE_CAPACITY + 20) {

@@ -47,6 +47,16 @@ pub enum Action {
     Closed(&'static str),
 }
 
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct AppliedAudio {
+    /// `software` for the WinMM 48 kHz path or `platform` for ADM fallback.
+    pub capture: &'static str,
+    /// Effective noise mode. Platform fallback always reports `auto`.
+    pub noise_mode: &'static str,
+    pub echo_cancellation: bool,
+    pub auto_gain_control: bool,
+}
+
 pub struct VoiceController {
     pub server_id: i64,
     pub channel_id: i64,
@@ -60,6 +70,14 @@ pub struct VoiceController {
     pub server_muted: bool,
     /// Pre-gate local microphone level of the real capture track.
     pub local_level: f64,
+    /// Once the software capture reports its pre-gate meter, the post-gate
+    /// `MediaSource` level must not overwrite it with a different scale.
+    input_level_seen: bool,
+    /// Whole 10 ms blocks discarded by the bounded PCM queue or the source.
+    pub input_dropped: u64,
+    pub input_muted: bool,
+    /// Last applied capture chain reported by the media engine.
+    pub applied_audio: Option<AppliedAudio>,
     owners: HashMap<String, String>,
     /// Last known mid for every receiver track. Renegotiation replaces the
     /// mid -> owner map; without this link an existing receiver whose
@@ -81,6 +99,10 @@ impl VoiceController {
             self_muted,
             server_muted: false,
             local_level: 0.0,
+            input_level_seen: false,
+            input_dropped: 0,
+            input_muted: true,
+            applied_audio: None,
             owners: HashMap::new(),
             track_mids: HashMap::new(),
             tracks: HashMap::new(),
@@ -99,8 +121,12 @@ impl VoiceController {
         c.muted |= self.server_muted;
         c
     }
-    pub fn update_controls(&mut self, controls: Controls, self_muted: bool) -> Vec<Action> {
+    pub fn update_controls(&mut self, mut controls: Controls, self_muted: bool) -> Vec<Action> {
         let gain_changed = controls.output_gain != self.controls.output_gain;
+        // The input device is owned by the explicit `SelectInput` request. A
+        // generic mute/DSP update that was queued before the user picked a
+        // different device must not revert that choice.
+        controls.input = self.controls.input.clone();
         self.controls = controls;
         self.self_muted = self_muted;
         // Capture stays closed until the server confirmed `voice.joined`; the
@@ -190,7 +216,46 @@ impl VoiceController {
                 track_id: None,
                 level,
             } => {
+                // The post-gate `MediaSource` level is a fallback for the
+                // platform path. The software path already reports its
+                // pre-gate meter, and mixing the two scales makes the room
+                // indicator jump to zero on every speech-to-silence edge.
+                if !self.input_level_seen {
+                    self.local_level = level;
+                }
+                vec![]
+            }
+            Event::InputLevel {
+                level,
+                muted,
+                dropped,
+            } => {
+                // Pre-gate software meter: it must show a quiet background
+                // while the gate transmits nothing.
                 self.local_level = level;
+                self.input_level_seen = true;
+                self.input_muted = muted;
+                self.input_dropped = dropped;
+                vec![]
+            }
+            Event::Audio {
+                capture,
+                noise_mode,
+                echo_cancellation,
+                auto_gain_control,
+            } => {
+                if capture == "platform" {
+                    // The platform path has no InputLevel; let MediaSource level
+                    // drive the meter again instead of freezing the last
+                    // software value.
+                    self.input_level_seen = false;
+                }
+                self.applied_audio = Some(AppliedAudio {
+                    capture,
+                    noise_mode,
+                    echo_cancellation,
+                    auto_gain_control,
+                });
                 vec![]
             }
             Event::State {
@@ -229,6 +294,7 @@ impl VoiceController {
                     )];
                 }
                 self.joined = true;
+                self.input_level_seen = false;
                 self.server_muted = p.server_mute;
                 self.resume_connection_id = Some(p.connection_id);
                 self.participants =
@@ -443,6 +509,154 @@ mod tests {
             actions.first(),
             Some(Action::Media(Command::Offer { .. }))
         ));
+    }
+
+    #[test]
+    fn input_level_reports_the_pre_gate_meter_and_dropped_blocks() {
+        let mut controller = VoiceController::new(1, 2, Controls::default(), false);
+        controller.media_event(Event::InputLevel {
+            level: 0.42,
+            muted: false,
+            dropped: 7,
+        });
+        assert!((controller.local_level - 0.42).abs() < f64::EPSILON);
+        assert!(!controller.input_muted);
+        assert_eq!(controller.input_dropped, 7);
+    }
+
+    #[test]
+    fn input_level_is_not_overwritten_by_the_post_gate_source_level() {
+        let mut controller = VoiceController::new(1, 2, Controls::default(), false);
+        controller.media_event(Event::InputLevel {
+            level: 0.2,
+            muted: false,
+            dropped: 0,
+        });
+        controller.media_event(Event::Level {
+            track_id: None,
+            level: 0.0,
+        });
+        assert!(
+            (controller.local_level - 0.2).abs() < f64::EPSILON,
+            "the pre-gate meter must keep its own scale"
+        );
+        // Without a software meter (platform fallback) the source level is
+        // still a useful fallback.
+        let mut platform = VoiceController::new(1, 2, Controls::default(), false);
+        platform.media_event(Event::Level {
+            track_id: None,
+            level: 0.4,
+        });
+        assert!((platform.local_level - 0.4).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn platform_fallback_restores_the_source_level_meter() {
+        let mut controller = VoiceController::new(1, 2, Controls::default(), false);
+        controller.media_event(Event::InputLevel {
+            level: 0.2,
+            muted: false,
+            dropped: 0,
+        });
+        controller.media_event(Event::Audio {
+            capture: "platform",
+            noise_mode: "auto",
+            echo_cancellation: true,
+            auto_gain_control: true,
+        });
+        controller.media_event(Event::Level {
+            track_id: None,
+            level: 0.4,
+        });
+        assert!((controller.local_level - 0.4).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn applied_audio_carries_the_actual_fallback_mode() {
+        let mut controller = VoiceController::new(1, 2, Controls::default(), false);
+        controller.media_event(Event::Audio {
+            capture: "platform",
+            noise_mode: "auto",
+            echo_cancellation: true,
+            auto_gain_control: true,
+        });
+        let applied = controller.applied_audio.as_ref().unwrap();
+        assert_eq!(applied.capture, "platform");
+        assert_eq!(applied.noise_mode, "auto");
+        assert!(applied.echo_cancellation);
+    }
+
+    #[test]
+    fn controls_to_audio_params_keep_wire_ranges() {
+        let controls = Controls {
+            noise_mode: crate::dsp::NoiseMode::parse("threshold"),
+            noise_gate_percent: 250,
+            input_gain: 9.0,
+            echo_cancellation: false,
+            auto_gain_control: false,
+            muted: false,
+            deafened: true,
+            ..Controls::default()
+        };
+        let params = controls.audio_params();
+        assert_eq!(params.mode, crate::dsp::NoiseMode::Threshold);
+        assert_eq!(params.gate_percent, 100);
+        assert!((params.input_gain - 2.0).abs() < f32::EPSILON);
+        assert!(!params.echo_cancellation);
+        assert!(!params.auto_gain_control);
+        assert!(params.muted, "deafen opens no microphone");
+    }
+
+    #[test]
+    fn state_action_carries_every_dsp_field() {
+        let mut controller = VoiceController::new(1, 2, Controls::default(), false);
+        controller.joined = true;
+        let controls = Controls {
+            noise_mode: crate::dsp::NoiseMode::Threshold,
+            noise_gate_percent: 42,
+            input_gain: 1.25,
+            echo_cancellation: false,
+            auto_gain_control: true,
+            ..Controls::default()
+        };
+        let actions = controller.update_controls(controls, false);
+        let Some(Action::Media(Command::State(state))) = actions.first() else {
+            panic!("expected a State media command: {actions:?}");
+        };
+        assert_eq!(state.noise_mode, crate::dsp::NoiseMode::Threshold);
+        assert_eq!(state.noise_gate_percent, 42);
+        assert!((state.input_gain - 1.25).abs() < f32::EPSILON);
+        assert!(!state.echo_cancellation);
+        assert!(state.auto_gain_control);
+    }
+
+    #[test]
+    fn a_control_update_keeps_the_selected_input_for_the_next_state() {
+        let mut controller = VoiceController::new(
+            1,
+            2,
+            Controls {
+                input: Some("mic".into()),
+                ..Controls::default()
+            },
+            false,
+        );
+        controller.joined = true;
+        // A stale mute/DSP snapshot still carries the previous device.
+        let actions = controller.update_controls(
+            Controls {
+                muted: true,
+                input: Some("stale".into()),
+                ..Controls::default()
+            },
+            false,
+        );
+        assert!(matches!(
+            actions.first(),
+            Some(Action::Media(Command::State(state)))
+                if state.input.as_deref() == Some("mic")
+        ));
+        assert_eq!(controller.controls.input.as_deref(), Some("mic"));
     }
 
     #[test]

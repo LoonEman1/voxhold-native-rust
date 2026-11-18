@@ -108,6 +108,55 @@ fn output_devices() -> Vec<(u32, String)> {
     devices
 }
 
+/// The sink behind the software mixer. A trait so the recovery tests can
+/// inject an open sequence without a Windows device.
+pub(super) trait Sink: Send {
+    fn writable(&self) -> bool;
+    fn write(&mut self, block: &[i16]) -> bool;
+    fn failed(&self) -> bool;
+    /// Whole 10 ms blocks the device still holds (used for the latency report).
+    fn buffered_blocks(&self) -> u16;
+    fn close(&mut self);
+}
+
+/// Opens one sink. The playout keeps the factory so a resume/device switch uses
+/// the same implementation (the unit tests substitute a fake).
+pub(super) type OpenSink = Box<dyn Fn(u32, u32) -> Result<Box<dyn Sink>, String> + Send + Sync>;
+
+pub(super) fn default_open(index: u32, rate: u32) -> Result<Box<dyn Sink>, String> {
+    Ok(Box::new(WinOut::open(index, rate)?))
+}
+
+impl Sink for WinOut {
+    fn writable(&self) -> bool {
+        WinOut::writable(self)
+    }
+
+    fn write(&mut self, block: &[i16]) -> bool {
+        WinOut::write(self, block)
+    }
+
+    fn failed(&self) -> bool {
+        WinOut::failed(self)
+    }
+
+    fn buffered_blocks(&self) -> u16 {
+        (0..BUFFERS)
+            .filter(|index| {
+                self.in_flight[*index] && {
+                    let flags =
+                        unsafe { ptr::read_volatile(&self.headers[*index].flags as *const u32) };
+                    flags & WHDR_DONE == 0
+                }
+            })
+            .count() as u16
+    }
+
+    fn close(&mut self) {
+        WinOut::close(self);
+    }
+}
+
 pub(super) struct WinOut {
     handle: usize,
     buffers: Vec<Box<[i16; crate::mixer::BLOCK_SAMPLES]>>,

@@ -2,27 +2,46 @@
 //!
 //! Windows delivers `WM_POWERBROADCAST` to top-level windows. GPUI has no hook
 //! for it, so the main window is subclassed with `SetWindowSubclass`; the
-//! callback only records the transition, and a foreground timer in the view
-//! applies it. Nothing in the window procedure touches the audio engine, so a
-//! slow media worker cannot block the message loop.
+//! callback only records the transition in a process-wide last-value slot. A
+//! foreground poller, which exists only while a voice call is active, drains it
+//! and applies it through the normal voice path.
 //!
-//! A suspend releases the software playout sink and closes the capture hold; a
-//! resume asks the media worker to reopen the sink and re-check the devices.
+//! The subclass has no heap allocation attached: repeated installs are
+//! idempotent and `WM_NCDESTROY` only removes the subclass. A suspend releases
+//! the software playout sink and closes the capture hold; a resume asks the
+//! media worker to reopen the sink and re-check the devices.
 
 use super::*;
-use std::sync::{Arc, Mutex};
+use std::sync::{Mutex, OnceLock};
 
-/// A queued power transition. `true` is a resume.
-pub(crate) type PowerQueue = Arc<Mutex<Vec<bool>>>;
-
-pub(crate) fn new_queue() -> PowerQueue {
-    Arc::new(Mutex::new(Vec::new()))
+/// Last queued transition: `true` is a resume. One slot is enough; a suspend
+/// followed by a resume before the poll runs must not replay the old suspend.
+fn queue() -> &'static Mutex<Vec<bool>> {
+    static QUEUE: OnceLock<Mutex<Vec<bool>>> = OnceLock::new();
+    QUEUE.get_or_init(|| Mutex::new(Vec::new()))
 }
 
-/// The subclass is removed when the window is destroyed. The boxed queue is
-/// released there too.
+pub(crate) fn clear() {
+    if let Ok(mut queue) = queue().lock() {
+        queue.clear();
+    }
+}
+
+pub(crate) fn take() -> Option<bool> {
+    queue().lock().ok()?.pop()
+}
+
+fn push(resumed: bool) {
+    if let Ok(mut queue) = queue().lock() {
+        queue.clear();
+        queue.push(resumed);
+    }
+}
+
+/// Install the subclass once. It is idempotent: a second call would fail inside
+/// `SetWindowSubclass` for the same id and is ignored.
 #[cfg(windows)]
-pub(crate) fn install(window: &gpui::Window, queue: PowerQueue) {
+pub(crate) fn install(window: &gpui::Window) {
     use raw_window_handle::RawWindowHandle;
     if cfg!(test) {
         return;
@@ -37,14 +56,15 @@ pub(crate) fn install(window: &gpui::Window, queue: PowerQueue) {
     if hwnd.is_null() {
         return;
     }
-    let data = Box::into_raw(Box::new(queue));
+    // Touch the queue so the callback never sees an uninitialised OnceLock.
+    let _ = queue();
     unsafe {
-        let _ = SetWindowSubclass(hwnd, Some(power_proc), SUBCLASS_ID, data as usize);
+        let _ = SetWindowSubclass(hwnd, Some(power_proc), SUBCLASS_ID, 0);
     }
 }
 
 #[cfg(not(windows))]
-pub(crate) fn install(_window: &gpui::Window, _queue: PowerQueue) {}
+pub(crate) fn install(_window: &gpui::Window) {}
 
 #[cfg(windows)]
 const SUBCLASS_ID: usize = 0x5648_5057; // "VHPW"
@@ -59,36 +79,21 @@ const PBT_APMRESUMEAUTOMATIC: usize = 0x0012;
 #[cfg(windows)]
 const WM_NCDESTROY: u32 = 0x0082;
 
+type SubclassProc =
+    unsafe extern "system" fn(*mut core::ffi::c_void, u32, usize, isize, usize, usize) -> isize;
+
 #[cfg(windows)]
 #[link(name = "comctl32")]
 unsafe extern "system" {
     fn SetWindowSubclass(
         hwnd: *mut core::ffi::c_void,
-        proc_: Option<
-            unsafe extern "system" fn(
-                *mut core::ffi::c_void,
-                u32,
-                usize,
-                isize,
-                usize,
-                usize,
-            ) -> isize,
-        >,
+        proc_: Option<SubclassProc>,
         id: usize,
         data: usize,
     ) -> i32;
     fn RemoveWindowSubclass(
         hwnd: *mut core::ffi::c_void,
-        proc_: Option<
-            unsafe extern "system" fn(
-                *mut core::ffi::c_void,
-                u32,
-                usize,
-                isize,
-                usize,
-                usize,
-            ) -> isize,
-        >,
+        proc_: Option<SubclassProc>,
         id: usize,
     ) -> i32;
     fn DefSubclassProc(
@@ -106,75 +111,81 @@ unsafe extern "system" fn power_proc(
     wparam: usize,
     lparam: isize,
     _id: usize,
-    data: usize,
+    _data: usize,
 ) -> isize {
     if msg == WM_POWERBROADCAST {
-        let transition = match wparam {
-            PBT_APMSUSPEND => Some(false),
-            PBT_APMRESUMESUSPEND | PBT_APMRESUMEAUTOMATIC => Some(true),
-            _ => None,
-        };
-        if let Some(resumed) = transition {
-            let queue = &*(data as *const PowerQueue);
-            if let Ok(mut queue) = queue.lock() {
-                // Last-value is enough: a suspend followed by a resume before
-                // the UI polls must not replay an old suspend.
-                queue.clear();
-                queue.push(resumed);
-            }
+        match wparam {
+            PBT_APMSUSPEND => push(false),
+            PBT_APMRESUMESUSPEND | PBT_APMRESUMEAUTOMATIC => push(true),
+            _ => {}
+        }
+        if matches!(
+            wparam,
+            PBT_APMSUSPEND | PBT_APMRESUMESUSPEND | PBT_APMRESUMEAUTOMATIC
+        ) {
             return 0;
         }
     }
     if msg == WM_NCDESTROY {
         unsafe {
             let _ = RemoveWindowSubclass(hwnd, Some(power_proc), SUBCLASS_ID);
-            drop(Box::from_raw(data as *mut PowerQueue));
         }
     }
     unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) }
 }
 
-/// One drained transition. `None` means nothing happened.
-pub(crate) fn take(queue: &PowerQueue) -> Option<bool> {
-    queue.lock().ok()?.pop()
-}
-
 impl Voxhold {
-    /// Subclass the main window and poll the queue on the foreground executor.
-    /// The media work happens in `power_event`, never in the window procedure.
+    /// Install the window hook. The poller is started only when a call becomes
+    /// active (`update_power_poll`), so an idle window has no timer.
     pub(crate) fn install_power(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let queue = new_queue();
-        install(window, queue.clone());
+        let _ = cx;
+        install(window);
+    }
+
+    /// Start or stop the foreground poller after a call starts or ends. This is
+    /// called from the panel's call handler, so every join/leave path reaches
+    /// it, including the room's own button and a server-ended call.
+    pub(super) fn update_power_poll(&mut self, cx: &mut Context<Self>) {
+        let active = self.voice_call_active_for_power(cx);
+        if !active {
+            // Dropping a Task cancels it; no timer remains while idle.
+            self.power_task = None;
+            return;
+        }
+        if self.power_task.is_some() {
+            return;
+        }
+        // Transitions from before the call are stale.
+        clear();
         let executor = cx.background_executor().clone();
-        cx.spawn_in(window, async move |this, cx| loop {
+        self.power_task = Some(cx.spawn(async move |this, cx| loop {
             executor.timer(std::time::Duration::from_millis(250)).await;
             let Some(view) = this.upgrade() else {
                 break;
             };
-            let transition = take(&queue);
-            if view
-                .update_in(cx, |view, window, cx| {
-                    if let Some(resumed) = transition {
-                        view.power_event(resumed, window, cx);
-                    }
-                })
-                .is_err()
-            {
+            let active = view
+                .update(cx, |view, cx| view.voice_call_active_for_power(cx))
+                .unwrap_or(false);
+            if !active {
                 break;
             }
-        })
-        .detach();
+            if let Some(resumed) = take() {
+                view.update(cx, |view, cx| view.power_event(resumed, cx))
+                    .ok();
+            }
+        }));
+    }
+
+    fn voice_call_active_for_power(&self, cx: &Context<Self>) -> bool {
+        self.voice
+            .as_ref()
+            .is_some_and(|panel| panel.read(cx).call_active())
     }
 
     /// Apply one system power transition through the normal voice path: the
     /// panel releases a held key, closes the microphone on suspend and asks the
     /// media worker to reopen the sink on resume.
-    pub(super) fn power_event(
-        &mut self,
-        resumed: bool,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub(super) fn power_event(&mut self, resumed: bool, cx: &mut Context<Self>) {
         if let Some(panel) = &self.voice {
             panel.update(cx, |panel, cx| panel.power(resumed, cx));
         }

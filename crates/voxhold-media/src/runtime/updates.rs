@@ -51,6 +51,10 @@ pub enum VoiceUpdate {
         input: Option<String>,
         error: Option<String>,
     },
+    /// The connection id this client was given on join. The roster can contain
+    /// two connections of the same user, so the server-mute row must be found
+    /// by this id, not by user id.
+    SelfConnection(Option<String>),
     /// The capture chain actually applied by the media engine, including the
     /// platform-ADM fallback and its forced NS/AGC.
     AudioMode(AppliedAudio),
@@ -82,6 +86,7 @@ impl VoiceUpdate {
                     | (Self::Tracks(_), Self::Tracks(_))
                     | (Self::Streams(_), Self::Streams(_))
                     | (Self::InputApplied { .. }, Self::InputApplied { .. })
+                    | (Self::SelfConnection(_), Self::SelfConnection(_))
                     | (Self::AudioMode(_), Self::AudioMode(_))
                     | (Self::Playout(_), Self::Playout(_))
             ),

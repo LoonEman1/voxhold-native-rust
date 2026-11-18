@@ -317,8 +317,9 @@ hot-unplug, физический DPI 125/150 (тесты используют п
 Ветка `codex/w-extensions`, база `609bb8651053e282d0ceeacd8488fd10292b8525`;
 сверены Go `09c82b983d5d842af0627289655b11c37ae56e1d`, frontend
 `ed7cb00ae12398753a8ef48a5a33b864e20cb04c`, backend
-`9b29fdd6d5dc818b7408e4892b8e68b27d123831`. Коммит и push не выполнялись по
-условию задачи; всё ниже — рабочее дерево.
+`9b29fdd6d5dc818b7408e4892b8e68b27d123831`. W02c закоммичен как `b097c0f`;
+правка после FAIL ревью находится в рабочем дереве над этим HEAD без коммита и
+push по условию задачи.
 
 - `crates/voxhold-media/src/mixer.rs` — программный микс шин `voice/system/
   preview`, громкость источника 0–200 % и **отдельный** признак локального
@@ -375,10 +376,10 @@ hot-unplug, физический DPI 125/150 (тесты используют п
   a_per_user_volume_reaches_the_snapshot_and_is_removed_at_one_hundred`,
   `the_playout_report_is_kept_for_the_measured_mixer_line`.
 - Проверено: `cargo fmt --all -- --check`, `cargo test --workspace --locked`
-  (11 API, 118 media с 9 `ignored` аудио-пробами, 344 приложения с 1
+  (11 API, 125 media с 9 `ignored` аудио-пробами, 345 приложения с 1
   `ignored`), `cargo build --release --locked`, `scripts/check-file-sizes.ps1
-  -All` (195 файлов), `git diff --check`, строгий UTF-8/BOM/U+FFFD-детектор по
-  128 отслеживаемым `*.rs`/`*.md`, mojibake-скан, smoke release (процесс жив
+  -All` (203 файла), `git diff --check`, строгий UTF-8/BOM/U+FFFD-детектор по
+  136 отслеживаемым `*.rs`/`*.md`, mojibake-скан, smoke release (процесс жив
   через 5 с).
 
 Не проверено: живое аудио и слышимый микс двух тонов на реальном устройстве,
@@ -387,3 +388,53 @@ hot-unplug, физический DPI 125/150 (тесты используют п
 громкость трансляции (плеер сохраняет отдельный ADM-движок и mute; системная
 шина не входит в микс комнаты). p95 и счётчики получены на синтетических
 блоках и на реальном sink в smoke-прогоне не снимались.
+
+#### W02c · правка после FAIL ревью (рабочее дерево над `b097c0f`)
+
+- `voice/playout.rs`, `voice.rs`: отказ software-sink больше не оставляет
+  `playout=None` навсегда. `OpenAttempts` повторяет открытие с задержкой
+  0,5/1/2/4 с, пятый отказ вызывает `engage_adm_fallback` (ADM включается
+  заново, дорожки возвращаются на mute-путь), есть медленный повтор ADM.
+  Тик `tick_playout` раз в 250 мс не крутится вхолостую; успешное открытие
+  перепривязывает выжившие receiver-дорожки и увеличивает `reconnects`.
+  `resume_playout` после сна и отказ устройства различаются текстом причины.
+  Конструктор sink (`OpenSink`) инъектируется; тест
+  `a_failed_sink_is_retried_after_the_backoff_and_then_restores_audio` проходит
+  два отказа, ждёт backoff и проверяет, что третий sink получает блок.
+- `mixer.rs`, `voice/playout.rs`: `PlayoutStats` теперь содержит
+  `latency_ms` (целые 10-мс блоки в буфере sink), `limited_blocks`,
+  `limiter_releases`, `blocks`, `reconnects` и честный `running`. Release
+  лимитера поднят до 0,02/блок и измерен: 0,49 → 0,99 за 195 блоков
+  (1950 мс). Профиль блока: release p50/p95 1/1 мкс, debug 21/28 мкс на
+  синтетических 400/800 Гц; это CPU-время, не замер устройства.
+- `Tap` в `playout.rs`: пост-лимитерный блок уходит подписчикам с
+  ограниченной очередью, застрявший подписчик удаляется. Хук готов для W07;
+  потребителя в этой задаче нет, поэтому запись не заявляется.
+- `voice_panel/controls.rs`, `settings_voice_view.rs`, `voice_panel/view.rs`,
+  `voice_panel/updates.rs`: `software_mixer()` требует живой `running`, форма и
+  комната скрывают строку микшера и меняют текст при остановке. Server mute
+  берётся из ростера по своему `connection_id` (`VoiceUpdate::SelfConnection`),
+  иконка и PTT подчиняются ему. Слайдер участника имеет id
+  `user-volume-<user_id>`; 18 участников проходят, значение не переезжает при
+  смене состава.
+- `src/app/power.rs`: статический last-value слот вместо `Box` на окно,
+  `WM_NCDESTROY` только снимает подкласс; поллер 250 мс создаётся обработчиком
+  панели только на время звонка и отменяется на leave/Ended.
+- Тесты: `voice::playout::tests::*` (5: retry/backoff/restore, бюджет 5,
+  полный канал источника, last-value громкостей, tap), `mixer::tests::
+  the_limiter_release_profile_is_measured`, `the_mix_block_profile_is_measured`,
+  `hotkey_tests::per_user_sliders_are_keyed_by_user_id_beyond_sixteen_participants`,
+  `a_server_mute_outranks_a_held_push_to_talk_key` (с handle и Connected),
+  `voice_settings_tests::the_playout_report_is_kept_for_the_measured_mixer_line`
+  (running=false). Мутации: `voice_room.rs:339` (`!server_muted`) и
+  `voice_panel.rs:697` (`self.server_muted → false`) обе роняют тест server mute;
+  файлы восстановлены, хеши совпадают с состоянием до мутации.
+- Проверено: fmt; `cargo test --workspace --locked` — 11 API, 125 media
+  (9 `ignored`), 345 приложения (1 `ignored`); release build; размеры
+  (203 отслеживаемых файла); строгий UTF-8/BOM/U+FFFD по 136 отслеживаемым
+  `*.rs`/`*.md`, mojibake-скан; smoke release — процесс жив через 5 с.
+
+Не проверено: живое аудио и слышимый микс, реальный сон/пробуждение,
+hot-unplug, живой backend/браузер, TURN/ICE на втором ПК, DPI 125/150,
+сквозная задержка устройства и запись W07 через `Tap`. `latency_ms` — число
+блоков в буфере sink, а не измеренная задержка; p95 — время микса на CPU.

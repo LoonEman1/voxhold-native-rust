@@ -64,7 +64,7 @@ impl Voxhold {
     /// the form state stays the single source.
     pub(super) fn settings_slider(
         &mut self,
-        id: &'static str,
+        id: &str,
         label: &str,
         value: i64,
         max: i64,
@@ -76,13 +76,15 @@ impl Voxhold {
         let max = max.max(1);
         let value = value.clamp(0, max);
         let ratio = value as f32 / max as f32;
+        let key = id.to_owned();
         let focus = self.focus_id(ElementId::Name(format!("{id}-track").into()), window, cx);
         let focused = focus.is_focused(window);
         // Arrow keys and Home/End reach the row through the dialog ring, so it
         // is a Tab stop like every button.
         self.settings_ring.push((focus.clone(), None));
-        self.settings_slider_focus.push((id, focus.clone()));
-        let cell = self.slider_tracks.entry(id).or_default().clone();
+        self.settings_slider_focus
+            .push((key.clone(), focus.clone()));
+        let cell = self.slider_tracks.entry(key.clone()).or_default().clone();
         let action: std::rc::Rc<dyn Fn(i64) -> SettingsAct> = std::rc::Rc::new(action);
         let paint_cell = cell.clone();
         let canvas = gpui::canvas(
@@ -128,9 +130,13 @@ impl Voxhold {
         let down_cell = cell.clone();
         let down_focus = focus.clone();
         let key_action = action.clone();
+        let debug_row = key.clone();
+        let debug_track = format!("{key}-track");
+        let id_field = key.clone();
+        let id_track = format!("{key}-track");
         div()
-            .id(ElementId::Name(id.into()))
-            .debug_selector(move || id.into())
+            .id(ElementId::Name(id_field.into()))
+            .debug_selector(move || debug_row.clone())
             .w_full()
             .flex()
             .flex_col()
@@ -143,8 +149,8 @@ impl Voxhold {
             )
             .child(
                 div()
-                    .id(ElementId::Name(format!("{id}-track").into()))
-                    .debug_selector(move || format!("{id}-track"))
+                    .id(ElementId::Name(id_track.into()))
+                    .debug_selector(move || debug_track.clone())
                     .w_full()
                     .h(px(ROW_HEIGHT))
                     .rounded(px(6.))

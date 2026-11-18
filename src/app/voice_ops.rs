@@ -204,6 +204,15 @@ impl Voxhold {
                         }
                     });
                 }));
+                let call_view = weak_view.clone();
+                panel.set_call_handler(Box::new(move |cx: &mut gpui::App| {
+                    let weak = call_view.clone();
+                    cx.defer(move |cx| {
+                        if let Some(view) = weak.upgrade() {
+                            view.update(cx, |view, cx| view.update_power_poll(cx));
+                        }
+                    });
+                }));
             });
             self.voice = Some(panel);
         }

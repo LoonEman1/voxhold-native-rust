@@ -105,7 +105,12 @@ impl Session {
                 self.recover_input(events);
                 continue;
             }
-            let resolved = if !input && self.playout.is_some() {
+            let resolved = if !input && self.software_playout_mode() {
+                // The recovery ladder owns a missing sink; the ADM check would
+                // look at a path this session disabled.
+                if self.playout.is_none() {
+                    continue;
+                }
                 // The room sink is a WinMM endpoint, not the ADM index.
                 super::winmm_out::resolve_output(id).is_some()
             } else {

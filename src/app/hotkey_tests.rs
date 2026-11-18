@@ -142,7 +142,7 @@ async fn typing_in_the_composer_blocks_mute_deafen_and_push_to_talk(cx: &mut Tes
         assert!(!panel.test_ptt_held(), "typing must not open push-to-talk");
     });
     // Outside the composer the same combination works.
-    visual.update(|window, app| {
+    visual.update(|_, app| {
         view.update(app, |v, cx| {
             v.channel = 7;
             cx.notify();
@@ -167,36 +167,133 @@ async fn a_server_mute_outranks_a_held_push_to_talk_key(cx: &mut TestAppContext)
     let (mut visual, _view, voice) = super::voice_tests::fixture(cx);
     visual.update(|window, app| {
         voice.update(app, |panel, cx| {
+            panel.test_attach_detached_handle();
             panel.set_push_to_talk(true);
+            panel.test_apply_update(
+                voxhold_media::runtime::VoiceUpdate::SelfConnection(Some("alice".into())),
+                window,
+                cx,
+            );
             panel.activate_push_to_talk(crate::voice_room::Hotkey::parse("Space"));
+            assert!(
+                !panel.test_controls_muted(),
+                "the fixture starts mutable: a held PTT opens the microphone"
+            );
+            // Another connection of the same user is not this client and must
+            // not be mistaken for the authoritative row.
             let me = panel
                 .test_self_participant("alice")
                 .expect("the fixture has the self participant");
             let mut me = me;
             me.server_mute = true;
+            let mut other = me.clone();
+            other.connection_id = "alice-second".into();
+            other.server_mute = false;
             panel.test_apply_update(
-                voxhold_media::runtime::VoiceUpdate::Participants(vec![me]),
+                voxhold_media::runtime::VoiceUpdate::Participants(vec![other, me]),
                 window,
                 cx,
             );
         });
     });
     voice.read_with(&*visual, |panel, _| {
+        assert!(!panel.test_self_muted(), "the local mute is not the cause");
         assert!(
             panel.test_controls_muted(),
             "the microphone stays closed while the server mute is active"
+        );
+        assert!(
+            panel.test_ptt_held(),
+            "the hold is kept, so only the server-mute flag can silence it"
         );
     });
 }
 
 #[gpui::test]
+async fn per_user_sliders_are_keyed_by_user_id_beyond_sixteen_participants(
+    cx: &mut TestAppContext,
+) {
+    use voxhold_media::controller::Participant;
+    let (visual, view, voice) = super::voice_tests::fixture(cx);
+    let roster = |range: std::ops::RangeInclusive<i64>| {
+        range
+            .map(|user| Participant {
+                connection_id: format!("conn-{user}"),
+                user_id: user,
+                server_id: 1,
+                channel_id: 7,
+                ..Participant::default()
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut after = roster(2..=17);
+    after.extend(roster(19..=19));
+    visual.update(|window, app| {
+        voice.update(app, |panel, cx| {
+            panel.test_apply_update(
+                voxhold_media::runtime::VoiceUpdate::Participants(roster(1..=18)),
+                window,
+                cx,
+            );
+        });
+    });
+    voice.read_with(&*visual, |panel, _| {
+        let rows = panel.call_participants();
+        assert_eq!(
+            rows.len(),
+            18,
+            "the list is not truncated at the old sixteen-slot cap"
+        );
+        assert!(rows.iter().any(|(user, _)| *user == 18));
+    });
+    visual.update(|_, app| {
+        view.update(app, |v, cx| {
+            assert!(
+                v.voice_settings_action(personal_settings::Action::SetVoiceUserVolume(18, 150), cx)
+            );
+        });
+    });
+    // The value is keyed by the user, so a roster change cannot move it to a
+    // neighbour row.
+    visual.update(|window, app| {
+        voice.update(app, |panel, cx| {
+            panel.test_apply_update(
+                voxhold_media::runtime::VoiceUpdate::Participants(after.clone()),
+                window,
+                cx,
+            );
+        });
+    });
+    voice.read_with(&*visual, |panel, _| {
+        assert_eq!(panel.user_volume(18), 150, "user 18 keeps its own value");
+        assert_eq!(
+            panel.user_volume(19),
+            100,
+            "the new participant does not inherit a neighbour's value"
+        );
+        assert!(
+            !panel
+                .call_participants()
+                .iter()
+                .any(|(user, _)| *user == 18),
+            "the departed user has no row"
+        );
+    });
+    assert_eq!(
+        super::settings_voice_view::user_volume_slider_id(18),
+        "user-volume-18",
+        "the slider id is the stable user id, not a slot index"
+    );
+}
+
+#[gpui::test]
 async fn suspend_closes_the_microphone_and_resume_reopens_the_median_path(cx: &mut TestAppContext) {
     let (mut visual, view, voice) = super::voice_tests::fixture(cx);
-    visual.update(|window, app| {
+    visual.update(|_, app| {
         voice.update(app, |panel, _| panel.test_attach_detached_handle());
-        view.update(app, |v, cx| v.power_event(false, window, cx));
+        view.update(app, |v, cx| v.power_event(false, cx));
     });
-    visual.update(|window, app| {
+    visual.update(|_, app| {
         voice.update(app, |panel, _| {
             assert!(panel.test_power_paused());
             assert!(panel.test_controls_muted(), "a suspended system is silent");
@@ -206,9 +303,7 @@ async fn suspend_closes_the_microphone_and_resume_reopens_the_median_path(cx: &m
                 "the suspend reaches the real media request slot"
             );
         });
-        view.update(app, |v, cx| {
-            v.power_event(true, window, cx);
-        });
+        view.update(app, |v, cx| v.power_event(true, cx));
     });
     visual.update(|_, app| {
         voice.update(app, |panel, _| {

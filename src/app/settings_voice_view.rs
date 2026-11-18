@@ -19,27 +19,11 @@ use gpui::ElementId;
 /// when the dialog is resized.
 const METER_WIDTH: f32 = 220.0;
 
-/// Fixed ids for the per-participant volume rows. The slider API keys its
-/// measured track by a static id, and a room rarely has more than sixteen
-/// speakers; the row order follows the confirmed roster.
-const USER_VOLUME_SLOTS: [&str; 16] = [
-    "user-volume-0",
-    "user-volume-1",
-    "user-volume-2",
-    "user-volume-3",
-    "user-volume-4",
-    "user-volume-5",
-    "user-volume-6",
-    "user-volume-7",
-    "user-volume-8",
-    "user-volume-9",
-    "user-volume-10",
-    "user-volume-11",
-    "user-volume-12",
-    "user-volume-13",
-    "user-volume-14",
-    "user-volume-15",
-];
+/// Slider id for one participant. It is the stable user id, not the row index,
+/// so a roster change cannot move a value to a neighbour.
+pub(super) fn user_volume_slider_id(user: i64) -> String {
+    format!("user-volume-{user}")
+}
 
 impl Voxhold {
     pub(super) fn voice_body(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
@@ -66,7 +50,16 @@ impl Voxhold {
         #[cfg(not(feature = "voxhold-media"))]
         let applied: Option<(&'static str, &'static str, bool, bool, bool)> = None;
         let capabilities = capabilities_for(applied.map(|(capture, ..)| capture));
-        let software_mixer = applied.is_some_and(|(_, _, _, _, mixer)| mixer);
+        // A stale applied snapshot must not keep promising a mixer that stopped:
+        // the panel combines it with the live playout report.
+        let mixer_was_software = applied.is_some_and(|(_, _, _, _, mixer)| mixer);
+        #[cfg(feature = "voxhold-media")]
+        let software_mixer = self
+            .voice
+            .as_ref()
+            .is_some_and(|panel| panel.read(cx).software_mixer());
+        #[cfg(not(feature = "voxhold-media"))]
+        let software_mixer = false;
         #[cfg(feature = "voxhold-media")]
         let mixer_stats = self
             .voice
@@ -75,11 +68,15 @@ impl Voxhold {
             .filter(|stats| stats.running)
             .map(|stats| {
                 format!(
-                    "Микшер после общего микса: уровень {:.0} % · p95 {} мкс · underrun {} · drop {}",
+                    "Микшер после общего микса: уровень {:.0} % · p95 {} мкс · underrun {} · drop {} · ограничено {} · release {} · переподключений {} · буфер {} мс",
                     f64::from(stats.level) * 100.0,
                     stats.p95_micros,
                     stats.underruns,
-                    stats.dropped
+                    stats.dropped,
+                    stats.limited_blocks,
+                    stats.limiter_releases,
+                    stats.reconnects,
+                    stats.latency_ms
                 )
             });
         #[cfg(not(feature = "voxhold-media"))]
@@ -238,30 +235,37 @@ impl Voxhold {
                 })
                 .unwrap_or_default();
             if !rows.is_empty() {
-                root = root
-                    .child(self.form_text(
-                        if software_mixer {
-                            "Громкость участника 0–200 % применяется программным микшером комнаты; локальный mute — отдельный признак."
-                        } else {
-                            "Программный микшер не открылся: усиление участников не применяется, доступен только mute."
-                        },
-                        !software_mixer,
-                    ))
-                    .child(self.form_text(
-                        "Уровень после микса измеряется в микшере; значения p95 и underrun видны в комнате.",
+                if software_mixer {
+                    root = root.child(self.form_text(
+                        "Громкость участника 0–200 % применяется программным микшером комнаты; локальный mute — отдельный признак.",
                         false,
                     ));
+                } else if mixer_was_software {
+                    root = root.child(self.form_text(
+                        "Микшер остановлен или перезапускается: усиление участников сейчас не применяется, работает только mute.",
+                        true,
+                    ));
+                } else {
+                    root = root.child(self.form_text(
+                        "Программный микшер не открылся: усиление участников не применяется, доступен только mute.",
+                        true,
+                    ));
+                }
+                root = root.child(self.form_text(
+                    "Уровень после микса измеряется в микшере; значения p95 и underrun видны в комнате.",
+                    false,
+                ));
                 if let Some(stats) = &mixer_stats {
                     root = root.child(self.form_text(stats, false));
                 }
-                for (slot, (user, name, volume)) in rows.into_iter().enumerate() {
-                    let Some(id) = USER_VOLUME_SLOTS.get(slot) else {
-                        break;
-                    };
+                for (user, name, volume) in rows {
+                    // The id is the stable user id, not a row index: a roster
+                    // change during a drag cannot move the value to a neighbour.
+                    let id = user_volume_slider_id(user);
                     root = root
                         .child(self.form_text(&name, false))
                         .child(self.settings_slider(
-                            id,
+                            &id,
                             "Громкость участника",
                             volume,
                             200,

@@ -871,6 +871,9 @@ async fn run_session(
                 }
                 live.updates
                     .push(VoiceUpdate::Participants(controller.participants.clone()));
+                live.updates.push(VoiceUpdate::SelfConnection(
+                    controller.resume_connection_id.clone(),
+                ));
                 live.updates
                     .push(VoiceUpdate::Speaking(controller.speaking.clone()));
                 live.updates

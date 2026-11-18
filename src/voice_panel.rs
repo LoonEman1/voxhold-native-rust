@@ -82,6 +82,9 @@ pub struct VoicePanel {
     /// Server-authoritative mute of this user. It outranks the local toggle:
     /// the microphone stays closed even while a PTT key is held.
     server_muted: bool,
+    /// The connection id this client was given on join. The roster may contain
+    /// two connections of the same user, so server mute is found by this id.
+    self_connection: Option<String>,
     /// Per-user output volume by stable user id (0–200 %). Persisted with the
     /// voice preferences, applied by the media mixer through track owners.
     user_volumes: std::collections::BTreeMap<i64, i64>,
@@ -154,6 +157,9 @@ pub struct VoicePanel {
     /// mounted, but the dock-only case and the sidebar rings need an explicit
     /// wake-up.
     speaking_handler: Option<Box<dyn Fn(&mut gpui::App)>>,
+    /// Called after the call starts or ends. The parent uses it to start/stop
+    /// the power poller so an idle window has no timer.
+    call_handler: Option<Box<dyn Fn(&mut gpui::App)>>,
     palette: Palette,
 }
 
@@ -208,6 +214,7 @@ impl VoicePanel {
             applied_audio: None,
             self_muted: false,
             server_muted: false,
+            self_connection: None,
             user_volumes: std::collections::BTreeMap::new(),
             playout: None,
             power_paused: false,
@@ -261,6 +268,7 @@ impl VoicePanel {
             recordings_handler: None,
             recordings_live: None,
             speaking_handler: None,
+            call_handler: None,
             palette: crate::theme::dark_palette(),
         }
     }
@@ -284,6 +292,18 @@ impl VoicePanel {
         self.speaking_handler = Some(handler);
     }
 
+    pub fn set_call_handler(&mut self, handler: Box<dyn Fn(&mut gpui::App)>) {
+        self.call_handler = Some(handler);
+    }
+
+    /// Tell the parent that the call started or ended. The handler defers its
+    /// own update, so the parent is never mutably borrowed twice.
+    fn notify_call_changed(&mut self, cx: &mut Context<Self>) {
+        if let Some(handler) = &self.call_handler {
+            handler(cx);
+        }
+    }
+
     /// Replace the detected speech set. Returns whether anything changed; the
     /// parent is woken only for a real change.
     fn set_speaking(&mut self, speaking: HashMap<String, bool>, cx: &mut gpui::App) -> bool {
@@ -299,6 +319,26 @@ impl VoicePanel {
 
     fn clear_speaking(&mut self, cx: &mut gpui::App) {
         self.set_speaking(HashMap::new(), cx);
+    }
+
+    /// Server mute is read from the roster row of *this* connection. A second
+    /// connection of the same user must not mute or unmute this client.
+    fn refresh_server_mute(&mut self) {
+        let Some(connection) = self.self_connection.as_deref() else {
+            return;
+        };
+        let Some(mute) = self
+            .participants
+            .iter()
+            .find(|participant| participant.connection_id == connection)
+            .map(|participant| participant.server_mute)
+        else {
+            return;
+        };
+        if self.server_muted != mute {
+            self.server_muted = mute;
+            self.refresh_capture();
+        }
     }
 
     pub fn set_recordings_live(&mut self, live: std::rc::Rc<std::cell::RefCell<Option<String>>>) {
@@ -501,6 +541,7 @@ impl VoicePanel {
                 self.local_mutes.clear();
                 self.close_player();
                 self.refresh_capture();
+                self.notify_call_changed(cx);
             }
             Err(error) => self.error = error,
         }
@@ -531,6 +572,7 @@ impl VoicePanel {
         self.ptt_combo = None;
         self.applied_audio = None;
         self.server_muted = false;
+        self.self_connection = None;
         self.playout = None;
         self.power_paused = false;
         // The next join starts with a closed microphone until the server
@@ -542,6 +584,7 @@ impl VoicePanel {
         self.local_mutes.clear();
         self.streams.clear();
         self.local_level = 0.0;
+        self.notify_call_changed(cx);
         cx.notify();
     }
 

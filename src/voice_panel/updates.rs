@@ -41,26 +41,18 @@ impl VoicePanel {
             }
             VoiceUpdate::Participants(participants) => {
                 self.participants = participants;
-                // The roster row for this user carries the server-authoritative
-                // mute. It outranks the local toggle and a held PTT key.
-                let self_user = self.self_user_id;
-                if self_user != 0 {
-                    if let Some(me) = self
-                        .participants
-                        .iter()
-                        .find(|participant| participant.user_id == self_user)
-                    {
-                        if self.server_muted != me.server_mute {
-                            self.server_muted = me.server_mute;
-                            self.refresh_capture();
-                        }
-                    }
-                }
+                self.refresh_server_mute();
                 self.local_mutes.retain(|connection| {
                     self.participants
                         .iter()
                         .any(|participant| &participant.connection_id == connection)
                 });
+            }
+            VoiceUpdate::SelfConnection(connection) => {
+                if self.self_connection != connection {
+                    self.self_connection = connection;
+                    self.refresh_server_mute();
+                }
             }
             VoiceUpdate::Speaking(speaking) => {
                 repaint = self.set_speaking(speaking, cx);
@@ -146,6 +138,7 @@ impl VoicePanel {
                 self.handle.take();
                 self.applied_audio = None;
                 self.server_muted = false;
+                self.self_connection = None;
                 self.playout = None;
                 self.controls.muted = true;
                 self.ptt_held = false;
@@ -163,6 +156,7 @@ impl VoicePanel {
                 self.clear_speaking(cx);
                 self.tracks.clear();
                 self.streams.clear();
+                self.notify_call_changed(cx);
             }
         }
         repaint

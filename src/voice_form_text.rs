@@ -63,14 +63,15 @@ pub fn noise_gate_note(support: Support) -> &'static str {
     }
 }
 
-/// Capability note for the room output volume. The controller applies it to
-/// every participant track in both capture paths; per-participant volumes, the
-/// limiter and the voice/system/preview mix are W02c.
+/// Capability note for the room output volume. The software mixer applies the
+/// per-participant percentage and the limiter; the ADM fallback has no numeric
+/// gain, so only mute is real there.
 pub const OUTPUT_GAIN_NOTE: &str =
-    "0 % закрывает дорожки участников, 1–200 % масштабирует их громкость";
+    "0 % закрывает дорожки участников; 1–200 % участника применяет программный микшер комнаты";
 
-/// Sentence under the output-volume slider.
-pub const OUTPUT_VOLUME_NOTE: &str = "Общая громкость воспроизведения применяется к дорожкам участников. Раздельные громкости участников, лимитер и микширование voice/system/preview — W02c.";
+/// Sentence under the output-volume slider. The honest fallback is part of the
+/// same sentence: an ADM path cannot apply the percentage.
+pub const OUTPUT_VOLUME_NOTE: &str = "Общая громкость применяется к дорожкам участников. Громкость каждого участника 0–200 % и лимитер применяет программный микшер комнаты; при недоступном микшере остаётся системный ADM, где действует только mute, а численное усиление участников не применяется.";
 
 /// Description of the AGC switch. The ADM's own AGC cannot be toggled from
 /// here and was not measured.
@@ -107,7 +108,18 @@ mod tests {
         assert!(!OUTPUT_VOLUME_NOTE.contains("не масштабирует"));
         assert!(OUTPUT_GAIN_NOTE.contains("1–200 %"));
         assert!(OUTPUT_VOLUME_NOTE.contains("дорожкам участников"));
-        assert!(OUTPUT_VOLUME_NOTE.contains("W02c"));
+        assert!(
+            OUTPUT_VOLUME_NOTE.contains("программный микшер"),
+            "the implemented path is named, not a future stage"
+        );
+        assert!(
+            !OUTPUT_VOLUME_NOTE.contains("W02c"),
+            "the text must not describe the implemented mixer as future work"
+        );
+        assert!(
+            OUTPUT_VOLUME_NOTE.contains("только mute"),
+            "the ADM fallback is described honestly"
+        );
     }
 
     #[test]

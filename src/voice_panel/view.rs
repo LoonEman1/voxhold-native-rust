@@ -530,15 +530,22 @@ impl VoicePanel {
                         .child(label),
                 );
             }
-            if let Some(stats) = self.playout.filter(|_| self.software_mixer()) {
+            if let Some(stats) = self
+                .playout
+                .filter(|stats| stats.running && self.software_mixer())
+            {
                 // Measured post-mix level and the real block-time percentile;
                 // the ADM fallback path has no such numbers and shows nothing.
                 let label = format!(
-                    "Микшер · {:.0}% · p95 {} мкс · underrun {} · drop {}",
+                    "Микшер · {:.0}% · p95 {} мкс · under {} · drop {} · огр. {} · release {} · recon {} · {} мс",
                     f64::from(stats.level) * 100.0,
                     stats.p95_micros,
                     stats.underruns,
-                    stats.dropped
+                    stats.dropped,
+                    stats.limited_blocks,
+                    stats.limiter_releases,
+                    stats.reconnects,
+                    stats.latency_ms
                 );
                 body = body.child(
                     div()

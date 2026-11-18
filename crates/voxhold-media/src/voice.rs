@@ -40,7 +40,7 @@ use input::normalize_input;
 mod platform;
 use platform::PlatformAudio;
 mod playout;
-use playout::Playout;
+use playout::{OpenAttempts, Playout, PlayoutMode};
 #[cfg(test)]
 mod loopback;
 mod winmm_out;
@@ -107,6 +107,7 @@ pub async fn run(
             }
             _ = stats.tick(), if session.is_some() => {
                 if let Some(session) = &mut session {
+                    session.tick_playout(&events);
                     session.check_devices(&events);
                     session.sample_levels(&events).await;
                 }
@@ -139,6 +140,18 @@ struct Session {
     /// suspend has released the sink, so resume reopens it instead of silently
     /// falling back to an ADM path that was never started.
     software_playout: bool,
+    /// Current playout path. `AdmFallback` means the mixer budget was spent.
+    playout_mode: PlayoutMode,
+    /// Reopen schedule of the software sink (bounded backoff).
+    playout_attempts: OpenAttempts,
+    /// Slow retry of the ADM path after a fallback that could not start.
+    adm_attempts: OpenAttempts,
+    /// Suspend released the sink; only an explicit resume reopens it.
+    playout_suspended: bool,
+    /// Successful software-sink reopens in this session.
+    playout_reconnects: u32,
+    /// Sink factory; tests substitute a fake without a Windows device.
+    playout_open: Arc<winmm_out::OpenSink>,
     /// Source tasks of the software playout; they end with the track and are
     /// aborted when the session drops.
     playout_tasks: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
@@ -210,12 +223,15 @@ impl Session {
         // silently degrade the call to silence.
         let mut playout = None;
         let mut software_playout = false;
+        let mut playout_mode = PlayoutMode::AdmFallback;
+        let playout_open: Arc<winmm_out::OpenSink> = Arc::new(Box::new(winmm_out::default_open));
         if room_session {
-            match Playout::start(controls.output.as_deref()) {
+            match Playout::start_with(controls.output.as_deref(), playout_open.clone()) {
                 Ok(started) => {
                     audio.set_playout(false);
                     playout = Some(started);
                     software_playout = true;
+                    playout_mode = PlayoutMode::Software;
                 }
                 Err(_) => events.push(Event::DeviceError {
                     message: "Программный микшер не открылся: громкость участников не применяется, звук идёт напрямую.",
@@ -485,9 +501,15 @@ impl Session {
             sources: HashMap::new(),
             playout,
             software_playout,
+            playout_mode,
+            playout_attempts: OpenAttempts::default(),
+            adm_attempts: OpenAttempts::default(),
+            playout_suspended: false,
+            playout_reconnects: 0,
+            playout_open,
             playout_tasks,
             runtime: tokio::runtime::Handle::current(),
-            last_playout_report: std::time::Instant::now(),
+            last_playout_report: std::time::Instant::now() - Duration::from_secs(1),
             speaking: HashMap::new(),
             local_speaking: false,
             remote_sdp: None,
@@ -600,7 +622,7 @@ impl Session {
                 Ok(())
             }
             Command::Suspend => {
-                self.suspend_playout();
+                self.suspend_playout(events);
                 Ok(())
             }
             Command::Start { .. } | Command::ViewStart { .. } | Command::Stop => unreachable!(),
@@ -899,24 +921,6 @@ impl Session {
                 track_id: None,
                 level: if speaking { local_level } else { 0.0 },
             });
-        }
-        // Publish the measured post-mix level and the playout counters once a
-        // second. They come from the real sink, not from a synthetic estimate.
-        if self.playout.is_some() && self.last_playout_report.elapsed() >= Duration::from_secs(1) {
-            self.last_playout_report = std::time::Instant::now();
-            if let Some(stats) = self.playout.as_ref().map(Playout::stats) {
-                if !stats.running && self.software_playout {
-                    // The sink thread ended (device removed or a driver
-                    // reset). Report and try once to reopen it; the failure
-                    // path leaves the call alive without room audio.
-                    events.push(Event::DeviceError {
-                        message: "Воспроизведение комнаты остановилось, перезапускаем.",
-                    });
-                    self.resume_playout(events);
-                } else {
-                    events.push(Event::Playout(stats));
-                }
-            }
         }
     }
 }

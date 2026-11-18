@@ -248,10 +248,10 @@ pub(crate) struct Voxhold {
     settings_ring: Vec<(FocusHandle, Option<SettingsAct>)>,
     /// Slider focus handles rebuilt on every settings paint, so Tab reaches a
     /// slider and the tests can drive its keys.
-    settings_slider_focus: Vec<(&'static str, FocusHandle)>,
+    settings_slider_focus: Vec<(String, FocusHandle)>,
     /// Measured track boxes of the settings sliders, keyed by slider id.
     slider_tracks: std::collections::HashMap<
-        &'static str,
+        String,
         std::rc::Rc<std::cell::Cell<settings_slider::SliderTrack>>,
     >,
     slider_drag: Option<settings_slider::SliderDrag>,
@@ -276,6 +276,10 @@ pub(crate) struct Voxhold {
     show_servers: bool,
     #[cfg(feature = "voxhold-media")]
     voice: Option<Entity<voice_panel::VoicePanel>>,
+    /// Power poller; it exists only while a call is active. Dropping the task
+    /// cancels the 250 ms timer.
+    #[cfg(feature = "voxhold-media")]
+    power_task: Option<gpui::Task<()>>,
     /// Channel shown in the room pane; independent from the call channel.
     #[cfg(feature = "voxhold-media")]
     voice_room: i64,
@@ -571,6 +575,8 @@ impl Voxhold {
             show_servers: false,
             #[cfg(feature = "voxhold-media")]
             voice: None,
+            #[cfg(feature = "voxhold-media")]
+            power_task: None,
             #[cfg(feature = "voxhold-media")]
             voice_room: 0,
             #[cfg(feature = "voxhold-media")]

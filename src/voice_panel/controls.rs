@@ -122,12 +122,14 @@ impl VoicePanel {
         self.playout
     }
 
-    /// Whether the numeric participant gain is applied by the software mixer.
-    /// The settings tab uses this to avoid promising gain on the ADM fallback.
+    /// Whether the numeric participant gain is applied by the software mixer
+    /// right now. The applied capture snapshot alone is not enough: the sink can
+    /// stop after it was reported, so the live playout report must agree.
     pub fn software_mixer(&self) -> bool {
         self.applied_audio
             .as_ref()
             .is_some_and(|audio| audio.software_mixer)
+            && self.playout.as_ref().is_none_or(|stats| stats.running)
     }
 
     /// System suspend/resume. A suspend releases the hold so a suspended

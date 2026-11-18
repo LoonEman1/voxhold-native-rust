@@ -108,6 +108,7 @@ async fn the_playout_report_is_kept_for_the_measured_mixer_line(cx: &mut TestApp
                     dropped: 1,
                     p95_micros: 120,
                     running: true,
+                    ..Default::default()
                 }),
                 window,
                 cx,
@@ -117,8 +118,31 @@ async fn the_playout_report_is_kept_for_the_measured_mixer_line(cx: &mut TestApp
             assert_eq!(stats.underruns, 3);
             assert!(
                 panel.software_mixer(),
-                "the fixture applies the software mixer"
+                "a live mixer report and the applied snapshot agree"
             );
+            // A dead sink must stop the claim even though the start snapshot
+            // still says software_mixer.
+            panel.test_apply_update(
+                VoiceUpdate::Playout(voxhold_media::mixer::PlayoutStats {
+                    running: false,
+                    ..stats
+                }),
+                window,
+                cx,
+            );
+            assert!(
+                !panel.software_mixer(),
+                "the UI must not claim a mixer that is not running"
+            );
+            panel.test_apply_update(
+                VoiceUpdate::Playout(voxhold_media::mixer::PlayoutStats {
+                    running: true,
+                    ..stats
+                }),
+                window,
+                cx,
+            );
+            assert!(panel.software_mixer(), "a recovered sink is claimed again");
         });
     });
 }

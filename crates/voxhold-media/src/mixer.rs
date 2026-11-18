@@ -23,8 +23,10 @@ const STARVE_BLOCKS: u64 = 5;
 /// wraps on a hot mix.
 pub const LIMIT_CEILING: f64 = 0.98;
 /// Release of the limiter gain towards unity, applied once per quiet block.
-/// One hot block must not recover its gain inside the same 10 ms.
-const LIMIT_RELEASE: f64 = 0.002;
+/// 2 % per 10 ms block: a gain of 0.49 recovers to 99 % in about 195 blocks
+/// (about 2 s), which the unit test measures instead of leaving it
+/// undocumented.
+const LIMIT_RELEASE: f64 = 0.02;
 /// Rolling window for the block-time percentiles (about 5 s at 10 ms blocks).
 const LATENCY_WINDOW: usize = 512;
 /// The room meter uses the same display scale as the WinMM preview (Go
@@ -183,10 +185,9 @@ impl SourcePool {
     }
 }
 
-/// Peak limiter with an instant attack and a slow per-sample release. The
-/// attack is per block (one gain for the whole block) so a transient cannot
-/// clip the i16 conversion; the release keeps the following blocks from
-/// staying ducked.
+/// Peak limiter with an instant attack and a per-block release. The attack is
+/// per block (one gain for the whole block) so a transient cannot clip the i16
+/// conversion; the release is applied once per block that is no longer limited.
 #[derive(Debug)]
 pub struct Limiter {
     gain: f64,
@@ -194,15 +195,18 @@ pub struct Limiter {
 
 impl Default for Limiter {
     fn default() -> Self {
-        Self { gain: 1.0 }
+        Self::new()
     }
 }
 
 impl Limiter {
-    /// Scale one f64 block in place; returns whether the block was limited.
-    /// The attack is per block, so one gain applies to every sample and no
-    /// sample inside the block can exceed the ceiling.
-    pub fn process(&mut self, block: &mut [f64]) -> bool {
+    pub fn new() -> Self {
+        Self { gain: 1.0 }
+    }
+
+    /// Scale one f64 block in place. Returns whether the block was limited and
+    /// whether it released gain towards unity (for the published counters).
+    pub fn process(&mut self, block: &mut [f64]) -> (bool, bool) {
         let peak = block
             .iter()
             .fold(0.0_f64, |peak, value| peak.max(value.abs()));
@@ -217,10 +221,12 @@ impl Limiter {
         for value in block.iter_mut() {
             *value *= self.gain;
         }
+        let mut released = false;
         if !limited && self.gain < 1.0 {
             self.gain = (self.gain + (1.0 - self.gain) * LIMIT_RELEASE).min(1.0);
+            released = true;
         }
-        limited
+        (limited, released)
     }
 
     #[cfg(test)]
@@ -305,17 +311,32 @@ impl MixStats {
     }
 }
 
-/// A snapshot of the playout path for the UI and the report. `p95_micros` is
-/// the measured CPU time of one mix block, not the device latency.
+/// A snapshot of the playout path for the UI and the report.
+///
+/// Provenance: `p95_micros`/`blocks`/`limiter_releases` are measured by the
+/// mixer thread on the host CPU; `underruns`/`dropped` are counted by the
+/// bounded queues; `latency_ms` is the number of whole 10 ms blocks the device
+/// still holds (`buffered_blocks * 10`), not a wall-clock measurement. The
+/// unit tests exercise the mix on synthetic blocks; nothing here is a
+/// measurement of a physical output device.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct PlayoutStats {
     pub level: f32,
     pub peak: f32,
     pub underruns: u64,
     pub dropped: u64,
+    /// Measured mix time per block: nearest-rank p95 of the rolling window.
     pub p95_micros: u32,
-    /// The software sink is open. `false` means the room is played by the
-    /// platform ADM and the numeric gain is not applied.
+    /// Whole 10 ms blocks currently queued in the device sink.
+    pub latency_ms: u16,
+    /// Blocks the limiter reduced, and blocks where it released gain.
+    pub limited_blocks: u64,
+    pub limiter_releases: u64,
+    pub blocks: u64,
+    /// Successful software-sink reopens in this session (resume/recovery).
+    pub reconnects: u32,
+    /// The software sink is open. `false` means the room is on the platform
+    /// ADM (or has no live path) and the numeric gain is not applied.
     pub running: bool,
 }
 
@@ -330,6 +351,7 @@ pub struct Mixer {
     level: f64,
     peak: f64,
     limited_blocks: u64,
+    limiter_releases: u64,
 }
 
 impl Default for Mixer {
@@ -344,6 +366,7 @@ impl Default for Mixer {
             level: 0.0,
             peak: 0.0,
             limited_blocks: 0,
+            limiter_releases: 0,
         }
     }
 }
@@ -415,9 +438,12 @@ impl Mixer {
         for value in mix.iter_mut() {
             *value *= bus_gain;
         }
-        let limited = self.limiter.process(mix);
+        let (limited, released) = self.limiter.process(mix);
         if limited {
             self.limited_blocks += 1;
+        }
+        if released {
+            self.limiter_releases += 1;
         }
         let peak = mix
             .iter()
@@ -456,6 +482,10 @@ impl Mixer {
 
     pub fn limited_blocks(&self) -> u64 {
         self.limited_blocks
+    }
+
+    pub fn limiter_releases(&self) -> u64 {
+        self.limiter_releases
     }
 
     pub fn stats(&self) -> &MixStats {
@@ -756,5 +786,68 @@ mod tests {
             pool.ensure(&format!("source-{index}"));
         }
         assert_eq!(pool.len(), 64);
+    }
+
+    /// The release parameter is a documented profile, not an unexplained
+    /// constant: measure how long a deep duck takes to recover to 99 %.
+    #[test]
+    fn the_limiter_release_profile_is_measured() {
+        let mut limiter = Limiter::new();
+        let mut hot = vec![2.0_f64; BLOCK_SAMPLES];
+        assert!(limiter.process(&mut hot).0, "2.0 hits the ceiling");
+        let start = limiter.gain();
+        let mut blocks = 0_u32;
+        while limiter.gain() < 0.99 && blocks < 10_000 {
+            let mut quiet = vec![0.0_f64; BLOCK_SAMPLES];
+            let (limited, released) = limiter.process(&mut quiet);
+            assert!(!limited);
+            assert!(released);
+            blocks += 1;
+        }
+        let millis = blocks * 10;
+        println!(
+            "limiter release {start:.3} -> {:.3}: {blocks} blocks / {millis} ms",
+            limiter.gain()
+        );
+        assert!(
+            (1_800..=2_200).contains(&millis),
+            "release profile is {millis} ms, expected about 2 s"
+        );
+        // The same profile must hold for every block after the first release.
+        assert!(limiter.gain() >= 0.99);
+    }
+
+    /// Publish the actual block-time profile of this host. It is the number the
+    /// journal cites; it is not a measurement of a physical sink.
+    #[test]
+    fn the_mix_block_profile_is_measured() {
+        let a = tone(400.0, 8192.0, 0.0, BLOCK_SAMPLES);
+        let b = tone(800.0, 4096.0, 0.7, BLOCK_SAMPLES);
+        let mut mixer = Mixer::default();
+        mixer.set_source("a", Source::default());
+        mixer.set_source("b", Source::default());
+        let mut out = vec![0_i16; BLOCK_SAMPLES];
+        for _ in 0..1_000 {
+            let mut pool = SourcePool::default();
+            pool.push("a", a.clone());
+            pool.push("b", b.clone());
+            let started = std::time::Instant::now();
+            mixer.render(Bus::Voice, &mut pool, &mut out);
+            mixer
+                .stats_mut()
+                .record_latency(started.elapsed().as_micros() as u32);
+        }
+        let p50 = mixer.stats().p50_micros();
+        let p95 = mixer.stats().p95_micros();
+        println!(
+            "mix profile: {} blocks, p50 {p50} us, p95 {p95} us, limiter releases {}",
+            mixer.stats().blocks(),
+            mixer.limiter_releases()
+        );
+        assert_eq!(mixer.stats().blocks(), 1_000);
+        assert!(
+            p95 < 2_000,
+            "one 10 ms block cannot take longer than the quantum: {p95} us"
+        );
     }
 }

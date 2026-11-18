@@ -317,9 +317,9 @@ hot-unplug, физический DPI 125/150 (тесты используют п
 Ветка `codex/w-extensions`, база `609bb8651053e282d0ceeacd8488fd10292b8525`;
 сверены Go `09c82b983d5d842af0627289655b11c37ae56e1d`, frontend
 `ed7cb00ae12398753a8ef48a5a33b864e20cb04c`, backend
-`9b29fdd6d5dc818b7408e4892b8e68b27d123831`. W02c закоммичен как `e7f2820`;
-правки текущего цикла находятся в рабочем дереве над этим HEAD без коммита и
-push по условию задачи.
+`9b29fdd6d5dc818b7408e4892b8e68b27d123831`. W02c закоммичен серией
+`b097c0f` → `f2db984` → `e7f2820` → `d3fec1a` → `180df01`; последний
+проверенный коммит этапа — `180df01`, дерево чистое и запушено.
 
 - `crates/voxhold-media/src/mixer.rs` — программный микс шин `voice/system/
   preview`, громкость источника 0–200 % и **отдельный** признак локального
@@ -376,11 +376,11 @@ push по условию задачи.
   a_per_user_volume_reaches_the_snapshot_and_is_removed_at_one_hundred`,
   `the_playout_report_is_kept_for_the_measured_mixer_line`.
 - Проверено: `cargo fmt --all -- --check`, `cargo test --workspace --locked`
-  (11 API, 133 media с 9 `ignored` аудио-пробами, 346 приложения с 1
-  `ignored`), `cargo build --release --locked`, `scripts/check-file-sizes.ps1
-  -All` (205 файла), `git diff --check`, строгий UTF-8/BOM/U+FFFD-детектор по
-  138 отслеживаемым `*.rs`/`*.md`, mojibake-скан, smoke release (процесс жив
-  через 5 с).
+  (11 API, 134 media с 9 `ignored` аудио-пробами, 346 приложения с 1
+  `ignored`, итого 491 passed), `cargo build --release --locked`,
+  `scripts/check-file-sizes.ps1 -All` (208 файлов), `git diff --check`,
+  строгий UTF-8/BOM/U+FFFD-детектор по 149 отслеживаемым `*.rs`/`*.md`,
+  mojibake-скан, smoke release (процесс жив через 5 с).
 
 Не проверено: живое аудио и слышимый микс двух тонов на реальном устройстве,
 реальный сон/пробуждение Windows, hot-unplug выбранного микрофона и выхода,
@@ -389,15 +389,19 @@ push по условию задачи.
 шина не входит в микс комнаты). p95 и счётчики получены на синтетических
 блоках и на реальном sink в smoke-прогоне не снимались.
 
-#### W02c · третий цикл правок после FAIL (рабочее дерево над `e7f2820`)
+#### W02c · третий и четвёртый циклы правок после FAIL (до `180df01`)
 
 - `voice.rs`, `voice/playout/session.rs`: первый sink обычного звонка больше не
-  обходит машину. `Session::new` сохраняет открытый sink и вызывает
-  `install_initial_playout`, который переводит `SinkRecovery` в `Unstable`
+  обходит машину. `Session::new` сохраняет открытый sink и передаёт его в
+  `adopt_initial_playout`, который переводит `SinkRecovery` в `Unstable`
   (`opened()`); через 2 с и 50 блоков `tick_playout` даёт `Stable` и очищает
-  бюджет. Тест `the_first_sink_proves_stability_through_tick_playout` идёт через
-  реальную точку входа (`install_initial_playout` → `tick_playout`, headless
-  Session), затем один отказ даёт `Opening`/`Retry(0,5 с)`.
+  бюджет. Хелпер общий для конструктора и headless-теста, поэтому удаление
+  `opened()` роняет тест. Тест `the_first_sink_proves_stability_through_tick_playout`
+  идёт через реальную точку входа (`adopt_initial_playout` → `tick_playout`,
+  headless Session), затем один отказ даёт `Opening`/`Retry(0,5 с)`.
+  Ограничение зафиксировано честно: сам `Session::new` открывает реальные ADM и
+  WinMM-микрофон, автоматического теста на него нет — для прямой проверки
+  конструктора нужен инъектируемый аудиобэкенд.
 - Смерть sink и ADM-fallback отправляют финальный
   `Event::Playout{running:false, phase}`; строка микшера в настройках строится
   `mixer_status_line` и скрывается, когда `software_mixer()` ложен. Тесты:
@@ -407,9 +411,11 @@ push по условию задачи.
   «неизвестно», не отказ; перезапуск и сообщение только при реально
   остановившемся `MediaPlayout.total_samples_duration`
   (`adm_health_requires_real_pcm_only_while_audio_is_expected`).
-- `switch_sink` сбрасывает окно стабильности (`Stability{since,blocks}`), новый
-  девайс не наследует доказательство старого
-  (`switching_the_sink_restarts_the_stability_window`).
+- `switch_playout` сбрасывает и окно стабильности (`Stability{since,blocks}`), и
+  фазу `SinkRecovery`: новый девайс публикуется как `Unstable`, не наследует
+  доказательство старого и не показывается как «стабильный микшер»
+  (`switching_the_device_reports_an_unstable_sink`,
+  `switching_the_sink_restarts_the_stability_window`).
 - `Tap`: медленный подписчик не удаляется; пропуски считаются в
   `TapReceiver::dropped()`, `try_recv` возвращает `Block`/`Empty`/`Closed`.
   `Drop for Playout` останавливает поток флагом; завершённые track-таски
@@ -424,15 +430,15 @@ push по условию задачи.
   `adm_health_requires_real_pcm_only_while_audio_is_expected`,
   `a_sink_that_opens_and_dies_still_spends_the_shared_budget`.
 - Мутации: `voice_room.rs:339` (`!server_muted`), `voice_panel.rs:697`
-  (`self.server_muted → false`), `SinkRecovery::sink_died` без учёта и удаление
-  `opened()` из `install_initial_playout` роняют свои тесты (последняя — фаза
-  остаётся `Opening`). Файлы восстановлены из копий, мутационных строк нет.
-- Проверено: fmt; `cargo test --workspace --locked` — 11 API, 133 media
-  (9 `ignored`), 346 приложения (1 `ignored`); release build; размеры
-  (205 отслеживаемых файла; новые `voice/sdp.rs`, `voice/test_support.rs`,
-  `voice/playout/session.rs` ещё не в индексе); строгий UTF-8/BOM/U+FFFD по 138
-  отслеживаемым `*.rs`/`*.md` плюс новые, mojibake-скан; smoke release — процесс
-  жив через 5 с. Новых release-предупреждений нет; два прежних
+  (`self.server_muted → false`), `SinkRecovery::sink_died` без учёта, удаление
+  `opened()` из `adopt_initial_playout` и снятие сброса фазы при смене
+  устройства роняют свои тесты. Файлы восстановлены из копий, мутационных строк
+  нет.
+- Проверено: fmt; `cargo test --workspace --locked` — 11 API, 134 media
+  (9 `ignored`), 346 приложения (1 `ignored`), итого 491 passed; release build;
+  размеры (208 отслеживаемых файлов, все новые в индексе); строгий
+  UTF-8/BOM/U+FFFD по 149 отслеживаемым `*.rs`/`*.md`, mojibake-скан; smoke
+  release — процесс жив через 5 с. Новых release-предупреждений нет; два прежних
   (`recordings_download` unused `id`, `set_allowed_channels`) остались.
 
 Профиль микшера: синтетические 400/800 Гц, 1000 блоков; debug p50 15–21 мкс,

@@ -37,8 +37,10 @@ pub enum Action {
     ConfirmDelete,
     CancelDelete,
     RefreshDevices,
-    SelectInput(usize),
-    SelectOutput(usize),
+    /// Stable endpoint id captured when the row was drawn. An index would
+    /// select a different device after a refresh, so the id is the identity.
+    SelectInput(String),
+    SelectOutput(String),
     SetVolume(&'static str, i64),
     SetBitrate(i64),
     ToggleSounds,

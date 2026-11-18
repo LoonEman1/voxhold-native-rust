@@ -150,6 +150,7 @@ impl Updates {
 }
 
 mod requests;
+mod test_support;
 use requests::{
     InputRequest, Pending, Requests, StreamCommand, set_input_request, set_stream_command,
 };

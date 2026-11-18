@@ -22,44 +22,11 @@ impl Voxhold {
                 self.load_voice_devices(cx);
                 self.start_voice_preview(cx);
             }
-            Action::SelectInput(index) | Action::SelectOutput(index) => {
-                let input = matches!(action, Action::SelectInput(_));
-                let (_, ids, _) = crate::voice_settings::device_choices(
-                    &self.voice_settings.prefs,
-                    &self.voice_settings.devices,
-                    input,
-                );
-                let Some(id) = ids.get(index).cloned() else {
-                    return true;
-                };
-                if input {
-                    self.voice_settings.prefs.input = id;
-                } else {
-                    self.voice_settings.prefs.output = id;
-                }
-                self.voice_settings.persist();
-                self.apply_voice_snapshot(cx);
-                #[cfg(feature = "voxhold-media")]
-                if let Some(voice) = &self.voice {
-                    if input {
-                        // R07b: input changes during a call use their own
-                        // generation, so a later PTT/DSP State cannot displace
-                        // the explicit choice.
-                        let input = self.voice_settings.prefs.input.clone();
-                        voice.update(cx, |panel, _| panel.select_input(Some(input)));
-                    } else {
-                        // R07a: an explicit output choice is its own request,
-                        // even when the cached id looks unchanged after a
-                        // hot-unplug.
-                        let output = self.voice_settings.prefs.output.clone();
-                        voice.update(cx, |panel, _| panel.select_output(Some(output)));
-                    }
-                }
-                self.voice_settings.device_notice.clear();
-                if input {
-                    self.start_voice_preview(cx);
-                }
-                cx.notify();
+            Action::SelectInput(id) => {
+                self.choose_voice_device(true, id, cx);
+            }
+            Action::SelectOutput(id) => {
+                self.choose_voice_device(false, id, cx);
             }
             Action::SetVolume(which, value) => {
                 match which {
@@ -72,41 +39,33 @@ impl Voxhold {
                     "noise" => self.voice_settings.prefs.noise_gate = value.clamp(0, 100),
                     _ => self.voice_settings.prefs.sound_volume = value.clamp(0, 100),
                 }
-                self.voice_settings.persist();
+                self.persist_voice(cx);
                 self.apply_voice_snapshot(cx);
                 cx.notify();
             }
             Action::SetBitrate(bitrate) => {
                 if crate::voice_settings::BITRATES.contains(&bitrate) {
                     self.voice_settings.prefs.bitrate = bitrate;
-                    self.voice_settings.persist();
+                    self.persist_voice(cx);
                     self.apply_voice_snapshot(cx);
                     cx.notify();
                 }
             }
             Action::ToggleSounds => {
                 self.voice_settings.prefs.sounds = !self.voice_settings.prefs.sounds;
-                self.voice_settings.persist();
+                self.persist_voice(cx);
                 cx.notify();
             }
             Action::SetNoiseMode(index) => {
-                self.voice_settings.prefs.noise_mode = if index == 1 {
-                    "threshold".into()
-                } else {
-                    "auto".into()
-                };
-                self.voice_settings.persist();
+                self.voice_settings.prefs.set_noise_mode(index);
+                self.persist_voice(cx);
                 self.apply_voice_snapshot(cx);
                 cx.notify();
             }
             Action::SetInputMode(index) => {
                 let push_to_talk = index == 1;
-                self.voice_settings.prefs.input_mode = if push_to_talk {
-                    "push_to_talk".into()
-                } else {
-                    "voice_activity".into()
-                };
-                self.voice_settings.persist();
+                self.voice_settings.prefs.set_input_mode(index);
+                self.persist_voice(cx);
                 self.apply_voice_snapshot(cx);
                 #[cfg(feature = "voxhold-media")]
                 if let Some(voice) = &self.voice {
@@ -119,7 +78,7 @@ impl Voxhold {
             }
             Action::ToggleAutoGain => {
                 self.voice_settings.prefs.auto_gain = !self.voice_settings.prefs.auto_gain;
-                self.voice_settings.persist();
+                self.persist_voice(cx);
                 self.apply_voice_snapshot(cx);
                 cx.notify();
             }
@@ -127,7 +86,7 @@ impl Voxhold {
                 // Go resets to `defaultVoicePreferences()` and therefore also
                 // clears both selected devices.
                 self.voice_settings.prefs = crate::voice_settings::VoicePrefs::default();
-                self.voice_settings.persist();
+                self.persist_voice(cx);
                 self.apply_voice_snapshot(cx);
                 #[cfg(feature = "voxhold-media")]
                 if let Some(voice) = &self.voice {
@@ -176,6 +135,105 @@ impl Voxhold {
         true
     }
 
+    /// One device choice, identified by the endpoint id that was captured when
+    /// the row was drawn. A list that changed since then (hot-unplug, refresh)
+    /// makes the id stale: it is rejected with a visible notice instead of
+    /// silently selecting whatever now sits at that position.
+    fn choose_voice_device(&mut self, input: bool, id: String, cx: &mut Context<Self>) {
+        let (_, ids, _) = crate::voice_settings::device_choices(
+            &self.voice_settings.prefs,
+            &self.voice_settings.devices,
+            input,
+        );
+        if !id.is_empty() && !ids.iter().any(|known| *known == id) {
+            self.voice_settings.device_notice =
+                "Это устройство больше не подключено — обновите список и выберите снова.".into();
+            self.load_voice_devices(cx);
+            cx.notify();
+            return;
+        }
+        if input {
+            self.voice_settings.prefs.input = id;
+        } else {
+            self.voice_settings.prefs.output = id;
+        }
+        self.persist_voice(cx);
+        self.apply_voice_snapshot(cx);
+        #[cfg(feature = "voxhold-media")]
+        if let Some(voice) = &self.voice {
+            if input {
+                // R07b: input changes during a call use their own generation,
+                // so a later PTT/DSP State cannot displace the explicit choice.
+                let input = self.voice_settings.prefs.input.clone();
+                voice.update(cx, |panel, _| panel.select_input(Some(input)));
+            } else {
+                // R07a: an explicit output choice is its own request, even when
+                // the cached id looks unchanged after a hot-unplug.
+                let output = self.voice_settings.prefs.output.clone();
+                voice.update(cx, |panel, _| panel.select_output(Some(output)));
+            }
+        }
+        self.voice_settings.device_notice.clear();
+        if input {
+            self.start_voice_preview(cx);
+        }
+        cx.notify();
+    }
+
+    /// Persist the voice preferences off the UI thread. Rapid changes (a slider
+    /// drag) collapse into one atomic write: every request takes a newer token
+    /// and only the token that is still the newest reaches the disk, so a late
+    /// writer can never resurrect an older value.
+    pub(super) fn persist_voice(&mut self, cx: &mut Context<Self>) {
+        let store = self.voice_settings.store.clone();
+        let generation = store.next();
+        let prefs = self.voice_settings.prefs.clone();
+        let path = self.voice_settings.path.clone();
+        let session = self.session_generation;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(150))
+                .await;
+            let Some(view) = this.upgrade() else {
+                return;
+            };
+            let newest = view
+                .update(cx, |view, _| {
+                    view.session_generation == session
+                        && view.voice_settings.store.is_newest(generation)
+                })
+                .unwrap_or(false);
+            if !newest {
+                return;
+            }
+            let writer = store.clone();
+            let result = cx
+                .background_spawn(async move { writer.save(generation, &prefs, path.as_deref()) })
+                .await;
+            let Some(saved) = result else { return };
+            let Some(view) = this.upgrade() else {
+                return;
+            };
+            view.update(cx, |view, cx| {
+                if view.session_generation != session
+                    || !view.voice_settings.store.is_newest(generation)
+                {
+                    return;
+                }
+                if saved {
+                    view.voice_settings.writes = view.voice_settings.writes.wrapping_add(1);
+                    view.voice_settings.saved_error.clear();
+                } else {
+                    view.voice_settings.saved_error =
+                        "Не удалось сохранить настройки звука.".into();
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     /// The single audio snapshot for the settings tab.
     fn apply_voice_snapshot(&mut self, cx: &mut Context<Self>) {
         #[cfg(feature = "voxhold-media")]
@@ -191,7 +249,13 @@ impl Voxhold {
             let output_volume = prefs.output_volume;
             let noise_mode = prefs.noise_mode.clone();
             let noise_gate = prefs.noise_gate;
-            let echo_cancellation = prefs.echo_cancellation;
+            // AEC needs a measured render reference, which no chain has, so the
+            // request never asks for it even though the stored preference is
+            // kept. The applied report is the only place that could say
+            // otherwise, and it never does in this build.
+            let echo_cancellation = prefs.echo_cancellation
+                && crate::audio_capabilities::audio_capabilities().echo_cancellation
+                    == crate::audio_capabilities::Support::Applied;
             let auto_gain = prefs.auto_gain;
             voice.update(cx, |panel, _| {
                 panel.apply_voice_prefs(
@@ -264,7 +328,9 @@ impl Voxhold {
     }
 
     /// Start the WinMM level preview for the visible voice tab outside a call.
-    /// The preview lives only as long as the tab.
+    /// The preview lives only as long as the tab. Endpoint resolution and WinMM
+    /// enumeration run on the background executor: a slow device stack must not
+    /// delay the frame, and a stale answer is dropped by `preview_epoch`.
     pub(super) fn start_voice_preview(&mut self, cx: &mut Context<Self>) {
         self.stop_voice_preview();
         self.voice_settings.preview_error.clear();
@@ -276,17 +342,25 @@ impl Voxhold {
         }
         #[cfg(all(feature = "voxhold-media", not(test)))]
         {
-            if !self.voice_tab_open() {
-                return;
-            }
-            if self.voice_call_active(cx) {
+            if !self.voice_tab_open() || self.voice_call_active(cx) {
                 return;
             }
             let device = self.voice_settings.prefs.input.clone();
-            match voxhold_media::preview::start_level(&device) {
-                Ok(preview) => self.voice_settings.preview = Some(preview),
-                Err(error) => self.voice_settings.preview_error = error,
-            }
+            let epoch = self.voice_settings.preview_epoch;
+            self.voice_settings.preview_pending = true;
+            cx.spawn(async move |this, cx| {
+                let started = cx
+                    .background_spawn(async move { voxhold_media::preview::start_level(&device) })
+                    .await;
+                let Some(this) = this.upgrade() else {
+                    return;
+                };
+                this.update(cx, |view, cx| {
+                    view.install_voice_preview(epoch, started, cx)
+                })
+                .ok();
+            })
+            .detach();
         }
         #[cfg(all(not(feature = "voxhold-media"), not(test)))]
         {
@@ -294,9 +368,38 @@ impl Voxhold {
         }
     }
 
+    /// Apply a background preview start. A result for an older epoch, or one
+    /// that arrives after the tab closed or a call started, is stopped instead
+    /// of installed.
+    #[cfg(all(feature = "voxhold-media", not(test)))]
+    fn install_voice_preview(
+        &mut self,
+        epoch: u64,
+        started: Result<voxhold_media::preview::LevelPreview, String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.voice_settings.preview_pending = false;
+        if epoch != self.voice_settings.preview_epoch
+            || !self.voice_tab_open()
+            || self.voice_call_active(cx)
+        {
+            if let Ok(mut preview) = started {
+                preview.stop();
+            }
+            return;
+        }
+        match started {
+            Ok(preview) => self.voice_settings.preview = Some(preview),
+            Err(error) => self.voice_settings.preview_error = error,
+        }
+        cx.notify();
+    }
+
     /// Signal the preview thread and drop the handle. Never joins the UI
     /// thread; the thread exits within one 50 ms tick.
     pub(super) fn stop_voice_preview(&mut self) {
+        self.voice_settings.preview_epoch = self.voice_settings.preview_epoch.wrapping_add(1);
+        self.voice_settings.preview_pending = false;
         #[cfg(feature = "voxhold-media")]
         if let Some(mut preview) = self.voice_settings.preview.take() {
             preview.stop();
@@ -332,7 +435,12 @@ impl Voxhold {
     }
 
     /// One meter tick. Returns whether the task should continue.
-    fn voice_meter_tick(&mut self, epoch: u64, session: u64, cx: &mut Context<Self>) -> bool {
+    pub(super) fn voice_meter_tick(
+        &mut self,
+        epoch: u64,
+        session: u64,
+        cx: &mut Context<Self>,
+    ) -> bool {
         if epoch != self.voice_settings.meter_epoch || session != self.session_generation {
             return false;
         }
@@ -362,6 +470,7 @@ impl Voxhold {
             // call ends, the tab's own preview starts again (Go `enter`).
             if !in_call
                 && self.voice_settings.preview.is_none()
+                && !self.voice_settings.preview_pending
                 && self.voice_settings.preview_error.is_empty()
             {
                 self.start_voice_preview(cx);
@@ -399,10 +508,21 @@ impl Voxhold {
             changed = true;
         }
         // A real hot-unplug reported by the engine: show it and re-read the
-        // device list so the unavailable id appears as such.
+        // device list so the unavailable id appears as such. The reverse is
+        // also handled: once the engine reports a working input again, the
+        // stale notice is cleared and the list is re-read, without touching
+        // the saved choice.
         let device_error = self.voice_device_error(cx);
         if !device_error.is_empty() && self.voice_settings.device_notice != device_error {
-            self.voice_settings.device_notice = device_error;
+            self.voice_settings.device_notice = device_error.clone();
+            self.voice_settings.device_error_shown = device_error;
+            self.load_voice_devices(cx);
+            changed = true;
+        } else if device_error.is_empty() && !self.voice_settings.device_error_shown.is_empty() {
+            if self.voice_settings.device_notice == self.voice_settings.device_error_shown {
+                self.voice_settings.device_notice.clear();
+            }
+            self.voice_settings.device_error_shown.clear();
             self.load_voice_devices(cx);
             changed = true;
         }

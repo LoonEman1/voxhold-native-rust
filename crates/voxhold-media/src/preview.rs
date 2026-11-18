@@ -3,7 +3,7 @@
 //! This is a direct port of the Go `cmd/voxhold/audio_windows.go` helpers:
 //! three 50 ms buffers (`rate / 20` samples) polled every 50 ms, RMS with the
 //! `min(1, sqrt(energy / samples) * 4.5)` scale and the 0.45/0.55 smoothing;
-//! the tone is `0.55В·sin(2ПЂ660t) + 0.45В·sin(2ПЂ880t)` with the Go envelope over
+//! the tone is `0.55·sin(2π660t) + 0.45·sin(2π880t)` with the Go envelope over
 //! `rate / 4` samples and a 350 ms wait. The preview never enters the WebRTC
 //! transmission; it only feeds the settings meter.
 
@@ -41,7 +41,7 @@ pub fn level_from_rms(rms: f64) -> f32 {
     (rms.max(0.0) * LEVEL_GAIN).min(1.0) as f32
 }
 
-/// Exact Go test tone. `volume` is the 0вЂ“100 signal volume.
+/// Exact Go test tone. `volume` is the 0–100 signal volume.
 pub fn tone_samples(rate: u32, volume: i64) -> Vec<i16> {
     let count = (rate / 4) as usize;
     let volume = volume.clamp(0, 100) as f64;
@@ -131,8 +131,7 @@ impl Drop for LevelPreview {
     }
 }
 
-pub const UNAVAILABLE_DEVICE: &str =
-    "Р’С‹Р±СЂР°РЅРЅРѕРµ Р°СѓРґРёРѕСѓСЃС‚СЂРѕР№СЃС‚РІРѕ РЅРµРґРѕСЃС‚СѓРїРЅРѕ.";
+pub const UNAVAILABLE_DEVICE: &str = "Выбранное аудиоустройство недоступно.";
 
 #[cfg(windows)]
 mod windows {
@@ -293,16 +292,16 @@ mod windows {
         }
         if code == 4 || code == 11 {
             return Err(
-                "РќРµС‚ РґРѕСЃС‚СѓРїР° Рє СѓСЃС‚СЂРѕР№СЃС‚РІСѓ. РџСЂРѕРІРµСЂСЊС‚Рµ СЂР°Р·СЂРµС€РµРЅРёСЏ Рё РЅР°СЃС‚СЂРѕР№РєРё Р·РІСѓРєР° Windows.".into(),
+                "Нет доступа к устройству. Проверьте разрешения и настройки звука Windows.".into(),
             );
         }
         Err(format!(
-            "РќРµ СѓРґР°Р»РѕСЃСЊ РѕС‚РєСЂС‹С‚СЊ Р°СѓРґРёРѕСѓСЃС‚СЂРѕР№СЃС‚РІРѕ Windows ({code})."
+            "Не удалось открыть аудиоустройство Windows ({code})."
         ))
     }
 
     fn wave_error(code: u32) -> String {
-        format!("РђСѓРґРёРѕСѓСЃС‚СЂРѕР№СЃС‚РІРѕ РІРµСЂРЅСѓР»Рѕ РѕС€РёР±РєСѓ {code}.")
+        format!("Аудиоустройство вернуло ошибку {code}.")
     }
 
     pub(super) fn run_level(preview: &LevelPreview, device: u32) -> Result<(), String> {
@@ -345,9 +344,7 @@ mod windows {
             }
             let code = unsafe { waveInStart(handle) };
             if code != 0 {
-                return Err(format!(
-                    "РќРµ СѓРґР°Р»РѕСЃСЊ Р·Р°РїСѓСЃС‚РёС‚СЊ РјРёРєСЂРѕС„РѕРЅ Windows ({code})."
-                ));
+                return Err(format!("Не удалось запустить микрофон Windows ({code})."));
             }
             let mut smoothed = 0.0_f64;
             while !preview.stop.load(Ordering::Relaxed) {
@@ -497,7 +494,7 @@ pub fn start_level(device_id: &str) -> Result<LevelPreview, String> {
                 store_shared_error(&worker.error, message);
             }
         })
-        .map_err(|error| format!("РќРµ СѓРґР°Р»РѕСЃСЊ Р·Р°РїСѓСЃС‚РёС‚СЊ РїСЂРѕРІРµСЂРєСѓ РјРёРєСЂРѕС„РѕРЅР°: {error}"))?;
+        .map_err(|error| format!("Не удалось запустить проверку микрофона: {error}"))?;
     Ok(LevelPreview {
         stop,
         level,
@@ -508,7 +505,7 @@ pub fn start_level(device_id: &str) -> Result<LevelPreview, String> {
 
 #[cfg(not(windows))]
 pub fn start_level(_device_id: &str) -> Result<LevelPreview, String> {
-    Err("РџСЂРѕРІРµСЂРєР° РјРёРєСЂРѕС„РѕРЅР° РґРѕСЃС‚СѓРїРЅР° С‚РѕР»СЊРєРѕ РІ Windows.".into())
+    Err("Проверка микрофона доступна только в Windows.".into())
 }
 
 /// Play the Go interface tone on the selected WinMM output and wait 350 ms.
@@ -523,7 +520,7 @@ pub fn play_tone(device_id: &str, volume: i64) -> Result<(), String> {
 
 #[cfg(not(windows))]
 pub fn play_tone(_device_id: &str, _volume: i64) -> Result<(), String> {
-    Err("РџСЂРѕРІРµСЂРєР° СЃРёРіРЅР°Р»РѕРІ РґРѕСЃС‚СѓРїРЅР° С‚РѕР»СЊРєРѕ РІ Windows.".into())
+    Err("Проверка сигналов доступна только в Windows.".into())
 }
 
 #[cfg(windows)]

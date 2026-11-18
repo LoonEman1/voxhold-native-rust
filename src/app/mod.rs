@@ -27,6 +27,9 @@ mod server_ops;
 mod session;
 #[cfg(test)]
 mod settings_review;
+mod settings_slider;
+#[cfg(test)]
+mod settings_slider_tests;
 #[cfg(test)]
 mod settings_tests;
 mod settings_view;
@@ -37,8 +40,12 @@ mod tests;
 mod theme_ops;
 mod thread_ops;
 pub(crate) mod ui;
+#[cfg(test)]
+mod voice_form_tests;
 mod voice_ops;
 mod voice_settings_ops;
+#[cfg(test)]
+mod voice_settings_tests;
 #[cfg(test)]
 mod voice_tests;
 mod workspace;
@@ -233,6 +240,22 @@ pub(crate) struct Voxhold {
     active_settings: Option<SettingsKind>,
     settings_return_focus: Option<FocusHandle>,
     settings_ring: Vec<(FocusHandle, Option<SettingsAct>)>,
+    /// Slider focus handles rebuilt on every settings paint, so Tab reaches a
+    /// slider and the tests can drive its keys.
+    settings_slider_focus: Vec<(&'static str, FocusHandle)>,
+    /// Measured track boxes of the settings sliders, keyed by slider id.
+    slider_tracks: std::collections::HashMap<
+        &'static str,
+        std::rc::Rc<std::cell::Cell<settings_slider::SliderTrack>>,
+    >,
+    slider_drag: Option<settings_slider::SliderDrag>,
+    /// Logical window scale reported by the platform. The settings card uses it
+    /// for its DPI-aware margins; a test can pin it instead of a real monitor
+    /// DPI (`test_pin_ui_scale`).
+    ui_scale: f32,
+    /// True once a test pinned `ui_scale`; the render then stops sampling the
+    /// window.
+    ui_scale_pinned: bool,
     settings_scroll: gpui::ScrollHandle,
     settings_close_focus: FocusHandle,
     settings_entry_focus: FocusHandle,
@@ -520,6 +543,11 @@ impl Voxhold {
             active_settings: None,
             settings_return_focus: None,
             settings_ring: Vec::new(),
+            settings_slider_focus: Vec::new(),
+            slider_tracks: std::collections::HashMap::new(),
+            slider_drag: None,
+            ui_scale: 1.0,
+            ui_scale_pinned: false,
             settings_scroll: gpui::ScrollHandle::new(),
             settings_close_focus: cx.focus_handle(),
             settings_entry_focus: cx.focus_handle(),

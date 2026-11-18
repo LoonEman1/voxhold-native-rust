@@ -11,7 +11,6 @@ mod fallback {
     pub enum Support {
         Applied,
         Automatic,
-        Limited,
         Unavailable,
     }
 

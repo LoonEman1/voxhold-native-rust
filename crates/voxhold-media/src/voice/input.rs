@@ -42,7 +42,9 @@ impl Session {
                 applied.auto_gain_control,
             )
         } else {
-            ("platform", NoiseMode::Auto.as_str(), true, true)
+            // The ADM applies its own NS/AGC. Nothing measures its echo
+            // canceller, so the applied report never claims AEC.
+            ("platform", NoiseMode::Auto.as_str(), false, true)
         };
         events.push(Event::Audio {
             capture,

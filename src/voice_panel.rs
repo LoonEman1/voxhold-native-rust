@@ -946,9 +946,9 @@ impl VoicePanel {
                     self.input_generation = generation;
                 }
                 self.controls.input = input;
-                if let Some(error) = error {
-                    self.device_error = error;
-                }
+                // A typed success means the saved (or fallback) input opened:
+                // an earlier hot-unplug notice is stale now.
+                self.device_error = error.unwrap_or_default();
             }
             VoiceUpdate::AudioMode(applied) => {
                 self.applied_audio = Some(applied);
@@ -1174,6 +1174,8 @@ impl VoicePanel {
 mod colors;
 mod controls;
 mod player;
+#[cfg(test)]
+mod test_support;
 mod view;
 
 pub(crate) use colors::VoiceColors;

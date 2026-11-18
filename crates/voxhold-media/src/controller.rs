@@ -691,4 +691,103 @@ mod tests {
             Some(Action::Media(Command::Volume { gain, .. })) if (*gain - 0.5).abs() < f64::EPSILON
         ));
     }
+
+    /// The settings slider stores 0–200 %; 150 % must reach the participant
+    /// track as 1.5 in the delivered command, not only in the snapshot.
+    #[test]
+    fn a_150_percent_output_volume_reaches_the_participant_track() {
+        let mut controller = VoiceController::new(1, 2, Controls::default(), false);
+        controller.joined = true;
+        controller.owners.insert("0".into(), "alice".into());
+        controller.owners.insert("1".into(), "bob".into());
+        for (mid, track) in [("0", "track-alice"), ("1", "track-bob")] {
+            controller.media_event(Event::Track {
+                track_id: track.into(),
+                stream_id: None,
+                mid: Some(mid.into()),
+            });
+        }
+        let actions = controller.update_controls(
+            Controls {
+                output_gain: Some(1.5),
+                ..Controls::default()
+            },
+            false,
+        );
+        let mut volumes: Vec<_> = actions
+            .iter()
+            .filter_map(|action| match action {
+                Action::Media(Command::Volume { track_id, gain }) => {
+                    Some((track_id.as_str(), *gain))
+                }
+                _ => None,
+            })
+            .collect();
+        volumes.sort_by(|a, b| a.0.cmp(b.0));
+        assert_eq!(
+            volumes,
+            vec![("track-alice", 1.5), ("track-bob", 1.5)],
+            "150 % must scale both participant tracks: {actions:?}"
+        );
+    }
+
+    /// One settings change is one `Command::State` carrying the whole snapshot;
+    /// a second command per field would make the engine apply them separately.
+    #[test]
+    fn one_settings_change_is_exactly_one_state_command() {
+        // The explicit input selection owns `controls.input` (a stale snapshot
+        // cannot revert it), so the controller starts with the selected device.
+        let mut controller = VoiceController::new(
+            1,
+            2,
+            Controls {
+                input: Some("endpoint-mic".into()),
+                ..Controls::default()
+            },
+            false,
+        );
+        controller.joined = true;
+        let actions = controller.update_controls(
+            Controls {
+                input: Some("endpoint-mic".into()),
+                output: Some("endpoint-spk".into()),
+                bitrate_kbps: Some(96),
+                input_gain: 1.4,
+                output_gain: Some(1.5),
+                noise_mode: crate::dsp::NoiseMode::Threshold,
+                noise_gate_percent: 32,
+                echo_cancellation: false,
+                auto_gain_control: false,
+                ..Controls::default()
+            },
+            false,
+        );
+        let states: Vec<_> = actions
+            .iter()
+            .filter(|action| matches!(action, Action::Media(Command::State(_))))
+            .collect();
+        assert_eq!(states.len(), 1, "exactly one State snapshot: {actions:?}");
+        let Action::Media(Command::State(state)) = states[0] else {
+            unreachable!()
+        };
+        assert_eq!(state.input.as_deref(), Some("endpoint-mic"));
+        assert_eq!(state.output.as_deref(), Some("endpoint-spk"));
+        assert_eq!(state.bitrate_kbps, Some(96));
+        assert!((state.input_gain - 1.4).abs() < f32::EPSILON);
+        assert_eq!(state.output_gain, Some(1.5));
+        assert_eq!(state.noise_mode, crate::dsp::NoiseMode::Threshold);
+        assert_eq!(state.noise_gate_percent, 32);
+        assert!(!state.echo_cancellation);
+        assert!(!state.auto_gain_control);
+        // No track exists yet, so nothing else goes to the media layer; the
+        // `voice.state_update` signal is not a parameter write.
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|action| matches!(action, Action::Media(_)))
+                .count(),
+            1,
+            "no extra media command besides the one State: {actions:?}"
+        );
+    }
 }

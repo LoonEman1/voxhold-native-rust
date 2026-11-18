@@ -4,6 +4,9 @@ impl Render for Voxhold {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let viewport = window.viewport_size();
         self.viewport = (viewport.width.into(), viewport.height.into());
+        if !self.ui_scale_pinned {
+            self.ui_scale = window.scale_factor();
+        }
         let (vw, vh) = self.viewport;
         let p = self.palette;
         let mut root = div()

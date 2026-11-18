@@ -130,6 +130,26 @@ impl VoicePrefs {
             && self.mute != self.push_to_talk
             && self.deafen != self.push_to_talk
     }
+
+    /// Form `SetNoiseMode`. Switching modes must not touch the other mode's
+    /// stored values (the gate, in this case), so both survive a round trip.
+    pub fn set_noise_mode(&mut self, index: usize) {
+        self.noise_mode = if index == 1 {
+            "threshold".into()
+        } else {
+            "auto".into()
+        };
+    }
+
+    /// Form `SetInputMode`. The push-to-talk combination is a separate field
+    /// and stays stored while voice activity is active.
+    pub fn set_input_mode(&mut self, index: usize) {
+        self.input_mode = if index == 1 {
+            "push_to_talk".into()
+        } else {
+            "voice_activity".into()
+        };
+    }
 }
 
 fn normalize_shortcut(value: &mut String, fallback: &str) {
@@ -223,12 +243,27 @@ pub struct VoiceSettings {
     /// Smoothed level shown by the meter (0..=1) after the input gain.
     pub preview_level: f32,
     pub preview_error: String,
+    /// Invalidates a preview start that was resolved on the background
+    /// executor and arrives after the tab closed or the device changed.
+    pub preview_epoch: u64,
+    /// A background `start_level` is in flight; a tick must not queue another.
+    pub preview_pending: bool,
     /// Real device notice (hot-unplug) or an in-call test explanation.
     pub device_notice: String,
     pub tone_pending: bool,
     pub tone_error: String,
     /// Bumped whenever the meter task must stop or restart.
     pub meter_epoch: u64,
+    /// Monotonic token of the newest requested save plus the write lock. A
+    /// snapshot is written only while its token is still the newest, so a late
+    /// writer can never resurrect an older value.
+    pub store: VoiceStore,
+    /// Atomic writes that actually reached disk. Rapid slider steps must
+    /// collapse into one; the coalescing regression reads this counter.
+    pub writes: u64,
+    /// Device error already turned into `device_notice`, so a meter tick can
+    /// tell "still broken" from "the engine recovered".
+    pub device_error_shown: String,
 }
 
 impl Default for VoiceSettings {
@@ -244,10 +279,15 @@ impl Default for VoiceSettings {
             preview: None,
             preview_level: 0.0,
             preview_error: String::new(),
+            preview_epoch: 0,
+            preview_pending: false,
             device_notice: String::new(),
             tone_pending: false,
             tone_error: String::new(),
             meter_epoch: 0,
+            store: VoiceStore::default(),
+            writes: 0,
+            device_error_shown: String::new(),
         }
     }
 }
@@ -261,11 +301,49 @@ impl VoiceSettings {
         }
     }
 
+    /// Synchronous save used by the preference tests. The live tab uses
+    /// `Voxhold::persist_voice`, which debounces and runs off the UI thread.
+    #[cfg(test)]
     pub fn persist(&mut self) {
         self.saved_error.clear();
-        if !self.prefs.save(self.path.as_deref()) {
+        if self.prefs.save(self.path.as_deref()) {
+            self.writes = self.writes.wrapping_add(1);
+        } else {
             self.saved_error = "Не удалось сохранить настройки звука.".into();
         }
+    }
+}
+
+/// The write pipeline for the voice preferences: a monotonic token shared with
+/// the background writer plus the lock that serializes the atomic renames.
+/// Cloneable, because the UI hands a copy to the executor.
+#[derive(Clone, Default)]
+pub struct VoiceStore {
+    token: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    lock: std::sync::Arc<std::sync::Mutex<()>>,
+}
+
+impl VoiceStore {
+    /// Take the token of a new save request.
+    pub fn next(&self) -> u64 {
+        self.token.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1
+    }
+
+    pub fn is_newest(&self, generation: u64) -> bool {
+        self.token.load(std::sync::atomic::Ordering::SeqCst) == generation
+    }
+
+    /// Write a queued snapshot only while `generation` is still the newest
+    /// request. The token check and the rename are one critical section, so two
+    /// background saves cannot reorder on disk; `None` means a newer edit
+    /// superseded this one and the file must stay untouched. Blocking: call it
+    /// from the background executor.
+    pub fn save(&self, generation: u64, prefs: &VoicePrefs, path: Option<&Path>) -> Option<bool> {
+        let _guard = self.lock.lock().unwrap_or_else(|error| error.into_inner());
+        if !self.is_newest(generation) {
+            return None;
+        }
+        Some(prefs.save(path))
     }
 }
 
@@ -409,19 +487,38 @@ mod tests {
 
     #[test]
     fn both_mode_values_survive_switching() {
+        // The form switches modes through these setters and then persists the
+        // document; the stored gate and the push-to-talk key must stay with
+        // their mode instead of being reset by the switch.
         let mut prefs = VoicePrefs::default();
+        prefs.set_input_mode(1);
+        prefs.set_noise_mode(1);
         prefs.noise_gate = 47;
         prefs.push_to_talk = "Ctrl+Space".into();
-        prefs.noise_mode = "threshold".into();
-        let round = VoicePrefs::from_json(&prefs.to_json());
-        assert_eq!(round.noise_gate, 47);
-        assert_eq!(round.push_to_talk, "Ctrl+Space");
-        // Switching the mode in the form only changes the mode string; the
-        // gate value and the push-to-talk key stay.
-        prefs.noise_mode = "auto".into();
-        prefs.input_mode = "push_to_talk".into();
-        assert_eq!(prefs.noise_gate, 47);
-        assert_eq!(prefs.push_to_talk, "Ctrl+Space");
+
+        let mut reopened = VoicePrefs::from_json(&prefs.to_json());
+        assert_eq!(reopened.input_mode, "push_to_talk");
+        assert_eq!(reopened.noise_mode, "threshold");
+
+        reopened.set_noise_mode(0);
+        assert_eq!(reopened.noise_gate, 47, "auto mode keeps the saved gate");
+        reopened.set_input_mode(0);
+        assert_eq!(
+            reopened.push_to_talk, "Ctrl+Space",
+            "voice activity keeps the push-to-talk key"
+        );
+
+        reopened.set_noise_mode(1);
+        reopened.set_input_mode(1);
+        assert_eq!(reopened.noise_mode, "threshold");
+        assert_eq!(reopened.input_mode, "push_to_talk");
+        assert_eq!(reopened.noise_gate, 47);
+        assert_eq!(reopened.push_to_talk, "Ctrl+Space");
+        assert_eq!(
+            VoicePrefs::from_json(&reopened.to_json()),
+            reopened,
+            "both modes and their values round trip"
+        );
     }
 
     #[test]
@@ -468,6 +565,32 @@ mod tests {
         settings.prefs.sound_volume = 90;
         settings.persist();
         assert!(!settings.saved_error.is_empty());
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn a_superseded_snapshot_never_reaches_the_file() {
+        let path = scratch("ordering.voice.json");
+        let settings = VoiceSettings::with_path(Some(path.clone()));
+        let generation = settings.store.next();
+        let mut newest = VoicePrefs::default();
+        newest.input_volume = 140;
+        assert_eq!(
+            settings.store.save(generation, &newest, Some(&path)),
+            Some(true)
+        );
+        // A later edit takes the next token before the older write reaches the
+        // disk; the older snapshot must not touch the file any more.
+        settings.store.next();
+        assert!(!settings.store.is_newest(generation));
+        let mut stale = VoicePrefs::default();
+        stale.input_volume = 10;
+        assert_eq!(
+            settings.store.save(generation, &stale, Some(&path)),
+            None,
+            "the superseded snapshot is dropped"
+        );
+        assert_eq!(VoicePrefs::load(Some(&path)).input_volume, 140);
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 

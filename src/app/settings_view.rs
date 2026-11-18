@@ -14,6 +14,15 @@ pub(super) enum ButtonKind {
 }
 
 impl Voxhold {
+    /// The settings elements are looked up by their id in the layout tests; the
+    /// debug selector is a no-op outside test builds.
+    fn element_selector(id: &ElementId) -> Option<String> {
+        match id {
+            ElementId::Name(name) => Some(name.to_string()),
+            _ => None,
+        }
+    }
+
     pub(super) fn focus_id(
         &mut self,
         id: ElementId,
@@ -40,6 +49,7 @@ impl Voxhold {
         let p = self.palette;
         let focus = self.focus_id(id.clone(), window, cx);
         let focused = focus.is_focused(window);
+        let selector = Self::element_selector(&id);
         if !disabled {
             self.settings_ring
                 .push((focus.clone(), Some(action.clone())));
@@ -109,6 +119,9 @@ impl Voxhold {
         if kind != ButtonKind::Icon {
             button = button.child(label.into());
         }
+        if let Some(selector) = selector {
+            button = button.debug_selector(move || selector.clone());
+        }
         button
     }
 
@@ -147,7 +160,8 @@ impl Voxhold {
                     .bg(ink(if on { 0x15150f } else { p.muted })),
             );
         let _ = focused;
-        div()
+        let selector = Self::element_selector(&id);
+        let mut row = div()
             .id(id)
             .w_full()
             .py(px(6.))
@@ -185,8 +199,11 @@ impl Voxhold {
                         .text_color(ink(p.muted))
                         .child(description.to_owned()),
                 )
-            })
-            .into_any_element()
+            });
+        if let Some(selector) = selector {
+            row = row.debug_selector(move || selector.clone());
+        }
+        row.into_any_element()
     }
 
     pub(super) fn settings_option(
@@ -202,11 +219,12 @@ impl Voxhold {
     ) -> AnyElement {
         let p = self.palette;
         let focus = self.focus_id(id.clone(), window, cx);
+        let selector = Self::element_selector(&id);
         if !disabled {
             self.settings_ring
                 .push((focus.clone(), Some(action.clone())));
         }
-        div()
+        let mut row = div()
             .id(id)
             .w_full()
             .py(px(8.))
@@ -254,81 +272,11 @@ impl Voxhold {
                                 .child(description.to_owned()),
                         )
                     }),
-            )
-            .into_any_element()
-    }
-
-    pub(super) fn settings_value_slider(
-        &mut self,
-        id: &'static str,
-        label: &str,
-        value: i64,
-        max: i64,
-        step: i64,
-        action: impl Fn(i64) -> SettingsAct + 'static,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let p = self.palette;
-        let ratio = (value.clamp(0, max) as f32 / max.max(1) as f32).clamp(0., 1.);
-        let lower = action((value - step).clamp(0, max));
-        let upper = action((value + step).clamp(0, max));
-        div()
-            .w_full()
-            .flex()
-            .flex_col()
-            .gap_1()
-            .child(
-                div()
-                    .text_size(px(13.))
-                    .font_weight(gpui::FontWeight::BOLD)
-                    .child(format!("{label} · {value}")),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(self.settings_button(
-                        ElementId::Name(format!("{id}-down").into()),
-                        "−",
-                        ButtonKind::Secondary,
-                        false,
-                        value <= 0,
-                        lower,
-                        window,
-                        cx,
-                    ))
-                    .child(
-                        div()
-                            .flex_1()
-                            .h(px(6.))
-                            .rounded(px(3.))
-                            .bg(ink(p.selection))
-                            .relative()
-                            .child(
-                                div()
-                                    .absolute()
-                                    .left(px(0.))
-                                    .top(px(0.))
-                                    .h(px(6.))
-                                    .w(px(220. * ratio))
-                                    .rounded(px(3.))
-                                    .bg(ink(p.lime)),
-                            ),
-                    )
-                    .child(self.settings_button(
-                        ElementId::Name(format!("{id}-up").into()),
-                        "+",
-                        ButtonKind::Secondary,
-                        false,
-                        value >= max,
-                        upper,
-                        window,
-                        cx,
-                    )),
-            )
-            .into_any_element()
+            );
+        if let Some(selector) = selector {
+            row = row.debug_selector(move || selector.clone());
+        }
+        row.into_any_element()
     }
 
     pub(super) fn settings_input(
@@ -382,6 +330,15 @@ impl Voxhold {
             .text_color(ink(if danger { p.danger } else { p.muted }))
             .child(text.to_owned())
             .into_any_element()
+    }
+
+    /// Pin the logical scale the settings card lays out against. The production
+    /// path samples `window.scale_factor()` on every paint; the layout tests
+    /// pin it to emulate 125 %/150 % on a fixed test window.
+    #[cfg(test)]
+    pub(super) fn test_pin_ui_scale(&mut self, scale: f32) {
+        self.ui_scale = scale.max(1.0);
+        self.ui_scale_pinned = true;
     }
 
     pub(super) fn settings_overlay(
@@ -454,12 +411,16 @@ impl Voxhold {
         };
         let p = self.palette;
         let (vw, vh) = self.viewport;
-        let width = 680_f32.min(vw - 16.).max(260.);
-        let height = 780_f32.min(vh - 24.).max(240.);
+        // Physical margins are constant across DPI steps: the logical inset
+        // grows with the scale, so a 150 % window keeps the same physical gap.
+        let scale = self.ui_scale.clamp(1.0, 3.0);
+        let width = 680_f32.min(vw - 16. * scale).max(260.);
+        let height = 780_f32.min(vh - 24. * scale).max(240.);
         let pad = if width < 440. { 16. } else { 24. };
         let left = (vw - width) / 2.;
         let top = (vh - height) / 2.;
         self.settings_ring.clear();
+        self.settings_slider_focus.clear();
 
         let header = div()
             .h(px(67.))
@@ -550,6 +511,7 @@ impl Voxhold {
         let close = self.settings_close_focus.clone();
         let mut card = div()
             .id("settings-card")
+            .debug_selector(|| "settings-card".into())
             .absolute()
             .left(px(left))
             .top(px(top))
@@ -608,7 +570,21 @@ impl Voxhold {
                 }),
             )
             .child(header)
-            .child(tab_strip);
+            .child(tab_strip)
+            .on_mouse_move(cx.listener(|s, event: &gpui::MouseMoveEvent, window, cx| {
+                if s.slider_drag.is_none() {
+                    return;
+                }
+                if event.pressed_button != Some(MouseButton::Left) {
+                    s.end_slider_drag();
+                    return;
+                }
+                s.drag_slider_to(f32::from(event.position.x), window, cx);
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|s, _, _, _| s.end_slider_drag()),
+            );
         if let Some(banner) = error_banner {
             card = card.child(banner);
         }

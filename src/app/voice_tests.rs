@@ -79,7 +79,7 @@ fn focus_room(visual: &mut VisualTestContext, voice: &Entity<voice_panel::VoiceP
 
 /// A window with two voice rooms and one text channel, an active call in room
 /// 7 and the matching panel entity.
-fn fixture(
+pub(super) fn fixture(
     cx: &mut TestAppContext,
 ) -> (
     &'static mut VisualTestContext,
@@ -643,12 +643,12 @@ async fn voice_actions_apply_one_snapshot_and_persist(cx: &mut TestAppContext) {
                     input: false,
                 },
             ];
-            assert!(v.voice_settings_action(Action::SelectInput(1), cx));
+            assert!(v.voice_settings_action(Action::SelectInput("1:Mic".into()), cx));
             assert_eq!(v.voice_settings.prefs.input, "1:Mic");
             assert_eq!(v.voice_settings.prefs.output, "", "output is untouched");
             assert!(v.voice_settings.preview.is_none(), "no in-call preview");
 
-            assert!(v.voice_settings_action(Action::SelectOutput(1), cx));
+            assert!(v.voice_settings_action(Action::SelectOutput("2:Spk".into()), cx));
             assert_eq!(v.voice_settings.prefs.output, "2:Spk");
             assert_eq!(v.voice_settings.prefs.input, "1:Mic");
 

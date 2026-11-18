@@ -3,8 +3,10 @@
 //! The form mirrors Go `settings_voice.go` and the frontend
 //! `VoiceSettingsDialog.tsx`. R07b applies input gain, the software gate and
 //! APM NS/AGC in the live call; this tab shows the active capture chain
-//! (`software` or `platform` ADM), reports AEC as unavailable because there is
-//! no render reference, and keeps the WinMM preview/test tone as real actions.
+//! (`software` or `platform` ADM) and reports AEC as unavailable/unmeasured
+//! because there is no render reference, while keeping the WinMM preview/test
+//! tone as real actions. The exact sentences live in `voice_form_text` so they
+//! stay testable without a UI query API.
 
 use super::settings_view::ButtonKind;
 use super::*;
@@ -54,8 +56,8 @@ impl Voxhold {
             .is_some_and(|panel| panel.read(cx).call_active());
         #[cfg(not(feature = "voxhold-media"))]
         let in_call = false;
-        let (input_names, _, input_current) = device_choices(&prefs, &devices, true);
-        let (output_names, _, output_current) = device_choices(&prefs, &devices, false);
+        let (input_names, input_ids, input_current) = device_choices(&prefs, &devices, true);
+        let (output_names, output_ids, output_current) = device_choices(&prefs, &devices, false);
 
         let mut root = div().flex().flex_col().gap(px(14.)).child(self.heading(
             "Голос и звук",
@@ -79,7 +81,11 @@ impl Voxhold {
                 },
                 input_names[index] == input_current,
                 false,
-                SettingsAct::Personal(personal_settings::Action::SelectInput(index)),
+                // The endpoint id captured at draw time, not the row index: a
+                // refreshed list would otherwise select another device.
+                SettingsAct::Personal(personal_settings::Action::SelectInput(
+                    input_ids[index].clone(),
+                )),
                 window,
                 cx,
             ));
@@ -96,7 +102,9 @@ impl Voxhold {
                 },
                 output_names[index] == output_current,
                 false,
-                SettingsAct::Personal(personal_settings::Action::SelectOutput(index)),
+                SettingsAct::Personal(personal_settings::Action::SelectOutput(
+                    output_ids[index].clone(),
+                )),
                 window,
                 cx,
             ));
@@ -122,12 +130,11 @@ impl Voxhold {
                 "Уровни звука",
                 "Громкость микрофона применяется в software-тракте до Opus. При platform-fallback действует встроенная обработка ADM.",
             ))
-            .child(self.settings_value_slider(
+            .child(self.settings_slider(
                 "input-volume",
                 "Громкость микрофона",
                 prefs.input_volume,
                 200,
-                5,
                 |value| SettingsAct::Personal(personal_settings::Action::SetVolume("input", value)),
                 window,
                 cx,
@@ -161,22 +168,18 @@ impl Voxhold {
             false,
         ));
         root = root
-            .child(self.settings_value_slider(
+            .child(self.settings_slider(
                 "output-volume",
                 "Громкость вывода",
                 prefs.output_volume,
                 200,
-                5,
                 |value| {
                     SettingsAct::Personal(personal_settings::Action::SetVolume("output", value))
                 },
                 window,
                 cx,
             ))
-            .child(self.form_text(
-                "0 % закрывает треки собеседников. 1–200 % пока не масштабирует звук: полный коэффициент появится в W02c.",
-                false,
-            ))
+            .child(self.form_text(crate::voice_form_text::OUTPUT_VOLUME_NOTE, false))
             .child(self.form_text(
                 &format!("Качество передачи · {} Кбит/с", prefs.bitrate),
                 false,
@@ -218,12 +221,11 @@ impl Voxhold {
             ));
         if prefs.sounds {
             root = root
-                .child(self.settings_value_slider(
+                .child(self.settings_slider(
                     "sound-volume",
                     "Громкость сигналов",
                     prefs.sound_volume,
                     100,
-                    5,
                     |value| {
                         SettingsAct::Personal(personal_settings::Action::SetVolume("sound", value))
                     },
@@ -265,37 +267,34 @@ impl Voxhold {
                 cx,
             ));
         if prefs.noise_mode == "threshold" {
-            root = root.child(self.settings_value_slider(
+            root = root.child(self.settings_slider(
                 "noise-gate",
                 "Планка шума",
                 prefs.noise_gate,
                 100,
-                5,
                 |value| SettingsAct::Personal(personal_settings::Action::SetVolume("noise", value)),
                 window,
                 cx,
             ));
         }
         let capture_note = match applied {
-            Some(("software", noise_mode, echo, agc)) => format!(
-                "Активный тракт: software 48 кГц · NS {noise_mode} · AGC {} · AEC {}.",
-                if agc { "вкл" } else { "выкл" },
-                if echo { "вкл" } else { "недоступно" }
-            ),
-            Some(_) => "Активный тракт: platform ADM · NS auto · AGC и AEC включены ADM принудительно. Пользовательские gain/gate в этом тракте не применяются.".into(),
-            None => "Активный тракт появится после подтверждённого входа в звонок. По умолчанию используется software 48 кГц; при отказе WinMM — platform ADM.".into(),
+            Some(("software", noise_mode, echo, agc)) => {
+                crate::voice_form_text::software_capture_note(noise_mode, echo, agc)
+            }
+            Some(_) => crate::voice_form_text::PLATFORM_CAPTURE_NOTE.to_owned(),
+            None => crate::voice_form_text::PENDING_CAPTURE_NOTE.to_owned(),
         };
         root = root
             .child(self.form_text(&capture_note, false))
             .child(self.voice_capability(
                 "Эхоподавление",
                 capabilities.echo_cancellation,
-                "в software-пути нет render-reference, поэтому AEC не включается; platform ADM включает своё по умолчанию без замера",
+                crate::voice_form_text::echo_cancellation_note(capabilities.echo_cancellation),
             ))
             .child(self.settings_toggle(
                 ElementId::Name("auto-gain".into()),
                 "Автоматическое усиление",
-                "APM в software-пути выравнивает голос; platform ADM включает AGC принудительно",
+                crate::voice_form_text::AUTO_GAIN_DESCRIPTION,
                 prefs.auto_gain,
                 capabilities.auto_gain == Support::Automatic,
                 SettingsAct::Personal(personal_settings::Action::ToggleAutoGain),
@@ -305,22 +304,22 @@ impl Voxhold {
             .child(self.voice_capability(
                 "Шумоподавление",
                 capabilities.noise_suppression,
-                "auto — APM NS; threshold — программный gate; platform ADM включает NS принудительно",
+                "auto — APM NS; threshold — программный gate; platform ADM применяет своё NS",
             ))
             .child(self.voice_capability(
                 "Усиление микрофона",
                 capabilities.input_gain,
-                "0–200 % в software-пути до Opus; 0 % — тишина. В platform ADM пользовательское усиление не применяется",
+                crate::voice_form_text::input_gain_note(capabilities.input_gain),
             ))
             .child(self.voice_capability(
                 "Планка шума",
                 capabilities.noise_gate,
-                "0 % обходит gate; 1–100 % действует в software-пути. В platform ADM порог недоступен",
+                crate::voice_form_text::noise_gate_note(capabilities.noise_gate),
             ))
             .child(self.voice_capability(
                 "Громкость вывода",
                 capabilities.output_gain,
-                "0 % закрывает дорожки; 1–200 % пока не масштабирует звук — W02c",
+                crate::voice_form_text::OUTPUT_GAIN_NOTE,
             ))
             .child(self.voice_capability(
                 "Качество передачи",
@@ -331,7 +330,6 @@ impl Voxhold {
                 "Тракт по умолчанию — software 48 кГц mono; при отказе WinMM движок переходит на platform ADM и сообщает об этом. AEC в software-пути недоступно без render-reference.",
                 false,
             ));
-
         root = root
             .child(self.separator())
             .child(self.heading("Режим ввода и горячие клавиши", ""))
@@ -495,12 +493,11 @@ impl Voxhold {
         let tag = match support {
             Support::Applied => "применяется",
             Support::Automatic => "автоматически",
-            Support::Limited => "частично",
             Support::Unavailable => "недоступно",
         };
         let tag_color = match support {
             Support::Applied => p.lime,
-            Support::Automatic | Support::Limited => p.muted,
+            Support::Automatic => p.muted,
             Support::Unavailable => p.danger,
         };
         div()

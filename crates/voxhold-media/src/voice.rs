@@ -382,7 +382,10 @@ impl Session {
                             });
                         }
                         let track = factory.create_device_audio_track("voxhold-microphone");
-                        (track, ("platform", NoiseMode::Auto.as_str(), true, true))
+                        // The ADM applies its own NS/AGC. Its echo canceller is
+                        // not measured here (no render-reference probe), so the
+                        // applied snapshot must not report AEC as enabled.
+                        (track, ("platform", NoiseMode::Auto.as_str(), false, true))
                     }
                 }
             };

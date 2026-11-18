@@ -212,11 +212,12 @@ impl CaptureGate {
         if state.capture != Some(capture) {
             return;
         }
-        state.acked = Some(
-            state
-                .acked
-                .map_or(generation, |acked| acked.max(generation)),
-        );
+        // The capture loop polls continuously; do not repeat a WebRTC
+        // `set_enabled` for a generation this instance already confirmed.
+        if state.acked.is_some_and(|acked| acked >= generation) {
+            return;
+        }
+        state.acked = Some(generation);
         self.apply(&state);
     }
 

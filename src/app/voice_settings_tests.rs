@@ -55,6 +55,75 @@ fn voice_call(
 }
 
 #[gpui::test]
+async fn a_per_user_volume_reaches_the_snapshot_and_is_removed_at_one_hundred(
+    cx: &mut TestAppContext,
+) {
+    let (visual, view, voice) = voice_call(cx);
+    visual.update(|_, app| {
+        view.update(app, |v, cx| {
+            use personal_settings::Action;
+            assert!(v.voice_settings_action(Action::SetVoiceUserVolume(2, 150), cx));
+            let snapshot = voice
+                .update(cx, |panel, _| panel.test_take_audio_snapshot())
+                .expect("the per-user volume is one State snapshot");
+            assert_eq!(snapshot.0.user_volumes.get(&2), Some(&150));
+            assert_eq!(v.voice_settings.prefs.user_volumes.get(&2), Some(&150));
+            assert_eq!(
+                voice.read(cx).user_volume(2),
+                150,
+                "the panel keeps the stable user key"
+            );
+            // 100 % is the default and is not persisted as an override.
+            assert!(v.voice_settings_action(Action::SetVoiceUserVolume(2, 100), cx));
+            let snapshot = voice
+                .update(cx, |panel, _| panel.test_take_audio_snapshot())
+                .expect("removing the override is also one snapshot");
+            assert!(snapshot.0.user_volumes.get(&2).is_none());
+            assert!(!v.voice_settings.prefs.user_volumes.contains_key(&2));
+        });
+    });
+}
+
+#[gpui::test]
+async fn the_playout_report_is_kept_for_the_measured_mixer_line(cx: &mut TestAppContext) {
+    let (visual, _view, voice) = voice_call(cx);
+    visual.update(|window, app| {
+        voice.update(app, |panel, cx| {
+            panel.test_apply_update(
+                VoiceUpdate::AudioMode(voxhold_media::controller::AppliedAudio {
+                    capture: "software",
+                    noise_mode: "auto",
+                    echo_cancellation: false,
+                    auto_gain_control: true,
+                    software_mixer: true,
+                }),
+                window,
+                cx,
+            );
+            panel.test_apply_update(
+                VoiceUpdate::Playout(voxhold_media::mixer::PlayoutStats {
+                    level: 0.42,
+                    peak: 0.6,
+                    underruns: 3,
+                    dropped: 1,
+                    p95_micros: 120,
+                    running: true,
+                }),
+                window,
+                cx,
+            );
+            let stats = panel.playout_stats().expect("the report is stored");
+            assert_eq!(stats.p95_micros, 120);
+            assert_eq!(stats.underruns, 3);
+            assert!(
+                panel.software_mixer(),
+                "the fixture applies the software mixer"
+            );
+        });
+    });
+}
+
+#[gpui::test]
 async fn closing_the_view_flushes_a_queued_voice_save(cx: &mut TestAppContext) {
     let (mut visual, view, _voice) = voice_call(cx);
     let directory = std::env::temp_dir().join(format!(
@@ -354,4 +423,67 @@ async fn rapid_slider_changes_collapse_into_one_atomic_write(cx: &mut TestAppCon
     );
     assert!(!path.with_file_name(".prefs.voice.json.tmp").exists());
     std::fs::remove_dir_all(&directory).unwrap();
+}
+#[gpui::test]
+async fn one_voice_snapshot_carries_devices_bitrate_and_both_gains(cx: &mut TestAppContext) {
+    let (mut visual, _view, voice) = super::voice_tests::fixture(cx);
+    draw(&mut visual);
+    visual.update(|_, app| {
+        voice.update(app, |panel, cx| {
+            panel.mute(cx);
+            assert!(panel.test_controls_muted(), "the local mute closes the mic");
+            panel.apply_voice_prefs(
+                Some("1:Mic".into()),
+                Some("2:Spk".into()),
+                96,
+                140,
+                0,
+                "threshold",
+                32,
+                false,
+                false,
+                std::collections::BTreeMap::new(),
+            );
+            let controls = panel.test_controls();
+            assert_eq!(controls.input.as_deref(), Some("1:Mic"));
+            assert_eq!(controls.output.as_deref(), Some("2:Spk"));
+            assert_eq!(
+                controls.bitrate_kbps,
+                Some(96),
+                "one snapshot carries the selected preset"
+            );
+            assert_eq!(
+                controls.output_gain,
+                Some(0.0),
+                "0 % closes the room tracks"
+            );
+            assert_eq!(controls.noise_mode.as_str(), "threshold");
+            assert_eq!(controls.noise_gate_percent, 32);
+            assert!((controls.input_gain - 1.4).abs() < 1e-6);
+            assert!(!controls.echo_cancellation);
+            assert!(!controls.auto_gain_control);
+            assert!((controls.input_gain - 1.4).abs() < 1e-6);
+            assert!(
+                panel.test_controls_muted(),
+                "a settings snapshot must not clear the local mute"
+            );
+            panel.apply_voice_prefs(
+                None,
+                None,
+                64,
+                0,
+                100,
+                "auto",
+                15,
+                true,
+                true,
+                std::collections::BTreeMap::new(),
+            );
+            assert_eq!(panel.test_controls().input_gain, 0.0);
+            assert_eq!(panel.test_controls().bitrate_kbps, Some(64));
+            assert_eq!(panel.test_controls().output_gain, Some(1.0));
+            assert_eq!(panel.test_controls().noise_mode.as_str(), "auto");
+            assert_eq!(panel.test_controls().input_gain, 0.0);
+        });
+    });
 }

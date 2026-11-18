@@ -51,6 +51,7 @@ impl Session {
             noise_mode,
             echo_cancellation: echo,
             auto_gain_control: gain,
+            software_mixer: self.software_playout,
         });
     }
 

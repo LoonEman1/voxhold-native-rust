@@ -39,8 +39,13 @@ mod input;
 use input::normalize_input;
 mod platform;
 use platform::PlatformAudio;
+mod playout;
+use playout::Playout;
 #[cfg(test)]
 mod loopback;
+mod winmm_out;
+
+use crate::mixer::Source;
 
 const ICE_CAPACITY: usize = 64;
 const COMPLETED_UFRAG_CAPACITY: usize = 16;
@@ -122,9 +127,25 @@ struct Session {
     /// microphone and the software DSP cannot run.
     mic: Option<MicCapture>,
     controls: Controls,
-    volumes: HashMap<String, f64>,
-    /// last effective coefficient applied per receiver.
-    gains: HashMap<String, f64>,
+    /// Per-receiver-track playout gain and local mute. The gain is the
+    /// participant percentage (0–200 %, resolved by the controller from the
+    /// stable user id); `muted` is the separate local mute/deafen flag, so
+    /// unmuting restores the percentage instead of a remembered zero.
+    sources: HashMap<String, Source>,
+    /// Software room playout. `None` means the platform ADM plays the room and
+    /// the numeric gain is not applied (reported to the UI).
+    playout: Option<Playout>,
+    /// The room session owns the playout rather than the ADM. Set even while a
+    /// suspend has released the sink, so resume reopens it instead of silently
+    /// falling back to an ADM path that was never started.
+    software_playout: bool,
+    /// Source tasks of the software playout; they end with the track and are
+    /// aborted when the session drops.
+    playout_tasks: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    /// Tokio handle for spawning the audio-sink tasks from the WebRTC
+    /// callback thread.
+    runtime: tokio::runtime::Handle,
+    last_playout_report: std::time::Instant,
     speaking: HashMap<String, bool>,
     local_speaking: bool,
     remote_sdp: Option<RemoteSdp>,
@@ -182,6 +203,27 @@ impl Session {
         viewer: Option<Arc<VideoStore>>,
     ) -> Result<Self, &'static str> {
         let audio = PlatformAudio::new(false)?;
+        let room_session = viewer.is_none();
+        // The software mixer is the only path with a numeric participant gain.
+        // It is opened before the ADM playout is disabled: a sink that cannot
+        // open must leave the working ADM path in place and be reported, not
+        // silently degrade the call to silence.
+        let mut playout = None;
+        let mut software_playout = false;
+        if room_session {
+            match Playout::start(controls.output.as_deref()) {
+                Ok(started) => {
+                    audio.set_playout(false);
+                    playout = Some(started);
+                    software_playout = true;
+                }
+                Err(_) => events.push(Event::DeviceError {
+                    message: "Программный микшер не открылся: громкость участников не применяется, звук идёт напрямую.",
+                }),
+            }
+        }
+        let playout_tasks: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>> =
+            Arc::new(Mutex::new(Vec::new()));
         // A saved device that is gone at join time must not fail the call:
         // keep the default path and report it once. The software capture path
         // opens the recording device itself; the platform ADM recording side
@@ -267,13 +309,25 @@ impl Session {
             (None, Some((video, task)))
         } else {
             let track_events = events.clone();
+            let clip = playout.as_ref().map(Playout::clip);
+            let runtime = tokio::runtime::Handle::current();
+            let tasks = playout_tasks.clone();
             peer.on_track(Some(Box::new(move |event| {
-                if matches!(event.track, MediaStreamTrack::Audio(_)) {
+                if let MediaStreamTrack::Audio(track) = &event.track {
+                    let track_id = track.id();
                     track_events.push(Event::Track {
-                        track_id: event.track.id(),
+                        track_id: track_id.clone(),
                         stream_id: event.streams.first().map(|stream| stream.id()),
                         mid: event.transceiver.mid(),
                     });
+                    // The mixer receives decoded PCM per receiver. The sink is
+                    // created with the room playout and follows a resume.
+                    if let Some(clip) = &clip {
+                        let task = clip.attach(track_id, track.clone(), runtime.clone());
+                        if let Ok(mut tasks) = tasks.lock() {
+                            tasks.push(task);
+                        }
+                    }
                 }
             })));
             // The software path owns capture so the gate, gain and mute are
@@ -406,6 +460,7 @@ impl Session {
                 noise_mode: applied.1,
                 echo_cancellation: applied.2,
                 auto_gain_control: applied.3,
+                software_mixer: software_playout,
             });
             (Some(sender), None)
         };
@@ -427,8 +482,12 @@ impl Session {
             audio,
             mic,
             controls,
-            volumes: HashMap::new(),
-            gains: HashMap::new(),
+            sources: HashMap::new(),
+            playout,
+            software_playout,
+            playout_tasks,
+            runtime: tokio::runtime::Handle::current(),
+            last_playout_report: std::time::Instant::now(),
             speaking: HashMap::new(),
             local_speaking: false,
             remote_sdp: None,
@@ -519,11 +578,29 @@ impl Session {
                 });
                 Ok(())
             }
-            Command::Volume { track_id, gain } => {
-                if self.volumes.len() < 64 || self.volumes.contains_key(&track_id) {
-                    self.volumes.insert(track_id, gain.clamp(0.0, 2.0));
+            Command::Volume {
+                track_id,
+                gain,
+                muted,
+            } => {
+                if self.sources.len() < 64 || self.sources.contains_key(&track_id) {
+                    self.sources.insert(
+                        track_id,
+                        Source {
+                            gain: gain.clamp(0.0, 2.0),
+                            muted,
+                        },
+                    );
                     self.apply_audio_controls();
                 }
+                Ok(())
+            }
+            Command::Resume => {
+                self.resume_playout(events);
+                Ok(())
+            }
+            Command::Suspend => {
+                self.suspend_playout();
                 Ok(())
             }
             Command::Start { .. } | Command::ViewStart { .. } | Command::Stop => unreachable!(),
@@ -598,6 +675,11 @@ impl Session {
     }
 
     fn switch_device(&mut self, id: &str, input: bool) -> SwitchResult {
+        // The room playout is not the ADM: switching its sink is a WinMM open,
+        // and the previous device stays open until the new one succeeded.
+        if !input && self.playout.is_some() {
+            return self.switch_playout(id);
+        }
         let opened_id = if input {
             self.input_opened.clone()
         } else {
@@ -684,34 +766,6 @@ impl Session {
             encoding.max_bitrate = Some(u64::from(bitrate.clamp(6, 128)) * 1000);
         }
         let _ = sender.set_parameters(parameters);
-    }
-
-    fn apply_audio_controls(&mut self) {
-        let master = if self.controls.deafened { 0.0 } else { 1.0 };
-        // The pinned libwebrtc wrapper exposes no PCM render callback or
-        // per-track volume, so the numeric 0–200 % room coefficient cannot yet
-        // be applied without touching the Windows process mixer (forbidden).
-        // Zero still silences the room immediately; the full gain path belongs
-        // to the R07b audio pipeline. Stream audio has its own engine and mute.
-        let room_audible = self.controls.output_gain.unwrap_or(1.0) > 0.0;
-        self.gains.clear();
-        for receiver in self.peer.receivers() {
-            if let Some(MediaStreamTrack::Audio(track)) = receiver.track() {
-                let id = track.id();
-                // Keep the numeric coefficient for the future PCM path: 1 %,
-                // 50 %, 100 % and 200 % are distinct settings, not a boolean.
-                let gain = (self.volumes.get(&id).copied().unwrap_or(1.0) * master).clamp(0.0, 2.0);
-                self.gains.insert(id, gain);
-                track.set_enabled(room_audible && gain > 0.0);
-            }
-        }
-    }
-
-    /// Effective coefficient used by the PCM path for one receiver. Reapplied
-    /// whenever a track reappears or the SDP is renegotiated.
-    #[allow(dead_code)]
-    pub fn gain_for_track(&self, track_id: &str) -> f64 {
-        self.gains.get(track_id).copied().unwrap_or(1.0)
     }
 
     async fn answer(&mut self, sdp: &str, events: &Events) -> Result<(), &'static str> {
@@ -846,11 +900,35 @@ impl Session {
                 level: if speaking { local_level } else { 0.0 },
             });
         }
+        // Publish the measured post-mix level and the playout counters once a
+        // second. They come from the real sink, not from a synthetic estimate.
+        if self.playout.is_some() && self.last_playout_report.elapsed() >= Duration::from_secs(1) {
+            self.last_playout_report = std::time::Instant::now();
+            if let Some(stats) = self.playout.as_ref().map(Playout::stats) {
+                if !stats.running && self.software_playout {
+                    // The sink thread ended (device removed or a driver
+                    // reset). Report and try once to reopen it; the failure
+                    // path leaves the call alive without room audio.
+                    events.push(Event::DeviceError {
+                        message: "Воспроизведение комнаты остановилось, перезапускаем.",
+                    });
+                    self.resume_playout(events);
+                } else {
+                    events.push(Event::Playout(stats));
+                }
+            }
+        }
     }
 }
 
 impl Drop for Session {
     fn drop(&mut self) {
+        if let Ok(mut tasks) = self.playout_tasks.lock() {
+            for task in tasks.drain(..) {
+                task.abort();
+            }
+        }
+        self.playout.take();
         if let Some(mut mic) = self.mic.take() {
             mic.stop();
         }

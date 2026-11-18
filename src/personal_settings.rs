@@ -50,6 +50,10 @@ pub enum Action {
     ResetVoice,
     TestMicrophone,
     TestTone,
+    /// Start recording a shortcut for `0` mute, `1` deafen, `2` push-to-talk.
+    RecordShortcut(usize),
+    /// Per-user room volume by the stable user id (0–200 %).
+    SetVoiceUserVolume(i64, i64),
     CropZoom(i32),
     CropX(i32),
     CropY(i32),

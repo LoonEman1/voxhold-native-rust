@@ -190,6 +190,7 @@ fn a_missing_saved_microphone_does_not_fail_the_join() {
                 noise_mode,
                 echo_cancellation,
                 auto_gain_control,
+                ..
             } => {
                 applied = Some((capture, noise_mode, echo_cancellation, auto_gain_control));
             }

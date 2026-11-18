@@ -311,3 +311,79 @@ hot-unplug, физический DPI 125/150 (тесты используют п
 Журналы этапов вынесены из плана в этот файл, потому что
 `docs/development-plan.md` достиг лимита 1200 строк; таблица статусов, правила
 журнала и чек-лист PR остались в разделе 7 плана.
+
+### W02c · Микшер, клавиши и восстановление — черновик к ревью
+
+Ветка `codex/w-extensions`, база `609bb8651053e282d0ceeacd8488fd10292b8525`;
+сверены Go `09c82b983d5d842af0627289655b11c37ae56e1d`, frontend
+`ed7cb00ae12398753a8ef48a5a33b864e20cb04c`, backend
+`9b29fdd6d5dc818b7408e4892b8e68b27d123831`. Коммит и push не выполнялись по
+условию задачи; всё ниже — рабочее дерево.
+
+- `crates/voxhold-media/src/mixer.rs` — программный микс шин `voice/system/
+  preview`, громкость источника 0–200 % и **отдельный** признак локального
+  mute/deafen (снятие mute возвращает сохранённый процент, а не запомненный
+  ноль), блочный peak-лимитер с потолком 0,98, RMS/peak и уровень после микса
+  по шкале WinMM-превью (×4,5), p50/p95 времени блока (nearest rank, окно
+  512), счётчики starvation и drop, ограниченные очереди 5 блоков и 64
+  источника. Тесты: две известные синусоиды (400/800 Гц) суммируются и
+  измеряются после микса, 200 % дают удвоение, две полные шкалы упираются в
+  лимитер, mute сохраняет gain, 0 % потребляет поток, p95 по известному ряду.
+- `crates/voxhold-media/src/voice/playout.rs`, `voice/winmm_out.rs` — реальный
+  тракт комнаты: по одному `NativeAudioStream` (48 кГц mono, очередь 8 кадров)
+  на удалённую дорожку, свой поток микширования и WinMM `waveOut` на четыре
+  10-мс буфера. ADM playout выключается **только если** sink открылся; иначе
+  остаётся ADM и UI сообщает, что численное усиление не применяется.
+  Смена устройства открывает новый sink до замены старого, откат сохраняет
+  прежний путь. `Command::Volume{gain,muted}` несёт процент и отдельный mute;
+  в ADM-fallback mute по-прежнему выражается `track.set_enabled(false)`.
+- `crates/voxhold-media/src/controller.rs`, `src/voice_settings.rs`,
+  `src/voice_panel/controls.rs`, `src/app/settings_voice_view.rs` — громкость
+  участника хранится по стабильному `user_id` (`UserVolumes` в voice JSON,
+  как `voxhold.voice.userVolumes.v1` во фронтенде) и разрешается в текущий
+  `connection_id` через ростер и track owner; при повторном использовании
+  connection id другим пользователем процент не переезжает, а неизвестный
+  владелец даёт 100 %. Слайдеры участников появляются в табе только в звонке.
+  Локальный mute остаётся отдельным множеством. `server_mute` из ростера
+  закрывает микрофон даже при удержанном PTT и показывается в комнате.
+- `src/app/hotkeys.rs`, `src/app/shell_view.rs`,
+  `src/app/settings_voice_view.rs` — запись сочетания следующим нажатием
+  (Escape отменяет, одиночный модификатор не считается), конфликт сравнивается
+  по канонической форме (`Control+M` = `Ctrl+Shift+m` = `Shift+Ctrl+M`),
+  «disable while typing» закрывает все три действия при фокусе в composer
+  (как `isEditableKeyboardTarget` во фронтенде), blur/смена активации окна и
+  suspend снимают PTT. Глобального хука в сборке нет: заявлен только
+  window-режим, строка формы это прямо говорит.
+- `src/app/power.rs`, `crates/voxhold-media/src/runtime*` — подкласс главного
+  окна `SetWindowSubclass` ловит `WM_POWERBROADCAST` и только кладёт переход в
+  очередь; foreground-таймер вызывает `Voxhold::power_event`, панель снимает
+  PTT и отправляет `Suspend`/`Resume` через существующий слот запросов.
+  Media на resume переоткрывает sink и заново привязывает выжившие receiver-
+  дорожки; на suspend отпускает устройство. Для software-микрофона добавлена
+  проверка присутствия WinMM-устройства (unplug выбранного микрофона ведёт в
+  обычную лестницу восстановления), выход по-прежнему проверяется
+  `check_devices`, включая WinMM-имена для software-sink.
+- `VoiceUpdate::Playout` публикует измеренные уровень, peak, p95, underrun и
+  drop; комната и таб показывают эти числа только при открытом software-
+  микшере. ICE/TURN не перезаявляются: конфигурация по-прежнему приходит из
+  `webrtc_config()`, живой relay не проверялся.
+- Тесты: `mixer::tests::*` (10), `controller::tests::
+  a_user_volume_never_moves_to_another_participant_after_reconnect`,
+  `a_150_percent_user_volume_reaches_the_participant_track`,
+  `src/app/hotkey_tests.rs` (запись/конфликт/Escape, typing guard, server mute,
+  suspend/resume через реальный обработчик), `voice_settings_tests::
+  a_per_user_volume_reaches_the_snapshot_and_is_removed_at_one_hundred`,
+  `the_playout_report_is_kept_for_the_measured_mixer_line`.
+- Проверено: `cargo fmt --all -- --check`, `cargo test --workspace --locked`
+  (11 API, 118 media с 9 `ignored` аудио-пробами, 344 приложения с 1
+  `ignored`), `cargo build --release --locked`, `scripts/check-file-sizes.ps1
+  -All` (195 файлов), `git diff --check`, строгий UTF-8/BOM/U+FFFD-детектор по
+  128 отслеживаемым `*.rs`/`*.md`, mojibake-скан, smoke release (процесс жив
+  через 5 с).
+
+Не проверено: живое аудио и слышимый микс двух тонов на реальном устройстве,
+реальный сон/пробуждение Windows, hot-unplug выбранного микрофона и выхода,
+живой backend/браузер, TURN/ICE на втором ПК, физический DPI 125/150, численная
+громкость трансляции (плеер сохраняет отдельный ADM-движок и mute; системная
+шина не входит в микс комнаты). p95 и счётчики получены на синтетических
+блоках и на реальном sink в smoke-прогоне не снимались.

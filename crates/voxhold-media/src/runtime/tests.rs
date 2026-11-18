@@ -1,6 +1,7 @@
 //! Bounded request/update behaviour of the voice session.
 
 use super::*;
+use std::collections::HashMap;
 
 fn publication(connection: &str) -> Publication {
     Publication {
@@ -336,12 +337,12 @@ fn updates_coalesce_high_frequency_values_and_keep_the_terminal_reason() {
 #[test]
 fn a_burst_of_device_notices_stays_bounded() {
     let updates = Updates::new();
-    for index in 0..(UPDATE_CAPACITY + 30) {
+    for index in 0..(super::updates::UPDATE_CAPACITY + 30) {
         updates.push(VoiceUpdate::DeviceError(format!("device {index}")));
     }
     let mut count = 0;
     while updates.poll().is_some() {
         count += 1;
     }
-    assert_eq!(count, UPDATE_CAPACITY);
+    assert_eq!(count, super::updates::UPDATE_CAPACITY);
 }

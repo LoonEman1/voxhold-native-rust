@@ -3,6 +3,7 @@ mod capture;
 pub mod catalog;
 pub mod controller;
 pub mod dsp;
+pub mod mixer;
 pub mod preview;
 mod video;
 pub mod viewer;
@@ -63,6 +64,10 @@ pub struct Controls {
     pub echo_cancellation: bool,
     /// WebRTC APM automatic gain control in the software capture path.
     pub auto_gain_control: bool,
+    /// Per-user output overrides, keyed by the stable user id (0–200 %). The
+    /// engine resolves each entry to the participant's current
+    /// `connection_id`; an entry never transfers to another participant.
+    pub user_volumes: std::collections::BTreeMap<i64, i64>,
 }
 
 impl Default for Controls {
@@ -79,6 +84,7 @@ impl Default for Controls {
             output_gain: None,
             echo_cancellation: true,
             auto_gain_control: true,
+            user_volumes: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -135,8 +141,17 @@ pub enum Command {
     },
     Volume {
         track_id: String,
+        /// Participant percentage in 0..=2, or the deafen/local-mute result
+        /// when the software mixer is not available.
         gain: f64,
+        /// Local mute / deafen as a separate flag. The numeric gain is kept so
+        /// unmuting restores the stored percentage.
+        muted: bool,
     },
+    /// Reopen the room playout after a system resume or a lost sink.
+    Resume,
+    /// Release the playout device while the system is suspended.
+    Suspend,
     Stop,
 }
 
@@ -174,7 +189,13 @@ pub enum Event {
         noise_mode: &'static str,
         echo_cancellation: bool,
         auto_gain_control: bool,
+        /// The room is played by the software mixer, so the numeric participant
+        /// gain, the limiter and the post-mix meter are real. `false` means the
+        /// ADM plays the room and only mute is applied.
+        software_mixer: bool,
     },
+    /// Post-mix meter and playout counters from the software mixer.
+    Playout(crate::mixer::PlayoutStats),
     Frame,
     Error {
         message: &'static str,
@@ -232,7 +253,10 @@ impl Events {
             queue.frame_pending = true;
         }
         if queue.items.len() == EVENT_CAPACITY {
-            if matches!(event, Event::Level { .. } | Event::InputLevel { .. }) {
+            if matches!(
+                event,
+                Event::Level { .. } | Event::InputLevel { .. } | Event::Playout(_)
+            ) {
                 return;
             }
             queue.items.clear();

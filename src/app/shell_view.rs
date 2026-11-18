@@ -17,6 +17,11 @@ impl Render for Voxhold {
             .text_color(ink(p.fg))
             .capture_key_down(cx.listener(|s, event: &gpui::KeyDownEvent, window, cx| {
                 #[cfg(feature = "voxhold-media")]
+                if s.record_shortcut_key(event, cx) {
+                    cx.stop_propagation();
+                    return;
+                }
+                #[cfg(feature = "voxhold-media")]
                 if s.voice_key_down(event, window, cx) {
                     cx.stop_propagation();
                     return;

@@ -13,7 +13,7 @@ use crate::voice_panel::RoomAccess;
 #[cfg(feature = "voxhold-media")]
 use crate::voice_room::{Hotkey, PlayerKey};
 #[cfg(feature = "voxhold-media")]
-use gpui::{img, prelude::*, px, rgb, Focusable};
+use gpui::{img, prelude::*, px, rgb};
 #[cfg(feature = "voxhold-media")]
 use std::collections::HashMap;
 
@@ -137,6 +137,7 @@ impl Voxhold {
                     prefs.noise_gate,
                     prefs.echo_cancellation,
                     prefs.auto_gain,
+                    prefs.user_volumes.clone(),
                 );
                 panel.set_palette(palette);
                 cx.notify();
@@ -170,6 +171,7 @@ impl Voxhold {
                     prefs.noise_gate,
                     prefs.echo_cancellation,
                     prefs.auto_gain,
+                    prefs.user_volumes.clone(),
                 );
                 panel.set_palette(palette);
                 panel
@@ -492,20 +494,24 @@ impl Voxhold {
         if blocked {
             return false;
         }
+        // Typing in the composer must not mute, deafen or open the microphone.
+        // The frontend blocks every voice shortcut on an editable target; this
+        // build has no other text input inside the room.
+        if self.voice_typing(window, cx) {
+            return false;
+        }
         if !panel.read(cx).call_active() {
             return false;
         }
         if prefs.input_mode == "push_to_talk" {
             let hotkey = Hotkey::parse(&prefs.push_to_talk);
-            let editor_focused = self.composer.read(cx).focus_handle(cx).is_focused(window);
             if hotkey.matches(
                 &key,
                 modifiers.control,
                 modifiers.shift,
                 modifiers.alt,
                 modifiers.platform,
-            ) && !editor_focused
-            {
+            ) {
                 // Windows sets `is_held` on an auto-repeat. Only a fresh press
                 // may open the hold; the repeat is consumed but ignored.
                 if !event.is_held {

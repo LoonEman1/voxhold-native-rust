@@ -75,6 +75,7 @@ impl VoicePanel {
         noise_gate: i64,
         echo_cancellation: bool,
         auto_gain: bool,
+        user_volumes: std::collections::BTreeMap<i64, i64>,
     ) {
         self.controls.input = input;
         self.controls.output = output;
@@ -85,6 +86,65 @@ impl VoicePanel {
         self.controls.noise_gate_percent = noise_gate.clamp(0, 100) as u8;
         self.controls.echo_cancellation = echo_cancellation;
         self.controls.auto_gain_control = auto_gain;
+        self.user_volumes = user_volumes
+            .into_iter()
+            .filter(|(user, _)| *user > 0)
+            .map(|(user, volume)| (user, volume.clamp(0, 200)))
+            .collect();
+        self.controls.user_volumes = self.user_volumes.clone();
         self.refresh_capture();
+    }
+
+    /// Per-user loudness chosen in the settings tab. The map is keyed by the
+    /// stable user id; the media controller resolves it through the current
+    /// track owner, so it cannot move to another participant on reconnect.
+    pub fn user_volume(&self, user_id: i64) -> i64 {
+        self.user_volumes.get(&user_id).copied().unwrap_or(100)
+    }
+
+    /// Roster of the active call with display names, for the per-user volume
+    /// rows. Empty when the call is not active.
+    pub fn call_participants(&self) -> Vec<(i64, String)> {
+        if !self.call_active() || !self.access_confirmed {
+            return Vec::new();
+        }
+        let mut seen = std::collections::HashSet::new();
+        self.participants
+            .iter()
+            .filter(|participant| seen.insert(participant.user_id))
+            .map(|participant| (participant.user_id, self.member_name(participant.user_id)))
+            .collect()
+    }
+
+    /// Measured post-mix level and counters of the software mixer, when the
+    /// room session runs on it.
+    pub fn playout_stats(&self) -> Option<voxhold_media::mixer::PlayoutStats> {
+        self.playout
+    }
+
+    /// Whether the numeric participant gain is applied by the software mixer.
+    /// The settings tab uses this to avoid promising gain on the ADM fallback.
+    pub fn software_mixer(&self) -> bool {
+        self.applied_audio
+            .as_ref()
+            .is_some_and(|audio| audio.software_mixer)
+    }
+
+    /// System suspend/resume. A suspend releases the hold so a suspended
+    /// system never keeps the microphone open; a resume forwards the request
+    /// to the media worker, which reopens the sink and re-checks the devices.
+    pub fn power(&mut self, resumed: bool, cx: &mut Context<Self>) {
+        self.power_paused = !resumed;
+        self.release_push_to_talk();
+        if let Some(handle) = &self.handle {
+            handle.power(resumed);
+        }
+        self.refresh_capture();
+        cx.notify();
+    }
+
+    #[cfg(test)]
+    pub fn test_power_paused(&self) -> bool {
+        self.power_paused
     }
 }

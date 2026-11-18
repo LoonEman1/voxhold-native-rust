@@ -8,12 +8,18 @@ mod composer;
 mod history_actions;
 mod history_ops;
 mod history_view;
+#[cfg(all(feature = "voxhold-media", test))]
+mod hotkey_tests;
+#[cfg(feature = "voxhold-media")]
+mod hotkeys;
 mod inbox_ops;
 mod media_ops;
 mod members_view;
 mod navigation_view;
 mod overlays_view;
 mod personal_ops;
+#[cfg(feature = "voxhold-media")]
+mod power;
 mod profile_view;
 mod realtime;
 mod recordings_download;

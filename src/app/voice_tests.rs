@@ -730,58 +730,6 @@ async fn closing_the_dialog_stops_the_voice_meter(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-async fn one_voice_snapshot_carries_devices_bitrate_and_both_gains(cx: &mut TestAppContext) {
-    let (mut visual, _view, voice) = fixture(cx);
-    draw(&mut visual);
-    visual.update(|_, app| {
-        voice.update(app, |panel, cx| {
-            panel.mute(cx);
-            assert!(panel.test_controls_muted(), "the local mute closes the mic");
-            panel.apply_voice_prefs(
-                Some("1:Mic".into()),
-                Some("2:Spk".into()),
-                96,
-                140,
-                0,
-                "threshold",
-                32,
-                false,
-                false,
-            );
-            let controls = panel.test_controls();
-            assert_eq!(controls.input.as_deref(), Some("1:Mic"));
-            assert_eq!(controls.output.as_deref(), Some("2:Spk"));
-            assert_eq!(
-                controls.bitrate_kbps,
-                Some(96),
-                "one snapshot carries the selected preset"
-            );
-            assert_eq!(
-                controls.output_gain,
-                Some(0.0),
-                "0 % closes the room tracks"
-            );
-            assert_eq!(controls.noise_mode.as_str(), "threshold");
-            assert_eq!(controls.noise_gate_percent, 32);
-            assert!((controls.input_gain - 1.4).abs() < 1e-6);
-            assert!(!controls.echo_cancellation);
-            assert!(!controls.auto_gain_control);
-            assert!((controls.input_gain - 1.4).abs() < 1e-6);
-            assert!(
-                panel.test_controls_muted(),
-                "a settings snapshot must not clear the local mute"
-            );
-            panel.apply_voice_prefs(None, None, 64, 0, 100, "auto", 15, true, true);
-            assert_eq!(panel.test_controls().input_gain, 0.0);
-            assert_eq!(panel.test_controls().bitrate_kbps, Some(64));
-            assert_eq!(panel.test_controls().output_gain, Some(1.0));
-            assert_eq!(panel.test_controls().noise_mode.as_str(), "auto");
-            assert_eq!(panel.test_controls().input_gain, 0.0);
-        });
-    });
-}
-
-#[gpui::test]
 async fn the_room_keeps_the_current_palette(cx: &mut TestAppContext) {
     let (visual, view, voice) = fixture(cx);
     // A real theme switch reaches an already running panel.
@@ -945,6 +893,7 @@ async fn applied_audio_update_reaches_the_panel(cx: &mut TestAppContext) {
         noise_mode: "auto",
         echo_cancellation: true,
         auto_gain_control: true,
+        software_mixer: true,
     };
     let expected = applied.clone();
     visual.update(|window, app| {

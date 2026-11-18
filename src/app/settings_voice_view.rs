@@ -19,6 +19,28 @@ use gpui::ElementId;
 /// when the dialog is resized.
 const METER_WIDTH: f32 = 220.0;
 
+/// Fixed ids for the per-participant volume rows. The slider API keys its
+/// measured track by a static id, and a room rarely has more than sixteen
+/// speakers; the row order follows the confirmed roster.
+const USER_VOLUME_SLOTS: [&str; 16] = [
+    "user-volume-0",
+    "user-volume-1",
+    "user-volume-2",
+    "user-volume-3",
+    "user-volume-4",
+    "user-volume-5",
+    "user-volume-6",
+    "user-volume-7",
+    "user-volume-8",
+    "user-volume-9",
+    "user-volume-10",
+    "user-volume-11",
+    "user-volume-12",
+    "user-volume-13",
+    "user-volume-14",
+    "user-volume-15",
+];
+
 impl Voxhold {
     pub(super) fn voice_body(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let devices = self.voice_settings.devices.clone();
@@ -37,12 +59,31 @@ impl Voxhold {
                     audio.noise_mode,
                     audio.echo_cancellation,
                     audio.auto_gain_control,
+                    audio.software_mixer,
                 )
             })
         });
         #[cfg(not(feature = "voxhold-media"))]
-        let applied: Option<(&'static str, &'static str, bool, bool)> = None;
+        let applied: Option<(&'static str, &'static str, bool, bool, bool)> = None;
         let capabilities = capabilities_for(applied.map(|(capture, ..)| capture));
+        let software_mixer = applied.is_some_and(|(_, _, _, _, mixer)| mixer);
+        #[cfg(feature = "voxhold-media")]
+        let mixer_stats = self
+            .voice
+            .as_ref()
+            .and_then(|panel| panel.read(cx).playout_stats())
+            .filter(|stats| stats.running)
+            .map(|stats| {
+                format!(
+                    "Микшер после общего микса: уровень {:.0} % · p95 {} мкс · underrun {} · drop {}",
+                    f64::from(stats.level) * 100.0,
+                    stats.p95_micros,
+                    stats.underruns,
+                    stats.dropped
+                )
+            });
+        #[cfg(not(feature = "voxhold-media"))]
+        let mixer_stats: Option<String> = None;
         let level = self.voice_settings.preview_level.clamp(0.0, 1.0);
         let threshold = (prefs.noise_mode == "threshold").then_some(prefs.noise_gate);
         let preview_error = self.voice_settings.preview_error.clone();
@@ -179,11 +220,66 @@ impl Voxhold {
                 window,
                 cx,
             ))
-            .child(self.form_text(crate::voice_form_text::OUTPUT_VOLUME_NOTE, false))
-            .child(self.form_text(
-                &format!("Качество передачи · {} Кбит/с", prefs.bitrate),
-                false,
-            ));
+            .child(self.form_text(crate::voice_form_text::OUTPUT_VOLUME_NOTE, false));
+        // Per-user room volume: the stable key is the user id, so a reconnect
+        // that changes connection ids does not move a volume to another person.
+        #[cfg(feature = "voxhold-media")]
+        if in_call {
+            let rows: Vec<(i64, String, i64)> = self
+                .voice
+                .as_ref()
+                .map(|panel| {
+                    let panel = panel.read(cx);
+                    panel
+                        .call_participants()
+                        .into_iter()
+                        .map(|(user, name)| (user, name, panel.user_volume(user)))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if !rows.is_empty() {
+                root = root
+                    .child(self.form_text(
+                        if software_mixer {
+                            "Громкость участника 0–200 % применяется программным микшером комнаты; локальный mute — отдельный признак."
+                        } else {
+                            "Программный микшер не открылся: усиление участников не применяется, доступен только mute."
+                        },
+                        !software_mixer,
+                    ))
+                    .child(self.form_text(
+                        "Уровень после микса измеряется в микшере; значения p95 и underrun видны в комнате.",
+                        false,
+                    ));
+                if let Some(stats) = &mixer_stats {
+                    root = root.child(self.form_text(stats, false));
+                }
+                for (slot, (user, name, volume)) in rows.into_iter().enumerate() {
+                    let Some(id) = USER_VOLUME_SLOTS.get(slot) else {
+                        break;
+                    };
+                    root = root
+                        .child(self.form_text(&name, false))
+                        .child(self.settings_slider(
+                            id,
+                            "Громкость участника",
+                            volume,
+                            200,
+                            move |value| {
+                                SettingsAct::Personal(
+                                    personal_settings::Action::SetVoiceUserVolume(user, value),
+                                )
+                            },
+                            window,
+                            cx,
+                        ));
+                }
+            }
+        }
+        root = root.child(self.form_text(
+            &format!("Качество передачи · {} Кбит/с", prefs.bitrate),
+            false,
+        ));
         root = root.child(
             self.voice_segments(
                 "bitrate",
@@ -278,7 +374,7 @@ impl Voxhold {
             ));
         }
         let capture_note = match applied {
-            Some(("software", noise_mode, echo, agc)) => {
+            Some(("software", noise_mode, echo, agc, _)) => {
                 crate::voice_form_text::software_capture_note(noise_mode, echo, agc)
             }
             Some(_) => crate::voice_form_text::PLATFORM_CAPTURE_NOTE.to_owned(),
@@ -353,13 +449,11 @@ impl Voxhold {
                 window,
                 cx,
             ))
-            .child(self.form_text(
-                &format!(
-                    "Микрофон: {} · Звук: {} · Нажми и говори: {}",
-                    prefs.mute, prefs.deafen, prefs.push_to_talk
-                ),
-                false,
-            ));
+            .child(self.voice_shortcuts(window, cx));
+        root = root.child(self.form_text(
+            "Сочетания действуют, пока окно Voxhold активно: в этой сборке нет глобального перехвата клавиатуры (RegisterHotKey/WH_KEYBOARD_LL), поэтому «глобальный» режим не заявляется.",
+            false,
+        ));
         if !prefs.shortcuts_valid() {
             root = root
                 .child(self.form_text("Назначьте разные сочетания для каждого действия.", true));
@@ -396,6 +490,49 @@ impl Voxhold {
                 )),
         );
         root.into_any_element()
+    }
+
+    /// Go `voiceShortcuts`: one row per action with the current binding. While
+    /// recording, the row that owns the recorder says "Нажмите…" and the next
+    /// key-down in the settings card becomes the binding.
+    fn voice_shortcuts(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let prefs = self.voice_settings.prefs.clone();
+        let recording = self.voice_settings.recording_shortcut;
+        let rows = [
+            (0usize, "Микрофон вкл/выкл", prefs.mute.clone()),
+            (1, "Звук вкл/выкл", prefs.deafen.clone()),
+            (2, "Нажми и говори", prefs.push_to_talk.clone()),
+        ];
+        let mut column = div().w_full().flex().flex_col().gap(px(6.));
+        for (field, title, value) in rows {
+            let active = recording == Some(field);
+            let label = if active {
+                "Нажмите сочетание…".to_owned()
+            } else {
+                format!("{title}: {}", crate::voice_settings::shortcut_label(&value))
+            };
+            column = column.child(self.settings_button(
+                ElementId::Name(format!("voice-shortcut-{field}").into()),
+                label,
+                if active {
+                    ButtonKind::Tab
+                } else {
+                    ButtonKind::Secondary
+                },
+                active,
+                false,
+                SettingsAct::Personal(personal_settings::Action::RecordShortcut(field)),
+                window,
+                cx,
+            ));
+        }
+        if recording.is_some() {
+            column = column.child(self.form_text(
+                "Нажмите сочетание клавиш или Escape, чтобы отменить.",
+                false,
+            ));
+        }
+        column.into_any_element()
     }
 
     /// Go `f.segments`: one row of equal-width mode buttons. The selected

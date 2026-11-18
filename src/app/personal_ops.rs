@@ -669,6 +669,9 @@ impl Voxhold {
             Action::CropZoom(value) => self.edit_crop(window, cx, 0, value),
             Action::CropX(value) => self.edit_crop(window, cx, 1, value),
             Action::CropY(value) => self.edit_crop(window, cx, 2, value),
+            // The voice tab handles these before this match; a stray event
+            // while the tab is closed is a no-op.
+            Action::RecordShortcut(_) | Action::SetVoiceUserVolume(_, _) => {}
         }
     }
 

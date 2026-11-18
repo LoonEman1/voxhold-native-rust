@@ -26,4 +26,9 @@ impl VoiceHandle {
     pub fn take_controls_for_tests(&self) -> Option<(Controls, bool)> {
         self.requests.controls.lock().ok()?.take()
     }
+
+    /// The queued power transition, if the UI forwarded one.
+    pub fn take_power_for_tests(&self) -> Option<bool> {
+        self.requests.power.lock().ok()?.take()
+    }
 }

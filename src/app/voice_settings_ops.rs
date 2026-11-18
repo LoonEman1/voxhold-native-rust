@@ -130,6 +130,35 @@ impl Voxhold {
                 cx.notify();
             }
             Action::TestTone => self.play_voice_test_tone(cx),
+            Action::RecordShortcut(field) => {
+                #[cfg(feature = "voxhold-media")]
+                if self.voice_settings.recording_shortcut == Some(field) {
+                    self.voice_settings.recording_shortcut = None;
+                    cx.notify();
+                } else {
+                    self.start_shortcut_recording(field, cx);
+                }
+                #[cfg(not(feature = "voxhold-media"))]
+                {
+                    let _ = field;
+                }
+            }
+            Action::SetVoiceUserVolume(user_id, volume) => {
+                if user_id > 0 {
+                    let value = volume.clamp(0, 200);
+                    if value == 100 {
+                        self.voice_settings.prefs.user_volumes.remove(&user_id);
+                    } else {
+                        self.voice_settings
+                            .prefs
+                            .user_volumes
+                            .insert(user_id, value);
+                    }
+                    self.persist_voice(cx);
+                    self.apply_voice_snapshot(cx);
+                    cx.notify();
+                }
+            }
             _ => return false,
         }
         true
@@ -236,7 +265,7 @@ impl Voxhold {
     }
 
     /// The single audio snapshot for the settings tab.
-    fn apply_voice_snapshot(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn apply_voice_snapshot(&mut self, cx: &mut Context<Self>) {
         #[cfg(feature = "voxhold-media")]
         {
             let Some(voice) = &self.voice else {
@@ -269,6 +298,7 @@ impl Voxhold {
                     noise_gate,
                     echo_cancellation,
                     auto_gain,
+                    prefs.user_volumes.clone(),
                 );
             });
         }
@@ -279,7 +309,7 @@ impl Voxhold {
     }
 
     /// Whether tab 1 of the personal dialog is currently visible.
-    fn voice_tab_open(&self) -> bool {
+    pub(super) fn voice_tab_open(&self) -> bool {
         self.active_settings == Some(SettingsKind::Personal)
             && self.personal.as_ref().is_some_and(|panel| panel.tab() == 1)
     }

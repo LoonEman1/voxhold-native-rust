@@ -96,12 +96,22 @@ impl Session {
                 continue;
             };
             if input && self.mic.is_some() {
-                // The software WinMM path is not enumerated by Core Audio, so
-                // a name-prefix miss would restart a working microphone every
-                // second. Hot-unplug recovery for this path belongs to W02c.
+                // The software WinMM path is not enumerated by Core Audio: ask
+                // the same resolver the capture path used, so an unplugged
+                // selected microphone is recovered instead of staying silent.
+                if crate::capture::input_available(id) {
+                    continue;
+                }
+                self.recover_input(events);
                 continue;
             }
-            if self.audio.resolve(id, input).is_some() {
+            let resolved = if !input && self.playout.is_some() {
+                // The room sink is a WinMM endpoint, not the ADM index.
+                super::winmm_out::resolve_output(id).is_some()
+            } else {
+                self.audio.resolve(id, input).is_some()
+            };
+            if resolved {
                 continue;
             }
             // The old index may now point at another device. Resolve the

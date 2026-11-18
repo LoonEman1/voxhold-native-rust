@@ -3,6 +3,7 @@
 //! lists devices and owns the tab-lifetime preview/meter state, matching
 //! `settings_voice.go` and `workspace-layout.json.voice.json`.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
@@ -27,6 +28,10 @@ pub struct VoicePrefs {
     pub mute: String,
     pub deafen: String,
     pub push_to_talk: String,
+    /// Per-user room volume by the stable user id (0–200 %). The frontend
+    /// stores the same map in `voxhold.voice.userVolumes.v1`; a connection id
+    /// is never a key, so a reconnect cannot move a volume to another person.
+    pub user_volumes: BTreeMap<i64, i64>,
 }
 
 impl Default for VoicePrefs {
@@ -47,6 +52,7 @@ impl Default for VoicePrefs {
             mute: "Ctrl+Shift+M".into(),
             deafen: "Ctrl+Shift+D".into(),
             push_to_talk: "Space".into(),
+            user_volumes: BTreeMap::new(),
         }
     }
 }
@@ -76,6 +82,10 @@ impl VoicePrefs {
         normalize_shortcut(&mut self.mute, "Ctrl+Shift+M");
         normalize_shortcut(&mut self.deafen, "Ctrl+Shift+D");
         normalize_shortcut(&mut self.push_to_talk, "Space");
+        self.user_volumes.retain(|user, _| *user > 0);
+        for volume in self.user_volumes.values_mut() {
+            *volume = (*volume).clamp(0, 200);
+        }
     }
 
     pub fn from_json(value: &Value) -> Self {
@@ -99,6 +109,17 @@ impl VoicePrefs {
             mute: value["Mute"].as_str().unwrap_or_default().to_owned(),
             deafen: value["Deafen"].as_str().unwrap_or_default().to_owned(),
             push_to_talk: value["PushToTalk"].as_str().unwrap_or_default().to_owned(),
+            user_volumes: value["UserVolumes"]
+                .as_object()
+                .map(|volumes| {
+                    volumes
+                        .iter()
+                        .filter_map(|(key, value)| {
+                            Some((key.parse::<i64>().ok()?, value.as_i64()?))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
         };
         prefs.normalize();
         prefs
@@ -121,14 +142,27 @@ impl VoicePrefs {
             "Mute": self.mute,
             "Deafen": self.deafen,
             "PushToTalk": self.push_to_talk,
+            "UserVolumes": self
+                .user_volumes
+                .iter()
+                .map(|(user, volume)| (user.to_string(), json!(volume)))
+                .collect::<serde_json::Map<_, _>>(),
         })
     }
 
-    /// Duplicate shortcuts are rejected by the Go form.
+    /// Duplicate shortcuts are rejected by the Go form. Comparison ignores
+    /// modifier spelling and order, so `Ctrl+Shift+M` and `Shift+Control+M`
+    /// are the same binding.
     pub fn shortcuts_valid(&self) -> bool {
-        self.mute != self.deafen
-            && self.mute != self.push_to_talk
-            && self.deafen != self.push_to_talk
+        let mute = canonical_shortcut(&self.mute);
+        let deafen = canonical_shortcut(&self.deafen);
+        let push_to_talk = canonical_shortcut(&self.push_to_talk);
+        !mute.is_empty()
+            && !deafen.is_empty()
+            && !push_to_talk.is_empty()
+            && mute != deafen
+            && mute != push_to_talk
+            && deafen != push_to_talk
     }
 
     /// Form `SetNoiseMode`. Switching modes must not touch the other mode's
@@ -159,6 +193,59 @@ fn normalize_shortcut(value: &mut String, fallback: &str) {
     } else if trimmed.len() != value.len() {
         *value = trimmed.to_owned();
     }
+}
+
+/// One spelling for a shortcut: `ctrl+alt+shift+super+key`, modifiers sorted.
+/// The form stores what the user pressed; conflict detection must not treat
+/// `Control+M` and `Ctrl+m` as different bindings.
+pub fn canonical_shortcut(text: &str) -> String {
+    let mut ctrl = false;
+    let mut alt = false;
+    let mut shift = false;
+    let mut platform = false;
+    let mut key = String::new();
+    for part in text
+        .split('+')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+    {
+        match part.to_lowercase().as_str() {
+            "ctrl" | "control" => ctrl = true,
+            "alt" => alt = true,
+            "shift" => shift = true,
+            "super" | "win" | "cmd" | "meta" | "platform" => platform = true,
+            _ => key = part.to_lowercase(),
+        }
+    }
+    if key.is_empty() {
+        return String::new();
+    }
+    let mut modifiers = Vec::new();
+    if ctrl {
+        modifiers.push("ctrl");
+    }
+    if alt {
+        modifiers.push("alt");
+    }
+    if shift {
+        modifiers.push("shift");
+    }
+    if platform {
+        modifiers.push("super");
+    }
+    modifiers.push(&key);
+    modifiers.join("+")
+}
+
+/// Go `shortcutLabel`: `Space` reads as `Пробел` and components are spaced.
+pub fn shortcut_label(text: &str) -> String {
+    text.split('+')
+        .map(|part| match part.trim() {
+            "Space" | "space" => "Пробел".to_owned(),
+            other => other.to_owned(),
+        })
+        .collect::<Vec<_>>()
+        .join(" + ")
 }
 
 pub fn path_from_layout(path: &Path) -> PathBuf {
@@ -250,6 +337,8 @@ pub struct VoiceSettings {
     pub preview_pending: bool,
     /// Real device notice (hot-unplug) or an in-call test explanation.
     pub device_notice: String,
+    /// Shortcut currently being recorded: 0 mute, 1 deafen, 2 push-to-talk.
+    pub recording_shortcut: Option<usize>,
     pub tone_pending: bool,
     pub tone_error: String,
     /// Bumped whenever the meter task must stop or restart.
@@ -285,6 +374,7 @@ impl Default for VoiceSettings {
             preview_epoch: 0,
             preview_pending: false,
             device_notice: String::new(),
+            recording_shortcut: None,
             tone_pending: false,
             tone_error: String::new(),
             meter_epoch: 0,
@@ -665,6 +755,47 @@ mod tests {
         let mut prefs = VoicePrefs::default();
         prefs.mute = prefs.deafen.clone();
         assert!(!prefs.shortcuts_valid());
+    }
+
+    #[test]
+    fn shortcut_conflicts_ignore_modifier_spelling_and_order() {
+        let mut prefs = VoicePrefs::default();
+        prefs.mute = "Control+Shift+m".into();
+        prefs.deafen = "Shift+Ctrl+M".into();
+        assert!(
+            !prefs.shortcuts_valid(),
+            "the same binding in another spelling is still a conflict"
+        );
+        prefs.deafen = "Ctrl+Shift+D".into();
+        assert!(prefs.shortcuts_valid());
+        assert_eq!(canonical_shortcut("Win+M"), "super+m");
+        assert_eq!(canonical_shortcut("M"), "m");
+        assert_eq!(canonical_shortcut("Ctrl+"), "");
+        assert_eq!(shortcut_label("Ctrl+Shift+Space"), "Ctrl + Shift + Пробел");
+    }
+
+    #[test]
+    fn user_volumes_are_keyed_by_user_id_and_bounded() {
+        let mut prefs = VoicePrefs::default();
+        prefs.user_volumes.insert(7, 150);
+        prefs.user_volumes.insert(8, 999);
+        prefs.user_volumes.insert(0, 50);
+        prefs.user_volumes.insert(-3, 50);
+        let loaded = VoicePrefs::from_json(&prefs.to_json());
+        assert_eq!(loaded.user_volumes.get(&7), Some(&150));
+        assert_eq!(
+            loaded.user_volumes.get(&8),
+            Some(&200),
+            "the stored value is normalized"
+        );
+        assert!(!loaded.user_volumes.contains_key(&0));
+        assert!(!loaded.user_volumes.contains_key(&-3));
+        // A malformed map cannot invent a user or a volume.
+        let broken = VoicePrefs::from_json(&json!({
+            "UserVolumes": {"alice": 40, "9": "loud", "10": 140}
+        }));
+        assert_eq!(broken.user_volumes.get(&10), Some(&140));
+        assert_eq!(broken.user_volumes.len(), 1);
     }
 
     #[test]

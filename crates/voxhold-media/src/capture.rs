@@ -41,6 +41,20 @@ const BUFFERS: usize = 4;
 const MAX_PENDING_BLOCKS: usize = 20;
 const MAX_PENDING: usize = BLOCK * MAX_PENDING_BLOCKS;
 const LEVEL_INTERVAL: u32 = 5;
+
+/// Whether a saved microphone id still resolves to a current WinMM input.
+/// `Session::check_devices` uses this because a working WinMM capture is not
+/// enumerated by Core Audio; an unplugged selected microphone must move to the
+/// system device instead of staying silently dead until the next join.
+#[cfg(windows)]
+pub fn input_available(id: &str) -> bool {
+    winmm::choose_device(Some(id), &winmm::list()).is_ok()
+}
+
+#[cfg(not(windows))]
+pub fn input_available(_id: &str) -> bool {
+    false
+}
 /// The software WinMM path has no render reference, so it cannot run echo
 /// cancellation and reports `false`. The platform ADM fallback keeps its own
 /// render/playout reference and may apply its default AEC, but nothing in this

@@ -105,6 +105,8 @@ fn main() {
                 },
                 move |window, cx| {
                     let view = cx.new(|cx| Voxhold::new(window, cx, &prefill, layout_path.clone()));
+                    #[cfg(feature = "voxhold-media")]
+                    view.update(cx, |view, cx| view.install_power(window, cx));
                     cx.new(|cx| Root::new(view.into(), window, cx))
                 },
             )

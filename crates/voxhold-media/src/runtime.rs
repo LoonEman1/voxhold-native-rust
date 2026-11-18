@@ -9,13 +9,13 @@
 
 use crate::{
     Command, Controls, Event, IceServer, Media, VideoFrame,
-    controller::{Action, AppliedAudio, Participant, Publication, Signal, VoiceController},
+    controller::{Action, Publication, Signal, VoiceController},
     stream::{EngineUpdate, StreamViewer},
     viewer::{Outcome as ViewerOutcome, Viewer},
     voice::CaptureGate,
 };
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::VecDeque,
     sync::{
         Arc, Condvar, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -25,7 +25,6 @@ use std::{
 };
 use tokio::sync::Notify;
 
-const UPDATE_CAPACITY: usize = 64;
 const LOCAL_MUTE_CAPACITY: usize = 64;
 const FRAMES_PER_TICK: usize = 4;
 const DEFAULT_VIEWPORT: (u32, u32) = (960, 540);
@@ -38,116 +37,9 @@ const SEND_TIMEOUT: Duration = Duration::from_secs(2);
 /// The leave handshake is best effort; the capture is already latched.
 const LEAVE_SEND_TIMEOUT: Duration = Duration::from_millis(750);
 
-#[derive(Clone, Debug)]
-pub enum VoiceUpdate {
-    Connecting,
-    Connected,
-    Reconnecting,
-    Participants(Vec<Participant>),
-    Speaking(HashMap<String, bool>),
-    LocalLevel(f64),
-    Tracks(HashSet<String>),
-    Streams(Vec<Publication>),
-    StreamStatus {
-        selection: u64,
-        status: String,
-    },
-    StreamError {
-        selection: u64,
-        error: String,
-    },
-    StreamConnected {
-        selection: u64,
-        connected: bool,
-    },
-    /// A stream-audio device notice. It must not close the viewer: on a
-    /// successful rollback the video and the previous output stay alive.
-    StreamAudio {
-        selection: u64,
-        error: Option<String>,
-    },
-    DeviceError(String),
-    /// Applied input device for an explicit selection or an engine fallback.
-    /// `generation` is zero for engine-initiated changes.
-    InputApplied {
-        generation: u64,
-        input: Option<String>,
-        error: Option<String>,
-    },
-    /// The capture chain actually applied by the media engine, including the
-    /// platform-ADM fallback and its forced NS/AGC.
-    AudioMode(AppliedAudio),
-    /// The attempt finished. An error reason is carried together with the end
-    /// so the UI can never lose it to a coalesced terminal `Left`.
-    Ended(Option<String>),
-}
-
-impl VoiceUpdate {
-    fn same_slot(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Self::StreamStatus { selection: a, .. }, Self::StreamStatus { selection: b, .. })
-            | (Self::StreamError { selection: a, .. }, Self::StreamError { selection: b, .. })
-            | (Self::StreamAudio { selection: a, .. }, Self::StreamAudio { selection: b, .. })
-            | (
-                Self::StreamConnected { selection: a, .. },
-                Self::StreamConnected { selection: b, .. },
-            ) => a == b,
-            _ => matches!(
-                (self, other),
-                (Self::Connecting, Self::Connecting)
-                    | (Self::Connected, Self::Connected)
-                    | (Self::Reconnecting, Self::Reconnecting)
-                    | (Self::Participants(_), Self::Participants(_))
-                    | (Self::Speaking(_), Self::Speaking(_))
-                    | (Self::LocalLevel(_), Self::LocalLevel(_))
-                    | (Self::Tracks(_), Self::Tracks(_))
-                    | (Self::Streams(_), Self::Streams(_))
-                    | (Self::InputApplied { .. }, Self::InputApplied { .. })
-                    | (Self::AudioMode(_), Self::AudioMode(_))
-            ),
-        }
-    }
-
-    fn terminal(&self) -> bool {
-        matches!(self, Self::Ended(_))
-    }
-}
-
-/// Coalescing update queue. Terminal updates are never merged into a snapshot.
-struct Updates {
-    queue: Mutex<VecDeque<VoiceUpdate>>,
-}
-
-impl Updates {
-    fn new() -> Self {
-        Self {
-            queue: Mutex::new(VecDeque::new()),
-        }
-    }
-
-    fn push(&self, update: VoiceUpdate) {
-        let Ok(mut queue) = self.queue.lock() else {
-            return;
-        };
-        if update.terminal() {
-            queue.retain(|old| !old.terminal());
-            queue.push_back(update);
-            return;
-        }
-        if let Some(slot) = queue.iter_mut().find(|old| old.same_slot(&update)) {
-            *slot = update;
-            return;
-        }
-        if queue.len() >= UPDATE_CAPACITY {
-            queue.pop_front();
-        }
-        queue.push_back(update);
-    }
-
-    fn poll(&self) -> Option<VoiceUpdate> {
-        self.queue.lock().ok()?.pop_front()
-    }
-}
+mod updates;
+use updates::Updates;
+pub use updates::VoiceUpdate;
 
 mod requests;
 mod test_support;
@@ -276,6 +168,15 @@ impl VoiceHandle {
                 queue.pop_front();
             }
             queue.push_back((connection, muted));
+        }
+        self.requests.wake();
+    }
+
+    /// System power transition. The worker reopens or releases the playout
+    /// sink; a resume before the first session is a no-op for the engine.
+    pub fn power(&self, resumed: bool) {
+        if let Ok(mut slot) = self.requests.power.lock() {
+            *slot = Some(resumed);
         }
         self.requests.wake();
     }
@@ -474,6 +375,7 @@ impl Live {
             let speaking = controller.speaking.clone();
             let tracks = controller.connections_with_audio();
             let applied = controller.applied_audio.clone();
+            let playout = controller.playout;
             let actions = controller.media_event(event);
             if !self.execute(actions).await? {
                 return Ok(false);
@@ -481,6 +383,11 @@ impl Live {
             if controller.applied_audio != applied {
                 if let Some(applied) = controller.applied_audio.clone() {
                     self.updates.push(VoiceUpdate::AudioMode(applied));
+                }
+            }
+            if controller.playout != playout {
+                if let Some(stats) = controller.playout {
+                    self.updates.push(VoiceUpdate::Playout(stats));
                 }
             }
             if controller.speaking != speaking {
@@ -909,6 +816,18 @@ async fn run_session(
                     live.updates
                         .push(VoiceUpdate::Speaking(controller.speaking.clone()));
                 }
+                Pending::Power(resumed) => {
+                    let command = if resumed {
+                        Command::Resume
+                    } else {
+                        Command::Suspend
+                    };
+                    if let Err(error) = live.media.command(command) {
+                        live.updates.push(VoiceUpdate::DeviceError(format!(
+                            "Не удалось передать состояние питания медиадвижку: {error:?}"
+                        )));
+                    }
+                }
             }
             live.updates
                 .push(VoiceUpdate::Participants(controller.participants.clone()));
@@ -1103,6 +1022,10 @@ fn run(
                     }
                     Pending::StreamMute(selection, muted) => {
                         let _ = viewer.set_muted(selection, muted);
+                    }
+                    Pending::Power(_) => {
+                        // No engine exists between attempts: the next session
+                        // opens its sink from the controls snapshot.
                     }
                 }
             }

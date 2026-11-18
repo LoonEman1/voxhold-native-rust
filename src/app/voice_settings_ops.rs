@@ -39,12 +39,19 @@ impl Voxhold {
                 }
                 self.voice_settings.persist();
                 self.apply_voice_snapshot(cx);
-                // R07a: an explicit output choice is its own request, even when
-                // the cached id looks unchanged after a hot-unplug.
                 #[cfg(feature = "voxhold-media")]
-                if !input {
-                    let output = self.voice_settings.prefs.output.clone();
-                    if let Some(voice) = &self.voice {
+                if let Some(voice) = &self.voice {
+                    if input {
+                        // R07b: input changes during a call use their own
+                        // generation, so a later PTT/DSP State cannot displace
+                        // the explicit choice.
+                        let input = self.voice_settings.prefs.input.clone();
+                        voice.update(cx, |panel, _| panel.select_input(Some(input)));
+                    } else {
+                        // R07a: an explicit output choice is its own request,
+                        // even when the cached id looks unchanged after a
+                        // hot-unplug.
+                        let output = self.voice_settings.prefs.output.clone();
                         voice.update(cx, |panel, _| panel.select_output(Some(output)));
                     }
                 }
@@ -110,12 +117,24 @@ impl Voxhold {
                 }
                 cx.notify();
             }
+            Action::ToggleAutoGain => {
+                self.voice_settings.prefs.auto_gain = !self.voice_settings.prefs.auto_gain;
+                self.voice_settings.persist();
+                self.apply_voice_snapshot(cx);
+                cx.notify();
+            }
             Action::ResetVoice => {
                 // Go resets to `defaultVoicePreferences()` and therefore also
                 // clears both selected devices.
                 self.voice_settings.prefs = crate::voice_settings::VoicePrefs::default();
                 self.voice_settings.persist();
                 self.apply_voice_snapshot(cx);
+                #[cfg(feature = "voxhold-media")]
+                if let Some(voice) = &self.voice {
+                    // The empty selection is the system default, and it must
+                    // reach the live software/ADM input, not only the file.
+                    voice.update(cx, |panel, _| panel.select_input(None));
+                }
                 #[cfg(feature = "voxhold-media")]
                 if let Some(voice) = &self.voice {
                     voice.update(cx, |voice, cx| {
@@ -170,8 +189,22 @@ impl Voxhold {
             let bitrate = prefs.bitrate as u32;
             let input_volume = prefs.input_volume;
             let output_volume = prefs.output_volume;
+            let noise_mode = prefs.noise_mode.clone();
+            let noise_gate = prefs.noise_gate;
+            let echo_cancellation = prefs.echo_cancellation;
+            let auto_gain = prefs.auto_gain;
             voice.update(cx, |panel, _| {
-                panel.apply_voice_prefs(input, output, bitrate, input_volume, output_volume);
+                panel.apply_voice_prefs(
+                    input,
+                    output,
+                    bitrate,
+                    input_volume,
+                    output_volume,
+                    &noise_mode,
+                    noise_gate,
+                    echo_cancellation,
+                    auto_gain,
+                );
             });
         }
         #[cfg(not(feature = "voxhold-media"))]

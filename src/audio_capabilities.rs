@@ -41,6 +41,10 @@ mod fallback {
             output_test: Support::Unavailable,
         }
     }
+
+    pub fn capabilities_for(_capture: Option<&str>) -> AudioCapabilities {
+        audio_capabilities()
+    }
 }
 
 #[cfg(not(feature = "voxhold-media"))]

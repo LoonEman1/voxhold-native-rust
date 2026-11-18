@@ -44,6 +44,7 @@ pub enum Action {
     ToggleSounds,
     SetNoiseMode(usize),
     SetInputMode(usize),
+    ToggleAutoGain,
     ResetVoice,
     TestMicrophone,
     TestTone,

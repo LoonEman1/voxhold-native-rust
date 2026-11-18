@@ -2,11 +2,13 @@
 //! played signal in this build. The settings form renders these values instead
 //! of fake switches.
 //!
-//! R07b (the PCM capture → APM → gate → gain path) is not in `dev` yet. The
-//! pinned `libwebrtc` 0.4.0 platform ADM applies its own AEC/NS/AGC and offers
-//! no per-connection PCM hook; `builtin_*` switches only describe Windows
-//! hardware, where they are false. So echo cancellation and gain control are
-//! reported as automatic, not as user-toggled features.
+//! R07b introduced a software WinMM capture path with one APM, a software gate
+//! and input gain. Those values are applied in that path. The platform ADM
+//! fallback is a different chain: it forces its own NS/AGC and cannot honour a
+//! custom gate or gain, so the settings tab asks [`capabilities_for`] for the
+//! active capture chain instead of promising the software values everywhere.
+//! Echo cancellation is reported as unavailable because the pinned engine has
+//! no render reference; the ADM's own AEC is the unmeasured platform default.
 
 /// How a preference relates to the real audio path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -23,14 +25,17 @@ pub enum Support {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AudioCapabilities {
-    /// Extra microphone gain 1–200 %; needs the R07b PCM path.
+    /// Microphone gain 0–200 %. Applied in the software capture path.
     pub input_gain: Support,
-    /// Noise gate threshold; needs the R07b PCM path.
+    /// Software threshold gate. Applied in the software capture path.
     pub noise_gate: Support,
+    /// Echo cancellation. No render reference exists for the software APM.
     pub echo_cancellation: Support,
+    /// WebRTC APM automatic gain in the software path.
     pub auto_gain: Support,
+    /// APM noise suppression in auto mode; threshold uses the software gate.
     pub noise_suppression: Support,
-    /// Room output gain: 0 closes the tracks, 1–200 is not applied yet.
+    /// Room output gain: 0 closes the tracks, 1–200 is not applied yet (W02c).
     pub output_gain: Support,
     /// Opus maximum bitrate selection.
     pub bitrate: Support,
@@ -40,20 +45,34 @@ pub struct AudioCapabilities {
     pub output_test: Support,
 }
 
-/// The capabilities of this build. Windows gets the WinMM preview/tone port;
-/// every other target reports them unavailable.
+/// The capabilities of this build before a call reports its capture chain.
 pub fn audio_capabilities() -> AudioCapabilities {
     AudioCapabilities {
-        input_gain: Support::Unavailable,
-        noise_gate: Support::Unavailable,
-        echo_cancellation: Support::Automatic,
-        auto_gain: Support::Automatic,
-        noise_suppression: Support::Automatic,
+        input_gain: Support::Applied,
+        noise_gate: Support::Applied,
+        echo_cancellation: Support::Unavailable,
+        auto_gain: Support::Applied,
+        noise_suppression: Support::Applied,
         output_gain: Support::Limited,
         bitrate: Support::Applied,
         microphone_preview: preview_support(),
         output_test: tone_support(),
     }
+}
+
+/// Capabilities of the chain that is actually open. `software` is the WinMM
+/// 48 kHz path; `platform` is the ADM fallback, where NS/AGC are forced and the
+/// stored gate/gain are not applied.
+pub fn capabilities_for(capture: Option<&str>) -> AudioCapabilities {
+    let mut capabilities = audio_capabilities();
+    if capture == Some("platform") {
+        capabilities.input_gain = Support::Limited;
+        capabilities.noise_gate = Support::Unavailable;
+        capabilities.echo_cancellation = Support::Automatic;
+        capabilities.auto_gain = Support::Automatic;
+        capabilities.noise_suppression = Support::Automatic;
+    }
+    capabilities
 }
 
 #[cfg(windows)]
@@ -81,15 +100,35 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_map_tells_the_truth_about_every_switch() {
+    fn the_software_path_applies_gate_gain_and_apm() {
         let capabilities = audio_capabilities();
-        assert_eq!(capabilities.bitrate, Support::Applied);
+        assert_eq!(capabilities.input_gain, Support::Applied);
+        assert_eq!(capabilities.noise_gate, Support::Applied);
+        assert_eq!(capabilities.auto_gain, Support::Applied);
+        assert_eq!(capabilities.noise_suppression, Support::Applied);
+        assert_ne!(
+            capabilities.echo_cancellation,
+            Support::Applied,
+            "no render reference exists"
+        );
         assert_eq!(capabilities.output_gain, Support::Limited);
-        assert_eq!(capabilities.echo_cancellation, Support::Automatic);
-        assert_eq!(capabilities.auto_gain, Support::Automatic);
-        assert_eq!(capabilities.noise_suppression, Support::Automatic);
-        assert_ne!(capabilities.input_gain, Support::Applied);
-        assert_ne!(capabilities.noise_gate, Support::Applied);
+        assert_eq!(capabilities.bitrate, Support::Applied);
+    }
+
+    #[test]
+    fn the_platform_fallback_is_not_described_as_software() {
+        let platform = capabilities_for(Some("platform"));
+        assert_eq!(platform.input_gain, Support::Limited);
+        assert_eq!(platform.noise_gate, Support::Unavailable);
+        assert_eq!(platform.echo_cancellation, Support::Automatic);
+        assert_eq!(platform.auto_gain, Support::Automatic);
+        assert_eq!(platform.noise_suppression, Support::Automatic);
+        assert_eq!(platform.bitrate, Support::Applied);
+
+        let software = capabilities_for(Some("software"));
+        assert_eq!(software.input_gain, Support::Applied);
+        assert_eq!(software.noise_gate, Support::Applied);
+        assert_eq!(software.echo_cancellation, Support::Unavailable);
     }
 
     #[cfg(windows)]

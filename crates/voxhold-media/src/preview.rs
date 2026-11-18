@@ -3,7 +3,7 @@
 //! This is a direct port of the Go `cmd/voxhold/audio_windows.go` helpers:
 //! three 50 ms buffers (`rate / 20` samples) polled every 50 ms, RMS with the
 //! `min(1, sqrt(energy / samples) * 4.5)` scale and the 0.45/0.55 smoothing;
-//! the tone is `0.55·sin(2π660t) + 0.45·sin(2π880t)` with the Go envelope over
+//! the tone is `0.55В·sin(2ПЂ660t) + 0.45В·sin(2ПЂ880t)` with the Go envelope over
 //! `rate / 4` samples and a 350 ms wait. The preview never enters the WebRTC
 //! transmission; it only feeds the settings meter.
 
@@ -41,7 +41,7 @@ pub fn level_from_rms(rms: f64) -> f32 {
     (rms.max(0.0) * LEVEL_GAIN).min(1.0) as f32
 }
 
-/// Exact Go test tone. `volume` is the 0–100 signal volume.
+/// Exact Go test tone. `volume` is the 0вЂ“100 signal volume.
 pub fn tone_samples(rate: u32, volume: i64) -> Vec<i16> {
     let count = (rate / 4) as usize;
     let volume = volume.clamp(0, 100) as f64;
@@ -77,6 +77,20 @@ pub fn resolve_device(id: &str, devices: &[(u32, String)]) -> Option<u32> {
         .iter()
         .find(|(_, candidate)| candidate == name)
         .map(|(index, _)| *index)
+}
+
+/// Endpoint ids do not contain the WinMM display name. Resolve them only when
+/// one current input has that name; two identical microphones are ambiguous.
+pub fn unique_index_by_name(name: &str, devices: &[(u32, String)]) -> Option<u32> {
+    if name.is_empty() {
+        return None;
+    }
+    let mut matches = devices
+        .iter()
+        .filter(|(_, candidate)| candidate == name)
+        .map(|(index, _)| *index);
+    let first = matches.next()?;
+    matches.next().is_none().then_some(first)
 }
 
 /// Live WinMM preview owned by the settings tab. `stop` only signals; the
@@ -117,7 +131,8 @@ impl Drop for LevelPreview {
     }
 }
 
-pub const UNAVAILABLE_DEVICE: &str = "Выбранное аудиоустройство недоступно.";
+pub const UNAVAILABLE_DEVICE: &str =
+    "Р’С‹Р±СЂР°РЅРЅРѕРµ Р°СѓРґРёРѕСѓСЃС‚СЂРѕР№СЃС‚РІРѕ РЅРµРґРѕСЃС‚СѓРїРЅРѕ.";
 
 #[cfg(windows)]
 mod windows {
@@ -182,7 +197,7 @@ mod windows {
         fn waveInGetDevCapsW(id: usize, caps: *mut WaveInCaps, size: u32) -> u32;
         fn waveOutGetDevCapsW(id: usize, caps: *mut WaveOutCaps, size: u32) -> u32;
         fn waveInOpen(
-            handle: *mut isize,
+            handle: *mut usize,
             device: u32,
             format: *const WaveFormat,
             callback: usize,
@@ -190,24 +205,24 @@ mod windows {
             flags: u32,
         ) -> u32;
         fn waveOutOpen(
-            handle: *mut isize,
+            handle: *mut usize,
             device: u32,
             format: *const WaveFormat,
             callback: usize,
             instance: usize,
             flags: u32,
         ) -> u32;
-        fn waveInClose(handle: isize) -> u32;
-        fn waveOutClose(handle: isize) -> u32;
-        fn waveInPrepareHeader(handle: isize, header: *mut WaveHdr, size: u32) -> u32;
-        fn waveInUnprepareHeader(handle: isize, header: *mut WaveHdr, size: u32) -> u32;
-        fn waveOutPrepareHeader(handle: isize, header: *mut WaveHdr, size: u32) -> u32;
-        fn waveOutUnprepareHeader(handle: isize, header: *mut WaveHdr, size: u32) -> u32;
-        fn waveInReset(handle: isize) -> u32;
-        fn waveOutReset(handle: isize) -> u32;
-        fn waveInAddBuffer(handle: isize, header: *mut WaveHdr, size: u32) -> u32;
-        fn waveOutWrite(handle: isize, header: *mut WaveHdr, size: u32) -> u32;
-        fn waveInStart(handle: isize) -> u32;
+        fn waveInClose(handle: usize) -> u32;
+        fn waveOutClose(handle: usize) -> u32;
+        fn waveInPrepareHeader(handle: usize, header: *mut WaveHdr, size: u32) -> u32;
+        fn waveInUnprepareHeader(handle: usize, header: *mut WaveHdr, size: u32) -> u32;
+        fn waveOutPrepareHeader(handle: usize, header: *mut WaveHdr, size: u32) -> u32;
+        fn waveOutUnprepareHeader(handle: usize, header: *mut WaveHdr, size: u32) -> u32;
+        fn waveInReset(handle: usize) -> u32;
+        fn waveOutReset(handle: usize) -> u32;
+        fn waveInAddBuffer(handle: usize, header: *mut WaveHdr, size: u32) -> u32;
+        fn waveOutWrite(handle: usize, header: *mut WaveHdr, size: u32) -> u32;
+        fn waveInStart(handle: usize) -> u32;
     }
 
     fn label(name: &[u16]) -> String {
@@ -244,7 +259,7 @@ mod windows {
     }
 
     struct Opened {
-        handle: isize,
+        handle: usize,
         rate: u32,
     }
 
@@ -264,7 +279,7 @@ mod windows {
         let mut code = 0;
         for rate in [48_000_u32, 44_100] {
             let wave_format = format(rate);
-            let mut handle: isize = 0;
+            let mut handle: usize = 0;
             code = unsafe {
                 if input {
                     waveInOpen(&mut handle, device, &wave_format, 0, 0, CALLBACK_NULL)
@@ -278,16 +293,16 @@ mod windows {
         }
         if code == 4 || code == 11 {
             return Err(
-                "Нет доступа к устройству. Проверьте разрешения и настройки звука Windows.".into(),
+                "РќРµС‚ РґРѕСЃС‚СѓРїР° Рє СѓСЃС‚СЂРѕР№СЃС‚РІСѓ. РџСЂРѕРІРµСЂСЊС‚Рµ СЂР°Р·СЂРµС€РµРЅРёСЏ Рё РЅР°СЃС‚СЂРѕР№РєРё Р·РІСѓРєР° Windows.".into(),
             );
         }
         Err(format!(
-            "Не удалось открыть аудиоустройство Windows ({code})."
+            "РќРµ СѓРґР°Р»РѕСЃСЊ РѕС‚РєСЂС‹С‚СЊ Р°СѓРґРёРѕСѓСЃС‚СЂРѕР№СЃС‚РІРѕ Windows ({code})."
         ))
     }
 
     fn wave_error(code: u32) -> String {
-        format!("Аудиоустройство вернуло ошибку {code}.")
+        format!("РђСѓРґРёРѕСѓСЃС‚СЂРѕР№СЃС‚РІРѕ РІРµСЂРЅСѓР»Рѕ РѕС€РёР±РєСѓ {code}.")
     }
 
     pub(super) fn run_level(preview: &LevelPreview, device: u32) -> Result<(), String> {
@@ -330,7 +345,9 @@ mod windows {
             }
             let code = unsafe { waveInStart(handle) };
             if code != 0 {
-                return Err(format!("Не удалось запустить микрофон Windows ({code})."));
+                return Err(format!(
+                    "РќРµ СѓРґР°Р»РѕСЃСЊ Р·Р°РїСѓСЃС‚РёС‚СЊ РјРёРєСЂРѕС„РѕРЅ Windows ({code})."
+                ));
             }
             let mut smoothed = 0.0_f64;
             while !preview.stop.load(Ordering::Relaxed) {
@@ -443,13 +460,24 @@ pub fn tone_available() -> bool {
     false
 }
 
+#[cfg(windows)]
+fn resolve_input_device(id: &str) -> Option<u32> {
+    let devices = windows::input_devices();
+    if let Some(index) = resolve_device(id, &devices) {
+        return Some(index);
+    }
+    // New preferences store the Core Audio endpoint id (R07b). Resolve it to
+    // the WinMM index only when the display name identifies one device.
+    let name = crate::devices::endpoint_name(id)?;
+    unique_index_by_name(&name, &devices)
+}
+
 /// Start the level preview on the selected WinMM input. An unknown id is
 /// rejected before any thread is spawned; open/capture failures land in
 /// `LevelPreview::error`.
 #[cfg(windows)]
 pub fn start_level(device_id: &str) -> Result<LevelPreview, String> {
-    let devices = windows::input_devices();
-    let Some(device) = resolve_device(device_id, &devices) else {
+    let Some(device) = resolve_input_device(device_id) else {
         return Err(UNAVAILABLE_DEVICE.into());
     };
     let stop = Arc::new(AtomicBool::new(false));
@@ -469,7 +497,7 @@ pub fn start_level(device_id: &str) -> Result<LevelPreview, String> {
                 store_shared_error(&worker.error, message);
             }
         })
-        .map_err(|error| format!("Не удалось запустить проверку микрофона: {error}"))?;
+        .map_err(|error| format!("РќРµ СѓРґР°Р»РѕСЃСЊ Р·Р°РїСѓСЃС‚РёС‚СЊ РїСЂРѕРІРµСЂРєСѓ РјРёРєСЂРѕС„РѕРЅР°: {error}"))?;
     Ok(LevelPreview {
         stop,
         level,
@@ -480,7 +508,7 @@ pub fn start_level(device_id: &str) -> Result<LevelPreview, String> {
 
 #[cfg(not(windows))]
 pub fn start_level(_device_id: &str) -> Result<LevelPreview, String> {
-    Err("Проверка микрофона доступна только в Windows.".into())
+    Err("РџСЂРѕРІРµСЂРєР° РјРёРєСЂРѕС„РѕРЅР° РґРѕСЃС‚СѓРїРЅР° С‚РѕР»СЊРєРѕ РІ Windows.".into())
 }
 
 /// Play the Go interface tone on the selected WinMM output and wait 350 ms.
@@ -495,7 +523,7 @@ pub fn play_tone(device_id: &str, volume: i64) -> Result<(), String> {
 
 #[cfg(not(windows))]
 pub fn play_tone(_device_id: &str, _volume: i64) -> Result<(), String> {
-    Err("Проверка сигналов доступна только в Windows.".into())
+    Err("РџСЂРѕРІРµСЂРєР° СЃРёРіРЅР°Р»РѕРІ РґРѕСЃС‚СѓРїРЅР° С‚РѕР»СЊРєРѕ РІ Windows.".into())
 }
 
 #[cfg(windows)]
@@ -603,5 +631,19 @@ mod tests {
         assert_eq!(resolve_device("9:Missing", &devices), None);
         assert_eq!(resolve_device("Microphone", &[]), None);
         assert_eq!(resolve_device("", &[]), Some(WAVE_MAPPER));
+    }
+
+    #[test]
+    fn an_endpoint_name_must_identify_one_input() {
+        let devices = vec![(1, "Microphone".to_owned()), (2, "Line In".to_owned())];
+        assert_eq!(unique_index_by_name("Line In", &devices), Some(2));
+        assert_eq!(unique_index_by_name("Missing", &devices), None);
+        assert_eq!(unique_index_by_name("", &devices), None);
+        let duplicated = vec![(1, "USB Mic".to_owned()), (2, "USB Mic".to_owned())];
+        assert_eq!(
+            unique_index_by_name("USB Mic", &duplicated),
+            None,
+            "two identical names must not open an arbitrary microphone"
+        );
     }
 }

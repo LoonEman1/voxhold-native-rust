@@ -269,6 +269,59 @@ impl VoiceSettings {
     }
 }
 
+/// Migrate a legacy WinMM `index:name` input preference to the stable endpoint
+/// id. Only a unique name/prefix is migrated; duplicate names are left for the
+/// user to choose again. Endpoint ids and empty values are unchanged.
+pub fn migrate_legacy_input(input: &str, devices: &[Device]) -> Option<String> {
+    if input.is_empty() {
+        return None;
+    }
+    let (index, name) = input.split_once(':')?;
+    if index.parse::<u32>().is_err() || name.is_empty() {
+        return None;
+    }
+    if devices
+        .iter()
+        .any(|device| device.input && device.id == input)
+    {
+        return None;
+    }
+    let exact: Vec<_> = devices
+        .iter()
+        .filter(|device| device.input && device.name == name)
+        .collect();
+    if let [device] = exact.as_slice() {
+        return Some(device.id.clone());
+    }
+    if !exact.is_empty() {
+        return None;
+    }
+    let prefix: Vec<_> = devices
+        .iter()
+        .filter(|device| device.input && device.name.starts_with(name))
+        .collect();
+    match prefix.as_slice() {
+        [device] => Some(device.id.clone()),
+        _ => None,
+    }
+}
+
+/// Migrate either legacy form of a saved input: the WinMM `index:name` value
+/// or the older PnP interface id. New Core Audio endpoint ids pass through
+/// unchanged.
+pub fn migrate_saved_input(input: &str, devices: &[Device]) -> Option<String> {
+    migrate_legacy_input(input, devices).or_else(|| {
+        #[cfg(feature = "voxhold-media")]
+        {
+            voxhold_media::devices::canonical_input_id(input).filter(|id| id != input)
+        }
+        #[cfg(not(feature = "voxhold-media"))]
+        {
+            None
+        }
+    })
+}
+
 /// Device labels with the synthetic "system default" and an unavailable
 /// selected id, exactly like `deviceChoice` in Go.
 pub fn device_choices(
@@ -431,6 +484,41 @@ mod tests {
         let mut prefs = VoicePrefs::default();
         prefs.mute = prefs.deafen.clone();
         assert!(!prefs.shortcuts_valid());
+    }
+
+    #[test]
+    fn legacy_winmm_inputs_migrate_only_when_unambiguous() {
+        let devices = vec![
+            Device {
+                id: "endpoint-0".into(),
+                name: "USB Mic".into(),
+                input: true,
+            },
+            Device {
+                id: "endpoint-1".into(),
+                name: "USB Mic".into(),
+                input: true,
+            },
+            Device {
+                id: "endpoint-2".into(),
+                name: "Headset".into(),
+                input: true,
+            },
+        ];
+        assert_eq!(
+            migrate_legacy_input("0:Headset", &devices),
+            Some("endpoint-2".into())
+        );
+        assert_eq!(
+            migrate_legacy_input("0:USB Mic", &devices),
+            None,
+            "identical names require an explicit reselect"
+        );
+        assert_eq!(
+            migrate_legacy_input("endpoint-0", &devices),
+            None,
+            "new endpoint ids are not rewritten"
+        );
     }
 
     #[test]

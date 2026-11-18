@@ -1,4 +1,4 @@
-//! Settings dialog lifecycle and personal settings operations.
+﻿//! Settings dialog lifecycle and personal settings operations.
 
 use super::*;
 use crate::settings::{self, RequestToken};
@@ -504,7 +504,22 @@ impl Voxhold {
                     if s.active_settings == Some(SettingsKind::Personal)
                         && s.personal.as_ref().map(|panel| panel.dialog.generation) == generation
                     {
+                        let migrated = crate::voice_settings::migrate_saved_input(
+                            &s.voice_settings.prefs.input,
+                            &devices,
+                        );
                         s.voice_settings.devices = devices;
+                        if let Some(id) = migrated {
+                            s.voice_settings.prefs.input = id.clone();
+                            s.voice_settings.persist();
+                            // The live panel and the tab preview must follow
+                            // the canonical endpoint id immediately.
+                            #[cfg(feature = "voxhold-media")]
+                            if let Some(voice) = &s.voice {
+                                voice.update(cx, |panel, _| panel.select_input(Some(id)));
+                            }
+                            s.start_voice_preview(cx);
+                        }
                     }
                     cx.notify();
                 })
@@ -537,7 +552,7 @@ impl Voxhold {
             Action::RetrySessions => self.load_personal_sessions(cx),
             Action::SaveProfile => self.save_profile(window, cx),
             Action::CancelProfile => {
-                // "Отмена" must not roll the form back while a PATCH owns the
+                // "РћС‚РјРµРЅР°" must not roll the form back while a PATCH owns the
                 // editor values: that would clear `dispatched`, and the
                 // successful answer would no longer update the fields.
                 if self.active_profile_save.is_some() {
@@ -647,6 +662,7 @@ impl Voxhold {
             | Action::ToggleSounds
             | Action::SetNoiseMode(_)
             | Action::SetInputMode(_)
+            | Action::ToggleAutoGain
             | Action::ResetVoice
             | Action::TestMicrophone
             | Action::TestTone => {}
@@ -774,7 +790,7 @@ impl Voxhold {
                         }
                         panel.profile = Some(profile);
                         if accepted || profile_visible {
-                            panel.notice = "Профиль обновлён.".into();
+                            panel.notice = "РџСЂРѕС„РёР»СЊ РѕР±РЅРѕРІР»С‘РЅ.".into();
                         }
                     }
                     Err(error) => {
@@ -838,7 +854,7 @@ impl Voxhold {
                                     input.set_value(String::new(), window, cx)
                                 });
                             }
-                            panel.notice = "Пароль изменён. Остальные сессии завершены.".into();
+                            panel.notice = "РџР°СЂРѕР»СЊ РёР·РјРµРЅС‘РЅ. РћСЃС‚Р°Р»СЊРЅС‹Рµ СЃРµСЃСЃРёРё Р·Р°РІРµСЂС€РµРЅС‹.".into();
                         }
                         s.load_personal_sessions(cx);
                     }
@@ -1007,7 +1023,7 @@ impl Voxhold {
         let password = panel.delete_password.read(cx).value().to_string();
         if name != profile.username || password.is_empty() {
             if let Some(panel) = &mut self.personal {
-                panel.validation = "Введите имя аккаунта и пароль.".into();
+                panel.validation = "Р’РІРµРґРёС‚Рµ РёРјСЏ Р°РєРєР°СѓРЅС‚Р° Рё РїР°СЂРѕР»СЊ.".into();
             }
             cx.notify();
             return;
@@ -1015,7 +1031,7 @@ impl Voxhold {
         if self.servers.iter().any(|server| server.role == "owner") {
             if let Some(panel) = &mut self.personal {
                 panel.validation =
-                    "Владелец не может удалить пространство или свой аккаунт из приложения.".into();
+                    "Р’Р»Р°РґРµР»РµС† РЅРµ РјРѕР¶РµС‚ СѓРґР°Р»РёС‚СЊ РїСЂРѕСЃС‚СЂР°РЅСЃС‚РІРѕ РёР»Рё СЃРІРѕР№ Р°РєРєР°СѓРЅС‚ РёР· РїСЂРёР»РѕР¶РµРЅРёСЏ.".into();
             }
             cx.notify();
             return;

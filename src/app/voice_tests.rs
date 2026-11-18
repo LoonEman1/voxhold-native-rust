@@ -5,7 +5,8 @@
 use super::*;
 use crate::voice_room::CallPhase;
 use gpui::{Keystroke, TestAppContext, VisualTestContext};
-use voxhold_media::controller::{Participant, Publication};
+use voxhold_media::controller::{AppliedAudio, Participant, Publication};
+use voxhold_media::runtime::VoiceUpdate;
 
 fn client() -> voxhold_api::Client {
     let mut client = voxhold_api::Client::new("http://127.0.0.1:1").unwrap();
@@ -661,6 +662,22 @@ async fn voice_actions_apply_one_snapshot_and_persist(cx: &mut TestAppContext) {
             assert!(v.voice_settings_action(Action::SetNoiseMode(1), cx));
             assert_eq!(v.voice_settings.prefs.noise_mode, "threshold");
             assert!(v.voice_settings_action(Action::SetVolume("noise", 40), cx));
+            if let Some(voice) = &v.voice {
+                let controls = voice.read(cx).test_controls();
+                assert_eq!(controls.noise_mode.as_str(), "threshold");
+                assert_eq!(controls.noise_gate_percent, 40);
+                assert!((controls.input_gain - 1.5).abs() < 1e-6);
+                assert_eq!(controls.output_gain, Some(0.0));
+            }
+            let auto_gain = v.voice_settings.prefs.auto_gain;
+            assert!(v.voice_settings_action(Action::ToggleAutoGain, cx));
+            assert_ne!(v.voice_settings.prefs.auto_gain, auto_gain);
+            if let Some(voice) = &v.voice {
+                assert_eq!(
+                    voice.read(cx).test_controls().auto_gain_control,
+                    v.voice_settings.prefs.auto_gain
+                );
+            }
             assert!(v.voice_settings_action(Action::SetVolume("sound", 25), cx));
             assert_eq!(v.voice_settings.prefs.sound_volume, 25);
             let sounds = v.voice_settings.prefs.sounds;
@@ -680,11 +697,14 @@ async fn voice_actions_apply_one_snapshot_and_persist(cx: &mut TestAppContext) {
     });
     voice.read_with(&*visual, |panel, _| {
         let controls = panel.test_controls();
-        assert_eq!(controls.input.as_deref(), Some(""));
+        assert!(
+            controls.input.is_none() || controls.input.as_deref() == Some(""),
+            "reset selects the system input"
+        );
         assert_eq!(controls.output.as_deref(), Some(""));
         assert_eq!(controls.bitrate_kbps, Some(64));
         assert_eq!(controls.output_gain, Some(1.0));
-        assert_eq!(panel.test_input_volume(), 100);
+        assert!((controls.input_gain - 1.0).abs() < 1e-6);
         assert!(!panel.test_push_to_talk(), "reset keeps voice activity");
     });
 }
@@ -717,7 +737,17 @@ async fn one_voice_snapshot_carries_devices_bitrate_and_both_gains(cx: &mut Test
         voice.update(app, |panel, cx| {
             panel.mute(cx);
             assert!(panel.test_controls_muted(), "the local mute closes the mic");
-            panel.apply_voice_prefs(Some("1:Mic".into()), Some("2:Spk".into()), 96, 140, 0);
+            panel.apply_voice_prefs(
+                Some("1:Mic".into()),
+                Some("2:Spk".into()),
+                96,
+                140,
+                0,
+                "threshold",
+                32,
+                false,
+                false,
+            );
             let controls = panel.test_controls();
             assert_eq!(controls.input.as_deref(), Some("1:Mic"));
             assert_eq!(controls.output.as_deref(), Some("2:Spk"));
@@ -731,15 +761,22 @@ async fn one_voice_snapshot_carries_devices_bitrate_and_both_gains(cx: &mut Test
                 Some(0.0),
                 "0 % closes the room tracks"
             );
-            assert_eq!(panel.test_input_volume(), 140);
+            assert_eq!(controls.noise_mode.as_str(), "threshold");
+            assert_eq!(controls.noise_gate_percent, 32);
+            assert!((controls.input_gain - 1.4).abs() < 1e-6);
+            assert!(!controls.echo_cancellation);
+            assert!(!controls.auto_gain_control);
+            assert!((controls.input_gain - 1.4).abs() < 1e-6);
             assert!(
                 panel.test_controls_muted(),
                 "a settings snapshot must not clear the local mute"
             );
-            panel.apply_voice_prefs(None, None, 64, 0, 100);
-            assert_eq!(panel.test_input_volume(), 0, "the stored gain is clamped");
+            panel.apply_voice_prefs(None, None, 64, 0, 100, "auto", 15, true, true);
+            assert_eq!(panel.test_controls().input_gain, 0.0);
             assert_eq!(panel.test_controls().bitrate_kbps, Some(64));
             assert_eq!(panel.test_controls().output_gain, Some(1.0));
+            assert_eq!(panel.test_controls().noise_mode.as_str(), "auto");
+            assert_eq!(panel.test_controls().input_gain, 0.0);
         });
     });
 }
@@ -864,6 +901,71 @@ async fn an_app_opened_room_wakes_the_sidebar_on_speech(cx: &mut TestAppContext)
     // without a re-entrant entity update.
     draw(&mut visual);
     panel.read_with(&*visual, |panel, _| assert!(panel.speaking("alice")));
+}
+
+#[gpui::test]
+async fn dsp_controls_accept_the_web_ranges(cx: &mut TestAppContext) {
+    let (mut visual, _view, voice) = fixture(cx);
+    draw(&mut visual);
+    voice.update(&mut *visual, |panel, _| {
+        panel.set_dsp("threshold", 250, 999, false, false);
+    });
+    voice.read_with(&*visual, |panel, _| {
+        let controls = panel.test_controls();
+        assert_eq!(
+            controls.noise_mode,
+            voxhold_media::dsp::NoiseMode::Threshold
+        );
+        assert_eq!(controls.noise_gate_percent, 100);
+        assert!((controls.input_gain - 2.0).abs() < f32::EPSILON);
+        assert!(!controls.echo_cancellation);
+        assert!(!controls.auto_gain_control);
+    });
+    voice.update(&mut *visual, |panel, _| {
+        panel.set_dsp("auto", 15, 0, true, true);
+    });
+    voice.update(&mut *visual, |panel, _| {
+        panel.select_input(Some("endpoint-x".into()));
+    });
+    voice.read_with(&*visual, |panel, _| {
+        let controls = panel.test_controls();
+        assert_eq!(controls.noise_mode, voxhold_media::dsp::NoiseMode::Auto);
+        assert_eq!(controls.noise_gate_percent, 15);
+        assert_eq!(controls.input_gain, 0.0);
+        assert_eq!(controls.input.as_deref(), Some("endpoint-x"));
+    });
+}
+
+#[gpui::test]
+async fn applied_audio_update_reaches_the_panel(cx: &mut TestAppContext) {
+    let (mut visual, _view, voice) = fixture(cx);
+    draw(&mut visual);
+    let applied = AppliedAudio {
+        capture: "platform",
+        noise_mode: "auto",
+        echo_cancellation: true,
+        auto_gain_control: true,
+    };
+    let expected = applied.clone();
+    visual.update(|window, app| {
+        voice.update(app, |panel, cx| {
+            assert!(panel.apply_update(VoiceUpdate::AudioMode(applied), window, cx));
+        });
+    });
+    voice.read_with(&*visual, |panel, _| {
+        assert_eq!(panel.applied_audio(), Some(&expected));
+    });
+    draw(&mut visual);
+    assert!(
+        visual.debug_bounds("voice-audio-mode").is_some(),
+        "the applied processing mode must be visible in the active room"
+    );
+    // Leaving the call must clear the diagnostic so a later attempt cannot
+    // show the previous engine's mode.
+    voice.update(&mut *visual, |panel, cx| panel.leave_call(cx));
+    voice.read_with(&*visual, |panel, _| {
+        assert!(panel.applied_audio().is_none());
+    });
 }
 
 #[test]

@@ -1,6 +1,9 @@
 use std::{
     collections::{HashMap, VecDeque},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
@@ -23,111 +26,38 @@ use tokio::{
     time,
 };
 
-use crate::{Candidate, Command, Controls, Event, Events, IceServer, video::VideoStore};
+use crate::{
+    Candidate, Command, Controls, Event, Events, IceServer,
+    capture::{self, ECHO_CANCELLATION_AVAILABLE, MicCapture},
+    dsp::{AudioParams, NoiseMode},
+    video::VideoStore,
+};
 
 mod output;
 use output::{OutputState, SwitchResult};
+mod input;
+use input::normalize_input;
+mod platform;
+use platform::PlatformAudio;
+#[cfg(test)]
+mod loopback;
 
 const ICE_CAPACITY: usize = 64;
 const COMPLETED_UFRAG_CAPACITY: usize = 16;
 const SIGNAL_TIMEOUT: Duration = Duration::from_secs(8);
 const SPEAKING_THRESHOLD: f64 = 0.018;
+/// A recovery attempt is only cleared after this much uninterrupted capture.
+/// One delivered block is not proof that a driver recovered.
+const INPUT_STABLE_CAPTURE: Duration = Duration::from_secs(5);
+/// The system WinMM input may open without ever delivering PCM. Bound those
+/// reopens so the ladder always reaches the platform ADM.
+const MAX_SYSTEM_INPUT_ATTEMPTS: u8 = 2;
+/// How long the platform ADM may take to report its first audio-source stats
+/// after the device was opened.
+const INPUT_CAPTURE_GRACE: Duration = Duration::from_secs(5);
 
-/// Permission to transmit is tracked independently of the socket worker, so a
-/// blocked `send` cannot keep the microphone open. Transmission requires all
-/// of: no leave latch, a confirmed join, server permission and the local
-/// mute/deafen/push-to-talk decision.
-#[derive(Default)]
-pub struct CaptureGate(Mutex<CaptureState>);
-
-#[derive(Default)]
-struct CaptureState {
-    latched: bool,
-    joined: bool,
-    server_allowed: bool,
-    local_allowed: bool,
-    track: Option<RtcAudioTrack>,
-}
-
-impl CaptureGate {
-    fn is_enabled(state: &CaptureState) -> bool {
-        !state.latched && state.joined && state.server_allowed && state.local_allowed
-    }
-
-    fn apply(state: &CaptureState) {
-        if let Some(track) = &state.track {
-            track.set_enabled(Self::is_enabled(state));
-        }
-    }
-
-    /// Leave/logout/PTT release for the whole attempt: a late `State` command
-    /// can never reopen the capture because the latch outranks every flag.
-    pub fn latch(&self) {
-        let mut state = self.0.lock().unwrap();
-        state.latched = true;
-        Self::apply(&state);
-    }
-
-    /// A new transport starts unconfirmed without server permission. The leave
-    /// latch and local PTT decision belong to the handle, so a reconnect keeps
-    /// both and a late `Start` after `leave` can never reopen the microphone.
-    pub fn reset_transport(&self) {
-        let mut state = self.0.lock().unwrap();
-        state.joined = false;
-        state.server_allowed = false;
-        Self::apply(&state);
-    }
-
-    /// One transport ended. Clear only join/server permission and detach the
-    /// track; the local decision and leave latch belong to the handle.
-    pub fn end_transport(&self) {
-        let mut state = self.0.lock().unwrap();
-        state.joined = false;
-        state.server_allowed = false;
-        if let Some(track) = state.track.take() {
-            track.set_enabled(false);
-        }
-        Self::apply(&state);
-    }
-
-    pub fn set_joined(&self, joined: bool) {
-        let mut state = self.0.lock().unwrap();
-        state.joined = joined;
-        Self::apply(&state);
-    }
-
-    pub fn set_server_allowed(&self, allowed: bool) {
-        let mut state = self.0.lock().unwrap();
-        state.server_allowed = allowed;
-        Self::apply(&state);
-    }
-
-    pub fn set_local(&self, allowed: bool) {
-        let mut state = self.0.lock().unwrap();
-        state.local_allowed = allowed;
-        Self::apply(&state);
-    }
-
-    fn attach(&self, track: RtcAudioTrack) {
-        let mut state = self.0.lock().unwrap();
-        track.set_enabled(Self::is_enabled(&state));
-        state.track = Some(track);
-    }
-
-    fn detach(&self) {
-        let mut state = self.0.lock().unwrap();
-        if let Some(track) = state.track.take() {
-            track.set_enabled(false);
-        }
-    }
-
-    /// Test hook: the gate state is the one applied to the capture track.
-    #[cfg(test)]
-    pub fn enabled(&self) -> bool {
-        let state = self.0.lock().unwrap();
-        Self::is_enabled(&state)
-    }
-}
+mod capture_gate;
+pub use capture_gate::CaptureGate;
 
 pub async fn run(
     mut commands: mpsc::Receiver<Command>,
@@ -180,161 +110,17 @@ pub async fn run(
     }
 }
 
-struct PlatformAudio(PeerConnectionFactory);
-
-impl PlatformAudio {
-    fn new(recording: bool) -> Result<Self, &'static str> {
-        let factory = PeerConnectionFactory::default();
-        if !factory.acquire_platform_adm() {
-            return Err("Не удалось открыть аудиосистему Windows.");
-        }
-        factory.set_adm_recording_enabled(recording);
-        factory.set_adm_playout_enabled(true);
-        Ok(Self(factory))
-    }
-
-    /// Resolve a persisted device id to a current Core Audio index. The legacy
-    /// WinMM UI stores `index:name`, so a unique name prefix is accepted; a GUID
-    /// from the engine is matched exactly. An empty id means the Windows
-    /// default endpoint, resolved to its current GUID rather than assuming
-    /// index 0 after a device-order change.
-    fn resolve(&self, id: &str, input: bool) -> Option<u16> {
-        let factory = &self.0;
-        let count = if input {
-            factory.recording_devices()
-        } else {
-            factory.playout_devices()
-        };
-        let guid = |index| {
-            if input {
-                factory.recording_device_guid(index)
-            } else {
-                factory.playout_device_guid(index)
-            }
-        };
-        let name = |index| {
-            if input {
-                factory.recording_device_name(index)
-            } else {
-                factory.playout_device_name(index)
-            }
-        };
-        if id.is_empty() {
-            let default = default_endpoint_guid(input);
-            return default
-                .and_then(|default| (0..count.max(0) as u16).find(|&index| guid(index) == default))
-                .or_else(|| (count > 0).then_some(0));
-        }
-        if let Some((_, old_name)) = id
-            .split_once(':')
-            .filter(|(index, _)| index.parse::<u32>().is_ok())
-        {
-            let mut matches =
-                (0..count.max(0) as u16).filter(|&index| name(index).starts_with(old_name));
-            let first = matches.next();
-            first.filter(|_| matches.next().is_none())
-        } else {
-            (0..count.max(0) as u16).find(|&index| guid(index) == id)
-        }
-    }
-
-    fn running(&self, input: bool) -> bool {
-        if input {
-            self.0.recording_is_initialized()
-        } else {
-            self.0.playout_is_initialized()
-        }
-    }
-
-    fn stop(&self, input: bool) -> bool {
-        if input {
-            self.0.stop_recording()
-        } else {
-            self.0.stop_playout()
-        }
-    }
-
-    fn start(&self, input: bool) -> bool {
-        if input {
-            self.0.init_recording() && self.0.start_recording()
-        } else {
-            self.0.init_playout() && self.0.start_playout()
-        }
-    }
-
-    /// Point the ADM at one index and restore the requested running state.
-    /// The previous device is only released after the new station is set; a
-    /// failed set or start leaves the caller able to roll back explicitly.
-    fn apply(&self, index: u16, input: bool, running: bool) -> bool {
-        let factory = &self.0;
-        let was_running = self.running(input);
-        if was_running && !self.stop(input) {
-            return false;
-        }
-        let selected = if input {
-            factory.set_recording_device(index)
-        } else {
-            factory.set_playout_device(index)
-        };
-        if !selected {
-            return false;
-        }
-        !running || self.start(input)
-    }
-
-    /// Initial join: choose a device and start the path only if the platform
-    /// path is expected to run. Used by `Session::new`.
-    fn activate(&self, index: u16, input: bool) -> bool {
-        let running = self.running(input);
-        self.apply(index, input, running)
-    }
-}
-
-impl Drop for PlatformAudio {
-    fn drop(&mut self) {
-        self.0.release_platform_adm();
-    }
-}
-
-#[cfg(windows)]
-fn default_endpoint_guid(input: bool) -> Option<String> {
-    use windows::Win32::Media::Audio::{
-        IMMDeviceEnumerator, MMDeviceEnumerator, eCapture, eConsole, eRender,
-    };
-    use windows::Win32::System::Com::{
-        CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoTaskMemFree,
-        CoUninitialize,
-    };
-    unsafe {
-        let initialized = CoInitializeEx(None, COINIT_MULTITHREADED).is_ok();
-        let result = (|| -> windows::core::Result<String> {
-            let enumerator: IMMDeviceEnumerator =
-                CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
-            let flow = if input { eCapture } else { eRender };
-            let device = enumerator.GetDefaultAudioEndpoint(flow, eConsole)?;
-            let id = device.GetId()?;
-            let value = id.to_string().unwrap_or_default();
-            CoTaskMemFree(Some(id.0 as *const core::ffi::c_void));
-            Ok(value)
-        })();
-        if initialized {
-            CoUninitialize();
-        }
-        result.ok().filter(|value| !value.is_empty())
-    }
-}
-
-#[cfg(not(windows))]
-fn default_endpoint_guid(_input: bool) -> Option<String> {
-    None
-}
-
 struct Session {
     peer: PeerConnection,
     sender: Option<RtpSender>,
     viewer: Option<(Arc<VideoStore>, JoinHandle<()>)>,
     capture: Arc<CaptureGate>,
+    /// Kept for capture restarts on the same session.
+    events: Arc<Events>,
     audio: PlatformAudio,
+    /// Software WinMM capture; `None` when the platform ADM fallback owns the
+    /// microphone and the software DSP cannot run.
+    mic: Option<MicCapture>,
     controls: Controls,
     volumes: HashMap<String, f64>,
     /// last effective coefficient applied per receiver.
@@ -351,6 +137,37 @@ struct Session {
     /// The id of the device that is actually open, not merely selected. A
     /// hot-unplugged device index can be reused by another device.
     input_opened: Option<String>,
+    /// Software capture liveness. `failed` comes from a WinMM requeue/reset
+    /// error; a stalled progress counter catches a driver that stopped
+    /// delivering buffers without reporting an error (USB unplug).
+    input_progress: u64,
+    input_progress_at: std::time::Instant,
+    /// When the current capture path was opened. Used for the startup grace
+    /// before the platform path is expected to report PCM.
+    input_started_at: std::time::Instant,
+    /// Last `total_samples_duration` from the platform ADM's audio source.
+    /// The pinned WebRTC build does not populate `total_samples_captured`, so
+    /// this cumulative duration is the real proof that PCM is arriving.
+    /// `None` means the stats have not reported yet.
+    input_duration: Option<f64>,
+    /// The peer has connected since the platform path was opened. The ADM
+    /// watchdog starts its startup grace from this point, not from the device
+    /// switch.
+    input_connected: bool,
+    /// Both software and platform fallbacks failed. Retry only on an explicit
+    /// device selection, not every two seconds.
+    input_recovery_failed: bool,
+    /// The selected id was already reopened once in this failure episode. If
+    /// it stays silent, the next recovery must use the system input.
+    input_reopen_attempted: bool,
+    /// System WinMM reopens in this failure episode. A driver can open the
+    /// system device and never deliver PCM, so this is bounded separately
+    /// from the selected-device retry; after the limit the ladder must reach
+    /// the platform ADM.
+    input_system_attempts: u8,
+    /// Start of the current uninterrupted progress run. A single block must
+    /// not clear the recovery counters; only sustained capture does.
+    input_stable_since: Option<std::time::Instant>,
     output: OutputState,
     device_check: std::time::Instant,
 }
@@ -364,27 +181,14 @@ impl Session {
         capture: Arc<CaptureGate>,
         viewer: Option<Arc<VideoStore>>,
     ) -> Result<Self, &'static str> {
-        let audio = PlatformAudio::new(viewer.is_none())?;
+        let audio = PlatformAudio::new(false)?;
         // A saved device that is gone at join time must not fail the call:
-        // keep the default path and report it once.
+        // keep the default path and report it once. The software capture path
+        // opens the recording device itself; the platform ADM recording side
+        // stays closed unless that path falls back.
         let mut input_index = None;
         let mut output_index = None;
         let mut input_opened = None;
-        if let Some(id) = controls.input.clone().filter(|id| !id.is_empty()) {
-            if let Some(index) = audio
-                .resolve(&id, true)
-                .filter(|index| audio.activate(*index, true))
-            {
-                input_index = Some(index);
-                input_opened = Some(id);
-            } else {
-                // Report the actual result: the saved id is not open.
-                controls.input = None;
-                events.push(Event::DeviceError {
-                    message: "Выбранный микрофон недоступен, используется системный.",
-                });
-            }
-        }
         if let Some(id) = controls.output.clone().filter(|id| !id.is_empty()) {
             if let Some(index) = audio
                 .resolve(&id, false)
@@ -447,6 +251,7 @@ impl Session {
                 username_fragment,
             }));
         })));
+        let mut mic: Option<MicCapture> = None;
         let (sender, viewer) = if let Some(video) = viewer {
             let (track_tx, track_rx) = watch::channel(None);
             peer.on_track(Some(Box::new(move |event| {
@@ -471,19 +276,153 @@ impl Session {
                     });
                 }
             })));
-            let mic = factory.create_device_audio_track("voxhold-microphone");
+            // The software path owns capture so the gate, gain and mute are
+            // provable over the exact PCM that reaches Opus. The platform ADM
+            // is kept as a capability fallback for devices WinMM cannot open.
+            capture.set_params(controls.audio_params());
+            let params = capture.params();
+            let source = libwebrtc::audio_source::native::NativeAudioSource::new(
+                capture::source_options(),
+                capture::SAMPLE_RATE,
+                capture::CHANNELS,
+                0,
+            );
+            let mut software = MicCapture::new(
+                source.clone(),
+                params,
+                capture.permission_epoch(),
+                Some(capture.clone()),
+                events.clone(),
+            );
+            let mut software_mic = None;
+            let selected_input = normalize_input(controls.input.clone());
+            let (track, applied) = match software.start(selected_input.as_deref()) {
+                Ok(()) => {
+                    controls.input = selected_input.clone();
+                    input_opened = selected_input;
+                    input_index = None;
+                    software_mic = Some(software);
+                    let applied = controls.audio_params();
+                    let track = factory.create_audio_track("voxhold-microphone", source.clone());
+                    (
+                        track,
+                        (
+                            "software",
+                            applied.mode.as_str(),
+                            ECHO_CANCELLATION_AVAILABLE && applied.echo_cancellation,
+                            applied.auto_gain_control,
+                        ),
+                    )
+                }
+                Err(_) => {
+                    // A temporary failure of the saved device must not drop the
+                    // software DSP: try the system WinMM input before ADM.
+                    let selected = controls.input.clone().filter(|id| !id.is_empty());
+                    if software.start(None).is_ok() {
+                        controls.input = None;
+                        input_opened = None;
+                        input_index = None;
+                        software_mic = Some(software);
+                        if selected.is_some() {
+                            events.push(Event::DeviceError {
+                                message: "Выбранный микрофон недоступен, используется системный.",
+                            });
+                        }
+                        let applied = controls.audio_params();
+                        let track =
+                            factory.create_audio_track("voxhold-microphone", source.clone());
+                        (
+                            track,
+                            (
+                                "software",
+                                applied.mode.as_str(),
+                                ECHO_CANCELLATION_AVAILABLE && applied.echo_cancellation,
+                                applied.auto_gain_control,
+                            ),
+                        )
+                    } else {
+                        // Its ADM applies its own NS/AGC and may enable echo
+                        // cancellation on the render reference; the software
+                        // toggles do not apply.
+                        audio.set_recording(true);
+                        let mut started = false;
+                        if let Some(id) = controls.input.as_deref().filter(|id| !id.is_empty()) {
+                            if let Some(index) = audio
+                                .resolve(id, true)
+                                .filter(|index| audio.apply(*index, true, true))
+                            {
+                                input_index = Some(index);
+                                input_opened = Some(id.to_owned());
+                                started = true;
+                            } else {
+                                controls.input = None;
+                                input_index = None;
+                                input_opened = None;
+                                events.push(Event::DeviceError {
+                                    message:
+                                        "Выбранный микрофон недоступен, используется системный.",
+                                });
+                            }
+                        }
+                        // Start the system ADM too when no saved device was
+                        // open. The start result is checked: initialization
+                        // alone does not prove that recording began.
+                        if !started {
+                            if let Some(index) = audio
+                                .resolve("", true)
+                                .filter(|index| audio.apply(*index, true, true))
+                            {
+                                input_index = Some(index);
+                                started = true;
+                            }
+                        }
+                        if !started {
+                            events.push(Event::DeviceError {
+                                message: "Системный микрофон ADM недоступен.",
+                            });
+                        }
+                        let track = factory.create_device_audio_track("voxhold-microphone");
+                        (track, ("platform", NoiseMode::Auto.as_str(), true, true))
+                    }
+                }
+            };
+            // The gate attaches after `add_track`; keep the new track silent
+            // until it has applied the current permission state.
+            track.set_enabled(false);
             let sender = peer
-                .add_track(MediaStreamTrack::Audio(mic.clone()), &["voxhold-voice"])
+                .add_track(MediaStreamTrack::Audio(track.clone()), &["voxhold-voice"])
                 .map_err(|_| "Не удалось подключить микрофон к WebRTC.")?;
-            capture.attach(mic);
+            if let Some(mic) = &software_mic {
+                capture.attach_source(track, source, mic.id());
+            } else {
+                capture.attach(track);
+            }
+            mic = software_mic;
+            events.push(Event::Audio {
+                capture: applied.0,
+                noise_mode: applied.1,
+                echo_cancellation: applied.2,
+                auto_gain_control: applied.3,
+            });
             (Some(sender), None)
         };
+        // Typed result of the device selection the session actually opened.
+        // The UI uses it instead of clearing a saved id on any late device
+        // notice.
+        events.push(Event::InputApplied {
+            generation: 0,
+            input: controls.input.clone(),
+            error: None,
+        });
+        let input_progress = mic.as_ref().map(MicCapture::progress).unwrap_or(0);
         let mut session = Self {
             peer,
             sender,
             viewer,
             capture,
+            events: Arc::clone(events),
             audio,
+            mic,
             controls,
             volumes: HashMap::new(),
             gains: HashMap::new(),
@@ -495,6 +434,15 @@ impl Session {
             input_index,
             output_index,
             input_opened,
+            input_progress,
+            input_progress_at: std::time::Instant::now(),
+            input_started_at: std::time::Instant::now(),
+            input_duration: None,
+            input_connected: false,
+            input_recovery_failed: false,
+            input_reopen_attempted: false,
+            input_system_attempts: 0,
+            input_stable_since: None,
             output,
             device_check: std::time::Instant::now(),
         };
@@ -526,6 +474,9 @@ impl Session {
                 Ok(())
             }
             Command::State(controls) => self.update_controls(controls, events),
+            Command::SelectInput { input, generation } => {
+                self.select_input(input, generation, events)
+            }
             Command::ViewAudio { muted } => {
                 self.controls.deafened = muted;
                 self.apply_audio_controls();
@@ -583,11 +534,27 @@ impl Session {
     fn update_controls(&mut self, controls: Controls, events: &Events) -> Result<(), &'static str> {
         let deafen_changed = self.controls.deafened != controls.deafened;
         let gain_changed = self.controls.output_gain != controls.output_gain;
+        let dsp_changed = self.controls.noise_mode != controls.noise_mode
+            || self.controls.noise_gate_percent != controls.noise_gate_percent
+            || (self.controls.input_gain - controls.input_gain).abs() > f32::EPSILON
+            || self.controls.echo_cancellation != controls.echo_cancellation
+            || self.controls.auto_gain_control != controls.auto_gain_control;
         let requested_output = controls.output.clone();
         let output_needs_switch = self.output.needs_switch(&requested_output);
         self.controls.muted = controls.muted;
         self.controls.deafened = controls.deafened;
+        self.controls.noise_mode = controls.noise_mode;
+        self.controls.noise_gate_percent = controls.noise_gate_percent;
+        self.controls.input_gain = controls.input_gain;
+        self.controls.echo_cancellation = controls.echo_cancellation;
+        self.controls.auto_gain_control = controls.auto_gain_control;
         self.controls.output_gain = controls.output_gain;
+        // The capture thread reads this snapshot; the permission flags keep
+        // `muted` authoritative even if an older queued state arrives late.
+        self.capture.set_params(controls.audio_params());
+        if dsp_changed {
+            self.report_audio(events);
+        }
         self.output.request(requested_output.clone());
         self.controls.output = requested_output.clone();
         if let Some(bitrate) = controls
@@ -600,23 +567,9 @@ impl Session {
         if deafen_changed || gain_changed {
             self.apply_audio_controls();
         }
-        if let Some(input) = controls
-            .input
-            .filter(|id| self.controls.input.as_ref() != Some(id))
-        {
-            let result = self.switch_device(&input, true);
-            if result.switched {
-                self.controls.input = Some(input);
-            } else {
-                events.push(Event::DeviceError {
-                    message: if result.audible {
-                        "Не удалось переключить микрофон, прежний работает."
-                    } else {
-                        "Не удалось переключить микрофон и восстановить прежний."
-                    },
-                });
-            }
-        }
+        // Input changes during a call use `SelectInput` only. A stale generic
+        // `State` queued before the user picked another device must not switch
+        // the microphone back.
         if output_needs_switch {
             let result = match requested_output.as_deref() {
                 Some(id) if !id.is_empty() => self.switch_device(id, false),
@@ -831,6 +784,10 @@ impl Session {
         if self.peer.connection_state() != PeerConnectionState::Connected {
             return;
         }
+        if self.mic.is_none() && !self.input_connected {
+            self.input_connected = true;
+            self.input_started_at = std::time::Instant::now();
+        }
         let Ok(Ok(report)) = time::timeout(Duration::from_millis(125), self.peer.get_stats()).await
         else {
             return;
@@ -840,6 +797,16 @@ impl Session {
             match stat {
                 RtcStats::MediaSource(source) => {
                     local_level = local_level.max(source.audio.audio_level);
+                    if self.mic.is_none() {
+                        // The platform ADM has no software block counter. Its
+                        // cumulative captured-sample count is the real proof
+                        // that recording is still delivering PCM.
+                        let total = source.audio.total_samples_duration;
+                        if self.input_duration != Some(total) {
+                            self.input_duration = Some(total);
+                            self.input_progress_at = std::time::Instant::now();
+                        }
+                    }
                 }
                 RtcStats::InboundRtp(inbound) if inbound.stream.kind == "audio" => {
                     let track_id = inbound.inbound.track_identifier;
@@ -881,6 +848,9 @@ impl Session {
 
 impl Drop for Session {
     fn drop(&mut self) {
+        if let Some(mut mic) = self.mic.take() {
+            mic.stop();
+        }
         if let Some((video, task)) = self.viewer.take() {
             task.abort();
             video.clear();

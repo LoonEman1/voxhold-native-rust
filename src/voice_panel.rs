@@ -20,7 +20,8 @@ use std::{
 };
 use voxhold_api::Client;
 use voxhold_media::{
-    controller::{Participant, Publication},
+    controller::{AppliedAudio, Participant, Publication},
+    dsp::NoiseMode,
     runtime::{VoiceHandle, VoiceUpdate},
     Controls,
 };
@@ -74,6 +75,9 @@ pub struct VoicePanel {
     status: String,
     error: String,
     controls: Controls,
+    /// Applied capture chain reported by the engine. Rendered as a diagnostic
+    /// label in the active room; not part of the Go room layout.
+    applied_audio: Option<AppliedAudio>,
     self_muted: bool,
     push_to_talk: bool,
     ptt_held: bool,
@@ -87,11 +91,11 @@ pub struct VoicePanel {
     tracks: HashSet<String>,
     local_mutes: HashSet<String>,
     local_level: f64,
-    /// Microphone gain 0–200 %. The value is stored and shown now; the PCM
-    /// capture path that applies 1–200 arrives with R07b, so only 0 % (a
-    /// closed microphone) changes this build's transmission.
-    input_volume: i64,
     device_error: String,
+    /// Newest explicit input request. A typed result for an older generation
+    /// must not overwrite a newer choice; zero marks an engine-initiated
+    /// fallback and is always current.
+    input_generation: u64,
     streams: Vec<Publication>,
     /// Publications of the displayed room from the account WebSocket; the
     /// call's runtime owns `streams` for the room it is in.
@@ -190,6 +194,7 @@ impl VoicePanel {
             status: String::new(),
             error: String::new(),
             controls,
+            applied_audio: None,
             self_muted: false,
             push_to_talk,
             ptt_held: false,
@@ -201,8 +206,8 @@ impl VoicePanel {
             tracks: HashSet::new(),
             local_mutes: HashSet::new(),
             local_level: 0.0,
-            input_volume: 100,
             device_error: String::new(),
+            input_generation: 0,
             streams: Vec::new(),
             room_streams: Vec::new(),
             access_confirmed: true,
@@ -504,6 +509,7 @@ impl VoicePanel {
         self.error.clear();
         self.ptt_held = false;
         self.ptt_combo = None;
+        self.applied_audio = None;
         // The next join starts with a closed microphone until the server
         // confirms `voice.joined`, even if the previous call was unmuted.
         self.controls.muted = true;
@@ -615,8 +621,8 @@ impl VoicePanel {
 
     fn refresh_capture(&mut self) {
         let joined = self.handle.is_some() && self.phase == CallPhase::Connected;
-        // The stored input gain is part of the capture decision: 0 % means a
-        // deliberately closed microphone even when the call is confirmed.
+        // Local mute/PTT/deafen are the only owners of capture permission;
+        // input volume 0 is silence inside the DSP, not a second mute flag.
         self.controls.muted = !voice_room::microphone_open(
             joined && self.call_channel != 0,
             self.self_muted,
@@ -624,31 +630,10 @@ impl VoicePanel {
             self.push_to_talk,
             self.ptt_held,
             self.ptt_blocked,
-        ) || self.input_volume <= 0;
+        );
         if let Some(handle) = &self.handle {
             handle.controls(self.controls.clone(), self.self_muted);
         }
-    }
-
-    /// One audio snapshot from the settings tab: devices, bitrate and both
-    /// gain values. It must stay the only State write for a settings change so
-    /// the device/bitrate/gain triple cannot be applied piecemeal. Local mute
-    /// and push-to-talk stay untouched.
-    pub fn apply_voice_prefs(
-        &mut self,
-        input: Option<String>,
-        output: Option<String>,
-        bitrate: u32,
-        input_volume: i64,
-        output_volume: i64,
-    ) {
-        self.controls.input = input;
-        self.controls.output = output;
-        self.controls.bitrate_kbps = Some(bitrate);
-        self.controls.output_gain = Some(output_volume.clamp(0, 200) as f64 / 100.0);
-        self.input_volume = input_volume.clamp(0, 200);
-        self.device_error.clear();
-        self.refresh_capture();
     }
 
     pub fn mute(&mut self, cx: &mut Context<Self>) {
@@ -679,15 +664,10 @@ impl VoicePanel {
         self.local_mutes.contains(connection)
     }
 
-    /// Explicit output selection from the settings tab. This is forwarded even
-    /// when the cached value looks unchanged, because a hot-unplug may have
-    /// moved the engine to a fallback endpoint before its notice was applied.
-    pub fn select_output(&mut self, output: Option<String>) {
-        self.controls.output = output.clone();
-        self.device_error.clear();
-        if let Some(handle) = &self.handle {
-            handle.select_output(output);
-        }
+    /// Applied capture chain reported by the engine. `software` honours the
+    /// DSP toggles; `platform` is the ADM fallback with forced NS/AGC.
+    pub fn applied_audio(&self) -> Option<&AppliedAudio> {
+        self.applied_audio.as_ref()
     }
 
     /// Device failure reported by the engine (for example a hot-unplug). The
@@ -853,7 +833,7 @@ impl VoicePanel {
         }
     }
 
-    fn apply_update(
+    pub(crate) fn apply_update(
         &mut self,
         update: VoiceUpdate,
         window: &mut Window,
@@ -864,6 +844,7 @@ impl VoicePanel {
             VoiceUpdate::Connecting => {
                 self.phase = CallPhase::Connecting;
                 self.status = "Подключение…".into();
+                self.applied_audio = None;
                 self.controls.muted = true;
                 self.release_push_to_talk();
             }
@@ -877,6 +858,7 @@ impl VoicePanel {
             VoiceUpdate::Reconnecting => {
                 self.phase = CallPhase::Reconnecting;
                 self.status = "Восстанавливаем соединение…".into();
+                self.applied_audio = None;
                 self.controls.muted = true;
                 self.release_push_to_talk();
                 // Go drops the confirmed roster until the fresh join; a
@@ -942,9 +924,38 @@ impl VoicePanel {
                 }
                 self.stream_connected = connected;
             }
-            VoiceUpdate::DeviceError(error) => self.device_error = error,
+            VoiceUpdate::DeviceError(error) => {
+                // A notice is not proof that the saved choice is dead: the
+                // typed `InputApplied` result below is the only thing allowed
+                // to replace `controls.input`. Clearing it here let a late
+                // notice undo a newer explicit selection.
+                self.device_error = error;
+            }
+            VoiceUpdate::InputApplied {
+                generation,
+                input,
+                error,
+            } => {
+                // A result for an older explicit request must not overwrite a
+                // newer selection. Zero is an engine-initiated fallback and is
+                // always the current applied device.
+                if generation != 0 {
+                    if generation < self.input_generation {
+                        return false;
+                    }
+                    self.input_generation = generation;
+                }
+                self.controls.input = input;
+                if let Some(error) = error {
+                    self.device_error = error;
+                }
+            }
+            VoiceUpdate::AudioMode(applied) => {
+                self.applied_audio = Some(applied);
+            }
             VoiceUpdate::Ended(error) => {
                 self.handle.take();
+                self.applied_audio = None;
                 self.controls.muted = true;
                 self.ptt_held = false;
                 self.ptt_combo = None;
@@ -1110,11 +1121,6 @@ impl VoicePanel {
     }
 
     #[cfg(test)]
-    pub fn test_input_volume(&self) -> i64 {
-        self.input_volume
-    }
-
-    #[cfg(test)]
     pub fn test_player_area(&self) -> Rect {
         self.player_area
     }
@@ -1166,6 +1172,7 @@ impl VoicePanel {
 }
 
 mod colors;
+mod controls;
 mod player;
 mod view;
 

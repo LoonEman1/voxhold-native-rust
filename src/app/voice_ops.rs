@@ -133,6 +133,10 @@ impl Voxhold {
                     prefs.bitrate as u32,
                     prefs.input_volume,
                     prefs.output_volume,
+                    &prefs.noise_mode,
+                    prefs.noise_gate,
+                    prefs.echo_cancellation,
+                    prefs.auto_gain,
                 );
                 panel.set_palette(palette);
                 cx.notify();
@@ -162,6 +166,10 @@ impl Voxhold {
                     prefs.bitrate as u32,
                     prefs.input_volume,
                     prefs.output_volume,
+                    &prefs.noise_mode,
+                    prefs.noise_gate,
+                    prefs.echo_cancellation,
+                    prefs.auto_gain,
                 );
                 panel.set_palette(palette);
                 panel

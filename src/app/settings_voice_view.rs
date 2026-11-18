@@ -1,15 +1,14 @@
 //! The "Голос и звук" tab of the personal settings dialog.
 //!
 //! The form mirrors Go `settings_voice.go` and the frontend
-//! `VoiceSettingsDialog.tsx`, but every control says what it really does in
-//! this build. Echo cancellation, automatic gain and noise suppression are
-//! applied by the platform audio path and are shown as capabilities, not as
-//! switches; input gain and the gate need the R07b PCM path; the microphone
-//! preview and the interface tone are real WinMM ports.
+//! `VoiceSettingsDialog.tsx`. R07b applies input gain, the software gate and
+//! APM NS/AGC in the live call; this tab shows the active capture chain
+//! (`software` or `platform` ADM), reports AEC as unavailable because there is
+//! no render reference, and keeps the WinMM preview/test tone as real actions.
 
 use super::settings_view::ButtonKind;
 use super::*;
-use crate::audio_capabilities::{audio_capabilities, Support};
+use crate::audio_capabilities::{capabilities_for, Support};
 use crate::voice_settings::{device_choices, BITRATES};
 use gpui::ElementId;
 
@@ -28,7 +27,20 @@ impl Voxhold {
             self.voice_settings.devices_error.clone()
         };
         let prefs = self.voice_settings.prefs.clone();
-        let capabilities = audio_capabilities();
+        #[cfg(feature = "voxhold-media")]
+        let applied = self.voice.as_ref().and_then(|panel| {
+            panel.read(cx).applied_audio().map(|audio| {
+                (
+                    audio.capture,
+                    audio.noise_mode,
+                    audio.echo_cancellation,
+                    audio.auto_gain_control,
+                )
+            })
+        });
+        #[cfg(not(feature = "voxhold-media"))]
+        let applied: Option<(&'static str, &'static str, bool, bool)> = None;
+        let capabilities = capabilities_for(applied.map(|(capture, ..)| capture));
         let level = self.voice_settings.preview_level.clamp(0.0, 1.0);
         let threshold = (prefs.noise_mode == "threshold").then_some(prefs.noise_gate);
         let preview_error = self.voice_settings.preview_error.clone();
@@ -47,7 +59,7 @@ impl Voxhold {
 
         let mut root = div().flex().flex_col().gap(px(14.)).child(self.heading(
             "Голос и звук",
-            "Устройства и битрейт применяются к звонку без перезапуска комнаты. Обработка микрофона показывает реальные возможности этого тракта.",
+            "Устройства, битрейт и обработка микрофона применяются к звонку без перезапуска комнаты; ниже показан фактический тракт.",
         ));
 
         root = root
@@ -108,7 +120,7 @@ impl Voxhold {
             .child(self.separator())
             .child(self.heading(
                 "Уровни звука",
-                "Громкость микрофона применяется в проверке. Качество передачи применяется в голосовом канале.",
+                "Громкость микрофона применяется в software-тракте до Opus. При platform-fallback действует встроенная обработка ADM.",
             ))
             .child(self.settings_value_slider(
                 "input-volume",
@@ -140,9 +152,9 @@ impl Voxhold {
         }
         root = root.child(self.form_text(
             if in_call {
-                "В звонке индикатор показывает уровень передачи, а не отдельный предпросмотр: микрофон уже принадлежит звонку."
+                "В звонке индикатор показывает уровень до gate из активного тракта: в software-пути gate, усиление и AGC уже применены к передаче."
             } else if capabilities.microphone_preview == Support::Applied {
-                "Вне звонка индикатор показывает предпросмотр WinMM с выбранного устройства; в передачу этот захват не входит."
+                "Вне звонка индикатор показывает сырой предпросмотр WinMM с выбранного устройства; коралловая риска — сохранённая планка, к предпросмотру gate не применяется."
             } else {
                 "Предпросмотр микрофона недоступен в этой сборке."
             },
@@ -162,7 +174,7 @@ impl Voxhold {
                 cx,
             ))
             .child(self.form_text(
-                "0 % закрывает треки собеседников. 1–200 % пока не масштабирует звук: полный коэффициент появится с PCM-трактом R07b.",
+                "0 % закрывает треки собеседников. 1–200 % пока не масштабирует звук: полный коэффициент появится в W02c.",
                 false,
             ))
             .child(self.form_text(
@@ -264,44 +276,59 @@ impl Voxhold {
                 cx,
             ));
         }
+        let capture_note = match applied {
+            Some(("software", noise_mode, echo, agc)) => format!(
+                "Активный тракт: software 48 кГц · NS {noise_mode} · AGC {} · AEC {}.",
+                if agc { "вкл" } else { "выкл" },
+                if echo { "вкл" } else { "недоступно" }
+            ),
+            Some(_) => "Активный тракт: platform ADM · NS auto · AGC и AEC включены ADM принудительно. Пользовательские gain/gate в этом тракте не применяются.".into(),
+            None => "Активный тракт появится после подтверждённого входа в звонок. По умолчанию используется software 48 кГц; при отказе WinMM — platform ADM.".into(),
+        };
         root = root
+            .child(self.form_text(&capture_note, false))
             .child(self.voice_capability(
                 "Эхоподавление",
                 capabilities.echo_cancellation,
-                "применяется системным аудиотрактом автоматически",
+                "в software-пути нет render-reference, поэтому AEC не включается; platform ADM включает своё по умолчанию без замера",
             ))
-            .child(self.voice_capability(
+            .child(self.settings_toggle(
+                ElementId::Name("auto-gain".into()),
                 "Автоматическое усиление",
-                capabilities.auto_gain,
-                "выравнивает голос автоматически",
+                "APM в software-пути выравнивает голос; platform ADM включает AGC принудительно",
+                prefs.auto_gain,
+                capabilities.auto_gain == Support::Automatic,
+                SettingsAct::Personal(personal_settings::Action::ToggleAutoGain),
+                window,
+                cx,
             ))
             .child(self.voice_capability(
                 "Шумоподавление",
                 capabilities.noise_suppression,
-                "применяется системным аудиотрактом автоматически",
+                "auto — APM NS; threshold — программный gate; platform ADM включает NS принудительно",
             ))
             .child(self.voice_capability(
                 "Усиление микрофона",
                 capabilities.input_gain,
-                "сейчас действует только 0 % (микрофон закрыт); 1–200 % и порог начнут действовать с PCM-трактом R07b",
+                "0–200 % в software-пути до Opus; 0 % — тишина. В platform ADM пользовательское усиление не применяется",
             ))
             .child(self.voice_capability(
                 "Планка шума",
                 capabilities.noise_gate,
-                "порог сохраняется и показывается, но в передаче начнёт действовать с R07b",
+                "0 % обходит gate; 1–100 % действует в software-пути. В platform ADM порог недоступен",
             ))
             .child(self.voice_capability(
                 "Громкость вывода",
                 capabilities.output_gain,
-                "0 % закрывает дорожки; 1–200 % пока не масштабирует звук",
+                "0 % закрывает дорожки; 1–200 % пока не масштабирует звук — W02c",
             ))
             .child(self.voice_capability(
                 "Качество передачи",
                 capabilities.bitrate,
-                "битрейт применяется сразу",
+                "максимальный битрейт Opus применяется сразу",
             ))
             .child(self.form_text(
-                "Состояние этих возможностей проверено по закреплённому libwebrtc 0.4.0: программные AEC/AGC/шумоподавление включает сам аудиотракт, отдельных переключателей в этой сборке нет.",
+                "Тракт по умолчанию — software 48 кГц mono; при отказе WinMM движок переходит на platform ADM и сообщает об этом. AEC в software-пути недоступно без render-reference.",
                 false,
             ));
 
@@ -469,7 +496,7 @@ impl Voxhold {
             Support::Applied => "применяется",
             Support::Automatic => "автоматически",
             Support::Limited => "частично",
-            Support::Unavailable => "после R07b",
+            Support::Unavailable => "недоступно",
         };
         let tag_color = match support {
             Support::Applied => p.lime,

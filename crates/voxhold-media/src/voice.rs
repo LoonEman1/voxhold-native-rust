@@ -40,7 +40,7 @@ use input::normalize_input;
 mod platform;
 use platform::PlatformAudio;
 mod playout;
-use playout::{OpenAttempts, Playout, PlayoutMode};
+use playout::{Playout, PlayoutMode, RetryAt, SinkRecovery};
 #[cfg(test)]
 mod loopback;
 mod winmm_out;
@@ -142,10 +142,16 @@ struct Session {
     software_playout: bool,
     /// Current playout path. `AdmFallback` means the mixer budget was spent.
     playout_mode: PlayoutMode,
-    /// Reopen schedule of the software sink (bounded backoff).
-    playout_attempts: OpenAttempts,
-    /// Slow retry of the ADM path after a fallback that could not start.
-    adm_attempts: OpenAttempts,
+    /// Recovery state machine of the software sink (bounded shared budget,
+    /// stability proof, phase for the report).
+    playout_attempts: SinkRecovery,
+    /// Slow retry of the ADM path after a fallback that could not start or
+    /// stopped delivering PCM.
+    adm_retry: RetryAt,
+    /// Last observed ADM playout progress for the platform fallback watchdog.
+    adm_playout_duration: Option<f64>,
+    adm_playout_progress_at: std::time::Instant,
+    adm_playout_started_at: std::time::Instant,
     /// Suspend released the sink; only an explicit resume reopens it.
     playout_suspended: bool,
     /// Successful software-sink reopens in this session.
@@ -245,29 +251,9 @@ impl Session {
         // opens the recording device itself; the platform ADM recording side
         // stays closed unless that path falls back.
         let mut input_index = None;
-        let mut output_index = None;
+        let mut output_index =
+            output::activate_saved_output(&audio, &mut controls, playout.is_none(), events);
         let mut input_opened = None;
-        if let Some(id) = controls.output.clone().filter(|id| !id.is_empty()) {
-            if let Some(index) = audio
-                .resolve(&id, false)
-                .filter(|index| audio.activate(*index, false))
-            {
-                output_index = Some(index);
-            } else {
-                controls.output = None;
-                events.push(Event::DeviceError {
-                    message: "Выбранное устройство воспроизведения недоступно, используется системное.",
-                });
-                events.push(Event::Output {
-                    applied: None,
-                    audible: true,
-                    working: true,
-                    error: Some(
-                        "Выбранное устройство воспроизведения недоступно, используется системное.",
-                    ),
-                });
-            }
-        }
         let output = OutputState::new(controls.output.clone());
         let factory = &audio.0;
         let mut config = RtcConfiguration::default();
@@ -502,8 +488,11 @@ impl Session {
             playout,
             software_playout,
             playout_mode,
-            playout_attempts: OpenAttempts::default(),
-            adm_attempts: OpenAttempts::default(),
+            playout_attempts: SinkRecovery::default(),
+            adm_retry: RetryAt::default(),
+            adm_playout_duration: None,
+            adm_playout_progress_at: std::time::Instant::now(),
+            adm_playout_started_at: std::time::Instant::now(),
             playout_suspended: false,
             playout_reconnects: 0,
             playout_open,
@@ -909,6 +898,16 @@ impl Session {
                         track_id: Some(track_id),
                         level,
                     });
+                }
+                RtcStats::MediaPlayout(playout) => {
+                    // The ADM's cumulative played duration is the only proof
+                    // that the platform fallback is delivering PCM; initialized
+                    // alone is not enough (same rule as the capture watchdog).
+                    let total = playout.audio_playout.total_samples_duration;
+                    if self.adm_playout_duration != Some(total) {
+                        self.adm_playout_duration = Some(total);
+                        self.adm_playout_progress_at = std::time::Instant::now();
+                    }
                 }
                 _ => {}
             }

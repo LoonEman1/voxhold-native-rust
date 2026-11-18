@@ -338,6 +338,39 @@ pub struct PlayoutStats {
     /// The software sink is open. `false` means the room is on the platform
     /// ADM (or has no live path) and the numeric gain is not applied.
     pub running: bool,
+    /// Recovery state machine, not a guess: the UI and the journal show it.
+    pub phase: PlayoutPhase,
+}
+
+/// Lifecycle of the software playout as the recovery machine sees it.
+///
+/// An open sink is `Unstable` until it proves itself: it must live for
+/// `STABLE_AFTER` and write `STABLE_BLOCKS` blocks without a driver error. Only
+/// then does it become `Stable` and clear the failure budget, so a sink that
+/// opens and immediately dies still spends the shared budget and can reach the
+/// ADM fallback.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PlayoutPhase {
+    /// No sink; the next bounded open attempt is scheduled.
+    #[default]
+    Opening,
+    /// Sink open, stability not yet proven.
+    Unstable,
+    /// Sink proved stable; the failure budget is clear.
+    Stable,
+    /// The budget was spent; the platform ADM owns the room.
+    AdmFallback,
+}
+
+impl PlayoutPhase {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Opening => "открытие",
+            Self::Unstable => "проверка стабильности",
+            Self::Stable => "стабильный микшер",
+            Self::AdmFallback => "системный ADM",
+        }
+    }
 }
 
 /// The bus gains, source gains, limiter and meter of one playout path.

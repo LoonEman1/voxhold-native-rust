@@ -39,9 +39,10 @@ pub struct AudioCapabilities {
     pub auto_gain: Support,
     /// APM noise suppression in auto mode; threshold uses the software gate.
     pub noise_suppression: Support,
-    /// Room output gain. Applied to the participant tracks in every capture
-    /// path: 0 closes them, 1–200 scales them. Per-participant volumes, the
-    /// limiter and the voice/system/preview mix arrive with W02c.
+    /// Room output gain. `Applied` means the software room mixer scales each
+    /// participant 0–200 % and sums with a limiter; on the ADM fallback only
+    /// mute is real (`Support::Applied` still describes the availability of the
+    /// control, not the fallback path, which the form states explicitly).
     pub output_gain: Support,
     /// Opus maximum bitrate selection.
     pub bitrate: Support,

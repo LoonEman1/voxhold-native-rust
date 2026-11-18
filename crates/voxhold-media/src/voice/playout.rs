@@ -30,7 +30,7 @@ use libwebrtc::{
 use tokio_stream::StreamExt;
 
 use super::*;
-use crate::mixer::{BLOCK_SAMPLES, Bus, Mixer, PlayoutStats, Source, SourcePool};
+use crate::mixer::{BLOCK_SAMPLES, Bus, Mixer, PlayoutPhase, PlayoutStats, Source, SourcePool};
 use winmm_out::{OpenSink, Sink, WAVE_MAPPER, resolve_output};
 
 /// 48 kHz mono, the same rate as the software capture and the tone.
@@ -39,10 +39,15 @@ pub(super) const PLAYOUT_RATE: u32 = 48_000;
 const SOURCE_CHANNEL: usize = 8;
 /// How often the playout thread publishes its counters.
 const PUBLISH_INTERVAL: Duration = Duration::from_millis(250);
-/// Software-sink reopen budget. Each failure schedules the next attempt; the
-/// fifth failure switches the session to the ADM fallback instead of retrying
-/// forever.
+/// Software-sink reopen budget. Each failed open *and* each sink that opened
+/// but died before proving stability spends one attempt; the fifth failure
+/// switches the session to the ADM fallback instead of retrying forever.
 pub(super) const MAX_OPEN_ATTEMPTS: u8 = 5;
+/// Stability proof: the sink must live this long and write this many blocks.
+/// A driver can open and fail after the first buffer; two seconds covers a
+/// device reset/unplug race, and 50 blocks (0.5 s) prove that PCM was accepted.
+pub(super) const STABLE_AFTER: Duration = Duration::from_secs(2);
+pub(super) const STABLE_BLOCKS: u64 = 50;
 /// Slow retry of the ADM path when it could not be started.
 const ADM_RETRY: Duration = Duration::from_secs(5);
 const REPORT_INTERVAL: Duration = Duration::from_secs(1);
@@ -74,7 +79,6 @@ enum Msg {
     Remove(String),
     Frame(String, Vec<i16>),
     Sink(Box<dyn Sink>),
-    Stop,
 }
 
 /// Bounded, coalesced state slot. A busy frame channel must never lose a gain
@@ -94,45 +98,8 @@ impl StateSlot {
     }
 }
 
-/// One post-mix block tap. W07's recorder subscribes here instead of decoding
-/// the same tracks a second time; each subscriber gets its own bounded queue.
-#[derive(Clone, Default)]
-pub(super) struct Tap {
-    sender: Arc<Mutex<Vec<SyncSender<Vec<i16>>>>>,
-}
-
-pub(super) struct TapReceiver {
-    receiver: Receiver<Vec<i16>>,
-}
-
-impl TapReceiver {
-    #[allow(dead_code)]
-    pub(super) fn try_recv(&self) -> Option<Vec<i16>> {
-        self.receiver.try_recv().ok()
-    }
-}
-
-impl Tap {
-    fn subscribe(&self) -> TapReceiver {
-        let (sender, receiver) = sync_channel(16);
-        if let Ok(mut senders) = self.sender.lock() {
-            senders.push(sender);
-        }
-        TapReceiver { receiver }
-    }
-
-    #[cfg(test)]
-    fn subscribers(&self) -> usize {
-        self.sender.lock().map(|senders| senders.len()).unwrap_or(0)
-    }
-
-    fn emit(&self, block: &[i16]) {
-        let Ok(mut senders) = self.sender.lock() else {
-            return;
-        };
-        senders.retain(|sender| sender.try_send(block.to_vec()).is_ok());
-    }
-}
+mod tap;
+use tap::{Tap, TapRead, TapReceiver};
 
 #[derive(Default)]
 struct Metrics {
@@ -147,6 +114,9 @@ struct Metrics {
     limited_blocks: AtomicU64,
     limiter_releases: AtomicU64,
     blocks: AtomicU64,
+    /// Whole blocks the sink accepted. Stability requires real writes, not just
+    /// a successful `waveOutOpen`.
+    blocks_written: AtomicU64,
     running: AtomicBool,
 }
 
@@ -185,23 +155,29 @@ impl Metrics {
             blocks: self.blocks.load(Ordering::Relaxed),
             reconnects: 0,
             running: self.running.load(Ordering::Relaxed),
+            phase: PlayoutPhase::Opening,
         }
     }
 }
 
-/// Reopen scheduling shared by resume and sink failure. The unit test drives
-/// exactly this type; the attempt count is bounded and the delay grows.
+/// Reopen scheduling shared by resume and sink failure. An open is not a
+/// recovery: it moves to `Unstable` and only a proven-stable sink clears the
+/// failure budget. The unit tests drive this exact type.
 #[derive(Clone, Copy, Debug)]
-pub(super) struct OpenAttempts {
-    attempts: u8,
+pub(super) struct SinkRecovery {
+    failures: u8,
     next_at: Instant,
+    phase: PlayoutPhase,
+    opened_at: Option<Instant>,
 }
 
-impl Default for OpenAttempts {
+impl Default for SinkRecovery {
     fn default() -> Self {
         Self {
-            attempts: 0,
+            failures: 0,
             next_at: Instant::now(),
+            phase: PlayoutPhase::Opening,
+            opened_at: None,
         }
     }
 }
@@ -212,36 +188,122 @@ pub(super) enum FailureOutcome {
     AdmFallback,
 }
 
-impl OpenAttempts {
-    pub(super) fn reset(&mut self, now: Instant) {
-        self.attempts = 0;
-        self.next_at = now;
+impl SinkRecovery {
+    pub(super) fn phase(&self) -> PlayoutPhase {
+        self.phase
     }
+
+    #[cfg(test)]
+    pub(super) fn failures(&self) -> u8 {
+        self.failures
+    }
+
     pub(super) fn due(&self, now: Instant) -> bool {
         now >= self.next_at
     }
 
-    #[cfg(test)]
-    pub(super) fn attempts(&self) -> u8 {
-        self.attempts
+    /// A successful open is only the start of the proof window.
+    pub(super) fn opened(&mut self, now: Instant) {
+        self.phase = PlayoutPhase::Unstable;
+        self.opened_at = Some(now);
     }
 
-    /// Record one failed open. The first four failures schedule 0.5/1/2/4 s;
-    /// the fifth spends the budget and asks for the ADM fallback.
+    /// The sink lived long enough and wrote real blocks: the budget is clear.
+    pub(super) fn mark_stable(&mut self) {
+        if self.phase != PlayoutPhase::Unstable {
+            return;
+        }
+        self.failures = 0;
+        self.phase = PlayoutPhase::Stable;
+        self.opened_at = None;
+    }
+
+    /// Resume keeps the spent budget: a resumed system must not get five fresh
+    /// attempts for every suspend.
+    pub(super) fn reset_for_resume(&mut self, now: Instant) {
+        self.phase = PlayoutPhase::Opening;
+        self.next_at = now;
+        self.opened_at = None;
+    }
+
+    /// Record one failed open or one sink that died before proving stability.
+    /// Both spend the same budget; the fifth failure asks for the ADM fallback.
     pub(super) fn record_failure(&mut self, now: Instant) -> FailureOutcome {
-        self.attempts = self.attempts.saturating_add(1);
-        if self.attempts >= MAX_OPEN_ATTEMPTS {
+        self.failures = self.failures.saturating_add(1);
+        self.opened_at = None;
+        if self.failures >= MAX_OPEN_ATTEMPTS {
+            self.phase = PlayoutPhase::AdmFallback;
             return FailureOutcome::AdmFallback;
         }
-        let delay = match self.attempts {
+        let delay = match self.failures {
             1 => Duration::from_millis(500),
             2 => Duration::from_secs(1),
             3 => Duration::from_secs(2),
             _ => Duration::from_secs(4),
         };
+        self.phase = PlayoutPhase::Opening;
         self.next_at = now + delay;
         FailureOutcome::Retry(delay)
     }
+
+    pub(super) fn to_adm(&mut self) {
+        self.phase = PlayoutPhase::AdmFallback;
+        self.opened_at = None;
+    }
+
+    /// A sink that opened and died before proving stability spends the same
+    /// budget as an open that never succeeded. This is the only accounting for
+    /// the "opened but died" path; removing it would make the ladder endless.
+    pub(super) fn sink_died(&mut self, now: Instant) -> FailureOutcome {
+        self.record_failure(now)
+    }
+
+    #[cfg(test)]
+    pub(super) fn opened_at(&self) -> Option<Instant> {
+        self.opened_at
+    }
+}
+
+/// Slow retry slot for the platform path. It has no budget: the ADM is the
+/// last audible path, so it keeps being restarted every few seconds.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct RetryAt {
+    next_at: Instant,
+}
+
+impl Default for RetryAt {
+    fn default() -> Self {
+        Self {
+            next_at: Instant::now(),
+        }
+    }
+}
+
+impl RetryAt {
+    pub(super) fn due(&self, now: Instant) -> bool {
+        now >= self.next_at
+    }
+
+    pub(super) fn schedule(&mut self, now: Instant, delay: Duration) {
+        self.next_at = now + delay;
+    }
+}
+
+/// ADM health: initialized is not enough. The cumulative played duration must
+/// move; a startup grace covers the first stats report, as for capture.
+pub(super) fn adm_playout_ok(
+    running: bool,
+    since_start: Duration,
+    duration_seen: bool,
+    since_progress: Duration,
+) -> bool {
+    if !running {
+        return false;
+    }
+    if since_start < INPUT_CAPTURE_GRACE {
+        return true;
+    }
+    duration_seen && since_progress < Duration::from_secs(2)
 }
 
 /// One bounded open attempt shared by resume and the sink-health tick. The
@@ -249,15 +311,15 @@ impl OpenAttempts {
 pub(super) fn open_sink(
     open: &Arc<OpenSink>,
     device: Option<&str>,
-    attempts: &mut OpenAttempts,
+    recovery: &mut SinkRecovery,
     now: Instant,
 ) -> Result<Playout, FailureOutcome> {
     match Playout::start_with(device, open.clone()) {
         Ok(playout) => {
-            attempts.reset(now);
+            recovery.opened(now);
             Ok(playout)
         }
-        Err(_) => Err(attempts.record_failure(now)),
+        Err(_) => Err(recovery.record_failure(now)),
     }
 }
 
@@ -270,6 +332,9 @@ pub(super) struct Playout {
     state: StateSlot,
     tap: Tap,
     open: Arc<OpenSink>,
+    /// Non-blocking shutdown signal; `Drop` sets it instead of sending on a
+    /// possibly full channel.
+    stop: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
     started: Instant,
 }
@@ -344,14 +409,28 @@ impl Playout {
         let sink = open(index, PLAYOUT_RATE)?;
         let (sender, receiver) = sync_channel(SOURCE_CHANNEL * 8);
         let metrics = Arc::new(Metrics::default());
+        // A freshly opened sink is running until the thread proves otherwise;
+        // the old `started < 250 ms` shortcut hid an immediate failure.
+        metrics.running.store(true, Ordering::Relaxed);
         let worker_metrics = metrics.clone();
         let state = StateSlot::default();
         let worker_state = state.clone();
         let tap = Tap::default();
         let worker_tap = tap.clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = stop.clone();
         let thread = std::thread::Builder::new()
             .name("voxhold-playout".into())
-            .spawn(move || run(sink, receiver, worker_metrics, worker_state, worker_tap))
+            .spawn(move || {
+                run(
+                    sink,
+                    receiver,
+                    worker_metrics,
+                    worker_state,
+                    worker_tap,
+                    worker_stop,
+                )
+            })
             .map_err(|error| format!("Не удалось запустить микшер: {error}"))?;
         let clip = PlayoutClip {
             sender: sender.clone(),
@@ -364,6 +443,7 @@ impl Playout {
             state,
             tap,
             open,
+            stop,
             thread: Some(thread),
             started: Instant::now(),
         })
@@ -402,23 +482,31 @@ impl Playout {
     }
 
     pub(super) fn stats(&self) -> PlayoutStats {
-        let mut stats = self.metrics.snapshot();
-        // The thread publishes on its own cadence; right after open the
-        // counters are still zero but the sink is live.
-        if self.started.elapsed() < PUBLISH_INTERVAL {
-            stats.running = true;
-        }
-        stats
+        self.metrics.snapshot()
     }
 
     pub(super) fn running(&self) -> bool {
         self.stats().running
     }
+
+    /// A sink proves stability by living `STABLE_AFTER` and accepting
+    /// `STABLE_BLOCKS` whole blocks since it was opened.
+    pub(super) fn stable(&self, now: Instant) -> bool {
+        now.duration_since(self.started) >= STABLE_AFTER
+            && self.metrics.blocks_written.load(Ordering::Relaxed) >= STABLE_BLOCKS
+    }
+
+    #[cfg(test)]
+    pub(super) fn written_blocks(&self) -> u64 {
+        self.metrics.blocks_written.load(Ordering::Relaxed)
+    }
 }
 
 impl Drop for Playout {
     fn drop(&mut self) {
-        let _ = self.sender.send(Msg::Stop);
+        // Non-blocking: a full frame channel must not delay a leave. The thread
+        // observes the flag within one 2 ms tick and closes the sink.
+        self.stop.store(true, Ordering::SeqCst);
         // Detach: closing the WinMM sink may wait a few milliseconds for the
         // driver and must not delay a UI-driven leave.
         if let Some(thread) = self.thread.take() {
@@ -433,12 +521,16 @@ fn run(
     metrics: Arc<Metrics>,
     state: StateSlot,
     tap: Tap,
+    stop: Arc<AtomicBool>,
 ) {
     let mut mixer = Mixer::default();
     let mut pool = SourcePool::default();
     let mut block = vec![0_i16; BLOCK_SAMPLES];
     let mut last_publish = Instant::now();
     'outer: loop {
+        if stop.load(Ordering::SeqCst) {
+            break;
+        }
         let mut stopped = false;
         for _ in 0..64 {
             match receiver.recv_timeout(Duration::ZERO) {
@@ -451,7 +543,7 @@ fn run(
                     let mut old = std::mem::replace(&mut sink, next);
                     old.close();
                 }
-                Ok(Msg::Stop) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                     stopped = true;
                     break;
                 }
@@ -499,6 +591,7 @@ fn run(
             if !sink.write(&block) {
                 break;
             }
+            metrics.blocks_written.fetch_add(1, Ordering::Relaxed);
             filled += 1;
             // Without attached sources, keep the device alive with silence but
             // do not spin through the buffers faster than real time.
@@ -515,6 +608,10 @@ fn run(
     }
     metrics.publish(&mixer, &pool, 0, false);
     sink.close();
+}
+
+fn prune_finished(tasks: &mut Vec<tokio::task::JoinHandle<()>>) {
+    tasks.retain(|task| !task.is_finished());
 }
 
 impl Session {
@@ -579,17 +676,22 @@ impl Session {
     /// moves to the ADM fallback instead of staying silent.
     pub(super) fn resume_playout(&mut self, events: &Events) {
         self.playout_suspended = false;
+        let now = std::time::Instant::now();
         if !self.software_playout {
             // The platform path owns playout on this session; force the normal
             // device poll instead of opening a second sink.
-            self.device_check = std::time::Instant::now() - Duration::from_secs(2);
+            self.device_check = now - Duration::from_secs(2);
             self.check_devices(events);
             return;
         }
         if self.playout_mode == PlayoutMode::AdmFallback {
             // The mixer budget was already spent. Reopening it while the ADM
-            // plays would duplicate the room; only the ADM path is restored.
+            // plays would duplicate the room; only the ADM path is restored,
+            // and its real PCM progress is checked by the watchdog tick.
             self.audio.set_playout(true);
+            self.adm_playout_started_at = now;
+            self.adm_playout_duration = None;
+            self.adm_playout_progress_at = now;
             if !self.audio.running(false) {
                 let started = self.audio.start(false);
                 self.report_audio(events);
@@ -607,7 +709,7 @@ impl Session {
         }
         self.playout.take();
         self.abort_playout_tasks();
-        self.playout_attempts.reset(std::time::Instant::now());
+        self.playout_attempts.reset_for_resume(now);
         if !self.attempt_software_playout(events, RecoveryCause::Resume) {
             // The retry ladder owns the next attempt; the UI must stop saying
             // that the mixer applies gain in the meantime.
@@ -616,9 +718,10 @@ impl Session {
     }
 
     /// Periodic sink health and retry driver. Called from the media tick, not
-    /// from the UI, and never busy-loops: a failed open schedules a delay.
+    /// from the UI, and never busy-loops: every transition is counted once.
     pub(super) fn tick_playout(&mut self, events: &Events) {
         let now = std::time::Instant::now();
+        self.prune_playout_tasks();
         match self.playout_mode {
             PlayoutMode::Software => {
                 if self.playout_suspended {
@@ -626,22 +729,35 @@ impl Session {
                 }
                 if let Some(playout) = &self.playout {
                     if playout.running() {
+                        if self.playout_attempts.phase() == PlayoutPhase::Unstable
+                            && playout.stable(now)
+                        {
+                            // Only proof of stability clears the shared budget.
+                            self.playout_attempts.mark_stable();
+                        }
                         if self.last_playout_report.elapsed() >= REPORT_INTERVAL {
                             self.last_playout_report = now;
                             let mut stats = playout.stats();
                             stats.reconnects = self.playout_reconnects;
+                            stats.phase = self.playout_attempts.phase();
                             events.push(Event::Playout(stats));
                         }
                         return;
                     }
-                    // The thread ended (device removed or a driver reset).
+                    // The sink opened but died before proving stability. This
+                    // is one state transition: one failure, one message, no
+                    // reattach and no immediate reopen.
                     self.playout = None;
                     self.abort_playout_tasks();
-                    self.playout_attempts.reset(now);
+                    let outcome = self.playout_attempts.sink_died(now);
                     events.push(Event::DeviceError {
                         message: "Воспроизведение комнаты остановилось; восстанавливаем.",
                     });
                     self.report_audio(events);
+                    if outcome == FailureOutcome::AdmFallback {
+                        self.engage_adm_fallback(events, RecoveryCause::Sink);
+                        return;
+                    }
                 }
                 if !self.playout_attempts.due(now) {
                     return;
@@ -649,27 +765,53 @@ impl Session {
                 self.attempt_software_playout(events, RecoveryCause::Sink);
             }
             PlayoutMode::AdmFallback => {
-                if !self.adm_attempts.due(now) {
+                if self.playout_suspended {
                     return;
                 }
-                self.adm_attempts.reset(now + ADM_RETRY);
+                if !self.adm_retry.due(now) {
+                    return;
+                }
+                self.adm_retry.schedule(now, ADM_RETRY);
+                if self.adm_playout_healthy(now) {
+                    return;
+                }
+                // Initialized is not proof of PCM: restart a platform path that
+                // stopped delivering played samples.
                 if self.audio.running(false) {
-                    return;
+                    let _ = self.audio.stop(false);
                 }
+                self.audio.set_playout(true);
                 let started = self.audio.start(false);
+                self.adm_playout_started_at = now;
+                self.adm_playout_duration = None;
+                self.adm_playout_progress_at = now;
                 self.report_audio(events);
-                if !started {
-                    events.push(Event::DeviceError {
-                        message: "Системное воспроизведение комнаты не восстановлено; повторяем.",
-                    });
-                }
+                events.push(Event::DeviceError {
+                    message: if started {
+                        "Системный ADM не отдаёт PCM; перезапускаем воспроизведение."
+                    } else {
+                        "Системное воспроизведение комнаты не восстановлено; повторяем."
+                    },
+                });
             }
         }
     }
 
-    /// One bounded open attempt. `Ok` attaches the surviving receivers and
-    /// reports the restored path; failures schedule the next attempt or move
-    /// to the ADM fallback.
+    /// The ADM path is healthy only while its cumulative played duration moves.
+    /// A startup grace covers the first stats report, exactly as the capture
+    /// watchdog does.
+    fn adm_playout_healthy(&self, now: std::time::Instant) -> bool {
+        adm_playout_ok(
+            self.audio.running(false),
+            now.duration_since(self.adm_playout_started_at),
+            self.adm_playout_duration.is_some(),
+            self.adm_playout_progress_at.elapsed(),
+        )
+    }
+
+    /// One bounded open attempt. A successful open is not yet a recovery: it
+    /// moves to `Unstable` and the health tick proves it before the budget is
+    /// cleared. Failures schedule the next attempt or move to the ADM fallback.
     pub(super) fn attempt_software_playout(
         &mut self,
         events: &Events,
@@ -698,12 +840,15 @@ impl Session {
                 if let Some(playout) = &self.playout {
                     let mut stats = playout.stats();
                     stats.reconnects = self.playout_reconnects;
+                    stats.phase = PlayoutPhase::Unstable;
                     events.push(Event::Playout(stats));
                 }
                 events.push(Event::DeviceError {
                     message: match cause {
-                        RecoveryCause::Resume => "Звук комнаты возобновлён после сна.",
-                        RecoveryCause::Sink => "Звук комнаты восстановлен после остановки микшера.",
+                        RecoveryCause::Resume => {
+                            "Звук комнаты открыт после сна; проверяем стабильность."
+                        }
+                        RecoveryCause::Sink => "Микшер открыт заново; проверяем стабильность.",
                     },
                 });
                 true
@@ -728,12 +873,16 @@ impl Session {
     /// and tell the UI that only mute is applied from now on.
     fn engage_adm_fallback(&mut self, events: &Events, cause: RecoveryCause) {
         self.playout_mode = PlayoutMode::AdmFallback;
+        self.playout_attempts.to_adm();
         self.playout = None;
         self.abort_playout_tasks();
         self.audio.set_playout(true);
         let started = self.audio.start(false);
-        self.adm_attempts
-            .reset(std::time::Instant::now() + ADM_RETRY);
+        let now = std::time::Instant::now();
+        self.adm_retry.schedule(now, ADM_RETRY);
+        self.adm_playout_started_at = now;
+        self.adm_playout_duration = None;
+        self.adm_playout_progress_at = now;
         self.apply_audio_controls();
         self.report_audio(events);
         events.push(Event::DeviceError {
@@ -759,9 +908,18 @@ impl Session {
         }
     }
 
+    /// A finished track task is kept in the shared Vec until the call ends
+    /// unless it is pruned; a call can add a task per renegotiation.
+    fn prune_playout_tasks(&mut self) {
+        if let Ok(mut tasks) = self.playout_tasks.lock() {
+            prune_finished(&mut tasks);
+        }
+    }
+
     /// Every receiver that is still present gets a fresh engine sink on the new
     /// mixer. `on_track` is not repeated for those tracks after a system sleep.
     fn attach_existing_tracks(&mut self) {
+        self.prune_playout_tasks();
         let Some(playout) = self.playout.as_ref().map(Playout::clip) else {
             return;
         };

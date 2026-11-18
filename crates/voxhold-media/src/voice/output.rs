@@ -50,6 +50,43 @@ impl OutputState {
     }
 }
 
+/// Resolve and activate the saved ADM playout endpoint when the ADM owns
+/// playout. A software sink already playing on that device must not be
+/// disturbed, so a session that owns the mixer passes `adm_owns_playout=false`
+/// and keeps the saved id untouched.
+pub(super) fn activate_saved_output(
+    audio: &PlatformAudio,
+    controls: &mut Controls,
+    adm_owns_playout: bool,
+    events: &Events,
+) -> Option<u16> {
+    if !adm_owns_playout {
+        return None;
+    }
+    let id = controls.output.clone().filter(|id| !id.is_empty())?;
+    match audio
+        .resolve(&id, false)
+        .filter(|index| audio.activate(*index, false))
+    {
+        Some(index) => Some(index),
+        None => {
+            controls.output = None;
+            events.push(Event::DeviceError {
+                message: "Выбранное устройство воспроизведения недоступно, используется системное.",
+            });
+            events.push(Event::Output {
+                applied: None,
+                audible: true,
+                working: true,
+                error: Some(
+                    "Выбранное устройство воспроизведения недоступно, используется системное.",
+                ),
+            });
+            None
+        }
+    }
+}
+
 /// The platform ADM is stale when it is no longer initialized, when its
 /// captured-sample duration stopped moving, or when it never reported any
 /// capture after the transport connected.

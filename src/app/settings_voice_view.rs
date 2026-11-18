@@ -68,7 +68,8 @@ impl Voxhold {
             .filter(|stats| stats.running)
             .map(|stats| {
                 format!(
-                    "Микшер после общего микса: уровень {:.0} % · p95 {} мкс · underrun {} · drop {} · ограничено {} · release {} · переподключений {} · буфер {} мс",
+                    "Микшер после общего микса: {} · уровень {:.0} % · p95 {} мкс · underrun {} · drop {} · ограничено {} · release {} · переподключений {} · буфер {} мс",
+                    stats.phase.label(),
                     f64::from(stats.level) * 100.0,
                     stats.p95_micros,
                     stats.underruns,

@@ -537,8 +537,9 @@ impl VoicePanel {
                 // Measured post-mix level and the real block-time percentile;
                 // the ADM fallback path has no such numbers and shows nothing.
                 let label = format!(
-                    "Микшер · {:.0}% · p95 {} мкс · under {} · drop {} · огр. {} · release {} · recon {} · {} мс",
+                    "Микшер · {:.0}% · {} · p95 {} мкс · under {} · drop {} · огр. {} · release {} · recon {} · {} мс",
                     f64::from(stats.level) * 100.0,
+                    stats.phase.label(),
                     stats.p95_micros,
                     stats.underruns,
                     stats.dropped,

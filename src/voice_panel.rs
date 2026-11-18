@@ -92,6 +92,10 @@ pub struct VoicePanel {
     local_mutes: HashSet<String>,
     local_level: f64,
     device_error: String,
+    /// Newest explicit input request. A typed result for an older generation
+    /// must not overwrite a newer choice; zero marks an engine-initiated
+    /// fallback and is always current.
+    input_generation: u64,
     streams: Vec<Publication>,
     /// Publications of the displayed room from the account WebSocket; the
     /// call's runtime owns `streams` for the room it is in.
@@ -203,6 +207,7 @@ impl VoicePanel {
             local_mutes: HashSet::new(),
             local_level: 0.0,
             device_error: String::new(),
+            input_generation: 0,
             streams: Vec::new(),
             room_streams: Vec::new(),
             access_confirmed: true,
@@ -914,16 +919,30 @@ impl VoicePanel {
                 self.stream_connected = connected;
             }
             VoiceUpdate::DeviceError(error) => {
-                if error.starts_with("Выбранный микрофон")
-                    || error.starts_with("Микрофон отключён")
-                    || error.starts_with("Микрофон недоступен")
-                {
-                    // The engine fell back to the system input; stop sending
-                    // the dead saved id with every mute/PTT update. An explicit
-                    // settings selection will set it again.
-                    self.controls.input = None;
-                }
+                // A notice is not proof that the saved choice is dead: the
+                // typed `InputApplied` result below is the only thing allowed
+                // to replace `controls.input`. Clearing it here let a late
+                // notice undo a newer explicit selection.
                 self.device_error = error;
+            }
+            VoiceUpdate::InputApplied {
+                generation,
+                input,
+                error,
+            } => {
+                // A result for an older explicit request must not overwrite a
+                // newer selection. Zero is an engine-initiated fallback and is
+                // always the current applied device.
+                if generation != 0 {
+                    if generation < self.input_generation {
+                        return false;
+                    }
+                    self.input_generation = generation;
+                }
+                self.controls.input = input;
+                if let Some(error) = error {
+                    self.device_error = error;
+                }
             }
             VoiceUpdate::AudioMode(applied) => {
                 self.applied_audio = Some(applied);

@@ -46,6 +46,12 @@ const ICE_CAPACITY: usize = 64;
 const COMPLETED_UFRAG_CAPACITY: usize = 16;
 const SIGNAL_TIMEOUT: Duration = Duration::from_secs(8);
 const SPEAKING_THRESHOLD: f64 = 0.018;
+/// A recovery attempt is only cleared after this much uninterrupted capture.
+/// One delivered block is not proof that a driver recovered.
+const INPUT_STABLE_CAPTURE: Duration = Duration::from_secs(5);
+/// The system WinMM input may open without ever delivering PCM. Bound those
+/// reopens so the ladder always reaches the platform ADM.
+const MAX_SYSTEM_INPUT_ATTEMPTS: u8 = 2;
 
 mod capture_gate;
 pub use capture_gate::CaptureGate;
@@ -139,6 +145,14 @@ struct Session {
     /// The selected id was already reopened once in this failure episode. If
     /// it stays silent, the next recovery must use the system input.
     input_reopen_attempted: bool,
+    /// System WinMM reopens in this failure episode. A driver can open the
+    /// system device and never deliver PCM, so this is bounded separately
+    /// from the selected-device retry; after the limit the ladder must reach
+    /// the platform ADM.
+    input_system_attempts: u8,
+    /// Start of the current uninterrupted progress run. A single block must
+    /// not clear the recovery counters; only sustained capture does.
+    input_stable_since: Option<std::time::Instant>,
     output: OutputState,
     device_check: std::time::Instant,
 }
@@ -314,27 +328,51 @@ impl Session {
                         // Its ADM applies its own NS/AGC and may enable echo
                         // cancellation on the render reference; the software
                         // toggles do not apply.
+                        audio.set_recording(true);
+                        let mut started = false;
                         if let Some(id) = controls.input.as_deref().filter(|id| !id.is_empty()) {
-                            if audio.select(id, true) {
-                                input_index = audio.resolve(id, true);
+                            if let Some(index) = audio
+                                .resolve(id, true)
+                                .filter(|index| audio.apply(*index, true, true))
+                            {
+                                input_index = Some(index);
                                 input_opened = Some(id.to_owned());
+                                started = true;
                             } else {
                                 controls.input = None;
                                 input_index = None;
                                 input_opened = None;
-                                audio.select("", true);
                                 events.push(Event::DeviceError {
                                     message:
                                         "Выбранный микрофон недоступен, используется системный.",
                                 });
                             }
                         }
-                        audio.set_recording(true);
+                        // Start the system ADM too when no saved device was
+                        // open. The start result is checked: initialization
+                        // alone does not prove that recording began.
+                        if !started {
+                            if let Some(index) = audio
+                                .resolve("", true)
+                                .filter(|index| audio.apply(*index, true, true))
+                            {
+                                input_index = Some(index);
+                                started = true;
+                            }
+                        }
+                        if !started {
+                            events.push(Event::DeviceError {
+                                message: "Системный микрофон ADM недоступен.",
+                            });
+                        }
                         let track = factory.create_device_audio_track("voxhold-microphone");
                         (track, ("platform", NoiseMode::Auto.as_str(), true, true))
                     }
                 }
             };
+            // The gate attaches after `add_track`; keep the new track silent
+            // until it has applied the current permission state.
+            track.set_enabled(false);
             let sender = peer
                 .add_track(MediaStreamTrack::Audio(track.clone()), &["voxhold-voice"])
                 .map_err(|_| "Не удалось подключить микрофон к WebRTC.")?;
@@ -352,6 +390,14 @@ impl Session {
             });
             (Some(sender), None)
         };
+        // Typed result of the device selection the session actually opened.
+        // The UI uses it instead of clearing a saved id on any late device
+        // notice.
+        events.push(Event::InputApplied {
+            generation: 0,
+            input: controls.input.clone(),
+            error: None,
+        });
         let input_progress = mic.as_ref().map(MicCapture::progress).unwrap_or(0);
         let mut session = Self {
             peer,
@@ -376,6 +422,8 @@ impl Session {
             input_progress_at: std::time::Instant::now(),
             input_recovery_failed: false,
             input_reopen_attempted: false,
+            input_system_attempts: 0,
+            input_stable_since: None,
             output,
             device_check: std::time::Instant::now(),
         };
@@ -407,6 +455,9 @@ impl Session {
                 Ok(())
             }
             Command::State(controls) => self.update_controls(controls, events),
+            Command::SelectInput { input, generation } => {
+                self.select_input(input, generation, events)
+            }
             Command::ViewAudio { muted } => {
                 self.controls.deafened = muted;
                 self.apply_audio_controls();
@@ -469,7 +520,6 @@ impl Session {
             || (self.controls.input_gain - controls.input_gain).abs() > f32::EPSILON
             || self.controls.echo_cancellation != controls.echo_cancellation
             || self.controls.auto_gain_control != controls.auto_gain_control;
-        let retry_input = controls.retry_input;
         let requested_input = normalize_input(controls.input.clone());
         let requested_output = controls.output.clone();
         let output_needs_switch = self.output.needs_switch(&requested_output);
@@ -499,9 +549,14 @@ impl Session {
         if deafen_changed || gain_changed {
             self.apply_audio_controls();
         }
-        if retry_input || requested_input != self.controls.input {
-            if let Err(message) = self.switch_input(requested_input, retry_input, events) {
-                events.push(Event::DeviceError { message });
+        if requested_input != self.controls.input {
+            match self.switch_input(requested_input, false, events) {
+                Ok(()) => events.push(Event::InputApplied {
+                    generation: 0,
+                    input: self.controls.input.clone(),
+                    error: None,
+                }),
+                Err(message) => events.push(Event::DeviceError { message }),
             }
         }
         if output_needs_switch {

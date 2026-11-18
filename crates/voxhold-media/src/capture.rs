@@ -4,8 +4,9 @@
 //! `eac53c0e9883cc53c262815ae971fc1366d3d37e`, base `09c82b9`).
 //!
 //! Windows is captured with `waveIn` at 48 kHz mono 16-bit. The settings list
-//! stores the stable Windows endpoint interface id; a legacy `index:name` is
-//! resolved by a unique name. WebRTC's platform ADM keeps only the playout side
+//! stores the Core Audio endpoint id (`DRV_QUERYFUNCTIONINSTANCEID`); a legacy
+//! `index:name` or older PnP interface id is migrated by a unique name. WebRTC's
+//! platform ADM keeps only the playout side
 //! here: capture is ours so the gate, gain and mute are provable over the exact
 //! PCM that reaches Opus. Platform ADM is used only when no WinMM input opens.
 
@@ -52,6 +53,9 @@ pub const ECHO_CANCELLATION_AVAILABLE: bool = false;
 pub struct PcmBuffer {
     samples: VecDeque<i16>,
     dropped_blocks: u64,
+    /// Permission generation of every queued sample. Blocks from an older
+    /// generation are dropped instead of being replayed under the new one.
+    generation: u64,
 }
 
 impl PcmBuffer {
@@ -59,13 +63,21 @@ impl PcmBuffer {
         Self {
             samples: VecDeque::with_capacity(MAX_PENDING + BLOCK),
             dropped_blocks: 0,
+            generation: 0,
         }
     }
 
-    /// Append one completed driver buffer. Every overflow removes one whole
-    /// 10 ms block and increments the counter, so the meter can report a
-    /// stalled consumer instead of silently hiding it.
-    pub fn push(&mut self, chunk: &[i16]) {
+    /// Append one completed driver buffer. The generation is captured before
+    /// the driver is read, so a buffer that started before a mute/unmute edge
+    /// cannot inherit the new permission just because the epoch changed while
+    /// `completed()` was running.
+    pub fn push(&mut self, chunk: &[i16], generation: u64) {
+        if generation != self.generation {
+            // The driver queue may still contain a block from the previous
+            // state; discard it together with everything already copied.
+            self.samples.clear();
+            self.generation = generation;
+        }
         for sample in chunk {
             while self.samples.len() >= MAX_PENDING {
                 for _ in 0..BLOCK {
@@ -77,7 +89,11 @@ impl PcmBuffer {
         }
     }
 
-    pub fn pop_block(&mut self, block: &mut [i16; BLOCK]) -> bool {
+    pub fn pop_block(&mut self, block: &mut [i16; BLOCK], generation: u64) -> bool {
+        if self.generation != generation {
+            self.samples.clear();
+            return false;
+        }
         if self.samples.len() < BLOCK {
             return false;
         }
@@ -279,7 +295,11 @@ fn capture_loop(
     let mut ticks = 0_u32;
     let mut permission = PermissionEpoch::new(&epoch);
     while !stop.load(Ordering::Acquire) {
-        if permission.changed(&epoch) {
+        // Bind the permission generation before touching the driver queue.
+        // Everything read in this pass belongs to this generation even if a
+        // mute/PTT edge advances the epoch while `completed()` is running.
+        let generation = epoch.load(Ordering::Acquire);
+        if permission.changed(generation) {
             // The control decision changed (including a fast PTT press that
             // returned to the same boolean). Throw away Rust and driver
             // buffers captured under the previous state.
@@ -291,21 +311,22 @@ fn capture_loop(
                 break;
             }
         }
-        device.completed(|samples| pending.push(samples));
+        device.completed(|samples| pending.push(samples, generation));
         if device.failed() {
             failed.store(true, Ordering::Release);
             break;
         }
         loop {
-            let block_epoch = epoch.load(Ordering::Acquire);
-            if !pending.pop_block(&mut block) {
-                break;
-            }
-            if epoch.load(Ordering::Acquire) != block_epoch {
+            // Do not hand any block to Opus after a generation change until
+            // the driver queue has been flushed at the top of the outer loop.
+            if epoch.load(Ordering::Acquire) != generation {
                 pending.clear();
                 source.clear_buffer();
                 processor.reset();
-                continue;
+                break;
+            }
+            if !pending.pop_block(&mut block, generation) {
+                break;
             }
             let current = params
                 .lock()
@@ -316,13 +337,12 @@ fn capture_loop(
                     ..AudioParams::default()
                 });
             let (level, muted) = processor.process(&mut block, &current);
-            // A transition in the middle of a block (or a stale buffer that
-            // slipped through) must not reach Opus as live audio.
-            if epoch.load(Ordering::Acquire) != block_epoch {
+            if epoch.load(Ordering::Acquire) != generation {
                 dsp::silence(&mut block);
                 pending.clear();
                 source.clear_buffer();
                 processor.reset();
+                break;
             }
             let frame = AudioFrame {
                 data: std::borrow::Cow::Borrowed(&block),
@@ -367,8 +387,7 @@ impl PermissionEpoch {
         }
     }
 
-    fn changed(&mut self, epoch: &std::sync::atomic::AtomicU64) -> bool {
-        let current = epoch.load(Ordering::Acquire);
+    fn changed(&mut self, current: u64) -> bool {
         if current == self.seen {
             return false;
         }
@@ -434,7 +453,7 @@ mod tests {
         let mut buffer = PcmBuffer::with_capacity();
         for block_index in 0..=MAX_PENDING_BLOCKS {
             let block = vec![block_index as i16; BLOCK];
-            buffer.push(&block);
+            buffer.push(&block, 0);
         }
         assert_eq!(buffer.len(), MAX_PENDING);
         assert_eq!(buffer.dropped_blocks(), 1);
@@ -444,22 +463,22 @@ mod tests {
             "the oldest block was discarded, not the newest"
         );
         let mut block = [0_i16; BLOCK];
-        assert!(buffer.pop_block(&mut block));
+        assert!(buffer.pop_block(&mut block, 0));
         assert!(block.iter().all(|sample| *sample == 1));
     }
 
     #[test]
     fn clearing_the_queue_removes_stale_samples() {
         let mut buffer = PcmBuffer::with_capacity();
-        buffer.push(&vec![9_000_i16; BLOCK]);
+        buffer.push(&vec![9_000_i16; BLOCK], 0);
         buffer.clear();
         // A discontinuity/restart starts from the next captured block, not
         // from the samples that were already queued.
-        buffer.push(&vec![222_i16; BLOCK]);
+        buffer.push(&vec![222_i16; BLOCK], 0);
         let mut block = [0_i16; BLOCK];
-        assert!(buffer.pop_block(&mut block));
+        assert!(buffer.pop_block(&mut block, 0));
         assert!(block.iter().all(|sample| *sample == 222));
-        assert!(!buffer.pop_block(&mut block));
+        assert!(!buffer.pop_block(&mut block, 0));
     }
 
     #[test]
@@ -730,17 +749,17 @@ mod tests {
         let epoch = std::sync::atomic::AtomicU64::new(0);
         let mut permission = PermissionEpoch::new(&epoch);
         let mut pending = PcmBuffer::with_capacity();
-        pending.push(&vec![9_000_i16; BLOCK]);
+        pending.push(&vec![9_000_i16; BLOCK], 0);
         // Press and release between two polls restores the boolean state but
         // still advances the epoch twice.
         epoch.fetch_add(1, Ordering::SeqCst);
         epoch.fetch_add(1, Ordering::SeqCst);
-        assert!(permission.changed(&epoch));
+        assert!(permission.changed(epoch.load(Ordering::Acquire)));
         pending.clear();
         let mut block = [0_i16; BLOCK];
-        assert!(!pending.pop_block(&mut block), "old audio was discarded");
-        pending.push(&vec![222_i16; BLOCK]);
-        assert!(pending.pop_block(&mut block));
+        assert!(!pending.pop_block(&mut block, 2), "old audio was discarded");
+        pending.push(&vec![222_i16; BLOCK], 2);
+        assert!(pending.pop_block(&mut block, 2));
         assert!(block.iter().all(|sample| *sample == 222));
         // End-to-end view of the same transition: the first processed block
         // after the flush comes from the post-transition buffer, not from the
@@ -762,7 +781,30 @@ mod tests {
             "stale pre-unmute audio reached the output: {:?}",
             &block[..4]
         );
-        assert!(!permission.changed(&epoch));
+        assert!(!permission.changed(epoch.load(Ordering::Acquire)));
+    }
+
+    #[test]
+    fn a_block_read_before_a_generation_change_is_not_sent_after_unmute() {
+        let mut pending = PcmBuffer::with_capacity();
+        // The driver buffer was captured while muted, so the loop tagged it
+        // with generation 7 before calling `completed()`. The mute is released
+        // while that call is still running; the generation reaches 8.
+        pending.push(&vec![12_345_i16; BLOCK], 7);
+        let mut block = [0_i16; BLOCK];
+        assert!(
+            !pending.pop_block(&mut block, 8),
+            "a buffer tagged with the old generation must not pass the new epoch check"
+        );
+        assert!(
+            block.iter().all(|sample| *sample == 0),
+            "no stale sample may be left in the output block"
+        );
+        // After the queue is reset, only a block read under the new
+        // generation is eligible.
+        pending.push(&vec![222_i16; BLOCK], 8);
+        assert!(pending.pop_block(&mut block, 8));
+        assert!(block.iter().all(|sample| *sample == 222));
     }
 
     #[test]
@@ -773,11 +815,13 @@ mod tests {
                 index: 0,
                 name: "Speakers".into(),
                 endpoint: Some("endpoint-0".into()),
+                legacy_interface: Some("interface-0".into()),
             },
             winmm::DeviceInfo {
                 index: 1,
                 name: "USB Headset".into(),
                 endpoint: Some("endpoint-1".into()),
+                legacy_interface: Some("interface-1".into()),
             },
         ];
         assert_eq!(
@@ -793,6 +837,13 @@ mod tests {
                 .index,
             1,
             "new preferences use the stable endpoint id"
+        );
+        assert_eq!(
+            winmm::choose_device(Some("interface-1"), &devices)
+                .unwrap()
+                .index,
+            1,
+            "a legacy PnP interface id saved by an older build still migrates"
         );
         assert_eq!(
             winmm::choose_device(Some("1:USB"), &devices).unwrap().index,
@@ -814,11 +865,13 @@ mod tests {
                 index: 3,
                 name: "USB Mic".into(),
                 endpoint: Some("endpoint-3".into()),
+                legacy_interface: Some("interface-3".into()),
             },
             winmm::DeviceInfo {
                 index: 0,
                 name: "USB Mic".into(),
                 endpoint: Some("endpoint-0".into()),
+                legacy_interface: Some("interface-0".into()),
             },
         ];
         assert!(

@@ -152,6 +152,7 @@ impl StreamViewer {
             | Event::Level { .. }
             | Event::InputLevel { .. }
             | Event::Audio { .. }
+            | Event::InputApplied { .. }
             | Event::DeviceError { .. } => None,
         }
     }

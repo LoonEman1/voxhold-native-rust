@@ -68,7 +68,10 @@ unsafe extern "system" {
 pub(super) struct DeviceInfo {
     pub index: u32,
     pub name: String,
+    /// Current Core Audio endpoint id, the value saved by new preferences.
     pub endpoint: Option<String>,
+    /// PnP interface id saved by older builds; matched only for migration.
+    pub legacy_interface: Option<String>,
 }
 
 fn label(name: &[u16]) -> String {
@@ -90,6 +93,7 @@ fn list() -> Vec<DeviceInfo> {
                     index,
                     name: label(&caps.name),
                     endpoint: crate::devices::endpoint_id(index),
+                    legacy_interface: crate::devices::legacy_interface_id(index),
                 });
             }
         }
@@ -161,11 +165,14 @@ pub(super) fn choose_device(saved: Option<&str>, devices: &[DeviceInfo]) -> Resu
         ),
         None => devices
             .iter()
-            .find(|device| device.endpoint.as_deref() == Some(saved))
+            .find(|device| {
+                device.endpoint.as_deref() == Some(saved)
+                    || device.legacy_interface.as_deref() == Some(saved)
+            })
             .map(|device| Chosen {
                 index: device.index,
                 expected_endpoint: device.endpoint.clone(),
-                expected_name: None,
+                expected_name: Some(device.name.clone()),
             })
             .ok_or_else(|| "Выбранное устройство ввода недоступно.".to_owned()),
     }
@@ -191,6 +198,7 @@ fn actual_device(handle: usize) -> Option<DeviceInfo> {
         index,
         name: label(&caps.name),
         endpoint: crate::devices::endpoint_id(index),
+        legacy_interface: crate::devices::legacy_interface_id(index),
     })
 }
 

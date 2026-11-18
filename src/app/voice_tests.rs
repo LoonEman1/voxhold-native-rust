@@ -770,10 +770,6 @@ async fn dsp_controls_accept_the_web_ranges(cx: &mut TestAppContext) {
         assert_eq!(controls.noise_gate_percent, 15);
         assert_eq!(controls.input_gain, 0.0);
         assert_eq!(controls.input.as_deref(), Some("endpoint-x"));
-        assert!(
-            !controls.retry_input,
-            "the retry flag must not leak into later mute/PTT updates"
-        );
     });
 }
 

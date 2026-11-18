@@ -17,14 +17,13 @@ impl VoicePanel {
 
     /// Explicit input selection. Even the same saved id is forwarded once, so
     /// a microphone that was missing at join (and fell back to the system
-    /// device) can be retried without rejoining.
+    /// device) can be retried without rejoining. The request has its own slot
+    /// and generation, so a later PTT/DSP update cannot displace it.
     pub fn select_input(&mut self, input: Option<String>) {
-        self.controls.input = input;
-        self.controls.retry_input = true;
+        self.controls.input = input.clone();
         if let Some(handle) = &self.handle {
-            handle.controls(self.controls.clone(), self.self_muted);
+            self.input_generation = handle.select_input(input);
         }
-        self.controls.retry_input = false;
     }
 
     /// Explicit output selection from the settings tab. This is forwarded even

@@ -212,6 +212,22 @@ pub fn migrate_legacy_input(input: &str, devices: &[Device]) -> Option<String> {
     }
 }
 
+/// Migrate either legacy form of a saved input: the WinMM `index:name` value
+/// or the older PnP interface id. New Core Audio endpoint ids pass through
+/// unchanged.
+pub fn migrate_saved_input(input: &str, devices: &[Device]) -> Option<String> {
+    migrate_legacy_input(input, devices).or_else(|| {
+        #[cfg(feature = "voxhold-media")]
+        {
+            voxhold_media::devices::canonical_input_id(input).filter(|id| id != input)
+        }
+        #[cfg(not(feature = "voxhold-media"))]
+        {
+            None
+        }
+    })
+}
+
 /// Device labels with the synthetic "system default" and an unavailable
 /// selected id, exactly like `deviceChoice` in Go.
 pub fn device_choices(

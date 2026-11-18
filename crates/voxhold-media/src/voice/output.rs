@@ -110,6 +110,13 @@ impl Session {
                     self.controls.output = None;
                     self.output.request(None);
                 }
+                if input {
+                    events.push(Event::InputApplied {
+                        generation: 0,
+                        input: self.controls.input.clone(),
+                        error: None,
+                    });
+                }
                 events.push(Event::DeviceError {
                     message: if input {
                         "Микрофон отключён, используется системный."
@@ -135,13 +142,29 @@ impl Session {
         }
         let Some((failed, progress)) = self.mic.as_ref().map(|mic| (mic.failed(), mic.progress()))
         else {
+            // The software progress counter says nothing about the ADM path.
+            // Only a lost platform recording is a recovery trigger here.
+            if !self.input_recovery_failed && !self.audio.running(true) {
+                self.recover_input(events);
+            }
             return;
         };
+        let now = std::time::Instant::now();
         if progress != self.input_progress {
             self.input_progress = progress;
-            self.input_progress_at = std::time::Instant::now();
-            self.input_reopen_attempted = false;
-            self.input_recovery_failed = false;
+            self.input_progress_at = now;
+            match self.input_stable_since {
+                Some(since) if now.duration_since(since) >= INPUT_STABLE_CAPTURE => {
+                    // A single block was already proven not to be enough:
+                    // clear the ladder only after sustained capture.
+                    self.input_reopen_attempted = false;
+                    self.input_recovery_failed = false;
+                    self.input_system_attempts = 0;
+                    self.input_stable_since = Some(now);
+                }
+                None => self.input_stable_since = Some(now),
+                Some(_) => {}
+            }
             return;
         }
         if failed || self.input_progress_at.elapsed() >= Duration::from_secs(2) {

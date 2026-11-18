@@ -204,6 +204,34 @@ fn a_missing_saved_microphone_does_not_fail_the_join() {
 }
 
 #[test]
+fn recovery_ladder_bounds_the_silent_system_input_before_the_adm() {
+    assert_eq!(
+        input::recovery_step(true, false, 0),
+        input::RecoveryStep::ReopenSelected,
+        "the selected device gets one reopen"
+    );
+    assert_eq!(
+        input::recovery_step(true, true, 0),
+        input::RecoveryStep::System,
+        "a silent selected device falls through to the system input"
+    );
+    assert_eq!(
+        input::recovery_step(true, true, MAX_SYSTEM_INPUT_ATTEMPTS),
+        input::RecoveryStep::Platform,
+        "a system device that opens but never delivers PCM must not loop forever"
+    );
+    assert_eq!(
+        input::recovery_step(false, false, MAX_SYSTEM_INPUT_ATTEMPTS - 1),
+        input::RecoveryStep::System,
+        "the last system attempt is still used"
+    );
+    assert_eq!(
+        input::recovery_step(false, false, MAX_SYSTEM_INPUT_ATTEMPTS),
+        input::RecoveryStep::Platform
+    );
+}
+
+#[test]
 fn platform_device_names_are_matched_only_when_unique() {
     let unique = platform::unique_name_match(
         "USB Headset",

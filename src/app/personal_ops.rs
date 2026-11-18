@@ -488,7 +488,7 @@ impl Voxhold {
                     if s.active_settings == Some(SettingsKind::Personal)
                         && s.personal.as_ref().map(|panel| panel.dialog.generation) == generation
                     {
-                        let migrated = crate::voice_settings::migrate_legacy_input(
+                        let migrated = crate::voice_settings::migrate_saved_input(
                             &s.voice_settings.prefs.input,
                             &devices,
                         );

@@ -4,6 +4,33 @@ pub(super) fn normalize_input(input: Option<String>) -> Option<String> {
     input.filter(|id| !id.is_empty())
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum RecoveryStep {
+    /// Reopen the selected microphone once in this failure episode.
+    ReopenSelected,
+    /// The selected retry is spent; try the bounded system WinMM input.
+    System,
+    /// The system input budget is spent; go straight to the platform ADM.
+    Platform,
+}
+
+/// Recovery ladder for a capture that stopped delivering PCM. The selected
+/// device is only retried once, and the system WinMM input has its own bounded
+/// budget so a device that opens but stays silent cannot loop forever.
+pub(super) fn recovery_step(
+    has_selected: bool,
+    reopen_attempted: bool,
+    system_attempts: u8,
+) -> RecoveryStep {
+    if has_selected && !reopen_attempted {
+        RecoveryStep::ReopenSelected
+    } else if system_attempts >= MAX_SYSTEM_INPUT_ATTEMPTS {
+        RecoveryStep::Platform
+    } else {
+        RecoveryStep::System
+    }
+}
+
 impl Session {
     pub(super) fn report_audio(&self, events: &Events) {
         let applied = self.controls.audio_params();
@@ -54,6 +81,9 @@ impl Session {
             .audio
             .0
             .create_audio_track("voxhold-microphone", source.clone());
+        // The sender must never transmit a freshly created track before the
+        // gate has applied the current mute/PTT/permission state.
+        track.set_enabled(false);
         if let Some(sender) = &self.sender {
             sender
                 .set_track(Some(MediaStreamTrack::Audio(track.clone())))
@@ -71,6 +101,7 @@ impl Session {
         self.capture.attach_source(track, source);
         self.input_progress = mic.progress();
         self.input_progress_at = std::time::Instant::now();
+        self.input_stable_since = None;
         self.mic = Some(mic);
         self.controls.input = input.clone();
         self.input_opened = input;
@@ -81,47 +112,122 @@ impl Session {
 
     /// Switch to the platform ADM capture path (used when WinMM cannot open
     /// any microphone, or when the software driver reports a failure).
+    ///
+    /// The recording path is started and confirmed before the sender track is
+    /// replaced. A failed start or `set_track` rolls the ADM selection back to
+    /// the previous device (or releases it when software capture was already
+    /// working), so a failed fallback never turns the working input into
+    /// silence.
     pub(super) fn install_platform_input(
         &mut self,
         input: Option<String>,
         events: &Events,
     ) -> Result<(), &'static str> {
         let input = normalize_input(input);
-        if let Some(id) = input.as_deref() {
-            if !self.audio.select(id, true) {
-                return Err("Выбранный микрофон недоступен.");
-            }
-            self.input_index = self.audio.resolve(id, true);
-        } else {
-            if !self.audio.select("", true) {
-                return Err("Системный микрофон недоступен.");
-            }
-            self.input_index = None;
-        }
+        let had_platform = self.mic.is_none();
+        let previous_opened = self.input_opened.clone();
+        let previous_index = self.input_index;
+        let Some(index) = self.audio.resolve(input.as_deref().unwrap_or(""), true) else {
+            return Err(if input.is_some() {
+                "Выбранный микрофон недоступен."
+            } else {
+                "Системный микрофон недоступен."
+            });
+        };
         self.audio.set_recording(true);
-        if !self.audio.running(true) {
-            let _ = self.audio.start(true);
+        // `apply(..., running = true)` stops the previous ADM station, selects
+        // the new device and returns the result of StartRecording. Checking
+        // only `recording_is_initialized()` would report a failed start as a
+        // working microphone.
+        if !self.audio.apply(index, true, true) {
+            self.restore_platform_input(had_platform, &previous_opened, previous_index);
+            return Err("Не удалось запустить микрофон ADM.");
         }
         let track = self.audio.0.create_device_audio_track("voxhold-microphone");
+        // The new track is attached to the sender below, before CaptureGate
+        // knows it. Keep it disabled until the gate has applied the current
+        // mute/PTT/server permission.
+        track.set_enabled(false);
         if let Some(sender) = &self.sender {
             if sender
                 .set_track(Some(MediaStreamTrack::Audio(track.clone())))
                 .is_err()
             {
-                self.audio.set_recording(false);
+                self.restore_platform_input(had_platform, &previous_opened, previous_index);
                 return Err("Не удалось подключить микрофон к WebRTC.");
             }
         }
         if let Some(mut old) = self.mic.take() {
             old.stop();
         }
+        // Registers the track and enables it only if the live permission
+        // allows transmission right now.
         self.capture.attach(track);
         self.mic = None;
         self.input_progress = 0;
         self.input_progress_at = std::time::Instant::now();
+        self.input_stable_since = None;
         self.controls.input = input.clone();
         self.input_opened = input;
+        self.input_index = Some(index);
         self.report_audio(events);
+        Ok(())
+    }
+
+    /// Restore the path that was live before a failed platform switch. When
+    /// software capture was already working, the ADM must be released and the
+    /// old sender track stays untouched. When the ADM was the previous path,
+    /// reopen its device and start recording again.
+    fn restore_platform_input(
+        &mut self,
+        had_platform: bool,
+        previous_opened: &Option<String>,
+        previous_index: Option<u16>,
+    ) {
+        if !had_platform {
+            self.release_platform_capture();
+            return;
+        }
+        let previous = previous_opened.as_deref().unwrap_or("");
+        let restored = self
+            .audio
+            .resolve(previous, true)
+            .or_else(|| self.audio.resolve("", true))
+            .filter(|index| self.audio.apply(*index, true, true));
+        if let Some(index) = restored {
+            self.input_index = Some(index);
+        } else {
+            self.input_index = previous_index;
+            self.release_platform_capture();
+        }
+    }
+
+    fn release_platform_capture(&self) {
+        self.audio.set_recording(false);
+        if self.audio.running(true) {
+            let _ = self.audio.stop(true);
+        }
+    }
+
+    /// Explicit input selection. It has its own request/generation path so a
+    /// later PTT or DSP update cannot displace it, and the typed result tells
+    /// the UI which device is actually applied after a fallback.
+    pub(super) fn select_input(
+        &mut self,
+        input: Option<String>,
+        generation: u64,
+        events: &Events,
+    ) -> Result<(), &'static str> {
+        let error = self
+            .switch_input(normalize_input(input), true, events)
+            .err();
+        events.push(Event::InputApplied {
+            generation,
+            input: self.controls.input.clone(),
+            error,
+        });
+        // A failed explicit selection keeps the previous working path and is
+        // reported through the typed event, not by ending the call.
         Ok(())
     }
 
@@ -140,6 +246,8 @@ impl Session {
         }
         self.input_recovery_failed = false;
         self.input_reopen_attempted = false;
+        self.input_system_attempts = 0;
+        self.input_stable_since = None;
         if self
             .install_software_input(requested.clone(), events)
             .is_ok()
@@ -172,10 +280,16 @@ impl Session {
     /// the platform ADM. Keep the call alive.
     pub(super) fn recover_input(&mut self, events: &Events) {
         self.input_progress_at = std::time::Instant::now();
-        if let Some(id) = self.controls.input.clone() {
-            if !self.input_reopen_attempted {
-                self.input_reopen_attempted = true;
+        let step = recovery_step(
+            self.controls.input.is_some(),
+            self.input_reopen_attempted,
+            self.input_system_attempts,
+        );
+        if step == RecoveryStep::ReopenSelected {
+            self.input_reopen_attempted = true;
+            if let Some(id) = self.controls.input.clone() {
                 if self.install_software_input(Some(id), events).is_ok() {
+                    self.report_input_applied(events, None);
                     events.push(Event::DeviceError {
                         message: "Микрофон перезапущен.",
                     });
@@ -183,21 +297,40 @@ impl Session {
                 }
             }
         }
-        if self.install_software_input(None, events).is_ok() {
-            events.push(Event::DeviceError {
-                message: "Микрофон недоступен, используется системный.",
-            });
-            return;
+        if step != RecoveryStep::Platform && self.input_system_attempts < MAX_SYSTEM_INPUT_ATTEMPTS
+        {
+            self.input_system_attempts += 1;
+            if self.install_software_input(None, events).is_ok() {
+                self.report_input_applied(events, None);
+                events.push(Event::DeviceError {
+                    message: "Микрофон недоступен, используется системный.",
+                });
+                return;
+            }
         }
+        // A system WinMM device that opens but stays silent would otherwise be
+        // chosen again on every recovery tick. Once its budget is spent the
+        // ladder must fall through to the platform ADM.
         if self.install_platform_input(None, events).is_ok() {
+            self.input_system_attempts = 0;
+            self.report_input_applied(events, None);
             events.push(Event::DeviceError {
                 message: "Микрофон недоступен, звук переведён на системный ADM.",
             });
             return;
         }
         self.input_recovery_failed = true;
+        self.report_input_applied(events, Some("Микрофон недоступен, звук не восстановлен."));
         events.push(Event::DeviceError {
             message: "Микрофон недоступен, звук не восстановлен.",
+        });
+    }
+
+    fn report_input_applied(&self, events: &Events, error: Option<&'static str>) {
+        events.push(Event::InputApplied {
+            generation: 0,
+            input: self.controls.input.clone(),
+            error,
         });
     }
 }

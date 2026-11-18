@@ -61,9 +61,6 @@ pub struct Controls {
     pub echo_cancellation: bool,
     /// WebRTC APM automatic gain control in the software capture path.
     pub auto_gain_control: bool,
-    /// One-shot request: retry the input even when the id equals the current
-    /// one. Set by an explicit settings choice, cleared per command.
-    pub retry_input: bool,
 }
 
 impl Default for Controls {
@@ -80,7 +77,6 @@ impl Default for Controls {
             output_gain: None,
             echo_cancellation: true,
             auto_gain_control: true,
-            retry_input: false,
         }
     }
 }
@@ -129,6 +125,12 @@ pub enum Command {
     },
     Ice(Candidate),
     State(Controls),
+    /// Explicit input selection. Kept outside `State` so a later PTT or DSP
+    /// update cannot displace it. `generation` is echoed in `InputApplied`.
+    SelectInput {
+        input: Option<String>,
+        generation: u64,
+    },
     Volume {
         track_id: String,
         gain: f64,
@@ -178,6 +180,15 @@ pub enum Event {
     /// A device switch failed but the previous, working path is still live.
     DeviceError {
         message: &'static str,
+    },
+    /// The input device actually open after an explicit selection, a fallback
+    /// or a recovery. `generation` is the explicit request id, or zero for an
+    /// engine-initiated change. A late result for an older generation must not
+    /// overwrite a newer selection in the UI.
+    InputApplied {
+        generation: u64,
+        input: Option<String>,
+        error: Option<&'static str>,
     },
     /// Result of a stream-player output switch. `applied` is the device that is
     /// actually open after the attempt, which may be the previous one after a

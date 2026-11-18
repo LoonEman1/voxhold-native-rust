@@ -65,10 +65,16 @@ impl PlatformAudio {
                 .and_then(|default| (0..count.max(0) as u16).find(|&index| guid(index) == default))
                 .or_else(|| (count > 0).then_some(0));
         }
+        // New settings store the Core Audio endpoint id from
+        // `DRV_QUERYFUNCTIONINSTANCEID`; match it exactly before falling back
+        // to a display name, which cannot distinguish duplicate microphones.
+        if let Some(index) = (0..count.max(0) as u16).find(|&index| guid(index) == id) {
+            return Some(index);
+        }
         if input {
-            // WinMM endpoint interface ids and Core Audio endpoint ids are
-            // different formats. Map the saved WinMM endpoint to its device
-            // name and use a unique Core Audio name match.
+            // Settings written by older builds hold the WinMM PnP interface
+            // id. It is not the ADM id, so migrate it by its stable device name
+            // and accept only an unambiguous match.
             if let Some(saved) = crate::devices::endpoint_name(id) {
                 let matched = unique_name_match(
                     &saved,
@@ -88,7 +94,7 @@ impl PlatformAudio {
             let first = matches.next();
             first.filter(|_| matches.next().is_none())
         } else {
-            (0..count.max(0) as u16).find(|&index| guid(index) == id)
+            None
         }
     }
 
@@ -134,15 +140,6 @@ impl PlatformAudio {
             return false;
         }
         !running || self.start(input)
-    }
-
-    /// Resolve and switch one endpoint, preserving the running state. A bad
-    /// selection returns `false` before the working path is touched.
-    pub(super) fn select(&self, id: &str, input: bool) -> bool {
-        let Some(index) = self.resolve(id, input) else {
-            return false;
-        };
-        self.apply(index, input, self.running(input))
     }
 
     /// Initial join: choose a device and start the path only if the platform

@@ -25,6 +25,31 @@ pub(super) fn user_volume_slider_id(user: i64) -> String {
     format!("user-volume-{user}")
 }
 
+/// The measured mixer line shown in the voice tab. It depends on both the
+/// applied path and the live report: a stale `running` snapshot after a death
+/// or an ADM fallback must not keep claiming a working software mixer.
+pub(super) fn mixer_status_line(
+    stats: Option<voxhold_media::mixer::PlayoutStats>,
+    software_mixer: bool,
+) -> Option<String> {
+    let stats = stats?;
+    if !software_mixer || !stats.running {
+        return None;
+    }
+    Some(format!(
+        "Микшер после общего микса: {} · уровень {:.0} % · p95 {} мкс · underrun {} · drop {} · ограничено {} · release {} · переподключений {} · буфер {} мс",
+        stats.phase.label(),
+        f64::from(stats.level) * 100.0,
+        stats.p95_micros,
+        stats.underruns,
+        stats.dropped,
+        stats.limited_blocks,
+        stats.limiter_releases,
+        stats.reconnects,
+        stats.latency_ms
+    ))
+}
+
 impl Voxhold {
     pub(super) fn voice_body(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let devices = self.voice_settings.devices.clone();
@@ -61,25 +86,12 @@ impl Voxhold {
         #[cfg(not(feature = "voxhold-media"))]
         let software_mixer = false;
         #[cfg(feature = "voxhold-media")]
-        let mixer_stats = self
-            .voice
-            .as_ref()
-            .and_then(|panel| panel.read(cx).playout_stats())
-            .filter(|stats| stats.running)
-            .map(|stats| {
-                format!(
-                    "Микшер после общего микса: {} · уровень {:.0} % · p95 {} мкс · underrun {} · drop {} · ограничено {} · release {} · переподключений {} · буфер {} мс",
-                    stats.phase.label(),
-                    f64::from(stats.level) * 100.0,
-                    stats.p95_micros,
-                    stats.underruns,
-                    stats.dropped,
-                    stats.limited_blocks,
-                    stats.limiter_releases,
-                    stats.reconnects,
-                    stats.latency_ms
-                )
-            });
+        let mixer_stats = mixer_status_line(
+            self.voice
+                .as_ref()
+                .and_then(|panel| panel.read(cx).playout_stats()),
+            software_mixer,
+        );
         #[cfg(not(feature = "voxhold-media"))]
         let mixer_stats: Option<String> = None;
         let level = self.voice_settings.preview_level.clamp(0.0, 1.0);

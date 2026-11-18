@@ -2,6 +2,10 @@ use super::*;
 
 use std::sync::atomic::AtomicUsize;
 
+use super::tap::TapRead;
+use crate::voice::Session;
+use crate::{Event, Events};
+
 struct FakeSink {
     writes: Arc<Mutex<Vec<Vec<i16>>>>,
     failed: bool,
@@ -350,18 +354,29 @@ fn a_stalled_tap_subscriber_counts_drops_instead_of_being_silently_removed() {
 }
 
 #[test]
-fn adm_health_requires_real_playout_progress_after_the_grace() {
+fn adm_health_requires_real_pcm_only_while_audio_is_expected() {
     let grace = INPUT_CAPTURE_GRACE;
-    assert!(!adm_playout_ok(false, grace * 2, true, Duration::ZERO));
+    assert!(!adm_playout_ok(
+        false,
+        true,
+        grace * 2,
+        true,
+        Duration::ZERO
+    ));
     assert!(
-        adm_playout_ok(true, Duration::from_secs(1), false, grace * 2),
+        adm_playout_ok(true, false, grace + Duration::from_secs(1), false, grace),
+        "an empty room has no inbound audio: unknown is not a failure"
+    );
+    assert!(
+        adm_playout_ok(true, true, Duration::from_secs(1), false, grace * 2),
         "startup grace"
     );
     assert!(
-        !adm_playout_ok(true, grace + Duration::from_secs(1), false, grace),
-        "initialized but no played duration is not healthy"
+        adm_playout_ok(true, true, grace + Duration::from_secs(1), false, grace),
+        "no stats yet is unknown, not a failure"
     );
     assert!(adm_playout_ok(
+        true,
         true,
         grace + Duration::from_secs(1),
         true,
@@ -370,11 +385,12 @@ fn adm_health_requires_real_playout_progress_after_the_grace() {
     assert!(
         !adm_playout_ok(
             true,
+            true,
             grace + Duration::from_secs(1),
             true,
             Duration::from_secs(3)
         ),
-        "stalled progress is a failure"
+        "stale observed progress is a real failure"
     );
 }
 
@@ -402,4 +418,134 @@ fn finished_track_tasks_are_pruned() {
     });
     prune_finished(&mut tasks);
     assert!(tasks.is_empty(), "a finished handle is not kept forever");
+}
+
+fn wait_for_blocks(playout: &Playout, min: u64) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while playout.written_blocks() < min && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert!(
+        playout.written_blocks() >= min,
+        "the fake sink must write {min} blocks"
+    );
+}
+
+fn wait_until_dead(playout: &Playout) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while playout.running() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert!(!playout.running(), "the sink thread must stop");
+}
+
+fn drain(events: &Events) -> (u32, Option<PlayoutStats>) {
+    let mut errors = 0;
+    let mut last = None;
+    while let Some(event) = events.poll(Duration::ZERO) {
+        match event {
+            Event::DeviceError { .. } => errors += 1,
+            Event::Playout(stats) => last = Some(stats),
+            _ => {}
+        }
+    }
+    (errors, last)
+}
+
+/// The initial sink is opened by `Session::new`; this drives the same
+/// `install_initial_playout` + `tick_playout` entry points without devices.
+#[tokio::test]
+async fn the_first_sink_proves_stability_through_tick_playout() {
+    let writes = Arc::new(Mutex::new(Vec::new()));
+    let (open, calls) = failing_then_open(0, writes);
+    let mut session = Session::test_headless(open.clone());
+    let playout = Playout::start_with(None, open).expect("the first sink opens");
+    session.install_initial_playout(playout);
+    let events = session.events.clone();
+    assert_eq!(session.playout_attempts.phase(), PlayoutPhase::Unstable);
+    wait_for_blocks(session.playout.as_ref().unwrap(), STABLE_BLOCKS);
+    session
+        .playout
+        .as_ref()
+        .unwrap()
+        .test_rewind_start(STABLE_AFTER + Duration::from_millis(10));
+    session.tick_playout(&events);
+    assert_eq!(
+        session.playout_attempts.phase(),
+        PlayoutPhase::Stable,
+        "a normal call must leave the Opening/Unstable state"
+    );
+    assert_eq!(session.playout_attempts.failures(), 0);
+    // A single later failure starts the ladder at Retry(0.5 s).
+    session.playout.as_ref().unwrap().test_stop();
+    wait_until_dead(session.playout.as_ref().unwrap());
+    session.tick_playout(&events);
+    assert_eq!(session.playout_attempts.phase(), PlayoutPhase::Opening);
+    assert_eq!(session.playout_attempts.failures(), 1);
+    assert!(
+        !session
+            .playout_attempts
+            .due(Instant::now() + Duration::from_millis(100))
+    );
+    assert!(
+        session
+            .playout_attempts
+            .due(Instant::now() + Duration::from_millis(600))
+    );
+    let (errors, _) = drain(&events);
+    assert_eq!(errors, 1, "one message for the death transition");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "no reopen before the due time"
+    );
+}
+
+#[tokio::test]
+async fn the_fifth_failure_emits_one_message_and_a_final_report() {
+    let (open, calls) = always_open_broken_sink();
+    let mut session = Session::test_headless(open.clone());
+    let playout = Playout::start_with(None, open).expect("opens");
+    session.install_initial_playout(playout);
+    let events = session.events.clone();
+    let now = Instant::now();
+    for _ in 0..4 {
+        session.playout_attempts.record_failure(now);
+    }
+    assert_eq!(session.playout_attempts.phase(), PlayoutPhase::Opening);
+    session.playout.as_ref().unwrap().test_stop();
+    wait_until_dead(session.playout.as_ref().unwrap());
+    session.tick_playout(&events);
+    assert_eq!(session.playout_attempts.phase(), PlayoutPhase::AdmFallback);
+    assert_eq!(session.playout_attempts.failures(), MAX_OPEN_ATTEMPTS);
+    let (errors, last) = drain(&events);
+    assert_eq!(errors, 1, "exactly one message on the transition to ADM");
+    let report = last.expect("a final playout report");
+    assert!(!report.running);
+    assert_eq!(report.phase, PlayoutPhase::AdmFallback);
+    // The fallback branch must not reopen the software sink.
+    let opened = calls.load(Ordering::SeqCst);
+    for _ in 0..4 {
+        session.tick_playout(&events);
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), opened);
+}
+
+#[test]
+fn switching_the_sink_restarts_the_stability_window() {
+    let writes = Arc::new(Mutex::new(Vec::new()));
+    let (open, _) = failing_then_open(0, writes);
+    let playout = Playout::start_with(None, open).expect("opens");
+    wait_for_blocks(&playout, STABLE_BLOCKS);
+    playout.test_rewind_start(STABLE_AFTER + Duration::from_millis(10));
+    assert!(playout.stable(Instant::now()));
+    playout.switch_sink(None).expect("a second device opens");
+    assert!(
+        !playout.stable(Instant::now()),
+        "the new sink must prove itself from scratch"
+    );
+    let baseline = playout.written_blocks();
+    wait_for_blocks(&playout, baseline + STABLE_BLOCKS);
+    playout.test_rewind_start(STABLE_AFTER + Duration::from_millis(10));
+    assert!(playout.stable(Instant::now()));
 }

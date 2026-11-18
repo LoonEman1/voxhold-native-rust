@@ -84,6 +84,35 @@ async fn a_per_user_volume_reaches_the_snapshot_and_is_removed_at_one_hundred(
     });
 }
 
+#[test]
+fn the_mixer_line_disappears_when_the_software_mixer_stops() {
+    use voxhold_media::mixer::{PlayoutPhase, PlayoutStats};
+    let live = PlayoutStats {
+        level: 0.4,
+        running: true,
+        phase: PlayoutPhase::Stable,
+        ..PlayoutStats::default()
+    };
+    assert!(
+        super::settings_voice_view::mixer_status_line(Some(live), true).is_some(),
+        "a live mixer shows its measured line"
+    );
+    // After the death/ADM fallback the panel's `software_mixer()` is false;
+    // the stale running snapshot must not keep the line alive.
+    assert!(
+        super::settings_voice_view::mixer_status_line(Some(live), false).is_none(),
+        "the line is hidden once the applied path is no longer software"
+    );
+    let dead = PlayoutStats {
+        running: false,
+        ..live
+    };
+    assert!(
+        super::settings_voice_view::mixer_status_line(Some(dead), true).is_none(),
+        "a final running=false report hides the line as well"
+    );
+}
+
 #[gpui::test]
 async fn the_playout_report_is_kept_for_the_measured_mixer_line(cx: &mut TestAppContext) {
     let (visual, _view, voice) = voice_call(cx);

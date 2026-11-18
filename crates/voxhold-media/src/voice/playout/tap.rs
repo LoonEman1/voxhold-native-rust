@@ -12,7 +12,7 @@ use super::*;
 /// distinguishes an empty queue from a closed tap, so truncation is never
 /// silent.
 #[derive(Clone, Default)]
-pub(super) struct Tap {
+pub(crate) struct Tap {
     senders: Arc<Mutex<Vec<TapSender>>>,
 }
 
@@ -26,21 +26,21 @@ struct TapSender {
 /// no consumer in this stage.
 #[allow(dead_code)]
 #[derive(Debug)]
-pub(super) enum TapRead {
+pub(crate) enum TapRead {
     Block(Vec<i16>),
     Empty,
     Closed,
 }
 
 #[allow(dead_code)]
-pub(super) struct TapReceiver {
+pub(crate) struct TapReceiver {
     receiver: Receiver<Vec<i16>>,
     dropped: Arc<AtomicU64>,
 }
 
 #[allow(dead_code)]
 impl TapReceiver {
-    pub(super) fn try_recv(&self) -> TapRead {
+    pub(crate) fn try_recv(&self) -> TapRead {
         match self.receiver.try_recv() {
             Ok(block) => TapRead::Block(block),
             Err(std::sync::mpsc::TryRecvError::Empty) => TapRead::Empty,
@@ -49,13 +49,13 @@ impl TapReceiver {
     }
 
     /// Blocks this subscriber missed because its bounded queue was full.
-    pub(super) fn dropped(&self) -> u64 {
+    pub(crate) fn dropped(&self) -> u64 {
         self.dropped.load(Ordering::Relaxed)
     }
 }
 
 impl Tap {
-    pub(super) fn subscribe(&self) -> TapReceiver {
+    pub(crate) fn subscribe(&self) -> TapReceiver {
         let (sender, receiver) = sync_channel(16);
         let dropped = Arc::new(AtomicU64::new(0));
         if let Ok(mut senders) = self.senders.lock() {
@@ -68,14 +68,14 @@ impl Tap {
     }
 
     #[cfg(test)]
-    pub(super) fn subscribers(&self) -> usize {
+    pub(crate) fn subscribers(&self) -> usize {
         self.senders
             .lock()
             .map(|senders| senders.len())
             .unwrap_or(0)
     }
 
-    pub(super) fn emit(&self, block: &[i16]) {
+    pub(crate) fn emit(&self, block: &[i16]) {
         let Ok(mut senders) = self.senders.lock() else {
             return;
         };

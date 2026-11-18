@@ -57,9 +57,9 @@ PR [#13](https://github.com/LoonEman1/voxhold-native-rust/pull/13); сверен
 
 Первый раунд ревью — [`57184ae`](https://github.com/LoonEman1/voxhold-native-rust/commit/57184ae): пересылка по `message_id`, отложенный переход из поиска, удаление корня ветки по WebSocket, отдельная попытка отправки и закрытие панели, tombstone/слияние страницы, новостные комментарии, ACL-фильтр поиска, реакция старого сообщения ЛС, reconnect ЛС, раздельные состояния закрепов, слот прав после `403`, единый hover-диспетчер. Второй раунд — [`4d8cac1`](https://github.com/LoonEman1/voxhold-native-rust/commit/4d8cac1): поиск (включая ЛС) ждёт подтверждённого снимка каналов; POST ветки хранится в `pending_sends` по `ChatKey::thread` и виден переоткрытой панели; пустая последняя страница ветки сохраняет WS/POST-строки и отсекает tombstone; два события реакции дают один активный GET и один повтор по `(ChatKey, message_id)`. После правок: `cargo fmt --check`, `cargo test --workspace --locked` (167: 166 passed, 1 `ignored`; 6 API; 6 media), размеры. Release, GUI и живой backend после правок не перезапускались; осталось: два аккаунта, кадры/DPI, живые новостные роли и закрепы/реакции ЛС, E2EE. См. [status.md](status.md).
 
-Третий раунд — [`4057c7a`](https://github.com/LoonEman1/voxhold-native-rust/commit/4057c7a): отзыв доступа в ЛС сбрасывает подтверждённый поисковый снимок и старые страницы, а при закрытом popup свежий `/channels` запускается следующим открытием; `403` без окна подтверждает права только через владельца слота снимка. Выбор канала переустанавливает уже подтверждённые права до загрузки закрепов и дозагружает их после нового подтверждения. Подтверждение POST ветки снимает «Отправка…» и очищает/сохраняет живой черновик по `plan.key` даже после смены канала, а вставку строки и read ограничивает `access_generation`. «К последним» заменяет старое окно, но возвращает комментарии, пришедшие по WS во время GET, и соблюдает tombstone. После правок: `cargo fmt --all -- --check`, `cargo test --workspace --locked` (173 теста приложения: 172 passed, 1 `ignored`; 6 API; 6 media), размеры (137 файлов). Release, GUI и живой backend после правок не перезапускались; осталось: два аккаунта, кадры/DPI, живые новостные роли и закрепы/реакции ЛС, E2EE. См. [status.md](status.md).
+Третий раунд — [`4057c7a`](https://github.com/LoonEman1/voxhold-native-rust/commit/4057c7a): отзыв доступа в ЛС сбрасывает подтверждённый поисковый снимок и старые страницы, а при закрытом popup свежий `/channels` запускается следующим открытием; `403` без окна подтверждает права только через владельца слота снимка. Выбор канала переустанавливает уже подтверждённые права до загрузки закрепов и дозагружает их после нового подтверждения. Подтверждение POST ветки снимает «Отправка…» и очищает/сохраняет живой черновик по `plan.key` даже после смены канала, а вставку строки и read ограничивает `access_generation`. «К последним» заменяет старое окно, но возвращает комментарии, пришедшие по WS во время GET, и соблюдает tombstone. После правок: `cargo fmt --all -- --check`, `cargo test --workspace --locked` (173 теста приложения: 172 passed, 1 `ignored`; 6 API; 6 media), размеры (138 файлов). Release, GUI и живой backend после правок не перезапускались; осталось: два аккаунта, кадры/DPI, живые новостные роли и закрепы/реакции ЛС, E2EE. См. [status.md](status.md).
 
-Дополнение третьего раунда — [`0b57d56`](https://github.com/LoonEman1/voxhold-native-rust/commit/0b57d56): `channels.changed` в ЛС освобождает и слот `/channels`-проверки после `403`, поэтому старый ответ не может снова разрешить поиск; запрос проверки переведён на tokio без блокировки UI. Возврат ЛС → канал при неподтверждённом снимке запускает свежий `/channels`, и только его callback синхронизирует права и загружает закрепы. Добавлены регрессии на удержание обоих GET и на DM → канал с закрепом 42. Проверки: `cargo fmt --all -- --check`, `cargo test --workspace --locked` (173 теста приложения: 172 passed, 1 `ignored`; 6 API; 6 media), размеры (137 файлов). Release, GUI и живой backend не перезапускались.
+Дополнение третьего раунда — [`0b57d56`](https://github.com/LoonEman1/voxhold-native-rust/commit/0b57d56): `channels.changed` в ЛС освобождает и слот `/channels`-проверки после `403`, поэтому старый ответ не может снова разрешить поиск; запрос проверки переведён на tokio без блокировки UI. Возврат ЛС → канал при неподтверждённом снимке запускает свежий `/channels`, и только его callback синхронизирует права и загружает закрепы. Добавлены регрессии на удержание обоих GET и на DM → канал с закрепом 42. Проверки: `cargo fmt --all -- --check`, `cargo test --workspace --locked` (173 теста приложения: 172 passed, 1 `ignored`; 6 API; 6 media), размеры (138 файлов). Release, GUI и живой backend не перезапускались.
 
 ### R05 · Участники, личные и административные настройки — журнал PR #14
 
@@ -317,7 +317,7 @@ hot-unplug, физический DPI 125/150 (тесты используют п
 Ветка `codex/w-extensions`, база `609bb8651053e282d0ceeacd8488fd10292b8525`;
 сверены Go `09c82b983d5d842af0627289655b11c37ae56e1d`, frontend
 `ed7cb00ae12398753a8ef48a5a33b864e20cb04c`, backend
-`9b29fdd6d5dc818b7408e4892b8e68b27d123831`. W02c закоммичен как `f2db984`;
+`9b29fdd6d5dc818b7408e4892b8e68b27d123831`. W02c закоммичен как `e7f2820`;
 правки текущего цикла находятся в рабочем дереве над этим HEAD без коммита и
 push по условию задачи.
 
@@ -376,10 +376,10 @@ push по условию задачи.
   a_per_user_volume_reaches_the_snapshot_and_is_removed_at_one_hundred`,
   `the_playout_report_is_kept_for_the_measured_mixer_line`.
 - Проверено: `cargo fmt --all -- --check`, `cargo test --workspace --locked`
-  (11 API, 125 media с 9 `ignored` аудио-пробами, 345 приложения с 1
+  (11 API, 133 media с 9 `ignored` аудио-пробами, 346 приложения с 1
   `ignored`), `cargo build --release --locked`, `scripts/check-file-sizes.ps1
-  -All` (204 файла), `git diff --check`, строгий UTF-8/BOM/U+FFFD-детектор по
-  137 отслеживаемым `*.rs`/`*.md`, mojibake-скан, smoke release (процесс жив
+  -All` (205 файла), `git diff --check`, строгий UTF-8/BOM/U+FFFD-детектор по
+  138 отслеживаемым `*.rs`/`*.md`, mojibake-скан, smoke release (процесс жив
   через 5 с).
 
 Не проверено: живое аудио и слышимый микс двух тонов на реальном устройстве,
@@ -389,48 +389,56 @@ push по условию задачи.
 шина не входит в микс комнаты). p95 и счётчики получены на синтетических
 блоках и на реальном sink в smoke-прогоне не снимались.
 
-#### W02c · второй цикл правок после FAIL (рабочее дерево над `f2db984`)
+#### W02c · третий цикл правок после FAIL (рабочее дерево над `e7f2820`)
 
-- `voice/playout.rs`, `voice.rs`: явная машина `SinkRecovery`
-  (`Opening → Unstable → Stable`, `AdmFallback`). Успешный `open` не является
-  восстановлением: бюджет тратится, пока sink не прожил `STABLE_AFTER` = 2 с и
-  не записал `STABLE_BLOCKS` = 50 целых блоков; только это сбрасывает счётчик.
-  Отказы «не открылся» и «открылся и умер» идут в один бюджет
-  (`sink_died` → `record_failure`, 0,5/1/2/4 с), пятый отказ вызывает
-  `engage_adm_fallback`. Один переход даёт одно сообщение, один `reconnects` и
-  одну перепривязку; мёртвый sink больше не переоткрывается на каждом тике.
-  `resume_playout` сохраняет потраченный бюджет (`reset_for_resume`), а
-  ADM-fallback проверяет реальный `MediaPlayout.total_samples_duration`
-  (стартовый grace 5 с), не запускает ADM во время suspend и не открывает
-  software поверх звучащего ADM. Состояние — в `PlayoutStats.phase`.
+- `voice.rs`, `voice/playout/session.rs`: первый sink обычного звонка больше не
+  обходит машину. `Session::new` сохраняет открытый sink и вызывает
+  `install_initial_playout`, который переводит `SinkRecovery` в `Unstable`
+  (`opened()`); через 2 с и 50 блоков `tick_playout` даёт `Stable` и очищает
+  бюджет. Тест `the_first_sink_proves_stability_through_tick_playout` идёт через
+  реальную точку входа (`install_initial_playout` → `tick_playout`, headless
+  Session), затем один отказ даёт `Opening`/`Retry(0,5 с)`.
+- Смерть sink и ADM-fallback отправляют финальный
+  `Event::Playout{running:false, phase}`; строка микшера в настройках строится
+  `mixer_status_line` и скрывается, когда `software_mixer()` ложен. Тесты:
+  `the_fifth_failure_emits_one_message_and_a_final_report` (ровно одно
+  `DeviceError` на переход, финальный отчёт), `the_mixer_line_disappears_when_the_software_mixer_stops`.
+- ADM-здоровье: пустая комната без inbound-дорожек и отсутствие стата — это
+  «неизвестно», не отказ; перезапуск и сообщение только при реально
+  остановившемся `MediaPlayout.total_samples_duration`
+  (`adm_health_requires_real_pcm_only_while_audio_is_expected`).
+- `switch_sink` сбрасывает окно стабильности (`Stability{since,blocks}`), новый
+  девайс не наследует доказательство старого
+  (`switching_the_sink_restarts_the_stability_window`).
 - `Tap`: медленный подписчик не удаляется; пропуски считаются в
   `TapReceiver::dropped()`, `try_recv` возвращает `Block`/`Empty`/`Closed`.
-  `Drop for Playout` останавливает поток атомарным флагом, а не блокирующим
-  `send`; завершённые track-таски вычищаются (`prune_finished`).
+  `Drop for Playout` останавливает поток флагом; завершённые track-таски
+  вычищаются (`prune_finished`). Предупреждения `TapRead`/`TapReceiver` и
+  неиспользуемого `opened_at` устранены.
 - `voice.rs`: ADM-ветка `resolve/activate` не выполняется, если software-sink
   уже открыт, поэтому отказ ADM не сбрасывает выбранный output.
-- Тесты: `voice::playout::tests::*` (10), включая
-  `a_sink_that_opens_and_dies_still_spends_the_shared_budget` (всегда `Ok`,
-  sink сразу `failed`: ровно один fallback после пяти открытий, затем
-  переоткрытий нет), `a_stable_sink_clears_the_budget_so_a_single_later_failure_is_retried`,
-  `adm_health_requires_real_playout_progress_after_the_grace`,
-  `a_stalled_tap_subscriber_counts_drops_instead_of_being_silently_removed`,
-  `a_closed_tap_is_distinguishable_from_an_empty_one`,
-  `finished_track_tasks_are_pruned`.
+- Тесты: `voice::playout::tests::*` (13), включая
+  `the_first_sink_proves_stability_through_tick_playout`,
+  `the_fifth_failure_emits_one_message_and_a_final_report`,
+  `switching_the_sink_restarts_the_stability_window`,
+  `adm_health_requires_real_pcm_only_while_audio_is_expected`,
+  `a_sink_that_opens_and_dies_still_spends_the_shared_budget`.
 - Мутации: `voice_room.rs:339` (`!server_muted`), `voice_panel.rs:697`
-  (`self.server_muted → false`) и `SinkRecovery::sink_died` без учёта
-  (возврат `Retry` без `record_failure`) роняют свои тесты — последняя даёт 40
-  открытий и 0 fallback. Файлы восстановлены из копий, мутационных строк нет.
-- Проверено: fmt; `cargo test --workspace --locked` — 11 API, 130 media
-  (9 `ignored`), 345 приложения (1 `ignored`); release build; размеры
-  (204 отслеживаемых файла; новый `voice/playout/tap.rs` ещё не в индексе);
-  строгий UTF-8/BOM/U+FFFD по 137 отслеживаемым `*.rs`/`*.md` плюс новый файл,
-  mojibake-скан; smoke release — процесс жив через 5 с.
+  (`self.server_muted → false`), `SinkRecovery::sink_died` без учёта и удаление
+  `opened()` из `install_initial_playout` роняют свои тесты (последняя — фаза
+  остаётся `Opening`). Файлы восстановлены из копий, мутационных строк нет.
+- Проверено: fmt; `cargo test --workspace --locked` — 11 API, 133 media
+  (9 `ignored`), 346 приложения (1 `ignored`); release build; размеры
+  (205 отслеживаемых файла; новые `voice/sdp.rs`, `voice/test_support.rs`,
+  `voice/playout/session.rs` ещё не в индексе); строгий UTF-8/BOM/U+FFFD по 138
+  отслеживаемым `*.rs`/`*.md` плюс новые, mojibake-скан; smoke release — процесс
+  жив через 5 с. Новых release-предупреждений нет; два прежних
+  (`recordings_download` unused `id`, `set_allowed_channels`) остались.
 
 Профиль микшера: синтетические 400/800 Гц, 1000 блоков; debug p50 15–21 мкс,
-p95 20–38 мкс за четыре прогона (у ревьюера 16/21), release p50/p95 1/1 мкс;
-release лимитера прежний (0,49 → 0,99 за 195 блоков / 1950 мс). Это CPU-время
-теста, не замер устройства; `latency_ms` — блоки в буфере sink.
+p95 20–38 мкс за пять прогонов (у ревьюера 16/21), release p50/p95 1/1 мкс;
+лимитер 0,49 → 0,99 за 195 блоков / 1950 мс. Это CPU-время теста, не замер
+устройства; `latency_ms` — блоки в буфере sink.
 
 Не проверено: живое аудио и слышимый микс, реальный сон/пробуждение,
 повторное включение ADM после fallback на железе, hot-unplug, живой

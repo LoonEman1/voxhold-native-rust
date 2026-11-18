@@ -43,6 +43,8 @@ mod playout;
 use playout::{Playout, PlayoutMode, RetryAt, SinkRecovery};
 #[cfg(test)]
 mod loopback;
+#[cfg(test)]
+mod test_support;
 mod winmm_out;
 
 use crate::mixer::Source;
@@ -152,6 +154,9 @@ struct Session {
     adm_playout_duration: Option<f64>,
     adm_playout_progress_at: std::time::Instant,
     adm_playout_started_at: std::time::Instant,
+    /// Test-only guard: the headless session must never touch platform audio.
+    #[cfg(test)]
+    test_no_adm: bool,
     /// Suspend released the sink; only an explicit resume reopens it.
     playout_suspended: bool,
     /// Successful software-sink reopens in this session.
@@ -227,17 +232,15 @@ impl Session {
         // It is opened before the ADM playout is disabled: a sink that cannot
         // open must leave the working ADM path in place and be reported, not
         // silently degrade the call to silence.
-        let mut playout = None;
+        let mut initial_playout = None;
         let mut software_playout = false;
-        let mut playout_mode = PlayoutMode::AdmFallback;
         let playout_open: Arc<winmm_out::OpenSink> = Arc::new(Box::new(winmm_out::default_open));
         if room_session {
             match Playout::start_with(controls.output.as_deref(), playout_open.clone()) {
                 Ok(started) => {
                     audio.set_playout(false);
-                    playout = Some(started);
+                    initial_playout = Some(started);
                     software_playout = true;
-                    playout_mode = PlayoutMode::Software;
                 }
                 Err(_) => events.push(Event::DeviceError {
                     message: "Программный микшер не открылся: громкость участников не применяется, звук идёт напрямую.",
@@ -251,8 +254,8 @@ impl Session {
         // opens the recording device itself; the platform ADM recording side
         // stays closed unless that path falls back.
         let mut input_index = None;
-        let mut output_index =
-            output::activate_saved_output(&audio, &mut controls, playout.is_none(), events);
+        let output_index =
+            output::activate_saved_output(&audio, &mut controls, initial_playout.is_none(), events);
         let mut input_opened = None;
         let output = OutputState::new(controls.output.clone());
         let factory = &audio.0;
@@ -311,7 +314,7 @@ impl Session {
             (None, Some((video, task)))
         } else {
             let track_events = events.clone();
-            let clip = playout.as_ref().map(Playout::clip);
+            let clip = initial_playout.as_ref().map(Playout::clip);
             let runtime = tokio::runtime::Handle::current();
             let tasks = playout_tasks.clone();
             peer.on_track(Some(Box::new(move |event| {
@@ -485,14 +488,16 @@ impl Session {
             mic,
             controls,
             sources: HashMap::new(),
-            playout,
-            software_playout,
-            playout_mode,
+            playout: None,
+            software_playout: false,
+            playout_mode: PlayoutMode::AdmFallback,
             playout_attempts: SinkRecovery::default(),
             adm_retry: RetryAt::default(),
             adm_playout_duration: None,
             adm_playout_progress_at: std::time::Instant::now(),
             adm_playout_started_at: std::time::Instant::now(),
+            #[cfg(test)]
+            test_no_adm: false,
             playout_suspended: false,
             playout_reconnects: 0,
             playout_open,
@@ -519,6 +524,12 @@ impl Session {
             output,
             device_check: std::time::Instant::now(),
         };
+        if let Some(started) = initial_playout {
+            // The very first sink enters the same stability machine as a
+            // reopened one; without this the phase stays `Opening` forever and
+            // the budget is never cleared for a normal call.
+            session.install_initial_playout(started);
+        }
         session.apply_audio_controls();
         Ok(session)
     }
@@ -947,48 +958,8 @@ impl Drop for Session {
     }
 }
 
-struct RemoteSdp {
-    ufrags: Vec<String>,
-}
-
-impl RemoteSdp {
-    fn new(sdp: &str) -> Self {
-        let mut ufrags = Vec::new();
-        for ufrag in sdp
-            .lines()
-            .filter_map(|line| line.strip_prefix("a=ice-ufrag:"))
-        {
-            if !ufrags.iter().any(|value| value == ufrag) {
-                ufrags.push(ufrag.to_owned());
-            }
-        }
-        Self { ufrags }
-    }
-
-    fn accepts(&self, candidate: &Candidate) -> bool {
-        candidate.ufrag().is_none_or(|ufrag| {
-            self.ufrags.is_empty() || self.ufrags.iter().any(|value| value == ufrag)
-        })
-    }
-}
-
-impl Candidate {
-    fn ufrag(&self) -> Option<&str> {
-        self.username_fragment
-            .as_deref()
-            .or_else(|| candidate_ufrag(&self.candidate))
-    }
-}
-
-fn candidate_ufrag(candidate: &str) -> Option<&str> {
-    let mut tokens = candidate.split_ascii_whitespace().skip(8);
-    while let (Some(key), Some(value)) = (tokens.next(), tokens.next()) {
-        if key == "ufrag" {
-            return Some(value);
-        }
-    }
-    None
-}
+mod sdp;
+use sdp::{RemoteSdp, candidate_ufrag};
 
 #[cfg(test)]
 mod tests;

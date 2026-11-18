@@ -38,6 +38,16 @@ impl Voxhold {
             .collect()
     }
 
+    /// Permission Stream of the displayed room, confirmed by the channel list.
+    /// The panel enables «Экран» only when this and the join/slot checks pass.
+    fn stream_permission(&self, channel: i64) -> bool {
+        self.channels.iter().any(|item| {
+            item.id == channel
+                && item.kind == "voice"
+                && item.permissions & crate::settings::PERMISSION_STREAM != 0
+        })
+    }
+
     /// Snapshot data is only shown for rooms the confirmed channel list still
     /// allows. While an ACL reload is in flight the server's data is hidden;
     /// other servers keep their cache until they become current.
@@ -118,6 +128,7 @@ impl Voxhold {
         let roster = self.voice_roster(self.server, channel);
         let streams = self.voice_stream_list(self.server, channel);
         let prefs = self.voice_settings.prefs.clone();
+        let can_stream = self.stream_permission(channel);
         if let Some(panel) = &self.voice {
             let self_user = self.self_user_id;
             let palette = self.palette;
@@ -127,6 +138,7 @@ impl Voxhold {
                 panel.set_self_user(self_user);
                 panel.set_members(members);
                 panel.set_room_state(channel, roster, streams);
+                panel.set_stream_permission(can_stream);
                 panel.apply_voice_prefs(
                     Some(prefs.input.clone()),
                     Some(prefs.output.clone()),
@@ -161,6 +173,7 @@ impl Voxhold {
                 panel.set_self_user(self_user);
                 panel.set_members(members);
                 panel.set_room_state(channel, roster, streams);
+                panel.set_stream_permission(can_stream);
                 panel.apply_voice_prefs(
                     Some(prefs.input.clone()),
                     Some(prefs.output.clone()),
@@ -258,12 +271,14 @@ impl Voxhold {
         let self_user = self.self_user_id;
         let access_confirmed = !self.voice_unconfirmed.contains(&self.server);
         let palette = self.palette;
+        let can_stream = self.stream_permission(room);
         panel.update(cx, |panel, cx| {
             panel.set_access_confirmed(access_confirmed);
             panel.set_rooms(rooms);
             panel.set_self_user(self_user);
             panel.set_members(members);
             panel.set_room_state(room, roster, streams);
+            panel.set_stream_permission(can_stream);
             panel.set_palette(palette);
             cx.notify();
         });
@@ -456,8 +471,9 @@ impl Voxhold {
     }
 
     /// True when a modal or the image viewer owns the keyboard, so a PTT press
-    /// must not open the microphone.
-    pub(super) fn voice_keyboard_blocked(&self) -> bool {
+    /// must not open the microphone. The screen picker lives inside the panel,
+    /// so it is asked there too.
+    pub(super) fn voice_keyboard_blocked(&self, cx: &gpui::App) -> bool {
         self.active_settings.is_some()
             || self.recordings_dialog.is_some()
             || self.media.viewer.is_some()
@@ -468,10 +484,14 @@ impl Voxhold {
             || self.message_menu.is_some()
             || self.member_menu.is_some()
             || self.forward.is_some()
+            || self
+                .voice
+                .as_ref()
+                .is_some_and(|panel| panel.read(cx).screen_share_open())
     }
 
     pub(super) fn sync_push_to_talk_block(&self, cx: &mut Context<Self>) {
-        let blocked = self.voice_keyboard_blocked();
+        let blocked = self.voice_keyboard_blocked(cx);
         if let Some(panel) = &self.voice {
             let current = panel.read(cx).push_to_talk_blocked();
             if current != blocked {
@@ -494,7 +514,7 @@ impl Voxhold {
         let key = event.keystroke.key.to_lowercase();
         let modifiers = event.keystroke.modifiers;
         let prefs = self.voice_settings.prefs.clone();
-        let blocked = self.voice_keyboard_blocked();
+        let blocked = self.voice_keyboard_blocked(cx);
         if key == "escape" {
             if panel.update(cx, |panel, _| panel.player_escape(window)) {
                 return true;

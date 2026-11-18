@@ -75,6 +75,11 @@ impl VoicePanel {
         self.room_streams()
             .iter()
             .filter(|publication| publication.channel_id == self.room)
+            // A client never watches its own publication: the on-air card owns
+            // that slot instead.
+            .filter(|publication| {
+                Some(&publication.publisher_connection_id) != self.self_connection.as_ref()
+            })
             .cloned()
             .collect()
     }
@@ -373,7 +378,9 @@ impl VoicePanel {
         let active = self.call_channel != 0 && self.call_channel == self.room;
         let roster = self.visible_roster();
         let streams = self.visible_streams();
-        let count = roster.len() + streams.len();
+        let sharing = self.screen_card_active();
+        let own_cards = usize::from(sharing);
+        let count = roster.len() + streams.len() + own_cards;
         let geometry = voice_room::room_geometry(
             Rect::new(0.0, 0.0, width, height),
             active,
@@ -383,15 +390,24 @@ impl VoicePanel {
         let max_scroll = (geometry.content_height - geometry.viewport.h).max(0.0);
         self.room_scroll = self.room_scroll.clamp(0.0, max_scroll);
         let mut children = Vec::new();
-        for (index, publication) in streams.iter().enumerate() {
-            let Some(rect) = geometry.cards.get(index) else {
+        let mut index = 0;
+        if sharing {
+            if let Some(rect) = geometry.cards.first() {
+                if let Some(card) = self.screen_card(*rect, cx) {
+                    children.push(card);
+                }
+            }
+            index += 1;
+        }
+        for (offset, publication) in streams.iter().enumerate() {
+            let Some(rect) = geometry.cards.get(index + offset) else {
                 break;
             };
-            children.push(self.stream_tile(index, *rect, publication, active, cx));
+            children.push(self.stream_tile(offset, *rect, publication, active, cx));
         }
         let mut slot = 0;
-        for (index, participant) in roster.iter().enumerate() {
-            let Some(rect) = geometry.cards.get(streams.len() + index) else {
+        for (offset, participant) in roster.iter().enumerate() {
+            let Some(rect) = geometry.cards.get(index + streams.len() + offset) else {
                 break;
             };
             let audio = self.audio_for(&participant.connection_id);
@@ -426,7 +442,9 @@ impl VoicePanel {
             panel.room_scroll = (panel.room_scroll - delta).max(0.0);
             let (width, height) = panel.room_size;
             let active = panel.call_channel != 0 && panel.call_channel == panel.room;
-            let count = panel.visible_roster().len() + panel.visible_streams().len();
+            let count = panel.visible_roster().len()
+                + panel.visible_streams().len()
+                + usize::from(panel.screen_card_active());
             let geometry = voice_room::room_geometry(
                 Rect::new(0.0, 0.0, width, height),
                 active,
@@ -614,7 +632,25 @@ impl VoicePanel {
             for (index, action) in VOICE_ACTIONS.iter().enumerate() {
                 bar = bar.child(self.action_button(index, action, true, cx));
             }
+            bar = bar.child(self.screen_share_button(cx));
             body = body.child(bar);
+            // The disabled button carries its reason in the room, not in a
+            // hover-only tooltip: there is no dead element without an
+            // explanation.
+            if let Err(reason) = self.share_gate() {
+                body = body.child(
+                    div()
+                        .debug_selector(|| "voice-screen-reason".into())
+                        .absolute()
+                        .left(px(toolbar.x))
+                        .top(px(toolbar.y - 16.))
+                        .w(px(toolbar.w + 52.))
+                        .text_size(px(10.))
+                        .text_color(rgb(c.muted))
+                        .truncate()
+                        .child(reason),
+                );
+            }
         } else {
             let join = geometry.toolbar;
             body = body.child(
@@ -649,6 +685,26 @@ impl VoicePanel {
                     .text_size(px(11.))
                     .text_color(rgb(c.danger))
                     .child(self.device_error.clone()),
+            );
+        }
+        if active
+            && self.screen.sharing.phase == voxhold_media::publisher::Phase::Failed
+            && self
+                .screen
+                .sharing
+                .error
+                .as_deref()
+                .is_some_and(|error| !error.is_empty())
+        {
+            body = body.child(
+                div()
+                    .debug_selector(|| "voice-screen-error".into())
+                    .absolute()
+                    .left(px(24.))
+                    .top(px(66.))
+                    .text_size(px(11.))
+                    .text_color(rgb(c.danger))
+                    .child(self.screen.sharing.error.clone().unwrap_or_default()),
             );
         }
         let _ = height;

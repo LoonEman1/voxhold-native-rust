@@ -5,6 +5,8 @@ pub mod controller;
 pub mod dsp;
 pub mod mixer;
 pub mod preview;
+pub mod publisher;
+pub mod screen_capture;
 mod video;
 pub mod viewer;
 mod voice;

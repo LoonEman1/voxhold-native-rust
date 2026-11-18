@@ -1,6 +1,7 @@
 //! Bounded request/update behaviour of the voice session.
 
 use super::*;
+use crate::runtime::requests::ScreenCommand;
 use std::collections::HashMap;
 
 fn publication(connection: &str) -> Publication {
@@ -15,6 +16,60 @@ fn publication(connection: &str) -> Publication {
         viewer_count: 1,
         started_at_ms: 1,
     }
+}
+
+#[test]
+fn screen_commands_keep_their_order_and_listings_keep_the_newest_generation() {
+    use crate::publisher::{Codec, PublishRequest, Quality};
+    use crate::screen_capture::{ScreenSource, SourceKind};
+
+    let requests = Requests::default();
+    let request = PublishRequest {
+        source: ScreenSource {
+            id: 1,
+            kind: SourceKind::Monitor,
+            title: "Экран 1".into(),
+            display_id: -1,
+            width: 1920,
+            height: 1080,
+        },
+        quality: Quality::default(),
+        codec: Codec::Vp8,
+    };
+    // Opening the picker must reach the worker before the chosen source.
+    crate::runtime::requests::push_screen(&requests, ScreenCommand::OpenPicker { picker: 1 });
+    crate::runtime::requests::push_screen(
+        &requests,
+        ScreenCommand::Publish {
+            picker: 1,
+            request,
+            stream_permission: true,
+            slot_available: true,
+        },
+    );
+    assert!(matches!(
+        requests.take(),
+        Some(Pending::Screen(ScreenCommand::OpenPicker { picker: 1 }))
+    ));
+    assert!(matches!(
+        requests.take(),
+        Some(Pending::Screen(ScreenCommand::Publish { picker: 1, .. }))
+    ));
+
+    // A late older listing cannot replace a newer one of the same kind.
+    crate::runtime::requests::set_source_request(&requests, SourceKind::Monitor, 4);
+    crate::runtime::requests::set_source_request(&requests, SourceKind::Monitor, 3);
+    crate::runtime::requests::set_source_request(&requests, SourceKind::Window, 7);
+    let first = requests.take();
+    let second = requests.take();
+    let generations: Vec<u64> = [first, second]
+        .into_iter()
+        .filter_map(|pending| match pending {
+            Some(Pending::ScreenSources(request)) => Some(request.generation),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(generations, vec![4, 7], "newest listing per kind only");
 }
 
 #[test]

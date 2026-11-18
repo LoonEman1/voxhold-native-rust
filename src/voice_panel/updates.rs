@@ -10,6 +10,12 @@ impl VoicePanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
+        if matches!(
+            update,
+            VoiceUpdate::ScreenShare(_) | VoiceUpdate::ScreenSources { .. }
+        ) {
+            return self.apply_screen_update(update);
+        }
         let mut repaint = true;
         match update {
             VoiceUpdate::Connecting => {
@@ -136,6 +142,7 @@ impl VoicePanel {
             }
             VoiceUpdate::Ended(error) => {
                 self.handle.take();
+                self.reset_screen();
                 self.applied_audio = None;
                 self.server_muted = false;
                 self.self_connection = None;
@@ -158,6 +165,7 @@ impl VoicePanel {
                 self.streams.clear();
                 self.notify_call_changed(cx);
             }
+            VoiceUpdate::ScreenShare(_) | VoiceUpdate::ScreenSources { .. } => {}
         }
         repaint
     }

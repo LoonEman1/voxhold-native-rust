@@ -175,6 +175,11 @@ impl Viewer {
         self.intent.as_ref().is_some_and(|intent| intent.muted)
     }
 
+    /// A `stream.leave` is still waiting for its acknowledgement.
+    pub fn leaving(&self) -> bool {
+        self.pending_leave.is_some()
+    }
+
     /// `voice.joined`/transport state. On a reconnect the old engine, catalog
     /// and leave request are gone; the selected publication stays and is
     /// watched again only after both a fresh snapshot and the join confirm.

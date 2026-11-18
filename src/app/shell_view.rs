@@ -822,6 +822,11 @@ impl Render for Voxhold {
             if let Some(overlay) = voice.update(cx, |panel, cx| panel.player_overlay(window, cx)) {
                 root = root.child(overlay);
             }
+            if let Some(overlay) =
+                voice.update(cx, |panel, cx| panel.screen_share_overlay(window, cx))
+            {
+                root = root.child(overlay);
+            }
         }
         if let Some(layer) = self.viewer_layer(window, cx) {
             root = root.child(layer);

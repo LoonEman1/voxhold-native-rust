@@ -1,6 +1,8 @@
 //! Bounded last-value request slots shared by `VoiceHandle` and the worker.
 
 use super::*;
+use crate::publisher::PublishRequest;
+use crate::screen_capture::SourceKind;
 
 /// Selecting and closing a stream share one last-value slot. A stale close can
 /// therefore never overtake a newer watch intent.
@@ -13,6 +15,33 @@ pub(super) enum StreamCommand {
     Close {
         selection: u64,
     },
+}
+
+/// Screen-share user actions. They are queued in order: opening the picker must
+/// reach the worker before the chosen source, and a cancel must be able to
+/// clear a pending publish of the same picker.
+#[derive(Clone, Debug)]
+pub(super) enum ScreenCommand {
+    OpenPicker {
+        picker: u64,
+    },
+    Publish {
+        picker: u64,
+        request: PublishRequest,
+        stream_permission: bool,
+        slot_available: bool,
+    },
+    CancelPicker {
+        picker: u64,
+    },
+    Stop,
+}
+
+/// One source listing request. The kind and generation identify the answer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct SourceRequest {
+    pub(super) kind: SourceKind,
+    pub(super) generation: u64,
 }
 
 impl StreamCommand {
@@ -83,6 +112,38 @@ pub(super) fn set_input_request(slot: &mut Option<InputRequest>, request: InputR
     }
 }
 
+const SCREEN_CAPACITY: usize = 8;
+const SOURCE_REQUEST_CAPACITY: usize = 4;
+
+/// Queue one user action. The queue is bounded; only a burst of clicks can
+/// overflow it and the oldest action of that burst is the one to drop.
+pub(super) fn push_screen(requests: &Requests, command: ScreenCommand) {
+    if let Ok(mut queue) = requests.screen.lock() {
+        if queue.len() >= SCREEN_CAPACITY {
+            queue.pop_front();
+        }
+        queue.push_back(command);
+    }
+}
+
+/// Remember the newest listing request of this kind. A late older request
+/// never replaces a newer one, and the picker shows one answer per kind.
+pub(super) fn set_source_request(requests: &Requests, kind: SourceKind, generation: u64) {
+    let Ok(mut queue) = requests.screen_sources.lock() else {
+        return;
+    };
+    if let Some(slot) = queue.iter_mut().find(|request| request.kind == kind) {
+        if generation >= slot.generation {
+            slot.generation = generation;
+        }
+        return;
+    }
+    if queue.len() >= SOURCE_REQUEST_CAPACITY {
+        queue.remove(0);
+    }
+    queue.push(SourceRequest { kind, generation });
+}
+
 /// Latest-value request slots shared by the handle and the worker.
 #[derive(Default)]
 pub(super) struct Requests {
@@ -93,6 +154,11 @@ pub(super) struct Requests {
     pub(super) local_mutes: Mutex<VecDeque<(String, bool)>>,
     pub(super) stream: Mutex<StreamRequests>,
     pub(super) stream_mute: Mutex<Option<(u64, bool)>>,
+    /// Screen-share actions in order. Low frequency (a few per minute), so a
+    /// small bounded queue keeps open→publish→cancel ordering.
+    pub(super) screen: Mutex<VecDeque<ScreenCommand>>,
+    /// Picker listings. Only the newest request of each kind matters.
+    pub(super) screen_sources: Mutex<Vec<SourceRequest>>,
     /// Explicit output selection from settings. This is separate from generic
     /// control updates so it always reaches the media engine even when the
     /// runtime cache still describes the pre-unplug device.
@@ -107,6 +173,8 @@ pub(super) struct Requests {
 pub(super) enum Pending {
     Leave,
     Stream(StreamCommand),
+    Screen(ScreenCommand),
+    ScreenSources(SourceRequest),
     Output(Option<String>),
     Input(InputRequest),
     Controls(Controls, bool),
@@ -129,6 +197,16 @@ impl Requests {
         if let Ok(mut stream) = self.stream.lock() {
             if let Some(command) = stream.take() {
                 return Some(Pending::Stream(command));
+            }
+        }
+        if let Ok(mut screen) = self.screen.lock() {
+            if let Some(command) = screen.pop_front() {
+                return Some(Pending::Screen(command));
+            }
+        }
+        if let Ok(mut sources) = self.screen_sources.lock() {
+            if !sources.is_empty() {
+                return Some(Pending::ScreenSources(sources.remove(0)));
             }
         }
         if let Ok(mut output) = self.output.lock() {

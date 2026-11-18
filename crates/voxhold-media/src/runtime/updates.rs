@@ -12,6 +12,8 @@ use std::{
 use crate::{
     controller::{AppliedAudio, Participant, Publication},
     mixer::PlayoutStats,
+    publisher::Sharing,
+    screen_capture::{ScreenSource, SourceKind},
 };
 
 pub(super) const UPDATE_CAPACITY: usize = 64;
@@ -60,6 +62,16 @@ pub enum VoiceUpdate {
     AudioMode(AppliedAudio),
     /// Measured post-mix playout level and counters (software mixer).
     Playout(PlayoutStats),
+    /// The screen-sharing attempt state, including its measured counters.
+    ScreenShare(Sharing),
+    /// The answer of one source listing request. `generation` lets the picker
+    /// discard an answer that was already replaced by a refresh.
+    ScreenSources {
+        generation: u64,
+        kind: SourceKind,
+        sources: Vec<ScreenSource>,
+        error: Option<String>,
+    },
     /// The attempt finished. An error reason is carried together with the end
     /// so the UI can never lose it to a coalesced terminal `Left`.
     Ended(Option<String>),
@@ -75,6 +87,7 @@ impl VoiceUpdate {
                 Self::StreamConnected { selection: a, .. },
                 Self::StreamConnected { selection: b, .. },
             ) => a == b,
+            (Self::ScreenSources { kind: a, .. }, Self::ScreenSources { kind: b, .. }) => a == b,
             _ => matches!(
                 (self, other),
                 (Self::Connecting, Self::Connecting)
@@ -89,6 +102,7 @@ impl VoiceUpdate {
                     | (Self::SelfConnection(_), Self::SelfConnection(_))
                     | (Self::AudioMode(_), Self::AudioMode(_))
                     | (Self::Playout(_), Self::Playout(_))
+                    | (Self::ScreenShare(_), Self::ScreenShare(_))
             ),
         }
     }

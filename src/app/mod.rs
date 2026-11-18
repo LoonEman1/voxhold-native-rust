@@ -49,6 +49,8 @@ pub(crate) mod ui;
 #[cfg(test)]
 mod voice_form_tests;
 mod voice_ops;
+#[cfg(test)]
+mod voice_screen_tests;
 mod voice_settings_ops;
 #[cfg(test)]
 mod voice_settings_tests;

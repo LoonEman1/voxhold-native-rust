@@ -1,0 +1,300 @@
+//! Screen-share wiring between the panel, the voice session and the publisher.
+//!
+//! `VoiceHandle` methods only write bounded request slots; they never create a
+//! peer or a capture. The session worker owns `Publisher` and at most one
+//! `PublisherEngine`, applies the deterministic decisions and reports the
+//! result back as one coalesced `ScreenShare` update.
+
+use super::*;
+use crate::publisher::engine::PublisherEngine;
+use crate::publisher::{Access, Outcome as PublisherOutcome};
+use crate::runtime::requests::{ScreenCommand, SourceRequest, push_screen, set_source_request};
+use crate::screen_capture::SourceKind;
+
+/// One preview picture for the local on-air card.
+pub struct ScreenFrame {
+    pub width: u32,
+    pub height: u32,
+    /// BGRA bytes; the panel hands them to `RenderImage` directly.
+    pub bgra: Vec<u8>,
+}
+
+impl VoiceHandle {
+    /// Open the local picker. The returned id is required by
+    /// [`Self::publish_screen`] and rejected after a leave or a newer picker.
+    pub fn begin_screen_picker(&self) -> u64 {
+        let picker = self.screen_picker.fetch_add(1, Ordering::SeqCst);
+        push_screen(&self.requests, ScreenCommand::OpenPicker { picker });
+        self.requests.wake();
+        picker
+    }
+
+    /// Ask the session to start publishing the chosen source. Access values
+    /// come from the panel's gate; the worker repeats the join check.
+    pub fn publish_screen(
+        &self,
+        picker: u64,
+        request: crate::publisher::PublishRequest,
+        stream_permission: bool,
+        slot_available: bool,
+    ) {
+        push_screen(
+            &self.requests,
+            ScreenCommand::Publish {
+                picker,
+                request,
+                stream_permission,
+                slot_available,
+            },
+        );
+        self.requests.wake();
+    }
+
+    pub fn cancel_screen_picker(&self, picker: u64) {
+        push_screen(&self.requests, ScreenCommand::CancelPicker { picker });
+        self.requests.wake();
+    }
+
+    /// One stop intent. The capture stops before the socket answer arrives.
+    pub fn stop_screen_share(&self) {
+        push_screen(&self.requests, ScreenCommand::Stop);
+        self.requests.wake();
+    }
+
+    /// Refresh the picker list of one kind; the answer is tagged with the
+    /// returned generation.
+    pub fn screen_sources(&self, kind: SourceKind) -> u64 {
+        let generation = self.source_generation.fetch_add(1, Ordering::SeqCst);
+        set_source_request(&self.requests, kind, generation);
+        self.requests.wake();
+        generation
+    }
+
+    /// The newest local preview; only the on-air card reads it.
+    pub fn take_screen_frame(&self) -> Option<ScreenFrame> {
+        let frame = self.screen_preview.take()?;
+        Some(ScreenFrame {
+            width: frame.width,
+            height: frame.height,
+            bgra: frame.bgra,
+        })
+    }
+}
+
+impl Live {
+    /// Apply the publisher that belongs to this socket session.
+    pub(super) async fn apply_screen(
+        &mut self,
+        outcomes: Vec<PublisherOutcome>,
+        viewer: &mut Viewer,
+    ) -> Result<bool, SessionEnd> {
+        let mut work: VecDeque<PublisherOutcome> = outcomes.into();
+        while let Some(outcome) = work.pop_front() {
+            match outcome {
+                PublisherOutcome::StartEngine { request, .. } => {
+                    // A new attempt never shares a capture with the old one.
+                    self.screen = None;
+                    match PublisherEngine::start(
+                        request,
+                        self.servers.clone(),
+                        self.policy.clone(),
+                        self.screen_preview.clone(),
+                    ) {
+                        Ok(engine) => self.screen = Some(engine),
+                        Err(message) => {
+                            for outcome in self
+                                .publisher
+                                .on_start_failed(&message, Instant::now())
+                                .into_iter()
+                                .rev()
+                            {
+                                work.push_front(outcome);
+                            }
+                        }
+                    }
+                }
+                PublisherOutcome::StopEngine => {
+                    self.screen = None;
+                    self.screen_preview.clear();
+                }
+                PublisherOutcome::LeaveViewer => {
+                    let outcomes = viewer.leave(Instant::now());
+                    if !self.apply(outcomes, viewer).await? {
+                        return Ok(false);
+                    }
+                }
+                PublisherOutcome::Send(signal) => self.send_signal(signal).await?,
+                PublisherOutcome::Offer(sdp) => {
+                    let failure = self
+                        .screen
+                        .as_ref()
+                        .and_then(|screen| screen.offer(sdp).err());
+                    if let Some(message) = failure {
+                        for outcome in self
+                            .publisher
+                            .on_start_failed(&message, Instant::now())
+                            .into_iter()
+                            .rev()
+                        {
+                            work.push_front(outcome);
+                        }
+                    }
+                }
+                PublisherOutcome::Ice(candidate) => {
+                    let failure = self
+                        .screen
+                        .as_ref()
+                        .and_then(|screen| screen.ice(candidate).err());
+                    if let Some(message) = failure {
+                        for outcome in self
+                            .publisher
+                            .on_start_failed(&message, Instant::now())
+                            .into_iter()
+                            .rev()
+                        {
+                            work.push_front(outcome);
+                        }
+                    }
+                }
+                PublisherOutcome::State(sharing) => {
+                    self.updates.push(VoiceUpdate::ScreenShare(sharing));
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    /// Drain the engine of the current attempt, one bounded batch per tick.
+    pub(super) async fn drain_screen(&mut self, viewer: &mut Viewer) -> Result<bool, SessionEnd> {
+        for _ in 0..FRAMES_PER_TICK {
+            let Some(event) = self.screen.as_ref().and_then(|screen| screen.poll()) else {
+                return Ok(true);
+            };
+            let outcomes = self.publisher.on_engine(event, Instant::now());
+            if !self.apply_screen(outcomes, viewer).await? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Leave/logout/reconnect: the capture is released before the socket is
+    /// touched, and a late picker of this session is rejected.
+    pub(super) async fn abandon_screen(&mut self, viewer: &mut Viewer) -> Result<(), SessionEnd> {
+        let outcomes = self.publisher.abandon();
+        let _ = self.apply_screen(outcomes, viewer).await?;
+        self.screen = None;
+        self.screen_preview.clear();
+        Ok(())
+    }
+}
+
+/// Access of the room as the worker sees it. `permission` and `slot` are the
+/// panel's confirmed gate; the join is re-checked from the voice controller.
+pub(super) fn screen_access(joined: bool, permission: bool, slot: bool) -> Access {
+    Access {
+        joined,
+        stream_permission: permission,
+        slots_available: slot,
+    }
+}
+
+/// The viewer is gone (never watched, or its `stream.left` was acknowledged)
+/// and the publisher may start.
+pub(super) fn viewer_cleared(viewer: &Viewer) -> bool {
+    viewer.watching().is_none() && !viewer.leaving()
+}
+
+impl Live {
+    /// Execute one user action of the picker. The capture belongs to the
+    /// session, so every transition is applied through `apply_screen`.
+    pub(super) async fn handle_screen_command(
+        &mut self,
+        command: ScreenCommand,
+        controller: &crate::controller::VoiceController,
+        viewer: &mut Viewer,
+    ) -> Result<(), SessionEnd> {
+        let now = Instant::now();
+        match command {
+            ScreenCommand::OpenPicker { picker } => {
+                let outcomes = self.publisher.begin_picker(picker);
+                self.apply_screen(outcomes, viewer).await?;
+            }
+            ScreenCommand::CancelPicker { picker } => {
+                let outcomes = self.publisher.cancel_picker(picker);
+                self.apply_screen(outcomes, viewer).await?;
+            }
+            ScreenCommand::Stop => {
+                let outcomes = self.publisher.stop(now);
+                self.apply_screen(outcomes, viewer).await?;
+            }
+            ScreenCommand::Publish {
+                picker,
+                request,
+                stream_permission,
+                slot_available,
+            } => {
+                self.publisher
+                    .set_connection(controller.resume_connection_id.clone());
+                self.publisher.set_access(screen_access(
+                    controller.joined,
+                    stream_permission,
+                    slot_available,
+                ));
+                let viewer_active = viewer.watching().is_some();
+                let outcomes = self.publisher.publish(picker, request, viewer_active, now);
+                self.apply_screen(outcomes, viewer).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Enumerate the picker list off the UI thread and report one typed answer.
+    pub(super) fn list_screen_sources(&self, request: SourceRequest) {
+        let (sources, error) = match crate::screen_capture::list_sources(request.kind) {
+            Ok(sources) => (sources, None),
+            Err(message) => (Vec::new(), Some(message.to_owned())),
+        };
+        self.updates.push(VoiceUpdate::ScreenSources {
+            generation: request.generation,
+            kind: request.kind,
+            sources,
+            error,
+        });
+    }
+
+    /// Route one `stream.*` event to the publisher and start the attempt that
+    /// waited for the viewer's `stream.left`.
+    pub(super) async fn on_screen_signal(
+        &mut self,
+        kind: &str,
+        request_id: &str,
+        data: &serde_json::Value,
+        now: Instant,
+        viewer: &mut Viewer,
+    ) -> Result<(), SessionEnd> {
+        let outcomes = self.publisher.on_server_event(kind, request_id, data, now);
+        self.apply_screen(outcomes, viewer).await?;
+        if viewer_cleared(viewer) {
+            let outcomes = self.publisher.viewer_left(now);
+            self.apply_screen(outcomes, viewer).await?;
+        }
+        Ok(())
+    }
+
+    /// Deadlines of the share attempt and the publisher's engine events.
+    pub(super) async fn tick_screen(
+        &mut self,
+        now: Instant,
+        viewer: &mut Viewer,
+    ) -> Result<(), SessionEnd> {
+        let outcomes = self.publisher.tick(now);
+        self.apply_screen(outcomes, viewer).await?;
+        if viewer_cleared(viewer) {
+            let outcomes = self.publisher.viewer_left(now);
+            self.apply_screen(outcomes, viewer).await?;
+        }
+        self.drain_screen(viewer).await?;
+        Ok(())
+    }
+}

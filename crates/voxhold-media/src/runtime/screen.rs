@@ -7,7 +7,7 @@
 
 use super::*;
 use crate::publisher::engine::PublisherEngine;
-use crate::publisher::{Access, Outcome as PublisherOutcome};
+use crate::publisher::{Access, Outcome as PublisherOutcome, PublishRequest, Publisher};
 use crate::runtime::requests::{ScreenCommand, SourceRequest, push_screen, set_source_request};
 use crate::screen_capture::SourceKind;
 
@@ -94,23 +94,18 @@ impl Live {
                 PublisherOutcome::StartEngine { request, .. } => {
                     // A new attempt never shares a capture with the old one.
                     self.screen = None;
-                    match PublisherEngine::start(
+                    let servers = self.servers.clone();
+                    let policy = self.policy.clone();
+                    let preview = self.screen_preview.clone();
+                    let (engine, outcomes) = start_engine(
+                        &mut self.publisher,
                         request,
-                        self.servers.clone(),
-                        self.policy.clone(),
-                        self.screen_preview.clone(),
-                    ) {
-                        Ok(engine) => self.screen = Some(engine),
-                        Err(message) => {
-                            for outcome in self
-                                .publisher
-                                .on_start_failed(&message, Instant::now())
-                                .into_iter()
-                                .rev()
-                            {
-                                work.push_front(outcome);
-                            }
-                        }
+                        Instant::now(),
+                        move |request| PublisherEngine::start(request, servers, policy, preview),
+                    );
+                    self.screen = engine;
+                    for outcome in outcomes.into_iter().rev() {
+                        work.push_front(outcome);
                     }
                 }
                 PublisherOutcome::StopEngine => {
@@ -141,19 +136,10 @@ impl Live {
                     }
                 }
                 PublisherOutcome::Ice(candidate) => {
-                    let failure = self
-                        .screen
-                        .as_ref()
-                        .and_then(|screen| screen.ice(candidate).err());
-                    if let Some(message) = failure {
-                        for outcome in self
-                            .publisher
-                            .on_start_failed(&message, Instant::now())
-                            .into_iter()
-                            .rev()
-                        {
-                            work.push_front(outcome);
-                        }
+                    // A full command queue drops a candidate and counts the
+                    // loss; an ICE burst must not end the publication.
+                    if let Some(screen) = self.screen.as_ref() {
+                        screen.ice(candidate);
                     }
                 }
                 PublisherOutcome::State(sharing) => {
@@ -202,7 +188,30 @@ pub(super) fn screen_access(joined: bool, permission: bool, slot: bool) -> Acces
 /// The viewer is gone (never watched, or its `stream.left` was acknowledged)
 /// and the publisher may start.
 pub(super) fn viewer_cleared(viewer: &Viewer) -> bool {
-    viewer.watching().is_none() && !viewer.leaving()
+    viewer.watching().is_none() && viewer.intent().is_none() && !viewer.leaving()
+}
+
+/// A running view, a pending switch (B selected while A is still leaving) and
+/// an unacknowledged `stream.leave` all conflict with a publication in the
+/// same channel. Treating only `watching()` as a conflict started the capture
+/// without `LeaveViewer` and the viewer then began B during the publication.
+pub(super) fn viewer_conflicts(viewer: &Viewer) -> bool {
+    viewer.watching().is_some() || viewer.intent().is_some() || viewer.leaving()
+}
+
+/// Two-phase engine start: `stream.start` is only sent after the engine really
+/// exists. A failed start returns no engine and the terminal `Failed`
+/// outcomes, so no phantom SFU publication or stuck "Запускаем…" state remains.
+pub(super) fn start_engine<E>(
+    publisher: &mut Publisher,
+    request: PublishRequest,
+    now: Instant,
+    start: impl FnOnce(PublishRequest) -> Result<E, String>,
+) -> (Option<E>, Vec<PublisherOutcome>) {
+    match start(request) {
+        Ok(engine) => (Some(engine), publisher.engine_ready(now)),
+        Err(message) => (None, publisher.on_start_failed(&message, now)),
+    }
 }
 
 impl Live {
@@ -241,7 +250,7 @@ impl Live {
                     stream_permission,
                     slot_available,
                 ));
-                let viewer_active = viewer.watching().is_some();
+                let viewer_active = viewer_conflicts(viewer);
                 let outcomes = self.publisher.publish(picker, request, viewer_active, now);
                 self.apply_screen(outcomes, viewer).await?;
             }

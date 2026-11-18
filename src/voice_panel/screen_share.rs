@@ -54,6 +54,9 @@ pub(super) struct ScreenShareUi {
     pub(super) sharing: Sharing,
     pub(super) preview: Option<Arc<RenderImage>>,
     pub(super) ring: Vec<(FocusHandle, ShareKey)>,
+    /// Set once the dialog focused its first ring element. The flag is reset
+    /// with the dialog, so a repaint never steals focus back from the user.
+    pub(super) focus_placed: bool,
 }
 
 impl Default for ScreenShareUi {
@@ -79,6 +82,7 @@ impl Default for ScreenShareUi {
             sharing: Sharing::default(),
             preview: None,
             ring: Vec::new(),
+            focus_placed: false,
         }
     }
 }
@@ -131,6 +135,31 @@ impl VoicePanel {
         self.screen.open
     }
 
+    /// Whether a Start was pressed and the worker has not answered yet.
+    #[cfg(test)]
+    pub fn screen_share_busy(&self) -> bool {
+        self.screen.busy
+    }
+
+    /// Whether this client currently owns a publication attempt. In this
+    /// phase the «Экран» action shows a status instead of a disabled reason.
+    pub(super) fn share_active(&self) -> bool {
+        matches!(
+            self.screen.sharing.phase,
+            Phase::Publishing | Phase::Live | Phase::Stopping
+        )
+    }
+
+    /// Why the «Экран» action is disabled, shown next to the toolbar. During
+    /// an active share the reason would be the permanent "already running"
+    /// text, so the room shows the publication state instead.
+    pub(super) fn screen_reason(&self) -> Option<&'static str> {
+        if self.share_active() {
+            return None;
+        }
+        self.share_gate().err()
+    }
+
     fn active_publishers_in_room(&self) -> usize {
         self.room_streams()
             .iter()
@@ -143,6 +172,10 @@ impl VoicePanel {
     /// Why the «Экран» action is disabled. The same values are re-checked by
     /// the publisher state machine.
     pub fn share_gate(&self) -> Result<(), &'static str> {
+        #[cfg(test)]
+        if let Some(result) = self.test_share_gate {
+            return result;
+        }
         if !MULTI_STREAMS_SUPPORTED {
             return Err("Клиент не поддерживает несколько трансляций.");
         }
@@ -190,6 +223,7 @@ impl VoicePanel {
         self.screen.error.clear();
         self.screen.selected = None;
         self.screen.kind = SourceKind::Monitor;
+        self.screen.focus_placed = false;
         if let Some(handle) = &self.handle {
             self.screen.picker = handle.begin_screen_picker();
         }
@@ -197,17 +231,26 @@ impl VoicePanel {
         cx.notify();
     }
 
-    /// Close the picker without touching a running publication or a viewer.
+    /// Close the picker. Before Start this only cancels the picker and leaves
+    /// the viewer alone. After Start (Escape, backdrop or a repeated close)
+    /// it is a stop intent: the attempt already committed, so the capture is
+    /// released and exactly one `stream.stop` is sent.
     pub(super) fn close_screen_share(&mut self, cx: &mut Context<Self>) {
         if !self.screen.open {
             return;
         }
+        let committed = self.screen.busy || self.share_active();
         self.screen.open = false;
         self.screen.busy = false;
         self.screen.error.clear();
         self.screen.selected = None;
+        self.screen.focus_placed = false;
         if let Some(handle) = &self.handle {
-            handle.cancel_screen_picker(self.screen.picker);
+            if committed {
+                handle.stop_screen_share();
+            } else {
+                handle.cancel_screen_picker(self.screen.picker);
+            }
         }
         cx.notify();
     }
@@ -252,12 +295,9 @@ impl VoicePanel {
             return;
         }
         if let Err(reason) = self.share_gate() {
-            // A live publication ends the gate with "already running"; that is
-            // not an error for this button.
-            if !matches!(
-                self.screen.sharing.phase,
-                Phase::Publishing | Phase::Live | Phase::Stopping
-            ) {
+            // An active publication is not an error for this button; its card
+            // owns the status and the stop action.
+            if !self.share_active() {
                 self.screen.error = reason.to_owned();
             }
             cx.notify();
@@ -314,9 +354,11 @@ impl VoicePanel {
                     // room now owns the status and the stop action.
                     self.screen.open = false;
                     self.screen.busy = false;
+                    self.screen.focus_placed = false;
                 }
                 if phase == Phase::Failed {
                     self.screen.busy = false;
+                    self.screen.focus_placed = false;
                     self.screen.error = self.screen.sharing.error.clone().unwrap_or_default();
                     // A failed attempt has no picker any more; reopening the
                     // dialog calls `begin_picker` again.
@@ -330,6 +372,7 @@ impl VoicePanel {
                         // while the dialog was open; its picker id is stale.
                         self.screen.open = false;
                         self.screen.busy = false;
+                        self.screen.focus_placed = false;
                         if previous != Phase::Idle {
                             self.screen.error =
                                 "Соединение было восстановлено, выберите экран снова.".into();
@@ -417,7 +460,9 @@ impl VoicePanel {
     }
 
     fn share_focus(&self, index: usize) -> FocusHandle {
-        self.screen_focus[index.min(self.screen_focus.len() - 1)].clone()
+        // A ring larger than the handle range reuses the last handle; the
+        // visible rows stay reachable and no index overlaps the toolbar.
+        self.picker_focus[index.min(self.picker_focus.len() - 1)].clone()
     }
 }
 
@@ -496,10 +541,9 @@ impl VoicePanel {
             sharing.status.clone()
         };
         let stats = sharing.stats.map(|stats| {
-            format!(
-                "{:.0} FPS · сброс {} · {}×{}",
-                stats.fps, stats.dropped, stats.width, stats.height
-            )
+            // FPS, drop, real resolution, limitation and source count come
+            // from OutboundRtpStats; this build has no GPU/CPU percentage.
+            stats.describe()
         });
         let quality = self.screen.quality_label();
         let mut card = div()
@@ -582,7 +626,7 @@ impl VoicePanel {
                     }),
             );
         if sharing.phase != Phase::Stopping {
-            let focus = self.share_focus(0);
+            let focus = self.screen_focus[0].clone();
             card = card.child(
                 div()
                     .id("screen-stop")

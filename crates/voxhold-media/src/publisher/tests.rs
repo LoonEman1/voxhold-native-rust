@@ -58,10 +58,12 @@ fn start_signal(outcomes: &[Outcome]) -> &Signal {
         .expect("stream.start")
 }
 
-/// Picker → publish → `stream.start` sent, the attempt is `Publishing`.
+/// Picker → publish → engine ready → `stream.start` sent, `Publishing`.
 fn publishing(publisher: &mut Publisher, now: Instant) -> Vec<Outcome> {
     publisher.begin_picker(1);
-    publisher.publish(1, request(), false, now)
+    let mut outcomes = publisher.publish(1, request(), false, now);
+    outcomes.extend(publisher.engine_ready(now));
+    outcomes
 }
 
 #[test]
@@ -204,6 +206,8 @@ fn live_needs_both_the_connection_and_a_sent_frame() {
             dropped: 3,
             width: 1280,
             height: 720,
+            sources: 1,
+            limitation: crate::publisher::engine::QualityLimitation::None,
         }),
         now,
     );
@@ -230,7 +234,8 @@ fn a_viewer_is_left_before_the_capture_starts() {
     // `stream.left` arrives well before the five-second contract.
     let started = publisher.viewer_left(now + Duration::from_millis(200));
     assert!(matches!(started[0], Outcome::StartEngine { .. }));
-    assert_eq!(start_signal(&started).kind, "stream.start");
+    let ready = publisher.engine_ready(now + Duration::from_millis(200));
+    assert_eq!(start_signal(&ready).kind, "stream.start");
 }
 
 #[test]
@@ -250,7 +255,8 @@ fn a_missing_stream_left_still_starts_after_the_five_second_contract() {
     );
     let started = publisher.tick(now + LEAVE_TIMEOUT);
     assert!(matches!(started[0], Outcome::StartEngine { .. }));
-    assert_eq!(start_signal(&started).kind, "stream.start");
+    let ready = publisher.engine_ready(now + LEAVE_TIMEOUT);
+    assert_eq!(start_signal(&ready).kind, "stream.start");
 }
 
 #[test]
@@ -580,6 +586,7 @@ fn the_ui_snapshot_follows_every_phase() {
     publisher.begin_picker(1);
     assert_eq!(publisher.sharing().phase, Phase::Picking);
     publisher.publish(1, request(), false, now);
+    publisher.engine_ready(now);
     assert_eq!(publisher.sharing().phase, Phase::Publishing);
     assert_eq!(
         publisher.sharing().quality.map(Quality::describe),
@@ -598,4 +605,200 @@ fn the_ui_snapshot_follows_every_phase() {
     assert_eq!(publisher.sharing().phase, Phase::Stopping);
     publisher.tick(now + STOP_TIMEOUT);
     assert_eq!(publisher.sharing().phase, Phase::Idle);
+}
+
+#[test]
+fn a_new_picker_after_a_failure_sends_its_own_stream_stop() {
+    let now = Instant::now();
+    let mut publisher = publisher();
+    let first = publishing(&mut publisher, now);
+    let start_id = start_signal(&first).request_id.clone().expect("start id");
+    // The server rejects the first publication after `stream.start`; the
+    // failed attempt already sent its own stop.
+    let failed = publisher.on_server_event("error", &start_id, &json!({"code": "forbidden"}), now);
+    assert_eq!(publisher.phase(), Phase::Failed);
+    assert_eq!(
+        sends(&failed)
+            .iter()
+            .filter(|signal| signal.kind == "stream.stop")
+            .count(),
+        1,
+        "the failed attempt stops its own server publication"
+    );
+
+    // A new picker after the failure is a clean attempt: it must not inherit
+    // the `stop_sent` latch of the previous one, or its stop is never sent.
+    let second_now = now + Duration::from_secs(1);
+    let opened = publisher.begin_picker(2);
+    assert_eq!(publisher.phase(), Phase::Picking);
+    assert!(matches!(opened.as_slice(), [Outcome::State(_)]));
+    let mut publish = publisher.publish(2, request(), false, second_now);
+    publish.extend(publisher.engine_ready(second_now));
+    assert!(
+        sends(&publish)
+            .iter()
+            .all(|signal| signal.kind != "stream.stop"),
+        "a fresh publish sends no stop: {publish:?}"
+    );
+    assert_eq!(
+        sends(&publish)
+            .iter()
+            .filter(|signal| signal.kind == "stream.start")
+            .count(),
+        1
+    );
+
+    let stop = publisher.stop(second_now);
+    assert_eq!(
+        sends(&stop)
+            .iter()
+            .filter(|signal| signal.kind == "stream.stop")
+            .count(),
+        1,
+        "the second attempt stops its own publication: {stop:?}"
+    );
+    assert_eq!(publisher.phase(), Phase::Stopping);
+}
+
+#[test]
+fn a_new_attempt_after_live_needs_its_own_connection_and_frame() {
+    let now = Instant::now();
+    let mut publisher = publisher();
+    publishing(&mut publisher, now);
+    publisher.on_engine(
+        EngineEvent::State(crate::publisher::Connection::Connected),
+        now,
+    );
+    publisher.on_engine(
+        EngineEvent::State(crate::publisher::Connection::FirstFrame),
+        now,
+    );
+    assert_eq!(publisher.phase(), Phase::Live);
+
+    // The server closes the live attempt; a new attempt follows.
+    publisher.on_server_event("stream.webrtc_closed", "", &json!({"reason": "test"}), now);
+    assert_eq!(publisher.phase(), Phase::Failed);
+
+    let second_now = now + Duration::from_secs(1);
+    publisher.begin_picker(2);
+    let mut publish = publisher.publish(2, request(), false, second_now);
+    publish.extend(publisher.engine_ready(second_now));
+    assert_eq!(
+        publisher.phase(),
+        Phase::Publishing,
+        "a new attempt starts unpublished"
+    );
+    let connected = publisher.on_engine(
+        EngineEvent::State(crate::publisher::Connection::Connected),
+        second_now,
+    );
+    assert_eq!(
+        publisher.phase(),
+        Phase::Publishing,
+        "the stale Connected of the previous attempt must not turn it Live"
+    );
+    assert!(!publisher.sharing().live);
+    assert!(connected.is_empty());
+    publisher.on_engine(
+        EngineEvent::State(crate::publisher::Connection::FirstFrame),
+        second_now,
+    );
+    assert_eq!(
+        publisher.phase(),
+        Phase::Live,
+        "both events of this attempt"
+    );
+}
+
+#[test]
+fn stream_start_waits_for_the_engine_and_a_failed_start_sends_nothing() {
+    let now = Instant::now();
+    let mut publisher = publisher();
+    publisher.begin_picker(1);
+    let publish = publisher.publish(1, request(), false, now);
+    assert!(
+        matches!(publish.as_slice(), [Outcome::StartEngine { .. }]),
+        "the start decision only asks for the engine: {publish:?}"
+    );
+    assert!(
+        sends(&publish).is_empty(),
+        "no stream.start before the engine exists: {publish:?}"
+    );
+
+    // The engine could not be created: the attempt is cancelled whole.
+    let failed = publisher.on_start_failed("Медиадвижок не создан.", now);
+    assert_eq!(publisher.phase(), Phase::Failed);
+    assert!(
+        sends(&failed).is_empty(),
+        "no phantom stream.start and no stream.stop: {failed:?}"
+    );
+    assert!(
+        !failed.contains(&Outcome::StopEngine),
+        "there is no engine to stop: {failed:?}"
+    );
+    assert!(
+        publisher.sharing().error.is_some(),
+        "the UI gets the reason"
+    );
+    assert!(
+        publisher.tick(now + ANSWER_TIMEOUT).is_empty(),
+        "the failed start leaves no deadline"
+    );
+
+    // Late signaling of the cancelled attempt is ignored.
+    assert!(
+        publisher
+            .on_server_event(
+                "stream.started",
+                "",
+                &json!({"channel_id": 2, "publisher_connection_id": "me"}),
+                now,
+            )
+            .is_empty()
+    );
+    assert!(
+        publisher
+            .on_server_event("stream.webrtc_offer", "", &json!({"sdp": "late"}), now)
+            .is_empty()
+    );
+    assert!(
+        publisher
+            .on_engine(EngineEvent::Answer("late answer".into()), now)
+            .is_empty()
+    );
+}
+
+#[test]
+fn stream_left_with_our_stop_request_finishes_without_the_timeout() {
+    for kind in ["stream.stopped", "stream.left"] {
+        let now = Instant::now();
+        let mut publisher = publisher();
+        publishing(&mut publisher, now);
+        let stop = publisher.stop(now);
+        let stop_id = sends(&stop)
+            .iter()
+            .find(|signal| signal.kind == "stream.stop")
+            .and_then(|signal| signal.request_id.clone())
+            .expect("tagged stop");
+        let done = publisher.on_server_event(kind, &stop_id, &json!({}), now);
+        assert_eq!(publisher.phase(), Phase::Idle, "{kind}");
+        assert!(matches!(done.as_slice(), [Outcome::State(_)]), "{kind}");
+    }
+}
+
+#[test]
+fn an_untagged_stream_left_does_not_end_our_stop_wait() {
+    let now = Instant::now();
+    let mut publisher = publisher();
+    publishing(&mut publisher, now);
+    publisher.stop(now);
+    // This is the viewer's leave, not an acknowledgement of our stop.
+    assert!(
+        publisher
+            .on_server_event("stream.left", "", &json!({}), now)
+            .is_empty()
+    );
+    assert_eq!(publisher.phase(), Phase::Stopping);
+    assert!(!publisher.tick(now + STOP_TIMEOUT).is_empty());
+    assert_eq!(publisher.phase(), Phase::Idle);
 }

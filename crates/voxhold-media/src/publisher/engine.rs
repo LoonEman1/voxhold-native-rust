@@ -14,7 +14,10 @@
 
 use std::{
     collections::VecDeque,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicU32, AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -28,6 +31,7 @@ use libwebrtc::{
     },
     rtp_sender::{RtpSender, VideoEncoderBackend},
     session_description::{SdpType, SessionDescription},
+    stats::{QualityLimitationReason, RtcStats},
     video_codec::VideoCodec,
     video_frame::{BoxVideoBuffer, I420Buffer, VideoFrame, VideoRotation},
     video_source::{VideoResolution, native::NativeVideoSource},
@@ -38,8 +42,7 @@ use crate::{
     Candidate, IceServer,
     publisher::{PublishRequest, Quality},
     screen_capture::{
-        CaptureFailure, CapturedImage, LatestImage, PreviewFrame, PreviewStore, ScreenCapture,
-        preview_from_i420,
+        CaptureFailure, CapturedImage, LatestImage, PreviewStore, ScreenCapture, preview_from_i420,
     },
 };
 
@@ -51,18 +54,60 @@ const FRAME_TIMEOUT: Duration = Duration::from_secs(5);
 const DISCONNECT_TIMEOUT: Duration = Duration::from_secs(8);
 /// Bounded pending ICE while no remote description exists (server contract).
 const ICE_CAPACITY: usize = 64;
+/// The server may hold up to 64 pending candidates; a burst plus an offer must
+/// fit without turning into a fatal command-channel overflow.
+const ENGINE_COMMAND_CAPACITY: usize = 64;
 const ENGINE_EVENT_CAPACITY: usize = 32;
+/// The outbound stats poll is cheap but must not stall command handling.
+const STATS_INTERVAL: Duration = Duration::from_secs(1);
+const STATS_TIMEOUT: Duration = Duration::from_millis(500);
 
-/// Measured counters of the publishing path. There is no CPU or GPU probe in
-/// this build, so none is reported.
+/// The plan asks for a GPU/CPU share; this build has no GPU probe. The pinned
+/// `OutboundRtpStats` does report `quality_limitation_reason`, which is the
+/// honest equivalent of the web diagnostics: none/cpu/bandwidth/other.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum QualityLimitation {
+    #[default]
+    None,
+    Cpu,
+    Bandwidth,
+    Other,
+}
+
+impl QualityLimitation {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::None => "нет",
+            Self::Cpu => "CPU",
+            Self::Bandwidth => "сеть",
+            Self::Other => "другое",
+        }
+    }
+
+    fn from_reason(reason: QualityLimitationReason) -> Self {
+        match reason {
+            QualityLimitationReason::None => Self::None,
+            QualityLimitationReason::Cpu => Self::Cpu,
+            QualityLimitationReason::Bandwidth => Self::Bandwidth,
+            QualityLimitationReason::Other => Self::Other,
+        }
+    }
+}
+
+/// Measured counters of the publishing path. FPS, resolution and limitation
+/// come from `OutboundRtpStats`; the drop counter belongs to the capture slot.
+/// There is no CPU or GPU percentage probe in this build, so none is invented.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PublishStats {
-    /// Frames accepted by the video source in the last measured second.
+    /// Encoded frames per second reported by the outbound RTP stats.
     pub fps: f32,
     /// Captured frames replaced before the encoder read them.
     pub dropped: u64,
     pub width: u32,
     pub height: u32,
+    /// Active screen sources of this publication. The stage publishes one.
+    pub sources: u32,
+    pub limitation: QualityLimitation,
 }
 
 impl Default for PublishStats {
@@ -72,7 +117,24 @@ impl Default for PublishStats {
             dropped: 0,
             width: 0,
             height: 0,
+            sources: 1,
+            limitation: QualityLimitation::None,
         }
+    }
+}
+
+impl PublishStats {
+    /// One honest line for the on-air card.
+    pub fn describe(self) -> String {
+        format!(
+            "{:.0} FPS · сброс {} · {}×{} · ограничение: {} · источников {}",
+            self.fps,
+            self.dropped,
+            self.width,
+            self.height,
+            self.limitation.label(),
+            self.sources
+        )
     }
 }
 
@@ -213,6 +275,16 @@ impl EventQueue {
     }
 }
 
+/// Capture-side counters that the outbound stats poll merges into one
+/// `PublishStats`. The frame loop owns them; the command loop only reads.
+#[derive(Default)]
+struct FrameCounters {
+    dropped: AtomicU64,
+    fps_bits: AtomicU32,
+    width: AtomicU32,
+    height: AtomicU32,
+}
+
 enum Command {
     Offer(String),
     Ice(Candidate),
@@ -222,9 +294,12 @@ enum Command {
 /// Non-blocking handle of one publishing engine. Dropping it releases the
 /// capture and closes the peer.
 pub struct PublisherEngine {
-    commands: mpsc::Sender<Command>,
+    /// `None` after `Drop` started: closing the channel is what wakes the
+    /// worker, so `join` never depends on `recv()` with a live sender.
+    commands: Option<mpsc::Sender<Command>>,
     events: Arc<EventQueue>,
     preview: Arc<PreviewStore>,
+    ice_dropped: AtomicU64,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -280,11 +355,13 @@ impl PublisherEngine {
         producer: Box<dyn FrameProducer>,
         preview: Arc<PreviewStore>,
     ) -> Result<Self, String> {
-        let (commands, receiver) = mpsc::channel(16);
+        let (commands, receiver) = mpsc::channel(ENGINE_COMMAND_CAPACITY);
         let events = Arc::new(EventQueue::default());
+        let counters = Arc::new(FrameCounters::default());
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let worker_events = events.clone();
         let worker_preview = preview.clone();
+        let worker_counters = counters.clone();
         let thread = std::thread::Builder::new()
             .name("voxhold-screen-publisher".into())
             .spawn(move || {
@@ -299,6 +376,7 @@ impl PublisherEngine {
                     receiver,
                     worker_events,
                     worker_preview,
+                    worker_counters,
                     request,
                     servers,
                     policy,
@@ -309,9 +387,10 @@ impl PublisherEngine {
             .map_err(|_| "Не удалось запустить поток трансляции.".to_string())?;
         match ready_rx.recv_timeout(Duration::from_secs(5)) {
             Ok(Ok(())) => Ok(Self {
-                commands,
+                commands: Some(commands),
                 events,
                 preview,
+                ice_dropped: AtomicU64::new(0),
                 thread: Some(thread),
             }),
             Ok(Err(message)) => {
@@ -320,6 +399,7 @@ impl PublisherEngine {
             }
             Err(_) => {
                 let _ = commands.try_send(Command::Stop);
+                drop(commands);
                 let _ = thread.join();
                 Err("Трансляция не запустилась за 5 секунд.".into())
             }
@@ -329,29 +409,43 @@ impl PublisherEngine {
     /// Apply the server offer and answer it. Never blocks the caller.
     pub fn offer(&self, sdp: String) -> Result<(), String> {
         self.commands
+            .as_ref()
+            .ok_or_else(|| "Медиадвижок трансляции уже закрыт.".to_string())?
             .try_send(Command::Offer(sdp))
             .map_err(|_| "Медиадвижок трансляции не принимает команды.".to_string())
     }
 
-    pub fn ice(&self, candidate: Candidate) -> Result<(), String> {
-        self.commands
-            .try_send(Command::Ice(candidate))
-            .map_err(|_| "Медиадвижок трансляции не принимает команды.".to_string())
+    /// Apply one server ICE candidate. A full queue drops the candidate; the
+    /// server may hold up to 64 pending ones and a multi-homed/TURN burst must
+    /// not turn into a terminal publication error. The loss is counted.
+    pub fn ice(&self, candidate: Candidate) -> bool {
+        let Some(commands) = self.commands.as_ref() else {
+            return false;
+        };
+        match commands.try_send(Command::Ice(candidate)) {
+            Ok(()) => true,
+            Err(_) => {
+                self.ice_dropped.fetch_add(1, Ordering::Relaxed);
+                false
+            }
+        }
+    }
+
+    /// Candidates dropped by a full command queue since the engine started.
+    pub fn ice_dropped(&self) -> u64 {
+        self.ice_dropped.load(Ordering::Relaxed)
     }
 
     pub fn poll(&self) -> Option<EngineEvent> {
         self.events.pop()
     }
-
-    /// The newest local preview picture for the on-air card.
-    pub fn take_preview(&self) -> Option<PreviewFrame> {
-        self.preview.take()
-    }
 }
 
 impl Drop for PublisherEngine {
     fn drop(&mut self) {
-        let _ = self.commands.try_send(Command::Stop);
+        // Close the channel before joining. A full queue may have swallowed
+        // the Stop command, but a closed channel always ends `recv()`.
+        drop(self.commands.take());
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
@@ -364,6 +458,7 @@ async fn run(
     mut commands: mpsc::Receiver<Command>,
     events: Arc<EventQueue>,
     preview: Arc<PreviewStore>,
+    counters: Arc<FrameCounters>,
     request: PublishRequest,
     servers: Vec<IceServer>,
     policy: String,
@@ -443,6 +538,7 @@ async fn run(
         source,
         events.clone(),
         preview,
+        counters.clone(),
         request.quality,
     ));
     let _ = ready.send(Ok(()));
@@ -450,6 +546,7 @@ async fn run(
     let mut remote_set = false;
     let mut pending: VecDeque<Candidate> = VecDeque::new();
     let mut disconnected_since: Option<Instant> = None;
+    let mut last_stats = Instant::now();
     loop {
         let command = tokio::select! {
             command = commands.recv() => command,
@@ -464,6 +561,12 @@ async fn run(
                     }
                 } else {
                     disconnected_since = None;
+                }
+                if last_stats.elapsed() >= STATS_INTERVAL {
+                    last_stats = Instant::now();
+                    if let Some(stats) = outbound_stats(&peer, &counters).await {
+                        events.push(EngineEvent::Stats(stats));
+                    }
                 }
                 continue;
             }
@@ -559,11 +662,57 @@ async fn add_ice(peer: &PeerConnection, candidate: Candidate) {
     }
 }
 
+/// One honest diagnostics sample: encoded FPS / resolution / limitation from
+/// `OutboundRtpStats`, the capture drop counter and the single active source.
+/// A failed or empty stats call falls back to the capture-side numbers.
+async fn outbound_stats(peer: &PeerConnection, counters: &FrameCounters) -> Option<PublishStats> {
+    let capture_width = counters.width.load(Ordering::Relaxed);
+    let capture_height = counters.height.load(Ordering::Relaxed);
+    let capture_fps = f32::from_bits(counters.fps_bits.load(Ordering::Relaxed));
+    let dropped = counters.dropped.load(Ordering::Relaxed);
+    let outbound = match tokio::time::timeout(STATS_TIMEOUT, peer.get_stats()).await {
+        Ok(Ok(stats)) => stats.into_iter().find_map(|stat| match stat {
+            RtcStats::OutboundRtp(outbound) if outbound.stream.kind == "video" => {
+                Some(outbound.outbound)
+            }
+            _ => None,
+        }),
+        _ => None,
+    };
+    let Some(outbound) = outbound else {
+        return Some(PublishStats {
+            fps: capture_fps,
+            dropped,
+            width: capture_width,
+            height: capture_height,
+            sources: 1,
+            limitation: QualityLimitation::None,
+        });
+    };
+    Some(PublishStats {
+        fps: outbound.frames_per_second as f32,
+        dropped,
+        width: if outbound.frame_width > 0 {
+            outbound.frame_width
+        } else {
+            capture_width
+        },
+        height: if outbound.frame_height > 0 {
+            outbound.frame_height
+        } else {
+            capture_height
+        },
+        sources: 1,
+        limitation: QualityLimitation::from_reason(outbound.quality_limitation_reason),
+    })
+}
+
 async fn frame_loop(
     mut producer: Box<dyn FrameProducer>,
     source: NativeVideoSource,
     events: Arc<EventQueue>,
     preview: Arc<PreviewStore>,
+    counters: Arc<FrameCounters>,
     quality: Quality,
 ) {
     let interval = Duration::from_micros(1_000_000 / u64::from(quality.fps.max(1)));
@@ -592,13 +741,21 @@ async fn frame_loop(
             if let Some(picture) = image.preview {
                 preview.publish(picture);
             }
-            if failed == Some(CaptureFailure::Temporary) {
-                failed = None;
-            }
+            // A good frame proves that a temporary compositor failure did not
+            // end the capture. Only a permanent failure is terminal below.
+            failed = None;
         }
         if let Some(failure) = failed {
-            events.push(EngineEvent::Error(failure.message().into()));
-            return;
+            match failure {
+                // A temporary failure waits for the frame watchdog: the next
+                // good frame recovers the publication, a dead source is
+                // caught by `FRAME_TIMEOUT` without an immediate false stop.
+                CaptureFailure::Temporary => {}
+                CaptureFailure::Permanent | CaptureFailure::Ended => {
+                    events.push(EngineEvent::Error(failure.message().into()));
+                    return;
+                }
+            }
         }
         if last_frame.elapsed() >= FRAME_TIMEOUT {
             events.push(EngineEvent::Error(
@@ -608,12 +765,15 @@ async fn frame_loop(
         }
         let elapsed = window.elapsed();
         if elapsed >= Duration::from_secs(1) {
-            events.push(EngineEvent::Stats(PublishStats {
-                fps: sent_in_window as f32 / elapsed.as_secs_f32(),
-                dropped: producer.dropped(),
-                width: size.0,
-                height: size.1,
-            }));
+            counters
+                .dropped
+                .store(producer.dropped(), Ordering::Relaxed);
+            counters.fps_bits.store(
+                (sent_in_window as f32 / elapsed.as_secs_f32()).to_bits(),
+                Ordering::Relaxed,
+            );
+            counters.width.store(size.0, Ordering::Relaxed);
+            counters.height.store(size.1, Ordering::Relaxed);
             sent_in_window = 0;
             window = Instant::now();
         }
@@ -632,3 +792,9 @@ fn ufrag(candidate: &str) -> Option<&str> {
 
 #[cfg(test)]
 mod loopback;
+
+#[cfg(test)]
+mod capture_tests;
+
+#[cfg(test)]
+mod lifecycle_tests;

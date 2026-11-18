@@ -265,6 +265,9 @@ pub struct Publisher {
     requests: HashSet<String>,
     started: Option<String>,
     start_sent: bool,
+    /// The media engine of this attempt was created. A failed start has no
+    /// engine, so its terminal decision must not emit `StopEngine`.
+    engine_live: bool,
     answered: bool,
     stop_sent: bool,
     connected: bool,
@@ -296,6 +299,7 @@ impl Publisher {
             requests: HashSet::new(),
             started: None,
             start_sent: false,
+            engine_live: false,
             answered: false,
             stop_sent: false,
             connected: false,
@@ -339,6 +343,11 @@ impl Publisher {
     }
 
     /// Open the picker for `picker`. Capture does not start yet.
+    ///
+    /// Every picker starts a fresh attempt: the confirmation flags, the stop
+    /// latch and the deadlines of a failed or finished attempt must not leak
+    /// into the next publication (otherwise its `stream.stop` is suppressed
+    /// and the first `Connected` turns it Live).
     pub fn begin_picker(&mut self, picker: u64) -> Vec<Outcome> {
         if picker <= self.stale_before {
             return Vec::new();
@@ -349,13 +358,11 @@ impl Publisher {
         ) {
             return Vec::new();
         }
+        self.reset();
         self.attempt = self.attempt.wrapping_add(1);
         self.picker = Some(picker);
-        self.request = None;
         self.phase = Phase::Picking;
         self.status = "Выберите экран".into();
-        self.error = None;
-        self.stats = None;
         vec![Outcome::State(self.sharing())]
     }
 
@@ -425,7 +432,10 @@ impl Publisher {
                 vec![Outcome::State(self.sharing())]
             }
             Phase::Publishing | Phase::Live => {
-                let mut out = vec![Outcome::StopEngine];
+                let mut out = Vec::new();
+                if self.engine_live {
+                    out.push(Outcome::StopEngine);
+                }
                 if self.start_sent && !self.stop_sent {
                     self.stop_sent = true;
                     out.push(Outcome::Send(self.signal("stream.stop", json!({}))));
@@ -455,7 +465,7 @@ impl Publisher {
     /// Leave, logout, revoked access or a lost socket. The capture is closed
     /// immediately and a late picker result for this session is rejected.
     pub fn abandon(&mut self) -> Vec<Outcome> {
-        let engine = matches!(self.phase, Phase::Publishing | Phase::Live);
+        let engine = self.engine_live;
         self.stale_before = self.stale_before.max(self.picker.unwrap_or(0));
         self.reset();
         let mut out = Vec::new();
@@ -510,6 +520,11 @@ impl Publisher {
                 vec![Outcome::State(self.sharing())]
             }
             "stream.stopped" => self.on_stopped(data, now),
+            // The pinned backend may acknowledge `stream.stop` with
+            // `stream.left` instead of `stream.stopped`. Only a tagged answer
+            // of our own stop request finishes the attempt; an untagged leave
+            // of the viewer stays unrelated.
+            "stream.left" => self.on_left_ack(request_id),
             "stream.webrtc_closed" => self.on_closed(data, now),
             "error" => {
                 if !self.active() || !self.tracked(request_id) {
@@ -651,6 +666,17 @@ impl Publisher {
         }
     }
 
+    /// `stream.left` is a valid acknowledgement of our own `stream.stop`.
+    fn on_left_ack(&mut self, request_id: &str) -> Vec<Outcome> {
+        if self.phase != Phase::Stopping
+            || request_id.is_empty()
+            || !self.requests.contains(request_id)
+        {
+            return Vec::new();
+        }
+        self.finish()
+    }
+
     fn on_closed(&mut self, data: &Value, now: Instant) -> Vec<Outcome> {
         let reason = data["reason"].as_str().unwrap_or_default();
         match self.phase {
@@ -691,7 +717,36 @@ impl Publisher {
         self.viewer_wait = None;
         self.phase = Phase::Publishing;
         self.status = "Запускаем трансляцию…".into();
-        self.deadline = Some(now + ANSWER_TIMEOUT);
+        // A new attempt never inherits the confirmations or the stop latch of
+        // the previous one. `stream.start` is not sent here: `engine_ready`
+        // does that only after the media engine really exists.
+        self.start_request = None;
+        self.start_sent = false;
+        self.engine_live = false;
+        self.answered = false;
+        self.stop_sent = false;
+        self.connected = false;
+        self.sent_frame = false;
+        self.started = None;
+        self.deadline = None;
+        self.stop_deadline = None;
+        self.stats = None;
+        let Some(request) = self.request.clone() else {
+            return self.fail("Источник трансляции не выбран.", now);
+        };
+        vec![Outcome::StartEngine {
+            attempt: self.attempt,
+            request,
+        }]
+    }
+
+    /// The engine of this attempt was created. Only now may `stream.start`
+    /// reach the server: a failed engine start must not leave a phantom SFU
+    /// publication or a second "Запускаем…" state behind.
+    pub fn engine_ready(&mut self, now: Instant) -> Vec<Outcome> {
+        if self.phase != Phase::Publishing || self.start_sent {
+            return Vec::new();
+        }
         let Some(request) = self.request.clone() else {
             return self.fail("Источник трансляции не выбран.", now);
         };
@@ -707,14 +762,10 @@ impl Publisher {
         );
         self.start_request = signal.request_id.clone();
         self.start_sent = true;
-        vec![
-            Outcome::StartEngine {
-                attempt: self.attempt,
-                request,
-            },
-            Outcome::Send(signal),
-            Outcome::State(self.sharing()),
-        ]
+        self.engine_live = true;
+        self.deadline = Some(now + ANSWER_TIMEOUT);
+        self.status = "Подключаемся…".into();
+        vec![Outcome::Send(signal), Outcome::State(self.sharing())]
     }
 
     fn maybe_live(&mut self) -> Vec<Outcome> {
@@ -731,7 +782,7 @@ impl Publisher {
         if self.phase == Phase::Idle {
             return Vec::new();
         }
-        let engine = matches!(self.phase, Phase::Publishing | Phase::Live);
+        let engine = self.engine_live;
         let mut out = Vec::new();
         if engine {
             out.push(Outcome::StopEngine);
@@ -753,14 +804,10 @@ impl Publisher {
     }
 
     fn finish(&mut self) -> Vec<Outcome> {
-        let engine = matches!(self.phase, Phase::Publishing | Phase::Live);
+        // `stop` already released the engine when the attempt entered
+        // `Stopping`; the acknowledgement only closes the attempt.
         self.reset();
-        let mut out = Vec::new();
-        if engine {
-            out.push(Outcome::StopEngine);
-        }
-        out.push(Outcome::State(self.sharing()));
-        out
+        vec![Outcome::State(self.sharing())]
     }
 
     fn reset(&mut self) {
@@ -771,6 +818,7 @@ impl Publisher {
         self.requests.clear();
         self.started = None;
         self.start_sent = false;
+        self.engine_live = false;
         self.answered = false;
         self.stop_sent = false;
         self.connected = false;

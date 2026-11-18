@@ -148,9 +148,12 @@ pub struct VoicePanel {
     dock_focus: Vec<FocusHandle>,
     dock_visible: bool,
     stream_focus: Vec<FocusHandle>,
-    /// Focus handles of the picker and the «Экран» action. Index 0 is the
-    /// on-air stop action, index 1 the toolbar button.
+    /// Focus handles of the «Экран» toolbar action and the on-air stop
+    /// action. Index 0 is the on-air stop action, index 1 the toolbar button.
     screen_focus: Vec<FocusHandle>,
+    /// Focus handles of the source picker. A separate range cannot collide
+    /// with the toolbar (`screen_focus[1]`) or the on-air card (`screen_focus[0]`).
+    picker_focus: Vec<FocusHandle>,
     member_focus: Vec<FocusHandle>,
     player_actions: Vec<FocusHandle>,
     room_size: (f32, f32),
@@ -168,6 +171,10 @@ pub struct VoicePanel {
     /// the power poller so an idle window has no timer.
     call_handler: Option<Box<dyn Fn(&mut gpui::App)>>,
     palette: Palette,
+    /// Test-only gate override: the capture stack and codec of the host must
+    /// not decide whether a keyboard-path test can run.
+    #[cfg(test)]
+    test_share_gate: Option<Result<(), &'static str>>,
 }
 
 impl VoicePanel {
@@ -268,7 +275,8 @@ impl VoicePanel {
                 .collect(),
             dock_visible: false,
             stream_focus: (0..8).map(|_| cx.focus_handle()).collect(),
-            screen_focus: (0..32).map(|_| cx.focus_handle()).collect(),
+            screen_focus: (0..2).map(|_| cx.focus_handle()).collect(),
+            picker_focus: (0..32).map(|_| cx.focus_handle()).collect(),
             member_focus: (0..16).map(|_| cx.focus_handle()).collect(),
             player_actions: (0..3).map(|_| cx.focus_handle()).collect(),
             room_size: (0.0, 0.0),
@@ -280,6 +288,8 @@ impl VoicePanel {
             speaking_handler: None,
             call_handler: None,
             palette: crate::theme::dark_palette(),
+            #[cfg(test)]
+            test_share_gate: None,
         }
     }
 

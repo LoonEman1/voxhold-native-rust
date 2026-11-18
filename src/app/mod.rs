@@ -469,6 +469,14 @@ impl Voxhold {
                 crate::voice_panel::VoiceTabPrev,
                 Some("VoiceRoom"),
             ),
+            // The screen picker is a modal over the room; its own context is
+            // deeper, so Tab cycles the picker ring instead of the room.
+            gpui::KeyBinding::new("tab", crate::voice_panel::VoiceTab, Some("ScreenPicker")),
+            gpui::KeyBinding::new(
+                "shift-tab",
+                crate::voice_panel::VoiceTabPrev,
+                Some("ScreenPicker"),
+            ),
         ]);
         let history_list = Self::new_history_list(ListAlignment::Bottom, cx);
         let system_light = theme::system_light();

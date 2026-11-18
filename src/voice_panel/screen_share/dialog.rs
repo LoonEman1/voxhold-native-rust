@@ -89,7 +89,7 @@ impl VoicePanel {
     /// The full-window picker. `None` when it is closed.
     pub fn screen_share_overlay(
         &mut self,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<gpui::AnyElement> {
         if !self.screen.open {
@@ -306,12 +306,18 @@ impl VoicePanel {
                     .border_1()
                     .border_color(rgb(c.line))
                     .text_size(px(12.))
-                    .text_color(rgb(c.fg))
+                    .text_color(rgb(if self.screen.busy { c.muted } else { c.fg }))
                     .flex()
                     .items_center()
-                    .cursor_pointer()
                     .track_focus(&cancel_focus)
-                    .on_click(cx.listener(|panel, _, _, cx| panel.close_screen_share(cx)))
+                    // Once Start was pressed the attempt is committed: the
+                    // explicit Cancel button is unavailable, while Escape and
+                    // the backdrop turn into one stop intent.
+                    .when(!self.screen.busy, |button| {
+                        button
+                            .cursor_pointer()
+                            .on_click(cx.listener(|panel, _, _, cx| panel.close_screen_share(cx)))
+                    })
                     .child("Отмена"),
             )
             .child(
@@ -333,9 +339,21 @@ impl VoicePanel {
             );
 
         self.screen.ring = ring;
+        // The modal must own the keyboard from its first frame; otherwise the
+        // user has to click before Tab works. Focus is applied after the frame
+        // so the handle is part of the rendered focus path; only the first
+        // paint does this, so a later repaint never steals focus.
+        if !self.screen.focus_placed {
+            if let Some((handle, _)) = self.screen.ring.first() {
+                let handle = handle.clone();
+                window.defer(cx, move |window, _| window.focus(&handle));
+                self.screen.focus_placed = true;
+            }
+        }
         let mut card = div()
             .id("share-card")
             .debug_selector(|| "screen-share-card".into())
+            .key_context("ScreenPicker")
             .absolute()
             .left(px(left))
             .top(px(top))
@@ -439,7 +457,13 @@ impl VoicePanel {
             }
             ShareKey::BitrateDown => self.change_bitrate(-100, cx),
             ShareKey::BitrateUp => self.change_bitrate(100, cx),
-            ShareKey::Cancel => self.close_screen_share(cx),
+            ShareKey::Cancel => {
+                // The committed attempt is stopped by Escape/backdrop; the
+                // Cancel button itself is unavailable while busy.
+                if !self.screen.busy {
+                    self.close_screen_share(cx);
+                }
+            }
             ShareKey::Start => self.start_screen_share(cx),
             ShareKey::Source(index) => {
                 // The click handler carries the source itself; the keyboard
@@ -480,6 +504,33 @@ impl VoicePanel {
             .map(|(_, key)| *key);
         if let Some(key) = key {
             self.activate_share(key, cx);
+        }
+    }
+
+    /// Keyboard routing for the open picker. The root shell calls this before
+    /// its own Escape handling, so a committed attempt becomes a stop instead
+    /// of the dialog silently closing behind a live publication.
+    pub(crate) fn screen_share_key(
+        &mut self,
+        key: &str,
+        shift: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        match key {
+            "escape" => {
+                self.close_screen_share(cx);
+                true
+            }
+            "tab" => {
+                self.cycle_share_focus(shift, window, cx);
+                true
+            }
+            "enter" | "space" => {
+                self.activate_focused_share(window, cx);
+                true
+            }
+            _ => false,
         }
     }
 }

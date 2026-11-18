@@ -22,6 +22,11 @@ impl Render for Voxhold {
                     return;
                 }
                 #[cfg(feature = "voxhold-media")]
+                if s.screen_picker_key_down(event, window, cx) {
+                    cx.stop_propagation();
+                    return;
+                }
+                #[cfg(feature = "voxhold-media")]
                 if s.voice_key_down(event, window, cx) {
                     cx.stop_propagation();
                     return;
@@ -166,7 +171,11 @@ impl Render for Voxhold {
                 .on_action(cx.listener(|s, _: &voice_panel::VoiceTab, window, cx| {
                     if let Some(voice) = &s.voice {
                         voice.update(cx, |panel, cx| {
-                            panel.cycle_focus(false, window, cx);
+                            if panel.screen_share_open() {
+                                panel.screen_share_key("tab", false, window, cx);
+                            } else {
+                                panel.cycle_focus(false, window, cx);
+                            }
                         });
                     }
                     cx.stop_propagation();
@@ -174,7 +183,11 @@ impl Render for Voxhold {
                 .on_action(cx.listener(|s, _: &voice_panel::VoiceTabPrev, window, cx| {
                     if let Some(voice) = &s.voice {
                         voice.update(cx, |panel, cx| {
-                            panel.cycle_focus(true, window, cx);
+                            if panel.screen_share_open() {
+                                panel.screen_share_key("tab", true, window, cx);
+                            } else {
+                                panel.cycle_focus(true, window, cx);
+                            }
                         });
                     }
                     cx.stop_propagation();

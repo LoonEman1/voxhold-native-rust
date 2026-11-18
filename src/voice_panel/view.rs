@@ -636,8 +636,9 @@ impl VoicePanel {
             body = body.child(bar);
             // The disabled button carries its reason in the room, not in a
             // hover-only tooltip: there is no dead element without an
-            // explanation.
-            if let Err(reason) = self.share_gate() {
+            // explanation. An active share shows its card status instead of
+            // the permanent "already running" text.
+            if let Some(reason) = self.screen_reason() {
                 body = body.child(
                     div()
                         .debug_selector(|| "voice-screen-reason".into())
@@ -733,11 +734,19 @@ impl Render for VoicePanel {
             .track_focus(&self.focus)
             .key_context("VoiceRoom")
             .on_action(cx.listener(|panel, _: &VoiceTab, window, cx| {
-                panel.cycle_focus(false, window, cx);
+                if panel.screen_share_open() {
+                    panel.screen_share_key("tab", false, window, cx);
+                } else {
+                    panel.cycle_focus(false, window, cx);
+                }
                 cx.stop_propagation();
             }))
             .on_action(cx.listener(|panel, _: &VoiceTabPrev, window, cx| {
-                panel.cycle_focus(true, window, cx);
+                if panel.screen_share_open() {
+                    panel.screen_share_key("tab", true, window, cx);
+                } else {
+                    panel.cycle_focus(true, window, cx);
+                }
                 cx.stop_propagation();
             }))
             .size_full()

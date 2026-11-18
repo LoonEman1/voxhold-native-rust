@@ -272,23 +272,11 @@ impl PreviewStore {
     }
 }
 
-/// Counters reported to the UI. Frames are counted after conversion, drops
-/// when a newer image replaced an unread one.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct CaptureStats {
-    pub captured: u64,
-    pub dropped: u64,
-    pub width: u32,
-    pub height: u32,
-    pub failure: Option<&'static str>,
-}
-
 /// One capture thread. Dropping it stops and joins the thread.
 pub struct ScreenCapture {
     stop: Arc<AtomicBool>,
     latest: Arc<LatestImage>,
     failure: Arc<Mutex<Option<CaptureFailure>>>,
-    size: Arc<Mutex<(u32, u32)>>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -308,13 +296,11 @@ impl ScreenCapture {
         capability()?;
         let stop = Arc::new(AtomicBool::new(false));
         let failure = Arc::new(Mutex::new(None));
-        let size = Arc::new(Mutex::new((0, 0)));
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), &'static str>>();
 
         let worker_stop = stop.clone();
         let worker_latest = latest.clone();
         let worker_failure = failure.clone();
-        let worker_size = size.clone();
         let thread = std::thread::Builder::new()
             .name("voxhold-screen-capture".into())
             .spawn(move || {
@@ -326,7 +312,6 @@ impl ScreenCapture {
                     worker_latest,
                     worker_stop,
                     worker_failure,
-                    worker_size,
                     ready_tx,
                 );
                 #[cfg(not(windows))]
@@ -339,7 +324,6 @@ impl ScreenCapture {
                         &worker_stop,
                         &worker_failure,
                     );
-                    let _ = worker_size;
                     let _ = ready_tx.send(Err("Захват экрана поддерживается только в Windows."));
                 }
             })
@@ -350,7 +334,6 @@ impl ScreenCapture {
                 stop,
                 latest,
                 failure,
-                size,
                 thread: Some(thread),
             }),
             Ok(Err(message)) => {
@@ -372,17 +355,6 @@ impl ScreenCapture {
 
     pub fn failure(&self) -> Option<CaptureFailure> {
         self.failure.lock().ok().and_then(|failure| *failure)
-    }
-
-    pub fn stats(&self) -> CaptureStats {
-        let (width, height) = self.size.lock().map(|size| *size).unwrap_or((0, 0));
-        CaptureStats {
-            captured: self.latest.published(),
-            dropped: self.latest.dropped(),
-            width,
-            height,
-            failure: self.failure().map(CaptureFailure::as_str),
-        }
     }
 
     /// Ask the thread to stop and wait a bounded time for it.
@@ -626,6 +598,11 @@ mod windows {
             let title = source.title();
             match kind {
                 SourceKind::Monitor => {
+                    // The pinned capturer reports `display_id = -1` on this
+                    // host, so the name/size are matched by the capturer's
+                    // source order. That is a known limitation: a reordered
+                    // source list can attach a neighbour's size to a monitor
+                    // until the capturer exposes a stable display id.
                     let (name, width, height) = monitors
                         .get(id as usize)
                         .cloned()
@@ -763,7 +740,6 @@ mod windows {
         latest: Arc<LatestImage>,
         stop: Arc<AtomicBool>,
         failure: Arc<Mutex<Option<CaptureFailure>>>,
-        size: Arc<Mutex<(u32, u32)>>,
         ready: Sender<Result<(), &'static str>>,
     ) {
         let mut options = DesktopCapturerOptions::new(source_type(source.kind));
@@ -784,21 +760,13 @@ mod windows {
             *slot = None;
         }
         let converter_latest = latest.clone();
-        let converter_size = size.clone();
         let converter_failure = failure.clone();
-        let mut last_target = (0_u32, 0_u32);
         capturer.start_capture(Some(selected), move |result| match result {
             Ok(frame) => {
                 let (width, height) = (frame.width().max(0) as u32, frame.height().max(0) as u32);
                 let output = fit_even(width, height, target.0, target.1);
                 if output == (0, 0) {
                     return;
-                }
-                if output != last_target {
-                    last_target = output;
-                    if let Ok(mut slot) = converter_size.lock() {
-                        *slot = output;
-                    }
                 }
                 let mut buffer = I420Buffer::new(output.0, output.1);
                 if convert_bgra_to_i420(frame.data(), width, height, frame.stride(), &mut buffer) {

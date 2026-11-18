@@ -265,7 +265,9 @@ fn a_real_desktop_capture_delivers_a_frame() {
     // still proves the window capturer is usable on this host.
     let windows = list_sources(SourceKind::Window).expect("window list");
     for window in windows.iter().take(5) {
-        println!("window {} · {}", window.id, window.describe());
+        // No titles in test output: the log stays free of personal window
+        // names, while id and size still prove the listing works.
+        println!("window {} · {}×{}", window.id, window.width, window.height);
     }
     assert!(
         windows.iter().all(|window| !window.title.trim().is_empty()),

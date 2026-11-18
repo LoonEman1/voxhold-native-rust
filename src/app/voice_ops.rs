@@ -500,6 +500,31 @@ impl Voxhold {
         }
     }
 
+    /// Keyboard routing for the open screen picker. It runs before the shell's
+    /// own Escape handling, so Escape after Start stops the committed attempt
+    /// instead of only closing the dialog.
+    pub(super) fn screen_picker_key_down(
+        &mut self,
+        event: &gpui::KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(panel) = self.voice.clone() else {
+            return false;
+        };
+        if !panel.read(cx).screen_share_open() {
+            return false;
+        }
+        let key = event.keystroke.key.to_lowercase();
+        if !matches!(key.as_str(), "escape" | "tab" | "enter" | "space") {
+            return false;
+        }
+        let shift = event.keystroke.modifiers.shift;
+        panel.update(cx, |panel, cx| {
+            panel.screen_share_key(&key, shift, window, cx)
+        })
+    }
+
     /// Keyboard routing for the voice surfaces. Returns whether the event was
     /// consumed. Go order: mute/deafen, then push-to-talk press.
     pub(super) fn voice_key_down(

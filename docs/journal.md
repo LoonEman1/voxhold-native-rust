@@ -379,7 +379,7 @@ hot-unplug, физический DPI 125/150 (тесты используют п
   (11 API, 134 media с 9 `ignored` аудио-пробами, 346 приложения с 1
   `ignored`, итого 491 passed), `cargo build --release --locked`,
   `scripts/check-file-sizes.ps1 -All` (208 файлов), `git diff --check`,
-  строгий UTF-8/BOM/U+FFFD-детектор по 149 отслеживаемым `*.rs`/`*.md`,
+  строгий UTF-8/BOM/U+FFFD-детектор по 141 отслеживаемому `*.rs`/`*.md`,
   mojibake-скан, smoke release (процесс жив через 5 с).
 
 Не проверено: живое аудио и слышимый микс двух тонов на реальном устройстве,
@@ -437,7 +437,7 @@ hot-unplug, физический DPI 125/150 (тесты используют п
 - Проверено: fmt; `cargo test --workspace --locked` — 11 API, 134 media
   (9 `ignored`), 346 приложения (1 `ignored`), итого 491 passed; release build;
   размеры (208 отслеживаемых файлов, все новые в индексе); строгий
-  UTF-8/BOM/U+FFFD по 149 отслеживаемым `*.rs`/`*.md`, mojibake-скан; smoke
+  UTF-8/BOM/U+FFFD по 141 отслеживаемому `*.rs`/`*.md`, mojibake-скан; smoke
   release — процесс жив через 5 с. Новых release-предупреждений нет; два прежних
   (`recordings_download` unused `id`, `set_allowed_channels`) остались.
 

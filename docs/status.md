@@ -748,7 +748,7 @@ release (процесс активен через 5 с).
 - Проверено: fmt; `cargo test --workspace --locked` — 11 API, 134 media
   (9 `ignored`), 346 приложения (1 `ignored`), 491 passed, 0 failed; release
   build; размеры файлов (208 отслеживаемых, все новые файлы в индексе);
-  строгая проверка UTF-8/BOM/U+FFFD (149 отслеживаемых `*.rs`/`*.md`),
+  строгая проверка UTF-8/BOM/U+FFFD (141 отслеживаемый `*.rs`/`*.md`),
   mojibake-скан; smoke release — процесс жив через 5 с. Мутации: `!server_muted`
   (`voice_room.rs:339`), `self.server_muted → false` (`voice_panel.rs:697`),
   удаление `sink_died`-учёта, удаление `opened()` из `adopt_initial_playout` и

@@ -20,10 +20,10 @@ impl Session {
     /// Adopt the sink opened by the constructor. Every initial sink enters the
     /// same `Opening → Unstable` proof window as a reopened one; otherwise a
     /// normal call never reaches `Stable` and never clears the budget.
-    /// `Session::new` and the headless test constructor both go through this
-    /// single entry point, so a regression "the first sink bypasses the
-    /// recovery machine" is covered by the media tests instead of a manual
-    /// field write in the test.
+    /// `Session::new` calls this right after it opens the sink, and the media
+    /// tests call it on a headless session, so the regression "the first sink
+    /// bypasses the recovery machine" is covered by the media tests instead of
+    /// a manual field write in the test.
     pub(crate) fn adopt_initial_playout(mut self, playout: Option<Playout>) -> Self {
         if let Some(playout) = playout {
             self.playout = Some(playout);

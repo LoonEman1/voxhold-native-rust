@@ -50,6 +50,29 @@ impl OutputState {
     }
 }
 
+/// The platform ADM is stale when it is no longer initialized, when its
+/// captured-sample count stopped moving, or when it never reported any samples
+/// after the transport connected.
+pub(super) fn platform_input_stalled(
+    running: bool,
+    connected: bool,
+    samples_seen: bool,
+    since_progress: Duration,
+    since_start: Duration,
+) -> bool {
+    if !running {
+        return true;
+    }
+    if !connected {
+        return false;
+    }
+    if samples_seen {
+        since_progress >= Duration::from_secs(2)
+    } else {
+        since_start >= INPUT_CAPTURE_GRACE
+    }
+}
+
 impl Session {
     /// A hot-unplugged device cannot be reported by WebRTC; poll the Core
     /// Audio list once a second and fall back to the default path.
@@ -59,6 +82,11 @@ impl Session {
         }
         self.device_check = std::time::Instant::now();
         for input in [true, false] {
+            // A viewer session has no outgoing audio track. Its capture path
+            // is intentionally closed and must never be recovered here.
+            if input && self.sender.is_none() {
+                continue;
+            }
             let selected = if input {
                 self.input_opened.as_deref()
             } else {
@@ -140,11 +168,36 @@ impl Session {
                 });
             }
         }
+        // Without an outgoing track there is no capture to watch or recover.
+        if self.sender.is_none() {
+            return;
+        }
         let Some((failed, progress)) = self.mic.as_ref().map(|mic| (mic.failed(), mic.progress()))
         else {
-            // The software progress counter says nothing about the ADM path.
-            // Only a lost platform recording is a recovery trigger here.
-            if !self.input_recovery_failed && !self.audio.running(true) {
+            // The software block counter says nothing about the ADM path.
+            // Initialization alone is not proof of recording either: the
+            // platform source's captured-sample count must keep moving. Allow
+            // a startup grace before the first stats report.
+            if self.input_recovery_failed {
+                return;
+            }
+            // Before the transport connects there is no capture stats signal
+            // to judge; do not reopen the microphone just because the peer is
+            // still negotiating.
+            if self.peer.connection_state() != PeerConnectionState::Connected {
+                return;
+            }
+            let stalled = platform_input_stalled(
+                self.audio.running(true),
+                // The stats probe runs after this check; let it establish the
+                // connected baseline first.
+                self.input_connected
+                    && self.peer.connection_state() == PeerConnectionState::Connected,
+                self.input_samples.is_some(),
+                self.input_progress_at.elapsed(),
+                self.input_started_at.elapsed(),
+            );
+            if stalled {
                 self.recover_input(events);
             }
             return;

@@ -121,8 +121,12 @@ impl VoiceController {
         c.muted |= self.server_muted;
         c
     }
-    pub fn update_controls(&mut self, controls: Controls, self_muted: bool) -> Vec<Action> {
+    pub fn update_controls(&mut self, mut controls: Controls, self_muted: bool) -> Vec<Action> {
         let gain_changed = controls.output_gain != self.controls.output_gain;
+        // The input device is owned by the explicit `SelectInput` request. A
+        // generic mute/DSP update that was queued before the user picked a
+        // different device must not revert that choice.
+        controls.input = self.controls.input.clone();
         self.controls = controls;
         self.self_muted = self_muted;
         // Capture stays closed until the server confirmed `voice.joined`; the
@@ -628,11 +632,21 @@ mod tests {
 
     #[test]
     fn a_control_update_keeps_the_selected_input_for_the_next_state() {
-        let mut controller = VoiceController::new(1, 2, Controls::default(), false);
-        controller.joined = true;
-        let actions = controller.update_controls(
+        let mut controller = VoiceController::new(
+            1,
+            2,
             Controls {
                 input: Some("mic".into()),
+                ..Controls::default()
+            },
+            false,
+        );
+        controller.joined = true;
+        // A stale mute/DSP snapshot still carries the previous device.
+        let actions = controller.update_controls(
+            Controls {
+                muted: true,
+                input: Some("stale".into()),
                 ..Controls::default()
             },
             false,
@@ -642,6 +656,7 @@ mod tests {
             Some(Action::Media(Command::State(state)))
                 if state.input.as_deref() == Some("mic")
         ));
+        assert_eq!(controller.controls.input.as_deref(), Some("mic"));
     }
 
     #[test]

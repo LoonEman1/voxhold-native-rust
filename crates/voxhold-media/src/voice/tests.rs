@@ -204,6 +204,100 @@ fn a_missing_saved_microphone_does_not_fail_the_join() {
 }
 
 #[test]
+fn a_software_track_waits_for_the_capture_thread_acknowledgement() {
+    let factory = PeerConnectionFactory::default();
+    let source = libwebrtc::audio_source::native::NativeAudioSource::new(
+        capture::source_options(),
+        capture::SAMPLE_RATE,
+        capture::CHANNELS,
+        0,
+    );
+    let track = factory.create_audio_track("ack", source.clone());
+    let gate = CaptureGate::default();
+    gate.attach_source(track.clone(), source);
+    gate.set_joined(true);
+    gate.set_server_allowed(true);
+    gate.set_local(true);
+    assert!(
+        !track.enabled(),
+        "an opened software track must stay silent until the capture thread flushes"
+    );
+    let generation = gate.permission_epoch().load(Ordering::SeqCst);
+    gate.acknowledge(generation);
+    assert!(track.enabled(), "the acknowledged generation may transmit");
+    // A later mute/unmute edge must close the track again before the next
+    // acknowledgement, so an old block stuck in the sender cannot leak.
+    gate.set_local(false);
+    gate.set_local(true);
+    assert!(
+        !track.enabled(),
+        "a new generation must wait for its own flush acknowledgement"
+    );
+}
+
+#[test]
+fn platform_watchdog_requires_pcm_not_just_initialization() {
+    assert!(!output::platform_input_stalled(
+        true,
+        true,
+        true,
+        Duration::from_millis(100),
+        Duration::from_secs(30)
+    ));
+    assert!(
+        output::platform_input_stalled(
+            true,
+            true,
+            true,
+            Duration::from_secs(3),
+            Duration::from_secs(30)
+        ),
+        "an initialized but silent ADM is stale"
+    );
+    assert!(
+        output::platform_input_stalled(
+            true,
+            true,
+            true,
+            Duration::from_secs(3),
+            Duration::from_secs(30)
+        ),
+        "a stopped captured-sample counter must trigger recovery"
+    );
+    assert!(
+        !output::platform_input_stalled(
+            true,
+            false,
+            false,
+            Duration::from_secs(30),
+            Duration::from_secs(30)
+        ),
+        "no stats before the transport connects are not a stall"
+    );
+    assert!(!output::platform_input_stalled(
+        true,
+        true,
+        false,
+        Duration::from_secs(30),
+        Duration::from_secs(1)
+    ));
+    assert!(output::platform_input_stalled(
+        true,
+        true,
+        false,
+        Duration::from_secs(30),
+        INPUT_CAPTURE_GRACE
+    ));
+    assert!(output::platform_input_stalled(
+        false,
+        false,
+        false,
+        Duration::from_secs(30),
+        Duration::from_secs(30)
+    ));
+}
+
+#[test]
 fn recovery_ladder_bounds_the_silent_system_input_before_the_adm() {
     assert_eq!(
         input::recovery_step(true, false, 0),

@@ -52,6 +52,9 @@ const INPUT_STABLE_CAPTURE: Duration = Duration::from_secs(5);
 /// The system WinMM input may open without ever delivering PCM. Bound those
 /// reopens so the ladder always reaches the platform ADM.
 const MAX_SYSTEM_INPUT_ATTEMPTS: u8 = 2;
+/// How long the platform ADM may take to report its first audio-source stats
+/// after the device was opened.
+const INPUT_CAPTURE_GRACE: Duration = Duration::from_secs(5);
 
 mod capture_gate;
 pub use capture_gate::CaptureGate;
@@ -139,6 +142,16 @@ struct Session {
     /// delivering buffers without reporting an error (USB unplug).
     input_progress: u64,
     input_progress_at: std::time::Instant,
+    /// When the current capture path was opened. Used for the startup grace
+    /// before the platform path is expected to report PCM.
+    input_started_at: std::time::Instant,
+    /// Last `total_samples_captured` from the platform ADM's audio source.
+    /// `None` means the stats have not reported yet.
+    input_samples: Option<u64>,
+    /// The peer has connected since the platform path was opened. The ADM
+    /// watchdog starts its startup grace from this point, not from the device
+    /// switch.
+    input_connected: bool,
     /// Both software and platform fallbacks failed. Retry only on an explicit
     /// device selection, not every two seconds.
     input_recovery_failed: bool,
@@ -276,6 +289,7 @@ impl Session {
                 source.clone(),
                 params,
                 capture.permission_epoch(),
+                Some(capture.clone()),
                 events.clone(),
             );
             let mut software_mic = None;
@@ -420,6 +434,9 @@ impl Session {
             input_opened,
             input_progress,
             input_progress_at: std::time::Instant::now(),
+            input_started_at: std::time::Instant::now(),
+            input_samples: None,
+            input_connected: false,
             input_recovery_failed: false,
             input_reopen_attempted: false,
             input_system_attempts: 0,
@@ -520,7 +537,6 @@ impl Session {
             || (self.controls.input_gain - controls.input_gain).abs() > f32::EPSILON
             || self.controls.echo_cancellation != controls.echo_cancellation
             || self.controls.auto_gain_control != controls.auto_gain_control;
-        let requested_input = normalize_input(controls.input.clone());
         let requested_output = controls.output.clone();
         let output_needs_switch = self.output.needs_switch(&requested_output);
         self.controls.muted = controls.muted;
@@ -549,16 +565,9 @@ impl Session {
         if deafen_changed || gain_changed {
             self.apply_audio_controls();
         }
-        if requested_input != self.controls.input {
-            match self.switch_input(requested_input, false, events) {
-                Ok(()) => events.push(Event::InputApplied {
-                    generation: 0,
-                    input: self.controls.input.clone(),
-                    error: None,
-                }),
-                Err(message) => events.push(Event::DeviceError { message }),
-            }
-        }
+        // Input changes during a call use `SelectInput` only. A stale generic
+        // `State` queued before the user picked another device must not switch
+        // the microphone back.
         if output_needs_switch {
             let result = match requested_output.as_deref() {
                 Some(id) if !id.is_empty() => self.switch_device(id, false),
@@ -773,6 +782,10 @@ impl Session {
         if self.peer.connection_state() != PeerConnectionState::Connected {
             return;
         }
+        if self.mic.is_none() && !self.input_connected {
+            self.input_connected = true;
+            self.input_started_at = std::time::Instant::now();
+        }
         let Ok(Ok(report)) = time::timeout(Duration::from_millis(125), self.peer.get_stats()).await
         else {
             return;
@@ -782,6 +795,16 @@ impl Session {
             match stat {
                 RtcStats::MediaSource(source) => {
                     local_level = local_level.max(source.audio.audio_level);
+                    if self.mic.is_none() {
+                        // The platform ADM has no software block counter. Its
+                        // cumulative captured-sample count is the real proof
+                        // that recording is still delivering PCM.
+                        let total = source.audio.total_samples_captured;
+                        if self.input_samples != Some(total) {
+                            self.input_samples = Some(total);
+                            self.input_progress_at = std::time::Instant::now();
+                        }
+                    }
                 }
                 RtcStats::InboundRtp(inbound) if inbound.stream.kind == "audio" => {
                     let track_id = inbound.inbound.track_identifier;

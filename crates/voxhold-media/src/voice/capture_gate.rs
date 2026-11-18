@@ -32,6 +32,10 @@ struct CaptureState {
     /// queued `State` command.
     params: Arc<Mutex<AudioParams>>,
     source: Option<libwebrtc::audio_source::native::NativeAudioSource>,
+    /// Newest permission generation whose old WinMM buffers were flushed and
+    /// discarded by the capture thread. A software track stays disabled until
+    /// this catches up with `CaptureGate::epoch`.
+    acked: u64,
 }
 
 impl CaptureGate {
@@ -39,10 +43,18 @@ impl CaptureGate {
         !state.latched && state.joined && state.server_allowed && state.local_allowed
     }
 
-    fn apply(state: &CaptureState) {
+    /// A software track may only transmit after its capture thread confirmed
+    /// the current generation. The platform ADM has no software capture thread,
+    /// so its track follows the permission flags directly.
+    fn track_enabled(&self, state: &CaptureState) -> bool {
+        Self::is_enabled(state)
+            && (state.source.is_none() || state.acked >= self.epoch.load(Ordering::Acquire))
+    }
+
+    fn apply(&self, state: &CaptureState) {
         let enabled = Self::is_enabled(state);
         if let Some(track) = &state.track {
-            track.set_enabled(enabled);
+            track.set_enabled(self.track_enabled(state));
         }
         if let Ok(mut params) = state.params.lock() {
             params.muted = !enabled;
@@ -89,10 +101,10 @@ impl CaptureGate {
         let mut state = self.state.lock().unwrap();
         let was = Self::is_enabled(&state);
         state.latched = true;
-        Self::apply(&state);
         if Self::is_enabled(&state) != was {
             self.bump();
         }
+        self.apply(&state);
     }
 
     /// A new transport starts unconfirmed without server permission. The leave
@@ -103,10 +115,10 @@ impl CaptureGate {
         let was = Self::is_enabled(&state);
         state.joined = false;
         state.server_allowed = false;
-        Self::apply(&state);
         if Self::is_enabled(&state) != was {
             self.bump();
         }
+        self.apply(&state);
     }
 
     /// One transport ended. Clear only join/server permission and detach the
@@ -120,47 +132,47 @@ impl CaptureGate {
             track.set_enabled(false);
         }
         state.source = None;
-        Self::apply(&state);
         if Self::is_enabled(&state) != was {
             self.bump();
         }
+        self.apply(&state);
     }
 
     pub fn set_joined(&self, joined: bool) {
         let mut state = self.state.lock().unwrap();
         let was = Self::is_enabled(&state);
         state.joined = joined;
-        Self::apply(&state);
         if Self::is_enabled(&state) != was {
             self.bump();
         }
+        self.apply(&state);
     }
 
     pub fn set_server_allowed(&self, allowed: bool) {
         let mut state = self.state.lock().unwrap();
         let was = Self::is_enabled(&state);
         state.server_allowed = allowed;
-        Self::apply(&state);
         if Self::is_enabled(&state) != was {
             self.bump();
         }
+        self.apply(&state);
     }
 
     pub fn set_local(&self, allowed: bool) {
         let mut state = self.state.lock().unwrap();
         let was = Self::is_enabled(&state);
         state.local_allowed = allowed;
-        Self::apply(&state);
         if Self::is_enabled(&state) != was {
             self.bump();
         }
+        self.apply(&state);
     }
 
     pub(super) fn attach(&self, track: RtcAudioTrack) {
         let mut state = self.state.lock().unwrap();
-        track.set_enabled(Self::is_enabled(&state));
         state.track = Some(track);
         state.source = None;
+        self.apply(&state);
     }
 
     /// Software path: the capture thread fills this source, so mute can also
@@ -171,9 +183,17 @@ impl CaptureGate {
         source: libwebrtc::audio_source::native::NativeAudioSource,
     ) {
         let mut state = self.state.lock().unwrap();
-        track.set_enabled(Self::is_enabled(&state));
         state.track = Some(track);
         state.source = Some(source);
+        self.apply(&state);
+    }
+
+    /// The capture thread has dropped every buffer from before `generation`
+    /// and flushed WinMM. Only now may the software track transmit again.
+    pub(crate) fn acknowledge(&self, generation: u64) {
+        let mut state = self.state.lock().unwrap();
+        state.acked = state.acked.max(generation);
+        self.apply(&state);
     }
 
     pub(super) fn detach(&self) {

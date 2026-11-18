@@ -73,6 +73,7 @@ impl Session {
             source.clone(),
             params,
             self.capture.permission_epoch(),
+            Some(self.capture.clone()),
             self.events.clone(),
         );
         mic.start(input.as_deref())
@@ -101,6 +102,9 @@ impl Session {
         self.capture.attach_source(track, source);
         self.input_progress = mic.progress();
         self.input_progress_at = std::time::Instant::now();
+        self.input_started_at = std::time::Instant::now();
+        self.input_samples = None;
+        self.input_connected = false;
         self.input_stable_since = None;
         self.mic = Some(mic);
         self.controls.input = input.clone();
@@ -166,6 +170,9 @@ impl Session {
         self.mic = None;
         self.input_progress = 0;
         self.input_progress_at = std::time::Instant::now();
+        self.input_started_at = std::time::Instant::now();
+        self.input_samples = None;
+        self.input_connected = false;
         self.input_stable_since = None;
         self.controls.input = input.clone();
         self.input_opened = input;

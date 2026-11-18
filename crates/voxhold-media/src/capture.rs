@@ -29,6 +29,7 @@ use libwebrtc::{
 use crate::{
     Event, Events,
     dsp::{self, AudioParams, NoiseGate, NoiseMode, ProcessingKey},
+    voice::CaptureGate,
 };
 
 pub const SAMPLE_RATE: u32 = 48_000;
@@ -195,6 +196,9 @@ pub struct MicCapture {
     source: NativeAudioSource,
     params: Arc<Mutex<AudioParams>>,
     epoch: Arc<std::sync::atomic::AtomicU64>,
+    /// Optional gate acknowledgement. A software track stays disabled until
+    /// the capture thread has flushed the generation it just observed.
+    gate: Option<Arc<CaptureGate>>,
     events: Arc<Events>,
     stop: Arc<AtomicBool>,
     failed: Arc<AtomicBool>,
@@ -207,12 +211,14 @@ impl MicCapture {
         source: NativeAudioSource,
         params: Arc<Mutex<AudioParams>>,
         epoch: Arc<std::sync::atomic::AtomicU64>,
+        gate: Option<Arc<CaptureGate>>,
         events: Arc<Events>,
     ) -> Self {
         Self {
             source,
             params,
             epoch,
+            gate,
             events,
             stop: Arc::new(AtomicBool::new(false)),
             failed: Arc::new(AtomicBool::new(false)),
@@ -247,6 +253,7 @@ impl MicCapture {
         let source = self.source.clone();
         let params = self.params.clone();
         let epoch = self.epoch.clone();
+        let gate = self.gate.clone();
         let events = self.events.clone();
         let stop = self.stop.clone();
         let failed = self.failed.clone();
@@ -256,7 +263,7 @@ impl MicCapture {
                 .name("voxhold-mic".into())
                 .spawn(move || {
                     capture_loop(
-                        device, source, params, epoch, events, stop, failed, progress,
+                        device, source, params, epoch, gate, events, stop, failed, progress,
                     )
                 })
                 .map_err(|_| "Не удалось запустить поток микрофона.".to_owned())?,
@@ -283,6 +290,7 @@ fn capture_loop(
     source: NativeAudioSource,
     params: Arc<Mutex<AudioParams>>,
     epoch: Arc<std::sync::atomic::AtomicU64>,
+    gate: Option<Arc<CaptureGate>>,
     events: Arc<Events>,
     stop: Arc<AtomicBool>,
     failed: Arc<AtomicBool>,
@@ -294,15 +302,19 @@ fn capture_loop(
     let mut source_dropped = 0_u64;
     let mut ticks = 0_u32;
     let mut permission = PermissionEpoch::new(&epoch);
+    let mut acknowledged = false;
     while !stop.load(Ordering::Acquire) {
         // Bind the permission generation before touching the driver queue.
         // Everything read in this pass belongs to this generation even if a
         // mute/PTT edge advances the epoch while `completed()` is running.
         let generation = epoch.load(Ordering::Acquire);
-        if permission.changed(generation) {
+        if !acknowledged || permission.changed(generation) {
             // The control decision changed (including a fast PTT press that
             // returned to the same boolean). Throw away Rust and driver
-            // buffers captured under the previous state.
+            // buffers captured under the previous state before telling the
+            // gate that this generation is safe to transmit. The initial
+            // acknowledgement also covers a capture started while the gate
+            // was already open.
             pending.clear();
             source.clear_buffer();
             processor.reset();
@@ -310,6 +322,10 @@ fn capture_loop(
                 failed.store(true, Ordering::Release);
                 break;
             }
+            if let Some(gate) = &gate {
+                gate.acknowledge(generation);
+            }
+            acknowledged = true;
         }
         device.completed(|samples| pending.push(samples, generation));
         if device.failed() {
@@ -728,7 +744,7 @@ mod tests {
         let events = Arc::new(Events::default());
         let source = NativeAudioSource::new(source_options(), SAMPLE_RATE, CHANNELS, 0);
         let epoch = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let mut mic = MicCapture::new(source, params, epoch, events.clone());
+        let mut mic = MicCapture::new(source, params, epoch, None, events.clone());
         mic.start(None).expect("default microphone");
         thread::sleep(Duration::from_millis(600));
         mic.stop();

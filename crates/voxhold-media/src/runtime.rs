@@ -1075,7 +1075,11 @@ fn run(
                         break;
                     }
                     Pending::Controls(controls, self_muted) => {
+                        // A control snapshot queued before `SelectInput` must
+                        // not replace the device for the next connection.
+                        let input = controller.controls.input.clone();
                         controller.controls = controls;
+                        controller.controls.input = input;
                         controller.self_muted = self_muted;
                     }
                     Pending::Output(output) => {

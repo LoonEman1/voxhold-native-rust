@@ -453,14 +453,14 @@ fn drain(events: &Events) -> (u32, Option<PlayoutStats>) {
 }
 
 /// The initial sink is opened by `Session::new`; this drives the same
-/// `install_initial_playout` + `tick_playout` entry points without devices.
+/// `adopt_initial_playout` constructor tail and `tick_playout` without devices,
+/// so a session that forgets to enter the proof window fails here.
 #[tokio::test]
 async fn the_first_sink_proves_stability_through_tick_playout() {
     let writes = Arc::new(Mutex::new(Vec::new()));
     let (open, calls) = failing_then_open(0, writes);
-    let mut session = Session::test_headless(open.clone());
-    let playout = Playout::start_with(None, open).expect("the first sink opens");
-    session.install_initial_playout(playout);
+    let playout = Playout::start_with(None, open.clone()).expect("the first sink opens");
+    let mut session = Session::test_headless(open).adopt_initial_playout(Some(playout));
     let events = session.events.clone();
     assert_eq!(session.playout_attempts.phase(), PlayoutPhase::Unstable);
     wait_for_blocks(session.playout.as_ref().unwrap(), STABLE_BLOCKS);
@@ -504,9 +504,8 @@ async fn the_first_sink_proves_stability_through_tick_playout() {
 #[tokio::test]
 async fn the_fifth_failure_emits_one_message_and_a_final_report() {
     let (open, calls) = always_open_broken_sink();
-    let mut session = Session::test_headless(open.clone());
-    let playout = Playout::start_with(None, open).expect("opens");
-    session.install_initial_playout(playout);
+    let playout = Playout::start_with(None, open.clone()).expect("opens");
+    let mut session = Session::test_headless(open).adopt_initial_playout(Some(playout));
     let events = session.events.clone();
     let now = Instant::now();
     for _ in 0..4 {
@@ -529,6 +528,42 @@ async fn the_fifth_failure_emits_one_message_and_a_final_report() {
         session.tick_playout(&events);
     }
     assert_eq!(calls.load(Ordering::SeqCst), opened);
+}
+
+/// A device switch must restart the recovery proof, not just the sink's own
+/// window: the UI would otherwise keep "stable mixer" for a device that has not
+/// lived two seconds and written 50 blocks yet.
+#[tokio::test]
+async fn switching_the_device_reports_an_unstable_sink() {
+    let writes = Arc::new(Mutex::new(Vec::new()));
+    let (open, _calls) = failing_then_open(0, writes);
+    let playout = Playout::start_with(None, open.clone()).expect("the first sink opens");
+    let mut session = Session::test_headless(open).adopt_initial_playout(Some(playout));
+    let events = session.events.clone();
+    wait_for_blocks(session.playout.as_ref().unwrap(), STABLE_BLOCKS);
+    session
+        .playout
+        .as_ref()
+        .unwrap()
+        .test_rewind_start(STABLE_AFTER + Duration::from_millis(10));
+    session.tick_playout(&events);
+    assert_eq!(session.playout_attempts.phase(), PlayoutPhase::Stable);
+    let _ = drain(&events);
+
+    let result = session.switch_playout("", &events);
+    assert!(result.switched, "the system device opens");
+    assert_eq!(
+        session.playout_attempts.phase(),
+        PlayoutPhase::Unstable,
+        "a fresh device must prove itself again"
+    );
+    let (_, last) = drain(&events);
+    let report = last.expect("the switch reports the new sink immediately");
+    assert_eq!(report.phase, PlayoutPhase::Unstable);
+    assert!(report.running, "the new sink is open but unproven");
+    // The old proof must not carry over to the new device.
+    session.tick_playout(&events);
+    assert_eq!(session.playout_attempts.phase(), PlayoutPhase::Unstable);
 }
 
 #[test]

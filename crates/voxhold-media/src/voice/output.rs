@@ -158,7 +158,7 @@ impl Session {
             }
             // The old index may now point at another device. Resolve the
             // system default from scratch instead of reusing it.
-            let result = self.switch_device("", input);
+            let result = self.switch_device("", input, events);
             if !input {
                 if result.switched || result.audible {
                     self.output.confirmed(result.applied.clone());

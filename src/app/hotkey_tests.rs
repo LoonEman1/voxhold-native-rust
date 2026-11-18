@@ -89,7 +89,7 @@ async fn the_next_key_becomes_the_binding_and_a_duplicate_is_flagged(cx: &mut Te
 
 #[gpui::test]
 async fn escape_and_a_lone_modifier_keep_or_cancel_the_recorder(cx: &mut TestAppContext) {
-    let (mut visual, view) = voice_tab(cx);
+    let (visual, view) = voice_tab(cx);
     visual.update(|_, app| {
         view.update(app, |v, cx| v.start_shortcut_recording(2, cx));
     });
@@ -164,7 +164,7 @@ async fn typing_in_the_composer_blocks_mute_deafen_and_push_to_talk(cx: &mut Tes
 
 #[gpui::test]
 async fn a_server_mute_outranks_a_held_push_to_talk_key(cx: &mut TestAppContext) {
-    let (mut visual, _view, voice) = super::voice_tests::fixture(cx);
+    let (visual, _view, voice) = super::voice_tests::fixture(cx);
     visual.update(|window, app| {
         voice.update(app, |panel, cx| {
             panel.test_attach_detached_handle();
@@ -288,7 +288,7 @@ async fn per_user_sliders_are_keyed_by_user_id_beyond_sixteen_participants(
 
 #[gpui::test]
 async fn suspend_closes_the_microphone_and_resume_reopens_the_median_path(cx: &mut TestAppContext) {
-    let (mut visual, view, voice) = super::voice_tests::fixture(cx);
+    let (visual, view, voice) = super::voice_tests::fixture(cx);
     visual.update(|_, app| {
         voice.update(app, |panel, _| panel.test_attach_detached_handle());
         view.update(app, |v, cx| v.power_event(false, cx));

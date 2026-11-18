@@ -478,7 +478,7 @@ impl Session {
             error: None,
         });
         let input_progress = mic.as_ref().map(MicCapture::progress).unwrap_or(0);
-        let mut session = Self {
+        let session = Self {
             peer,
             sender,
             viewer,
@@ -524,14 +524,10 @@ impl Session {
             output,
             device_check: std::time::Instant::now(),
         };
-        if let Some(started) = initial_playout {
-            // The very first sink enters the same stability machine as a
-            // reopened one; without this the phase stays `Opening` forever and
-            // the budget is never cleared for a normal call.
-            session.install_initial_playout(started);
-        }
-        session.apply_audio_controls();
-        Ok(session)
+        // The very first sink enters the same stability machine as a reopened
+        // one; without this the phase stays `Opening` forever and the budget is
+        // never cleared for a normal call.
+        Ok(session.adopt_initial_playout(initial_playout))
     }
 
     async fn apply(&mut self, command: Command, events: &Events) -> Result<(), &'static str> {
@@ -576,8 +572,8 @@ impl Session {
                 self.output.request(output.clone());
                 self.controls.output = output.clone();
                 let result = match &output {
-                    Some(id) if !id.is_empty() => self.switch_device(id, false),
-                    _ => self.switch_device("", false),
+                    Some(id) if !id.is_empty() => self.switch_device(id, false, events),
+                    _ => self.switch_device("", false, events),
                 };
                 if result.switched || result.audible {
                     self.output.confirmed(result.applied.clone());
@@ -674,8 +670,8 @@ impl Session {
         // the microphone back.
         if output_needs_switch {
             let result = match requested_output.as_deref() {
-                Some(id) if !id.is_empty() => self.switch_device(id, false),
-                _ => self.switch_device("", false),
+                Some(id) if !id.is_empty() => self.switch_device(id, false, events),
+                _ => self.switch_device("", false, events),
             };
             if result.switched || result.audible {
                 self.output.confirmed(result.applied.clone());
@@ -696,11 +692,11 @@ impl Session {
         Ok(())
     }
 
-    fn switch_device(&mut self, id: &str, input: bool) -> SwitchResult {
+    fn switch_device(&mut self, id: &str, input: bool, events: &Events) -> SwitchResult {
         // The room playout is not the ADM: switching its sink is a WinMM open,
         // and the previous device stays open until the new one succeeded.
         if !input && self.playout.is_some() {
-            return self.switch_playout(id);
+            return self.switch_playout(id, events);
         }
         let opened_id = if input {
             self.input_opened.clone()

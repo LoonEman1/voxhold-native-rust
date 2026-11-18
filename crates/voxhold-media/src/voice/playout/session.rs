@@ -17,15 +17,23 @@ impl Session {
         }
     }
 
-    /// Install the sink opened by `Session::new`. The initial open must enter
-    /// the same `Opening → Unstable` proof window as a reopened one; otherwise
-    /// a normal call never reaches `Stable` and never clears the budget.
-    pub(crate) fn install_initial_playout(&mut self, playout: Playout) {
-        self.playout = Some(playout);
-        self.software_playout = true;
-        self.playout_mode = PlayoutMode::Software;
-        self.playout_attempts.opened();
-        self.last_playout_report = std::time::Instant::now() - Duration::from_secs(1);
+    /// Adopt the sink opened by the constructor. Every initial sink enters the
+    /// same `Opening → Unstable` proof window as a reopened one; otherwise a
+    /// normal call never reaches `Stable` and never clears the budget.
+    /// `Session::new` and the headless test constructor both go through this
+    /// single entry point, so a regression "the first sink bypasses the
+    /// recovery machine" is covered by the media tests instead of a manual
+    /// field write in the test.
+    pub(crate) fn adopt_initial_playout(mut self, playout: Option<Playout>) -> Self {
+        if let Some(playout) = playout {
+            self.playout = Some(playout);
+            self.software_playout = true;
+            self.playout_mode = PlayoutMode::Software;
+            self.playout_attempts.opened();
+            self.last_playout_report = std::time::Instant::now() - Duration::from_secs(1);
+        }
+        self.apply_audio_controls();
+        self
     }
 
     /// Feed the current bus gain and per-source gains/mutes to the mixer. A
@@ -49,8 +57,11 @@ impl Session {
     }
 
     /// Switch the software sink. The new device is opened before the old sink
-    /// is replaced; a failure leaves the previous audible path in place.
-    pub(crate) fn switch_playout(&mut self, id: &str) -> SwitchResult {
+    /// is replaced; a failure leaves the previous audible path in place. A
+    /// successful switch is only an open: the new device starts its own
+    /// `Unstable` proof window, and the report says so immediately instead of
+    /// keeping the previous device's `Stable` phase.
+    pub(crate) fn switch_playout(&mut self, id: &str, events: &Events) -> SwitchResult {
         let Some(playout) = &self.playout else {
             return SwitchResult {
                 switched: false,
@@ -60,15 +71,28 @@ impl Session {
         };
         let target = (!id.is_empty()).then(|| id.to_owned());
         let opened = self.output.applied.clone();
-        match playout.switch_sink(target.as_deref()) {
-            Ok(()) => SwitchResult {
-                switched: true,
-                audible: true,
-                applied: target,
-            },
+        let switched = playout.switch_sink(target.as_deref());
+        match switched {
+            Ok(()) => {
+                // The old sink's age and written blocks must not carry over to
+                // the device that was just opened.
+                self.playout_attempts.opened();
+                self.last_playout_report = std::time::Instant::now();
+                if let Some(playout) = &self.playout {
+                    let mut stats = playout.stats();
+                    stats.phase = PlayoutPhase::Unstable;
+                    stats.reconnects = self.playout_reconnects;
+                    events.push(Event::Playout(stats));
+                }
+                SwitchResult {
+                    switched: true,
+                    audible: true,
+                    applied: target,
+                }
+            }
             Err(_) => SwitchResult {
                 switched: false,
-                audible: playout.running(),
+                audible: self.playout.as_ref().is_some_and(Playout::running),
                 applied: opened,
             },
         }

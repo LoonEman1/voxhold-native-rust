@@ -39,8 +39,15 @@ mod input;
 use input::normalize_input;
 mod platform;
 use platform::PlatformAudio;
+mod playout;
+use playout::{Playout, PlayoutMode, RetryAt, SinkRecovery};
 #[cfg(test)]
 mod loopback;
+#[cfg(test)]
+mod test_support;
+mod winmm_out;
+
+use crate::mixer::Source;
 
 const ICE_CAPACITY: usize = 64;
 const COMPLETED_UFRAG_CAPACITY: usize = 16;
@@ -102,6 +109,7 @@ pub async fn run(
             }
             _ = stats.tick(), if session.is_some() => {
                 if let Some(session) = &mut session {
+                    session.tick_playout(&events);
                     session.check_devices(&events);
                     session.sample_levels(&events).await;
                 }
@@ -122,9 +130,46 @@ struct Session {
     /// microphone and the software DSP cannot run.
     mic: Option<MicCapture>,
     controls: Controls,
-    volumes: HashMap<String, f64>,
-    /// last effective coefficient applied per receiver.
-    gains: HashMap<String, f64>,
+    /// Per-receiver-track playout gain and local mute. The gain is the
+    /// participant percentage (0–200 %, resolved by the controller from the
+    /// stable user id); `muted` is the separate local mute/deafen flag, so
+    /// unmuting restores the percentage instead of a remembered zero.
+    sources: HashMap<String, Source>,
+    /// Software room playout. `None` means the platform ADM plays the room and
+    /// the numeric gain is not applied (reported to the UI).
+    playout: Option<Playout>,
+    /// The room session owns the playout rather than the ADM. Set even while a
+    /// suspend has released the sink, so resume reopens it instead of silently
+    /// falling back to an ADM path that was never started.
+    software_playout: bool,
+    /// Current playout path. `AdmFallback` means the mixer budget was spent.
+    playout_mode: PlayoutMode,
+    /// Recovery state machine of the software sink (bounded shared budget,
+    /// stability proof, phase for the report).
+    playout_attempts: SinkRecovery,
+    /// Slow retry of the ADM path after a fallback that could not start or
+    /// stopped delivering PCM.
+    adm_retry: RetryAt,
+    /// Last observed ADM playout progress for the platform fallback watchdog.
+    adm_playout_duration: Option<f64>,
+    adm_playout_progress_at: std::time::Instant,
+    adm_playout_started_at: std::time::Instant,
+    /// Test-only guard: the headless session must never touch platform audio.
+    #[cfg(test)]
+    test_no_adm: bool,
+    /// Suspend released the sink; only an explicit resume reopens it.
+    playout_suspended: bool,
+    /// Successful software-sink reopens in this session.
+    playout_reconnects: u32,
+    /// Sink factory; tests substitute a fake without a Windows device.
+    playout_open: Arc<winmm_out::OpenSink>,
+    /// Source tasks of the software playout; they end with the track and are
+    /// aborted when the session drops.
+    playout_tasks: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    /// Tokio handle for spawning the audio-sink tasks from the WebRTC
+    /// callback thread.
+    runtime: tokio::runtime::Handle,
+    last_playout_report: std::time::Instant,
     speaking: HashMap<String, bool>,
     local_speaking: bool,
     remote_sdp: Option<RemoteSdp>,
@@ -182,34 +227,36 @@ impl Session {
         viewer: Option<Arc<VideoStore>>,
     ) -> Result<Self, &'static str> {
         let audio = PlatformAudio::new(false)?;
+        let room_session = viewer.is_none();
+        // The software mixer is the only path with a numeric participant gain.
+        // It is opened before the ADM playout is disabled: a sink that cannot
+        // open must leave the working ADM path in place and be reported, not
+        // silently degrade the call to silence.
+        let mut initial_playout = None;
+        let mut software_playout = false;
+        let playout_open: Arc<winmm_out::OpenSink> = Arc::new(Box::new(winmm_out::default_open));
+        if room_session {
+            match Playout::start_with(controls.output.as_deref(), playout_open.clone()) {
+                Ok(started) => {
+                    audio.set_playout(false);
+                    initial_playout = Some(started);
+                    software_playout = true;
+                }
+                Err(_) => events.push(Event::DeviceError {
+                    message: "Программный микшер не открылся: громкость участников не применяется, звук идёт напрямую.",
+                }),
+            }
+        }
+        let playout_tasks: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>> =
+            Arc::new(Mutex::new(Vec::new()));
         // A saved device that is gone at join time must not fail the call:
         // keep the default path and report it once. The software capture path
         // opens the recording device itself; the platform ADM recording side
         // stays closed unless that path falls back.
         let mut input_index = None;
-        let mut output_index = None;
+        let output_index =
+            output::activate_saved_output(&audio, &mut controls, initial_playout.is_none(), events);
         let mut input_opened = None;
-        if let Some(id) = controls.output.clone().filter(|id| !id.is_empty()) {
-            if let Some(index) = audio
-                .resolve(&id, false)
-                .filter(|index| audio.activate(*index, false))
-            {
-                output_index = Some(index);
-            } else {
-                controls.output = None;
-                events.push(Event::DeviceError {
-                    message: "Выбранное устройство воспроизведения недоступно, используется системное.",
-                });
-                events.push(Event::Output {
-                    applied: None,
-                    audible: true,
-                    working: true,
-                    error: Some(
-                        "Выбранное устройство воспроизведения недоступно, используется системное.",
-                    ),
-                });
-            }
-        }
         let output = OutputState::new(controls.output.clone());
         let factory = &audio.0;
         let mut config = RtcConfiguration::default();
@@ -267,13 +314,25 @@ impl Session {
             (None, Some((video, task)))
         } else {
             let track_events = events.clone();
+            let clip = initial_playout.as_ref().map(Playout::clip);
+            let runtime = tokio::runtime::Handle::current();
+            let tasks = playout_tasks.clone();
             peer.on_track(Some(Box::new(move |event| {
-                if matches!(event.track, MediaStreamTrack::Audio(_)) {
+                if let MediaStreamTrack::Audio(track) = &event.track {
+                    let track_id = track.id();
                     track_events.push(Event::Track {
-                        track_id: event.track.id(),
+                        track_id: track_id.clone(),
                         stream_id: event.streams.first().map(|stream| stream.id()),
                         mid: event.transceiver.mid(),
                     });
+                    // The mixer receives decoded PCM per receiver. The sink is
+                    // created with the room playout and follows a resume.
+                    if let Some(clip) = &clip {
+                        let task = clip.attach(track_id, track.clone(), runtime.clone());
+                        if let Ok(mut tasks) = tasks.lock() {
+                            tasks.push(task);
+                        }
+                    }
                 }
             })));
             // The software path owns capture so the gate, gain and mute are
@@ -382,7 +441,10 @@ impl Session {
                             });
                         }
                         let track = factory.create_device_audio_track("voxhold-microphone");
-                        (track, ("platform", NoiseMode::Auto.as_str(), true, true))
+                        // The ADM applies its own NS/AGC. Its echo canceller is
+                        // not measured here (no render-reference probe), so the
+                        // applied snapshot must not report AEC as enabled.
+                        (track, ("platform", NoiseMode::Auto.as_str(), false, true))
                     }
                 }
             };
@@ -403,6 +465,7 @@ impl Session {
                 noise_mode: applied.1,
                 echo_cancellation: applied.2,
                 auto_gain_control: applied.3,
+                software_mixer: software_playout,
             });
             (Some(sender), None)
         };
@@ -415,7 +478,7 @@ impl Session {
             error: None,
         });
         let input_progress = mic.as_ref().map(MicCapture::progress).unwrap_or(0);
-        let mut session = Self {
+        let session = Self {
             peer,
             sender,
             viewer,
@@ -424,8 +487,23 @@ impl Session {
             audio,
             mic,
             controls,
-            volumes: HashMap::new(),
-            gains: HashMap::new(),
+            sources: HashMap::new(),
+            playout: None,
+            software_playout: false,
+            playout_mode: PlayoutMode::AdmFallback,
+            playout_attempts: SinkRecovery::default(),
+            adm_retry: RetryAt::default(),
+            adm_playout_duration: None,
+            adm_playout_progress_at: std::time::Instant::now(),
+            adm_playout_started_at: std::time::Instant::now(),
+            #[cfg(test)]
+            test_no_adm: false,
+            playout_suspended: false,
+            playout_reconnects: 0,
+            playout_open,
+            playout_tasks,
+            runtime: tokio::runtime::Handle::current(),
+            last_playout_report: std::time::Instant::now() - Duration::from_secs(1),
             speaking: HashMap::new(),
             local_speaking: false,
             remote_sdp: None,
@@ -446,8 +524,10 @@ impl Session {
             output,
             device_check: std::time::Instant::now(),
         };
-        session.apply_audio_controls();
-        Ok(session)
+        // The very first sink enters the same stability machine as a reopened
+        // one; without this the phase stays `Opening` forever and the budget is
+        // never cleared for a normal call.
+        Ok(session.adopt_initial_playout(initial_playout))
     }
 
     async fn apply(&mut self, command: Command, events: &Events) -> Result<(), &'static str> {
@@ -492,8 +572,8 @@ impl Session {
                 self.output.request(output.clone());
                 self.controls.output = output.clone();
                 let result = match &output {
-                    Some(id) if !id.is_empty() => self.switch_device(id, false),
-                    _ => self.switch_device("", false),
+                    Some(id) if !id.is_empty() => self.switch_device(id, false, events),
+                    _ => self.switch_device("", false, events),
                 };
                 if result.switched || result.audible {
                     self.output.confirmed(result.applied.clone());
@@ -516,11 +596,29 @@ impl Session {
                 });
                 Ok(())
             }
-            Command::Volume { track_id, gain } => {
-                if self.volumes.len() < 64 || self.volumes.contains_key(&track_id) {
-                    self.volumes.insert(track_id, gain.clamp(0.0, 2.0));
+            Command::Volume {
+                track_id,
+                gain,
+                muted,
+            } => {
+                if self.sources.len() < 64 || self.sources.contains_key(&track_id) {
+                    self.sources.insert(
+                        track_id,
+                        Source {
+                            gain: gain.clamp(0.0, 2.0),
+                            muted,
+                        },
+                    );
                     self.apply_audio_controls();
                 }
+                Ok(())
+            }
+            Command::Resume => {
+                self.resume_playout(events);
+                Ok(())
+            }
+            Command::Suspend => {
+                self.suspend_playout(events);
                 Ok(())
             }
             Command::Start { .. } | Command::ViewStart { .. } | Command::Stop => unreachable!(),
@@ -572,8 +670,8 @@ impl Session {
         // the microphone back.
         if output_needs_switch {
             let result = match requested_output.as_deref() {
-                Some(id) if !id.is_empty() => self.switch_device(id, false),
-                _ => self.switch_device("", false),
+                Some(id) if !id.is_empty() => self.switch_device(id, false, events),
+                _ => self.switch_device("", false, events),
             };
             if result.switched || result.audible {
                 self.output.confirmed(result.applied.clone());
@@ -594,7 +692,12 @@ impl Session {
         Ok(())
     }
 
-    fn switch_device(&mut self, id: &str, input: bool) -> SwitchResult {
+    fn switch_device(&mut self, id: &str, input: bool, events: &Events) -> SwitchResult {
+        // The room playout is not the ADM: switching its sink is a WinMM open,
+        // and the previous device stays open until the new one succeeded.
+        if !input && self.playout.is_some() {
+            return self.switch_playout(id, events);
+        }
         let opened_id = if input {
             self.input_opened.clone()
         } else {
@@ -681,34 +784,6 @@ impl Session {
             encoding.max_bitrate = Some(u64::from(bitrate.clamp(6, 128)) * 1000);
         }
         let _ = sender.set_parameters(parameters);
-    }
-
-    fn apply_audio_controls(&mut self) {
-        let master = if self.controls.deafened { 0.0 } else { 1.0 };
-        // The pinned libwebrtc wrapper exposes no PCM render callback or
-        // per-track volume, so the numeric 0–200 % room coefficient cannot yet
-        // be applied without touching the Windows process mixer (forbidden).
-        // Zero still silences the room immediately; the full gain path belongs
-        // to the R07b audio pipeline. Stream audio has its own engine and mute.
-        let room_audible = self.controls.output_gain.unwrap_or(1.0) > 0.0;
-        self.gains.clear();
-        for receiver in self.peer.receivers() {
-            if let Some(MediaStreamTrack::Audio(track)) = receiver.track() {
-                let id = track.id();
-                // Keep the numeric coefficient for the future PCM path: 1 %,
-                // 50 %, 100 % and 200 % are distinct settings, not a boolean.
-                let gain = (self.volumes.get(&id).copied().unwrap_or(1.0) * master).clamp(0.0, 2.0);
-                self.gains.insert(id, gain);
-                track.set_enabled(room_audible && gain > 0.0);
-            }
-        }
-    }
-
-    /// Effective coefficient used by the PCM path for one receiver. Reapplied
-    /// whenever a track reappears or the SDP is renegotiated.
-    #[allow(dead_code)]
-    pub fn gain_for_track(&self, track_id: &str) -> f64 {
-        self.gains.get(track_id).copied().unwrap_or(1.0)
     }
 
     async fn answer(&mut self, sdp: &str, events: &Events) -> Result<(), &'static str> {
@@ -831,6 +906,16 @@ impl Session {
                         level,
                     });
                 }
+                RtcStats::MediaPlayout(playout) => {
+                    // The ADM's cumulative played duration is the only proof
+                    // that the platform fallback is delivering PCM; initialized
+                    // alone is not enough (same rule as the capture watchdog).
+                    let total = playout.audio_playout.total_samples_duration;
+                    if self.adm_playout_duration != Some(total) {
+                        self.adm_playout_duration = Some(total);
+                        self.adm_playout_progress_at = std::time::Instant::now();
+                    }
+                }
                 _ => {}
             }
         }
@@ -848,6 +933,12 @@ impl Session {
 
 impl Drop for Session {
     fn drop(&mut self) {
+        if let Ok(mut tasks) = self.playout_tasks.lock() {
+            for task in tasks.drain(..) {
+                task.abort();
+            }
+        }
+        self.playout.take();
         if let Some(mut mic) = self.mic.take() {
             mic.stop();
         }
@@ -863,48 +954,8 @@ impl Drop for Session {
     }
 }
 
-struct RemoteSdp {
-    ufrags: Vec<String>,
-}
-
-impl RemoteSdp {
-    fn new(sdp: &str) -> Self {
-        let mut ufrags = Vec::new();
-        for ufrag in sdp
-            .lines()
-            .filter_map(|line| line.strip_prefix("a=ice-ufrag:"))
-        {
-            if !ufrags.iter().any(|value| value == ufrag) {
-                ufrags.push(ufrag.to_owned());
-            }
-        }
-        Self { ufrags }
-    }
-
-    fn accepts(&self, candidate: &Candidate) -> bool {
-        candidate.ufrag().is_none_or(|ufrag| {
-            self.ufrags.is_empty() || self.ufrags.iter().any(|value| value == ufrag)
-        })
-    }
-}
-
-impl Candidate {
-    fn ufrag(&self) -> Option<&str> {
-        self.username_fragment
-            .as_deref()
-            .or_else(|| candidate_ufrag(&self.candidate))
-    }
-}
-
-fn candidate_ufrag(candidate: &str) -> Option<&str> {
-    let mut tokens = candidate.split_ascii_whitespace().skip(8);
-    while let (Some(key), Some(value)) = (tokens.next(), tokens.next()) {
-        if key == "ufrag" {
-            return Some(value);
-        }
-    }
-    None
-}
+mod sdp;
+use sdp::{RemoteSdp, candidate_ufrag};
 
 #[cfg(test)]
 mod tests;

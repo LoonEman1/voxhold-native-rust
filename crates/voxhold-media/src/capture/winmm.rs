@@ -78,7 +78,7 @@ fn label(name: &[u16]) -> String {
     String::from_utf16_lossy(&name[..name.iter().position(|c| *c == 0).unwrap_or(name.len())])
 }
 
-fn list() -> Vec<DeviceInfo> {
+pub(super) fn list() -> Vec<DeviceInfo> {
     let mut devices = Vec::new();
     unsafe {
         for index in 0..waveInGetNumDevs() {

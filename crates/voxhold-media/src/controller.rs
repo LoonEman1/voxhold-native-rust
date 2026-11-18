@@ -55,6 +55,9 @@ pub struct AppliedAudio {
     pub noise_mode: &'static str,
     pub echo_cancellation: bool,
     pub auto_gain_control: bool,
+    /// The room is played by the software mixer, so the participant gain,
+    /// limiter and post-mix meter are real.
+    pub software_mixer: bool,
 }
 
 pub struct VoiceController {
@@ -78,6 +81,8 @@ pub struct VoiceController {
     pub input_muted: bool,
     /// Last applied capture chain reported by the media engine.
     pub applied_audio: Option<AppliedAudio>,
+    /// Last measured post-mix playout level and counters.
+    pub playout: Option<crate::mixer::PlayoutStats>,
     owners: HashMap<String, String>,
     /// Last known mid for every receiver track. Renegotiation replaces the
     /// mid -> owner map; without this link an existing receiver whose
@@ -103,6 +108,7 @@ impl VoiceController {
             input_dropped: 0,
             input_muted: true,
             applied_audio: None,
+            playout: None,
             owners: HashMap::new(),
             track_mids: HashMap::new(),
             tracks: HashMap::new(),
@@ -122,7 +128,8 @@ impl VoiceController {
         c
     }
     pub fn update_controls(&mut self, mut controls: Controls, self_muted: bool) -> Vec<Action> {
-        let gain_changed = controls.output_gain != self.controls.output_gain;
+        let volume_changed = controls.output_gain != self.controls.output_gain
+            || controls.user_volumes != self.controls.user_volumes;
         // The input device is owned by the explicit `SelectInput` request. A
         // generic mute/DSP update that was queued before the user picked a
         // different device must not revert that choice.
@@ -136,11 +143,13 @@ impl VoiceController {
         } else {
             Vec::new()
         };
-        if gain_changed && self.joined {
+        if volume_changed && self.joined {
             for (track, owner) in &self.tracks {
+                let (gain, muted) = self.source_for(owner);
                 a.push(Action::Media(Command::Volume {
                     track_id: track.clone(),
-                    gain: self.gain_for(owner),
+                    gain,
+                    muted,
                 }));
             }
         }
@@ -162,22 +171,35 @@ impl VoiceController {
             .iter()
             .filter(|(_, owner)| owner.as_str() == connection)
             .map(|(track, owner)| {
+                let (gain, muted) = self.source_for(owner);
                 Action::Media(Command::Volume {
                     track_id: track.clone(),
-                    gain: self.gain_for(owner),
+                    gain,
+                    muted,
                 })
             })
             .collect()
     }
 
-    /// Audible gain of one participant: the configured output volume, zero for
-    /// a local mute. Stream audio is a separate engine and is not affected.
-    fn gain_for(&self, owner: &str) -> f64 {
-        if self.controls.deafened || self.local_mutes.contains(owner) {
-            0.0
-        } else {
-            self.controls.output_gain.unwrap_or(1.0).clamp(0.0, 2.0)
-        }
+    /// Audible gain and the separate mute flag of one participant. The
+    /// percentage is stored by the stable user id and resolved through the
+    /// current roster entry for `owner`; a connection id that now belongs to
+    /// somebody else never inherits the previous user's volume.
+    fn source_for(&self, owner: &str) -> (f64, bool) {
+        let muted = self.controls.deafened || self.local_mutes.contains(owner);
+        (self.user_gain(owner), muted)
+    }
+
+    fn user_gain(&self, owner: &str) -> f64 {
+        let user = self
+            .participants
+            .iter()
+            .find(|participant| participant.connection_id == owner)
+            .map(|participant| participant.user_id);
+        let volume = user
+            .and_then(|id| self.controls.user_volumes.get(&id).copied())
+            .unwrap_or(100);
+        (volume.clamp(0, 200) as f64) / 100.0
     }
     pub fn media_event(&mut self, event: Event) -> Vec<Action> {
         match event {
@@ -196,9 +218,11 @@ impl VoiceController {
                 self.track_mids.insert(track_id.clone(), mid.clone());
                 if let Some(owner) = self.owners.get(&mid) {
                     self.tracks.insert(track_id.clone(), owner.clone());
+                    let (gain, muted) = self.source_for(owner);
                     return vec![Action::Media(Command::Volume {
                         track_id,
-                        gain: self.gain_for(owner),
+                        gain,
+                        muted,
                     })];
                 }
                 vec![]
@@ -243,6 +267,7 @@ impl VoiceController {
                 noise_mode,
                 echo_cancellation,
                 auto_gain_control,
+                software_mixer,
             } => {
                 if capture == "platform" {
                     // The platform path has no InputLevel; let MediaSource level
@@ -255,7 +280,12 @@ impl VoiceController {
                     noise_mode,
                     echo_cancellation,
                     auto_gain_control,
+                    software_mixer,
                 });
+                vec![]
+            }
+            Event::Playout(stats) => {
+                self.playout = Some(stats);
                 vec![]
             }
             Event::State {
@@ -327,9 +357,11 @@ impl VoiceController {
                     // Apply the configured gain again to receivers that
                     // survived the renegotiation without another on_track.
                     for (track, owner) in &self.tracks {
+                        let (gain, muted) = self.source_for(owner);
                         actions.push(Action::Media(Command::Volume {
                             track_id: track.clone(),
-                            gain: self.gain_for(owner),
+                            gain,
+                            muted,
                         }));
                     }
                     actions
@@ -474,6 +506,11 @@ mod tests {
     fn a_renegotiation_keeps_receiver_owners_and_reapplies_gain() {
         let mut controller = VoiceController::new(1, 2, Controls::default(), false);
         controller.joined = true;
+        controller.participants = vec![Participant {
+            connection_id: "alice".into(),
+            user_id: 7,
+            ..Participant::default()
+        }];
         controller.owners.insert("0".into(), "alice".into());
         let track = controller.media_event(Event::Track {
             track_id: "track-alice".into(),
@@ -484,9 +521,11 @@ mod tests {
             track.first(),
             Some(Action::Media(Command::Volume { gain, .. })) if (*gain - 1.0).abs() < f64::EPSILON
         ));
+        let mut volumes = std::collections::BTreeMap::new();
+        volumes.insert(7, 50);
         controller.update_controls(
             Controls {
-                output_gain: Some(0.5),
+                user_volumes: volumes,
                 ..Controls::default()
             },
             false,
@@ -500,7 +539,7 @@ mod tests {
         assert!(
             actions.iter().any(|action| matches!(
                 action,
-                Action::Media(Command::Volume { track_id, gain })
+                Action::Media(Command::Volume { track_id, gain, .. })
                     if track_id == "track-alice" && (*gain - 0.5).abs() < f64::EPSILON
             )),
             "the surviving receiver keeps its owner and numeric gain: {actions:?}"
@@ -563,6 +602,7 @@ mod tests {
             noise_mode: "auto",
             echo_cancellation: true,
             auto_gain_control: true,
+            software_mixer: true,
         });
         controller.media_event(Event::Level {
             track_id: None,
@@ -579,11 +619,16 @@ mod tests {
             noise_mode: "auto",
             echo_cancellation: true,
             auto_gain_control: true,
+            software_mixer: false,
         });
         let applied = controller.applied_audio.as_ref().unwrap();
         assert_eq!(applied.capture, "platform");
         assert_eq!(applied.noise_mode, "auto");
         assert!(applied.echo_cancellation);
+        assert!(
+            !applied.software_mixer,
+            "the mixer flag is the applied path, not a guess"
+        );
     }
 
     #[test]
@@ -663,9 +708,16 @@ mod tests {
     fn output_gain_scales_a_participant_and_a_local_mute_wins() {
         let mut controller = VoiceController::new(1, 2, Controls::default(), false);
         controller.joined = true;
+        controller.participants = vec![Participant {
+            connection_id: "alice".into(),
+            user_id: 7,
+            ..Participant::default()
+        }];
+        let mut volumes = std::collections::BTreeMap::new();
+        volumes.insert(7, 50);
         controller.update_controls(
             Controls {
-                output_gain: Some(0.5),
+                user_volumes: volumes,
                 ..Controls::default()
             },
             false,
@@ -678,17 +730,203 @@ mod tests {
         });
         assert!(matches!(
             actions.first(),
-            Some(Action::Media(Command::Volume { gain, .. })) if (*gain - 0.5).abs() < f64::EPSILON
+            Some(Action::Media(Command::Volume { gain, muted, .. }))
+                if (*gain - 0.5).abs() < f64::EPSILON && !muted
         ));
+        // A local mute is a separate flag: the stored 50 % stays in the gain.
         let muted = controller.set_local_mute("alice", true);
         assert!(matches!(
             muted.first(),
-            Some(Action::Media(Command::Volume { gain, .. })) if *gain == 0.0
+            Some(Action::Media(Command::Volume { gain, muted, .. }))
+                if (*gain - 0.5).abs() < f64::EPSILON && *muted
         ));
         let restored = controller.set_local_mute("alice", false);
         assert!(matches!(
             restored.first(),
-            Some(Action::Media(Command::Volume { gain, .. })) if (*gain - 0.5).abs() < f64::EPSILON
+            Some(Action::Media(Command::Volume { gain, muted, .. }))
+                if (*gain - 0.5).abs() < f64::EPSILON && !muted
         ));
+    }
+
+    /// The per-user slider stores 0–200 % by user id; 150 % must reach that
+    /// user's current track as 1.5 in the delivered command, not only in the
+    /// snapshot.
+    #[test]
+    fn a_150_percent_user_volume_reaches_the_participant_track() {
+        let mut controller = VoiceController::new(1, 2, Controls::default(), false);
+        controller.joined = true;
+        controller.participants = vec![
+            Participant {
+                connection_id: "alice".into(),
+                user_id: 7,
+                ..Participant::default()
+            },
+            Participant {
+                connection_id: "bob".into(),
+                user_id: 8,
+                ..Participant::default()
+            },
+        ];
+        controller.owners.insert("0".into(), "alice".into());
+        controller.owners.insert("1".into(), "bob".into());
+        for (mid, track) in [("0", "track-alice"), ("1", "track-bob")] {
+            controller.media_event(Event::Track {
+                track_id: track.into(),
+                stream_id: None,
+                mid: Some(mid.into()),
+            });
+        }
+        let mut volumes = std::collections::BTreeMap::new();
+        volumes.insert(7, 150);
+        volumes.insert(8, 80);
+        let actions = controller.update_controls(
+            Controls {
+                user_volumes: volumes,
+                ..Controls::default()
+            },
+            false,
+        );
+        let mut volumes: Vec<_> = actions
+            .iter()
+            .filter_map(|action| match action {
+                Action::Media(Command::Volume { track_id, gain, .. }) => {
+                    Some((track_id.as_str(), *gain))
+                }
+                _ => None,
+            })
+            .collect();
+        volumes.sort_by(|a, b| a.0.cmp(b.0));
+        assert_eq!(
+            volumes,
+            vec![("track-alice", 1.5), ("track-bob", 0.8)],
+            "each user's percentage reaches that user's track: {actions:?}"
+        );
+    }
+
+    /// A reconnect can give the old connection id to another participant. The
+    /// volume is keyed by user id and validated against the current owner, so
+    /// it must not move to the new holder of that connection.
+    #[test]
+    fn a_user_volume_never_moves_to_another_participant_after_reconnect() {
+        let mut controller = VoiceController::new(1, 2, Controls::default(), false);
+        controller.joined = true;
+        controller.participants = vec![
+            Participant {
+                connection_id: "conn-a".into(),
+                user_id: 8,
+                ..Participant::default()
+            },
+            Participant {
+                connection_id: "conn-b".into(),
+                user_id: 7,
+                ..Participant::default()
+            },
+        ];
+        let mut volumes = std::collections::BTreeMap::new();
+        volumes.insert(7, 200);
+        controller.controls.user_volumes = volumes;
+        // Alice was on conn-a; after a reconnect Bob holds conn-a and Alice
+        // has conn-b. The roster is the authority for who holds a connection.
+        controller.owners.insert("0".into(), "conn-a".into());
+        controller.owners.insert("1".into(), "conn-b".into());
+        let bob = controller.media_event(Event::Track {
+            track_id: "track-bob".into(),
+            stream_id: None,
+            mid: Some("0".into()),
+        });
+        assert!(
+            matches!(
+                bob.first(),
+                Some(Action::Media(Command::Volume { gain, .. }))
+                    if (*gain - 1.0).abs() < f64::EPSILON
+            ),
+            "Bob must not inherit Alice's 200 % through the reused connection id: {bob:?}"
+        );
+        let alice = controller.media_event(Event::Track {
+            track_id: "track-alice".into(),
+            stream_id: None,
+            mid: Some("1".into()),
+        });
+        assert!(
+            matches!(
+                alice.first(),
+                Some(Action::Media(Command::Volume { gain, .. }))
+                    if (*gain - 2.0).abs() < f64::EPSILON
+            ),
+            "Alice's own track keeps her 200 %: {alice:?}"
+        );
+        // A stale owner that is no longer in the roster is unity, not a
+        // remembered override.
+        controller.owners.insert("2".into(), "gone".into());
+        let stale = controller.media_event(Event::Track {
+            track_id: "track-gone".into(),
+            stream_id: None,
+            mid: Some("2".into()),
+        });
+        assert!(matches!(
+            stale.first(),
+            Some(Action::Media(Command::Volume { gain, .. }))
+                if (*gain - 1.0).abs() < f64::EPSILON
+        ));
+    }
+
+    /// One settings change is one `Command::State` carrying the whole snapshot;
+    /// a second command per field would make the engine apply them separately.
+    #[test]
+    fn one_settings_change_is_exactly_one_state_command() {
+        // The explicit input selection owns `controls.input` (a stale snapshot
+        // cannot revert it), so the controller starts with the selected device.
+        let mut controller = VoiceController::new(
+            1,
+            2,
+            Controls {
+                input: Some("endpoint-mic".into()),
+                ..Controls::default()
+            },
+            false,
+        );
+        controller.joined = true;
+        let actions = controller.update_controls(
+            Controls {
+                input: Some("endpoint-mic".into()),
+                output: Some("endpoint-spk".into()),
+                bitrate_kbps: Some(96),
+                input_gain: 1.4,
+                output_gain: Some(1.5),
+                noise_mode: crate::dsp::NoiseMode::Threshold,
+                noise_gate_percent: 32,
+                echo_cancellation: false,
+                auto_gain_control: false,
+                ..Controls::default()
+            },
+            false,
+        );
+        let states: Vec<_> = actions
+            .iter()
+            .filter(|action| matches!(action, Action::Media(Command::State(_))))
+            .collect();
+        assert_eq!(states.len(), 1, "exactly one State snapshot: {actions:?}");
+        let Action::Media(Command::State(state)) = states[0] else {
+            unreachable!()
+        };
+        assert_eq!(state.input.as_deref(), Some("endpoint-mic"));
+        assert_eq!(state.output.as_deref(), Some("endpoint-spk"));
+        assert_eq!(state.bitrate_kbps, Some(96));
+        assert!((state.input_gain - 1.4).abs() < f32::EPSILON);
+        assert_eq!(state.output_gain, Some(1.5));
+        assert_eq!(state.noise_mode, crate::dsp::NoiseMode::Threshold);
+        assert_eq!(state.noise_gate_percent, 32);
+        assert!(!state.echo_cancellation);
+        assert!(!state.auto_gain_control);
+        // No track exists yet, so nothing else goes to the media layer; the
+        // `voice.state_update` signal is not a parameter write.
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|action| matches!(action, Action::Media(_)))
+                .count(),
+            1,
+            "no extra media command besides the one State: {actions:?}"
+        );
     }
 }

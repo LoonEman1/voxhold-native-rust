@@ -14,6 +14,15 @@ pub(super) enum ButtonKind {
 }
 
 impl Voxhold {
+    /// The settings elements are looked up by their id in the layout tests; the
+    /// debug selector is a no-op outside test builds.
+    fn element_selector(id: &ElementId) -> Option<String> {
+        match id {
+            ElementId::Name(name) => Some(name.to_string()),
+            _ => None,
+        }
+    }
+
     pub(super) fn focus_id(
         &mut self,
         id: ElementId,
@@ -40,6 +49,7 @@ impl Voxhold {
         let p = self.palette;
         let focus = self.focus_id(id.clone(), window, cx);
         let focused = focus.is_focused(window);
+        let selector = Self::element_selector(&id);
         if !disabled {
             self.settings_ring
                 .push((focus.clone(), Some(action.clone())));
@@ -109,6 +119,9 @@ impl Voxhold {
         if kind != ButtonKind::Icon {
             button = button.child(label.into());
         }
+        if let Some(selector) = selector {
+            button = button.debug_selector(move || selector.clone());
+        }
         button
     }
 
@@ -147,7 +160,8 @@ impl Voxhold {
                     .bg(ink(if on { 0x15150f } else { p.muted })),
             );
         let _ = focused;
-        div()
+        let selector = Self::element_selector(&id);
+        let mut row = div()
             .id(id)
             .w_full()
             .py(px(6.))
@@ -185,8 +199,11 @@ impl Voxhold {
                         .text_color(ink(p.muted))
                         .child(description.to_owned()),
                 )
-            })
-            .into_any_element()
+            });
+        if let Some(selector) = selector {
+            row = row.debug_selector(move || selector.clone());
+        }
+        row.into_any_element()
     }
 
     pub(super) fn settings_option(
@@ -202,11 +219,12 @@ impl Voxhold {
     ) -> AnyElement {
         let p = self.palette;
         let focus = self.focus_id(id.clone(), window, cx);
+        let selector = Self::element_selector(&id);
         if !disabled {
             self.settings_ring
                 .push((focus.clone(), Some(action.clone())));
         }
-        div()
+        let mut row = div()
             .id(id)
             .w_full()
             .py(px(8.))
@@ -254,81 +272,11 @@ impl Voxhold {
                                 .child(description.to_owned()),
                         )
                     }),
-            )
-            .into_any_element()
-    }
-
-    pub(super) fn settings_value_slider(
-        &mut self,
-        id: &'static str,
-        label: &str,
-        value: i64,
-        max: i64,
-        step: i64,
-        action: impl Fn(i64) -> SettingsAct + 'static,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let p = self.palette;
-        let ratio = (value.clamp(0, max) as f32 / max.max(1) as f32).clamp(0., 1.);
-        let lower = action((value - step).clamp(0, max));
-        let upper = action((value + step).clamp(0, max));
-        div()
-            .w_full()
-            .flex()
-            .flex_col()
-            .gap_1()
-            .child(
-                div()
-                    .text_size(px(13.))
-                    .font_weight(gpui::FontWeight::BOLD)
-                    .child(format!("{label} · {value}")),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(self.settings_button(
-                        ElementId::Name(format!("{id}-down").into()),
-                        "−",
-                        ButtonKind::Secondary,
-                        false,
-                        value <= 0,
-                        lower,
-                        window,
-                        cx,
-                    ))
-                    .child(
-                        div()
-                            .flex_1()
-                            .h(px(6.))
-                            .rounded(px(3.))
-                            .bg(ink(p.selection))
-                            .relative()
-                            .child(
-                                div()
-                                    .absolute()
-                                    .left(px(0.))
-                                    .top(px(0.))
-                                    .h(px(6.))
-                                    .w(px(220. * ratio))
-                                    .rounded(px(3.))
-                                    .bg(ink(p.lime)),
-                            ),
-                    )
-                    .child(self.settings_button(
-                        ElementId::Name(format!("{id}-up").into()),
-                        "+",
-                        ButtonKind::Secondary,
-                        false,
-                        value >= max,
-                        upper,
-                        window,
-                        cx,
-                    )),
-            )
-            .into_any_element()
+            );
+        if let Some(selector) = selector {
+            row = row.debug_selector(move || selector.clone());
+        }
+        row.into_any_element()
     }
 
     pub(super) fn settings_input(
@@ -382,6 +330,15 @@ impl Voxhold {
             .text_color(ink(if danger { p.danger } else { p.muted }))
             .child(text.to_owned())
             .into_any_element()
+    }
+
+    /// Pin the logical scale the settings card lays out against. The production
+    /// path samples `window.scale_factor()` on every paint; the layout tests
+    /// pin it to emulate 125 %/150 % on a fixed test window.
+    #[cfg(test)]
+    pub(super) fn test_pin_ui_scale(&mut self, scale: f32) {
+        self.ui_scale = scale.max(1.0);
+        self.ui_scale_pinned = true;
     }
 
     pub(super) fn settings_overlay(
@@ -454,12 +411,16 @@ impl Voxhold {
         };
         let p = self.palette;
         let (vw, vh) = self.viewport;
-        let width = 680_f32.min(vw - 16.).max(260.);
-        let height = 780_f32.min(vh - 24.).max(240.);
+        // Physical margins are constant across DPI steps: the logical inset
+        // grows with the scale, so a 150 % window keeps the same physical gap.
+        let scale = self.ui_scale.clamp(1.0, 3.0);
+        let width = 680_f32.min(vw - 16. * scale).max(260.);
+        let height = 780_f32.min(vh - 24. * scale).max(240.);
         let pad = if width < 440. { 16. } else { 24. };
         let left = (vw - width) / 2.;
         let top = (vh - height) / 2.;
         self.settings_ring.clear();
+        self.settings_slider_focus.clear();
 
         let header = div()
             .h(px(67.))
@@ -550,6 +511,7 @@ impl Voxhold {
         let close = self.settings_close_focus.clone();
         let mut card = div()
             .id("settings-card")
+            .debug_selector(|| "settings-card".into())
             .absolute()
             .left(px(left))
             .top(px(top))
@@ -608,7 +570,16 @@ impl Voxhold {
                 }),
             )
             .child(header)
-            .child(tab_strip);
+            .child(tab_strip)
+            // Moves while the pointer is over the form (the card occludes the
+            // backdrop, so only one of the two receives the event).
+            .on_mouse_move(cx.listener(|s, event: &gpui::MouseMoveEvent, window, cx| {
+                s.slider_pointer_moved(event, window, cx)
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|s, _, _, _| s.end_slider_drag()),
+            );
         if let Some(banner) = error_banner {
             card = card.child(banner);
         }
@@ -637,6 +608,17 @@ impl Voxhold {
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|s, _, window, cx| s.close_settings(true, window, cx)),
+                )
+                // The pointer capture of the Go slider: a drag that leaves the
+                // card keeps updating the value while the button is held, and
+                // the track math clamps it to the row ends. The backdrop covers
+                // the whole window, so moves outside the card still arrive.
+                .on_mouse_move(cx.listener(|s, event: &gpui::MouseMoveEvent, window, cx| {
+                    s.slider_pointer_moved(event, window, cx)
+                }))
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(|s, _, _, _| s.end_slider_drag()),
                 )
                 .child(card)
                 .into_any_element(),
@@ -736,247 +718,6 @@ impl Voxhold {
                     cx,
                 ));
         }
-        let _ = p;
-        root.into_any_element()
-    }
-
-    fn voice_body(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        let p = self.palette;
-        let devices = self.voice_settings.devices.clone();
-        let loading = self.voice_settings.devices_loading;
-        let error = if self.voice_settings.devices_error.is_empty() {
-            self.voice_settings.saved_error.clone()
-        } else {
-            self.voice_settings.devices_error.clone()
-        };
-        let prefs = self.voice_settings.prefs.clone();
-        let (input_names, _, input_current) =
-            crate::voice_settings::device_choices(&prefs, &devices, true);
-        let (output_names, _, output_current) =
-            crate::voice_settings::device_choices(&prefs, &devices, false);
-        let mut root = div().flex().flex_col().gap(px(14.)).child(self.heading(
-            "Голос и звук",
-            "Устройства и уровни звука. Голосовой движок не перезапускается при изменении этих настроек.",
-        ));
-        root = root
-            .child(self.heading(
-                "Устройства",
-                "Выберите, откуда брать голос и куда выводить звук комнаты.",
-            ))
-            .child(self.form_text(&format!("Устройство ввода · {input_current}"), false));
-        for index in 0..input_names.len() {
-            root = root.child(self.settings_button(
-                ElementId::Name(format!("audio-in-{index}").into()),
-                input_names[index].clone(),
-                if input_names[index] == input_current {
-                    ButtonKind::Tab
-                } else {
-                    ButtonKind::Secondary
-                },
-                input_names[index] == input_current,
-                false,
-                SettingsAct::Personal(personal_settings::Action::SelectInput(index)),
-                window,
-                cx,
-            ));
-        }
-        root = root.child(self.form_text(&format!("Устройство вывода · {output_current}"), false));
-        for index in 0..output_names.len() {
-            root = root.child(self.settings_button(
-                ElementId::Name(format!("audio-out-{index}").into()),
-                output_names[index].clone(),
-                if output_names[index] == output_current {
-                    ButtonKind::Tab
-                } else {
-                    ButtonKind::Secondary
-                },
-                output_names[index] == output_current,
-                false,
-                SettingsAct::Personal(personal_settings::Action::SelectOutput(index)),
-                window,
-                cx,
-            ));
-        }
-        root = root.child(self.settings_button(
-            ElementId::Name("audio-refresh".into()),
-            if loading {
-                "Обновляем…"
-            } else {
-                "Обновить"
-            },
-            ButtonKind::Secondary,
-            false,
-            loading,
-            SettingsAct::Personal(personal_settings::Action::RefreshDevices),
-            window,
-            cx,
-        ));
-        root = root
-            .child(self.separator())
-            .child(self.heading(
-                "Уровни звука",
-                "Громкость микрофона и обработка применяются в голосовом канале. Качество передачи применяется там же.",
-            ))
-            .child(self.settings_value_slider(
-                "input-volume",
-                "Громкость микрофона",
-                prefs.input_volume,
-                200,
-                5,
-                |value| SettingsAct::Personal(personal_settings::Action::SetVolume("input", value)),
-                window,
-                cx,
-            ))
-            .child(self.settings_value_slider(
-                "output-volume",
-                "Громкость вывода",
-                prefs.output_volume,
-                200,
-                5,
-                |value| SettingsAct::Personal(personal_settings::Action::SetVolume("output", value)),
-                window,
-                cx,
-            ))
-            .child(self.form_text(
-                "Громкость микрофона 0–200 % и обработка применяются в software-тракте голосового канала до Opus. При platform-fallback действует встроенная обработка ADM. Громкость вывода 0–200 %: 0 % выключает комнату, числовой коэффициент появится в W02c.",
-                false,
-            ))
-            .child(self.form_text(&format!("Качество передачи · {} Кбит/с", prefs.bitrate), false));
-        for bitrate in crate::voice_settings::BITRATES {
-            root = root.child(self.settings_button(
-                ElementId::Name(format!("bitrate-{bitrate}").into()),
-                bitrate.to_string(),
-                if bitrate == prefs.bitrate {
-                    ButtonKind::Tab
-                } else {
-                    ButtonKind::Secondary
-                },
-                bitrate == prefs.bitrate,
-                false,
-                SettingsAct::Personal(personal_settings::Action::SetBitrate(bitrate)),
-                window,
-                cx,
-            ));
-        }
-        root = root.child(self.separator()).child(self.settings_toggle(
-            ElementId::Name("sounds".into()),
-            "Звуки подключения и микрофона",
-            "",
-            prefs.sounds,
-            false,
-            SettingsAct::Personal(personal_settings::Action::ToggleSounds),
-            window,
-            cx,
-        ));
-        if prefs.sounds {
-            root = root.child(self.settings_value_slider(
-                "sound-volume",
-                "Громкость сигналов",
-                prefs.sound_volume,
-                100,
-                5,
-                |value| SettingsAct::Personal(personal_settings::Action::SetVolume("sound", value)),
-                window,
-                cx,
-            ));
-        }
-        root = root
-            .child(self.separator())
-            .child(self.heading("Обработка микрофона", ""))
-            .child(self.settings_option(
-                ElementId::Name("noise-auto".into()),
-                "Автоматически",
-                "",
-                prefs.noise_mode == "auto",
-                false,
-                SettingsAct::Personal(personal_settings::Action::SetNoiseMode(0)),
-                window,
-                cx,
-            ))
-            .child(self.settings_option(
-                ElementId::Name("noise-threshold".into()),
-                "С нижней планкой",
-                "",
-                prefs.noise_mode == "threshold",
-                false,
-                SettingsAct::Personal(personal_settings::Action::SetNoiseMode(1)),
-                window,
-                cx,
-            ));
-        if prefs.noise_mode == "threshold" {
-            root = root.child(self.settings_value_slider(
-                "noise-gate",
-                "Планка шума",
-                prefs.noise_gate,
-                100,
-                5,
-                |value| SettingsAct::Personal(personal_settings::Action::SetVolume("noise", value)),
-                window,
-                cx,
-            ));
-        }
-        root = root
-            .child(self.separator())
-            .child(self.heading("Режим ввода и горячие клавиши", ""))
-            .child(self.settings_option(
-                ElementId::Name("input-mode-voice".into()),
-                "Постоянный микрофон",
-                "Голос передаётся, пока микрофон не выключен.",
-                prefs.input_mode == "voice_activity",
-                false,
-                SettingsAct::Personal(personal_settings::Action::SetInputMode(0)),
-                window,
-                cx,
-            ))
-            .child(self.settings_option(
-                ElementId::Name("input-mode-ptt".into()),
-                "Нажми и говори",
-                "Микрофон работает только при удержании клавиши.",
-                prefs.input_mode == "push_to_talk",
-                false,
-                SettingsAct::Personal(personal_settings::Action::SetInputMode(1)),
-                window,
-                cx,
-            ))
-            .child(self.form_text(
-                &format!(
-                    "Микрофон: {} · Звук: {} · Нажми и говори: {}",
-                    prefs.mute, prefs.deafen, prefs.push_to_talk
-                ),
-                false,
-            ));
-        if !prefs.shortcuts_valid() {
-            root = root
-                .child(self.form_text("Назначьте разные сочетания для каждого действия.", true));
-        }
-        if !error.is_empty() {
-            root = root.child(self.form_text(&error, true));
-        }
-        root = root.child(self.separator()).child(
-            div()
-                .flex()
-                .gap_2()
-                .child(self.settings_button(
-                    ElementId::Name("voice-reset".into()),
-                    "Сбросить",
-                    ButtonKind::Secondary,
-                    false,
-                    false,
-                    SettingsAct::Personal(personal_settings::Action::ResetVoice),
-                    window,
-                    cx,
-                ))
-                .child(self.settings_button(
-                    ElementId::Name("voice-done".into()),
-                    "Готово",
-                    ButtonKind::Primary,
-                    false,
-                    false,
-                    SettingsAct::Close,
-                    window,
-                    cx,
-                )),
-        );
         let _ = p;
         root.into_any_element()
     }

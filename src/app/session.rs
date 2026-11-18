@@ -146,10 +146,20 @@ impl Voxhold {
     }
 
     pub(super) fn logout(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.stop_voice_preview();
+        self.stop_voice_meter();
+        // A test tone or a preview error belongs to the signed-out session.
+        self.voice_settings.tone_pending = false;
+        self.voice_settings.tone_error.clear();
+        self.voice_settings.preview_error.clear();
+        self.voice_settings.device_notice.clear();
         self.stop_realtime();
         for (_, pending) in self.pending_sends.drain() {
             pending.abort.abort();
         }
+        // The pending voice save would be aborted by the generation bump; write
+        // it before the session it belongs to goes away.
+        self.voice_settings.flush();
         self.session_generation = self.session_generation.wrapping_add(1);
         self.active_profile_save = None;
         self.notification_saves.clear();

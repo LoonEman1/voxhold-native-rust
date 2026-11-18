@@ -79,6 +79,20 @@ pub struct VoicePanel {
     /// label in the active room; not part of the Go room layout.
     applied_audio: Option<AppliedAudio>,
     self_muted: bool,
+    /// Server-authoritative mute of this user. It outranks the local toggle:
+    /// the microphone stays closed even while a PTT key is held.
+    server_muted: bool,
+    /// The connection id this client was given on join. The roster may contain
+    /// two connections of the same user, so server mute is found by this id.
+    self_connection: Option<String>,
+    /// Per-user output volume by stable user id (0–200 %). Persisted with the
+    /// voice preferences, applied by the media mixer through track owners.
+    user_volumes: std::collections::BTreeMap<i64, i64>,
+    /// Last measured mixer level and counters.
+    playout: Option<voxhold_media::mixer::PlayoutStats>,
+    /// The system is suspended: the sink is released and the microphone is
+    /// closed until the resume handler reopens them.
+    power_paused: bool,
     push_to_talk: bool,
     ptt_held: bool,
     ptt_blocked: bool,
@@ -143,6 +157,9 @@ pub struct VoicePanel {
     /// mounted, but the dock-only case and the sidebar rings need an explicit
     /// wake-up.
     speaking_handler: Option<Box<dyn Fn(&mut gpui::App)>>,
+    /// Called after the call starts or ends. The parent uses it to start/stop
+    /// the power poller so an idle window has no timer.
+    call_handler: Option<Box<dyn Fn(&mut gpui::App)>>,
     palette: Palette,
 }
 
@@ -196,6 +213,11 @@ impl VoicePanel {
             controls,
             applied_audio: None,
             self_muted: false,
+            server_muted: false,
+            self_connection: None,
+            user_volumes: std::collections::BTreeMap::new(),
+            playout: None,
+            power_paused: false,
             push_to_talk,
             ptt_held: false,
             ptt_blocked: false,
@@ -246,6 +268,7 @@ impl VoicePanel {
             recordings_handler: None,
             recordings_live: None,
             speaking_handler: None,
+            call_handler: None,
             palette: crate::theme::dark_palette(),
         }
     }
@@ -269,6 +292,18 @@ impl VoicePanel {
         self.speaking_handler = Some(handler);
     }
 
+    pub fn set_call_handler(&mut self, handler: Box<dyn Fn(&mut gpui::App)>) {
+        self.call_handler = Some(handler);
+    }
+
+    /// Tell the parent that the call started or ended. The handler defers its
+    /// own update, so the parent is never mutably borrowed twice.
+    fn notify_call_changed(&mut self, cx: &mut Context<Self>) {
+        if let Some(handler) = &self.call_handler {
+            handler(cx);
+        }
+    }
+
     /// Replace the detected speech set. Returns whether anything changed; the
     /// parent is woken only for a real change.
     fn set_speaking(&mut self, speaking: HashMap<String, bool>, cx: &mut gpui::App) -> bool {
@@ -284,6 +319,26 @@ impl VoicePanel {
 
     fn clear_speaking(&mut self, cx: &mut gpui::App) {
         self.set_speaking(HashMap::new(), cx);
+    }
+
+    /// Server mute is read from the roster row of *this* connection. A second
+    /// connection of the same user must not mute or unmute this client.
+    fn refresh_server_mute(&mut self) {
+        let Some(connection) = self.self_connection.as_deref() else {
+            return;
+        };
+        let Some(mute) = self
+            .participants
+            .iter()
+            .find(|participant| participant.connection_id == connection)
+            .map(|participant| participant.server_mute)
+        else {
+            return;
+        };
+        if self.server_muted != mute {
+            self.server_muted = mute;
+            self.refresh_capture();
+        }
     }
 
     pub fn set_recordings_live(&mut self, live: std::rc::Rc<std::cell::RefCell<Option<String>>>) {
@@ -425,6 +480,11 @@ impl VoicePanel {
     }
 
     #[cfg(test)]
+    pub fn test_self_muted(&self) -> bool {
+        self.self_muted
+    }
+
+    #[cfg(test)]
     pub fn participant_ids(&self) -> Vec<String> {
         self.participants
             .iter()
@@ -481,6 +541,7 @@ impl VoicePanel {
                 self.local_mutes.clear();
                 self.close_player();
                 self.refresh_capture();
+                self.notify_call_changed(cx);
             }
             Err(error) => self.error = error,
         }
@@ -510,6 +571,10 @@ impl VoicePanel {
         self.ptt_held = false;
         self.ptt_combo = None;
         self.applied_audio = None;
+        self.server_muted = false;
+        self.self_connection = None;
+        self.playout = None;
+        self.power_paused = false;
         // The next join starts with a closed microphone until the server
         // confirms `voice.joined`, even if the previous call was unmuted.
         self.controls.muted = true;
@@ -519,6 +584,7 @@ impl VoicePanel {
         self.local_mutes.clear();
         self.streams.clear();
         self.local_level = 0.0;
+        self.notify_call_changed(cx);
         cx.notify();
     }
 
@@ -621,14 +687,19 @@ impl VoicePanel {
 
     fn refresh_capture(&mut self) {
         let joined = self.handle.is_some() && self.phase == CallPhase::Connected;
-        self.controls.muted = !voice_room::microphone_open(
-            joined && self.call_channel != 0,
-            self.self_muted,
-            self.controls.deafened,
-            self.push_to_talk,
-            self.ptt_held,
-            self.ptt_blocked,
-        );
+        // Local mute/PTT/deafen and the server mute are the only owners of
+        // capture permission; input volume 0 is silence inside the DSP, not a
+        // second mute flag. A suspended system keeps the microphone closed.
+        self.controls.muted = self.power_paused
+            || !voice_room::microphone_open(
+                joined && self.call_channel != 0,
+                self.self_muted,
+                self.server_muted,
+                self.controls.deafened,
+                self.push_to_talk,
+                self.ptt_held,
+                self.ptt_blocked,
+            );
         if let Some(handle) = &self.handle {
             handle.controls(self.controls.clone(), self.self_muted);
         }
@@ -662,16 +733,20 @@ impl VoicePanel {
         self.local_mutes.contains(connection)
     }
 
-    #[cfg(test)]
+    /// Applied capture chain reported by the engine. `software` honours the
+    /// DSP toggles; `platform` is the ADM fallback with forced NS/AGC.
     pub fn applied_audio(&self) -> Option<&AppliedAudio> {
         self.applied_audio.as_ref()
     }
-    #[cfg(test)]
+
+    /// Device failure reported by the engine (for example a hot-unplug). The
+    /// settings meter polls this and refreshes the device list.
     pub fn device_error(&self) -> &str {
         &self.device_error
     }
 
-    #[cfg(test)]
+    /// Local speech level from the transmission (0..=1), used by the settings
+    /// meter while the call is active.
     pub fn local_level(&self) -> f64 {
         self.local_level
     }
@@ -764,7 +839,7 @@ impl VoicePanel {
 
     pub fn action_icon_for(&self, action_id: &str) -> &'static str {
         match action_id {
-            "voice-mic" if self.self_muted => "icons/mic-off.svg",
+            "voice-mic" if self.self_muted || self.server_muted => "icons/mic-off.svg",
             "voice-mic" => "icons/mic.svg",
             "voice-deaf" if self.controls.deafened => "icons/headphones-off.svg",
             "voice-deaf" => "icons/headphones.svg",
@@ -775,7 +850,12 @@ impl VoicePanel {
 
     /// `(mic, deafen, records, leave)` active flags for the dock buttons.
     pub fn action_active_flags(&self) -> [bool; 4] {
-        [self.self_muted, self.controls.deafened, false, true]
+        [
+            self.self_muted || self.server_muted,
+            self.controls.deafened,
+            false,
+            true,
+        ]
     }
 
     pub fn player_fullscreen(&self) -> bool {
@@ -825,160 +905,6 @@ impl VoicePanel {
         if changed {
             cx.notify();
         }
-    }
-
-    pub(crate) fn apply_update(
-        &mut self,
-        update: VoiceUpdate,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        let mut repaint = true;
-        match update {
-            VoiceUpdate::Connecting => {
-                self.phase = CallPhase::Connecting;
-                self.status = "Подключение…".into();
-                self.applied_audio = None;
-                self.controls.muted = true;
-                self.release_push_to_talk();
-            }
-            VoiceUpdate::Connected => {
-                if self.phase != CallPhase::Connected {
-                    self.phase = CallPhase::Connected;
-                    self.status = "Подключено".into();
-                    self.refresh_capture();
-                }
-            }
-            VoiceUpdate::Reconnecting => {
-                self.phase = CallPhase::Reconnecting;
-                self.status = "Восстанавливаем соединение…".into();
-                self.applied_audio = None;
-                self.controls.muted = true;
-                self.release_push_to_talk();
-                // Go drops the confirmed roster until the fresh join; a
-                // stale list must not look like a live call during a
-                // reconnect.
-                self.participants.clear();
-                self.clear_speaking(cx);
-                self.tracks.clear();
-            }
-            VoiceUpdate::Participants(participants) => {
-                self.participants = participants;
-                self.local_mutes.retain(|connection| {
-                    self.participants
-                        .iter()
-                        .any(|participant| &participant.connection_id == connection)
-                });
-            }
-            VoiceUpdate::Speaking(speaking) => {
-                repaint = self.set_speaking(speaking, cx);
-            }
-            VoiceUpdate::LocalLevel(level) => {
-                // Repaint the meter only for a visible step, not for every
-                // 20 Hz sample of the capture track.
-                repaint = (self.local_level - level).abs() > 0.04;
-                self.local_level = level;
-            }
-            VoiceUpdate::Tracks(tracks) => self.tracks = tracks,
-            VoiceUpdate::Streams(streams) => self.streams = streams,
-            VoiceUpdate::StreamStatus { selection, status } => {
-                if self.watching_selection != Some(selection) {
-                    return false;
-                }
-                if status.is_empty() {
-                    self.close_player_in_window(window);
-                } else {
-                    self.stream_status = status;
-                    self.stream_error.clear();
-                }
-            }
-            VoiceUpdate::StreamError { selection, error } => {
-                if self.watching_selection != Some(selection) {
-                    return false;
-                }
-                self.stream_error = error;
-                self.stream_status.clear();
-                self.stream_connected = false;
-                self.frame = None;
-            }
-            VoiceUpdate::StreamAudio { selection, error } => {
-                if self.watching_selection != Some(selection) {
-                    return false;
-                }
-                // Keep the frame and the peer: the previous output may still be
-                // playing after a successful rollback.
-                self.stream_audio_error = error.unwrap_or_default();
-            }
-            VoiceUpdate::StreamConnected {
-                selection,
-                connected,
-            } => {
-                if self.watching_selection != Some(selection) {
-                    return false;
-                }
-                self.stream_connected = connected;
-            }
-            VoiceUpdate::DeviceError(error) => {
-                // A notice is not proof that the saved choice is dead: the
-                // typed `InputApplied` result below is the only thing allowed
-                // to replace `controls.input`. Clearing it here let a late
-                // notice undo a newer explicit selection.
-                self.device_error = error;
-            }
-            VoiceUpdate::InputApplied {
-                generation,
-                input,
-                error,
-            } => {
-                // A result for an older explicit request must not overwrite a
-                // newer selection. Zero is an engine-initiated fallback and is
-                // always the current applied device.
-                if generation != 0 {
-                    if generation < self.input_generation {
-                        return false;
-                    }
-                    self.input_generation = generation;
-                }
-                self.controls.input = input;
-                if let Some(error) = error {
-                    self.device_error = error;
-                }
-            }
-            VoiceUpdate::AudioMode(applied) => {
-                self.applied_audio = Some(applied);
-            }
-            VoiceUpdate::Ended(error) => {
-                self.handle.take();
-                self.applied_audio = None;
-                self.controls.muted = true;
-                self.ptt_held = false;
-                self.ptt_combo = None;
-                self.close_player_in_window(window);
-                self.call_channel = 0;
-                self.phase = if error.is_some() {
-                    CallPhase::Failed
-                } else {
-                    CallPhase::Idle
-                };
-                self.error = error.unwrap_or_default();
-                self.status.clear();
-                self.participants.clear();
-                self.clear_speaking(cx);
-                self.tracks.clear();
-                self.streams.clear();
-            }
-        }
-        repaint
-    }
-
-    #[cfg(test)]
-    pub fn test_apply_update(
-        &mut self,
-        update: VoiceUpdate,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        self.apply_update(update, window, cx)
     }
 
     // ---- focus ring -----------------------------------------------------
@@ -1168,6 +1094,9 @@ impl VoicePanel {
 mod colors;
 mod controls;
 mod player;
+#[cfg(test)]
+mod test_support;
+mod updates;
 mod view;
 
 pub(crate) use colors::VoiceColors;

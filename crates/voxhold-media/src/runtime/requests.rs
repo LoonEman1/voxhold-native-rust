@@ -98,6 +98,8 @@ pub(super) struct Requests {
     /// runtime cache still describes the pre-unplug device.
     pub(super) output: Mutex<Option<Option<String>>>,
     pub(super) viewport: Mutex<Option<(u32, u32)>>,
+    /// System resume/suspend. Last-value: only the newest transition matters.
+    pub(super) power: Mutex<Option<bool>>,
     pub(super) leave: AtomicBool,
     pub(super) notify: Notify,
 }
@@ -110,6 +112,8 @@ pub(super) enum Pending {
     Controls(Controls, bool),
     StreamMute(u64, bool),
     LocalMute(String, bool),
+    /// `true` = resumed, `false` = suspended.
+    Power(bool),
 }
 
 impl Requests {
@@ -140,6 +144,11 @@ impl Requests {
         if let Ok(mut controls) = self.controls.lock() {
             if let Some((controls, self_muted)) = controls.take() {
                 return Some(Pending::Controls(controls, self_muted));
+            }
+        }
+        if let Ok(mut power) = self.power.lock() {
+            if let Some(resumed) = power.take() {
+                return Some(Pending::Power(resumed));
             }
         }
         if let Ok(mut mute) = self.stream_mute.lock() {

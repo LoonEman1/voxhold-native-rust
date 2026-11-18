@@ -14,7 +14,7 @@ impl VoicePanel {
 
     fn action_icon(&self, action: &VoiceAction) -> &'static str {
         match action.id {
-            "voice-mic" if self.self_muted => "icons/mic-off.svg",
+            "voice-mic" if self.self_muted || self.server_muted => "icons/mic-off.svg",
             "voice-mic" => "icons/mic.svg",
             "voice-deaf" if self.controls.deafened => "icons/headphones-off.svg",
             "voice-deaf" => "icons/headphones.svg",
@@ -25,7 +25,7 @@ impl VoicePanel {
 
     fn action_active(&self, action: &VoiceAction) -> bool {
         match action.id {
-            "voice-mic" => self.self_muted,
+            "voice-mic" => self.self_muted || self.server_muted,
             "voice-deaf" => self.controls.deafened,
             "voice-leave" => true,
             _ => false,
@@ -528,6 +528,47 @@ impl VoicePanel {
                         .text_size(px(9.))
                         .text_color(rgb(c.muted))
                         .child(label),
+                );
+            }
+            if let Some(stats) = self
+                .playout
+                .filter(|stats| stats.running && self.software_mixer())
+            {
+                // Measured post-mix level and the real block-time percentile;
+                // the ADM fallback path has no such numbers and shows nothing.
+                let label = format!(
+                    "Микшер · {:.0}% · {} · p95 {} мкс · under {} · drop {} · огр. {} · release {} · recon {} · {} мс",
+                    f64::from(stats.level) * 100.0,
+                    stats.phase.label(),
+                    stats.p95_micros,
+                    stats.underruns,
+                    stats.dropped,
+                    stats.limited_blocks,
+                    stats.limiter_releases,
+                    stats.reconnects,
+                    stats.latency_ms
+                );
+                body = body.child(
+                    div()
+                        .debug_selector(|| "voice-mixer".into())
+                        .absolute()
+                        .right(px(24.))
+                        .top(px(62.))
+                        .text_size(px(9.))
+                        .text_color(rgb(c.muted))
+                        .child(label),
+                );
+            }
+            if self.server_muted {
+                body = body.child(
+                    div()
+                        .debug_selector(|| "voice-server-mute".into())
+                        .absolute()
+                        .left(px(24.))
+                        .top(px(34.))
+                        .text_size(px(11.))
+                        .text_color(rgb(c.danger))
+                        .child("Микрофон выключен сервером"),
                 );
             }
         }

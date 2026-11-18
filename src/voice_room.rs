@@ -325,17 +325,18 @@ pub fn toolbar_buttons(toolbar: Rect, labels: bool) -> Vec<Rect> {
         .collect()
 }
 
-/// Microphone is closed until the join is confirmed, while the user is muted
-/// or deafened, and for push-to-talk unless the key is held.
+/// Microphone is closed until the join is confirmed, while the user is muted,
+/// server-muted or deafened, and for push-to-talk unless the key is held.
 pub fn microphone_open(
     joined: bool,
     self_muted: bool,
+    server_muted: bool,
     deafened: bool,
     push_to_talk: bool,
     held: bool,
     blocked: bool,
 ) -> bool {
-    joined && !self_muted && !deafened && (!push_to_talk || (held && !blocked))
+    joined && !self_muted && !server_muted && !deafened && (!push_to_talk || (held && !blocked))
 }
 
 /// Parsed shortcut like Go `Ctrl+Shift+M`. Modifier comparisons are exact and

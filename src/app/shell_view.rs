@@ -4,6 +4,9 @@ impl Render for Voxhold {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let viewport = window.viewport_size();
         self.viewport = (viewport.width.into(), viewport.height.into());
+        if !self.ui_scale_pinned {
+            self.ui_scale = window.scale_factor();
+        }
         let (vw, vh) = self.viewport;
         let p = self.palette;
         let mut root = div()
@@ -13,6 +16,11 @@ impl Render for Voxhold {
             .bg(ink(p.bg))
             .text_color(ink(p.fg))
             .capture_key_down(cx.listener(|s, event: &gpui::KeyDownEvent, window, cx| {
+                #[cfg(feature = "voxhold-media")]
+                if s.record_shortcut_key(event, cx) {
+                    cx.stop_propagation();
+                    return;
+                }
                 #[cfg(feature = "voxhold-media")]
                 if s.voice_key_down(event, window, cx) {
                     cx.stop_propagation();

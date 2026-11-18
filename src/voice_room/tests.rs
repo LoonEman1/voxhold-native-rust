@@ -148,16 +148,39 @@ fn room_and_dock_titles_follow_the_call_phase() {
 
 #[test]
 fn microphone_opens_only_for_a_confirmed_unmuted_join() {
-    assert!(!microphone_open(false, false, false, false, false, false));
-    assert!(microphone_open(true, false, false, false, false, false));
-    assert!(!microphone_open(true, true, false, false, false, false));
-    assert!(!microphone_open(true, false, true, false, false, false));
+    assert!(!microphone_open(
+        false, false, false, false, false, false, false
+    ));
+    assert!(microphone_open(
+        true, false, false, false, false, false, false
+    ));
+    assert!(!microphone_open(
+        true, true, false, false, false, false, false
+    ));
+    // A server mute outranks the local toggle and a held PTT key.
+    assert!(!microphone_open(
+        true, false, true, false, false, false, false
+    ));
+    assert!(!microphone_open(
+        true, false, true, false, true, true, false
+    ));
+    assert!(!microphone_open(
+        true, false, false, true, false, false, false
+    ));
     // Push-to-talk is closed until the key is held and not blocked.
-    assert!(!microphone_open(true, false, false, true, false, false));
-    assert!(microphone_open(true, false, false, true, true, false));
-    assert!(!microphone_open(true, false, false, true, true, true));
+    assert!(!microphone_open(
+        true, false, false, false, true, false, false
+    ));
+    assert!(microphone_open(
+        true, false, false, false, true, true, false
+    ));
+    assert!(!microphone_open(
+        true, false, false, false, true, true, true
+    ));
     // An unknown state (no join) stays closed even while held.
-    assert!(!microphone_open(false, false, false, true, true, false));
+    assert!(!microphone_open(
+        false, false, false, false, true, true, false
+    ));
 }
 
 #[test]

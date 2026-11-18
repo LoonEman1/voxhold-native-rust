@@ -8,12 +8,18 @@ mod composer;
 mod history_actions;
 mod history_ops;
 mod history_view;
+#[cfg(all(feature = "voxhold-media", test))]
+mod hotkey_tests;
+#[cfg(feature = "voxhold-media")]
+mod hotkeys;
 mod inbox_ops;
 mod media_ops;
 mod members_view;
 mod navigation_view;
 mod overlays_view;
 mod personal_ops;
+#[cfg(feature = "voxhold-media")]
+mod power;
 mod profile_view;
 mod realtime;
 mod recordings_download;
@@ -27,16 +33,25 @@ mod server_ops;
 mod session;
 #[cfg(test)]
 mod settings_review;
+mod settings_slider;
+#[cfg(test)]
+mod settings_slider_tests;
 #[cfg(test)]
 mod settings_tests;
 mod settings_view;
+mod settings_voice_view;
 mod shell_view;
 #[cfg(test)]
 mod tests;
 mod theme_ops;
 mod thread_ops;
 pub(crate) mod ui;
+#[cfg(test)]
+mod voice_form_tests;
 mod voice_ops;
+mod voice_settings_ops;
+#[cfg(test)]
+mod voice_settings_tests;
 #[cfg(test)]
 mod voice_tests;
 mod workspace;
@@ -231,6 +246,22 @@ pub(crate) struct Voxhold {
     active_settings: Option<SettingsKind>,
     settings_return_focus: Option<FocusHandle>,
     settings_ring: Vec<(FocusHandle, Option<SettingsAct>)>,
+    /// Slider focus handles rebuilt on every settings paint, so Tab reaches a
+    /// slider and the tests can drive its keys.
+    settings_slider_focus: Vec<(String, FocusHandle)>,
+    /// Measured track boxes of the settings sliders, keyed by slider id.
+    slider_tracks: std::collections::HashMap<
+        String,
+        std::rc::Rc<std::cell::Cell<settings_slider::SliderTrack>>,
+    >,
+    slider_drag: Option<settings_slider::SliderDrag>,
+    /// Logical window scale reported by the platform. The settings card uses it
+    /// for its DPI-aware margins; a test can pin it instead of a real monitor
+    /// DPI (`test_pin_ui_scale`).
+    ui_scale: f32,
+    /// True once a test pinned `ui_scale`; the render then stops sampling the
+    /// window.
+    ui_scale_pinned: bool,
     settings_scroll: gpui::ScrollHandle,
     settings_close_focus: FocusHandle,
     settings_entry_focus: FocusHandle,
@@ -245,6 +276,10 @@ pub(crate) struct Voxhold {
     show_servers: bool,
     #[cfg(feature = "voxhold-media")]
     voice: Option<Entity<voice_panel::VoicePanel>>,
+    /// Power poller; it exists only while a call is active. Dropping the task
+    /// cancels the 250 ms timer.
+    #[cfg(feature = "voxhold-media")]
+    power_task: Option<gpui::Task<()>>,
     /// Channel shown in the room pane; independent from the call channel.
     #[cfg(feature = "voxhold-media")]
     voice_room: i64,
@@ -380,6 +415,9 @@ pub(crate) struct Voxhold {
 
 impl Drop for Voxhold {
     fn drop(&mut self) {
+        // The window is going away, so the debounced voice save will never get
+        // its timer: write the newest snapshot now (atomic, one small file).
+        self.voice_settings.flush();
         self.stop_realtime();
     }
 }
@@ -518,6 +556,11 @@ impl Voxhold {
             active_settings: None,
             settings_return_focus: None,
             settings_ring: Vec::new(),
+            settings_slider_focus: Vec::new(),
+            slider_tracks: std::collections::HashMap::new(),
+            slider_drag: None,
+            ui_scale: 1.0,
+            ui_scale_pinned: false,
             settings_scroll: gpui::ScrollHandle::new(),
             settings_close_focus: cx.focus_handle(),
             settings_entry_focus: cx.focus_handle(),
@@ -532,6 +575,8 @@ impl Voxhold {
             show_servers: false,
             #[cfg(feature = "voxhold-media")]
             voice: None,
+            #[cfg(feature = "voxhold-media")]
+            power_task: None,
             #[cfg(feature = "voxhold-media")]
             voice_room: 0,
             #[cfg(feature = "voxhold-media")]

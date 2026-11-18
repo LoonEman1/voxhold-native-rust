@@ -125,36 +125,33 @@ impl Voxhold {
                         })),
                 );
                 root = root
-                    .child(self.settings_value_slider(
+                    .child(self.settings_slider(
                         "avatar-zoom",
                         "Приближение",
                         i64::from(crop.zoom),
                         100,
-                        5,
                         |value| {
                             SettingsAct::Personal(personal_settings::Action::CropZoom(value as i32))
                         },
                         window,
                         cx,
                     ))
-                    .child(self.settings_value_slider(
+                    .child(self.settings_slider(
                         "avatar-x",
                         "По горизонтали",
                         i64::from(crop.x),
                         100,
-                        5,
                         |value| {
                             SettingsAct::Personal(personal_settings::Action::CropX(value as i32))
                         },
                         window,
                         cx,
                     ))
-                    .child(self.settings_value_slider(
+                    .child(self.settings_slider(
                         "avatar-y",
                         "По вертикали",
                         i64::from(crop.y),
                         100,
-                        5,
                         |value| {
                             SettingsAct::Personal(personal_settings::Action::CropY(value as i32))
                         },

@@ -155,6 +155,12 @@ impl PlatformAudio {
     pub(super) fn set_recording(&self, enabled: bool) {
         self.0.set_adm_recording_enabled(enabled);
     }
+
+    /// The room playout is owned by the software mixer when it opened. Viewer
+    /// sessions keep the ADM playout; the flag is set before any track exists.
+    pub(super) fn set_playout(&self, enabled: bool) {
+        self.0.set_adm_playout_enabled(enabled);
+    }
 }
 
 impl Drop for PlatformAudio {

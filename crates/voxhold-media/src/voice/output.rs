@@ -50,6 +50,43 @@ impl OutputState {
     }
 }
 
+/// Resolve and activate the saved ADM playout endpoint when the ADM owns
+/// playout. A software sink already playing on that device must not be
+/// disturbed, so a session that owns the mixer passes `adm_owns_playout=false`
+/// and keeps the saved id untouched.
+pub(super) fn activate_saved_output(
+    audio: &PlatformAudio,
+    controls: &mut Controls,
+    adm_owns_playout: bool,
+    events: &Events,
+) -> Option<u16> {
+    if !adm_owns_playout {
+        return None;
+    }
+    let id = controls.output.clone().filter(|id| !id.is_empty())?;
+    match audio
+        .resolve(&id, false)
+        .filter(|index| audio.activate(*index, false))
+    {
+        Some(index) => Some(index),
+        None => {
+            controls.output = None;
+            events.push(Event::DeviceError {
+                message: "Выбранное устройство воспроизведения недоступно, используется системное.",
+            });
+            events.push(Event::Output {
+                applied: None,
+                audible: true,
+                working: true,
+                error: Some(
+                    "Выбранное устройство воспроизведения недоступно, используется системное.",
+                ),
+            });
+            None
+        }
+    }
+}
+
 /// The platform ADM is stale when it is no longer initialized, when its
 /// captured-sample duration stopped moving, or when it never reported any
 /// capture after the transport connected.
@@ -96,17 +133,32 @@ impl Session {
                 continue;
             };
             if input && self.mic.is_some() {
-                // The software WinMM path is not enumerated by Core Audio, so
-                // a name-prefix miss would restart a working microphone every
-                // second. Hot-unplug recovery for this path belongs to W02c.
+                // The software WinMM path is not enumerated by Core Audio: ask
+                // the same resolver the capture path used, so an unplugged
+                // selected microphone is recovered instead of staying silent.
+                if crate::capture::input_available(id) {
+                    continue;
+                }
+                self.recover_input(events);
                 continue;
             }
-            if self.audio.resolve(id, input).is_some() {
+            let resolved = if !input && self.software_playout_mode() {
+                // The recovery ladder owns a missing sink; the ADM check would
+                // look at a path this session disabled.
+                if self.playout.is_none() {
+                    continue;
+                }
+                // The room sink is a WinMM endpoint, not the ADM index.
+                super::winmm_out::resolve_output(id).is_some()
+            } else {
+                self.audio.resolve(id, input).is_some()
+            };
+            if resolved {
                 continue;
             }
             // The old index may now point at another device. Resolve the
             // system default from scratch instead of reusing it.
-            let result = self.switch_device("", input);
+            let result = self.switch_device("", input, events);
             if !input {
                 if result.switched || result.audible {
                     self.output.confirmed(result.applied.clone());

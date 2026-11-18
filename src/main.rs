@@ -3,6 +3,7 @@
 mod app;
 mod assets;
 mod attachments;
+mod audio_capabilities;
 mod auth;
 mod background;
 mod channel_settings;
@@ -29,6 +30,7 @@ mod settings;
 mod test_support;
 mod theme;
 mod thread_panel;
+mod voice_form_text;
 #[cfg(feature = "voxhold-media")]
 mod voice_panel;
 #[cfg(feature = "voxhold-media")]
@@ -103,6 +105,8 @@ fn main() {
                 },
                 move |window, cx| {
                     let view = cx.new(|cx| Voxhold::new(window, cx, &prefill, layout_path.clone()));
+                    #[cfg(feature = "voxhold-media")]
+                    view.update(cx, |view, cx| view.install_power(window, cx));
                     cx.new(|cx| Root::new(view.into(), window, cx))
                 },
             )

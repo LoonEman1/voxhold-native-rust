@@ -79,7 +79,7 @@ fn focus_room(visual: &mut VisualTestContext, voice: &Entity<voice_panel::VoiceP
 
 /// A window with two voice rooms and one text channel, an active call in room
 /// 7 and the matching panel entity.
-fn fixture(
+pub(super) fn fixture(
     cx: &mut TestAppContext,
 ) -> (
     &'static mut VisualTestContext,
@@ -619,6 +619,117 @@ async fn voice_participants_are_listed_under_their_channel(cx: &mut TestAppConte
 }
 
 #[gpui::test]
+async fn voice_actions_apply_one_snapshot_and_persist(cx: &mut TestAppContext) {
+    let (mut visual, view, voice) = fixture(cx);
+    draw(&mut visual);
+    visual.update(|_window, app| {
+        view.update(app, |v, cx| {
+            use personal_settings::Action;
+            // The fixture's panel is in a call, so device changes must not
+            // start a second WinMM preview while the transmission owns the
+            // microphone.
+            v.active_settings = Some(SettingsKind::Personal);
+            v.personal.as_mut().unwrap().dialog.active = 1;
+            v.voice_settings.path = None;
+            v.voice_settings.devices = vec![
+                crate::voice_settings::Device {
+                    id: "1:Mic".into(),
+                    name: "Mic".into(),
+                    input: true,
+                },
+                crate::voice_settings::Device {
+                    id: "2:Spk".into(),
+                    name: "Spk".into(),
+                    input: false,
+                },
+            ];
+            assert!(v.voice_settings_action(Action::SelectInput("1:Mic".into()), cx));
+            assert_eq!(v.voice_settings.prefs.input, "1:Mic");
+            assert_eq!(v.voice_settings.prefs.output, "", "output is untouched");
+            assert!(v.voice_settings.preview.is_none(), "no in-call preview");
+
+            assert!(v.voice_settings_action(Action::SelectOutput("2:Spk".into()), cx));
+            assert_eq!(v.voice_settings.prefs.output, "2:Spk");
+            assert_eq!(v.voice_settings.prefs.input, "1:Mic");
+
+            assert!(v.voice_settings_action(Action::SetBitrate(96), cx));
+            assert_eq!(v.voice_settings.prefs.bitrate, 96);
+            assert!(v.voice_settings_action(Action::SetBitrate(160), cx));
+            assert_eq!(v.voice_settings.prefs.bitrate, 96, "160 is not a preset");
+
+            assert!(v.voice_settings_action(Action::SetVolume("input", 150), cx));
+            assert!(v.voice_settings_action(Action::SetVolume("output", 0), cx));
+            assert!(v.voice_settings_action(Action::SetNoiseMode(1), cx));
+            assert_eq!(v.voice_settings.prefs.noise_mode, "threshold");
+            assert!(v.voice_settings_action(Action::SetVolume("noise", 40), cx));
+            if let Some(voice) = &v.voice {
+                let controls = voice.read(cx).test_controls();
+                assert_eq!(controls.noise_mode.as_str(), "threshold");
+                assert_eq!(controls.noise_gate_percent, 40);
+                assert!((controls.input_gain - 1.5).abs() < 1e-6);
+                assert_eq!(controls.output_gain, Some(0.0));
+            }
+            let auto_gain = v.voice_settings.prefs.auto_gain;
+            assert!(v.voice_settings_action(Action::ToggleAutoGain, cx));
+            assert_ne!(v.voice_settings.prefs.auto_gain, auto_gain);
+            if let Some(voice) = &v.voice {
+                assert_eq!(
+                    voice.read(cx).test_controls().auto_gain_control,
+                    v.voice_settings.prefs.auto_gain
+                );
+            }
+            assert!(v.voice_settings_action(Action::SetVolume("sound", 25), cx));
+            assert_eq!(v.voice_settings.prefs.sound_volume, 25);
+            let sounds = v.voice_settings.prefs.sounds;
+            assert!(v.voice_settings_action(Action::ToggleSounds, cx));
+            assert_ne!(v.voice_settings.prefs.sounds, sounds);
+
+            assert!(v.voice_settings_action(Action::SetInputMode(1), cx));
+            assert_eq!(v.voice_settings.prefs.input_mode, "push_to_talk");
+            assert!(v.voice_settings_action(Action::ResetVoice, cx));
+            assert!(v.voice_settings.prefs.input.is_empty());
+            assert!(v.voice_settings.prefs.output.is_empty());
+            assert_eq!(v.voice_settings.prefs.bitrate, 64);
+            assert_eq!(v.voice_settings.prefs.input_volume, 100);
+            assert_eq!(v.voice_settings.prefs.output_volume, 100);
+            assert!(!v.voice_settings_action(Action::ToggleTheme, cx));
+        });
+    });
+    voice.read_with(&*visual, |panel, _| {
+        let controls = panel.test_controls();
+        assert!(
+            controls.input.is_none() || controls.input.as_deref() == Some(""),
+            "reset selects the system input"
+        );
+        assert_eq!(controls.output.as_deref(), Some(""));
+        assert_eq!(controls.bitrate_kbps, Some(64));
+        assert_eq!(controls.output_gain, Some(1.0));
+        assert!((controls.input_gain - 1.0).abs() < 1e-6);
+        assert!(!panel.test_push_to_talk(), "reset keeps voice activity");
+    });
+}
+
+#[gpui::test]
+async fn closing_the_dialog_stops_the_voice_meter(cx: &mut TestAppContext) {
+    let (mut visual, view, _voice) = fixture(cx);
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            v.active_settings = Some(SettingsKind::Personal);
+            v.personal.as_mut().unwrap().dialog.active = 1;
+            v.start_voice_meter(cx);
+            let epoch = v.voice_settings.meter_epoch;
+            assert!(v.voice_settings.preview.is_none());
+            v.close_settings(false, window, cx);
+            assert!(v.active_settings.is_none());
+            assert!(
+                v.voice_settings.meter_epoch > epoch,
+                "closing bumps the epoch, so a late tick stops"
+            );
+        });
+    });
+}
+
+#[gpui::test]
 async fn the_room_keeps_the_current_palette(cx: &mut TestAppContext) {
     let (visual, view, voice) = fixture(cx);
     // A real theme switch reaches an already running panel.
@@ -782,6 +893,7 @@ async fn applied_audio_update_reaches_the_panel(cx: &mut TestAppContext) {
         noise_mode: "auto",
         echo_cancellation: true,
         auto_gain_control: true,
+        software_mixer: true,
     };
     let expected = applied.clone();
     visual.update(|window, app| {

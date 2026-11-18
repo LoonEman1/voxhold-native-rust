@@ -190,6 +190,7 @@ fn a_missing_saved_microphone_does_not_fail_the_join() {
                 noise_mode,
                 echo_cancellation,
                 auto_gain_control,
+                ..
             } => {
                 applied = Some((capture, noise_mode, echo_cancellation, auto_gain_control));
             }
@@ -198,7 +199,7 @@ fn a_missing_saved_microphone_does_not_fail_the_join() {
     }
     assert!(saw_device_error, "the fallback must be reported");
     match applied {
-        Some(("software", "auto", false, true)) | Some(("platform", "auto", true, true)) => {}
+        Some(("software", "auto", false, true)) | Some(("platform", "auto", false, true)) => {}
         other => panic!("unexpected fallback audio mode: {other:?}"),
     }
 }

@@ -37,14 +37,23 @@ pub enum Action {
     ConfirmDelete,
     CancelDelete,
     RefreshDevices,
-    SelectInput(usize),
-    SelectOutput(usize),
+    /// Stable endpoint id captured when the row was drawn. An index would
+    /// select a different device after a refresh, so the id is the identity.
+    SelectInput(String),
+    SelectOutput(String),
     SetVolume(&'static str, i64),
     SetBitrate(i64),
     ToggleSounds,
     SetNoiseMode(usize),
     SetInputMode(usize),
+    ToggleAutoGain,
     ResetVoice,
+    TestMicrophone,
+    TestTone,
+    /// Start recording a shortcut for `0` mute, `1` deafen, `2` push-to-talk.
+    RecordShortcut(usize),
+    /// Per-user room volume by the stable user id (0–200 %).
+    SetVoiceUserVolume(i64, i64),
     CropZoom(i32),
     CropX(i32),
     CropY(i32),

@@ -906,8 +906,8 @@ http_active,thumb_bytes,link_bytes,recording_bytes,workers,peers,live_textures
 | `R05` | В dev · PR [#14](https://github.com/LoonEman1/voxhold-native-rust/pull/14) · ветка `codex/r05-settings` | [`bf421cc`](https://github.com/LoonEman1/voxhold-native-rust/commit/bf421ccf386fb392d3f166a0d11b96d9e7ea2731) (merge `33d9a7a`): участники/присутствие, модальное дерево настроек, профиль/приватность, тема и уведомления, роли/хранилище/баны/CORS/диагностика, настройки канала и уведомления; Windows CI на `33d9a7a` успешен (run 43930378048), живой backend/кадры/два аккаунта не проверены | — |
 | `R06` | PR [#16](https://github.com/LoonEman1/voxhold-native-rust/pull/16) · ветка `codex/r06-recordings` | API list/get/preview/ticket/stream/delete, серверный снимок с `access_epoch`/tombstone/`recording.updated`, одна модалка из шапки и звонка, Windows save, клавиатура/клиппинг; тесты, release и размеры локально; живой backend, кадры/DPI и ручной GUI не проверены | — |
 | `R07a` | PR [#18](https://github.com/LoonEman1/voxhold-native-rust/pull/18) · ветка `codex/r07-voice-viewer` | Медиаслой: каталог/`viewer` с попытками, bounded `Requests`/`Updates`, BGRA и тесты кадра; UI: комната/док/плеер Go, PTT и устройства, GPUI-регрессии; живой backend, кадры и DPI не проверены | — |
-| `R07b` | К выполнению | — | — |
-| `W02b`–`W12` | В работе: `W02b` в ветке `codex/w-extensions` (`644fbb9`), ожидает ревью и PR; `W02c`–`W12` к выполнению | [Порядок работы](w-workflow.md) | — |
+| `R07b` | В dev · PR [#22](https://github.com/LoonEman1/voxhold-native-rust/pull/22) | `e1c0ff2` (merge `1547fa1`): software WinMM 48 кГц → APM → gate/gain → Opus, platform ADM fallback, typed DSP/`SelectInput`, endpoint IDs; тесты и release локально; живой звук/DPI не проверены | — |
+| `W02b`–`W12` | В работе: `W02b` (`644fbb9` + merge `fc9817d` с R07b) в ветке `codex/w-extensions`, ожидает ревью; `W02c`–`W12` к выполнению | [Порядок работы](w-workflow.md) | — |
 | `W13` (`R08`) | Итоговая приёмка после всех этапов реализации | — | — |
 
 ### R03 · Композер, вложения и медиа — журнал PR #12

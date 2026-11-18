@@ -642,44 +642,50 @@ release (процесс активен через 5 с).
 слышимый тест микрофона и звука. Input gain и тест звука относятся к
 `R07b`; peak meter комнаты читает реальный `MediaSource`, но DSP не измерен.
 
-## Срез W02b (17 ноября 2026, в работе)
+## Срез W02b (18 ноября 2026, в работе)
 
-База — `origin/dev` `993f6617a5dd6e4b6d3f0ed22f67d70fe8c22a15`, ветка
-`codex/w-extensions`. Коммит кода — `644fbb91ce56f3a7314ea73536a95e21c3f1b84d`.
-Независимое ревью, PR и merge ещё не выполнены; срез не объявляется принятым.
+База — `origin/dev` `e1c0ff2475abe7f71fa996bbb0961d7eba6602e4` (merge PR #22,
+`R07b`), ветка `codex/w-extensions`. W02b-код — `644fbb9`; влитие `dev` и
+интеграция R07b — `fc9817d`. PR [#21](https://github.com/LoonEman1/voxhold-native-rust/pull/21)
+остаётся draft, независимое ревью и merge ещё не выполнены; срез не
+объявляется принятым.
 
 - `src/voice_settings.rs` — шесть пресетов Go `24/32/48/64/96/128` (160
   убран), единая нормализация диапазонов/режимов/пустых сочетаний, атомарная
   запись через соседний temp-файл и `rename`, round trip JSON/файла. Reset
-  очищает и устройства, как `defaultVoicePreferences()` в Go.
+  очищает и устройства, как `defaultVoicePreferences()` в Go. Миграция
+  старых WinMM/interface-id входов в Core Audio endpoint id сохранена из
+  R07b.
 - `crates/voxhold-media/src/preview.rs` — порт `cmd/voxhold/audio_windows.go`:
   WinMM `MonitorInput` (3 буфера по `rate/20`, 50 мс, RMS, `min(1, sqrt*4.5)`,
   сглаживание `.45/.55`) и `PlayTest` (660/880 Гц, envelope, 16000·volume/100,
-  350 мс). Поток preview не входит в передачу и останавливается без join на
-  UI-потоке.
-- `crates/voxhold-media/src/capabilities.rs` — честная карта: bitrate
-  применяется, AEC/AGC/NS автоматические, output gain только 0 %,
-  input gain 1–200 и gate ждут `R07b`, WinMM-проверки доступны на Windows.
+  350 мс). Вход резолвится по endpoint id/имени, две одинаковые подписи не
+  открывают произвольный микрофон. Preview не входит в передачу и
+  останавливается без join на UI-потоке.
+- `crates/voxhold-media/src/capabilities.rs` — карта по фактическому тракту
+  R07b: software применяет gate/gain/AGC/NS; platform ADM включает NS/AGC
+  принудительно, а gain/gate не применяет; AEC в software недоступен без
+  render-reference; output gain 1–200 % остаётся за W02c.
 - `src/app/settings_voice_view.rs`, `voice_settings_ops.rs` — форма в
   существующем табе, meter 220 px с coral-риской, «Проверить микрофон»,
-  «Проверить» сигнал, сегменты режимов/битрейта, capability-строки.
-  Preview живёт только при открытой вкладке вне звонка; в звонке уровень
-  берётся из передачи. Hot-unplug перечитывает устройства; logout
-  останавливает preview/meter и сбрасывает pending/ошибки.
-- `src/voice_panel.rs`, `src/app/voice_ops.rs` — один
-  `apply_voice_prefs` (устройства, битрейт, оба gain) за один
-  `Command::State`. Input 0 % закрывает capture; локальный mute/PTT и
-  join/server mute остаются у прежних владельцев R07a. Явный выбор выхода
-  по-прежнему доходит до `Session::ViewOutput`.
-- Тесты: приложение 311 passed / 1 `ignored`, API 11, media 61.
-  `cargo fmt --all -- --check`, release build и проверка размеров (178
-  файлов) успешны; smoke release — процесс активен через 4 с.
+  «Проверить» сигнал, сегменты режимов/битрейта, AGC-toggle и capability-строки
+  с активным трактом. Preview живёт только при открытой вкладке вне звонка; в
+  звонке уровень берётся из pre-gate передачи. Hot-unplug перечитывает
+  устройства; logout останавливает preview/meter и сбрасывает pending/ошибки.
+- `src/voice_panel.rs`, `src/voice_panel/controls.rs`,
+  `src/app/voice_ops.rs` — один `apply_voice_prefs` snapshot (устройства,
+  битрейт, оба gain и DSP) за один `Command::State`. Явный выбор входа идёт
+  через `SelectInput` с поколением R07b, выход — через `select_output`;
+  локальный mute/PTT и join/server mute остаются у прежних владельцев R07a.
+- Тесты: приложение 314 passed / 1 `ignored`, API 11, media 103 (9 audio
+  probes `ignored`). `cargo fmt --all -- --check`, release build и проверка
+  размеров (187 файлов) успешны; smoke release — процесс активен через 4 с.
 
-Не проверено и почему: независимое ревью и PR не выполнялись; реальное
-аудиоустройство WinMM, слышимый тон, hot-unplug, GUI и DPI 125/150 не
-запускались; живой backend для этого среза не нужен. `R07b` отсутствует в
-`dev`, поэтому gate и input gain 1–200 сохранены, показаны и явно помечены
-как недействующие в текущей передаче. Сборка в этом окружении требует
-`VsDevCmd.bat -arch=x64` и короткий `CARGO_TARGET_DIR` (путь заголовка
-abseil в `target\w-extensions\target` достигает 262 символов); в репозиторий
-это не вносилось.
+Не проверено и почему: независимое ревью W02b после влития R07b ещё не
+выполнялось; реальное аудиоустройство WinMM, слышимый тон, горячий unplug,
+живой backend и браузер, GUI и DPI 125/150 не запускались. `AEC` нельзя
+объявлять работающим без render-reference и замера эха; output gain 1–200 %
+остаётся ограничением до W02c. Сборка в этом окружении требует
+`VsDevCmd.bat -arch=x64` и короткий `CARGO_TARGET_DIR` (путь заголовка abseil
+в `target\w-extensions\target` достигает 262 символов); в репозиторий это не
+вносилось.

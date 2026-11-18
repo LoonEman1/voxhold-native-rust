@@ -204,35 +204,62 @@ fn a_missing_saved_microphone_does_not_fail_the_join() {
 }
 
 #[test]
-fn a_software_track_waits_for_the_capture_thread_acknowledgement() {
+fn a_software_track_waits_for_its_own_capture_acknowledgement() {
     let factory = PeerConnectionFactory::default();
-    let source = libwebrtc::audio_source::native::NativeAudioSource::new(
+    let source_a = libwebrtc::audio_source::native::NativeAudioSource::new(
         capture::source_options(),
         capture::SAMPLE_RATE,
         capture::CHANNELS,
         0,
     );
-    let track = factory.create_audio_track("ack", source.clone());
+    let source_b = libwebrtc::audio_source::native::NativeAudioSource::new(
+        capture::source_options(),
+        capture::SAMPLE_RATE,
+        capture::CHANNELS,
+        0,
+    );
+    let track_a = factory.create_audio_track("ack-a", source_a.clone());
+    let track_b = factory.create_audio_track("ack-b", source_b.clone());
     let gate = CaptureGate::default();
-    gate.attach_source(track.clone(), source);
+    gate.attach_source(track_a.clone(), source_a, 11);
     gate.set_joined(true);
     gate.set_server_allowed(true);
     gate.set_local(true);
     assert!(
-        !track.enabled(),
+        !track_a.enabled(),
         "an opened software track must stay silent until the capture thread flushes"
     );
     let generation = gate.permission_epoch().load(Ordering::SeqCst);
-    gate.acknowledge(generation);
-    assert!(track.enabled(), "the acknowledged generation may transmit");
+    // Capture B may start before its track replaces A in the sender.
+    gate.acknowledge(12, generation);
+    assert!(
+        !track_a.enabled(),
+        "a different capture instance must not acknowledge A's old queue"
+    );
+    gate.acknowledge(11, generation);
+    assert!(
+        track_a.enabled(),
+        "the acknowledged generation may transmit"
+    );
     // A later mute/unmute edge must close the track again before the next
     // acknowledgement, so an old block stuck in the sender cannot leak.
     gate.set_local(false);
     gate.set_local(true);
     assert!(
-        !track.enabled(),
+        !track_a.enabled(),
         "a new generation must wait for its own flush acknowledgement"
     );
+    // Replacing the sender track resets the acknowledgement. A's late ack
+    // must not enable B, and B must acknowledge its own generation.
+    gate.attach_source(track_b.clone(), source_b, 12);
+    let generation = gate.permission_epoch().load(Ordering::SeqCst);
+    gate.acknowledge(11, generation);
+    assert!(
+        !track_b.enabled(),
+        "the old capture cannot enable the new track"
+    );
+    gate.acknowledge(12, generation);
+    assert!(track_b.enabled());
 }
 
 #[test]
@@ -262,7 +289,7 @@ fn platform_watchdog_requires_pcm_not_just_initialization() {
             Duration::from_secs(3),
             Duration::from_secs(30)
         ),
-        "a stopped captured-sample counter must trigger recovery"
+        "a stopped captured-duration counter must trigger recovery"
     );
     assert!(
         !output::platform_input_stalled(

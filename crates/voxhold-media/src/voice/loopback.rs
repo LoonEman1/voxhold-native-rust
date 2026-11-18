@@ -16,6 +16,7 @@ use libwebrtc::{
     media_stream_track::MediaStreamTrack,
     peer_connection::{AnswerOptions, OfferOptions, PeerConnection, PeerConnectionState},
     peer_connection_factory::{PeerConnectionFactory, native::PeerConnectionFactoryExt},
+    stats::RtcStats,
 };
 use tokio::time::{Duration, Instant, sleep};
 use tokio_stream::StreamExt;
@@ -148,7 +149,17 @@ fn analyse(frames: &[f32]) -> (f32, f32, f32) {
     (before, tone, after)
 }
 
-async fn run(mode: NoiseMode) -> Result<(f32, f32, f32), &'static str> {
+fn captured_duration(stats: Vec<RtcStats>) -> f64 {
+    stats
+        .into_iter()
+        .filter_map(|stat| match stat {
+            RtcStats::MediaSource(source) => Some(source.audio.total_samples_duration),
+            _ => None,
+        })
+        .fold(0.0_f64, f64::max)
+}
+
+async fn run(mode: NoiseMode) -> Result<(f32, f32, f32, f64, f64), &'static str> {
     let factory = PeerConnectionFactory::default();
     let source = NativeAudioSource::new(
         AudioSourceOptions {
@@ -197,6 +208,7 @@ async fn run(mode: NoiseMode) -> Result<(f32, f32, f32), &'static str> {
         sleep(Duration::from_millis(25)).await;
     }
 
+    let captured_before = captured_duration(sender.get_stats().await.map_err(|_| "initial stats")?);
     let track = remote.lock().unwrap().take().ok_or("no remote track")?;
     let mut stream = NativeAudioStream::new(track, RATE as i32, 1);
     let frames = Arc::new(Mutex::new(Vec::new()));
@@ -219,6 +231,7 @@ async fn run(mode: NoiseMode) -> Result<(f32, f32, f32), &'static str> {
     };
     play(&source, &params, &fixture[start..]).await;
     sleep(Duration::from_millis(900)).await;
+    let captured_after = captured_duration(sender.get_stats().await.map_err(|_| "final stats")?);
     reader.abort();
     let _ = reader.await;
     let frames = frames.lock().unwrap().clone();
@@ -227,7 +240,8 @@ async fn run(mode: NoiseMode) -> Result<(f32, f32, f32), &'static str> {
     if frames.len() < 200 {
         return Err("too few decoded frames");
     }
-    Ok(analyse(&frames))
+    let (before, tone, after) = analyse(&frames);
+    Ok((before, tone, after, captured_before, captured_after))
 }
 
 #[test]
@@ -236,11 +250,16 @@ fn threshold_gate_and_auto_noise_survive_opus_round_trip() {
         .enable_all()
         .build()
         .unwrap();
-    let (threshold_noise, tone, threshold_tail) =
+    let (threshold_noise, tone, threshold_tail, threshold_before, threshold_after) =
         runtime.block_on(run(NoiseMode::Threshold)).unwrap();
-    let (auto_noise, auto_tone, auto_tail) = runtime.block_on(run(NoiseMode::Auto)).unwrap();
+    let (auto_noise, auto_tone, auto_tail, auto_before, auto_after) =
+        runtime.block_on(run(NoiseMode::Auto)).unwrap();
     println!(
-        "threshold noise {threshold_noise:.1} dBFS, tone {tone:.1} dBFS, tail {threshold_tail:.1} dBFS; auto noise {auto_noise:.1} dBFS, tone {auto_tone:.1} dBFS, tail {auto_tail:.1} dBFS"
+        "threshold noise {threshold_noise:.1} dBFS, tone {tone:.1} dBFS, tail {threshold_tail:.1} dBFS, captured {threshold_before:.3}->{threshold_after:.3} s; auto noise {auto_noise:.1} dBFS, tone {auto_tone:.1} dBFS, tail {auto_tail:.1} dBFS, captured {auto_before:.3}->{auto_after:.3} s"
+    );
+    assert!(
+        threshold_after > threshold_before && auto_after > auto_before,
+        "the pinned WebRTC stats must report growing total_samples_duration: {threshold_before}->{threshold_after}, {auto_before}->{auto_after}"
     );
     assert!(
         threshold_noise < -60.0,

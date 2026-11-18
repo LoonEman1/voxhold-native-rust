@@ -145,9 +145,11 @@ struct Session {
     /// When the current capture path was opened. Used for the startup grace
     /// before the platform path is expected to report PCM.
     input_started_at: std::time::Instant,
-    /// Last `total_samples_captured` from the platform ADM's audio source.
+    /// Last `total_samples_duration` from the platform ADM's audio source.
+    /// The pinned WebRTC build does not populate `total_samples_captured`, so
+    /// this cumulative duration is the real proof that PCM is arriving.
     /// `None` means the stats have not reported yet.
-    input_samples: Option<u64>,
+    input_duration: Option<f64>,
     /// The peer has connected since the platform path was opened. The ADM
     /// watchdog starts its startup grace from this point, not from the device
     /// switch.
@@ -390,8 +392,8 @@ impl Session {
             let sender = peer
                 .add_track(MediaStreamTrack::Audio(track.clone()), &["voxhold-voice"])
                 .map_err(|_| "Не удалось подключить микрофон к WebRTC.")?;
-            if software_mic.is_some() {
-                capture.attach_source(track, source);
+            if let Some(mic) = &software_mic {
+                capture.attach_source(track, source, mic.id());
             } else {
                 capture.attach(track);
             }
@@ -435,7 +437,7 @@ impl Session {
             input_progress,
             input_progress_at: std::time::Instant::now(),
             input_started_at: std::time::Instant::now(),
-            input_samples: None,
+            input_duration: None,
             input_connected: false,
             input_recovery_failed: false,
             input_reopen_attempted: false,
@@ -799,9 +801,9 @@ impl Session {
                         // The platform ADM has no software block counter. Its
                         // cumulative captured-sample count is the real proof
                         // that recording is still delivering PCM.
-                        let total = source.audio.total_samples_captured;
-                        if self.input_samples != Some(total) {
-                            self.input_samples = Some(total);
+                        let total = source.audio.total_samples_duration;
+                        if self.input_duration != Some(total) {
+                            self.input_duration = Some(total);
                             self.input_progress_at = std::time::Instant::now();
                         }
                     }

@@ -51,8 +51,8 @@ impl OutputState {
 }
 
 /// The platform ADM is stale when it is no longer initialized, when its
-/// captured-sample count stopped moving, or when it never reported any samples
-/// after the transport connected.
+/// captured-sample duration stopped moving, or when it never reported any
+/// capture after the transport connected.
 pub(super) fn platform_input_stalled(
     running: bool,
     connected: bool,
@@ -193,7 +193,7 @@ impl Session {
                 // connected baseline first.
                 self.input_connected
                     && self.peer.connection_state() == PeerConnectionState::Connected,
-                self.input_samples.is_some(),
+                self.input_duration.is_some(),
                 self.input_progress_at.elapsed(),
                 self.input_started_at.elapsed(),
             );

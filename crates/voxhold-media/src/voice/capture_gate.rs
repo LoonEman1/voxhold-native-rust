@@ -32,10 +32,14 @@ struct CaptureState {
     /// queued `State` command.
     params: Arc<Mutex<AudioParams>>,
     source: Option<libwebrtc::audio_source::native::NativeAudioSource>,
+    /// Identity of the capture instance currently feeding `source`. A new
+    /// capture may start before its track replaces the sender, so its
+    /// acknowledgement must never enable the previous track.
+    capture: Option<u64>,
     /// Newest permission generation whose old WinMM buffers were flushed and
-    /// discarded by the capture thread. A software track stays disabled until
-    /// this catches up with `CaptureGate::epoch`.
-    acked: u64,
+    /// discarded by `capture`. A software track stays disabled until this
+    /// catches up with `CaptureGate::epoch`.
+    acked: Option<u64>,
 }
 
 impl CaptureGate {
@@ -48,7 +52,11 @@ impl CaptureGate {
     /// so its track follows the permission flags directly.
     fn track_enabled(&self, state: &CaptureState) -> bool {
         Self::is_enabled(state)
-            && (state.source.is_none() || state.acked >= self.epoch.load(Ordering::Acquire))
+            && (state.source.is_none()
+                || (state.capture.is_some()
+                    && state
+                        .acked
+                        .is_some_and(|acked| acked >= self.epoch.load(Ordering::Acquire))))
     }
 
     fn apply(&self, state: &CaptureState) {
@@ -132,6 +140,8 @@ impl CaptureGate {
             track.set_enabled(false);
         }
         state.source = None;
+        state.capture = None;
+        state.acked = None;
         if Self::is_enabled(&state) != was {
             self.bump();
         }
@@ -172,6 +182,8 @@ impl CaptureGate {
         let mut state = self.state.lock().unwrap();
         state.track = Some(track);
         state.source = None;
+        state.capture = None;
+        state.acked = None;
         self.apply(&state);
     }
 
@@ -181,18 +193,30 @@ impl CaptureGate {
         &self,
         track: RtcAudioTrack,
         source: libwebrtc::audio_source::native::NativeAudioSource,
+        capture: u64,
     ) {
         let mut state = self.state.lock().unwrap();
         state.track = Some(track);
         state.source = Some(source);
+        state.capture = Some(capture);
+        state.acked = None;
         self.apply(&state);
     }
 
-    /// The capture thread has dropped every buffer from before `generation`
-    /// and flushed WinMM. Only now may the software track transmit again.
-    pub(crate) fn acknowledge(&self, generation: u64) {
+    /// The capture thread `capture` has dropped every buffer from before
+    /// `generation` and flushed WinMM. Only its own track may transmit again;
+    /// a newer capture that started before `set_track` cannot acknowledge the
+    /// old track.
+    pub(crate) fn acknowledge(&self, capture: u64, generation: u64) {
         let mut state = self.state.lock().unwrap();
-        state.acked = state.acked.max(generation);
+        if state.capture != Some(capture) {
+            return;
+        }
+        state.acked = Some(
+            state
+                .acked
+                .map_or(generation, |acked| acked.max(generation)),
+        );
         self.apply(&state);
     }
 
@@ -202,6 +226,8 @@ impl CaptureGate {
             track.set_enabled(false);
         }
         state.source = None;
+        state.capture = None;
+        state.acked = None;
     }
 
     /// Test hook: the gate state is the one applied to the capture track.

@@ -76,6 +76,7 @@ impl Session {
             Some(self.capture.clone()),
             self.events.clone(),
         );
+        let capture_id = mic.id();
         mic.start(input.as_deref())
             .map_err(|_| "Выбранный микрофон недоступен.")?;
         let track = self
@@ -99,11 +100,11 @@ impl Session {
             self.audio.stop(true);
         }
         self.audio.set_recording(false);
-        self.capture.attach_source(track, source);
+        self.capture.attach_source(track, source, capture_id);
         self.input_progress = mic.progress();
         self.input_progress_at = std::time::Instant::now();
         self.input_started_at = std::time::Instant::now();
-        self.input_samples = None;
+        self.input_duration = None;
         self.input_connected = false;
         self.input_stable_since = None;
         self.mic = Some(mic);
@@ -171,7 +172,7 @@ impl Session {
         self.input_progress = 0;
         self.input_progress_at = std::time::Instant::now();
         self.input_started_at = std::time::Instant::now();
-        self.input_samples = None;
+        self.input_duration = None;
         self.input_connected = false;
         self.input_stable_since = None;
         self.controls.input = input.clone();

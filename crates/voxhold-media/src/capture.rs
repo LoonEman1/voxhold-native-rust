@@ -193,6 +193,9 @@ impl BlockProcessor {
 }
 
 pub struct MicCapture {
+    /// Unique software capture instance. A gate acknowledgement is only valid
+    /// for the track currently attached to this instance.
+    id: u64,
     source: NativeAudioSource,
     params: Arc<Mutex<AudioParams>>,
     epoch: Arc<std::sync::atomic::AtomicU64>,
@@ -214,7 +217,9 @@ impl MicCapture {
         gate: Option<Arc<CaptureGate>>,
         events: Arc<Events>,
     ) -> Self {
+        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         Self {
+            id: NEXT_ID.fetch_add(1, Ordering::SeqCst),
             source,
             params,
             epoch,
@@ -225,6 +230,10 @@ impl MicCapture {
             progress: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             thread: None,
         }
+    }
+
+    pub(crate) fn id(&self) -> u64 {
+        self.id
     }
 
     /// The driver stopped delivering or requeueing buffers. The session polls
@@ -250,6 +259,7 @@ impl MicCapture {
         self.stop();
         self.stop = Arc::new(AtomicBool::new(false));
         self.failed = Arc::new(AtomicBool::new(false));
+        let id = self.id;
         let source = self.source.clone();
         let params = self.params.clone();
         let epoch = self.epoch.clone();
@@ -263,7 +273,7 @@ impl MicCapture {
                 .name("voxhold-mic".into())
                 .spawn(move || {
                     capture_loop(
-                        device, source, params, epoch, gate, events, stop, failed, progress,
+                        id, device, source, params, epoch, gate, events, stop, failed, progress,
                     )
                 })
                 .map_err(|_| "Не удалось запустить поток микрофона.".to_owned())?,
@@ -286,6 +296,7 @@ impl Drop for MicCapture {
 }
 
 fn capture_loop(
+    capture: u64,
     mut device: WinIn,
     source: NativeAudioSource,
     params: Arc<Mutex<AudioParams>>,
@@ -322,10 +333,13 @@ fn capture_loop(
                 failed.store(true, Ordering::Release);
                 break;
             }
-            if let Some(gate) = &gate {
-                gate.acknowledge(generation);
-            }
             acknowledged = true;
+        }
+        // Acknowledge every pass, not only a changed generation. A new capture
+        // may start before its track replaces the sender; its acknowledgement
+        // must become effective only after `attach_source` names this instance.
+        if let Some(gate) = &gate {
+            gate.acknowledge(capture, generation);
         }
         device.completed(|samples| pending.push(samples, generation));
         if device.failed() {

@@ -13,6 +13,7 @@ mod draft;
 mod file_io;
 mod history;
 mod inbox;
+mod instance_prefs;
 mod layout;
 mod links;
 mod media;
@@ -81,6 +82,7 @@ fn parse_args() -> (String, Option<std::path::PathBuf>, f32, f32) {
 
 fn main() {
     let (server, layout_path, width, height) = parse_args();
+    let instance_path = instance_prefs::InstancePrefs::default_path();
     Application::new()
         .with_assets(assets::Assets::discover())
         .run(move |cx: &mut App| {
@@ -93,6 +95,7 @@ fn main() {
             let bounds = Bounds::centered(None, size(px(width), px(height)), cx);
             let prefill = server.clone();
             let layout_path = layout_path.clone();
+            let instance_path = instance_path.clone();
             cx.open_window(
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
@@ -105,7 +108,15 @@ fn main() {
                     ..Default::default()
                 },
                 move |window, cx| {
-                    let view = cx.new(|cx| Voxhold::new(window, cx, &prefill, layout_path.clone()));
+                    let view = cx.new(|cx| {
+                        Voxhold::new(
+                            window,
+                            cx,
+                            &prefill,
+                            layout_path.clone(),
+                            instance_path.clone(),
+                        )
+                    });
                     #[cfg(feature = "voxhold-media")]
                     view.update(cx, |view, cx| view.install_power(window, cx));
                     cx.new(|cx| Root::new(view.into(), window, cx))

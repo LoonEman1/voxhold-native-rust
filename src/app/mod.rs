@@ -69,9 +69,9 @@ use voxhold_api::{Channel, ChannelSubscription, Client, Member, Message, Server}
 #[cfg(feature = "voxhold-media")]
 use crate::voice_panel;
 use crate::{
-    attachments, auth, auth_session, background, channel_settings, draft, inbox, layout, links,
-    media, members, message_tools, personal_settings, reactions, recordings, recordings_dialog,
-    search, server_settings, theme, thread_panel, window_chrome,
+    attachments, auth, auth_session, background, channel_settings, draft, inbox, instance_prefs,
+    layout, links, media, members, message_tools, personal_settings, reactions, recordings,
+    recordings_dialog, search, server_settings, theme, thread_panel, window_chrome,
 };
 use ui::{icon, ink};
 
@@ -411,6 +411,9 @@ pub(crate) struct Voxhold {
     system_light: bool,
     shell: layout::Settings,
     shell_path: Option<std::path::PathBuf>,
+    /// Local "remember instance" preference. `None` or an empty path means the
+    /// write is a no-op (tests); the shipped app always has a real path.
+    instance_path: Option<std::path::PathBuf>,
     shell_initialized: bool,
     drag: Option<SplitterDrag>,
     viewport: (f32, f32),
@@ -478,6 +481,7 @@ impl Voxhold {
         cx: &mut Context<Self>,
         prefill: &str,
         shell_path: Option<std::path::PathBuf>,
+        instance_path: Option<std::path::PathBuf>,
     ) -> Self {
         #[cfg(feature = "voxhold-media")]
         cx.bind_keys([
@@ -504,6 +508,22 @@ impl Voxhold {
             .as_deref()
             .map(layout::Settings::load)
             .unwrap_or_default();
+        let saved_instance = instance_path
+            .as_deref()
+            .map(instance_prefs::InstancePrefs::load)
+            .unwrap_or_default();
+        let prefill = prefill.trim();
+        // An explicit CLI target always wins over the saved address. The saved
+        // checkbox state is kept, but the saved origin never replaces what the
+        // operator typed. Without a CLI target a valid remembered origin fills
+        // the field and the screen still waits for confirmation.
+        let (start_address, start_remember) = if !prefill.is_empty() {
+            (prefill.to_string(), saved_instance.remember)
+        } else if saved_instance.remember {
+            (saved_instance.instance.clone().unwrap_or_default(), true)
+        } else {
+            (String::new(), false)
+        };
         let recent_reactions = reactions::SharedRecents::default();
         let reaction_picker =
             cx.new(|cx| reactions::ReactionPicker::new(recent_reactions.clone(), window, cx));
@@ -515,7 +535,11 @@ impl Voxhold {
             .map(crate::voice_settings::path_from_layout);
         let view = Self {
             runtime: std::sync::Arc::new(tokio::runtime::Runtime::new().expect("Tokio runtime")),
-            instance: cx.new(|cx| InputState::new(window, cx).placeholder("https://example.com")),
+            instance: cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder("https://example.com")
+                    .default_value(start_address.clone())
+            }),
             username: cx.new(|cx| InputState::new(window, cx).placeholder("например, neva")),
             password: cx.new(|cx| {
                 InputState::new(window, cx)
@@ -681,13 +705,18 @@ impl Voxhold {
             busy: false,
             generation: 0,
             drafts: draft::Drafts::shared(),
-            auth: auth::AuthState::with_prefill(prefill),
+            auth: {
+                let mut auth = auth::AuthState::with_prefill(&start_address);
+                auth.remember_instance = start_remember;
+                auth
+            },
             palette: theme::Palette::resolve(theme_mode, system_light),
             theme_mode,
             theme_path,
             system_light,
             shell,
             shell_path,
+            instance_path,
             shell_initialized: false,
             drag: None,
             viewport: (0.0, 0.0),

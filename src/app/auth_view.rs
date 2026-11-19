@@ -724,6 +724,52 @@ impl Voxhold {
         if instance {
             let field = self.instance.clone();
             root = root.child(self.auth_field(&field, l.user, compact, cx));
+            // A separate checkbox under the address field. It owns only the
+            // preference; the origin is written after the form is confirmed.
+            let checked = self.auth.remember_instance;
+            let box_bg = if checked { p.lime } else { p.field_bg };
+            let box_border = if checked { p.lime } else { p.field_border };
+            root = root.child(
+                div()
+                    .id("auth-remember-instance")
+                    .debug_selector(|| "auth-remember-instance".into())
+                    .absolute()
+                    .left(px(l.remember.x))
+                    .top(px(l.remember.y))
+                    .w(px(l.remember.w))
+                    .h(px(l.remember.h))
+                    .cursor_pointer()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .on_click(cx.listener(|s, _, _, cx| {
+                        s.auth.remember_instance = !s.auth.remember_instance;
+                        cx.notify();
+                    }))
+                    .child(
+                        div()
+                            .w(px(18.))
+                            .h(px(18.))
+                            .rounded(px(4.))
+                            .bg(ink(box_bg))
+                            .border_1()
+                            .border_color(ink(box_border))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(if checked {
+                                icon("icons/check.svg", 12., ink(p.accent_button_ink))
+                            } else {
+                                div().into_any_element()
+                            }),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(13.))
+                            .text_color(ink(p.muted))
+                            .child("Запомнить адрес"),
+                    ),
+            );
         } else {
             let username = self.username.clone();
             let password = self.password.clone();

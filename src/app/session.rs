@@ -3,16 +3,29 @@ use super::*;
 impl Voxhold {
     pub(super) fn submit_instance(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let raw = self.instance.read(cx).value().to_string();
-        if self.auth.submit_instance(&raw).is_some() {
-            // Show the canonical origin that the login step and the session
-            // will use (no trailing slash, no default port).
-            let origin = self.auth.origin.clone();
-            self.instance.update(cx, |input, cx| {
-                input.set_value(origin, window, cx);
-            });
-            self.username
-                .update(cx, |input, cx| input.focus(window, cx));
+        let Some(origin) = self.auth.submit_instance(&raw) else {
+            cx.notify();
+            return;
+        };
+        // The address is confirmed: the canonical origin and the transition to
+        // the login step stand even when the local preference cannot be
+        // written. The checkbox state is persisted with the origin, so an
+        // unchecked box also clears a previously remembered address.
+        let prefs = crate::instance_prefs::InstancePrefs {
+            remember: self.auth.remember_instance,
+            instance: Some(origin.clone()),
+        };
+        let path = self.instance_path.clone().unwrap_or_default();
+        if prefs.save(&path).is_err() {
+            self.auth.status = crate::instance_prefs::SAVE_ERROR.to_string();
         }
+        // Show the canonical origin that the login step and the session
+        // will use (no trailing slash, no default port).
+        self.instance.update(cx, |input, cx| {
+            input.set_value(origin, window, cx);
+        });
+        self.username
+            .update(cx, |input, cx| input.focus(window, cx));
         cx.notify();
     }
 
@@ -193,6 +206,7 @@ impl Voxhold {
             .as_ref()
             .map(|session| session.origin().to_owned())
             .unwrap_or_else(|| self.auth.origin.clone());
+        let remember_instance = self.auth.remember_instance;
         self.session = None;
         self.session_epoch = self.session_epoch.wrapping_add(1);
         self.session_gate.reset();
@@ -315,6 +329,7 @@ impl Voxhold {
         self.auth = auth::AuthState::with_prefill(&origin);
         self.auth.screen = auth::AuthScreen::Login;
         self.auth.status = reason;
+        self.auth.remember_instance = remember_instance;
         self.username
             .update(cx, |input, cx| input.set_value("", window, cx));
         self.composer

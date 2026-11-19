@@ -3,23 +3,38 @@ use gpui::{TestAppContext, VisualTestContext};
 use gpui_component::Root;
 
 /// Build the real root view in a test window without touching the user's
-/// preferences: the layout file points at a fresh temporary path. The window
-/// root must be `gpui_component::Root`, exactly like the shipped window.
-fn add_auth_window(cx: &mut TestAppContext) -> (gpui::WindowHandle<Root>, Entity<Voxhold>) {
-    let shell = std::env::temp_dir().join(format!(
-        "voxhold-ui-test-{}-{}.json",
-        std::process::id(),
-        uuid::Uuid::new_v4()
-    ));
+/// preferences: the layout and instance files point at a fresh temporary
+/// directory. The window root must be `gpui_component::Root`, exactly like the
+/// shipped window.
+fn add_auth_window_with(
+    cx: &mut TestAppContext,
+    prefill: &str,
+    shell: std::path::PathBuf,
+    instance: std::path::PathBuf,
+) -> (gpui::WindowHandle<Root>, Entity<Voxhold>) {
     let slot: std::rc::Rc<std::cell::RefCell<Option<Entity<Voxhold>>>> = Default::default();
     let captured = slot.clone();
     let window = cx.add_window(move |window, cx| {
-        let view = cx.new(|cx| Voxhold::new(window, cx, "", Some(shell)));
+        let view = cx.new(|cx| Voxhold::new(window, cx, prefill, Some(shell), Some(instance)));
         *captured.borrow_mut() = Some(view.clone());
         Root::new(view.into(), window, cx)
     });
     let view = slot.borrow().clone().expect("view");
     (window, view)
+}
+
+fn add_auth_window(cx: &mut TestAppContext) -> (gpui::WindowHandle<Root>, Entity<Voxhold>) {
+    let dir = std::env::temp_dir().join(format!(
+        "voxhold-ui-test-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    add_auth_window_with(
+        cx,
+        "",
+        dir.join("workspace-layout.json"),
+        dir.join("instance.json"),
+    )
 }
 
 fn focus_field(
@@ -909,6 +924,7 @@ mod auth_session_tests;
 mod fixes;
 mod followup;
 mod followup2;
+mod instance_tests;
 mod media;
 mod r04;
 mod review;

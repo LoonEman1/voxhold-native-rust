@@ -41,6 +41,9 @@ pub struct AuthState {
     pub username: String,
     pub status: String,
     pub busy: bool,
+    /// The «Запомнить адрес» checkbox. The value is persisted only after the
+    /// address step is confirmed; toggling alone never writes a file.
+    pub remember_instance: bool,
     login_attempt: u64,
 }
 
@@ -52,12 +55,13 @@ impl AuthState {
             username: String::new(),
             status: String::new(),
             busy: false,
+            remember_instance: false,
             login_attempt: 0,
         }
     }
 
-    /// The `-server` flag only prefills the address; the operator still
-    /// confirms it. Go keeps the same first screen.
+    /// The `-server` flag and a remembered origin only prefill the address; the
+    /// operator still confirms it. Go keeps the same first screen.
     pub fn with_prefill(prefill: &str) -> Self {
         Self::new(prefill)
     }
@@ -170,6 +174,9 @@ pub struct AuthLayout {
     pub user: Rect,
     pub password: Rect,
     pub primary: Rect,
+    /// «Запомнить адрес» on the instance step. Empty on the login step, where
+    /// the geometry must stay identical to the reference.
+    pub remember: Rect,
     pub toggle: Rect,
     pub error: Rect,
     pub preview: Rect,
@@ -224,7 +231,7 @@ pub fn layout_auth(w: f32, h: f32, instance: bool, has_error: bool) -> AuthLayou
         content_height += 63.0;
     }
     if instance {
-        content_height = 228.0;
+        content_height = 253.0;
         if w <= 720.0 {
             content_height += 63.0;
         }
@@ -242,13 +249,19 @@ pub fn layout_auth(w: f32, h: f32, instance: bool, has_error: bool) -> AuthLayou
     }
     let user;
     let mut password = Rect::new(0.0, 0.0, 0.0, 0.0);
+    let remember;
     let primary;
     if instance {
         user = Rect::new(x, y + 110.0, width, 47.0);
-        primary = Rect::new(x, y + 178.0, width, 50.0);
+        // The checkbox is a separate control under the address field. The
+        // primary button moves down by the row it adds, and the card grows by
+        // the same amount so nothing overlaps at any breakpoint.
+        remember = Rect::new(x, y + 169.0, width, 20.0);
+        primary = Rect::new(x, y + 203.0, width, 50.0);
     } else {
         user = Rect::new(x, y + heading_height + 51.0, width, 47.0);
         password = Rect::new(x, y + heading_height + 140.0, width, 47.0);
+        remember = Rect::new(0.0, 0.0, 0.0, 0.0);
         let error_offset = if has_error { 57.0 } else { 0.0 };
         primary = Rect::new(x, y + heading_height + 208.0 + error_offset, width, 50.0);
     }
@@ -311,6 +324,7 @@ pub fn layout_auth(w: f32, h: f32, instance: bool, has_error: bool) -> AuthLayou
         user,
         password,
         primary,
+        remember,
         toggle,
         error,
         preview,
@@ -484,6 +498,55 @@ mod tests {
     }
 
     #[test]
+    fn remember_checkbox_stays_between_the_field_and_the_button() {
+        for (width, height) in [
+            (390.0, 760.0),
+            (560.0, 800.0),
+            (720.0, 900.0),
+            (1280.0, 900.0),
+            // A short window clamps the card to the top; the row must still
+            // stay inside the card and clear of both neighbours.
+            (390.0, 600.0),
+            // The minimum window size: the card itself may not fit, but the
+            // checkbox must stay inside the card and the client area.
+            (320.0, 360.0),
+        ] {
+            for has_error in [false, true] {
+                let layout = layout_auth(width, height, true, has_error);
+                let row = layout.remember;
+                assert!(
+                    row.w > 100.0,
+                    "{width}x{height}: checkbox column is {} wide",
+                    row.w
+                );
+                assert!(row.h >= 18.0, "{width}x{height}: checkbox row too short");
+                assert!(
+                    row.y >= layout.user.bottom(),
+                    "{width}x{height}: checkbox covers the address field"
+                );
+                assert!(
+                    row.bottom() <= layout.primary.y,
+                    "{width}x{height}: checkbox covers the button"
+                );
+                assert!(
+                    row.x >= layout.card.x
+                        && row.right() <= layout.card.right()
+                        && row.y >= layout.card.y
+                        && row.bottom() <= layout.card.bottom(),
+                    "{width}x{height}: checkbox leaves the card"
+                );
+                assert!(
+                    row.bottom() <= height && row.right() <= width,
+                    "{width}x{height}: checkbox leaves the client area"
+                );
+            }
+        }
+        // The login step keeps its original geometry and has no checkbox.
+        let login = layout_auth(1280.0, 900.0, false, false);
+        assert!(login.remember.is_empty());
+    }
+
+    #[test]
     fn error_adds_a_row_and_moves_the_button() {
         let clean = layout_auth(1280.0, 900.0, false, false);
         let failed = layout_auth(1280.0, 900.0, false, true);
@@ -560,6 +623,7 @@ mod tests {
     #[test]
     fn submit_validates_like_go() {
         let mut auth = AuthState::new("");
+        assert!(!auth.remember_instance);
         assert_eq!(auth.submit_instance("http://example.com").as_deref(), None);
         assert_eq!(auth.status, "Введите корректный HTTPS-адрес инстанса");
         assert!(auth.is_instance());

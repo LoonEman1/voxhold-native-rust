@@ -7,7 +7,7 @@ use crate::publisher::{
     Access, Codec, Outcome as PublisherOutcome, Phase, PublishRequest, Publisher, Quality,
 };
 use crate::screen_capture::{ScreenSource, SourceKind};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 #[derive(Default)]
 struct DropCounter(Arc<AtomicUsize>);
@@ -411,6 +411,129 @@ fn a_new_publish_replaces_the_pending_preparation() {
     assert_eq!(signal_count(&finish.outcomes, "stream.start"), 1);
     wait_dropped(&first, "the replaced preparation");
     assert_eq!(second.count(), 0, "the accepted engine is still owned");
+}
+
+#[test]
+fn a_duplicate_ready_is_discarded_instead_of_replacing_the_accepted_engine() {
+    // A second `Ready` of the same attempt must never become the installed
+    // engine: the publisher already sent `stream.start`, so the new peer was
+    // never negotiated with the SFU.
+    let now = Instant::now();
+    let mut publisher = publisher();
+    let binding = binding(publisher.sharing().attempt, "me");
+    let accepted = DropCounter::default();
+    let first = finish_prep(
+        &mut publisher,
+        &binding,
+        &binding,
+        access(),
+        PrepEvent::Ready {
+            engine: FakeEngine::new(&accepted),
+            has_audio: true,
+        },
+        now,
+    );
+    assert!(first.engine.is_some(), "the first engine is accepted");
+    assert_eq!(signal_count(&first.outcomes, "stream.start"), 1);
+
+    let duplicate = DropCounter::default();
+    let second = finish_prep(
+        &mut publisher,
+        &binding,
+        &binding,
+        access(),
+        PrepEvent::Ready {
+            engine: FakeEngine::new(&duplicate),
+            has_audio: false,
+        },
+        now,
+    );
+    assert!(
+        second.engine.is_none(),
+        "a second Ready never becomes the current attempt"
+    );
+    assert!(second.discard.is_some(), "the declined engine is released");
+    assert!(
+        second.outcomes.is_empty(),
+        "the second Ready sends no stream.start/stop and no state: {:?}",
+        second.outcomes
+    );
+    drop(second);
+    assert_eq!(duplicate.count(), 1, "the declined engine is dropped");
+    assert_eq!(accepted.count(), 0, "the accepted engine is untouched");
+    assert_eq!(
+        publisher.sharing().attempt,
+        binding.attempt,
+        "the duplicate does not begin a new attempt"
+    );
+    assert!(
+        publisher.sharing().has_audio,
+        "the duplicate must not change the accepted audio flag"
+    );
+}
+
+#[test]
+fn a_revocation_wins_over_a_ready_engine_the_session_has_not_observed() {
+    // The exact order of `Live::poll_screen_prep`: the newest gate is applied
+    // before the preparation is polled. `Live` needs a socket, so this drives
+    // the same shared decision (`screen::apply_access`) over the same publisher
+    // and preparation state, in the worst case where the engine is already
+    // queued in the result channel and only the poll is missing.
+    let now = Instant::now();
+    let mut publisher = publisher();
+    let binding = binding(publisher.sharing().attempt, "me");
+    let dropped = DropCounter::default();
+    let worker = DropCounter(dropped.0.clone());
+    let prepared = Arc::new(AtomicBool::new(false));
+    let flag = prepared.clone();
+    let mut prep = Some(
+        ScreenPrep::start(binding, now, Duration::from_secs(5), move |_| {
+            let engine = FakeEngine::new(&worker);
+            flag.store(true, Ordering::SeqCst);
+            Ok((engine, false))
+        })
+        .expect("the preparation thread starts"),
+    );
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !prepared.load(Ordering::SeqCst) {
+        assert!(Instant::now() < deadline, "the fake capture did not finish");
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    // The worker sends the engine into the one-slot channel right after the
+    // closure; the session has not observed it yet.
+    std::thread::sleep(Duration::from_millis(50));
+
+    let mut current = ScreenAccess {
+        stream_permission: true,
+        slot_available: true,
+    };
+    let outcomes = super::super::screen::apply_access(
+        true,
+        &mut current,
+        &mut prep,
+        &mut publisher,
+        ScreenAccess {
+            stream_permission: false,
+            slot_available: true,
+        },
+    );
+    assert!(
+        prep.is_none(),
+        "the pending preparation is cancelled before it is observed"
+    );
+    assert_eq!(publisher.sharing().phase, Phase::Failed);
+    assert_eq!(
+        publisher.sharing().error.as_deref(),
+        Some("Нет права запускать трансляцию.")
+    );
+    assert_eq!(signal_count(&outcomes, "stream.start"), 0);
+    assert_eq!(
+        signal_count(&outcomes, "stream.stop"),
+        0,
+        "the engine never reached stream.start, so there is nothing to stop"
+    );
+    // The queued engine is released on the cancellation thread.
+    wait_dropped(&dropped, "the engine of the revoked preparation");
 }
 
 #[test]

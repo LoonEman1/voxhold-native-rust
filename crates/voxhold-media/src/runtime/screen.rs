@@ -3,11 +3,13 @@
 //! `VoiceHandle` methods only write bounded request slots; they never create a
 //! peer or a capture. The session worker owns `Publisher` and at most one
 //! `PublisherEngine`, applies the deterministic decisions and reports the
-//! result back as one coalesced `ScreenShare` update.
+//! result back as one coalesced `ScreenShare` update. Every engine that stops
+//! (accepted or rejected) is dropped on a short-lived release thread, so the
+//! loop never joins a capture or a peer worker.
 
 use super::*;
 use crate::publisher::engine::PublisherEngine;
-use crate::publisher::{Access, Outcome as PublisherOutcome};
+use crate::publisher::{Access, Outcome as PublisherOutcome, Publisher};
 use crate::runtime::prep::{
     PREP_BUDGET, PrepBinding, ScreenPrep, access_violation, cancel_prep, finish_prep,
 };
@@ -134,8 +136,10 @@ impl Live {
         while let Some(outcome) = work.pop_front() {
             match outcome {
                 PublisherOutcome::StartEngine { attempt, request } => {
-                    // A new attempt never shares a capture with the old one;
-                    // a preparation still opening a device is replaced.
+                    // A new attempt never reuses the old capture: the previous
+                    // engine is handed to the release thread (its close
+                    // overlaps the new device start) and a preparation still
+                    // opening a device is replaced.
                     self.release_engine();
                     let _ = cancel_prep(&mut self.prep, &mut self.publisher, None, Instant::now());
                     // Bind the capture to the gate the panel has right now.
@@ -154,7 +158,7 @@ impl Live {
                 }
                 PublisherOutcome::StopEngine => {
                     // A stop also covers a capture that is still opening, so
-                    // the device is released even when no engine exists yet.
+                    // the device starts closing even when no engine exists yet.
                     let _ = self.cancel_screen_prep(None);
                     self.release_engine();
                     self.screen_preview.clear();
@@ -218,8 +222,8 @@ impl Live {
     }
 
     /// Leave/logout/reconnect: the pending capture is cancelled and the running
-    /// one is released before the socket is touched, and a late picker of this
-    /// session is rejected.
+    /// one starts closing before the socket is touched (the join itself runs on
+    /// the release thread), and a late picker of this session is rejected.
     pub(super) async fn abandon_screen(&mut self, viewer: &mut Viewer) -> Result<(), SessionEnd> {
         let _ = self.cancel_screen_prep(None);
         let outcomes = self.publisher.abandon();
@@ -284,15 +288,13 @@ impl Live {
     /// pending a revocation cancels it and fails the attempt before its late
     /// engine can reach `stream.start`.
     pub(super) fn apply_screen_access(&mut self, access: ScreenAccess) -> Vec<PublisherOutcome> {
-        self.access = access;
-        self.publisher.set_access(self.access_value());
-        if self.prep.is_none() {
-            return Vec::new();
-        }
-        match access_violation(self.access_value()) {
-            Some(message) => self.cancel_screen_prep(Some(message)),
-            None => Vec::new(),
-        }
+        apply_access(
+            self.joined,
+            &mut self.access,
+            &mut self.prep,
+            &mut self.publisher,
+            access,
+        )
     }
 
     /// Pull the newest gate out of the shared last-value slot and apply it.
@@ -351,6 +353,9 @@ impl Live {
         now: Instant,
         viewer: &mut Viewer,
     ) -> Result<(), SessionEnd> {
+        // The newest gate is applied before the preparation is observed, so a
+        // revocation that arrived during the device start cancels the pending
+        // preparation instead of letting its engine become the attempt.
         let stale = self.refresh_screen_access();
         if !stale.is_empty() {
             self.apply_screen(stale, viewer).await?;
@@ -362,6 +367,13 @@ impl Live {
             return Ok(());
         };
         let current = self.prep_binding();
+        // Read immediately before the decision. A revocation that lands between
+        // this read and `publisher.engine_ready` can still emit `stream.start`.
+        // That narrow residue is not unhandled: the server ends a publication
+        // that lost the permission (`stream.stopped` with a permission/access
+        // reason) or refuses the start (`forbidden`), and `Publisher` already
+        // treats both as the terminal failure of this attempt. Re-reading here
+        // narrows the window; it does not claim to close it.
         let access = self.access_value();
         let finish = finish_prep(
             &mut self.publisher,
@@ -372,40 +384,109 @@ impl Live {
             now,
         );
         if let Some(engine) = finish.engine {
-            self.screen = Some(engine);
-            #[cfg(test)]
-            crate::live_probe::record_engine_started();
+            self.install_engine(engine);
         }
         if let Some(engine) = finish.discard {
             // A rejected engine already owns a capture and a peer. Release it
             // away from the session loop; `PublisherEngine::drop` may join the
-            // capture thread and must not stall a mute or a socket event.
-            release_off_loop(engine);
+            // capture thread and must not stall a mute or a socket event. It
+            // was never installed, so the live probe does not count it.
+            release_off_loop(engine, false);
         }
         self.apply_screen(finish.outcomes, viewer).await?;
         Ok(())
     }
 
-    /// Drop the capture engine of the previous attempt. `PublisherEngine::drop`
-    /// closes the command channel and joins the capture thread, so the release
-    /// reported to the live test means the capture is really gone.
+    /// Make the engine of the current attempt the only capture. A replaced
+    /// engine is handed to the release thread: installation must never join a
+    /// capture that is still closing.
+    fn install_engine(&mut self, engine: PublisherEngine) {
+        if let Some(previous) = self.screen.replace(engine) {
+            release_off_loop(previous, true);
+        }
+        #[cfg(test)]
+        crate::live_probe::record_engine_started();
+    }
+
+    /// Hand the current capture to the release thread. A stop, restart or leave
+    /// must not wait for `PublisherEngine::drop` to join the publisher worker
+    /// (up to `WORKER_JOIN_TIMEOUT`), and the release starts immediately: the
+    /// engine is gone from the session before this returns, and its worker
+    /// closes just after. A new capture may open while the old one finishes
+    /// closing; the desktop capturer supports that overlap.
     fn release_engine(&mut self) {
-        let previous = self.screen.take();
-        #[cfg(test)]
-        let had_engine = previous.is_some();
-        drop(previous);
-        #[cfg(test)]
-        if had_engine {
-            crate::live_probe::record_engine_stopped();
+        if let Some(previous) = self.screen.take() {
+            release_off_loop(previous, true);
         }
     }
 }
 
-/// Release a rejected engine on a short-lived thread.
-fn release_off_loop(engine: PublisherEngine) {
+/// Release a capture engine on a short-lived thread. `tracked` marks an engine
+/// that was installed as the current attempt: the live probe counts a release
+/// only after `PublisherEngine::drop` returned (its bounded join included), so
+/// the test never reports a capture as gone while it is still closing.
+fn release_off_loop(engine: PublisherEngine, tracked: bool) {
+    release_on_worker(engine, move || {
+        #[cfg(test)]
+        if tracked {
+            crate::live_probe::record_engine_stopped();
+        }
+        #[cfg(not(test))]
+        let _ = tracked;
+    });
+}
+
+/// The off-loop part, split out so it can be tested with a double whose drop is
+/// gated: the caller must return before the drop completes. If the release
+/// thread cannot be created the closure (and the engine) is dropped inline by
+/// `spawn`'s error path, which only happens when the process cannot create
+/// threads at all.
+pub(super) fn release_on_worker<E: Send + 'static>(
+    value: E,
+    released: impl FnOnce() + Send + 'static,
+) {
     let _ = thread::Builder::new()
         .name("voxhold-screen-release".into())
-        .spawn(move || drop(engine));
+        .spawn(move || {
+            drop(value);
+            released();
+        });
+}
+
+impl Drop for Live {
+    /// The session is going away (leave, a lost socket, a reconnect). The
+    /// running capture must still be stopped, but joining it here would hold
+    /// the voice worker for up to `WORKER_JOIN_TIMEOUT` after the leave
+    /// handshake; hand it to the same release thread as every other stop.
+    fn drop(&mut self) {
+        if let Some(engine) = self.screen.take() {
+            release_off_loop(engine, true);
+        }
+    }
+}
+
+/// Set the panel's gate. A revocation while a preparation is pending cancels
+/// it and fails the attempt, so the engine of that preparation can never reach
+/// `stream.start`. `Live::poll_screen_prep` calls this before it observes the
+/// preparation: a gate that changed during the device start outranks a ready
+/// engine of the same attempt.
+pub(super) fn apply_access<E: Send + 'static>(
+    joined: bool,
+    access: &mut ScreenAccess,
+    prep: &mut Option<ScreenPrep<E>>,
+    publisher: &mut Publisher,
+    latest: ScreenAccess,
+) -> Vec<PublisherOutcome> {
+    *access = latest;
+    let gate = screen_access(joined, latest.stream_permission, latest.slot_available);
+    publisher.set_access(gate);
+    if prep.is_none() {
+        return Vec::new();
+    }
+    match access_violation(gate) {
+        Some(message) => cancel_prep(prep, publisher, Some(message), Instant::now()),
+        None => Vec::new(),
+    }
 }
 
 /// Access of the room as the worker sees it. `permission` and `slot` are the

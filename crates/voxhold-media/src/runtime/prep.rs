@@ -215,7 +215,8 @@ pub(super) fn cancel_prep<E: Send + 'static>(
 /// Apply one preparation event to the publisher. `stream.start` is released
 /// only for a result that still matches the current attempt, room, connection
 /// and gate; everything else is handed back as `discard` for an off-loop
-/// release and never touches the publisher.
+/// release and never touches the publisher. An engine the publisher declines
+/// (a duplicate `Ready` after `stream.start`) is discarded the same way.
 pub(super) fn finish_prep<E>(
     publisher: &mut Publisher,
     binding: &PrepBinding,
@@ -251,8 +252,21 @@ pub(super) fn finish_prep<E>(
                     ..PrepFinish::default()
                 };
             }
+            // The publisher accepts exactly one engine per attempt: it emits
+            // `stream.start` only while the attempt is still `Publishing` and
+            // has not sent it yet. An empty answer therefore means this engine
+            // was declined (the phase moved on or `stream.start` already left).
+            // Installing it anyway would let a duplicate `Ready` replace the
+            // accepted engine with an unnegotiated peer.
+            let outcomes = publisher.engine_ready(now, has_audio);
+            if outcomes.is_empty() {
+                return PrepFinish {
+                    discard: Some(engine),
+                    ..PrepFinish::default()
+                };
+            }
             PrepFinish {
-                outcomes: publisher.engine_ready(now, has_audio),
+                outcomes,
                 engine: Some(engine),
                 ..PrepFinish::default()
             }

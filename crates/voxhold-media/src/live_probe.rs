@@ -34,8 +34,12 @@ pub(crate) struct Sample {
     pub viewer_audio_packets: u64,
     /// Signaling kinds the session really sent, in order.
     pub signals: Vec<&'static str>,
-    /// Capture engines the runtime created and released; the release happens
-    /// after the engine thread joined, so it proves the capture is gone.
+    /// Capture engines the runtime created and released. A start is counted
+    /// when the engine became the current attempt; a stop is counted by the
+    /// release thread after `PublisherEngine::drop` returned (its bounded join
+    /// included), so the test never sees a capture as gone while it still
+    /// closes. A rejected engine that was never installed is not counted
+    /// either way.
     pub engines_started: u32,
     pub engines_stopped: u32,
 }
@@ -141,8 +145,8 @@ pub(crate) fn record_engine_started() {
     }
 }
 
-/// Called after the engine was dropped, which stops the capture thread and
-/// joins it.
+/// Called by the release thread after the engine was dropped, which stopped
+/// the capture thread and joined it.
 pub(crate) fn record_engine_stopped() {
     if !ENABLED.load(Ordering::Relaxed) {
         return;

@@ -313,16 +313,21 @@ fn wait_stats(handle: &VoiceHandle, mut sharing: Sharing) -> (Sharing, crate::li
     }
 }
 
-/// Stop the publication and wait for the worker to close the attempt.
-fn stop_and_wait(handle: &VoiceHandle) -> Duration {
+/// Stop the publication and wait for the worker to close the attempt. The
+/// engine stops on its own release thread, so the Idle snapshot can arrive
+/// before the probe counted the release; wait for both, bounded. Counting a
+/// release only after the engine was dropped keeps the probe honest without
+/// making the session loop wait for the join.
+fn stop_and_wait(handle: &VoiceHandle, expected_stopped: u32) -> Duration {
     let started = Instant::now();
     handle.stop_screen_share();
     let deadline = started + STOP_BUDGET;
+    let mut idle = false;
     loop {
         while let Some(update) = handle.try_update() {
             match update {
                 VoiceUpdate::ScreenShare(sharing) => match sharing.phase {
-                    Phase::Idle => return started.elapsed(),
+                    Phase::Idle => idle = true,
                     Phase::Failed => {
                         panic!("live: stop failed: {}", sharing.error.unwrap_or_default())
                     }
@@ -334,9 +339,17 @@ fn stop_and_wait(handle: &VoiceHandle) -> Duration {
                 _ => {}
             }
         }
+        if idle {
+            let stopped = crate::live_probe::sample()
+                .map(|sample| sample.engines_stopped)
+                .unwrap_or(0);
+            if stopped >= expected_stopped {
+                return started.elapsed();
+            }
+        }
         assert!(
             Instant::now() < deadline,
-            "live: the publication did not reach Idle within {STOP_BUDGET:?}"
+            "live: the publication did not reach Idle with {expected_stopped} released engines within {STOP_BUDGET:?}"
         );
         thread::sleep(POLL);
     }
@@ -585,7 +598,7 @@ fn live_stand_publishes_a_monitor_and_a_viewer_decodes_frames() {
         );
     }
 
-    let stopped = stop_and_wait(&publisher);
+    let stopped = stop_and_wait(&publisher, 2);
     let final_sample = crate::live_probe::sample().expect("live probe sample");
     let starts = final_sample
         .signals

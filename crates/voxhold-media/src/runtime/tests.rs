@@ -435,6 +435,72 @@ fn screen_publisher() -> crate::publisher::Publisher {
 }
 
 #[test]
+fn a_slow_engine_drop_does_not_block_the_release_path() {
+    use std::sync::{
+        Arc, Condvar, Mutex,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    /// A stand-in for `PublisherEngine` whose `Drop` takes as long as the gate
+    /// stays closed, like the bounded join of a capture/publisher worker. The
+    /// wait has its own timeout, so a release that ran on the caller's thread
+    /// fails the elapsed assertion instead of hanging the suite.
+    struct GatedEngine {
+        gate: Arc<(Mutex<bool>, Condvar)>,
+        released: Arc<AtomicBool>,
+    }
+
+    impl Drop for GatedEngine {
+        fn drop(&mut self) {
+            let (open, changed) = &*self.gate;
+            let mut open = open.lock().unwrap();
+            while !*open {
+                let (next, timeout) = changed.wait_timeout(open, Duration::from_secs(2)).unwrap();
+                open = next;
+                if timeout.timed_out() {
+                    break;
+                }
+            }
+            self.released.store(true, Ordering::SeqCst);
+        }
+    }
+
+    let gate = Arc::new((Mutex::new(false), Condvar::new()));
+    let released = Arc::new(AtomicBool::new(false));
+    let started = Instant::now();
+    // `screen::release_off_loop` is the same primitive plus the live probe; an
+    // engine that joins its worker for seconds must not hold the session loop.
+    super::screen::release_on_worker(
+        GatedEngine {
+            gate: gate.clone(),
+            released: released.clone(),
+        },
+        || {},
+    );
+    assert!(
+        started.elapsed() < Duration::from_millis(500),
+        "the session path waited for the engine drop: {:?}",
+        started.elapsed()
+    );
+    assert!(
+        !released.load(Ordering::SeqCst),
+        "the drop is still gated, so the caller must not have performed it"
+    );
+
+    // The engine is still released, just off the session path.
+    *gate.0.lock().unwrap() = true;
+    gate.1.notify_all();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !released.load(Ordering::SeqCst) {
+        assert!(
+            Instant::now() < deadline,
+            "the release thread never dropped the engine"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+#[test]
 fn a_failed_engine_start_cancels_the_attempt_without_stream_start() {
     use crate::publisher::{Outcome as PublisherOutcome, Phase};
     use crate::runtime::prep::{PrepBinding, PrepEvent, ScreenPrep, finish_prep};

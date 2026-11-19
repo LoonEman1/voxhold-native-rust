@@ -25,6 +25,7 @@ const CHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 const SECOND_CLEANUP_DELAY: Duration = Duration::from_secs(10);
 const PROGRESS_TICK: Duration = Duration::from_millis(100);
 const HELPER_NAME: &str = "voxhold-updater.exe";
+const PACKAGE_EXE_NAME: &str = "Voxhold.exe";
 const HANDSHAKE_NAME: &str = "handshake.ok";
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
@@ -665,6 +666,20 @@ impl Voxhold {
             cx.notify();
             return;
         }
+        // The helper copies the running image back into the installation by
+        // this name. A build under a different name (`voxhold-native-rust.exe`)
+        // must not make it fail after this process has already quit.
+        let Some(exe_name) = packaged_exe_name(&staged.app_dir, &self.update.exe_name) else {
+            self.update.phase = UpdatePhase::Error {
+                message: format!(
+                    "В обновлении нет исполняемого файла приложения ({}).",
+                    self.update.exe_name
+                ),
+                retry: RetryKind::Install,
+            };
+            cx.notify();
+            return;
+        };
         self.prepare_for_install(window, cx);
         let pid = std::process::id();
         let request = LaunchRequest {
@@ -677,7 +692,7 @@ impl Voxhold {
                 "--staged".into(),
                 staging_dir.into_os_string(),
                 "--exe".into(),
-                OsString::from(self.update.exe_name.clone()),
+                OsString::from(exe_name),
                 "--handshake".into(),
                 handshake.into_os_string(),
             ],
@@ -766,4 +781,19 @@ impl Voxhold {
         self.error = format!("Не удалось подтвердить запуск обновления: {message}");
         self.auth.status = self.error.clone();
     }
+}
+
+/// The image name the helper must copy back into the installation.
+///
+/// Prefers the name this process was started with, but only when the package
+/// actually contains it. A development build (`voxhold-native-rust.exe`) must
+/// fall back to the release name instead of failing after the app quit.
+fn packaged_exe_name(app_dir: &Path, running: &str) -> Option<String> {
+    if !running.is_empty() && app_dir.join(running).is_file() {
+        return Some(running.to_string());
+    }
+    if running != PACKAGE_EXE_NAME && app_dir.join(PACKAGE_EXE_NAME).is_file() {
+        return Some(PACKAGE_EXE_NAME.to_string());
+    }
+    None
 }

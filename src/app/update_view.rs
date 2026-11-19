@@ -11,6 +11,11 @@ use gpui::AnyElement;
 const PANEL_WIDTH: f32 = 320.0;
 const PANEL_MARGIN: f32 = 8.0;
 const HEADER_GAP: f32 = 6.0;
+/// Everything above and below the notes block: padding, gaps, header, version
+/// line, phase title and the 30 px button row. Keeps the buttons painted.
+const PANEL_CHROME: f32 = 148.0;
+const NOTES_MAX_HEIGHT: f32 = 120.0;
+const NOTES_MIN_HEIGHT: f32 = 40.0;
 
 impl Voxhold {
     /// Header button before the search action.
@@ -84,7 +89,11 @@ impl Voxhold {
             .max(PANEL_MARGIN)
             .min((viewport_width - width - PANEL_MARGIN).max(PANEL_MARGIN));
         let top = chat.y + header_height + HEADER_GAP;
-        let max_height = (viewport_height - top - PANEL_MARGIN).max(120.0);
+        // The panel must not slide under the mobile bottom bar, so the chat
+        // rectangle (not the viewport) is the real lower bound.
+        let lower = chat.bottom().min(viewport_height);
+        let max_height = (lower - top - PANEL_MARGIN).max(120.0);
+        let notes_max = (max_height - PANEL_CHROME).clamp(NOTES_MIN_HEIGHT, NOTES_MAX_HEIGHT);
         let current = update::current_version();
 
         let mut panel = div()
@@ -111,6 +120,7 @@ impl Voxhold {
             .child(
                 div()
                     .flex()
+                    .flex_shrink_0()
                     .items_center()
                     .justify_between()
                     .child(
@@ -131,6 +141,7 @@ impl Voxhold {
             )
             .child(
                 div()
+                    .flex_shrink_0()
                     .text_size(px(11.))
                     .text_color(ink(p.muted))
                     .child(format!("Текущая версия {current}")),
@@ -168,6 +179,7 @@ impl Voxhold {
             UpdatePhase::Available { version, notes } => {
                 panel = panel.child(
                     div()
+                        .flex_shrink_0()
                         .font_weight(gpui::FontWeight::BOLD)
                         .child(format!("Доступна версия {version}")),
                 );
@@ -176,7 +188,8 @@ impl Voxhold {
                         div()
                             .id("update-notes")
                             .debug_selector(|| "update-notes".into())
-                            .max_h(px(120.))
+                            .min_h(px(0.))
+                            .max_h(px(notes_max))
                             .overflow_y_scroll()
                             .text_color(ink(p.muted))
                             .child(notes),
@@ -186,6 +199,7 @@ impl Voxhold {
                     div()
                         .flex()
                         .flex_wrap()
+                        .flex_shrink_0()
                         .gap_2()
                         .child(update_button(
                             "update-download",
@@ -347,6 +361,7 @@ fn update_button(
     let mut button = div()
         .id(id)
         .debug_selector(move || id.into())
+        .flex_shrink_0()
         .min_w(px(96.))
         .h(px(30.))
         .px(px(10.))

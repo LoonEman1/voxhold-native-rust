@@ -644,9 +644,6 @@ impl Render for Voxhold {
                 .h(px(l.chat.h))
                 .child(chat),
         );
-        if self.update.panel_open {
-            root = root.child(self.update_panel(l.chat, mobile, cx));
-        }
         if mobile {
             root = root.child(
                 div()
@@ -796,6 +793,7 @@ impl Render for Voxhold {
         self.ensure_viewer_scale(window, cx);
         let popup_open = self.show_search
             || self.show_inbox
+            || self.update.panel_open
             || self.message_menu.is_some()
             || self.member_menu.is_some()
             || self.forward.is_some();
@@ -803,10 +801,16 @@ impl Render for Voxhold {
             root = root.child(
                 div()
                     .id("overlay-backdrop")
+                    .debug_selector(|| "overlay-backdrop".into())
                     .absolute()
                     .size_full()
                     .on_click(cx.listener(|s, _, _, cx| s.dismiss_overlays(cx))),
             );
+        }
+        // The popup sits above the backdrop so a click inside it is not a
+        // dismiss, and below the modal layers that follow.
+        if self.update.panel_open {
+            root = root.child(self.update_panel(l.chat, mobile, cx));
         }
         if let Some(overlay) = self.inbox_overlay(window, cx) {
             root = root.child(overlay);

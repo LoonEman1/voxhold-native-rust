@@ -10,6 +10,9 @@ impl Voxhold {
         self.show_inbox = false;
         self.editing = None;
         self.confirm_delete = None;
+        if self.update.panel_open {
+            self.close_update_panel(cx);
+        }
         cx.notify();
     }
 

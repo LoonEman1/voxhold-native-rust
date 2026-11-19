@@ -71,11 +71,17 @@ fn make_app(cx: &mut TestAppContext) -> (gpui::WindowHandle<Root>, Entity<Voxhol
 }
 
 fn staged_update(dir: &Path) -> StagedUpdate {
+    staged_update_with_exe(dir, Some("Voxhold.exe"))
+}
+
+fn staged_update_with_exe(dir: &Path, exe: Option<&str>) -> StagedUpdate {
     let staging = dir.join("updates").join("9.9.9");
     let app = staging.join("app");
     std::fs::create_dir_all(&app).unwrap();
     std::fs::write(app.join("voxhold-updater.exe"), b"helper").unwrap();
-    std::fs::write(app.join("Voxhold.exe"), b"app").unwrap();
+    if let Some(exe) = exe {
+        std::fs::write(app.join(exe), b"app").unwrap();
+    }
     StagedUpdate {
         version: semver::Version::new(9, 9, 9),
         method: StageMethod::Full,
@@ -83,6 +89,13 @@ fn staged_update(dir: &Path) -> StagedUpdate {
         app_dir: app,
         package_sha256: "a".repeat(64),
     }
+}
+
+fn long_notes() -> String {
+    (1..=40)
+        .map(|line| format!("Строка {line}: исправления, улучшения и подробности выпуска."))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[gpui::test]
@@ -245,6 +258,80 @@ async fn the_panel_stays_inside_narrow_and_scaled_windows(cx: &mut TestAppContex
             );
         }
     }
+}
+
+#[gpui::test]
+async fn the_panel_stops_above_the_mobile_bar_and_keeps_the_buttons(cx: &mut TestAppContext) {
+    cx.update(|cx| gpui_component::init(cx));
+    let (window, view, _dir) = make_app(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            v.test_pin_ui_scale(1.0);
+            v.update.phase = UpdatePhase::Available {
+                version: "0.2.0".into(),
+                notes: long_notes(),
+            };
+            v.update.panel_open = true;
+            cx.notify();
+        });
+        let _ = window;
+    });
+    visual.simulate_resize(size(px(320.), px(360.)));
+    draw(&mut visual);
+    draw(&mut visual);
+
+    let panel = visual.debug_bounds("update-panel").expect("panel");
+    let panel_top = f32::from(panel.origin.y);
+    let panel_bottom = panel_top + f32::from(panel.size.height);
+    let chat_bottom = 360.0 - crate::layout::BOTTOM_HEIGHT;
+    assert!(
+        panel_bottom <= chat_bottom + 0.5,
+        "the panel ends at {panel_bottom}, under the mobile bar at {chat_bottom}"
+    );
+    assert!(
+        visual.debug_bounds("update-notes").is_some(),
+        "long notes are painted"
+    );
+    for selector in ["update-download", "update-skip"] {
+        let bounds = visual
+            .debug_bounds(selector)
+            .unwrap_or_else(|| panic!("{selector} is painted"));
+        let top = f32::from(bounds.origin.y);
+        let bottom = top + f32::from(bounds.size.height);
+        let right = f32::from(bounds.origin.x) + f32::from(bounds.size.width);
+        assert!(
+            top >= panel_top - 0.5 && bottom <= panel_bottom + 0.5,
+            "{selector} leaves the panel ({top}..{bottom} vs {panel_top}..{panel_bottom})"
+        );
+        assert!(
+            bottom <= chat_bottom + 0.5,
+            "{selector} is cut by the mobile bar"
+        );
+        assert!(right <= 320.0 + 0.5, "{selector} leaves the client area");
+    }
+}
+
+#[gpui::test]
+async fn clicking_outside_the_panel_closes_it(cx: &mut TestAppContext) {
+    cx.update(|cx| gpui_component::init(cx));
+    let (window, view, _dir) = make_app(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            v.update.phase = UpdatePhase::Available {
+                version: "0.2.0".into(),
+                notes: "Заметки".into(),
+            };
+            v.update.panel_open = true;
+            cx.notify();
+        });
+        let _ = window;
+    });
+    draw(&mut visual);
+    assert!(visual.debug_bounds("overlay-backdrop").is_some());
+    click(&mut visual, gpui::point(px(2.), px(2.)));
+    view.read_with(&*visual, |v, _| assert!(!v.update.panel_open));
 }
 
 #[gpui::test]
@@ -451,6 +538,80 @@ async fn a_failed_helper_launch_keeps_the_app_in_the_error_state(cx: &mut TestAp
         assert!(!v.update.quit_requested);
         match &v.update.phase {
             UpdatePhase::Error { retry, .. } => assert_eq!(*retry, RetryKind::Install),
+            other => panic!("expected an install error, got {other:?}"),
+        }
+    });
+}
+
+#[gpui::test]
+async fn install_falls_back_to_the_packaged_exe_name(cx: &mut TestAppContext) {
+    cx.update(|cx| gpui_component::init(cx));
+    let (window, view, dir) = make_app(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
+    // The package ships `Voxhold.exe`; the running development binary has a
+    // different name and must not be handed to the helper.
+    let staged = staged_update(&dir);
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            v.update.launcher = Box::new(RecordingLauncher {
+                seen: seen.clone(),
+                fail: false,
+            });
+            v.update.exe_name = "voxhold-native-rust.exe".into();
+            v.update.phase = UpdatePhase::Ready {
+                version: "0.2.0".into(),
+                staged: staged.clone(),
+            };
+            v.update.install_dir = dir.join("install");
+            v.install_ready(window, cx);
+        });
+    });
+    let seen = seen.borrow();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].value_after("--exe").as_deref(), Some("Voxhold.exe"));
+    view.read_with(&*visual, |v, _| {
+        assert!(v.update.quit_requested);
+        assert!(matches!(v.update.phase, UpdatePhase::Installing));
+    });
+}
+
+#[gpui::test]
+async fn a_package_without_the_app_image_never_quits(cx: &mut TestAppContext) {
+    cx.update(|cx| gpui_component::init(cx));
+    let (window, view, dir) = make_app(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
+    let staged = staged_update_with_exe(&dir, None);
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            v.update.launcher = Box::new(RecordingLauncher {
+                seen: seen.clone(),
+                fail: false,
+            });
+            v.update.exe_name = "voxhold-native-rust.exe".into();
+            v.update.phase = UpdatePhase::Ready {
+                version: "0.2.0".into(),
+                staged: staged.clone(),
+            };
+            v.update.install_dir = dir.join("install");
+            v.install_ready(window, cx);
+        });
+    });
+    assert!(
+        seen.borrow().is_empty(),
+        "the helper must not start without an image"
+    );
+    view.read_with(&*visual, |v, _| {
+        assert!(!v.update.quit_requested, "the app stays open");
+        match &v.update.phase {
+            UpdatePhase::Error { message, retry } => {
+                assert_eq!(*retry, RetryKind::Install);
+                assert!(
+                    message.contains("voxhold-native-rust.exe"),
+                    "the error names the missing image: {message}"
+                );
+            }
             other => panic!("expected an install error, got {other:?}"),
         }
     });

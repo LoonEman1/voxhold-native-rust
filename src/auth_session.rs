@@ -216,7 +216,7 @@ pub fn classify_refresh_error(error: &voxhold_api::Error) -> RefreshFailure {
 }
 
 /// What the session timer should do on this tick.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum Plan {
     /// There is no usable session; the timer can stop.
     Idle,
@@ -226,6 +226,24 @@ pub enum Plan {
     Waiting,
     /// One request may start now.
     Refresh { generation: u64, token: String },
+}
+
+/// `Refresh` carries the token that the next request will send, so a derived
+/// `Debug` would print the credential. Diagnostics keep the generation and
+/// always show the token as `<redacted>`.
+impl std::fmt::Debug for Plan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Plan::Idle => f.write_str("Idle"),
+            Plan::Expired => f.write_str("Expired"),
+            Plan::Waiting => f.write_str("Waiting"),
+            Plan::Refresh { generation, .. } => f
+                .debug_struct("Refresh")
+                .field("generation", generation)
+                .field("token", &"<redacted>")
+                .finish(),
+        }
+    }
 }
 
 /// Single-flight and bounded-retry state for the refresh request.
@@ -543,6 +561,16 @@ mod tests {
         let revocation = value.clone().take_revocation().expect("revocation");
         let debug = format!("{revocation:?}");
         assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("token-1"), "{debug}");
+
+        // The plan handed to the refresh task carries the same credential.
+        let plan = Plan::Refresh {
+            generation: 3,
+            token: "token-1".into(),
+        };
+        let debug = format!("{plan:?}");
+        assert!(debug.contains("<redacted>"));
+        assert!(debug.contains("generation: 3"), "{debug}");
         assert!(!debug.contains("token-1"), "{debug}");
     }
 

@@ -12,12 +12,25 @@ pub enum AuthScreen {
     Login,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct LoginRequest {
     pub attempt: u64,
     pub origin: String,
     pub username: String,
     pub password: String,
+}
+
+/// A derived `Debug` would print the password. Diagnostics keep the attempt and
+/// the identity, never the credential.
+impl std::fmt::Debug for LoginRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LoginRequest")
+            .field("attempt", &self.attempt)
+            .field("origin", &self.origin)
+            .field("username", &self.username)
+            .field("password", &"<redacted>")
+            .finish()
+    }
 }
 
 /// State that survives a repaint of the auth page.
@@ -595,6 +608,19 @@ mod tests {
         assert_eq!(request.username, "neva");
         assert_eq!(request.password, "  pass word  ");
         assert!(auth.busy);
+    }
+
+    #[test]
+    fn debug_output_never_prints_the_password() {
+        let mut auth = AuthState::new("");
+        auth.submit_instance("https://chat.example.org");
+        let request = auth
+            .submit_login("neva", "hunter2-secret")
+            .expect("valid form");
+        let debug = format!("{request:?}");
+        assert!(debug.contains("<redacted>"), "{debug}");
+        assert!(debug.contains("neva"), "{debug}");
+        assert!(!debug.contains("hunter2-secret"), "{debug}");
     }
 
     #[test]

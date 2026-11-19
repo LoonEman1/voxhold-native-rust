@@ -19,7 +19,7 @@ impl VoicePanel {
         let mut repaint = true;
         match update {
             VoiceUpdate::Connecting => {
-                self.phase = CallPhase::Connecting;
+                self.transition_phase(CallPhase::Connecting);
                 self.status = "Подключение…".into();
                 self.applied_audio = None;
                 self.controls.muted = true;
@@ -27,13 +27,13 @@ impl VoicePanel {
             }
             VoiceUpdate::Connected => {
                 if self.phase != CallPhase::Connected {
-                    self.phase = CallPhase::Connected;
+                    self.transition_phase(CallPhase::Connected);
                     self.status = "Подключено".into();
                     self.refresh_capture();
                 }
             }
             VoiceUpdate::Reconnecting => {
-                self.phase = CallPhase::Reconnecting;
+                self.transition_phase(CallPhase::Reconnecting);
                 self.status = "Восстанавливаем соединение…".into();
                 self.applied_audio = None;
                 self.controls.muted = true;
@@ -152,11 +152,11 @@ impl VoicePanel {
                 self.ptt_combo = None;
                 self.close_player_in_window(window);
                 self.call_channel = 0;
-                self.phase = if error.is_some() {
+                self.transition_phase(if error.is_some() {
                     CallPhase::Failed
                 } else {
                     CallPhase::Idle
-                };
+                });
                 self.error = error.unwrap_or_default();
                 self.status.clear();
                 self.participants.clear();

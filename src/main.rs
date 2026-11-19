@@ -30,6 +30,8 @@ mod settings;
 mod test_support;
 mod theme;
 mod thread_panel;
+#[cfg(feature = "voxhold-media")]
+mod ui_sounds;
 mod voice_form_text;
 #[cfg(feature = "voxhold-media")]
 mod voice_panel;

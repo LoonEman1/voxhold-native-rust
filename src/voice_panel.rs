@@ -73,6 +73,8 @@ pub struct VoicePanel {
     attempt: u64,
     call_channel: i64,
     phase: CallPhase,
+    /// Local cues from real transitions; the parent drains them onto the output.
+    cues: cues::CueQueue,
     status: String,
     error: String,
     controls: Controls,
@@ -240,6 +242,7 @@ impl VoicePanel {
             attempt: 0,
             call_channel: 0,
             phase: CallPhase::Idle,
+            cues: cues::CueQueue::default(),
             status: String::new(),
             error: String::new(),
             controls,
@@ -576,7 +579,7 @@ impl VoicePanel {
                 self.attempt = handle.attempt();
                 self.handle = Some(handle);
                 self.call_channel = self.room;
-                self.phase = CallPhase::Connecting;
+                self.begin_attempt();
                 self.status = "Подключение…".into();
                 self.error.clear();
                 self.participants.clear();
@@ -610,7 +613,7 @@ impl VoicePanel {
         self.close_player();
         self.reset_screen();
         self.call_channel = 0;
-        self.phase = CallPhase::Idle;
+        self.transition_phase(CallPhase::Idle);
         self.status.clear();
         self.error.clear();
         self.ptt_held = false;
@@ -751,13 +754,22 @@ impl VoicePanel {
     }
 
     pub fn mute(&mut self, cx: &mut Context<Self>) {
+        let cue = crate::ui_sounds::mute_toggle_cue(self.self_muted);
+        let server_muted = self.server_muted;
         self.self_muted = !self.self_muted;
+        if !server_muted {
+            // The server mute owns the effective state; a toggle under it is
+            // not a local action and must stay silent, like the frontend.
+            self.queue_cue(cue);
+        }
         self.refresh_capture();
         cx.notify();
     }
 
     pub fn deafen(&mut self, cx: &mut Context<Self>) {
+        let cue = crate::ui_sounds::deafen_toggle_cue(self.controls.deafened);
         self.controls.deafened = !self.controls.deafened;
+        self.queue_cue(cue);
         self.refresh_capture();
         cx.notify();
     }
@@ -1176,6 +1188,7 @@ fn dock_focus_id(action_id: &str) -> &'static str {
 
 mod colors;
 mod controls;
+mod cues;
 mod player;
 mod screen_share;
 use screen_share::ScreenShareUi;

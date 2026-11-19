@@ -284,10 +284,68 @@ impl Voxhold {
         });
     }
 
+    /// Play the cues the panel recorded since the last drain. The panel owns
+    /// only the transition decision; the saved preferences and the single WinMM
+    /// player live here, so there is one persistence path and one audio path.
+    pub(super) fn drain_voice_cues(&mut self, cx: &mut Context<Self>) {
+        let Some(panel) = self.voice.clone() else {
+            return;
+        };
+        let cues = panel.update(cx, |panel, _| panel.take_cues());
+        if cues.is_empty() {
+            return;
+        }
+        let (sounds, volume, output) = {
+            let prefs = &self.voice_settings.prefs;
+            (prefs.sounds, prefs.sound_volume, prefs.output.clone())
+        };
+        // The checkbox and a zero slider silence the player before any device
+        // work; the drained list is dropped instead of accumulating.
+        if !sounds || volume <= 0 {
+            return;
+        }
+        for cue in cues {
+            #[cfg(test)]
+            self.voice_cue_calls.push(CueCall {
+                cue,
+                volume,
+                output: output.clone(),
+            });
+            #[cfg(not(test))]
+            self.play_voice_cue(cue, volume, &output);
+        }
+    }
+
+    /// Convert the pure frontend spec into the media cue description. The
+    /// device is resolved on the cue worker; an unavailable selection is silent.
+    #[cfg(not(test))]
+    fn play_voice_cue(&self, cue: crate::ui_sounds::VoiceCue, volume: i64, output: &str) {
+        let spec = cue.spec();
+        self.voice_cue_player.play(
+            voxhold_media::preview::CueSpec {
+                gain: spec.gain,
+                tones: spec
+                    .tones
+                    .iter()
+                    .map(|tone| voxhold_media::preview::CueTone {
+                        frequency: tone.frequency,
+                        at: tone.at,
+                        duration: tone.duration,
+                    })
+                    .collect(),
+            },
+            volume,
+            output,
+        );
+    }
+
     /// Mirror the call channel and drop calls whose access was revoked. A
     /// channel deleted, made unreadable or switched to E2EE ends the media
     /// session before the stale lease can keep audio or video.
     pub(super) fn refresh_voice_call(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Leave cues are recorded even when the call channel is already zero,
+        // so the drain must happen before the early return.
+        self.drain_voice_cues(cx);
         let Some(panel) = self.voice.clone() else {
             self.voice_channel = 0;
             return;
@@ -599,6 +657,7 @@ impl Voxhold {
             modifiers.platform,
         ) {
             panel.update(cx, |panel, cx| panel.mute(cx));
+            self.drain_voice_cues(cx);
             return true;
         }
         if Hotkey::parse(&prefs.deafen).matches(
@@ -609,6 +668,7 @@ impl Voxhold {
             modifiers.platform,
         ) {
             panel.update(cx, |panel, cx| panel.deafen(cx));
+            self.drain_voice_cues(cx);
             return true;
         }
         let fullscreen = panel.read(cx).player_fullscreen();

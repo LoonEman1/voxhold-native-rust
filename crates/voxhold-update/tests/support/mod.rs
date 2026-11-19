@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -33,6 +33,7 @@ pub struct RequestRecord {
 
 pub struct TestServer {
     pub base_url: String,
+    address: SocketAddr,
     requests: Arc<Mutex<Vec<RequestRecord>>>,
     shutdown: Arc<AtomicBool>,
     handle: Option<thread::JoinHandle<()>>,
@@ -41,9 +42,6 @@ pub struct TestServer {
 impl TestServer {
     pub fn start(routes: HashMap<String, Route>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
-        listener
-            .set_nonblocking(true)
-            .expect("nonblocking listener");
         let address = listener.local_addr().expect("local address");
         let routes = Arc::new(routes);
         let requests = Arc::new(Mutex::new(Vec::new()));
@@ -51,26 +49,27 @@ impl TestServer {
         let shutdown = Arc::new(AtomicBool::new(false));
         let thread_shutdown = shutdown.clone();
         let thread_requests = requests.clone();
-        let handle = thread::spawn(move || {
-            while !thread_shutdown.load(Ordering::SeqCst) {
-                match listener.accept() {
-                    Ok((stream, _)) => {
-                        let routes = routes.clone();
-                        let requests = thread_requests.clone();
-                        let counters = counters.clone();
-                        thread::spawn(move || {
-                            handle_connection(stream, &routes, &requests, &counters);
-                        });
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        thread::sleep(Duration::from_millis(5));
-                    }
-                    Err(_) => break,
-                }
+        // A blocking accept is deterministic: the polling version could miss a
+        // freshly queued connection under a loaded CI runner. Drop wakes the
+        // loop with one empty connection and joins it.
+        let handle = thread::spawn(move || loop {
+            if thread_shutdown.load(Ordering::SeqCst) {
+                break;
             }
+            let (stream, _) = match listener.accept() {
+                Ok(accepted) => accepted,
+                Err(_) => break,
+            };
+            let routes = routes.clone();
+            let requests = thread_requests.clone();
+            let counters = counters.clone();
+            thread::spawn(move || {
+                handle_connection(stream, &routes, &requests, &counters);
+            });
         });
         Self {
             base_url: format!("http://{address}"),
+            address,
             requests,
             shutdown,
             handle: Some(handle),
@@ -89,6 +88,9 @@ impl TestServer {
 impl Drop for TestServer {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::SeqCst);
+        // Wake the blocking accept. The handler thread returns immediately on
+        // an empty request; the accept loop sees the shutdown flag next.
+        let _ = TcpStream::connect_timeout(&self.address, Duration::from_millis(200));
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }

@@ -113,7 +113,10 @@ async fn rejects_a_tampered_manifest_before_parsing() {
         cancel: CancelToken::new(),
     })
     .await;
-    assert!(matches!(result, Err(UpdateError::BadSignature)));
+    assert!(
+        matches!(result, Err(UpdateError::BadSignature)),
+        "a tampered manifest must fail the signature check, got {result:?}"
+    );
 }
 
 #[tokio::test]

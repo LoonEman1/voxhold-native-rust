@@ -601,8 +601,8 @@ impl Voxhold {
                     div()
                         .id("auth-back")
                         .absolute()
-                        .left(px(l.card.x))
-                        .top(px((l.card.y - 28.0).max(8.0)))
+                        .left(px(l.back.x))
+                        .top(px(l.back.y))
                         .cursor_pointer()
                         .flex()
                         .items_center()
@@ -614,18 +614,19 @@ impl Voxhold {
                         .child("Назад"),
                 )
                 // The confirmed origin of this step. It is plain text, not a
-                // new control: the address is changed through «Назад».
+                // new control: the address is changed through «Назад». Its own
+                // measured column starts after the link and wraps, so a long
+                // address is fully visible and cannot cover the link or the
+                // theme toggle.
                 .child(
                     div()
                         .absolute()
-                        .left(px(l.card.x))
-                        .top(px((l.card.y - 28.0).max(8.0)))
-                        .w(px(l.card.w))
-                        .flex()
-                        .justify_end()
+                        .left(px(l.origin.x))
+                        .top(px(l.origin.y))
+                        .w(px(l.origin.w))
+                        .line_height(px(15.))
                         .text_size(px(12.))
                         .text_color(ink(p.muted))
-                        .truncate()
                         .child(self.auth.origin.clone()),
                 )
                 // Every label is positioned in client coordinates directly, not

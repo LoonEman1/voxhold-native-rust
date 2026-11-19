@@ -8,7 +8,8 @@
 //! * refresh five minutes before `expires_at`;
 //! * one rotation at a time, retried with bounded backoff while the session is
 //!   still valid;
-//! * a late 401 is applied only when it names the current token;
+//! * a late 401 is applied only when it names the current token, and a
+//!   current-token 401 waits for its own rotation to settle first;
 //! * a rotation is accepted only for the generation that started it.
 
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -30,7 +31,7 @@ pub fn now_unix() -> i64 {
 /// Login data from `internal/account/http/response.go`.
 ///
 /// The token and expiry come from `session`, the identity from `user`.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Session {
     origin: String,
     user_id: i64,
@@ -40,11 +41,35 @@ pub struct Session {
     generation: u64,
 }
 
+/// A derived `Debug` would print the credential. Diagnostics need the identity
+/// and the expiry, never the token.
+impl std::fmt::Debug for Session {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Session")
+            .field("origin", &self.origin)
+            .field("user_id", &self.user_id)
+            .field("username", &self.username)
+            .field("token", &"<redacted>")
+            .field("expires_at", &self.expires_at)
+            .field("generation", &self.generation)
+            .finish()
+    }
+}
+
 /// A server-side revocation request taken exactly once when the user logs out.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Revocation {
     pub origin: String,
     pub token: String,
+}
+
+impl std::fmt::Debug for Revocation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Revocation")
+            .field("origin", &self.origin)
+            .field("token", &"<redacted>")
+            .finish()
+    }
 }
 
 impl Session {
@@ -166,9 +191,12 @@ impl Session {
     }
 }
 
-/// Why a refresh attempt failed. Only a `401` is a confirmed loss of the
-/// session; transport, throttling, server and format errors keep the current
-/// token until it actually expires.
+/// Why a refresh attempt failed.
+///
+/// The split follows `AuthContext.tsx` (`ed7cb00a`): only a network error,
+/// `408`, `429` and `>= 500` are transient. Every other answer — `400`, `403`,
+/// `401` and a malformed body — ends the session immediately, because retrying
+/// cannot fix a rejected credential or a broken contract.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RefreshFailure {
     Unauthorized,
@@ -226,6 +254,13 @@ impl RefreshGate {
     #[allow(dead_code)]
     pub fn in_flight(&self) -> bool {
         self.flight.is_some()
+    }
+
+    /// Whether the rotation for exactly this generation is still open. The
+    /// application uses it to defer a `401` of the current token until the
+    /// refresh answer decides whether the token really died.
+    pub fn in_flight_for(&self, generation: u64) -> bool {
+        self.flight == Some(generation)
     }
 
     #[allow(dead_code)]
@@ -446,12 +481,9 @@ mod tests {
     }
 
     #[test]
-    fn errors_are_classified_like_the_web_client() {
+    fn refresh_errors_follow_the_web_client_policy() {
         use voxhold_api::Error;
-        assert_eq!(
-            classify_refresh_error(&Error::Http(401)),
-            RefreshFailure::Unauthorized
-        );
+        // `AuthContext.tsx`: transient means status 0, 408, 429 or >= 500.
         for transient in [
             Error::Network,
             Error::Http(408),
@@ -465,14 +497,53 @@ mod tests {
                 "{transient:?}"
             );
         }
+        // 401 is the confirmed loss of the credential.
         assert_eq!(
-            classify_refresh_error(&Error::InvalidResponse("bad")),
-            RefreshFailure::Invalid
+            classify_refresh_error(&Error::Http(401)),
+            RefreshFailure::Unauthorized
         );
-        assert_eq!(
-            classify_refresh_error(&Error::Http(403)),
-            RefreshFailure::Invalid
-        );
+        // A rejected request or a malformed answer is terminal: the web client
+        // calls expireNow instead of retrying, because another attempt cannot
+        // repair the contract.
+        for terminal in [
+            Error::Http(400),
+            Error::Http(403),
+            Error::Http(404),
+            Error::Http(422),
+            Error::InvalidResponse("bad"),
+        ] {
+            assert_eq!(
+                classify_refresh_error(&terminal),
+                RefreshFailure::Invalid,
+                "{terminal:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_flight_blocks_only_its_own_generation() {
+        let value = session(1_000);
+        let mut gate = RefreshGate::default();
+        let generation = value.generation();
+        assert!(!gate.in_flight_for(generation));
+        assert!(matches!(gate.plan(&value, 800), Plan::Refresh { .. }));
+        assert!(gate.in_flight_for(generation));
+        assert!(!gate.in_flight_for(generation.wrapping_add(1)));
+        gate.succeeded(generation);
+        assert!(!gate.in_flight_for(generation));
+    }
+
+    #[test]
+    fn debug_output_never_prints_the_credential() {
+        let value = session(1_000);
+        let debug = format!("{value:?}");
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("token-1"), "{debug}");
+
+        let revocation = value.clone().take_revocation().expect("revocation");
+        let debug = format!("{revocation:?}");
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("token-1"), "{debug}");
     }
 
     #[test]

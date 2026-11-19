@@ -161,6 +161,11 @@ pub struct AuthLayout {
     pub error: Rect,
     pub preview: Rect,
     pub brand: Rect,
+    /// The «Назад» link and the confirmed origin above the login card. They are
+    /// separate rectangles so the address can never sit under the link or the
+    /// theme toggle.
+    pub back: Rect,
+    pub origin: Rect,
     pub username_label: Rect,
     pub password_label: Rect,
     pub terms: Rect,
@@ -235,6 +240,28 @@ pub fn layout_auth(w: f32, h: f32, instance: bool, has_error: bool) -> AuthLayou
         primary = Rect::new(x, y + heading_height + 208.0 + error_offset, width, 50.0);
     }
     let toggle = Rect::new(w - 56.0, 22.0, 34.0, 34.0);
+    // The confirmed origin is plain text above the card. It gets its own row
+    // over the «Назад» link: a long address may wrap, but it never shares the
+    // link's box. When the card starts high enough the row sits above the link;
+    // otherwise it moves to the top strip and stops before the theme toggle.
+    let back = Rect::new(card_x, (card_y - 28.0).max(8.0), 54.0, 16.0);
+    let origin_y = if card_y - 48.0 >= 60.0 {
+        card_y - 48.0
+    } else {
+        22.0
+    };
+    let origin_right = if origin_y < 60.0 {
+        (w - 68.0).min(card.right())
+    } else {
+        card.right()
+    };
+    let origin_left = (card_x + 68.0).min(origin_right);
+    let origin = Rect::new(
+        origin_left,
+        origin_y,
+        (origin_right - origin_left).max(0.0),
+        32.0,
+    );
     let error_y = if instance {
         primary.bottom() + 12.0
     } else {
@@ -275,6 +302,8 @@ pub fn layout_auth(w: f32, h: f32, instance: bool, has_error: bool) -> AuthLayou
         error,
         preview,
         brand,
+        back,
+        origin,
         username_label,
         password_label,
         terms,
@@ -459,6 +488,53 @@ mod tests {
         assert_eq!(layout.radius, 22.0);
         assert!((layout.brand.y + 63.0 - layout.inner.y).abs() < 0.01);
         assert_eq!(layout.card.x, 57.0);
+    }
+
+    fn overlaps(a: Rect, b: Rect) -> bool {
+        a.x < b.right() && b.x < a.right() && a.y < b.bottom() && b.y < a.bottom()
+    }
+
+    #[test]
+    fn origin_never_covers_the_back_link_or_the_theme_toggle() {
+        for (width, height) in [
+            (390.0, 760.0),
+            (560.0, 800.0),
+            (720.0, 900.0),
+            (1280.0, 900.0),
+            // A short window clamps the card to the top; the origin row then
+            // moves to the top strip and must still stop before the toggle.
+            (390.0, 600.0),
+        ] {
+            let layout = layout_auth(width, height, false, false);
+            assert!(
+                layout.origin.w > 100.0,
+                "{width}x{height}: origin column is {} wide",
+                layout.origin.w
+            );
+            assert!(
+                !overlaps(layout.origin, layout.back),
+                "{width}x{height}: origin covers «Назад»"
+            );
+            assert!(
+                !overlaps(layout.origin, layout.toggle),
+                "{width}x{height}: origin covers the theme toggle"
+            );
+            assert!(
+                !overlaps(layout.origin, layout.card),
+                "{width}x{height}: origin covers the card"
+            );
+            assert!(
+                !overlaps(layout.origin, layout.brand),
+                "{width}x{height}: origin covers the mobile brand"
+            );
+            assert!(
+                layout.origin.right() <= width && layout.origin.bottom() <= height,
+                "{width}x{height}: origin leaves the client area"
+            );
+            // Two 15px lines plus the row itself: a long address may wrap, but
+            // the row reserves the room for it.
+            assert!(layout.origin.h >= 30.0);
+        }
     }
 
     #[test]

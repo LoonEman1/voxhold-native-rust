@@ -9,7 +9,7 @@ use super::*;
 
 /// The login answer: the user row and the session pair. The token is kept here
 /// once and never logged.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct LoginSession {
     pub user_id: i64,
     pub username: String,
@@ -17,11 +17,33 @@ pub struct LoginSession {
     pub expires_at: i64,
 }
 
+/// A derived `Debug` would print the credential; diagnostics only need the
+/// shape. The token is always shown as `<redacted>`.
+impl std::fmt::Debug for LoginSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LoginSession")
+            .field("user_id", &self.user_id)
+            .field("username", &self.username)
+            .field("token", &"<redacted>")
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
+}
+
 /// The `POST /api/v1/auth/refresh` answer, top-level `{token,expires_at}`.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct SessionUpdate {
     pub token: String,
     pub expires_at: i64,
+}
+
+impl std::fmt::Debug for SessionUpdate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionUpdate")
+            .field("token", &"<redacted>")
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
 }
 
 /// Credentials and the 401 signal shared by every clone of one client.
@@ -77,6 +99,14 @@ impl AuthShared {
     pub(crate) fn take_unauthorized(&self) -> Option<String> {
         self.lock_unauthorized().pop_front()
     }
+
+    /// The oldest refusal without removing it. The application peeks before
+    /// deciding whether the event may be applied: a 401 of the current token
+    /// that arrives during its own rotation must survive until the refresh
+    /// answer settles the session.
+    pub(crate) fn peek_unauthorized(&self) -> Option<String> {
+        self.lock_unauthorized().front().cloned()
+    }
 }
 
 impl Client {
@@ -100,6 +130,12 @@ impl Client {
     /// token; the caller decides whether it still matches the session.
     pub fn take_unauthorized(&self) -> Option<String> {
         self.auth.take_unauthorized()
+    }
+
+    /// The oldest refused token without consuming it, so a caller can defer a
+    /// `401` that belongs to a rotation still in flight.
+    pub fn peek_unauthorized(&self) -> Option<String> {
+        self.auth.peek_unauthorized()
     }
 
     /// `POST /api/v1/auth/login`. The answer is `{user,session}`; `expires_at`
@@ -169,5 +205,44 @@ impl Client {
     /// best effort.
     pub async fn logout(&self) -> Result<()> {
         self.action(Method::POST, "/api/v1/auth/logout", None).await
+    }
+}
+
+#[cfg(test)]
+mod session_tests {
+    use super::*;
+
+    #[test]
+    fn diagnostics_never_print_the_token() {
+        let login = LoginSession {
+            user_id: 7,
+            username: "neva".into(),
+            token: "token-secret".into(),
+            expires_at: 1_700_003_600,
+        };
+        let debug = format!("{login:?}");
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("token-secret"), "{debug}");
+
+        let update = SessionUpdate {
+            token: "token-secret".into(),
+            expires_at: 1_700_007_200,
+        };
+        let debug = format!("{update:?}");
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("token-secret"), "{debug}");
+    }
+
+    #[test]
+    fn a_peeked_refusal_is_kept_until_it_is_taken() {
+        let client = Client::new("http://127.0.0.1:1").expect("origin");
+        client.auth.note_unauthorized("token-1");
+        client.auth.note_unauthorized("token-2");
+        assert_eq!(client.peek_unauthorized().as_deref(), Some("token-1"));
+        assert_eq!(client.peek_unauthorized().as_deref(), Some("token-1"));
+        assert_eq!(client.take_unauthorized().as_deref(), Some("token-1"));
+        assert_eq!(client.peek_unauthorized().as_deref(), Some("token-2"));
+        assert_eq!(client.take_unauthorized().as_deref(), Some("token-2"));
+        assert_eq!(client.peek_unauthorized(), None);
     }
 }

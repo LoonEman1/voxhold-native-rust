@@ -370,31 +370,66 @@ impl Voxhold {
     /// The shared client records every `401` with the token that was actually
     /// sent. Only a refusal of the current token ends the session; a late one
     /// from a token that was already rotated away is ignored.
-    fn check_unauthorized(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+    ///
+    /// A refusal of the current token while its own rotation is in flight is
+    /// not applied yet: the server revokes the old token before it answers
+    /// `/auth/refresh`, so the answer may still deliver the new pair. The event
+    /// stays queued (peek, no take) until that flight settles, exactly like
+    /// `expire(expectedToken)` in `AuthContext.tsx` waits for the flight and
+    /// then re-reads the token. This also keeps the drain from spinning on the
+    /// same event inside one tick.
+    pub(super) fn check_unauthorized(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
         loop {
             let Some(token) = self
                 .client
                 .as_ref()
-                .and_then(|client| client.take_unauthorized())
+                .and_then(|client| client.peek_unauthorized())
             else {
                 return true;
             };
+            let (current, generation) = match self.session.as_ref() {
+                Some(session) => (token == session.token(), session.generation()),
+                None => (false, 0),
+            };
+            if !current {
+                // A late refusal of a token that was already rotated away, or
+                // of a session that has ended. Drop it now; it can never end a
+                // future login.
+                self.take_unauthorized();
+                continue;
+            }
+            if self.session_gate.in_flight_for(generation) {
+                // Wait for the refresh answer. The next tick re-reads the token:
+                // a successful rotation makes this 401 stale, a terminal
+                // failure ends the session anyway.
+                return true;
+            }
+            self.take_unauthorized();
             // The state machine compares the refused token with the current one
-            // and clears it only on a match; a late 401 from an old rotation is
-            // ignored and the next queued event is examined.
-            let current = self
+            // once more and clears the credential only on a match.
+            let matched = self
                 .session
                 .as_mut()
                 .is_some_and(|session| session.handle_unauthorized(&token));
-            if current {
+            if matched {
                 self.end_session(window, cx, "Сессия истекла. Войдите снова.".into());
                 return false;
             }
         }
     }
 
+    fn take_unauthorized(&mut self) {
+        if let Some(client) = self.client.as_ref() {
+            client.take_unauthorized();
+        }
+    }
+
     /// One clock tick. Returns whether the timer should keep running.
-    fn session_tick(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+    pub(super) fn session_tick(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let now = crate::auth_session::now_unix();
         let Some(session) = self.session.as_ref() else {
             return false;
@@ -453,7 +488,7 @@ impl Voxhold {
         .detach();
     }
 
-    fn finish_refresh(
+    pub(super) fn finish_refresh(
         &mut self,
         epoch: u64,
         generation: u64,
@@ -468,7 +503,9 @@ impl Voxhold {
         self.session_gate.finish(generation);
         enum Step {
             Rotated,
-            Unauthorized,
+            /// The credential is gone for good: 401, a rejected request or a
+            /// malformed answer. No retry can repair any of them.
+            Terminal,
             Retry,
             Ignore,
         }
@@ -484,19 +521,21 @@ impl Voxhold {
                 }
             }
             Err(error) => match crate::auth_session::classify_refresh_error(&error) {
-                crate::auth_session::RefreshFailure::Unauthorized => {
+                // The web client expires immediately for everything except the
+                // transient set; only a 401 also names the refused credential.
+                crate::auth_session::RefreshFailure::Unauthorized
+                | crate::auth_session::RefreshFailure::Invalid => {
                     let current = self
                         .session
                         .as_ref()
                         .is_some_and(|session| session.generation() == generation);
                     if current {
-                        Step::Unauthorized
+                        Step::Terminal
                     } else {
                         Step::Ignore
                     }
                 }
-                crate::auth_session::RefreshFailure::Transient
-                | crate::auth_session::RefreshFailure::Invalid => Step::Retry,
+                crate::auth_session::RefreshFailure::Transient => Step::Retry,
             },
         };
         match step {
@@ -504,7 +543,7 @@ impl Voxhold {
                 self.session_gate.succeeded(generation);
                 self.apply_rotated_token(window, cx);
             }
-            Step::Unauthorized => self.expire_session(window, cx),
+            Step::Terminal => self.expire_session(window, cx),
             Step::Retry => {
                 let now = crate::auth_session::now_unix();
                 let expired = self
@@ -526,7 +565,7 @@ impl Voxhold {
     /// the new credential; the account socket is recreated and the open
     /// channel subscription and the active voice call are restored through
     /// their normal paths.
-    fn apply_rotated_token(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn apply_rotated_token(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(token) = self
             .session
             .as_ref()

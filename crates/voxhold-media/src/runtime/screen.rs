@@ -183,6 +183,7 @@ impl Live {
     /// reported to the live test means the capture is really gone.
     fn release_engine(&mut self) {
         let previous = self.screen.take();
+        #[cfg(test)]
         let had_engine = previous.is_some();
         drop(previous);
         #[cfg(test)]

@@ -23,6 +23,8 @@ pub(crate) const SYSTEM_AUDIO_WARNING: &str =
 /// The backend has no runtime reconfigure; the dialog must warn honestly.
 pub(crate) const RESTART_WARNING: &str =
     "Изменение качества перезапустит трансляцию: текущая сессия будет остановлена, зрители увидят новое подключение.";
+/// A Start pressed before the endpoint probe answered; cleared by the answer.
+pub(crate) const AUDIO_PENDING_REASON: &str = "Дождитесь проверки системного звука.";
 
 /// The account socket always authenticates with `multi_streams: true`
 /// (`crates/voxhold-api/src/lib.rs:638`), so the client capability is known.
@@ -173,6 +175,16 @@ impl ScreenShareUi {
         self.audio_enabled && self.audio_available()
     }
 
+    /// The toggle may claim «Включён» only for the track that will really be
+    /// published; a pending probe has not confirmed the endpoint yet.
+    pub(super) fn audio_toggle_label(&self) -> &'static str {
+        if self.audio_requested() {
+            "Включён"
+        } else {
+            "Выключен"
+        }
+    }
+
     /// The honest on-air sound line. The measured rate comes from the RTP
     /// stats; before the first sample only the configured maximum is shown.
     pub(super) fn sound_label(&self) -> String {
@@ -298,7 +310,10 @@ impl VoicePanel {
         self.screen.kind = SourceKind::Monitor;
         // A fresh publication defaults to system audio; the background probe
         // fills in availability and disables the toggle if the endpoint fails.
+        // The previous picker's answer must not leak into this one: Start
+        // stays locked until the new probe settles.
         self.screen.audio_enabled = true;
+        self.screen.audio_availability = None;
         self.begin_audio_probe(cx);
         self.screen.focus_placed = false;
         if let Some(handle) = &self.handle {
@@ -366,6 +381,11 @@ impl VoicePanel {
                     panel.screen.audio_enabled = false;
                 }
                 panel.screen.audio_availability = Some(result);
+                // The blocked-Start reason is no longer true; any other error
+                // stays until the next intent.
+                if panel.screen.error == AUDIO_PENDING_REASON {
+                    panel.screen.error.clear();
+                }
                 cx.notify();
             });
         })
@@ -441,8 +461,24 @@ impl VoicePanel {
         cx.notify();
     }
 
+    /// Start is possible only after the endpoint probe answered: committing
+    /// while the answer is pending would publish video without the requested
+    /// system audio.
+    pub(super) fn screen_can_start(&self) -> bool {
+        self.screen.selected.is_some()
+            && !self.screen.busy
+            && !Codec::available().is_empty()
+            && self.screen.audio_availability.is_some()
+            && (!self.screen.restart || self.screen.sharing.phase == Phase::Live)
+    }
+
     pub(super) fn start_screen_share(&mut self, cx: &mut Context<Self>) {
         if self.screen.busy {
+            return;
+        }
+        if self.screen.audio_availability.is_none() {
+            self.screen.error = AUDIO_PENDING_REASON.into();
+            cx.notify();
             return;
         }
         if let Err(reason) = self.share_gate() {

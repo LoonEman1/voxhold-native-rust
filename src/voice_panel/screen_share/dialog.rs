@@ -232,8 +232,9 @@ impl VoicePanel {
         let bitrate_down = row(self, &mut ring, ShareKey::BitrateDown);
         let bitrate_up = row(self, &mut ring, ShareKey::BitrateUp);
         let audio_available = self.screen.audio_available();
-        let audio_enabled = self.screen.audio_enabled;
-        let audio_controls = audio_enabled && audio_available;
+        let audio_requested = self.screen.audio_requested();
+        let audio_toggle = self.screen.audio_toggle_label();
+        let audio_controls = audio_requested;
         let audio_down = row(self, &mut ring, ShareKey::AudioBitrateDown);
         let audio_up = row(self, &mut ring, ShareKey::AudioBitrateUp);
         let audio_focus = row(self, &mut ring, ShareKey::Audio);
@@ -360,12 +361,8 @@ impl VoicePanel {
                             .child("Системный звук"),
                     )
                     .child(self.choice_enabled(
-                        if audio_enabled {
-                            "Включён"
-                        } else {
-                            "Выключен"
-                        },
-                        audio_enabled,
+                        audio_toggle,
+                        audio_requested,
                         audio_available,
                         audio_focus,
                         ShareKey::Audio,
@@ -381,7 +378,7 @@ impl VoicePanel {
                             .child(audio_status),
                     ),
             )
-            .when(audio_enabled, |rows| {
+            .when(audio_requested, |rows| {
                 rows.child(
                     div()
                         .text_size(px(10.))
@@ -419,10 +416,7 @@ impl VoicePanel {
 
         let cancel_focus = row(self, &mut ring, ShareKey::Cancel);
         let start_focus = row(self, &mut ring, ShareKey::Start);
-        let can_start = self.screen.selected.is_some()
-            && !self.screen.busy
-            && !codec.is_empty()
-            && (!self.screen.restart || self.screen.sharing.phase == Phase::Live);
+        let can_start = self.screen_can_start();
         let start_label = if self.screen.restart {
             "Перезапустить"
         } else if self.screen.busy {

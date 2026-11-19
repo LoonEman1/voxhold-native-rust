@@ -109,6 +109,22 @@ impl VoicePanel {
         self.screen.audio_status()
     }
 
+    /// The label of the system-audio toggle.
+    pub fn test_audio_toggle_label(&self) -> &'static str {
+        self.screen.audio_toggle_label()
+    }
+
+    /// Whether the picker would offer Start with the current probe answer.
+    pub fn test_can_start(&self) -> bool {
+        self.screen_can_start()
+    }
+
+    /// Select the source after the production «Экран» path opened the picker.
+    pub fn test_select_screen_source(&mut self, source: ScreenSource, cx: &mut Context<Self>) {
+        self.screen.selected = Some(source);
+        cx.notify();
+    }
+
     /// Open the live quality dialog with the publication already Live.
     pub fn test_open_screen_settings(
         &mut self,

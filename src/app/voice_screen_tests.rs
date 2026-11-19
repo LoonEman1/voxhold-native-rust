@@ -537,6 +537,117 @@ async fn the_endpoint_probe_never_blocks_the_screen_share_click(cx: &mut TestApp
 }
 
 #[gpui::test]
+async fn a_pending_audio_probe_blocks_start_and_never_publishes_video_only(
+    cx: &mut TestAppContext,
+) {
+    let (mut visual, _view, voice) = super::voice_tests::fixture(cx);
+    let device = || AudioDeviceInfo {
+        id: "slow".into(),
+        label: "Медленное устройство".into(),
+        format: "48000 Гц · 2 канала · 16 бит PCM".into(),
+    };
+
+    // The answer is still pending: a Start here would publish video with
+    // `audio == false` although the user asked for system sound.
+    visual.update(|_window, app| {
+        voice.update(app, |panel, cx| {
+            panel.test_attach_detached_handle();
+            panel.test_set_share_gate(Ok(()));
+            panel.test_set_audio_probe(Arc::new(move || {
+                std::thread::sleep(Duration::from_millis(250));
+                Ok(device())
+            }));
+            panel.test_open_screen_share(cx);
+            panel.test_select_screen_source(source(), cx);
+            assert!(panel.test_audio_pending());
+            let opened = panel.test_take_screen_commands();
+            assert_eq!(opened.len(), 1, "one picker open: {opened:?}");
+            assert_eq!(opened[0].0, "open");
+            assert!(
+                !panel.test_can_start(),
+                "Start must wait for the endpoint probe"
+            );
+            panel.test_start_screen_share(cx);
+            assert!(
+                panel.test_take_screen_commands().is_empty(),
+                "a pending probe must not commit a video-only publication"
+            );
+            assert!(!panel.screen_share_busy(), "no publish attempt started");
+            assert_eq!(panel.test_audio_toggle_label(), "Выключен");
+        });
+    });
+
+    wait_for(&mut visual, &voice, |panel| !panel.test_audio_pending());
+
+    visual.update(|_window, app| {
+        voice.update(app, |panel, cx| {
+            assert_eq!(panel.test_audio_toggle_label(), "Включён");
+            assert!(panel.test_can_start());
+            panel.test_start_screen_share(cx);
+            let commands = panel.test_take_screen_commands();
+            assert_eq!(commands.len(), 1, "one publish intent: {commands:?}");
+            assert_eq!(commands[0].0, "publish");
+            assert!(
+                panel.test_screen_request().audio,
+                "the confirmed endpoint must be requested"
+            );
+        });
+    });
+
+    // Reopen with a probe that fails: the picker must stay honest about the
+    // missing track and still publish without audio.
+    visual.update(|_window, app| {
+        voice.update(app, |panel, cx| {
+            panel.test_set_audio_probe(Arc::new(|| {
+                std::thread::sleep(Duration::from_millis(250));
+                Err("Нет устройства вывода".to_owned())
+            }));
+            panel.test_open_screen_share(cx);
+            panel.test_select_screen_source(source(), cx);
+            assert!(panel.test_audio_pending());
+            let opened = panel.test_take_screen_commands();
+            assert_eq!(opened.len(), 1, "one picker open: {opened:?}");
+            assert_eq!(opened[0].0, "open");
+            assert_eq!(panel.test_audio_toggle_label(), "Выключен");
+            assert!(
+                !panel.test_can_start(),
+                "a repeated probe blocks Start until it answers"
+            );
+            panel.test_start_screen_share(cx);
+            assert!(
+                panel.test_take_screen_commands().is_empty(),
+                "a pending re-probe must not commit"
+            );
+        });
+    });
+
+    wait_for(&mut visual, &voice, |panel| !panel.test_audio_pending());
+
+    visual.update(|_window, app| {
+        voice.update(app, |panel, cx| {
+            assert!(
+                panel.test_audio_status().contains("Нет устройства вывода"),
+                "the failure reason stays visible: {}",
+                panel.test_audio_status()
+            );
+            assert_eq!(panel.test_audio_toggle_label(), "Выключен");
+            assert!(
+                panel.test_can_start(),
+                "Start is allowed without audio after a failed probe"
+            );
+            panel.test_start_screen_share(cx);
+            let commands = panel.test_take_screen_commands();
+            assert_eq!(commands.len(), 1, "one publish intent: {commands:?}");
+            assert_eq!(commands[0].0, "publish");
+            assert!(
+                !panel.test_screen_request().audio,
+                "a failed endpoint must not be requested"
+            );
+        });
+    });
+}
+
+#[gpui::test]
 async fn the_quality_action_is_rendered_only_while_the_stream_is_live(cx: &mut TestAppContext) {
     use voxhold_media::publisher::{Phase, Sharing};
     let (mut visual, _view, voice) = super::voice_tests::fixture(cx);

@@ -67,10 +67,6 @@ impl AudioMeter {
     }
 }
 
-/// Push exactly one 10 ms stereo frame every 10 ms. When the loopback has no
-/// packet (nothing is playing), a silent frame keeps the RTP timeline and the
-/// audio m-line continuous. A real device failure is reported to the state
-/// machine instead of being disguised as silence.
 /// One 10 ms frame from whatever the producer returned. `None`, a wrong
 /// length or a failed source become exactly one silent block: the RTP timeline
 /// and the audio m-line continue, and the counter records why. A real device
@@ -100,6 +96,10 @@ pub(super) fn frame_for(
     }
 }
 
+/// Push exactly one 10 ms stereo frame every 10 ms. When the loopback has no
+/// packet (nothing is playing), a silent frame keeps the RTP timeline and the
+/// audio m-line continuous. A real device failure is reported to the state
+/// machine instead of being disguised as silence.
 pub(super) async fn audio_loop(
     mut producer: Box<dyn AudioProducer>,
     source: NativeAudioSource,

@@ -5,13 +5,12 @@
 //! APM NS/AGC in the live call; this tab shows the active capture chain
 //! (`software` or `platform` ADM) and reports AEC as unavailable/unmeasured
 //! because there is no render reference, while keeping the WinMM preview/test
-//! tone as real actions. The exact sentences live in `voice_form_text` so they
-//! stay testable without a UI query API.
+//! tone as real actions. The sentences live in `voice_form_text` so they stay
+//! testable without a UI query API.
 //!
 //! Layout follows the web `voice-settings__section` cards: devices with two
 //! compact selectors, levels, bitrate presets, interface sounds, microphone
-//! processing, input mode/hotkeys and a collapsed «Подробнее» diagnostics block
-//! that owns the capture-chain note, the capability rows and the long notes.
+//! processing, input mode/hotkeys and a collapsed «Подробнее» diagnostics block.
 
 use super::settings_view::{settings_card_metrics, ButtonKind};
 use super::*;
@@ -24,18 +23,21 @@ use gpui::ElementId;
 /// when the dialog is resized.
 const METER_WIDTH: f32 = 220.0;
 
-/// Minimum usable inner form width for the two device selectors to sit side by
-/// side. Compared with the true `CardMetrics::form_width`, so it follows the
-/// painted dialog instead of a window guess.
-const TWO_COLUMN_FORM_WIDTH: f32 = 540.0;
+/// Minimum inner form width for the two device selectors: 538 px at the 620 px
+/// card keeps two columns, while a 600 px window leaves 502 px and stacks them.
+/// Compared with `CardMetrics::form_width`, i.e. the painted card.
+pub(super) const TWO_COLUMN_FORM_WIDTH: f32 = 536.0;
 
-/// Conservative painted width of the widest preset label, «128 кбит/с», at
-/// 13 px bold. GPUI exposes no glyph bounds to the layout tests, so the layout
-/// decision uses this budget and the tests assert the cell budget instead.
-pub(super) const BITRATE_LABEL_WIDTH: f32 = 65.0;
+/// Painted advance of the widest preset label, «128 кбит/с», in bundled Inter
+/// Bold at 13 px: 68.26 px, rounded up. The layout uses this budget because
+/// GPUI exposes no glyph bounds; the tests assert the resulting cell budget.
+pub(super) const BITRATE_LABEL_WIDTH: f32 = 68.5;
 
-/// Horizontal padding of one `settings_button` cell (`px(14.)` on both sides).
-pub(super) const BITRATE_BUTTON_PADDING: f32 = 28.0;
+/// One preset cell paints `px(10.)` per side instead of the shared 14 px.
+pub(super) const BITRATE_BUTTON_PADDING: f32 = 20.0;
+
+/// The secondary preset style adds a 1 px border per side.
+pub(super) const BITRATE_BORDER: f32 = 2.0;
 
 /// Gap between the preset cells, matching `gap_2`.
 pub(super) const BITRATE_GAP: f32 = 8.0;
@@ -43,16 +45,14 @@ pub(super) const BITRATE_GAP: f32 = 8.0;
 /// `BITRATES` always offers six presets.
 pub(super) const BITRATE_COLUMNS: usize = 6;
 
-/// Smallest inner form width where every one-row cell still fits the widest
-/// label inside the button padding: six padded cells and five gaps.
-/// 6 * (65 + 28) + 5 * 8 = 598 px. The 680 px design card has 600 px inside,
-/// so it keeps one row; a 620 px card has 540 px and falls back to 3 + 3.
+/// Smallest inner width where every one-row cell fits the widest label:
+/// 6 * (68.5 + 20 + 2) + 5 * 8 = 583 px. The 680 px card has 598 px, one row
+/// with 2.5 px slack per cell; the 620 px card has 538 px and uses 3 + 3.
 pub(super) const BITRATE_ONE_ROW_MIN_WIDTH: f32 = BITRATE_COLUMNS as f32
-    * (BITRATE_LABEL_WIDTH + BITRATE_BUTTON_PADDING)
+    * (BITRATE_LABEL_WIDTH + BITRATE_BUTTON_PADDING + BITRATE_BORDER)
     + (BITRATE_COLUMNS - 1) as f32 * BITRATE_GAP;
 
-/// Width of one preset cell on a single row, before the button padding. Only the
-/// layout tests need it; production uses the threshold constant.
+/// Width of one preset cell on a single row, before padding (layout tests only).
 #[cfg(test)]
 pub(super) fn bitrate_cell_width(form_width: f32) -> f32 {
     (form_width - BITRATE_GAP * (BITRATE_COLUMNS - 1) as f32) / BITRATE_COLUMNS as f32
@@ -762,9 +762,8 @@ impl Voxhold {
             .into_any_element()
     }
 
-    /// Six Opus presets, as in the web `.voice-bitrate-setting`: one row of six
-    /// on a wide-enough form, two rows of three otherwise. The selected preset
-    /// uses the primary (lime) style so the active value is unambiguous.
+    /// Six Opus presets as in the web `.voice-bitrate-setting`: one row of six
+    /// on a wide form, two rows of three otherwise; the selected one is lime.
     fn voice_bitrate_presets(
         &mut self,
         one_row: bool,
@@ -782,20 +781,22 @@ impl Voxhold {
                     .position(|preset| preset == value)
                     .unwrap_or(0);
                 let selected = bitrate == *value;
-                let button = self.settings_button(
-                    ElementId::Name(format!("bitrate-{index}").into()),
-                    format!("{value} кбит/с"),
-                    if selected {
-                        ButtonKind::Primary
-                    } else {
-                        ButtonKind::Secondary
-                    },
-                    selected,
-                    false,
-                    SettingsAct::Personal(personal_settings::Action::SetBitrate(*value)),
-                    window,
-                    cx,
-                );
+                let button = self
+                    .settings_button(
+                        ElementId::Name(format!("bitrate-{index}").into()),
+                        format!("{value} кбит/с"),
+                        if selected {
+                            ButtonKind::Primary
+                        } else {
+                            ButtonKind::Secondary
+                        },
+                        selected,
+                        false,
+                        SettingsAct::Personal(personal_settings::Action::SetBitrate(*value)),
+                        window,
+                        cx,
+                    )
+                    .px(px(10.));
                 line = line.child(div().flex_1().min_w(px(0.)).child(button.w_full()));
             }
             body = body.child(line);

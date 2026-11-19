@@ -402,47 +402,97 @@ fn adjacent_device_ids_use_the_endpoint_id_and_recover_from_a_missing_one() {
     assert_eq!(adjacent_device_ids(&[], ""), ("".to_owned(), "".to_owned()));
 }
 
-/// The form width must subtract both the dialog padding and the 16 px inset
-/// the card paints on each side. Ignoring the card inset turned the bitrate row
-/// on 32 px too early.
+/// The form width must subtract both the dialog padding, the 16 px inset the
+/// card paints on each side and the card's own 1 px border. Ignoring the card
+/// inset turned the bitrate row on 32 px too early; ignoring the border left the
+/// inner width 2 px too wide on both sides.
 #[test]
 fn form_width_subtracts_the_dialog_and_card_insets() {
-    use super::settings_view::{settings_card_metrics, CARD_INSET};
+    use super::settings_view::{settings_card_metrics, CARD_BORDER, CARD_INSET};
     assert_eq!(CARD_INSET, 16.0);
+    assert_eq!(CARD_BORDER, 1.0);
     let design = settings_card_metrics((1200., 900.), 1.0);
     assert_eq!((design.width, design.pad), (680., 24.));
-    assert_eq!(design.form_width(), 680. - 2. * 24. - 2. * 16.);
-    assert_eq!(design.form_width(), 600.);
+    assert_eq!(
+        design.form_width(),
+        680. - 2. * 24. - 2. * 16. - 2. * CARD_BORDER
+    );
+    assert_eq!(design.form_width(), 598.);
     let narrow = settings_card_metrics((400., 900.), 1.0);
     assert_eq!((narrow.width, narrow.pad), (384., 16.));
-    assert_eq!(narrow.form_width(), 384. - 2. * 16. - 2. * 16.);
+    assert_eq!(narrow.form_width(), 384. - 2. * 16. - 2. * 16. - 2.);
+    assert_eq!(narrow.form_width(), 318.);
 }
 
-/// The one-row threshold is derived from six padded cells and five 8 px gaps
-/// with a conservative 65 px label. GPUI exposes no glyph bounds to a test, so
-/// the decision asserts the cell budget instead of literal text measurement.
+/// The one-row threshold is derived from six cells carrying the measured
+/// 68.5 px Inter Bold advance, 10 px padding per side and the 1 px border per
+/// side, plus five 8 px gaps. GPUI exposes no glyph bounds to a test, so the
+/// decision asserts the cell budget instead of literal text measurement.
 #[test]
 fn bitrate_one_row_threshold_uses_the_padded_widest_label() {
     use super::settings_view::settings_card_metrics;
     use super::settings_voice_view::{
-        bitrate_cell_width, BITRATE_BUTTON_PADDING, BITRATE_LABEL_WIDTH, BITRATE_ONE_ROW_MIN_WIDTH,
+        bitrate_cell_width, BITRATE_BORDER, BITRATE_BUTTON_PADDING, BITRATE_LABEL_WIDTH,
+        BITRATE_ONE_ROW_MIN_WIDTH,
     };
-    assert_eq!(BITRATE_LABEL_WIDTH, 65.0);
-    assert_eq!(BITRATE_ONE_ROW_MIN_WIDTH, 6. * (65. + 28.) + 5. * 8.);
-    assert_eq!(BITRATE_ONE_ROW_MIN_WIDTH, 598.);
+    assert_eq!(BITRATE_LABEL_WIDTH, 68.5);
+    assert_eq!(BITRATE_BUTTON_PADDING, 20.0);
+    assert_eq!(BITRATE_BORDER, 2.0);
+    assert_eq!(BITRATE_ONE_ROW_MIN_WIDTH, 6. * (68.5 + 20. + 2.) + 5. * 8.);
+    assert_eq!(BITRATE_ONE_ROW_MIN_WIDTH, 583.);
+
     let design = settings_card_metrics((1200., 900.), 1.0).form_width();
-    assert_eq!(design, 600.);
+    assert_eq!(design, 598.);
     assert!(design >= BITRATE_ONE_ROW_MIN_WIDTH);
+    let budget = bitrate_cell_width(design) - BITRATE_BUTTON_PADDING - BITRATE_BORDER;
     assert!(
-        bitrate_cell_width(design) - BITRATE_BUTTON_PADDING >= BITRATE_LABEL_WIDTH,
-        "one-row cell budget {} px must fit the {} px label",
-        bitrate_cell_width(design) - BITRATE_BUTTON_PADDING,
+        budget >= BITRATE_LABEL_WIDTH,
+        "one-row cell budget {budget} px must fit the {} px label",
         BITRATE_LABEL_WIDTH
     );
+    assert!(
+        (budget - BITRATE_LABEL_WIDTH - 2.5).abs() < 1e-4,
+        "the 680 px card keeps 2.5 px of slack per cell: {budget}"
+    );
+
     let compact = settings_card_metrics((636., 900.), 1.0);
     assert_eq!(compact.width, 620.);
-    assert_eq!(compact.form_width(), 540.);
+    assert_eq!(compact.form_width(), 538.);
     assert!(compact.form_width() < BITRATE_ONE_ROW_MIN_WIDTH);
+    // 3 + 3 uses two gaps, so each of the three cells is wider than a one-row
+    // cell; the helper above only models the six-column row.
+    let compact_cell = (compact.form_width() - 2. * 8.) / 3.;
+    let compact_budget = compact_cell - BITRATE_BUTTON_PADDING - BITRATE_BORDER;
+    assert_eq!(compact_budget, 152.);
+    assert!(compact_budget > BITRATE_LABEL_WIDTH);
+
+    // The smallest card (260 px) must still leave a positive control width.
+    let smallest = settings_card_metrics((200., 600.), 1.0);
+    assert_eq!(smallest.width, 260.);
+    let smallest_cell = (smallest.form_width() - 2. * 8.) / 3.;
+    assert!(smallest_cell > 0.);
+    assert!(
+        smallest_cell - BITRATE_BUTTON_PADDING - BITRATE_BORDER > 0.,
+        "the 3 + 3 cell keeps positive content width on the smallest card"
+    );
+}
+
+/// The selector threshold is compared with the true inner width: the 620 px
+/// card leaves 538 px and keeps the two columns side by side, while a 600 px
+/// window leaves 502 px and stacks them.
+#[test]
+fn selector_columns_follow_the_true_inner_width() {
+    use super::settings_view::settings_card_metrics;
+    use super::settings_voice_view::TWO_COLUMN_FORM_WIDTH;
+    assert_eq!(TWO_COLUMN_FORM_WIDTH, 536.0);
+    let compact = settings_card_metrics((636., 900.), 1.0);
+    assert_eq!(compact.width, 620.);
+    assert_eq!(compact.form_width(), 538.);
+    assert!(compact.form_width() >= TWO_COLUMN_FORM_WIDTH);
+    let window = settings_card_metrics((600., 900.), 1.0);
+    assert_eq!(window.width, 584.);
+    assert_eq!(window.form_width(), 502.);
+    assert!(window.form_width() < TWO_COLUMN_FORM_WIDTH);
 }
 
 /// The unavailable label comes from the shared `UNAVAILABLE_DEVICE` constant,
@@ -787,13 +837,12 @@ async fn six_bitrate_presets_form_one_row_when_wide_and_two_rows_when_narrow(
 }
 
 /// GPUI exposes no glyph bounds to the test, so the rendered check asserts the
-/// row structure at the two real card sizes; the conservative cell budget is
+/// row structure at the two real card sizes; the measured cell budget is
 /// asserted against the metric in
-/// `bitrate_one_row_threshold_uses_the_padded_widest_label` (the painted row
-/// also loses a few px to the card border and the form scrollbar). At the 680 px
-/// design card (600 px inside) six presets share one row; at a 620 px card
-/// (540 px inside) they fall back to 3 + 3, while the selectors (threshold 540)
-/// stay side by side.
+/// `bitrate_one_row_threshold_uses_the_padded_widest_label`. At the 680 px
+/// design card (598 px inside) six presets share one row with 2.5 px slack per
+/// cell; at a 620 px card (538 px inside) they fall back to 3 + 3, while the
+/// selectors (threshold 536) stay side by side.
 #[gpui::test]
 async fn bitrate_row_uses_the_true_inner_width_at_680_and_620(cx: &mut TestAppContext) {
     const IDS: [&str; 6] = [
@@ -810,7 +859,7 @@ async fn bitrate_row_uses_the_true_inner_width_at_680_and_620(cx: &mut TestAppCo
     // numbers below map to the pure `settings_card_metrics` assertions.
     visual.update(|_, app| view.update(app, |v, _| v.test_pin_ui_scale(1.0)));
 
-    // A 1000 px viewport paints the 680 px card: 600 px inside, one row.
+    // A 1000 px viewport paints the 680 px card: 598 px inside, one row.
     resize(visual, 1000., 800.);
     let one_row: Vec<_> = IDS
         .iter()
@@ -827,8 +876,15 @@ async fn bitrate_row_uses_the_true_inner_width_at_680_and_620(cx: &mut TestAppCo
             "680 px card keeps preset {index} on the single row"
         );
     }
+    // The painted cell itself must hold the widest label: the measured 68.5 px
+    // advance, 10 px padding per side and the 2 px secondary border.
+    let cell = f32::from(one_row[0].size.width);
+    assert!(
+        cell >= 68.5 + 20. + 2.,
+        "the painted one-row cell {cell} px fits the widest label"
+    );
 
-    // A 636 px viewport is the 620 px card: 540 px inside, below the 598 px
+    // A 636 px viewport is the 620 px card: 538 px inside, below the 583 px
     // one-row threshold but still wide enough for two device selectors.
     resize(visual, 636., 800.);
     let compact: Vec<_> = IDS
@@ -866,7 +922,7 @@ async fn bitrate_row_uses_the_true_inner_width_at_680_and_620(cx: &mut TestAppCo
         .expect("the output selector is painted");
     assert!(
         f32::from(output.origin.y) < f32::from(input.origin.y + input.size.height) - 0.5,
-        "the 540 px inner width keeps the selectors side by side: {input:?} / {output:?}"
+        "the 538 px inner width keeps the selectors side by side: {input:?} / {output:?}"
     );
 }
 

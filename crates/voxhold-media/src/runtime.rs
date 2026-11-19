@@ -202,10 +202,24 @@ impl VoiceHandle {
     }
 
     /// Physical pixels of the player picture; the decoder scales to this.
+    /// A repeat of the current size is ignored, but a real change wakes the
+    /// worker so it re-reads the latest frame without waiting for a socket
+    /// event or a new RTP frame.
     pub fn set_viewport(&self, width: u32, height: u32) {
-        if let Ok(mut slot) = self.requests.viewport.lock() {
-            *slot = Some((width, height));
+        if width == 0 || height == 0 {
+            return;
         }
+        let Ok(mut slot) = self.requests.viewport.lock() else {
+            return;
+        };
+        if *slot == Some((width, height)) {
+            return;
+        }
+        *slot = Some((width, height));
+        // Release the slot before waking: the worker reads it at the top of its
+        // loop and must not contend with a writer that would not change it.
+        drop(slot);
+        self.requests.wake();
     }
 
     pub fn try_update(&self) -> Option<VoiceUpdate> {
@@ -724,6 +738,18 @@ async fn run_session(
     let mut tick = tokio::time::interval(Duration::from_millis(25));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
+        // A viewport change (fullscreen, resize, DPI) wakes the worker through
+        // `set_viewport`. Apply it before waiting for a socket event so the
+        // latest decoded frame is re-read without a new RTP frame.
+        let viewport = requests.viewport();
+        if viewport != live.viewport {
+            live.viewport = viewport;
+            match live.drain_viewer(viewer).await {
+                Ok(true) => {}
+                Ok(false) => return SessionEnd::Recover,
+                Err(end) => return end,
+            }
+        }
         let notified = requests.notify.notified();
         while let Some(pending) = requests.take() {
             match pending {

@@ -31,6 +31,10 @@ pub struct StreamViewer {
     requested_output: Option<String>,
     applied_output: Option<String>,
     output_working: bool,
+    /// Viewport applied to the last decoded read. A different size re-reads
+    /// the still-current frame so a static stream repaints at the new texture
+    /// size instead of waiting for another RTP frame.
+    viewport: (u32, u32),
 }
 
 impl StreamViewer {
@@ -60,6 +64,7 @@ impl StreamViewer {
             requested_output: output.clone(),
             applied_output: output,
             output_working: true,
+            viewport: (0, 0),
         })
     }
 
@@ -116,12 +121,22 @@ impl StreamViewer {
 
     /// Non-blocking: one queued engine event per call, so a burst of frames
     /// cannot starve signaling or the voice session on the same worker.
+    ///
+    /// A changed viewport re-reads the frame `VideoStore` already holds. The
+    /// read is size-aware, so an unchanged size reports nothing and the caller
+    /// settles instead of polling in a loop.
     pub fn poll(
         &mut self,
         frame: &mut VideoFrame,
         width: u32,
         height: u32,
     ) -> Option<EngineUpdate> {
+        if (width, height) != self.viewport {
+            self.viewport = (width, height);
+            if self.media.read_video(frame, width, height) {
+                return Some(EngineUpdate::Frame);
+            }
+        }
         let event = self.media.poll(Duration::ZERO)?;
         match event {
             Event::Frame => self
@@ -166,14 +181,22 @@ mod tests {
     use std::sync::Arc;
     use tokio::sync::mpsc;
 
-    fn headless(output: Option<&str>) -> (StreamViewer, mpsc::Receiver<Command>, Arc<Events>) {
+    fn headless(
+        output: Option<&str>,
+    ) -> (
+        StreamViewer,
+        mpsc::Receiver<Command>,
+        Arc<Events>,
+        Arc<VideoStore>,
+    ) {
         let (commands, receiver) = mpsc::channel(8);
         let events = Arc::new(Events::default());
+        let video = Arc::new(VideoStore::default());
         let media = Media {
             commands,
             events: events.clone(),
             capture: Arc::new(CaptureGate::default()),
-            video: Arc::new(VideoStore::default()),
+            video: video.clone(),
             worker: None,
         };
         let output = output.map(str::to_owned);
@@ -184,15 +207,17 @@ mod tests {
                 requested_output: output.clone(),
                 applied_output: output,
                 output_working: true,
+                viewport: (0, 0),
             },
             receiver,
             events,
+            video,
         )
     }
 
     #[test]
     fn a_rolled_back_output_can_be_requested_again() {
-        let (mut viewer, mut commands, events) = headless(Some("usb"));
+        let (mut viewer, mut commands, events, _video) = headless(Some("usb"));
         viewer.set_output(Some("hdmi".into())).unwrap();
         assert!(matches!(
             commands.try_recv(),
@@ -222,7 +247,7 @@ mod tests {
 
     #[test]
     fn an_unplug_fallback_does_not_hide_a_reconnected_device() {
-        let (mut viewer, mut commands, events) = headless(Some("usb-a"));
+        let (mut viewer, mut commands, events, _video) = headless(Some("usb-a"));
         // The hot-plug check switched playback to the default endpoint.
         events.push(Event::Output {
             applied: None,
@@ -248,8 +273,33 @@ mod tests {
     }
 
     #[test]
+    fn a_viewport_change_re_reads_a_static_frame_without_a_new_rtp_frame() {
+        let (mut viewer, _commands, events, video) = headless(None);
+        assert!(video.publish_i420(libwebrtc::video_frame::I420Buffer::new_black(320, 180)));
+        events.push(Event::Frame);
+        let mut frame = VideoFrame::default();
+        assert!(matches!(
+            viewer.poll(&mut frame, 160, 90),
+            Some(EngineUpdate::Frame)
+        ));
+        assert_eq!((frame.width(), frame.height()), (160, 90));
+
+        // Fullscreen: no `Event::Frame` is queued, only the picture surface
+        // changed. The viewer must re-read the frame it already decodes.
+        assert!(matches!(
+            viewer.poll(&mut frame, 320, 278),
+            Some(EngineUpdate::Frame)
+        ));
+        assert_eq!((frame.width(), frame.height()), (320, 180));
+
+        // The same size reports nothing, so the worker settles after one
+        // repaint instead of forcing frames in a loop.
+        assert!(viewer.poll(&mut frame, 320, 278).is_none());
+    }
+
+    #[test]
     fn an_explicit_selection_bypasses_the_stale_output_cache() {
-        let (mut viewer, mut commands, _events) = headless(Some("usb-a"));
+        let (mut viewer, mut commands, _events, _video) = headless(Some("usb-a"));
         // The fallback notice is still queued: the viewer cache says A is
         // applied and working. An explicit settings selection must still reach
         // `Session::ViewOutput`, whose own state knows about the unplug.

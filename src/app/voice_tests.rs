@@ -937,3 +937,48 @@ fn voice_room_colors_follow_the_theme() {
     assert_eq!(dark.accent_text, dark_palette.accent_ink);
     assert_eq!(light.accent_text, light_palette.accent_ink);
 }
+
+#[gpui::test]
+async fn the_decoder_viewport_tracks_the_fullscreen_picture(cx: &mut TestAppContext) {
+    let (mut visual, _view, voice) = fixture(cx);
+    draw(&mut visual);
+    visual.update(|_window, app| {
+        voice.update(app, |panel, _| {
+            panel.test_attach_detached_handle();
+            panel.set_scale(1.0);
+            panel.test_open_player(publication(7, "alice", 1));
+            panel.set_player_area_and_place(crate::voice_room::Rect::new(0., 0., 1920., 1080.));
+            assert_eq!(
+                panel.test_take_viewport(),
+                Some((358, 202)),
+                "the floating player keeps its own picture, not the whole window"
+            );
+            panel.test_set_fullscreen(true);
+            panel.test_sync_viewport();
+            assert_eq!(
+                panel.test_take_viewport(),
+                Some((1920, 1018)),
+                "fullscreen decodes to the full picture surface"
+            );
+            panel.test_sync_viewport();
+            assert_eq!(
+                panel.test_take_viewport(),
+                None,
+                "an unchanged viewport is not queued again"
+            );
+            panel.set_scale(2.0);
+            assert_eq!(
+                panel.test_take_viewport(),
+                Some((3840, 2036)),
+                "a DPI change requests physical pixels"
+            );
+        });
+    });
+    // Leaving fullscreen returns to the floating picture at the same scale.
+    visual.update(|window, app| {
+        voice.update(app, |panel, _| {
+            panel.exit_fullscreen(window);
+            assert_eq!(panel.test_take_viewport(), Some((716, 405)));
+        });
+    });
+}

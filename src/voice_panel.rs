@@ -145,6 +145,9 @@ pub struct VoicePanel {
     player_placed: bool,
     player_fullscreen: bool,
     owns_fullscreen: bool,
+    /// Physical size last handed to the media worker. Repeated renders must not
+    /// rewrite the same slot, but a real change is never skipped.
+    requested_viewport: Option<(u32, u32)>,
     player_drag: Option<PlayerDrag>,
     join_focus: FocusHandle,
     action_focus: Vec<FocusHandle>,
@@ -276,6 +279,7 @@ impl VoicePanel {
             player_placed: false,
             player_fullscreen: false,
             owns_fullscreen: false,
+            requested_viewport: None,
             player_drag: None,
             join_focus: cx.focus_handle(),
             action_focus: (0..VOICE_ACTIONS.len())
@@ -452,6 +456,9 @@ impl VoicePanel {
 
     pub fn set_scale(&mut self, scale: f32) {
         self.scale = scale.max(0.1);
+        // A DPI change moves the same window rectangle to different physical
+        // pixels, so the decoder must be told before the next frame arrives.
+        self.sync_viewport();
     }
 
     pub fn room(&self) -> i64 {
@@ -825,6 +832,9 @@ impl VoicePanel {
         self.watching = None;
         self.watching_selection = None;
         self.player_open = false;
+        // The next player may be served by another handle; its first viewport
+        // must reach that worker even if the size matches the closed player.
+        self.requested_viewport = None;
         self.stream_status.clear();
         self.stream_error.clear();
         self.stream_audio_error.clear();
@@ -902,15 +912,7 @@ impl VoicePanel {
     }
 
     fn poll(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(player) = self.player_box() {
-            let geometry = voice_room::player_geometry(self.player_area, player, self.has_audio());
-            let picture = geometry.picture;
-            let width = (picture.w * self.scale).max(1.0) as u32;
-            let height = (picture.h * self.scale).max(1.0) as u32;
-            if let Some(handle) = &self.handle {
-                handle.set_viewport(width, height);
-            }
-        }
+        self.sync_viewport();
         let preview_changed = self.take_screen_preview();
         let Some(handle) = &self.handle else {
             if preview_changed {

@@ -12,6 +12,19 @@ impl VoicePanel {
         let handle = VoiceHandle::detached_for_tests();
         self.attempt = handle.attempt();
         self.handle = Some(handle);
+        // A new worker starts with no viewport; the next render must send it.
+        self.requested_viewport = None;
+    }
+
+    /// Push the current player picture size, exactly as `poll` and the resize
+    /// paths do.
+    pub fn test_sync_viewport(&mut self) {
+        self.sync_viewport();
+    }
+
+    /// Take the viewport the UI queued for the detached media worker.
+    pub fn test_take_viewport(&mut self) -> Option<(u32, u32)> {
+        self.handle.as_ref()?.take_viewport_for_tests()
     }
 
     /// The newest control snapshot waiting for the media layer, if any. The

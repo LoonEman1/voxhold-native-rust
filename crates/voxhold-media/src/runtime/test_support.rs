@@ -36,6 +36,12 @@ impl VoiceHandle {
         self.requests.power.lock().ok()?.take()
     }
 
+    /// The newest viewport the UI requested. The slot is a last-value cell, so
+    /// `None` after a take proves that an unchanged size was not rewritten.
+    pub fn take_viewport_for_tests(&self) -> Option<(u32, u32)> {
+        self.requests.viewport.lock().ok()?.take()
+    }
+
     /// Drain the queued screen actions as (kind, picker) pairs. The detached
     /// handle has no worker, so this is exactly what the UI sent.
     pub fn take_screen_commands_for_tests(&self) -> Vec<(&'static str, u64)> {

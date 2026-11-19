@@ -34,6 +34,48 @@ impl VoicePanel {
             self.player_pos = (player.x, player.y);
             self.player_placed = true;
         }
+        // A window or room resize changes the picture surface even while the
+        // stream is static, so the decoder needs the new size right away.
+        self.sync_viewport();
+    }
+
+    /// The picture surface the player actually shows: the fullscreen picture
+    /// while the player owns the window, the floating picture otherwise.
+    pub(crate) fn picture_rect(&self) -> Option<Rect> {
+        let player = self.player_box()?;
+        let geometry = voice_room::player_geometry(self.player_area, player, self.has_audio());
+        Some(if self.player_fullscreen {
+            geometry.fullscreen_picture
+        } else {
+            geometry.picture
+        })
+    }
+
+    /// Physical pixels of the visible picture, at least 1x1. The decoder scales
+    /// its output to this size, so it must match the surface on screen.
+    pub(crate) fn viewport_pixels(&self) -> Option<(u32, u32)> {
+        let picture = self.picture_rect()?;
+        Some((
+            (picture.w * self.scale).max(1.0) as u32,
+            (picture.h * self.scale).max(1.0) as u32,
+        ))
+    }
+
+    /// Send the visible picture size to the media worker only when it changed.
+    /// The worker re-reads the latest decoded frame, which repaints a static
+    /// stream at the new texture size without a new RTP frame.
+    pub(crate) fn sync_viewport(&mut self) {
+        let Some(viewport) = self.viewport_pixels() else {
+            return;
+        };
+        if self.requested_viewport == Some(viewport) {
+            return;
+        }
+        let Some(handle) = &self.handle else {
+            return;
+        };
+        self.requested_viewport = Some(viewport);
+        handle.set_viewport(viewport.0, viewport.1);
     }
 
     pub fn player_toggle_fullscreen(&mut self, window: &mut Window) {
@@ -47,6 +89,9 @@ impl VoicePanel {
         }
         self.player_fullscreen = true;
         self.player_drag = None;
+        // Entering fullscreen switches from the floating picture to the whole
+        // window; request it before the window resize arrives as well.
+        self.sync_viewport();
         if !window.is_fullscreen() {
             window.toggle_fullscreen();
             self.owns_fullscreen = true;
@@ -66,6 +111,7 @@ impl VoicePanel {
         if let Some(player) = self.player_box() {
             self.player_pos = (player.x, player.y);
         }
+        self.sync_viewport();
         window.focus(&self.player_actions[1]);
     }
 

@@ -402,6 +402,74 @@ fn adjacent_device_ids_use_the_endpoint_id_and_recover_from_a_missing_one() {
     assert_eq!(adjacent_device_ids(&[], ""), ("".to_owned(), "".to_owned()));
 }
 
+/// The form width must subtract both the dialog padding and the 16 px inset
+/// the card paints on each side. Ignoring the card inset turned the bitrate row
+/// on 32 px too early.
+#[test]
+fn form_width_subtracts_the_dialog_and_card_insets() {
+    use super::settings_view::{settings_card_metrics, CARD_INSET};
+    assert_eq!(CARD_INSET, 16.0);
+    let design = settings_card_metrics((1200., 900.), 1.0);
+    assert_eq!((design.width, design.pad), (680., 24.));
+    assert_eq!(design.form_width(), 680. - 2. * 24. - 2. * 16.);
+    assert_eq!(design.form_width(), 600.);
+    let narrow = settings_card_metrics((400., 900.), 1.0);
+    assert_eq!((narrow.width, narrow.pad), (384., 16.));
+    assert_eq!(narrow.form_width(), 384. - 2. * 16. - 2. * 16.);
+}
+
+/// The one-row threshold is derived from six padded cells and five 8 px gaps
+/// with a conservative 65 px label. GPUI exposes no glyph bounds to a test, so
+/// the decision asserts the cell budget instead of literal text measurement.
+#[test]
+fn bitrate_one_row_threshold_uses_the_padded_widest_label() {
+    use super::settings_view::settings_card_metrics;
+    use super::settings_voice_view::{
+        bitrate_cell_width, BITRATE_BUTTON_PADDING, BITRATE_LABEL_WIDTH, BITRATE_ONE_ROW_MIN_WIDTH,
+    };
+    assert_eq!(BITRATE_LABEL_WIDTH, 65.0);
+    assert_eq!(BITRATE_ONE_ROW_MIN_WIDTH, 6. * (65. + 28.) + 5. * 8.);
+    assert_eq!(BITRATE_ONE_ROW_MIN_WIDTH, 598.);
+    let design = settings_card_metrics((1200., 900.), 1.0).form_width();
+    assert_eq!(design, 600.);
+    assert!(design >= BITRATE_ONE_ROW_MIN_WIDTH);
+    assert!(
+        bitrate_cell_width(design) - BITRATE_BUTTON_PADDING >= BITRATE_LABEL_WIDTH,
+        "one-row cell budget {} px must fit the {} px label",
+        bitrate_cell_width(design) - BITRATE_BUTTON_PADDING,
+        BITRATE_LABEL_WIDTH
+    );
+    let compact = settings_card_metrics((636., 900.), 1.0);
+    assert_eq!(compact.width, 620.);
+    assert_eq!(compact.form_width(), 540.);
+    assert!(compact.form_width() < BITRATE_ONE_ROW_MIN_WIDTH);
+}
+
+/// The unavailable label comes from the shared `UNAVAILABLE_DEVICE` constant,
+/// so `device_choices` and the danger styling in the selector cannot drift. The
+/// selector's endpoint-id selection is not affected by the label.
+#[test]
+fn unavailable_device_label_drives_the_danger_path() {
+    use super::settings_voice_view::device_name_is_unavailable;
+    use crate::voice_settings::{device_choices, VoicePrefs, UNAVAILABLE_DEVICE};
+    assert_eq!(UNAVAILABLE_DEVICE, "Устройство недоступно");
+    assert!(device_name_is_unavailable(UNAVAILABLE_DEVICE));
+    assert!(!device_name_is_unavailable("Speakers"));
+    assert!(!device_name_is_unavailable(""));
+
+    let mut prefs = VoicePrefs::default();
+    prefs.input = "gone".into();
+    let devices = [device("mic-a", "USB Mic", true)];
+    let (_, ids, current) = device_choices(&prefs, &devices, true);
+    assert_eq!(current, UNAVAILABLE_DEVICE);
+    assert!(
+        device_name_is_unavailable(&current),
+        "an unavailable saved id paints the danger name"
+    );
+    // The arrows still walk the listed endpoint ids, not the label.
+    assert_eq!(ids, vec!["".to_owned(), "mic-a".to_owned()]);
+}
+
 /// Resize, repaint twice (the first frame measures the new card) and return.
 fn resize(visual: &mut VisualTestContext, width: f32, height: f32) {
     visual.simulate_resize(size(px(width), px(height)));
@@ -716,6 +784,90 @@ async fn six_bitrate_presets_form_one_row_when_wide_and_two_rows_when_narrow(
     view.read_with(&*visual, |v, _| {
         assert_eq!(v.voice_settings.prefs.bitrate, 32)
     });
+}
+
+/// GPUI exposes no glyph bounds to the test, so the rendered check asserts the
+/// row structure at the two real card sizes; the conservative cell budget is
+/// asserted against the metric in
+/// `bitrate_one_row_threshold_uses_the_padded_widest_label` (the painted row
+/// also loses a few px to the card border and the form scrollbar). At the 680 px
+/// design card (600 px inside) six presets share one row; at a 620 px card
+/// (540 px inside) they fall back to 3 + 3, while the selectors (threshold 540)
+/// stay side by side.
+#[gpui::test]
+async fn bitrate_row_uses_the_true_inner_width_at_680_and_620(cx: &mut TestAppContext) {
+    const IDS: [&str; 6] = [
+        "bitrate-0",
+        "bitrate-1",
+        "bitrate-2",
+        "bitrate-3",
+        "bitrate-4",
+        "bitrate-5",
+    ];
+
+    let (visual, view) = voice_tab(cx);
+    // The test window reports scale 2.0; pin the logical scale so the viewport
+    // numbers below map to the pure `settings_card_metrics` assertions.
+    visual.update(|_, app| view.update(app, |v, _| v.test_pin_ui_scale(1.0)));
+
+    // A 1000 px viewport paints the 680 px card: 600 px inside, one row.
+    resize(visual, 1000., 800.);
+    let one_row: Vec<_> = IDS
+        .iter()
+        .map(|id| {
+            visual
+                .debug_bounds(*id)
+                .unwrap_or_else(|| panic!("{id} is painted"))
+        })
+        .collect();
+    let row_y = f32::from(one_row[0].origin.y);
+    for (index, bounds) in one_row.iter().enumerate() {
+        assert!(
+            (f32::from(bounds.origin.y) - row_y).abs() < 0.5,
+            "680 px card keeps preset {index} on the single row"
+        );
+    }
+
+    // A 636 px viewport is the 620 px card: 540 px inside, below the 598 px
+    // one-row threshold but still wide enough for two device selectors.
+    resize(visual, 636., 800.);
+    let compact: Vec<_> = IDS
+        .iter()
+        .map(|id| {
+            visual
+                .debug_bounds(*id)
+                .unwrap_or_else(|| panic!("{id} is still painted"))
+        })
+        .collect();
+    let first_row_y = f32::from(compact[0].origin.y);
+    let second_row_y = f32::from(compact[3].origin.y);
+    for bounds in &compact[..3] {
+        assert!(
+            (f32::from(bounds.origin.y) - first_row_y).abs() < 0.5,
+            "620 px card keeps the first three presets on one row"
+        );
+    }
+    for bounds in &compact[3..] {
+        assert!(
+            (f32::from(bounds.origin.y) - second_row_y).abs() < 0.5,
+            "620 px card puts the last three presets on the second row"
+        );
+    }
+    assert!(
+        second_row_y > first_row_y + f32::from(compact[0].size.height) - 0.5,
+        "620 px card uses 3 + 3: {first_row_y} vs {second_row_y}"
+    );
+
+    let input = visual
+        .debug_bounds("audio-in-selector")
+        .expect("the input selector is painted");
+    let output = visual
+        .debug_bounds("audio-out-selector")
+        .expect("the output selector is painted");
+    assert!(
+        f32::from(output.origin.y) < f32::from(input.origin.y + input.size.height) - 0.5,
+        "the 540 px inner width keeps the selectors side by side: {input:?} / {output:?}"
+    );
 }
 
 #[gpui::test]

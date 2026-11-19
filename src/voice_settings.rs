@@ -11,6 +11,11 @@ use serde_json::{json, Value};
 /// Go `voiceBitrates`, in the frontend order. 160 is not offered.
 pub const BITRATES: [i64; 6] = [24, 32, 48, 64, 96, 128];
 
+/// Name `device_choices` reports for a saved endpoint that is no longer listed.
+/// The voice form compares against this shared constant for the danger styling,
+/// so the label and its tone cannot drift apart.
+pub const UNAVAILABLE_DEVICE: &str = "Устройство недоступно";
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VoicePrefs {
     pub input: String,
@@ -543,7 +548,7 @@ pub fn device_choices(
         names.push(device.name.clone());
     }
     if !selected.is_empty() && !ids.contains(selected) {
-        current = "Устройство недоступно".to_owned();
+        current = UNAVAILABLE_DEVICE.to_owned();
     }
     (names, ids, current)
 }
@@ -856,7 +861,9 @@ mod tests {
         let (names, ids, select) = device_choices(&prefs, &devices, true);
         assert_eq!(names, vec!["Системное по умолчанию", "Microphone"]);
         assert_eq!(ids, vec!["", "mic-1"]);
-        assert_eq!(select, "Устройство недоступно");
+        assert_eq!(select, UNAVAILABLE_DEVICE);
+        // The published contract stays the exact Go/frontend sentence.
+        assert_eq!(UNAVAILABLE_DEVICE, "Устройство недоступно");
         assert_eq!(device_choices(&prefs, &devices, false).0[1], "Speakers");
     }
 }

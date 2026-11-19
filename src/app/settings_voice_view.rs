@@ -16,7 +16,7 @@
 use super::settings_view::{settings_card_metrics, ButtonKind};
 use super::*;
 use crate::audio_capabilities::{capabilities_for, Support};
-use crate::voice_settings::{device_choices, BITRATES};
+use crate::voice_settings::{device_choices, BITRATES, UNAVAILABLE_DEVICE};
 use gpui::ElementId;
 
 /// Fixed logical meter track, as in the Go `levelMeter` box. The fill is
@@ -24,11 +24,46 @@ use gpui::ElementId;
 /// when the dialog is resized.
 const METER_WIDTH: f32 = 220.0;
 
-/// Minimum usable form width for the two device selectors to sit side by side.
-/// The web grid switches at the modal width; here the number is compared with
-/// the real settings form width, so it follows the dialog instead of the
-/// window.
+/// Minimum usable inner form width for the two device selectors to sit side by
+/// side. Compared with the true `CardMetrics::form_width`, so it follows the
+/// painted dialog instead of a window guess.
 const TWO_COLUMN_FORM_WIDTH: f32 = 540.0;
+
+/// Conservative painted width of the widest preset label, «128 кбит/с», at
+/// 13 px bold. GPUI exposes no glyph bounds to the layout tests, so the layout
+/// decision uses this budget and the tests assert the cell budget instead.
+pub(super) const BITRATE_LABEL_WIDTH: f32 = 65.0;
+
+/// Horizontal padding of one `settings_button` cell (`px(14.)` on both sides).
+pub(super) const BITRATE_BUTTON_PADDING: f32 = 28.0;
+
+/// Gap between the preset cells, matching `gap_2`.
+pub(super) const BITRATE_GAP: f32 = 8.0;
+
+/// `BITRATES` always offers six presets.
+pub(super) const BITRATE_COLUMNS: usize = 6;
+
+/// Smallest inner form width where every one-row cell still fits the widest
+/// label inside the button padding: six padded cells and five gaps.
+/// 6 * (65 + 28) + 5 * 8 = 598 px. The 680 px design card has 600 px inside,
+/// so it keeps one row; a 620 px card has 540 px and falls back to 3 + 3.
+pub(super) const BITRATE_ONE_ROW_MIN_WIDTH: f32 = BITRATE_COLUMNS as f32
+    * (BITRATE_LABEL_WIDTH + BITRATE_BUTTON_PADDING)
+    + (BITRATE_COLUMNS - 1) as f32 * BITRATE_GAP;
+
+/// Width of one preset cell on a single row, before the button padding. Only the
+/// layout tests need it; production uses the threshold constant.
+#[cfg(test)]
+pub(super) fn bitrate_cell_width(form_width: f32) -> f32 {
+    (form_width - BITRATE_GAP * (BITRATE_COLUMNS - 1) as f32) / BITRATE_COLUMNS as f32
+}
+
+/// A saved endpoint that is no longer listed is the only name painted with the
+/// danger tone. Matching the shared constant keeps the form and
+/// `device_choices` on the same string.
+pub(super) fn device_name_is_unavailable(current: &str) -> bool {
+    current == UNAVAILABLE_DEVICE
+}
 
 /// Slider id for one participant. It is the stable user id, not the row index,
 /// so a roster change cannot move a value to a neighbour.
@@ -142,10 +177,12 @@ impl Voxhold {
         let in_call = false;
         let (_, input_ids, input_current) = device_choices(&prefs, &devices, true);
         let (_, output_ids, output_current) = device_choices(&prefs, &devices, false);
-        // The two-column decision follows the painted settings form, not a
-        // window size guess: the same numbers the overlay uses for its card.
+        // The two decisions follow the painted settings form, not a window size
+        // guess: the selectors only need room for two columns, while the
+        // bitrate row must fit six padded cells with the widest label.
         let form_width = settings_card_metrics(self.viewport, self.ui_scale).form_width();
-        let wide = form_width >= TWO_COLUMN_FORM_WIDTH;
+        let selectors_wide = form_width >= TWO_COLUMN_FORM_WIDTH;
+        let bitrate_wide = form_width >= BITRATE_ONE_ROW_MIN_WIDTH;
 
         let mut root = div().flex().flex_col().gap(px(12.)).child(self.heading(
             "Голос и звук",
@@ -174,7 +211,7 @@ impl Voxhold {
             window,
             cx,
         );
-        let selectors = if wide {
+        let selectors = if selectors_wide {
             div()
                 .w_full()
                 .flex()
@@ -360,7 +397,7 @@ impl Voxhold {
         }
 
         // Quality: six Opus presets, one row of six or two rows of three.
-        let quality = self.voice_bitrate_presets(wide, prefs.bitrate, window, cx);
+        let quality = self.voice_bitrate_presets(bitrate_wide, prefs.bitrate, window, cx);
         root = root.child(self.settings_card(
             "voice-quality-card",
             "Качество передачи",
@@ -652,7 +689,7 @@ impl Voxhold {
         };
         let selector_id = format!("{prefix}-selector");
         let name_id = format!("{prefix}-name");
-        let unavailable = current == "Устройство недоступно";
+        let unavailable = device_name_is_unavailable(current);
         let previous = self
             .settings_button(
                 ElementId::Name(format!("{prefix}-prev").into()),
@@ -726,16 +763,16 @@ impl Voxhold {
     }
 
     /// Six Opus presets, as in the web `.voice-bitrate-setting`: one row of six
-    /// on a wide form, two rows of three when the form is narrow. The selected
-    /// preset uses the primary (lime) style so the active value is unambiguous.
+    /// on a wide-enough form, two rows of three otherwise. The selected preset
+    /// uses the primary (lime) style so the active value is unambiguous.
     fn voice_bitrate_presets(
         &mut self,
-        wide: bool,
+        one_row: bool,
         bitrate: i64,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let columns = if wide { BITRATES.len() } else { 3 };
+        let columns = if one_row { BITRATE_COLUMNS } else { 3 };
         let mut body = div().w_full().flex().flex_col().gap(px(8.));
         for row in BITRATES.chunks(columns) {
             let mut line = div().w_full().flex().gap_2();

@@ -13,6 +13,10 @@ pub(super) enum ButtonKind {
     Icon,
 }
 
+/// Inner padding `settings_card` paints on every side. A row inside a card is
+/// narrower than the dialog body by this amount on each side.
+pub(super) const CARD_INSET: f32 = 16.0;
+
 /// Logical box of the settings card. The voice tab reuses the same numbers to
 /// decide whether its form is wide enough for two columns, so the predicate
 /// follows the real painted dialog instead of a hard-coded window guess.
@@ -24,9 +28,10 @@ pub(super) struct CardMetrics {
 }
 
 impl CardMetrics {
-    /// Usable width of one form row: the card minus both insets.
+    /// Usable width of one form row: the card minus both dialog insets and the
+    /// card's own inner padding on each side.
     pub(super) fn form_width(self) -> f32 {
-        self.width - 2.0 * self.pad
+        self.width - 2.0 * self.pad - 2.0 * CARD_INSET
     }
 }
 
@@ -410,7 +415,7 @@ impl Voxhold {
             .flex()
             .flex_col()
             .gap(px(12.))
-            .p(px(16.))
+            .p(px(CARD_INSET))
             .rounded(px(14.))
             .border_1()
             .border_color(ink(p.line))

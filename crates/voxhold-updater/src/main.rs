@@ -22,6 +22,12 @@
 //! `--detached`; the parent exits immediately. Release builds use the Windows
 //! subsystem so the helper never flashes a console window; failures are
 //! reported through `apply.log` and the exit code.
+//!
+//! After a successful apply the helper removes the staged payload and then
+//! runs a best-effort `cleanup_stale` over the updates root, keeping its own
+//! version directory because the running image cannot be deleted. The
+//! application removes the remainder on the next start or after its
+//! post-handshake cleanup timer.
 
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
@@ -36,7 +42,8 @@ use voxhold_update::apply::{
     relocate_helper,
 };
 use voxhold_update::stage::{
-    cleanup_after_install, cleanup_after_install_payload, updates_root, APPLY_LOG, APP_DIR,
+    cleanup_after_install, cleanup_after_install_payload, cleanup_stale, updates_root, APPLY_LOG,
+    APP_DIR,
 };
 
 const EXIT_OK: u8 = 0;
@@ -174,6 +181,7 @@ fn main() -> ExitCode {
                     &format!("staging cleanup failed: {}", error.code()),
                 );
             }
+            cleanup_other_versions(&arguments.staged, &log_path);
             ExitCode::from(EXIT_OK)
         }
         Err(error) => {
@@ -183,6 +191,37 @@ fn main() -> ExitCode {
             );
             ExitCode::from(EXIT_APPLY)
         }
+    }
+}
+
+/// Remove staging directories of older attempts before the helper exits.
+///
+/// Runs only after a successful apply. Windows cannot delete the running
+/// helper image, so the version directory of this run is kept (with
+/// `apply.log`); the application removes it on the next start or after its
+/// post-handshake cleanup timer. Every other entry is best-effort: an entry
+/// that is still locked is skipped and retried by the next cleanup.
+fn cleanup_other_versions(staged: &Path, log_path: &Path) {
+    let root = match updates_root() {
+        Ok(root) => root,
+        Err(error) => {
+            log(
+                log_path,
+                &format!("stale cleanup skipped: {}", error.code()),
+            );
+            return;
+        }
+    };
+    let keep = staged
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned());
+    match cleanup_stale(&root, keep.as_deref()) {
+        Ok(0) => {}
+        Ok(removed) => log(
+            log_path,
+            &format!("removed {removed} stale staging entries"),
+        ),
+        Err(error) => log(log_path, &format!("stale cleanup failed: {}", error.code())),
     }
 }
 

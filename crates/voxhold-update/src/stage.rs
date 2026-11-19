@@ -347,6 +347,15 @@ pub async fn cleanup_version(root: &Path, version: &str) -> Result<()> {
 ///
 /// `keep_version` keeps the staging directory of an update that is ready to
 /// install. Every other directory and stray file under `root` is removed.
+///
+/// The function is best-effort per entry: an entry that cannot be removed (a
+/// relocated `helper.exe` that is still running, a file held by another
+/// process, a directory with such a file) is skipped so that the remaining
+/// entries are still cleaned. The first start after an update therefore does
+/// not fail because the helper is still waiting for its handshake. The
+/// returned count is the number of entries that were actually removed; the
+/// next start retries the skipped ones. Only a failure to enumerate `root`
+/// itself is reported as [`UpdateError::Io`].
 pub fn cleanup_stale(root: &Path, keep_version: Option<&str>) -> Result<usize> {
     let entries = match std::fs::read_dir(root) {
         Ok(entries) => entries,
@@ -355,22 +364,24 @@ pub fn cleanup_stale(root: &Path, keep_version: Option<&str>) -> Result<usize> {
     };
     let mut removed = 0;
     for entry in entries {
-        let entry = entry.map_err(|error| UpdateError::io(root, error))?;
+        // A failed entry has no usable path to report; keep cleaning the rest.
+        let Ok(entry) = entry else {
+            continue;
+        };
         let name = entry.file_name();
         let name = name.to_string_lossy();
         if keep_version == Some(name.as_ref()) {
             continue;
         }
         let path = entry.path();
-        let file_type = entry
-            .file_type()
-            .map_err(|error| UpdateError::io(&path, error))?;
-        if file_type.is_dir() {
-            std::fs::remove_dir_all(&path).map_err(|error| UpdateError::io(&path, error))?;
-        } else {
-            std::fs::remove_file(&path).map_err(|error| UpdateError::io(&path, error))?;
+        let removed_ok = match entry.file_type() {
+            Ok(file_type) if file_type.is_dir() => std::fs::remove_dir_all(&path).is_ok(),
+            Ok(_) => std::fs::remove_file(&path).is_ok(),
+            Err(_) => false,
+        };
+        if removed_ok {
+            removed += 1;
         }
-        removed += 1;
     }
     Ok(removed)
 }
@@ -388,7 +399,9 @@ pub fn cleanup_after_install(staging: &Path) -> Result<()> {
 ///
 /// Windows cannot delete a running executable. When the helper was copied into
 /// the staging directory it removes everything else here; `helper.exe` and
-/// `apply.log` stay behind until the next start calls [`cleanup_stale`].
+/// `apply.log` stay behind until the next start calls [`cleanup_stale`]. The
+/// helper additionally calls [`cleanup_stale`] for the other version
+/// directories before it exits.
 pub fn cleanup_after_install_payload(staging: &Path) -> Result<()> {
     let entries = match std::fs::read_dir(staging) {
         Ok(entries) => entries,
@@ -432,6 +445,77 @@ mod tests {
         assert!(!root.join("stray.part").exists());
         assert_eq!(cleanup_stale(&root, None).unwrap(), 1);
         assert!(root.exists());
+    }
+
+    #[cfg(windows)]
+    struct LockedFile(windows_sys::Win32::Foundation::HANDLE);
+
+    #[cfg(windows)]
+    impl Drop for LockedFile {
+        fn drop(&mut self) {
+            // SAFETY: the handle was created by `CreateFileW` and is closed once.
+            unsafe { windows_sys::Win32::Foundation::CloseHandle(self.0) };
+        }
+    }
+
+    #[cfg(windows)]
+    fn lock_without_sharing(path: &Path) -> LockedFile {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+        use windows_sys::Win32::Storage::FileSystem::{
+            CreateFileW, FILE_ATTRIBUTE_NORMAL, OPEN_EXISTING,
+        };
+
+        const GENERIC_READ: u32 = 0x8000_0000;
+        let wide: Vec<u16> = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        // SAFETY: `wide` is NUL-terminated and outlives the call.
+        let handle = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                GENERIC_READ,
+                0,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_ne!(handle, INVALID_HANDLE_VALUE, "CreateFileW failed");
+        LockedFile(handle)
+    }
+
+    /// The first start after an update still sees a relocated helper image
+    /// that waits for its handshake. Its version directory must be skipped
+    /// while the neighbouring leftovers are removed.
+    #[cfg(windows)]
+    #[test]
+    fn cleanup_stale_skips_a_locked_entry() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("updates");
+        let busy = root.join("0.1.0");
+        std::fs::create_dir_all(&busy).unwrap();
+        let helper = busy.join(crate::apply::HELPER_FILE);
+        std::fs::write(&helper, b"helper image").unwrap();
+        std::fs::create_dir_all(root.join("0.2.0").join(APP_DIR)).unwrap();
+        std::fs::write(root.join("stray.part"), b"partial").unwrap();
+
+        // Emulates a running helper image: the file is opened without sharing,
+        // so `remove_dir_all` cannot delete its directory.
+        let lock = lock_without_sharing(&helper);
+        let removed = cleanup_stale(&root, None).unwrap();
+        assert_eq!(removed, 2);
+        assert!(busy.exists());
+        assert!(helper.exists());
+        assert!(!root.join("0.2.0").exists());
+        assert!(!root.join("stray.part").exists());
+
+        drop(lock);
+        assert_eq!(cleanup_stale(&root, None).unwrap(), 1);
+        assert!(!busy.exists());
     }
 
     #[test]

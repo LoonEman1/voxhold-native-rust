@@ -503,3 +503,4 @@ backend/браузер, TURN/ICE на втором ПК, DPI 125/150, запис
 - CI `release.yml`: одна Windows x64 сборка → portable ZIP + per-user Setup.exe (Inno), Authenticode при секретах, дельта от предыдущего `beta`, manifest+sign последним.
 - Ключ: публичный в `crates/voxhold-update/update-pubkey.txt`, приватный в GitHub secret `VOXHOLD_UPDATE_SIGNING_KEY` и вне репозитория; Authenticode-сертификата нет (`authenticode:false`).
 - Не проверено: реальный A→B из Setup и ZIP на чистой Windows, компиляция Inno/установка/удаление, Authenticode/SmartScreen, реальный GitHub-канал, живой GUI/DPI и настоящий helper-процесс.
+- Интеграция: PR #26 влит в `dev` коммитом `78a7cb3`; ревью и тесты пройдены на `2ceb420`. Реальный A→B, Inno и Authenticode остаются обязательными сценариями `W13`.

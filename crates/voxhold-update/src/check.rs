@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use crate::download::{build_client, CancelToken};
 use crate::error::{redact_url, Result, UpdateError};
-use crate::manifest::Manifest;
+use crate::manifest::VerifiedManifest;
 use crate::urls::validate_update_url;
 use crate::verify::{verify_and_parse, UpdatePublicKey};
 
@@ -27,7 +27,10 @@ pub struct CheckRequest<'a> {
 }
 
 /// Fetch `latest.json` and its detached signature, verify, then parse.
-pub async fn check_signed_manifest(request: CheckRequest<'_>) -> Result<Manifest> {
+///
+/// The result is a [`VerifiedManifest`] and can be passed to
+/// [`crate::stage::stage_update`].
+pub async fn check_signed_manifest(request: CheckRequest<'_>) -> Result<VerifiedManifest> {
     let manifest_origin = validate_update_url(request.manifest_url)?.origin();
     let signature_origin = validate_update_url(request.signature_url)?.origin();
     if manifest_origin != signature_origin {

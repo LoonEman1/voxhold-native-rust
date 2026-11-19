@@ -9,7 +9,7 @@ use ring::rand::SystemRandom;
 use ring::signature::{Ed25519KeyPair, KeyPair, UnparsedPublicKey, ED25519};
 
 use crate::error::{Result, UpdateError};
-use crate::manifest::Manifest;
+use crate::manifest::{Manifest, VerifiedManifest};
 
 /// Base64 text compiled into the client.
 ///
@@ -65,13 +65,16 @@ pub fn verify_bytes(key: &UpdatePublicKey, message: &[u8], signature_base64: &st
 }
 
 /// Verify the signature first, then parse and validate the manifest.
+///
+/// The returned value is the only way to obtain a [`VerifiedManifest`], which
+/// staging requires.
 pub fn verify_and_parse(
     key: &UpdatePublicKey,
     manifest_bytes: &[u8],
     signature_base64: &str,
-) -> Result<Manifest> {
+) -> Result<VerifiedManifest> {
     verify_bytes(key, manifest_bytes, signature_base64)?;
-    Manifest::parse(manifest_bytes)
+    Manifest::parse(manifest_bytes).map(VerifiedManifest::new)
 }
 
 /// Generate a new Ed25519 key pair.

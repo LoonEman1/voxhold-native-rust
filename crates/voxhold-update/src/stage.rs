@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::download::{download, CancelToken, DownloadRequest, ProgressFn, SIZE_MARGIN};
 use crate::error::{Result, UpdateError};
-use crate::manifest::{Manifest, Offer, WindowsVersion};
+use crate::manifest::{Offer, VerifiedManifest, WindowsVersion};
 use crate::package::{self, PackageIndex, PackedPackage};
 
 /// Marker written after a successful stage.
@@ -25,6 +25,10 @@ pub const PACKAGE_FILE: &str = "package.zip";
 pub const DELTA_FILE: &str = "delta.zip";
 /// Unpacked next version.
 pub const APP_DIR: &str = "app";
+/// Number of download attempts: the first try plus one retry.
+pub const DOWNLOAD_ATTEMPTS: u32 = 2;
+/// Pause between download attempts.
+const RETRY_DELAY: Duration = Duration::from_millis(200);
 
 /// How the staged package was produced.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -67,8 +71,11 @@ pub enum StageOutcome {
 }
 
 /// Input for [`stage_update`].
+///
+/// `manifest` is a [`VerifiedManifest`]: staging accepts only a document whose
+/// detached signature has already been checked.
 pub struct StageRequest<'a> {
-    pub manifest: &'a Manifest,
+    pub manifest: &'a VerifiedManifest,
     pub channel: &'a str,
     pub current_version: &'a Version,
     pub install_dir: &'a Path,
@@ -79,20 +86,40 @@ pub struct StageRequest<'a> {
 }
 
 /// Default updates root for this user.
-pub fn updates_root() -> PathBuf {
+///
+/// The directory is per-user and never a shared temporary directory. Without
+/// `LOCALAPPDATA` (Windows) or a usable cache/home directory elsewhere the
+/// function returns [`UpdateError::InvalidArgument`] instead of falling back.
+pub fn updates_root() -> Result<PathBuf> {
     #[cfg(windows)]
     {
-        if let Some(base) = std::env::var_os("LOCALAPPDATA") {
-            return PathBuf::from(base).join("VoxHold").join("updates");
-        }
+        updates_root_from_base(std::env::var_os("LOCALAPPDATA").as_deref())
     }
     #[cfg(not(windows))]
     {
         if let Some(base) = std::env::var_os("XDG_CACHE_HOME") {
-            return PathBuf::from(base).join("voxhold").join("updates");
+            return Ok(PathBuf::from(base).join("voxhold").join("updates"));
+        }
+        match std::env::var_os("HOME") {
+            Some(home) if !home.is_empty() => {
+                Ok(PathBuf::from(home).join(".cache").join("voxhold").join("updates"))
+            }
+            _ => Err(UpdateError::InvalidArgument(
+                "neither XDG_CACHE_HOME nor HOME is set; refusing to use a shared temporary directory for updates".into(),
+            )),
         }
     }
-    std::env::temp_dir().join("VoxHold").join("updates")
+}
+
+#[cfg(windows)]
+fn updates_root_from_base(base: Option<&std::ffi::OsStr>) -> Result<PathBuf> {
+    match base {
+        Some(base) if !base.is_empty() => Ok(PathBuf::from(base).join("VoxHold").join("updates")),
+        _ => Err(UpdateError::InvalidArgument(
+            "LOCALAPPDATA is not set; refusing to use a shared temporary directory for updates"
+                .into(),
+        )),
+    }
 }
 
 /// Staging directory for a version.
@@ -191,7 +218,7 @@ async fn stage_delta(
     delta: crate::manifest::DeltaEntry,
 ) -> Result<()> {
     let delta_path = staging.join(DELTA_FILE);
-    let mut attempts = 0;
+    let mut attempt = 1;
     let outcome = loop {
         let result = download(DownloadRequest {
             url: &delta.url,
@@ -204,9 +231,9 @@ async fn stage_delta(
         })
         .await;
         match result {
-            Err(UpdateError::Network(_)) if attempts < 2 => {
-                attempts += 1;
-                tokio::time::sleep(Duration::from_millis(200)).await;
+            Err(UpdateError::Network(_)) if attempt < DOWNLOAD_ATTEMPTS => {
+                attempt += 1;
+                tokio::time::sleep(RETRY_DELAY).await;
                 continue;
             }
             other => break other?,
@@ -234,7 +261,7 @@ async fn stage_delta(
 
 async fn stage_full(request: &StageRequest<'_>, staging: &Path) -> Result<()> {
     let package_path = staging.join(PACKAGE_FILE);
-    let mut attempts = 0;
+    let mut attempt = 1;
     let outcome = loop {
         let result = download(DownloadRequest {
             url: &request.manifest.full.url,
@@ -247,9 +274,9 @@ async fn stage_full(request: &StageRequest<'_>, staging: &Path) -> Result<()> {
         })
         .await;
         match result {
-            Err(UpdateError::Network(_)) if attempts < 2 => {
-                attempts += 1;
-                tokio::time::sleep(Duration::from_millis(200)).await;
+            Err(UpdateError::Network(_)) if attempt < DOWNLOAD_ATTEMPTS => {
+                attempt += 1;
+                tokio::time::sleep(RETRY_DELAY).await;
                 continue;
             }
             other => break other?,
@@ -357,6 +384,37 @@ pub fn cleanup_after_install(staging: &Path) -> Result<()> {
     }
 }
 
+/// Remove the staged payload but keep the relocated helper image and its log.
+///
+/// Windows cannot delete a running executable. When the helper was copied into
+/// the staging directory it removes everything else here; `helper.exe` and
+/// `apply.log` stay behind until the next start calls [`cleanup_stale`].
+pub fn cleanup_after_install_payload(staging: &Path) -> Result<()> {
+    let entries = match std::fs::read_dir(staging) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(UpdateError::io(staging, error)),
+    };
+    for entry in entries {
+        let entry = entry.map_err(|error| UpdateError::io(staging, error))?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.eq_ignore_ascii_case(crate::apply::HELPER_FILE) || name == APPLY_LOG {
+            continue;
+        }
+        let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .map_err(|error| UpdateError::io(&path, error))?;
+        if file_type.is_dir() {
+            std::fs::remove_dir_all(&path).map_err(|error| UpdateError::io(&path, error))?;
+        } else {
+            std::fs::remove_file(&path).map_err(|error| UpdateError::io(&path, error))?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -374,5 +432,41 @@ mod tests {
         assert!(!root.join("stray.part").exists());
         assert_eq!(cleanup_stale(&root, None).unwrap(), 1);
         assert!(root.exists());
+    }
+
+    #[test]
+    fn payload_cleanup_keeps_the_relocated_helper() {
+        let temp = tempfile::tempdir().unwrap();
+        let staging = temp.path().join("0.2.0");
+        std::fs::create_dir_all(staging.join(APP_DIR)).unwrap();
+        std::fs::write(staging.join(APP_DIR).join("Voxhold.exe"), b"exe").unwrap();
+        std::fs::write(staging.join(PACKAGE_FILE), b"zip").unwrap();
+        std::fs::write(staging.join(READY_FILE), b"{}").unwrap();
+        std::fs::write(staging.join(crate::apply::HELPER_FILE), b"helper").unwrap();
+        std::fs::write(staging.join(APPLY_LOG), b"log").unwrap();
+
+        cleanup_after_install_payload(&staging).unwrap();
+        assert!(!staging.join(APP_DIR).exists());
+        assert!(!staging.join(PACKAGE_FILE).exists());
+        assert!(!staging.join(READY_FILE).exists());
+        assert!(staging.join(crate::apply::HELPER_FILE).exists());
+        assert!(staging.join(APPLY_LOG).exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn updates_root_requires_local_appdata() {
+        assert!(matches!(
+            updates_root_from_base(None),
+            Err(UpdateError::InvalidArgument(_))
+        ));
+        assert!(matches!(
+            updates_root_from_base(Some(std::ffi::OsStr::new(""))),
+            Err(UpdateError::InvalidArgument(_))
+        ));
+        let root =
+            updates_root_from_base(Some(std::ffi::OsStr::new(r"C:\Users\test\AppData\Local")))
+                .unwrap();
+        assert!(root.ends_with(Path::new("VoxHold").join("updates")));
     }
 }

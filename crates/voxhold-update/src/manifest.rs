@@ -68,6 +68,43 @@ pub struct Manifest {
     pub deltas: Vec<DeltaEntry>,
 }
 
+/// A manifest whose detached Ed25519 signature has been verified.
+///
+/// The inner manifest is private and the only constructors are
+/// [`crate::verify::verify_and_parse`] and
+/// [`crate::check::check_signed_manifest`], so [`crate::stage::stage_update`]
+/// cannot be called with an unsigned document. Release tooling that creates
+/// and signs a manifest keeps using [`Manifest`] directly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedManifest {
+    manifest: Manifest,
+}
+
+impl VerifiedManifest {
+    /// Wrap an already verified manifest. Crate-internal on purpose.
+    pub(crate) fn new(manifest: Manifest) -> Self {
+        Self { manifest }
+    }
+
+    /// Borrow the verified manifest.
+    pub fn manifest(&self) -> &Manifest {
+        &self.manifest
+    }
+
+    /// Take the verified manifest.
+    pub fn into_manifest(self) -> Manifest {
+        self.manifest
+    }
+}
+
+impl std::ops::Deref for VerifiedManifest {
+    type Target = Manifest;
+
+    fn deref(&self) -> &Self::Target {
+        &self.manifest
+    }
+}
+
 /// Result of comparing a manifest version with the installed one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Offer {
@@ -181,6 +218,11 @@ impl Manifest {
         validate_size("full", self.full.size)?;
         validate_sha256("full.sha256", &self.full.sha256)?;
         validate_sha256("full.package_sha256", &self.full.package_sha256)?;
+        if self.schema == SCHEMA_VERSION && self.full.sha256 != self.full.package_sha256 {
+            return Err(UpdateError::InvalidManifest(
+                "full.sha256 and full.package_sha256 must match for schema 1: the downloaded portable ZIP is the canonical package".into(),
+            ));
+        }
         validate_url(&self.setup.url)?;
         validate_size("setup", self.setup.size)?;
         validate_sha256("setup.sha256", &self.setup.sha256)?;
@@ -515,6 +557,36 @@ mod tests {
         let mut manifest = sample();
         manifest.setup.size = MAX_PACKAGE_BYTES + 1;
         assert!(manifest.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_mismatched_full_hashes() {
+        let mut manifest = sample();
+        manifest.full.package_sha256 = "e".repeat(64);
+        assert!(matches!(
+            manifest.validate(),
+            Err(UpdateError::InvalidManifest(_))
+        ));
+        manifest.full.package_sha256 = manifest.full.sha256.clone();
+        assert!(manifest.validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_bad_published_at() {
+        for value in [
+            "2026-02-31T12:00:00Z",
+            "2026-11-19T24:00:00Z",
+            "2026-11-19T12:00:60Z",
+            "2026-11-19T12:00:00+24:00",
+            "2026-11-19 12:00:00Z",
+        ] {
+            let mut manifest = sample();
+            manifest.published_at = value.into();
+            assert!(manifest.validate().is_err(), "{value}");
+        }
+        let mut manifest = sample();
+        manifest.published_at = "2024-02-29T12:00:00+03:00".into();
+        assert!(manifest.validate().is_ok());
     }
 
     #[test]

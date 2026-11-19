@@ -18,6 +18,8 @@ pub struct Route {
     pub body: Vec<u8>,
     pub status: u16,
     pub interrupt_after: Option<usize>,
+    /// Interrupt every response, not only the first one.
+    pub interrupt_every: bool,
     pub allow_range: bool,
 }
 
@@ -189,7 +191,7 @@ fn handle_connection(
     if stream.write_all(headers.as_bytes()).is_err() {
         return;
     }
-    let sent = if first {
+    let sent = if first || route.interrupt_every {
         match route.interrupt_after {
             Some(limit) if limit < body.len() => {
                 let _ = stream.write_all(&body[..limit]);

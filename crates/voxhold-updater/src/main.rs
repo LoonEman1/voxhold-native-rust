@@ -4,21 +4,40 @@
 //!
 //! ```text
 //! --pid <process id> --target <install dir> --staged <staging dir>
-//! --exe <executable name> --handshake <file>
+//! --exe <executable name> --handshake <file> [--detached]
 //! ```
+//!
+//! `--target`, `--staged` and `--handshake` must be absolute paths; `--target`
+//! and `--staged` must already exist and are canonicalised before the process
+//! changes its working directory. `--exe` is a plain file name inside the
+//! staged `app` directory.
 //!
 //! `--staged` is the version directory (`...\updates\<version>`); the helper
 //! uses `<staged>\app` as the prepared payload and writes `<staged>\apply.log`.
 //! The log contains local paths and error codes only, never URLs or secrets.
+//!
+//! Windows cannot rename or delete a directory that contains a running image.
+//! A helper started from the installation or from the staged `app` directory
+//! therefore copies itself to `<staged>\helper.exe` and restarts there with
+//! `--detached`; the parent exits immediately. Release builds use the Windows
+//! subsystem so the helper never flashes a console window; failures are
+//! reported through `apply.log` and the exit code.
+
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
+use std::process::{Command, ExitCode};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use voxhold_update::apply::apply_staged;
-use voxhold_update::stage::{cleanup_after_install, APPLY_LOG, APP_DIR};
+use voxhold_update::apply::{
+    apply_staged, cleanup_install_backup, helper_relocation_destination, is_relocated_helper,
+    relocate_helper,
+};
+use voxhold_update::stage::{
+    cleanup_after_install, cleanup_after_install_payload, updates_root, APPLY_LOG, APP_DIR,
+};
 
 const EXIT_OK: u8 = 0;
 const EXIT_USAGE: u8 = 2;
@@ -26,22 +45,28 @@ const EXIT_WAIT: u8 = 3;
 const EXIT_APPLY: u8 = 4;
 const WAIT_LIMIT: Duration = Duration::from_secs(300);
 
+#[derive(Debug)]
 struct Arguments {
     pid: u32,
     target: PathBuf,
     staged: PathBuf,
     exe: String,
     handshake: PathBuf,
+    detached: bool,
 }
 
 fn main() -> ExitCode {
-    let arguments = match parse_arguments(std::env::args().skip(1)) {
+    let raw = match collect_arguments() {
+        Ok(raw) => raw,
+        Err(message) => {
+            log_usage_error(&message);
+            return ExitCode::from(EXIT_USAGE);
+        }
+    };
+    let arguments = match parse_arguments(raw.iter().cloned()) {
         Ok(arguments) => arguments,
         Err(message) => {
-            eprintln!("voxhold-updater: {message}");
-            eprintln!(
-                "usage: voxhold-updater --pid <pid> --target <dir> --staged <dir> --exe <name> --handshake <file>"
-            );
+            log_usage_error(&message);
             return ExitCode::from(EXIT_USAGE);
         }
     };
@@ -50,26 +75,67 @@ fn main() -> ExitCode {
     log(
         &log_path,
         &format!(
-            "pid={} target={} staged={} exe={}",
+            "pid={} target={} staged={} exe={} detached={}",
             arguments.pid,
             arguments.target.display(),
             arguments.staged.display(),
-            arguments.exe
+            arguments.exe,
+            arguments.detached
         ),
     );
-    // Do not hold the installation directory or the staging directory as the
-    // current directory: the swap renames the installation and the success
-    // path removes the staging directory. Use its parent instead.
-    let workdir = arguments
-        .staged
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(std::env::temp_dir);
-    if let Err(error) = std::env::set_current_dir(&workdir) {
+
+    // Every path is absolute now, so leave the installation and staging trees
+    // as the working directory; a current directory inside the target blocks
+    // the rename.
+    let _ = std::env::set_current_dir(std::env::temp_dir());
+
+    let current = match std::env::current_exe() {
+        Ok(path) => path,
+        Err(error) => {
+            log(
+                &log_path,
+                &format!("cannot resolve own path: {}", error.kind()),
+            );
+            return ExitCode::from(EXIT_APPLY);
+        }
+    };
+    if let Some(destination) =
+        helper_relocation_destination(&current, &arguments.target, &arguments.staged)
+    {
+        if arguments.detached {
+            log(
+                &log_path,
+                "refusing to run from the installation or staging directory",
+            );
+            return ExitCode::from(EXIT_APPLY);
+        }
+        if let Err(error) = relocate_helper(&current, &destination) {
+            log(
+                &log_path,
+                &format!("cannot relocate helper: {}", error.code()),
+            );
+            return ExitCode::from(EXIT_APPLY);
+        }
         log(
             &log_path,
-            &format!("cannot change directory: {}", error.kind()),
+            &format!("relocated helper to {}", destination.display()),
         );
+        match spawn_detached(&destination, &raw) {
+            Ok(()) => return ExitCode::from(EXIT_OK),
+            Err(message) => {
+                log(&log_path, &format!("cannot restart helper: {message}"));
+                return ExitCode::from(EXIT_APPLY);
+            }
+        }
+    }
+
+    match cleanup_install_backup(&arguments.target) {
+        Ok(true) => log(&log_path, "removed leftover installation backup"),
+        Ok(false) => {}
+        Err(error) => log(
+            &log_path,
+            &format!("leftover backup cleanup failed: {}", error.code()),
+        ),
     }
 
     if let Err(message) = wait_for_process(arguments.pid) {
@@ -79,17 +145,34 @@ fn main() -> ExitCode {
     log(&log_path, "client exited");
 
     let app = arguments.staged.join(APP_DIR);
-    let result = apply_staged(
+    match apply_staged(
         &arguments.target,
         &app,
         &arguments.exe,
         &arguments.handshake,
-    );
-    match result {
-        Ok(()) => {
-            log(&log_path, "apply succeeded");
-            if let Err(error) = cleanup_after_install(&arguments.staged) {
-                log(&log_path, &format!("cleanup failed: {}", error.code()));
+    ) {
+        Ok(outcome) => {
+            log(
+                &log_path,
+                &format!("apply succeeded backup_removed={}", outcome.backup_removed),
+            );
+            let relocated = is_relocated_helper(&current, &arguments.staged);
+            let cleanup = if relocated {
+                cleanup_after_install_payload(&arguments.staged)
+            } else {
+                cleanup_after_install(&arguments.staged).or_else(|error| {
+                    log(
+                        &log_path,
+                        &format!("staging cleanup deferred: {}", error.code()),
+                    );
+                    cleanup_after_install_payload(&arguments.staged)
+                })
+            };
+            if let Err(error) = cleanup {
+                log(
+                    &log_path,
+                    &format!("staging cleanup failed: {}", error.code()),
+                );
             }
             ExitCode::from(EXIT_OK)
         }
@@ -103,12 +186,24 @@ fn main() -> ExitCode {
     }
 }
 
+fn collect_arguments() -> Result<Vec<String>, String> {
+    std::env::args_os()
+        .skip(1)
+        .map(|argument| {
+            argument
+                .into_string()
+                .map_err(|_| "argument is not valid UTF-8".to_string())
+        })
+        .collect()
+}
+
 fn parse_arguments(mut arguments: impl Iterator<Item = String>) -> Result<Arguments, String> {
     let mut pid = None;
     let mut target = None;
     let mut staged = None;
     let mut exe = None;
     let mut handshake = None;
+    let mut detached = false;
     while let Some(flag) = arguments.next() {
         let mut value = || {
             arguments
@@ -123,20 +218,71 @@ fn parse_arguments(mut arguments: impl Iterator<Item = String>) -> Result<Argume
                         .map_err(|_| format!("invalid pid {raw}"))?,
                 );
             }
-            "--target" => target = Some(PathBuf::from(value()?)),
-            "--staged" => staged = Some(PathBuf::from(value()?)),
-            "--exe" => exe = Some(value()?),
-            "--handshake" => handshake = Some(PathBuf::from(value()?)),
+            "--target" => target = Some(absolute_path("--target", &value()?)?),
+            "--staged" => staged = Some(absolute_path("--staged", &value()?)?),
+            "--exe" => {
+                let name = value()?;
+                validate_exe_name(&name)?;
+                exe = Some(name);
+            }
+            "--handshake" => handshake = Some(absolute_path("--handshake", &value()?)?),
+            "--detached" => detached = true,
             other => return Err(format!("unknown argument {other}")),
         }
     }
+    let target = target.ok_or("missing --target")?;
+    let staged = staged.ok_or("missing --staged")?;
+    let target = std::fs::canonicalize(&target)
+        .map_err(|error| format!("--target {}: {error}", target.display()))?;
+    let staged = std::fs::canonicalize(&staged)
+        .map_err(|error| format!("--staged {}: {error}", staged.display()))?;
+    if !target.is_dir() {
+        return Err(format!("--target {} is not a directory", target.display()));
+    }
+    if !staged.is_dir() {
+        return Err(format!("--staged {} is not a directory", staged.display()));
+    }
     Ok(Arguments {
         pid: pid.ok_or("missing --pid")?,
-        target: target.ok_or("missing --target")?,
-        staged: staged.ok_or("missing --staged")?,
+        target,
+        staged,
         exe: exe.ok_or("missing --exe")?,
         handshake: handshake.ok_or("missing --handshake")?,
+        detached,
     })
+}
+
+fn absolute_path(flag: &str, raw: &str) -> Result<PathBuf, String> {
+    let path = PathBuf::from(raw);
+    if !path.is_absolute() {
+        return Err(format!("{flag} must be an absolute path, got {raw}"));
+    }
+    Ok(path)
+}
+
+fn validate_exe_name(name: &str) -> Result<(), String> {
+    if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\\', ':']) {
+        return Err(format!("--exe must be a plain file name, got {name}"));
+    }
+    Ok(())
+}
+
+fn spawn_detached(exe: &Path, raw: &[String]) -> Result<(), String> {
+    let mut command = Command::new(exe);
+    command.args(raw);
+    command.arg("--detached");
+    command.current_dir(std::env::temp_dir());
+    command
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| format!("cannot start {}: {error}", exe.display()))
+}
+
+fn log_usage_error(message: &str) {
+    eprintln!("voxhold-updater: {message}");
+    if let Ok(root) = updates_root() {
+        log(&root.join("helper-usage.log"), message);
+    }
 }
 
 fn log(path: &Path, message: &str) {
@@ -208,4 +354,129 @@ fn wait_for_process(pid: u32) -> Result<(), String> {
         std::thread::sleep(Duration::from_millis(200));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Fixture {
+        temp: tempfile::TempDir,
+        target: PathBuf,
+        staged: PathBuf,
+        handshake: PathBuf,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let temp = tempfile::tempdir().unwrap();
+            let target = temp.path().join("VoxHold");
+            let staged = temp.path().join("updates").join("0.2.0");
+            std::fs::create_dir_all(&target).unwrap();
+            std::fs::create_dir_all(&staged).unwrap();
+            let handshake = temp.path().join("ready.handshake");
+            Self {
+                temp,
+                target,
+                staged,
+                handshake,
+            }
+        }
+
+        fn args(&self) -> Vec<String> {
+            vec![
+                "--pid".into(),
+                "0".into(),
+                "--target".into(),
+                self.target.to_string_lossy().into_owned(),
+                "--staged".into(),
+                self.staged.to_string_lossy().into_owned(),
+                "--exe".into(),
+                "Voxhold.exe".into(),
+                "--handshake".into(),
+                self.handshake.to_string_lossy().into_owned(),
+            ]
+        }
+    }
+
+    #[test]
+    fn rejects_relative_paths() {
+        let fixture = Fixture::new();
+        let mut args = fixture.args();
+        args[3] = "VoxHold".into();
+        let error = parse_arguments(args.into_iter()).unwrap_err();
+        assert!(error.contains("--target"), "{error}");
+
+        let mut args = fixture.args();
+        args[5] = "updates/0.2.0".into();
+        let error = parse_arguments(args.into_iter()).unwrap_err();
+        assert!(error.contains("--staged"), "{error}");
+
+        let mut args = fixture.args();
+        args[9] = "ready.handshake".into();
+        let error = parse_arguments(args.into_iter()).unwrap_err();
+        assert!(error.contains("--handshake"), "{error}");
+    }
+
+    #[test]
+    fn canonicalises_paths_before_changing_directory() {
+        let fixture = Fixture::new();
+        std::fs::create_dir_all(fixture.temp.path().join("nested")).unwrap();
+        let mut args = fixture.args();
+        args[3] = fixture
+            .temp
+            .path()
+            .join("nested")
+            .join("..")
+            .join("VoxHold")
+            .to_string_lossy()
+            .into_owned();
+        let parsed = parse_arguments(args.into_iter()).unwrap();
+        assert_eq!(
+            parsed.target,
+            std::fs::canonicalize(&fixture.target).unwrap()
+        );
+        assert_eq!(
+            parsed.staged,
+            std::fs::canonicalize(&fixture.staged).unwrap()
+        );
+    }
+
+    #[test]
+    fn accepts_the_detached_flag() {
+        let fixture = Fixture::new();
+        let mut args = fixture.args();
+        args.push("--detached".into());
+        let parsed = parse_arguments(args.into_iter()).unwrap();
+        assert!(parsed.detached);
+    }
+
+    #[test]
+    fn rejects_unsafe_exe_names() {
+        for name in [
+            "",
+            ".",
+            "..",
+            "bin/Voxhold.exe",
+            "bin\\Voxhold.exe",
+            "C:Voxhold.exe",
+        ] {
+            assert!(validate_exe_name(name).is_err(), "{name}");
+        }
+        assert!(validate_exe_name("Voxhold.exe").is_ok());
+    }
+
+    #[test]
+    fn rejects_missing_directories() {
+        let fixture = Fixture::new();
+        let mut args = fixture.args();
+        args[5] = fixture
+            .temp
+            .path()
+            .join("absent")
+            .to_string_lossy()
+            .into_owned();
+        let error = parse_arguments(args.into_iter()).unwrap_err();
+        assert!(error.contains("--staged"), "{error}");
+    }
 }

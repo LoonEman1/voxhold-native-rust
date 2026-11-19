@@ -6,13 +6,16 @@ use std::path::{Path, PathBuf};
 use semver::Version;
 use support::{Route, TestServer};
 use voxhold_update::download::CancelToken;
-use voxhold_update::manifest::{DeltaEntry, FullPackage, Manifest, SetupPackage, BETA_CHANNEL};
+use voxhold_update::manifest::{
+    DeltaEntry, FullPackage, Manifest, SetupPackage, VerifiedManifest, BETA_CHANNEL,
+};
 use voxhold_update::package::{
     pack_with_index, read_package_json_from_dir, sha256_hex, unpack, PackageIndex,
 };
 use voxhold_update::stage::{
     cleanup_after_install, read_ready, stage_update, StageMethod, StageOutcome, StageRequest,
 };
+use voxhold_update::verify::{generate_keypair, sign_bytes, verify_and_parse, UpdatePublicKey};
 
 fn binary(len: usize, seed: u64) -> Vec<u8> {
     let mut state = seed | 1;
@@ -56,7 +59,7 @@ fn packages(temp: &Path) -> Packages {
     }
 }
 
-fn manifest(
+fn build_manifest(
     server: &TestServer,
     full: &[u8],
     delta: Option<&[u8]>,
@@ -100,6 +103,15 @@ fn manifest(
     }
 }
 
+/// Sign a manifest so staging accepts it, exactly like the client does.
+fn verified(manifest: &Manifest) -> VerifiedManifest {
+    let (private, public) = generate_keypair().unwrap();
+    let bytes = manifest.to_json();
+    let signature = sign_bytes(&private, &bytes).unwrap();
+    let key = UpdatePublicKey::from_base64(&public).unwrap();
+    verify_and_parse(&key, &bytes, &signature).unwrap()
+}
+
 fn install_base(temp: &Path, base: &[u8]) -> (PathBuf, PackageIndex) {
     let install = temp.join("VoxHold");
     let index = unpack(base, &install).unwrap();
@@ -132,8 +144,23 @@ fn server_for_with_interrupt(packages: &Packages, interrupt_after: Option<usize>
     TestServer::start(routes)
 }
 
+fn server_for_always_interrupt(packages: &Packages, interrupt_after: usize) -> TestServer {
+    let mut routes = HashMap::new();
+    routes.insert(
+        "/full.zip".to_string(),
+        Route {
+            body: packages.target.clone(),
+            allow_range: true,
+            interrupt_after: Some(interrupt_after),
+            interrupt_every: true,
+            ..Route::default()
+        },
+    );
+    TestServer::start(routes)
+}
+
 fn request<'a>(
-    manifest: &'a Manifest,
+    manifest: &'a VerifiedManifest,
     install: &'a Path,
     installed: Option<&'a PackageIndex>,
     root: &'a Path,
@@ -157,7 +184,13 @@ async fn stages_delta_then_cleans_up() {
     let packages = packages(temp.path());
     let (install, index) = install_base(temp.path(), &packages.base);
     let server = server_for(&packages);
-    let manifest = manifest(&server, &packages.target, Some(&packages.delta), None, None);
+    let manifest = verified(&build_manifest(
+        &server,
+        &packages.target,
+        Some(&packages.delta),
+        None,
+        None,
+    ));
     let root = temp.path().join("updates");
 
     let outcome = stage_update(request(&manifest, &install, Some(&index), &root)).await;
@@ -187,7 +220,13 @@ async fn falls_back_to_full_without_base() {
     let packages = packages(temp.path());
     let (install, _) = install_base(temp.path(), &packages.base);
     let server = server_for(&packages);
-    let manifest = manifest(&server, &packages.target, Some(&packages.delta), None, None);
+    let manifest = verified(&build_manifest(
+        &server,
+        &packages.target,
+        Some(&packages.delta),
+        None,
+        None,
+    ));
     let root = temp.path().join("updates");
 
     let outcome = stage_update(request(&manifest, &install, None, &root)).await;
@@ -207,13 +246,13 @@ async fn falls_back_when_delta_hash_is_wrong() {
     let packages = packages(temp.path());
     let (install, index) = install_base(temp.path(), &packages.base);
     let server = server_for(&packages);
-    let manifest = manifest(
+    let manifest = verified(&build_manifest(
         &server,
         &packages.target,
         Some(&packages.delta),
         None,
         Some("0".repeat(64)),
-    );
+    ));
     let root = temp.path().join("updates");
 
     let outcome = stage_update(request(&manifest, &install, Some(&index), &root)).await;
@@ -235,13 +274,13 @@ async fn ignores_delta_that_is_not_smaller() {
     let packages = packages(temp.path());
     let (install, index) = install_base(temp.path(), &packages.base);
     let server = server_for(&packages);
-    let manifest = manifest(
+    let manifest = verified(&build_manifest(
         &server,
         &packages.target,
         Some(&packages.delta),
         Some(packages.target.len() as u64),
         None,
-    );
+    ));
     let root = temp.path().join("updates");
 
     let outcome = stage_update(request(&manifest, &install, Some(&index), &root)).await;
@@ -260,7 +299,7 @@ async fn failed_download_removes_staging() {
     let packages = packages(temp.path());
     let (install, _) = install_base(temp.path(), &packages.base);
     let server = TestServer::start(HashMap::new());
-    let manifest = manifest(&server, &packages.target, None, None, None);
+    let manifest = verified(&build_manifest(&server, &packages.target, None, None, None));
     let root = temp.path().join("updates");
 
     let outcome = stage_update(request(&manifest, &install, None, &root)).await;
@@ -282,7 +321,7 @@ async fn full_download_resumes_after_interruption() {
     let packages = packages(temp.path());
     let (install, _) = install_base(temp.path(), &packages.base);
     let server = server_for_with_interrupt(&packages, Some(32 * 1024));
-    let manifest = manifest(&server, &packages.target, None, None, None);
+    let manifest = verified(&build_manifest(&server, &packages.target, None, None, None));
     let root = temp.path().join("updates");
 
     let outcome = stage_update(request(&manifest, &install, None, &root)).await;
@@ -302,6 +341,31 @@ async fn full_download_resumes_after_interruption() {
         .range
         .as_deref()
         .is_some_and(|value| value.starts_with("bytes="))));
+}
+
+#[tokio::test]
+async fn retries_a_network_error_once() {
+    let temp = tempfile::tempdir().unwrap();
+    let packages = packages(temp.path());
+    let (install, _) = install_base(temp.path(), &packages.base);
+    let server = server_for_always_interrupt(&packages, 0);
+    let manifest = verified(&build_manifest(&server, &packages.target, None, None, None));
+    let root = temp.path().join("updates");
+
+    let outcome = stage_update(request(&manifest, &install, None, &root)).await;
+    match outcome {
+        StageOutcome::Failed(error) => {
+            assert!(matches!(error, voxhold_update::UpdateError::Network(_)));
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+    let attempts = server
+        .requests()
+        .iter()
+        .filter(|request| request.path == "/full.zip")
+        .count();
+    assert_eq!(attempts, 2, "one retry means two attempts in total");
+    assert!(!root.join("0.2.0").exists());
 }
 
 #[tokio::test]

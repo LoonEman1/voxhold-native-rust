@@ -69,10 +69,12 @@ impl PackageIndex {
     pub fn validate(&self) -> Result<()> {
         semver::Version::parse(&self.version)
             .map_err(|_| UpdateError::InvalidVersion(self.version.clone()))?;
+        // Windows resolves paths case-insensitively, so `A.exe` and `a.exe`
+        // in one package would silently overwrite each other on disk.
         let mut seen = BTreeSet::new();
         for file in &self.files {
             validate_relative_path(&file.path)?;
-            if file.path == PACKAGE_JSON {
+            if file.path.eq_ignore_ascii_case(PACKAGE_JSON) {
                 return Err(UpdateError::InvalidPackage(
                     "package.json must not list itself".into(),
                 ));
@@ -84,9 +86,9 @@ impl PackageIndex {
                     file.path
                 )));
             }
-            if !seen.insert(file.path.clone()) {
+            if !seen.insert(file.path.to_lowercase()) {
                 return Err(UpdateError::InvalidPackage(format!(
-                    "duplicate path {}",
+                    "duplicate path {} (package paths are case-insensitive)",
                     file.path
                 )));
             }
@@ -420,6 +422,7 @@ pub fn read_zip_entries(bytes: &[u8]) -> Result<BTreeMap<String, Vec<u8>>> {
     let mut archive = ZipArchive::new(Cursor::new(bytes))
         .map_err(|error| UpdateError::InvalidPackage(error.to_string()))?;
     let mut entries = BTreeMap::new();
+    let mut seen = BTreeSet::new();
     let mut total = 0u64;
     for position in 0..archive.len() {
         let entry = archive
@@ -456,7 +459,8 @@ pub fn read_zip_entries(bytes: &[u8]) -> Result<BTreeMap<String, Vec<u8>>> {
                 actual: data.len() as u64,
             });
         }
-        if entries.insert(relative.clone(), data).is_some() {
+        if !seen.insert(relative.to_lowercase()) || entries.insert(relative.clone(), data).is_some()
+        {
             return Err(UpdateError::InvalidPackage(format!(
                 "duplicate archive entry {relative}"
             )));
@@ -484,7 +488,8 @@ pub fn write_zip_entries(entries: &BTreeMap<String, Vec<u8>>) -> Result<Vec<u8>>
         .into_inner())
 }
 
-/// Reject absolute paths, traversal, backslashes and Windows device names.
+/// Reject absolute paths, traversal, backslashes, Windows device names and
+/// trailing dots or spaces.
 pub fn validate_relative_path(path: &str) -> Result<String> {
     if path.is_empty() || path.len() > 4096 {
         return Err(UpdateError::InvalidPackage(
@@ -513,9 +518,41 @@ pub fn validate_relative_path(path: &str) -> Result<String> {
                 "drive or stream separator in {path}"
             )));
         }
+        // Windows silently strips a trailing dot or space, so `evil.` would
+        // become `evil` and could bypass the device-name check below.
+        if part.ends_with('.') || part.ends_with(' ') {
+            return Err(UpdateError::InvalidPackage(format!(
+                "trailing dot or space in {path}"
+            )));
+        }
+        if is_windows_device_name(part) {
+            return Err(UpdateError::InvalidPackage(format!(
+                "Windows device name in {path}"
+            )));
+        }
         cleaned.push(part);
     }
     Ok(cleaned.join("/"))
+}
+
+/// `CON`, `PRN`, `AUX`, `NUL`, `COM1..9` and `LPT1..9` are reserved on
+/// Windows in every directory and with any extension (`con.txt` included).
+fn is_windows_device_name(part: &str) -> bool {
+    // Windows ignores trailing dots and spaces when it resolves the name, so
+    // `con .txt` is still the CON device.
+    let stem = part
+        .split('.')
+        .next()
+        .unwrap_or(part)
+        .trim_end_matches([' ', '.']);
+    let upper = stem.to_ascii_uppercase();
+    if matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL" | "CLOCK$") {
+        return true;
+    }
+    let bytes = upper.as_bytes();
+    bytes.len() == 4
+        && (upper.starts_with("COM") || upper.starts_with("LPT"))
+        && (b'1'..=b'9').contains(&bytes[3])
 }
 
 fn relative_name(root: &Path, path: &Path) -> String {
@@ -590,6 +627,62 @@ mod tests {
         assert!(validate_relative_path("C:/x").is_err());
         assert!(validate_relative_path("a//b").is_err());
         assert_eq!(validate_relative_path("a/b.txt").unwrap(), "a/b.txt");
+    }
+
+    #[test]
+    fn rejects_windows_device_names_in_any_case() {
+        for path in [
+            "CON",
+            "con",
+            "CON.txt",
+            "dir/PRN",
+            "AUX",
+            "nul.log",
+            "COM1",
+            "com9.txt",
+            "dir/LPT1",
+            "lpt9.dll",
+            "con .txt",
+            "COM1 .log",
+        ] {
+            assert!(validate_relative_path(path).is_err(), "{path}");
+        }
+        // Names that merely start with a device prefix are fine.
+        assert!(validate_relative_path("console.txt").is_ok());
+        assert!(validate_relative_path("COM0").is_ok());
+        assert!(validate_relative_path("COM10.txt").is_ok());
+        assert!(validate_relative_path("LPT0").is_ok());
+    }
+
+    #[test]
+    fn rejects_trailing_dots_and_spaces() {
+        for path in ["a.", "a ", "dir./x", "dir /x", "x.exe.", "dir/x. "] {
+            assert!(validate_relative_path(path).is_err(), "{path}");
+        }
+        assert!(validate_relative_path("a.b/c d.txt").is_ok());
+    }
+
+    fn file(path: &str) -> PackageFile {
+        PackageFile {
+            path: path.into(),
+            size: 1,
+            sha256: "a".repeat(64),
+        }
+    }
+
+    #[test]
+    fn rejects_case_insensitive_duplicates() {
+        let index = PackageIndex::new("1.0.0", vec![file("A.exe"), file("a.exe")]);
+        assert!(matches!(
+            index.validate(),
+            Err(UpdateError::InvalidPackage(_))
+        ));
+        let index = PackageIndex::new("1.0.0", vec![file("dir/A.exe"), file("dir/a.exe")]);
+        assert!(index.validate().is_err());
+        let index = PackageIndex::new("1.0.0", vec![file("a.exe"), file("b.exe")]);
+        assert!(index.validate().is_ok());
+        let index = PackageIndex::new("1.0.0", vec![file("PACKAGE.JSON")]);
+        assert!(index.validate().is_err());
     }
 
     #[test]

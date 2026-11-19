@@ -207,8 +207,7 @@ impl Drop for LevelPreview {
     }
 }
 
-pub const UNAVAILABLE_DEVICE: &str =
-    "Выбранное аудиоустройство недоступно.";
+pub const UNAVAILABLE_DEVICE: &str = "Выбранное аудиоустройство недоступно.";
 
 /// Non-blocking local interface-cue player.
 ///
@@ -565,9 +564,7 @@ mod windows {
             }
             let code = unsafe { waveInStart(handle) };
             if code != 0 {
-                return Err(format!(
-                    "Не удалось запустить микрофон Windows ({code})."
-                ));
+                return Err(format!("Не удалось запустить микрофон Windows ({code})."));
             }
             let mut smoothed = 0.0_f64;
             while !preview.stop.load(Ordering::Relaxed) {

@@ -336,10 +336,7 @@ impl MicCapture {
                         id, device, source, params, epoch, gate, events, stop, failed, stats,
                     )
                 })
-                .map_err(|_| {
-                    "Не удалось запустить поток микрофона."
-                        .to_owned()
-                })?,
+                .map_err(|_| "Не удалось запустить поток микрофона.".to_owned())?,
         );
         Ok(())
     }

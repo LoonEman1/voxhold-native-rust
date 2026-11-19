@@ -42,12 +42,14 @@ use updates::Updates;
 pub use updates::VoiceUpdate;
 
 mod engine;
+mod prep;
 mod requests;
 mod screen;
 mod test_support;
 use engine::{EngineEffect, apply_engine_update};
 use requests::{
-    InputRequest, Pending, Requests, StreamCommand, set_input_request, set_stream_command,
+    InputRequest, Pending, Requests, ScreenAccess, StreamCommand, set_input_request,
+    set_stream_command,
 };
 
 pub struct StreamFrame {
@@ -323,6 +325,18 @@ struct Live {
     publisher: crate::publisher::Publisher,
     /// The capture and peer of the current publishing attempt.
     screen: Option<crate::publisher::engine::PublisherEngine>,
+    /// The one preparation that may be opening a capture or a peer. The session
+    /// loop only observes and cancels it.
+    prep: Option<prep::ScreenPrep<crate::publisher::engine::PublisherEngine>>,
+    /// Room identity a preparation result must still match.
+    server: i64,
+    channel: i64,
+    connection: Option<String>,
+    joined: bool,
+    /// Panel-confirmed gate of the current picker/attempt.
+    access: ScreenAccess,
+    /// Freshest gate written by `VoiceHandle::screen_access`.
+    screen_access: Arc<Mutex<Option<ScreenAccess>>>,
     screen_preview: Arc<crate::screen_capture::PreviewStore>,
     render: VideoFrame,
     viewport: (u32, u32),
@@ -692,6 +706,13 @@ async fn run_session(
         stream_selection: None,
         publisher: crate::publisher::Publisher::new(controller.server_id, controller.channel_id),
         screen: None,
+        prep: None,
+        server: controller.server_id,
+        channel: controller.channel_id,
+        connection: controller.resume_connection_id.clone(),
+        joined: controller.joined,
+        access: ScreenAccess::default(),
+        screen_access: requests.screen_access.clone(),
         screen_preview,
         render: VideoFrame::default(),
         viewport: requests.viewport(),
@@ -701,6 +722,7 @@ async fn run_session(
     };
     live.publisher
         .set_connection(controller.resume_connection_id.clone());
+    live.publisher.set_access(live.access_value());
     let mut tick = tokio::time::interval(Duration::from_millis(25));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
@@ -783,6 +805,15 @@ async fn run_session(
                     }
                 }
                 Pending::ScreenSources(request) => live.list_screen_sources(request),
+                Pending::ScreenAccess(access) => {
+                    // The panel's newest gate is applied before the pending
+                    // capture can complete; a revocation cancels it and fails
+                    // the attempt instead of letting a late engine start.
+                    let outcomes = live.apply_screen_access(access);
+                    if let Err(end) = live.apply_screen(outcomes, viewer).await {
+                        return end;
+                    }
+                }
                 Pending::Output(output) => {
                     live.output = output.clone();
                     if let Some(stream) = &mut live.stream {
@@ -918,8 +949,16 @@ async fn run_session(
                 live.media.set_joined(controller.joined);
                 live.media
                     .set_server_allowed(!controller.server_muted && !controller.controls.deafened);
-                live.publisher
-                    .set_connection(controller.resume_connection_id.clone());
+                // A changed connection id or a lost join invalidates a
+                // preparation that was bound to the old session.
+                let connection = live.set_connection(controller.resume_connection_id.clone());
+                if let Err(end) = live.apply_screen(connection, viewer).await {
+                    return end;
+                }
+                let joined = live.set_joined(controller.joined);
+                if let Err(end) = live.apply_screen(joined, viewer).await {
+                    return end;
+                }
                 // The viewer follows the confirmed voice state, not the socket:
                 // a fresh join re-watches the selected publication.
                 let outcomes = viewer.set_joined(controller.joined, Instant::now());
@@ -1095,7 +1134,7 @@ fn run(
                     Pending::StreamMute(selection, muted) => {
                         let _ = viewer.set_muted(selection, muted);
                     }
-                    Pending::Screen(_) | Pending::ScreenSources(_) => {
+                    Pending::Screen(_) | Pending::ScreenSources(_) | Pending::ScreenAccess(_) => {
                         // No session, no publisher and no capture: a picker
                         // action of the previous attempt is dropped. The UI
                         // cannot reach these states without a live call.

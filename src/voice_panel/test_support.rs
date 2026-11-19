@@ -37,6 +37,14 @@ impl VoicePanel {
             .and_then(|handle| handle.take_controls_for_tests())
     }
 
+    /// The newest screen gate the UI pushed while a picker or an attempt was
+    /// open. It is a last-value cell, so `None` after a take proves no repeat.
+    pub fn test_take_screen_access(&mut self) -> Option<(bool, bool)> {
+        self.handle
+            .as_ref()
+            .and_then(|handle| handle.take_screen_access_for_tests())
+    }
+
     /// The power transition queued for the media worker by the real handler.
     pub fn test_take_power(&mut self) -> Option<bool> {
         self.handle

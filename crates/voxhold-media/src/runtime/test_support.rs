@@ -42,6 +42,17 @@ impl VoiceHandle {
         self.requests.viewport.lock().ok()?.take()
     }
 
+    /// The newest screen gate the UI pushed for the worker while a picker or
+    /// an attempt was open.
+    pub fn take_screen_access_for_tests(&self) -> Option<(bool, bool)> {
+        self.requests
+            .screen_access
+            .lock()
+            .ok()?
+            .take()
+            .map(|access| (access.stream_permission, access.slot_available))
+    }
+
     /// Drain the queued screen actions as (kind, picker) pairs. The detached
     /// handle has no worker, so this is exactly what the UI sent.
     pub fn take_screen_commands_for_tests(&self) -> Vec<(&'static str, u64)> {

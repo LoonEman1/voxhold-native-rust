@@ -90,7 +90,12 @@ impl VoicePanel {
                 self.local_level = level;
             }
             VoiceUpdate::Tracks(tracks) => self.tracks = tracks,
-            VoiceUpdate::Streams(streams) => self.streams = streams,
+            VoiceUpdate::Streams(streams) => {
+                self.streams = streams;
+                // The slot count may have changed under an open picker or a
+                // pending capture preparation.
+                self.sync_screen_access();
+            }
             VoiceUpdate::StreamStatus { selection, status } => {
                 if self.watching_selection != Some(selection) {
                     return false;

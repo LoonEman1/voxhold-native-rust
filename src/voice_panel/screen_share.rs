@@ -326,6 +326,23 @@ impl ScreenShareUi {
 impl VoicePanel {
     pub fn set_stream_permission(&mut self, allowed: bool) {
         self.can_stream = allowed;
+        // A revocation that arrives while the picker or a capture preparation
+        // is open must reach the worker, not wait for the next Start.
+        self.sync_screen_access();
+    }
+
+    /// Push the current gate to the worker while a picker or an attempt is
+    /// open. The session re-checks it before it accepts a prepared engine, so
+    /// a permission or slot loss during the capture start cannot be missed.
+    pub(super) fn sync_screen_access(&self) {
+        if !(self.screen.open || self.screen.busy || self.share_active()) {
+            return;
+        }
+        let Some(handle) = &self.handle else {
+            return;
+        };
+        let slot_available = self.active_publishers_in_room() < MAX_CHANNEL_PUBLISHERS;
+        handle.screen_access(self.can_stream, slot_available);
     }
 
     pub fn screen_share_open(&self) -> bool {
@@ -443,6 +460,7 @@ impl VoicePanel {
         if let Some(handle) = &self.handle {
             self.screen.picker = handle.begin_screen_picker();
         }
+        self.sync_screen_access();
         self.request_screen_sources(cx);
         self.request_screen_previews(cx);
         cx.notify();
@@ -476,6 +494,7 @@ impl VoicePanel {
         self.screen.busy = false;
         self.screen.error.clear();
         self.screen.focus_placed = false;
+        self.sync_screen_access();
         cx.notify();
     }
 
@@ -858,6 +877,9 @@ impl VoicePanel {
                 if phase == Phase::Idle && previous != Phase::Idle {
                     self.screen.preview = None;
                 }
+                // The gate can change without a picker click: the attempt is
+                // now open or closed, and the worker needs the current value.
+                self.sync_screen_access();
                 true
             }
             VoiceUpdate::ScreenSources {

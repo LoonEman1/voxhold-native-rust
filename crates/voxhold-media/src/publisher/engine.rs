@@ -16,7 +16,7 @@ use std::{
     collections::VecDeque,
     sync::{
         Arc, Mutex, OnceLock,
-        atomic::{AtomicU32, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -66,6 +66,8 @@ const STATS_TIMEOUT: Duration = Duration::from_millis(500);
 /// A worker that does not finish after its channel closed is detached instead
 /// of hanging the runtime forever.
 const WORKER_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
+/// The session cancelled the preparation between two stages.
+const PREP_CANCELLED: &str = "Подготовка трансляции отменена.";
 
 /// The plan asks for a GPU/CPU share; this build has no GPU probe. The pinned
 /// `OutboundRtpStats` does report `quality_limitation_reason`, which is the
@@ -336,12 +338,21 @@ pub struct PublisherEngine {
 }
 
 impl PublisherEngine {
+    /// Open the capture, the loopback and the peer of one attempt.
+    ///
+    /// `cancelled` is checked before and after every blocking stage. A stage
+    /// that is already running may finish, but its product is dropped here on
+    /// the preparing thread and never reaches `stream.start`.
     pub fn start(
         request: PublishRequest,
         servers: Vec<IceServer>,
         policy: String,
         preview: Arc<PreviewStore>,
+        cancelled: &AtomicBool,
     ) -> Result<Self, String> {
+        if cancelled.load(Ordering::SeqCst) {
+            return Err(PREP_CANCELLED.into());
+        }
         let latest = Arc::new(LatestImage::default());
         let target = request.quality.resolution.size();
         let capture = ScreenCapture::start(
@@ -351,6 +362,9 @@ impl PublisherEngine {
             latest.clone(),
         )
         .map_err(str::to_owned)?;
+        if cancelled.load(Ordering::SeqCst) {
+            return Err(PREP_CANCELLED.into());
+        }
         // The loopback is opened before the engine reports itself ready, so
         // `stream.start` can carry the real `has_audio`. A missing endpoint is
         // an explicit capability error, never a silent video-only stream.
@@ -364,14 +378,22 @@ impl PublisherEngine {
         } else {
             None
         };
-        Self::spawn(
+        if cancelled.load(Ordering::SeqCst) {
+            return Err(PREP_CANCELLED.into());
+        }
+        let engine = Self::spawn(
             request,
             servers,
             policy,
             Box::new(DesktopProducer { capture, latest }),
             audio,
             preview,
-        )
+        )?;
+        if cancelled.load(Ordering::SeqCst) {
+            drop(engine);
+            return Err(PREP_CANCELLED.into());
+        }
+        Ok(engine)
     }
 
     /// Test entry point: the same engine with a frame producer that does not

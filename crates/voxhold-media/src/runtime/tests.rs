@@ -437,24 +437,44 @@ fn screen_publisher() -> crate::publisher::Publisher {
 #[test]
 fn a_failed_engine_start_cancels_the_attempt_without_stream_start() {
     use crate::publisher::{Outcome as PublisherOutcome, Phase};
+    use crate::runtime::prep::{PrepBinding, PrepEvent, ScreenPrep, finish_prep};
     let now = Instant::now();
     let mut publisher = screen_publisher();
     publisher.begin_picker(1);
-    let mut outcomes = publisher.publish(1, screen_request(), false, now);
-    assert!(matches!(
-        outcomes.as_slice(),
-        [PublisherOutcome::StartEngine { .. }]
-    ));
-    let PublisherOutcome::StartEngine { request, .. } = outcomes.remove(0) else {
+    let outcomes = publisher.publish(1, screen_request(), false, now);
+    let PublisherOutcome::StartEngine { attempt, .. } = outcomes[0] else {
         unreachable!()
     };
-    // The substitutable engine starter fails: the attempt must be cancelled
-    // whole, with neither `stream.start` nor a compensating `stream.stop`.
-    let (engine, failure) = super::screen::start_engine::<()>(&mut publisher, request, now, |_| {
+    let binding = PrepBinding {
+        attempt,
+        server: 1,
+        channel: 10,
+        connection: Some("me".into()),
+        access: super::screen::screen_access(true, true, true),
+    };
+    // The off-loop preparation fails: the attempt must be cancelled whole,
+    // with neither `stream.start` nor a compensating `stream.stop`.
+    let mut prep = ScreenPrep::<()>::start(binding.clone(), now, Duration::from_secs(5), |_| {
         Err("движок не создан".to_string())
-    });
-    assert!(engine.is_none());
-    outcomes.extend(failure);
+    })
+    .expect("the preparation thread starts");
+    let event = loop {
+        if let Some(event) = prep.poll(Instant::now()) {
+            break event;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    };
+    assert!(matches!(event, PrepEvent::Failed(_)));
+    let finish = finish_prep(
+        &mut publisher,
+        &binding,
+        &binding,
+        super::screen::screen_access(true, true, true),
+        event,
+        now,
+    );
+    assert!(finish.engine.is_none());
+    let outcomes = finish.outcomes;
     assert!(
         !outcomes
             .iter()
@@ -475,6 +495,35 @@ fn a_failed_engine_start_cancels_the_attempt_without_stream_start() {
             .is_empty(),
         "the failed start leaves no deadline"
     );
+}
+
+#[test]
+fn the_newest_screen_gate_is_a_last_value_request() {
+    let requests = Requests::default();
+    requests
+        .screen_access
+        .lock()
+        .unwrap()
+        .replace(ScreenAccess {
+            stream_permission: false,
+            slot_available: true,
+        });
+    requests
+        .screen_access
+        .lock()
+        .unwrap()
+        .replace(ScreenAccess {
+            stream_permission: true,
+            slot_available: false,
+        });
+    match requests.take() {
+        Some(Pending::ScreenAccess(access)) => {
+            assert!(access.stream_permission, "the newest value wins");
+            assert!(!access.slot_available);
+        }
+        _ => panic!("the newest gate must reach the worker"),
+    }
+    assert!(requests.take().is_none());
 }
 
 #[test]

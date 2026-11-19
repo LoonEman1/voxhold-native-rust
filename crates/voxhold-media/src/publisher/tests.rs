@@ -842,3 +842,26 @@ fn begin_picker_resets_the_previous_attempt_snapshot_immediately() {
     );
     assert_eq!(publisher.picker, Some(2), "the new picker owns the attempt");
 }
+
+#[test]
+fn a_cancelled_start_never_opens_a_capture() {
+    use crate::publisher::engine::PublisherEngine;
+    use crate::screen_capture::PreviewStore;
+    use std::sync::{Arc, atomic::AtomicBool};
+
+    // The preparation was cancelled between StartEngine and the first stage.
+    // The engine returns before touching the capture, the loopback or a peer,
+    // so this runs without a desktop.
+    let cancelled = AtomicBool::new(true);
+    let error = match PublisherEngine::start(
+        request(),
+        Vec::new(),
+        "all".into(),
+        Arc::new(PreviewStore::default()),
+        &cancelled,
+    ) {
+        Ok(_) => panic!("a cancelled start must not open a device"),
+        Err(error) => error,
+    };
+    assert!(error.contains("отменена"), "{error}");
+}

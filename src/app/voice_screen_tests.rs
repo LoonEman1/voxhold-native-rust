@@ -1031,6 +1031,43 @@ async fn a_duplicate_source_id_is_never_selected_or_published(cx: &mut TestAppCo
 }
 
 #[gpui::test]
+async fn the_panel_pushes_gate_changes_while_the_picker_is_open(cx: &mut TestAppContext) {
+    let (visual, _view, voice) = super::voice_tests::fixture(cx);
+    visual.update(|window, app| {
+        voice.update(app, |panel, cx| {
+            panel.test_attach_detached_handle();
+            panel.test_set_share_gate(Ok(()));
+            panel.test_open_screen_share(cx);
+            assert_eq!(
+                panel.test_take_screen_access(),
+                Some((false, true)),
+                "opening the picker binds the worker to the current gate"
+            );
+            panel.set_stream_permission(true);
+            assert_eq!(
+                panel.test_take_screen_access(),
+                Some((true, true)),
+                "a granted permission reaches the worker while the picker is open"
+            );
+            // The channel fills while the picker stays open. The worker must
+            // see the slot loss before it accepts a prepared capture.
+            panel.test_apply_update(
+                voxhold_media::runtime::VoiceUpdate::Streams((0..8).map(publication).collect()),
+                window,
+                cx,
+            );
+            assert_eq!(
+                panel.test_take_screen_access(),
+                Some((true, false)),
+                "the slot loss reaches the worker without a new Start"
+            );
+            panel.set_stream_permission(false);
+            assert_eq!(panel.test_take_screen_access(), Some((false, false)));
+        });
+    });
+}
+
+#[gpui::test]
 async fn keyboard_focus_follows_the_source_id_across_a_reorder(cx: &mut TestAppContext) {
     let (mut visual, _view, voice) = super::voice_tests::fixture(cx);
     draw(&mut visual);

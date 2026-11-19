@@ -159,6 +159,77 @@ async fn local_toggles_cue_once_and_server_state_stays_silent(cx: &mut TestAppCo
 }
 
 #[gpui::test]
+async fn an_unmounted_room_delivers_server_cues_through_the_call_handler(cx: &mut TestAppContext) {
+    let (mut visual, view, voice) = super::voice_tests::fixture(cx);
+    super::voice_tests::draw(&mut visual);
+
+    // Switch to the text channel so the voice room pane is not painted, then
+    // install the same deferred handler the app installs when it opens a room.
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            v.voice_settings.prefs.sounds = true;
+            v.voice_settings.prefs.sound_volume = 30;
+            v.voice_settings.prefs.output = "2:Speakers".into();
+            v.voice_cue_calls.clear();
+            v.install_voice_call_handler(cx);
+            v.channel = 9;
+            cx.notify();
+        });
+        let _ = window;
+    });
+    super::voice_tests::draw(&mut visual);
+    view.read_with(&*visual, |v, _| assert!(!v.voice_room_visible()));
+
+    // A server-driven leave must reach the player without a shell repaint or
+    // an explicit refresh_voice_call; the deferred handler fills the gap.
+    visual.update(|window, app| {
+        voice.update(app, |panel, cx| {
+            panel.test_apply_update(VoiceUpdate::Ended(None), window, cx);
+        });
+    });
+    view.read_with(&*visual, |v, _| {
+        assert_eq!(
+            v.voice_cue_calls,
+            vec![CueCall {
+                cue: VoiceCue::SelfLeave,
+                volume: 30,
+                output: "2:Speakers".into(),
+            }],
+            "a leave is delivered while the room is unmounted"
+        );
+    });
+
+    // The same path carries the confirmed join after a fresh connection.
+    visual.update(|window, app| {
+        voice.update(app, |panel, cx| {
+            panel.test_apply_update(VoiceUpdate::Connected, window, cx);
+        });
+    });
+    view.read_with(&*visual, |v, _| {
+        assert_eq!(
+            v.voice_cue_calls,
+            vec![
+                CueCall {
+                    cue: VoiceCue::SelfLeave,
+                    volume: 30,
+                    output: "2:Speakers".into(),
+                },
+                CueCall {
+                    cue: VoiceCue::SelfJoin,
+                    volume: 30,
+                    output: "2:Speakers".into(),
+                },
+            ],
+            "a join is delivered while the room is unmounted"
+        );
+    });
+
+    // A later shell repaint drains an empty queue: no duplicate cue.
+    super::voice_tests::draw(&mut visual);
+    view.read_with(&*visual, |v, _| assert_eq!(v.voice_cue_calls.len(), 2));
+}
+
+#[gpui::test]
 async fn the_app_drains_cues_through_the_saved_preferences(cx: &mut TestAppContext) {
     let (visual, view, voice) = super::voice_tests::fixture(cx);
     visual.update(|window, app| {

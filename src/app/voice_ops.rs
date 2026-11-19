@@ -217,17 +217,9 @@ impl Voxhold {
                         }
                     });
                 }));
-                let call_view = weak_view.clone();
-                panel.set_call_handler(Box::new(move |cx: &mut gpui::App| {
-                    let weak = call_view.clone();
-                    cx.defer(move |cx| {
-                        if let Some(view) = weak.upgrade() {
-                            view.update(cx, |view, cx| view.update_power_poll(cx));
-                        }
-                    });
-                }));
             });
             self.voice = Some(panel);
+            self.install_voice_call_handler(cx);
         }
         self.voice_room = channel;
         if let Some(panel) = &self.voice {
@@ -235,6 +227,29 @@ impl Voxhold {
             window.focus(&focus);
         }
         cx.notify();
+    }
+
+    /// Install the one deferred parent update a panel transition triggers. It
+    /// drains recorded cues (so an unmounted room still plays them) and keeps
+    /// the power poll in sync without borrowing the parent re-entrantly.
+    pub(super) fn install_voice_call_handler(&mut self, cx: &mut Context<Self>) {
+        let Some(panel) = self.voice.clone() else {
+            return;
+        };
+        let weak_view = cx.entity().downgrade();
+        panel.update(cx, |panel, _| {
+            panel.set_call_handler(Box::new(move |cx: &mut gpui::App| {
+                let weak = weak_view.clone();
+                cx.defer(move |cx| {
+                    if let Some(view) = weak.upgrade() {
+                        view.update(cx, |view, cx| {
+                            view.drain_voice_cues(cx);
+                            view.update_power_poll(cx);
+                        });
+                    }
+                });
+            }));
+        });
     }
 
     /// Push a roster and fresh room access into the panel. Called after
@@ -305,38 +320,41 @@ impl Voxhold {
             return;
         }
         for cue in cues {
-            #[cfg(test)]
-            self.voice_cue_calls.push(CueCall {
-                cue,
-                volume,
-                output: output.clone(),
-            });
-            #[cfg(not(test))]
             self.play_voice_cue(cue, volume, &output);
         }
     }
 
     /// Convert the pure frontend spec into the media cue description. The
     /// device is resolved on the cue worker; an unavailable selection is silent.
-    #[cfg(not(test))]
-    fn play_voice_cue(&self, cue: crate::ui_sounds::VoiceCue, volume: i64, output: &str) {
-        let spec = cue.spec();
-        self.voice_cue_player.play(
-            voxhold_media::preview::CueSpec {
-                gain: spec.gain,
-                tones: spec
-                    .tones
-                    .iter()
-                    .map(|tone| voxhold_media::preview::CueTone {
-                        frequency: tone.frequency,
-                        at: tone.at,
-                        duration: tone.duration,
-                    })
-                    .collect(),
-            },
+    /// Tests capture the same output id and volume inside this handoff, so they
+    /// exercise the saved preference path without opening a device.
+    fn play_voice_cue(&mut self, cue: crate::ui_sounds::VoiceCue, volume: i64, output: &str) {
+        #[cfg(test)]
+        self.voice_cue_calls.push(CueCall {
+            cue,
             volume,
-            output,
-        );
+            output: output.to_owned(),
+        });
+        #[cfg(not(test))]
+        {
+            let spec = cue.spec();
+            self.voice_cue_player.play(
+                voxhold_media::preview::CueSpec {
+                    gain: spec.gain,
+                    tones: spec
+                        .tones
+                        .iter()
+                        .map(|tone| voxhold_media::preview::CueTone {
+                            frequency: tone.frequency,
+                            at: tone.at,
+                            duration: tone.duration,
+                        })
+                        .collect(),
+                },
+                volume,
+                output,
+            );
+        }
     }
 
     /// Mirror the call channel and drop calls whose access was revoked. A

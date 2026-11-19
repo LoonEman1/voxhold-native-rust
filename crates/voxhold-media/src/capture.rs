@@ -337,7 +337,7 @@ impl MicCapture {
                     )
                 })
                 .map_err(|_| {
-                    "РќРµ СѓРґР°Р»РѕСЃСЊ Р·Р°РїСѓСЃС‚РёС‚СЊ РїРѕС‚РѕРє РјРёРєСЂРѕС„РѕРЅР°."
+                    "Не удалось запустить поток микрофона."
                         .to_owned()
                 })?,
         );
@@ -584,7 +584,7 @@ struct WinIn;
 #[cfg(not(windows))]
 impl WinIn {
     fn open(_input: Option<&str>) -> Result<Self, String> {
-        Err("Р—Р°С…РІР°С‚ РјРёРєСЂРѕС„РѕРЅР° РґРѕСЃС‚СѓРїРµРЅ С‚РѕР»СЊРєРѕ РІ Windows.".into())
+        Err("Захват микрофона доступен только в Windows.".into())
     }
 
     fn completed(&mut self, _sink: impl FnMut(&[i16])) {}

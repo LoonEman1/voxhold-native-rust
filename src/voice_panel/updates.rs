@@ -19,7 +19,7 @@ impl VoicePanel {
         let mut repaint = true;
         match update {
             VoiceUpdate::Connecting => {
-                self.transition_phase(CallPhase::Connecting);
+                self.transition_phase(CallPhase::Connecting, cx);
                 self.status = "Подключение…".into();
                 self.applied_audio = None;
                 self.controls.muted = true;
@@ -27,13 +27,13 @@ impl VoicePanel {
             }
             VoiceUpdate::Connected => {
                 if self.phase != CallPhase::Connected {
-                    self.transition_phase(CallPhase::Connected);
+                    self.transition_phase(CallPhase::Connected, cx);
                     self.status = "Подключено".into();
                     self.refresh_capture();
                 }
             }
             VoiceUpdate::Reconnecting => {
-                self.transition_phase(CallPhase::Reconnecting);
+                self.transition_phase(CallPhase::Reconnecting, cx);
                 self.status = "Восстанавливаем соединение…".into();
                 self.applied_audio = None;
                 self.controls.muted = true;
@@ -152,18 +152,20 @@ impl VoicePanel {
                 self.ptt_combo = None;
                 self.close_player_in_window(window);
                 self.call_channel = 0;
-                self.transition_phase(if error.is_some() {
-                    CallPhase::Failed
-                } else {
-                    CallPhase::Idle
-                });
+                self.transition_phase(
+                    if error.is_some() {
+                        CallPhase::Failed
+                    } else {
+                        CallPhase::Idle
+                    },
+                    cx,
+                );
                 self.error = error.unwrap_or_default();
                 self.status.clear();
                 self.participants.clear();
                 self.clear_speaking(cx);
                 self.tracks.clear();
                 self.streams.clear();
-                self.notify_call_changed(cx);
             }
             VoiceUpdate::ScreenShare(_) | VoiceUpdate::ScreenSources { .. } => {}
         }

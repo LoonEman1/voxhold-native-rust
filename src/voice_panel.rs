@@ -613,7 +613,7 @@ impl VoicePanel {
         self.close_player();
         self.reset_screen();
         self.call_channel = 0;
-        self.transition_phase(CallPhase::Idle);
+        self.transition_phase(CallPhase::Idle, cx);
         self.status.clear();
         self.error.clear();
         self.ptt_held = false;
@@ -632,7 +632,6 @@ impl VoicePanel {
         self.local_mutes.clear();
         self.streams.clear();
         self.local_level = 0.0;
-        self.notify_call_changed(cx);
         cx.notify();
     }
 
@@ -758,9 +757,9 @@ impl VoicePanel {
         let server_muted = self.server_muted;
         self.self_muted = !self.self_muted;
         if !server_muted {
-            // The server mute owns the effective state; a toggle under it is
-            // not a local action and must stay silent, like the frontend.
+            // Server mute owns the effective state; a local toggle stays silent.
             self.queue_cue(cue);
+            self.notify_call_changed(cx);
         }
         self.refresh_capture();
         cx.notify();
@@ -770,6 +769,7 @@ impl VoicePanel {
         let cue = crate::ui_sounds::deafen_toggle_cue(self.controls.deafened);
         self.controls.deafened = !self.controls.deafened;
         self.queue_cue(cue);
+        self.notify_call_changed(cx);
         self.refresh_capture();
         cx.notify();
     }

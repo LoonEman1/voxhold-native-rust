@@ -20,9 +20,12 @@ impl VoicePanel {
         self.phase = CallPhase::Connecting;
     }
 
-    /// Apply one real phase change and queue the cue it implies. Roster, frame,
-    /// settings and participant updates never call this, so they stay silent.
-    pub(super) fn transition_phase(&mut self, next: CallPhase) {
+    /// Apply one real phase change, queue the cue it implies and wake the
+    /// parent. The callback is deferred, so a room that is not being painted
+    /// still delivers the cue without waiting for an unrelated repaint.
+    /// Roster, frame, settings and participant updates never call this, so they
+    /// stay silent.
+    pub(super) fn transition_phase(&mut self, next: CallPhase, cx: &mut Context<Self>) {
         let cue = self
             .cues
             .policy
@@ -31,6 +34,7 @@ impl VoicePanel {
         if let Some(cue) = cue {
             self.queue_cue(cue);
         }
+        self.notify_call_changed(cx);
     }
 
     /// A local mute/deafen toggle is exactly one cue; the caller decides

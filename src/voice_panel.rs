@@ -78,23 +78,20 @@ pub struct VoicePanel {
     status: String,
     error: String,
     controls: Controls,
-    /// Applied capture chain reported by the engine. Rendered as a diagnostic
-    /// label in the active room; not part of the Go room layout.
+    /// Saved room output percentage; `None` is not sent to the ADM.
+    saved_output_gain: Option<f64>,
+    /// Applied capture chain reported by the engine.
     applied_audio: Option<AppliedAudio>,
     self_muted: bool,
-    /// Server-authoritative mute of this user. It outranks the local toggle:
-    /// the microphone stays closed even while a PTT key is held.
+    /// Server-authoritative mute; outranks the local toggle and PTT.
     server_muted: bool,
-    /// The connection id this client was given on join. The roster may contain
-    /// two connections of the same user, so server mute is found by this id.
+    /// Connection id this client was given on join.
     self_connection: Option<String>,
-    /// Per-user output volume by stable user id (0–200 %). Persisted with the
-    /// voice preferences, applied by the media mixer through track owners.
+    /// Per-user output volume by stable user id (0–200 %).
     user_volumes: std::collections::BTreeMap<i64, i64>,
     /// Last measured mixer level and counters.
     playout: Option<voxhold_media::mixer::PlayoutStats>,
-    /// The system is suspended: the sink is released and the microphone is
-    /// closed until the resume handler reopens them.
+    /// The system is suspended: the sink is released and the microphone is closed.
     power_paused: bool,
     push_to_talk: bool,
     ptt_held: bool,
@@ -245,6 +242,7 @@ impl VoicePanel {
             cues: cues::CueQueue::default(),
             status: String::new(),
             error: String::new(),
+            saved_output_gain: controls.output_gain,
             controls,
             applied_audio: None,
             self_muted: false,
@@ -622,6 +620,8 @@ impl VoicePanel {
         self.server_muted = false;
         self.self_connection = None;
         self.playout = None;
+        // The ADM cleared the numeric gain; the next join restores the saved value.
+        self.restore_output_gain();
         self.power_paused = false;
         // The next join starts with a closed microphone until the server
         // confirms `voice.joined`, even if the previous call was unmuted.

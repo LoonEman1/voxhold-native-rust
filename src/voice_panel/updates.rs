@@ -37,6 +37,9 @@ impl VoicePanel {
                 self.status = "Восстанавливаем соединение…".into();
                 self.applied_audio = None;
                 self.controls.muted = true;
+                // The next session starts before its playback path is known:
+                // hand it the stored percentage again.
+                self.sync_output_gain();
                 self.release_push_to_talk();
                 // Go drops the confirmed roster until the fresh join; a
                 // stale list must not look like a live call during a
@@ -136,6 +139,10 @@ impl VoicePanel {
             }
             VoiceUpdate::AudioMode(applied) => {
                 self.applied_audio = Some(applied);
+                // ADM has no numeric room gain: clear it while that path plays
+                // and put the stored percentage back when the software mixer
+                // returns, without waiting for the settings tab.
+                self.sync_output_gain();
             }
             VoiceUpdate::Playout(stats) => {
                 self.playout = Some(stats);
@@ -144,6 +151,7 @@ impl VoicePanel {
                 self.handle.take();
                 self.reset_screen();
                 self.applied_audio = None;
+                self.restore_output_gain();
                 self.server_muted = false;
                 self.self_connection = None;
                 self.playout = None;

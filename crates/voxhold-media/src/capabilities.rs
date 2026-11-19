@@ -7,7 +7,9 @@
 //! fallback is a different chain: its own NS/AGC are not ours to toggle and it
 //! cannot honour a custom gate or gain, so the settings tab asks
 //! [`capabilities_for`] for the active capture chain instead of promising the
-//! software values everywhere.
+//! software values everywhere. The ADM playback also has no numeric room gain:
+//! the stored output percentage is kept for the software mixer, and only mute
+//! is real on that path.
 //!
 //! Echo cancellation is reported as unavailable in both chains. The pinned
 //! engine has no render reference for the software APM, and nothing measures
@@ -40,9 +42,8 @@ pub struct AudioCapabilities {
     /// APM noise suppression in auto mode; threshold uses the software gate.
     pub noise_suppression: Support,
     /// Room output gain. `Applied` means the software room mixer scales each
-    /// participant 0–200 % and sums with a limiter; on the ADM fallback only
-    /// mute is real (`Support::Applied` still describes the availability of the
-    /// control, not the fallback path, which the form states explicitly).
+    /// participant 0–200 % and sums with a limiter; the ADM fallback has no
+    /// numeric bus gain, so this is `Unavailable` there and only mute is real.
     pub output_gain: Support,
     /// Opus maximum bitrate selection.
     pub bitrate: Support,
@@ -80,6 +81,9 @@ pub fn capabilities_for(capture: Option<&str>) -> AudioCapabilities {
         capabilities.echo_cancellation = Support::Unavailable;
         capabilities.auto_gain = Support::Automatic;
         capabilities.noise_suppression = Support::Automatic;
+        // The ADM has no numeric room gain: the stored percentage is kept for
+        // the software mixer, and only mute/deafen changes the played room.
+        capabilities.output_gain = Support::Unavailable;
     }
     capabilities
 }
@@ -144,13 +148,27 @@ mod tests {
         );
         assert_eq!(platform.auto_gain, Support::Automatic);
         assert_eq!(platform.noise_suppression, Support::Automatic);
-        assert_eq!(platform.output_gain, Support::Applied);
+        assert_eq!(
+            platform.output_gain,
+            Support::Unavailable,
+            "the ADM has no numeric room gain; only mute is real"
+        );
         assert_eq!(platform.bitrate, Support::Applied);
 
         let software = capabilities_for(Some("software"));
         assert_eq!(software.input_gain, Support::Applied);
         assert_eq!(software.noise_gate, Support::Applied);
         assert_eq!(software.echo_cancellation, Support::Unavailable);
+        assert_eq!(
+            software.output_gain,
+            Support::Applied,
+            "the software mixer applies the room percentage"
+        );
+        assert_eq!(
+            capabilities_for(None).output_gain,
+            Support::Applied,
+            "before a path is known the software default is described"
+        );
     }
 
     #[test]

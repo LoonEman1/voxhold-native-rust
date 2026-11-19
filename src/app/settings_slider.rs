@@ -72,18 +72,50 @@ impl Voxhold {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        self.settings_slider_state(id, label, value, max, true, action, window, cx)
+    }
+
+    /// A slider that keeps painting its stored value but cannot be edited. The
+    /// output gain uses this while the platform ADM plays: the percentage is
+    /// kept for the software mixer, but it does not reach the active path.
+    pub(super) fn settings_slider_disabled(
+        &mut self,
+        id: &str,
+        label: &str,
+        value: i64,
+        max: i64,
+        action: impl Fn(i64) -> SettingsAct + 'static,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        self.settings_slider_state(id, label, value, max, false, action, window, cx)
+    }
+
+    fn settings_slider_state(
+        &mut self,
+        id: &str,
+        label: &str,
+        value: i64,
+        max: i64,
+        enabled: bool,
+        action: impl Fn(i64) -> SettingsAct + 'static,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let p = self.palette;
         let max = max.max(1);
         let value = value.clamp(0, max);
         let ratio = value as f32 / max as f32;
         let key = id.to_owned();
         let focus = self.focus_id(ElementId::Name(format!("{id}-track").into()), window, cx);
-        let focused = focus.is_focused(window);
+        let focused = enabled && focus.is_focused(window);
         // Arrow keys and Home/End reach the row through the dialog ring, so it
-        // is a Tab stop like every button.
-        self.settings_ring.push((focus.clone(), None));
-        self.settings_slider_focus
-            .push((key.clone(), focus.clone()));
+        // is a Tab stop like every button. A disabled row is neither.
+        if enabled {
+            self.settings_ring.push((focus.clone(), None));
+            self.settings_slider_focus
+                .push((key.clone(), focus.clone()));
+        }
         let cell = self.slider_tracks.entry(key.clone()).or_default().clone();
         let action: std::rc::Rc<dyn Fn(i64) -> SettingsAct> = std::rc::Rc::new(action);
         let paint_cell = cell.clone();
@@ -135,6 +167,52 @@ impl Voxhold {
         let debug_value = format!("{key}-value");
         let id_field = key.clone();
         let id_track = format!("{key}-track");
+        let mut track = div()
+            .id(ElementId::Name(id_track.into()))
+            .debug_selector(move || debug_track.clone())
+            .w_full()
+            .h(px(ROW_HEIGHT))
+            .rounded(px(6.))
+            .when(focused, |row| {
+                row.border_1()
+                    .border_color(super::ui::ink_alpha(p.lime, 128))
+            });
+        if enabled {
+            track = track
+                .cursor_pointer()
+                .track_focus(&focus)
+                .tab_index(0)
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |s, event: &gpui::MouseDownEvent, window, cx| {
+                        window.focus(&down_focus);
+                        let track = down_cell.get();
+                        let next = slider_value(
+                            track.origin_x,
+                            track.width,
+                            max,
+                            f32::from(event.position.x),
+                        );
+                        s.begin_slider_drag(max, next, track, down_action.clone(), window, cx);
+                        cx.stop_propagation();
+                    }),
+                )
+                .on_key_down(
+                    cx.listener(move |s, event: &gpui::KeyDownEvent, window, cx| {
+                        let next = match event.keystroke.key.as_str() {
+                            "left" | "down" => Some(value - 1),
+                            "right" | "up" => Some(value + 1),
+                            "home" => Some(0),
+                            "end" => Some(max),
+                            _ => None,
+                        };
+                        if let Some(next) = next {
+                            s.settings_action(key_action(next.clamp(0, max)), window, cx);
+                            cx.stop_propagation();
+                        }
+                    }),
+                );
+        }
         div()
             .id(ElementId::Name(id_field.into()))
             .debug_selector(move || debug_row.clone())
@@ -142,6 +220,7 @@ impl Voxhold {
             .flex()
             .flex_col()
             .gap_1()
+            .when(!enabled, |row| row.opacity(0.55))
             .child(
                 // Web `voice-range`: label on the left, the percentage on the
                 // right. Only the header changes; the track below keeps the
@@ -171,52 +250,7 @@ impl Voxhold {
                             .child(format!("{value}%")),
                     ),
             )
-            .child(
-                div()
-                    .id(ElementId::Name(id_track.into()))
-                    .debug_selector(move || debug_track.clone())
-                    .w_full()
-                    .h(px(ROW_HEIGHT))
-                    .rounded(px(6.))
-                    .when(focused, |row| {
-                        row.border_1()
-                            .border_color(super::ui::ink_alpha(p.lime, 128))
-                    })
-                    .cursor_pointer()
-                    .track_focus(&focus)
-                    .tab_index(0)
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |s, event: &gpui::MouseDownEvent, window, cx| {
-                            window.focus(&down_focus);
-                            let track = down_cell.get();
-                            let next = slider_value(
-                                track.origin_x,
-                                track.width,
-                                max,
-                                f32::from(event.position.x),
-                            );
-                            s.begin_slider_drag(max, next, track, down_action.clone(), window, cx);
-                            cx.stop_propagation();
-                        }),
-                    )
-                    .on_key_down(
-                        cx.listener(move |s, event: &gpui::KeyDownEvent, window, cx| {
-                            let next = match event.keystroke.key.as_str() {
-                                "left" | "down" => Some(value - 1),
-                                "right" | "up" => Some(value + 1),
-                                "home" => Some(0),
-                                "end" => Some(max),
-                                _ => None,
-                            };
-                            if let Some(next) = next {
-                                s.settings_action(key_action(next.clamp(0, max)), window, cx);
-                                cx.stop_propagation();
-                            }
-                        }),
-                    )
-                    .child(canvas),
-            )
+            .child(track.child(canvas))
             .into_any_element()
     }
 

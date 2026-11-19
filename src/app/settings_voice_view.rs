@@ -117,6 +117,14 @@ pub(super) fn mixer_status_line(
     ))
 }
 
+/// Whether the output slider can change the live path. Outside a call there is
+/// no playback path yet, so the value is stored and editable for the next
+/// join; in a call only a path that applies the numeric gain (the software
+/// mixer) is editable.
+pub(super) fn output_gain_editable(in_call: bool, gain_applied: bool) -> bool {
+    !in_call || gain_applied
+}
+
 impl Voxhold {
     pub(super) fn voice_body(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let devices = self.voice_settings.devices.clone();
@@ -175,6 +183,17 @@ impl Voxhold {
             .is_some_and(|panel| panel.read(cx).call_active());
         #[cfg(not(feature = "voxhold-media"))]
         let in_call = false;
+        // The slider follows the same decision as the sent controls: outside a
+        // call the stored value is editable for the next join, in a call only
+        // a path that applies the numeric gain (the software mixer) is.
+        #[cfg(feature = "voxhold-media")]
+        let output_gain_applied = self
+            .voice
+            .as_ref()
+            .is_none_or(|panel| panel.read(cx).output_gain_applied());
+        #[cfg(not(feature = "voxhold-media"))]
+        let output_gain_applied = true;
+        let output_editable = output_gain_editable(in_call, output_gain_applied);
         let (_, input_ids, input_current) = device_choices(&prefs, &devices, true);
         let (_, output_ids, output_current) = device_choices(&prefs, &devices, false);
         // The two decisions follow the painted settings form, not a window size
@@ -303,20 +322,40 @@ impl Voxhold {
         if !preview_error.is_empty() {
             levels = levels.child(self.form_text(&preview_error, true));
         }
-        levels = levels
-            .child(self.form_text(meter_explanation, false))
-            .child(self.settings_slider(
-                "output-volume",
-                "Громкость вывода",
-                prefs.output_volume,
-                200,
-                |value| {
-                    SettingsAct::Personal(personal_settings::Action::SetVolume("output", value))
-                },
-                window,
-                cx,
-            ))
-            .child(self.form_text(crate::voice_form_text::OUTPUT_VOLUME_NOTE, false));
+        levels = levels.child(self.form_text(meter_explanation, false));
+        levels = if output_editable {
+            levels
+                .child(self.settings_slider(
+                    "output-volume",
+                    "Громкость вывода",
+                    prefs.output_volume,
+                    200,
+                    |value| {
+                        SettingsAct::Personal(personal_settings::Action::SetVolume("output", value))
+                    },
+                    window,
+                    cx,
+                ))
+                .child(self.form_text(crate::voice_form_text::OUTPUT_VOLUME_NOTE, false))
+        } else {
+            levels
+                .child(self.settings_slider_disabled(
+                    "output-volume",
+                    "Громкость вывода",
+                    prefs.output_volume,
+                    200,
+                    |value| {
+                        SettingsAct::Personal(personal_settings::Action::SetVolume("output", value))
+                    },
+                    window,
+                    cx,
+                ))
+                .child(self.voice_note(
+                    "output-volume-adm-note",
+                    crate::voice_form_text::OUTPUT_VOLUME_ADM_NOTE,
+                    false,
+                ))
+        };
         root = root.child(self.settings_card(
             "voice-levels-card",
             "Уровни звука",

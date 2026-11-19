@@ -73,6 +73,11 @@ pub const OUTPUT_GAIN_NOTE: &str =
 /// same sentence: an ADM path cannot apply the percentage.
 pub const OUTPUT_VOLUME_NOTE: &str = "Общая громкость применяется к дорожкам участников. Громкость каждого участника 0–200 % и лимитер применяет программный микшер комнаты; при недоступном микшере остаётся системный ADM, где действует только mute, а численное усиление участников не применяется.";
 
+/// Sentence under the output-volume slider while the platform ADM plays. The
+/// slider keeps painting the stored percentage, but that value only reaches
+/// the software mixer; on the ADM only the real mute is applied.
+pub const OUTPUT_VOLUME_ADM_NOTE: &str = "Сейчас комнату играет системный ADM: численная громкость вывода не применяется, действует только mute. Сохранённые 0–200 % остаются в настройках и вернутся, когда программный микшер снова заработает.";
+
 /// Description of the AGC switch. The ADM's own AGC cannot be toggled from
 /// here and was not measured.
 pub const AUTO_GAIN_DESCRIPTION: &str =
@@ -144,5 +149,16 @@ mod tests {
             echo_cancellation_note(Support::Unavailable),
             echo_cancellation_note(Support::Automatic)
         );
+    }
+
+    #[test]
+    fn the_adm_output_note_says_only_mute_is_applied_and_the_value_is_kept() {
+        assert!(OUTPUT_VOLUME_ADM_NOTE.contains("только mute"));
+        assert!(
+            OUTPUT_VOLUME_ADM_NOTE.contains("Сохранённые 0–200 %"),
+            "the percentage stays visible for the next software path"
+        );
+        assert!(OUTPUT_VOLUME_ADM_NOTE.contains("программный микшер"));
+        assert!(!OUTPUT_VOLUME_ADM_NOTE.contains("применяется к дорожкам"));
     }
 }

@@ -34,6 +34,12 @@ pub(super) enum ScreenCommand {
     CancelPicker {
         picker: u64,
     },
+    /// New settings of a live attempt: one stop followed by one new start.
+    Restart {
+        request: PublishRequest,
+        stream_permission: bool,
+        slot_available: bool,
+    },
     Stop,
 }
 

@@ -55,6 +55,26 @@ impl VoiceHandle {
         self.requests.wake();
     }
 
+    /// Change the quality of the live publication. The backend has no runtime
+    /// reconfigure, so the worker stops the current attempt and starts a new
+    /// one after the stop acknowledgement.
+    pub fn restart_screen_share(
+        &self,
+        request: crate::publisher::PublishRequest,
+        stream_permission: bool,
+        slot_available: bool,
+    ) {
+        push_screen(
+            &self.requests,
+            ScreenCommand::Restart {
+                request,
+                stream_permission,
+                slot_available,
+            },
+        );
+        self.requests.wake();
+    }
+
     /// One stop intent. The capture stops before the socket answer arrives.
     pub fn stop_screen_share(&self) {
         push_screen(&self.requests, ScreenCommand::Stop);
@@ -101,7 +121,14 @@ impl Live {
                         &mut self.publisher,
                         request,
                         Instant::now(),
-                        move |request| PublisherEngine::start(request, servers, policy, preview),
+                        move |request| {
+                            PublisherEngine::start(request, servers, policy, preview).map(
+                                |engine| {
+                                    let has_audio = engine.has_audio();
+                                    (engine, has_audio)
+                                },
+                            )
+                        },
                     );
                     self.screen = engine;
                     #[cfg(test)]
@@ -224,10 +251,10 @@ pub(super) fn start_engine<E>(
     publisher: &mut Publisher,
     request: PublishRequest,
     now: Instant,
-    start: impl FnOnce(PublishRequest) -> Result<E, String>,
+    start: impl FnOnce(PublishRequest) -> Result<(E, bool), String>,
 ) -> (Option<E>, Vec<PublisherOutcome>) {
     match start(request) {
-        Ok(engine) => (Some(engine), publisher.engine_ready(now)),
+        Ok((engine, has_audio)) => (Some(engine), publisher.engine_ready(now, has_audio)),
         Err(message) => (None, publisher.on_start_failed(&message, now)),
     }
 }
@@ -270,6 +297,21 @@ impl Live {
                 ));
                 let viewer_active = viewer_conflicts(viewer);
                 let outcomes = self.publisher.publish(picker, request, viewer_active, now);
+                self.apply_screen(outcomes, viewer).await?;
+            }
+            ScreenCommand::Restart {
+                request,
+                stream_permission,
+                slot_available,
+            } => {
+                self.publisher
+                    .set_connection(controller.resume_connection_id.clone());
+                self.publisher.set_access(screen_access(
+                    controller.joined,
+                    stream_permission,
+                    slot_available,
+                ));
+                let outcomes = self.publisher.restart(request, now);
                 self.apply_screen(outcomes, viewer).await?;
             }
         }

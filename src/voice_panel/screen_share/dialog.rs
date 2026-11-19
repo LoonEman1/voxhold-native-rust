@@ -5,7 +5,7 @@
 
 use super::*;
 use crate::theme;
-use voxhold_media::publisher::{Codec, Resolution};
+use voxhold_media::publisher::{Codec, Preset, Resolution};
 use voxhold_media::screen_capture::ScreenSource;
 
 impl VoicePanel {
@@ -17,8 +17,20 @@ impl VoicePanel {
         key: ShareKey,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
+        self.choice_enabled(label, active, true, focus, key, cx)
+    }
+
+    fn choice_enabled(
+        &self,
+        label: &'static str,
+        active: bool,
+        enabled: bool,
+        focus: FocusHandle,
+        key: ShareKey,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
         let c = self.colors();
-        div()
+        let mut button = div()
             .id(label)
             .h(px(30.))
             .px(px(10.))
@@ -26,16 +38,24 @@ impl VoicePanel {
             .border_1()
             .border_color(rgb(if active { c.accent_text } else { c.line }))
             .bg(rgb(if active { c.danger_bg } else { c.surface }))
-            .text_color(rgb(if active { c.fg } else { c.muted }))
+            .text_color(rgb(if !enabled {
+                c.line
+            } else if active {
+                c.fg
+            } else {
+                c.muted
+            }))
             .text_size(px(12.))
             .flex()
             .items_center()
             .justify_center()
-            .cursor_pointer()
-            .track_focus(&focus)
-            .on_click(cx.listener(move |panel, _, _, cx| panel.activate_share(key, cx)))
-            .child(label)
-            .into_any_element()
+            .track_focus(&focus);
+        if enabled {
+            button = button
+                .cursor_pointer()
+                .on_click(cx.listener(move |panel, _, _, cx| panel.activate_share(key, cx)));
+        }
+        button.child(label).into_any_element()
     }
 
     fn source_row(
@@ -43,13 +63,14 @@ impl VoicePanel {
         source: &ScreenSource,
         index: usize,
         selected: bool,
+        enabled: bool,
         focus: FocusHandle,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let c = self.colors();
         let description = source.describe();
         let clicked = source.clone();
-        div()
+        let mut row = div()
             .id(("share-source", index))
             .h(px(40.))
             .w_full()
@@ -61,12 +82,15 @@ impl VoicePanel {
             .flex()
             .items_center()
             .gap_2()
-            .cursor_pointer()
-            .track_focus(&focus)
-            .on_click(
-                cx.listener(move |panel, _, _, cx| panel.select_screen_source(clicked.clone(), cx)),
-            )
-            .child(img("icons/monitor.svg").w(px(16.)).h(px(16.)))
+            .track_focus(&focus);
+        if enabled {
+            row =
+                row.cursor_pointer()
+                    .on_click(cx.listener(move |panel, _, _, cx| {
+                        panel.select_screen_source(clicked.clone(), cx)
+                    }));
+        }
+        row.child(img("icons/monitor.svg").w(px(16.)).h(px(16.)))
             .child(
                 div()
                     .flex_1()
@@ -100,8 +124,8 @@ impl VoicePanel {
         if area.is_empty() {
             return None;
         }
-        let width = 560.0_f32.min((area.w - 32.0).max(320.0));
-        let height = 560.0_f32.min((area.h - 32.0).max(320.0));
+        let width = 620.0_f32.min((area.w - 32.0).max(320.0));
+        let height = 660.0_f32.min((area.h - 32.0).max(320.0));
         let left = area.x + (area.w - width) / 2.0;
         let top = area.y + (area.h - height) / 2.0;
 
@@ -164,7 +188,14 @@ impl VoicePanel {
         for (index, source) in sources.iter().enumerate() {
             let focus = row(self, &mut ring, ShareKey::Source(index));
             let is_selected = selected.as_ref() == Some(source);
-            list = list.child(self.source_row(source, index, is_selected, focus, cx));
+            list = list.child(self.source_row(
+                source,
+                index,
+                is_selected,
+                !self.screen.restart,
+                focus,
+                cx,
+            ));
         }
 
         // Quality: only values the SDR publication applies.
@@ -175,12 +206,39 @@ impl VoicePanel {
             self.screen.bitrate_kbps / 1000,
             (self.screen.bitrate_kbps % 1000) / 100
         );
+        let preset = Preset::detect(q);
+        let mut preset_row = div().flex().items_center().gap_2().child(
+            div()
+                .w(px(92.))
+                .text_size(px(12.))
+                .text_color(rgb(c.muted))
+                .child("Пресеты"),
+        );
+        for option in Preset::all() {
+            let focus = row(self, &mut ring, ShareKey::Preset(option));
+            preset_row = preset_row.child(self.choice(
+                option.label(),
+                preset == option,
+                focus,
+                ShareKey::Preset(option),
+                cx,
+            ));
+        }
+
         let res720 = row(self, &mut ring, ShareKey::Resolution(Resolution::P720));
         let res1080 = row(self, &mut ring, ShareKey::Resolution(Resolution::P1080));
         let fps30 = row(self, &mut ring, ShareKey::Fps(30));
         let fps60 = row(self, &mut ring, ShareKey::Fps(60));
         let bitrate_down = row(self, &mut ring, ShareKey::BitrateDown);
         let bitrate_up = row(self, &mut ring, ShareKey::BitrateUp);
+        let audio_available = self.screen.audio_available();
+        let audio_enabled = self.screen.audio_enabled;
+        let audio_controls = audio_enabled && audio_available;
+        let audio_down = row(self, &mut ring, ShareKey::AudioBitrateDown);
+        let audio_up = row(self, &mut ring, ShareKey::AudioBitrateUp);
+        let audio_focus = row(self, &mut ring, ShareKey::Audio);
+        let audio_rate = format!("{} кбит/с", self.screen.audio_bitrate_kbps);
+        let audio_status = self.screen.audio_status();
         let quality_row = div()
             .flex()
             .flex_col()
@@ -261,6 +319,86 @@ impl VoicePanel {
                             .w(px(92.))
                             .text_size(px(12.))
                             .text_color(rgb(c.muted))
+                            .child("Аудио"),
+                    )
+                    .child(self.choice_enabled(
+                        "− 64",
+                        false,
+                        audio_controls,
+                        audio_down,
+                        ShareKey::AudioBitrateDown,
+                        cx,
+                    ))
+                    .child(
+                        div()
+                            .h(px(30.))
+                            .px(px(8.))
+                            .flex()
+                            .items_center()
+                            .text_size(px(12.))
+                            .child(audio_rate),
+                    )
+                    .child(self.choice_enabled(
+                        "+ 64",
+                        false,
+                        audio_controls,
+                        audio_up,
+                        ShareKey::AudioBitrateUp,
+                        cx,
+                    )),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .w(px(92.))
+                            .text_size(px(12.))
+                            .text_color(rgb(c.muted))
+                            .child("Системный звук"),
+                    )
+                    .child(self.choice_enabled(
+                        if audio_enabled {
+                            "Включён"
+                        } else {
+                            "Выключен"
+                        },
+                        audio_enabled,
+                        audio_available,
+                        audio_focus,
+                        ShareKey::Audio,
+                        cx,
+                    ))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .text_size(px(10.))
+                            .text_color(rgb(c.muted))
+                            .truncate()
+                            .child(audio_status),
+                    ),
+            )
+            .when(audio_enabled, |rows| {
+                rows.child(
+                    div()
+                        .text_size(px(10.))
+                        .text_color(rgb(c.muted))
+                        .child(SYSTEM_AUDIO_WARNING),
+                )
+            })
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .w(px(92.))
+                            .text_size(px(12.))
+                            .text_color(rgb(c.muted))
                             .child("Кодек"),
                     )
                     .child(
@@ -281,8 +419,13 @@ impl VoicePanel {
 
         let cancel_focus = row(self, &mut ring, ShareKey::Cancel);
         let start_focus = row(self, &mut ring, ShareKey::Start);
-        let can_start = self.screen.selected.is_some() && !self.screen.busy && !codec.is_empty();
-        let start_label = if self.screen.busy {
+        let can_start = self.screen.selected.is_some()
+            && !self.screen.busy
+            && !codec.is_empty()
+            && (!self.screen.restart || self.screen.sharing.phase == Phase::Live);
+        let start_label = if self.screen.restart {
+            "Перезапустить"
+        } else if self.screen.busy {
             "Запускаем…"
         } else {
             "Начать трансляцию"
@@ -408,7 +551,16 @@ impl VoicePanel {
             )
             .child(tabs)
             .child(list)
+            .child(preset_row)
             .child(quality_row);
+        if let Some(warning) = self.screen.restart_warning() {
+            card = card.child(
+                div()
+                    .text_size(px(10.))
+                    .text_color(rgb(c.danger))
+                    .child(warning),
+            );
+        }
         if let Some(error) = error {
             card = card.child(
                 div()
@@ -457,6 +609,10 @@ impl VoicePanel {
             }
             ShareKey::BitrateDown => self.change_bitrate(-100, cx),
             ShareKey::BitrateUp => self.change_bitrate(100, cx),
+            ShareKey::Preset(preset) => self.apply_preset(preset, cx),
+            ShareKey::Audio => self.toggle_system_audio(cx),
+            ShareKey::AudioBitrateDown => self.change_audio_bitrate(false, cx),
+            ShareKey::AudioBitrateUp => self.change_audio_bitrate(true, cx),
             ShareKey::Cancel => {
                 // The committed attempt is stopped by Escape/backdrop; the
                 // Cancel button itself is unavailable while busy.

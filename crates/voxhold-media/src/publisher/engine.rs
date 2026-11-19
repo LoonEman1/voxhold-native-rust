@@ -22,6 +22,7 @@ use std::{
 };
 
 use libwebrtc::{
+    audio_source::{AudioSourceOptions, native::NativeAudioSource},
     ice_candidate::IceCandidate,
     media_stream_track::MediaStreamTrack,
     peer_connection::{AnswerOptions, BitrateSettings, PeerConnection, PeerConnectionState},
@@ -44,6 +45,7 @@ use crate::{
     screen_capture::{
         CaptureFailure, CapturedImage, LatestImage, PreviewStore, ScreenCapture, preview_from_i420,
     },
+    system_audio::{AudioProducer, CHANNELS, SAMPLE_RATE, SystemAudio},
 };
 
 /// How long the capture may deliver nothing before the attempt is failed.
@@ -61,6 +63,9 @@ const ENGINE_EVENT_CAPACITY: usize = 32;
 /// The outbound stats poll is cheap but must not stall command handling.
 const STATS_INTERVAL: Duration = Duration::from_secs(1);
 const STATS_TIMEOUT: Duration = Duration::from_millis(500);
+/// A worker that does not finish after its channel closed is detached instead
+/// of hanging the runtime forever.
+const WORKER_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The plan asks for a GPU/CPU share; this build has no GPU probe. The pinned
 /// `OutboundRtpStats` does report `quality_limitation_reason`, which is the
@@ -108,6 +113,15 @@ pub struct PublishStats {
     /// Active screen sources of this publication. The stage publishes one.
     pub sources: u32,
     pub limitation: QualityLimitation,
+    /// The engine really sends the system-audio track.
+    pub audio_active: bool,
+    /// Encoded audio bitrate measured over the interval between two stats
+    /// polls. `0` means the first sample has not produced a delta yet.
+    pub audio_kbps: f32,
+    /// Cumulative audio RTP packets reported by the outbound stats.
+    pub audio_packets_sent: u64,
+    /// 10 ms blocks the capture queue dropped because the encoder was behind.
+    pub audio_dropped: u64,
 }
 
 impl Default for PublishStats {
@@ -119,6 +133,10 @@ impl Default for PublishStats {
             height: 0,
             sources: 1,
             limitation: QualityLimitation::None,
+            audio_active: false,
+            audio_kbps: 0.0,
+            audio_packets_sent: 0,
+            audio_dropped: 0,
         }
     }
 }
@@ -126,8 +144,15 @@ impl Default for PublishStats {
 impl PublishStats {
     /// One honest line for the on-air card.
     pub fn describe(self) -> String {
+        let audio = if !self.audio_active {
+            "без звука".to_owned()
+        } else if self.audio_kbps > 0.0 {
+            format!("звук ~{:.0} кбит/с", self.audio_kbps)
+        } else {
+            "звук включён".to_owned()
+        };
         format!(
-            "{:.0} FPS · сброс {} · {}×{} · ограничение: {} · источников {}",
+            "{:.0} FPS · сброс {} · {}×{} · ограничение: {} · источников {} · {audio}",
             self.fps,
             self.dropped,
             self.width,
@@ -285,6 +310,9 @@ struct FrameCounters {
     height: AtomicU32,
 }
 
+mod audio;
+use audio::{AudioCounters, AudioMeter, audio_loop};
+
 enum Command {
     Offer(String),
     Ice(Candidate),
@@ -300,6 +328,7 @@ pub struct PublisherEngine {
     events: Arc<EventQueue>,
     preview: Arc<PreviewStore>,
     ice_dropped: AtomicU64,
+    has_audio: bool,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -319,18 +348,33 @@ impl PublisherEngine {
             latest.clone(),
         )
         .map_err(str::to_owned)?;
+        // The loopback is opened before the engine reports itself ready, so
+        // `stream.start` can carry the real `has_audio`. A missing endpoint is
+        // an explicit capability error, never a silent video-only stream.
+        let audio: Option<Box<dyn AudioProducer>> = if request.audio {
+            match SystemAudio::start() {
+                Ok(capture) => Some(Box::new(capture)),
+                Err(error) => {
+                    return Err(format!("Системный звук недоступен: {error}"));
+                }
+            }
+        } else {
+            None
+        };
         Self::spawn(
             request,
             servers,
             policy,
             Box::new(DesktopProducer { capture, latest }),
+            audio,
             preview,
         )
     }
 
     /// Test entry point: the same engine with a frame producer that does not
     /// need a desktop. `frame_size` may differ from the declared quality, like
-    /// a 21:9 monitor inside a 720p publication.
+    /// a 21:9 monitor inside a 720p publication. A synthetic audio producer
+    /// replaces the WASAPI loopback for the in-process SFU tests.
     #[cfg(test)]
     pub(crate) fn start_synthetic(
         request: PublishRequest,
@@ -338,14 +382,22 @@ impl PublisherEngine {
         policy: String,
         preview: bool,
         frame_size: (u32, u32),
+        audio: Option<Box<dyn AudioProducer>>,
     ) -> Result<Self, String> {
         Self::spawn(
             request,
             servers,
             policy,
             Box::new(SyntheticProducer::new(frame_size.0, frame_size.1, preview)),
+            audio,
             Arc::new(PreviewStore::default()),
         )
+    }
+
+    /// Whether the peer really carries the system-audio track. The state
+    /// machine forwards this value as `has_audio` of `stream.start`.
+    pub fn has_audio(&self) -> bool {
+        self.has_audio
     }
 
     fn spawn(
@@ -353,15 +405,19 @@ impl PublisherEngine {
         servers: Vec<IceServer>,
         policy: String,
         producer: Box<dyn FrameProducer>,
+        audio: Option<Box<dyn AudioProducer>>,
         preview: Arc<PreviewStore>,
     ) -> Result<Self, String> {
+        let has_audio = audio.is_some();
         let (commands, receiver) = mpsc::channel(ENGINE_COMMAND_CAPACITY);
         let events = Arc::new(EventQueue::default());
         let counters = Arc::new(FrameCounters::default());
+        let audio_counters = Arc::new(AudioCounters::default());
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let worker_events = events.clone();
         let worker_preview = preview.clone();
         let worker_counters = counters.clone();
+        let worker_audio_counters = audio_counters.clone();
         let thread = std::thread::Builder::new()
             .name("voxhold-screen-publisher".into())
             .spawn(move || {
@@ -377,10 +433,12 @@ impl PublisherEngine {
                     worker_events,
                     worker_preview,
                     worker_counters,
+                    worker_audio_counters,
                     request,
                     servers,
                     policy,
                     producer,
+                    audio,
                     ready_tx,
                 ));
             })
@@ -391,16 +449,17 @@ impl PublisherEngine {
                 events,
                 preview,
                 ice_dropped: AtomicU64::new(0),
+                has_audio,
                 thread: Some(thread),
             }),
             Ok(Err(message)) => {
-                let _ = thread.join();
+                join_bounded(thread, WORKER_JOIN_TIMEOUT);
                 Err(message)
             }
             Err(_) => {
                 let _ = commands.try_send(Command::Stop);
                 drop(commands);
-                let _ = thread.join();
+                join_bounded(thread, WORKER_JOIN_TIMEOUT);
                 Err("Трансляция не запустилась за 5 секунд.".into())
             }
         }
@@ -447,10 +506,24 @@ impl Drop for PublisherEngine {
         // the Stop command, but a closed channel always ends `recv()`.
         drop(self.commands.take());
         if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
+            join_bounded(thread, WORKER_JOIN_TIMEOUT);
         }
         self.preview.clear();
     }
+}
+
+/// Join a worker without an unbounded wait. The detached thread keeps only its
+/// own capture and peer; the publication handle is already gone, so a stuck
+/// driver cannot hold the session or the UI forever.
+fn join_bounded(thread: std::thread::JoinHandle<()>, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    while !thread.is_finished() {
+        if Instant::now() >= deadline {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let _ = thread.join();
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -459,10 +532,12 @@ async fn run(
     events: Arc<EventQueue>,
     preview: Arc<PreviewStore>,
     counters: Arc<FrameCounters>,
+    audio_counters: Arc<AudioCounters>,
     request: PublishRequest,
     servers: Vec<IceServer>,
     policy: String,
     producer: Box<dyn FrameProducer>,
+    audio: Option<Box<dyn AudioProducer>>,
     ready: std::sync::mpsc::Sender<Result<(), String>>,
 ) {
     let factory = PeerConnectionFactory::default();
@@ -529,6 +604,39 @@ async fn run(
             return;
         }
     };
+    // The audio track is added after the video track, so the local
+    // transceivers mirror the backend's m-line order: video, then audio. EC,
+    // NS and AGC are disabled: system audio is a program feed, not a mic.
+    let (audio_sender, audio_pump) = match audio {
+        Some(producer) => {
+            let audio_source = NativeAudioSource::new(
+                AudioSourceOptions {
+                    echo_cancellation: false,
+                    noise_suppression: false,
+                    auto_gain_control: false,
+                },
+                SAMPLE_RATE,
+                CHANNELS,
+                200,
+            );
+            let track = factory.create_audio_track("voxhold-system-audio", audio_source.clone());
+            let sender = match peer.add_track(MediaStreamTrack::Audio(track), &["voxhold-screen"]) {
+                Ok(sender) => sender,
+                Err(_) => {
+                    let _ = ready.send(Err("Не удалось добавить аудиодорожку трансляции.".into()));
+                    return;
+                }
+            };
+            let pump = tokio::spawn(audio_loop(
+                producer,
+                audio_source,
+                events.clone(),
+                audio_counters.clone(),
+            ));
+            (Some(sender), Some(pump))
+        }
+        None => (None, None),
+    };
     // The codec is pinned by the backend's `SetCodecPreferences`; the answer
     // selects the first common payload. The picker offers only verified codecs.
     let _ = request.codec;
@@ -547,6 +655,7 @@ async fn run(
     let mut pending: VecDeque<Candidate> = VecDeque::new();
     let mut disconnected_since: Option<Instant> = None;
     let mut last_stats = Instant::now();
+    let mut audio_meter = AudioMeter::default();
     loop {
         let command = tokio::select! {
             command = commands.recv() => command,
@@ -564,7 +673,15 @@ async fn run(
                 }
                 if last_stats.elapsed() >= STATS_INTERVAL {
                     last_stats = Instant::now();
-                    if let Some(stats) = outbound_stats(&peer, &counters).await {
+                    if let Some(stats) = outbound_stats(
+                        &peer,
+                        &counters,
+                        &audio_counters,
+                        &mut audio_meter,
+                        audio_sender.is_some(),
+                    )
+                    .await
+                    {
                         events.push(EngineEvent::Stats(stats));
                     }
                 }
@@ -573,7 +690,16 @@ async fn run(
         };
         match command {
             Some(Command::Offer(sdp)) => {
-                if !apply_offer(&peer, &sender, &sdp, request.quality.bitrate_kbps, &events).await {
+                if !apply_offer(
+                    &peer,
+                    &sender,
+                    audio_sender.as_ref(),
+                    &sdp,
+                    request.quality,
+                    &events,
+                )
+                .await
+                {
                     break;
                 }
                 remote_set = true;
@@ -593,6 +719,10 @@ async fn run(
     }
     pump.abort();
     let _ = pump.await;
+    if let Some(pump) = audio_pump {
+        pump.abort();
+        let _ = pump.await;
+    }
     peer.on_connection_state_change(None);
     peer.on_ice_candidate(None);
     peer.close();
@@ -601,8 +731,9 @@ async fn run(
 async fn apply_offer(
     peer: &PeerConnection,
     sender: &RtpSender,
+    audio_sender: Option<&RtpSender>,
     sdp: &str,
-    bitrate_kbps: u32,
+    quality: Quality,
     events: &EventQueue,
 ) -> bool {
     let offer = match SessionDescription::parse(sdp, SdpType::Offer) {
@@ -636,20 +767,39 @@ async fn apply_offer(
         ));
         return false;
     }
-    apply_bitrate(peer, sender, bitrate_kbps);
+    apply_bitrate(peer, sender, audio_sender, quality);
     events.push(EngineEvent::Answer(text));
     true
 }
 
-fn apply_bitrate(peer: &PeerConnection, sender: &RtpSender, bitrate_kbps: u32) {
-    let max = Some(u64::from(bitrate_kbps.clamp(500, 16_000)) * 1000);
+/// The video limit comes from the dialog; the audio limit is the Opus maximum
+/// of the same settings and is clamped to the backend's 32–510 kbit/s range.
+/// `RtpEncodingParameters` has no degradation preference, so nothing here
+/// pretends to set one.
+fn apply_bitrate(
+    peer: &PeerConnection,
+    sender: &RtpSender,
+    audio_sender: Option<&RtpSender>,
+    quality: Quality,
+) {
+    let video_max = Some(u64::from(quality.bitrate_kbps.clamp(500, 16_000)) * 1000);
     let mut parameters = sender.parameters();
     for encoding in &mut parameters.encodings {
-        encoding.max_bitrate = max;
+        encoding.max_bitrate = video_max;
     }
     let _ = sender.set_parameters(parameters);
+    let audio_max = audio_sender.map(|audio| {
+        let limit = Some(u64::from(quality.audio_bitrate_kbps.clamp(32, 510)) * 1000);
+        let mut parameters = audio.parameters();
+        for encoding in &mut parameters.encodings {
+            encoding.max_bitrate = limit;
+        }
+        let _ = audio.set_parameters(parameters);
+        limit
+    });
+    let total = video_max.unwrap_or(0) + audio_max.flatten().unwrap_or(0);
     let _ = peer.set_bitrate(BitrateSettings {
-        max_bitrate_bps: max,
+        max_bitrate_bps: Some(total),
         ..BitrateSettings::default()
     });
 }
@@ -665,19 +815,38 @@ async fn add_ice(peer: &PeerConnection, candidate: Candidate) {
 /// One honest diagnostics sample: encoded FPS / resolution / limitation from
 /// `OutboundRtpStats`, the capture drop counter and the single active source.
 /// A failed or empty stats call falls back to the capture-side numbers.
-async fn outbound_stats(peer: &PeerConnection, counters: &FrameCounters) -> Option<PublishStats> {
+async fn outbound_stats(
+    peer: &PeerConnection,
+    counters: &FrameCounters,
+    audio_counters: &AudioCounters,
+    audio_meter: &mut AudioMeter,
+    audio_active: bool,
+) -> Option<PublishStats> {
     let capture_width = counters.width.load(Ordering::Relaxed);
     let capture_height = counters.height.load(Ordering::Relaxed);
     let capture_fps = f32::from_bits(counters.fps_bits.load(Ordering::Relaxed));
     let dropped = counters.dropped.load(Ordering::Relaxed);
-    let outbound = match tokio::time::timeout(STATS_TIMEOUT, peer.get_stats()).await {
-        Ok(Ok(stats)) => stats.into_iter().find_map(|stat| match stat {
-            RtcStats::OutboundRtp(outbound) if outbound.stream.kind == "video" => Some(outbound),
-            _ => None,
-        }),
-        _ => None,
-    };
-    let Some(outbound) = outbound else {
+    let (mut video, mut audio) = (None, None);
+    if let Ok(Ok(stats)) = tokio::time::timeout(STATS_TIMEOUT, peer.get_stats()).await {
+        for stat in stats {
+            let RtcStats::OutboundRtp(outbound) = stat else {
+                continue;
+            };
+            match outbound.stream.kind.as_str() {
+                "video" => video = Some(outbound),
+                "audio" => audio = Some(outbound),
+                _ => {}
+            }
+        }
+    }
+    let mut audio_packets_sent = 0;
+    let mut audio_kbps = 0.0;
+    if let Some(outbound) = &audio {
+        audio_packets_sent = outbound.sent.packets_sent;
+        audio_meter.observe(outbound.sent.bytes_sent);
+        audio_kbps = audio_meter.kbps();
+    }
+    let Some(outbound) = video else {
         return Some(PublishStats {
             fps: capture_fps,
             dropped,
@@ -685,6 +854,10 @@ async fn outbound_stats(peer: &PeerConnection, counters: &FrameCounters) -> Opti
             height: capture_height,
             sources: 1,
             limitation: QualityLimitation::None,
+            audio_active,
+            audio_kbps,
+            audio_packets_sent,
+            audio_dropped: audio_counters.dropped(),
         });
     };
     let stream = outbound.outbound;
@@ -694,6 +867,8 @@ async fn outbound_stats(peer: &PeerConnection, counters: &FrameCounters) -> Opti
         outbound.sent.packets_sent,
         stream.frame_width,
         stream.frame_height,
+        audio_packets_sent,
+        audio_kbps,
     );
     Some(PublishStats {
         fps: stream.frames_per_second as f32,
@@ -710,6 +885,10 @@ async fn outbound_stats(peer: &PeerConnection, counters: &FrameCounters) -> Opti
         },
         sources: 1,
         limitation: QualityLimitation::from_reason(stream.quality_limitation_reason),
+        audio_active,
+        audio_kbps,
+        audio_packets_sent,
+        audio_dropped: audio_counters.dropped(),
     })
 }
 
@@ -798,6 +977,9 @@ fn ufrag(candidate: &str) -> Option<&str> {
 
 #[cfg(test)]
 mod loopback;
+
+#[cfg(test)]
+mod audio_tests;
 
 #[cfg(test)]
 mod capture_tests;

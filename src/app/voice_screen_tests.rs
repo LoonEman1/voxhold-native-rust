@@ -297,6 +297,141 @@ async fn cancel_while_busy_never_enqueues_a_cancel_and_the_close_is_a_stop(
 }
 
 #[gpui::test]
+async fn the_live_quality_dialog_warns_and_restarts_with_the_new_values(cx: &mut TestAppContext) {
+    use voxhold_media::publisher::{Phase, Preset, Quality, Resolution, Sharing};
+    let (mut visual, _view, voice) = super::voice_tests::fixture(cx);
+    draw(&mut visual);
+    visual.update(|_window, app| {
+        voice.update(app, |panel, cx| {
+            panel.test_attach_detached_handle();
+            let sharing = Sharing {
+                phase: Phase::Live,
+                live: true,
+                quality: Some(Quality {
+                    resolution: Resolution::P720,
+                    fps: 30,
+                    bitrate_kbps: 4000,
+                    audio_bitrate_kbps: 128,
+                }),
+                has_audio: true,
+                ..Sharing::default()
+            };
+            panel.test_open_screen_settings(source(), sharing, cx);
+            assert!(panel.screen_share_open(), "the live dialog opened");
+            assert!(panel.test_screen_restart());
+            assert!(
+                panel.test_restart_warning().is_some(),
+                "a live change must warn about the restart"
+            );
+            assert!(panel.test_sound_label().contains("128"));
+            // The preset changes only the applied fps/bitrate; audio is a
+            // separate field and can be turned off.
+            panel.test_apply_preset(Preset::Games, cx);
+            panel.test_toggle_system_audio(cx);
+            let request = panel.test_screen_request();
+            assert_eq!(request.quality.fps, 60);
+            assert_eq!(request.quality.bitrate_kbps, 12_000);
+            assert_eq!(request.quality.resolution, Resolution::P720);
+            assert!(!request.audio);
+            assert_eq!(request.source, source());
+        });
+    });
+    for _ in 0..40 {
+        if focused(&mut visual, &voice).as_deref() == Some("Start") {
+            break;
+        }
+        visual.simulate_keystrokes("tab");
+    }
+    assert_eq!(focused(&mut visual, &voice).as_deref(), Some("Start"));
+    visual.simulate_keystrokes("enter");
+    let commands = visual
+        .update(|_window, app| voice.update(app, |panel, _| panel.test_take_screen_commands()));
+    assert_eq!(
+        commands,
+        vec![("restart", 0)],
+        "Start in the live dialog queues exactly one restart"
+    );
+    voice.read_with(&*visual, |panel, _| {
+        assert!(panel.screen_share_busy(), "the restart is committed");
+    });
+}
+
+#[gpui::test]
+async fn closing_the_live_quality_dialog_keeps_the_stream(cx: &mut TestAppContext) {
+    use voxhold_media::publisher::{Phase, Quality, Sharing};
+    let (mut visual, _view, voice) = super::voice_tests::fixture(cx);
+    draw(&mut visual);
+    visual.update(|_window, app| {
+        voice.update(app, |panel, cx| {
+            panel.test_attach_detached_handle();
+            panel.test_open_screen_settings(
+                source(),
+                Sharing {
+                    phase: Phase::Live,
+                    live: true,
+                    quality: Some(Quality::default()),
+                    has_audio: true,
+                    ..Sharing::default()
+                },
+                cx,
+            );
+            assert!(panel.screen_share_open());
+        });
+    });
+    visual.simulate_keystrokes("escape");
+    draw(&mut visual);
+    let commands = visual
+        .update(|_window, app| voice.update(app, |panel, _| panel.test_take_screen_commands()));
+    assert!(
+        commands.is_empty(),
+        "closing the live quality dialog must not stop or cancel: {commands:?}"
+    );
+    voice.read_with(&*visual, |panel, _| {
+        assert!(!panel.screen_share_open());
+        assert_eq!(panel.test_screen_phase(), Phase::Live);
+    });
+}
+
+#[gpui::test]
+async fn the_on_air_sound_line_reports_measured_and_missing_audio(cx: &mut TestAppContext) {
+    use voxhold_media::publisher::{Phase, Quality, Sharing};
+    let (visual, _view, voice) = super::voice_tests::fixture(cx);
+    visual.update(|_window, app| {
+        voice.update(app, |panel, _| {
+            let quality = Quality::default();
+            panel.test_set_screen_sharing(Sharing {
+                phase: Phase::Live,
+                live: true,
+                quality: Some(quality),
+                has_audio: true,
+                stats: Some(voxhold_media::publisher::engine::PublishStats {
+                    audio_active: true,
+                    audio_kbps: 96.0,
+                    ..Default::default()
+                }),
+                ..Sharing::default()
+            });
+            assert!(
+                panel.test_sound_label().contains("96"),
+                "the card must show the measured audio rate"
+            );
+            panel.test_set_screen_sharing(Sharing {
+                phase: Phase::Live,
+                live: true,
+                quality: Some(quality),
+                has_audio: false,
+                ..Sharing::default()
+            });
+            assert_eq!(panel.test_sound_label(), "Без звука");
+            assert!(
+                !panel.test_screen_request().audio,
+                "an unavailable track is never requested"
+            );
+        });
+    });
+}
+
+#[gpui::test]
 async fn the_disabled_reason_is_hidden_while_a_share_is_active(cx: &mut TestAppContext) {
     use voxhold_media::publisher::{Phase, Sharing};
     let (visual, _view, voice) = super::voice_tests::fixture(cx);

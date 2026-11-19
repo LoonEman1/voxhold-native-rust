@@ -148,8 +148,9 @@ pub struct VoicePanel {
     dock_focus: Vec<FocusHandle>,
     dock_visible: bool,
     stream_focus: Vec<FocusHandle>,
-    /// Focus handles of the «Экран» toolbar action and the on-air stop
-    /// action. Index 0 is the on-air stop action, index 1 the toolbar button.
+    /// Focus handles of the «Экран» toolbar action and the on-air actions.
+    /// Index 0 is the on-air stop action, index 1 the toolbar button, index 2
+    /// the live quality action.
     screen_focus: Vec<FocusHandle>,
     /// Focus handles of the source picker. A separate range cannot collide
     /// with the toolbar (`screen_focus[1]`) or the on-air card (`screen_focus[0]`).
@@ -275,7 +276,7 @@ impl VoicePanel {
                 .collect(),
             dock_visible: false,
             stream_focus: (0..8).map(|_| cx.focus_handle()).collect(),
-            screen_focus: (0..2).map(|_| cx.focus_handle()).collect(),
+            screen_focus: (0..3).map(|_| cx.focus_handle()).collect(),
             picker_focus: (0..32).map(|_| cx.focus_handle()).collect(),
             member_focus: (0..16).map(|_| cx.focus_handle()).collect(),
             player_actions: (0..3).map(|_| cx.focus_handle()).collect(),

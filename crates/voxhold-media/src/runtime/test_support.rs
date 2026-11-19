@@ -2,6 +2,7 @@
 //! runtime module keeps its size and the seam is a separate, obvious surface.
 
 use super::*;
+use crate::runtime::requests::ScreenCommand;
 
 impl VoiceHandle {
     /// A handle with no worker and no socket. The settings tests use it to
@@ -14,6 +15,9 @@ impl VoiceHandle {
             updates: Arc::new(Updates::new()),
             frame: Arc::new(Mutex::new(None)),
             capture: Arc::new(CaptureGate::default()),
+            screen_preview: Arc::new(crate::screen_capture::PreviewStore::default()),
+            screen_picker: Arc::new(AtomicU64::new(1)),
+            source_generation: Arc::new(AtomicU64::new(1)),
             attempt: ATTEMPT.fetch_add(1, Ordering::SeqCst),
             worker: None,
             finished: Arc::new((Mutex::new(false), Condvar::new())),
@@ -30,5 +34,23 @@ impl VoiceHandle {
     /// The queued power transition, if the UI forwarded one.
     pub fn take_power_for_tests(&self) -> Option<bool> {
         self.requests.power.lock().ok()?.take()
+    }
+
+    /// Drain the queued screen actions as (kind, picker) pairs. The detached
+    /// handle has no worker, so this is exactly what the UI sent.
+    pub fn take_screen_commands_for_tests(&self) -> Vec<(&'static str, u64)> {
+        let mut out = Vec::new();
+        while let Some(pending) = self.requests.take() {
+            let Pending::Screen(command) = pending else {
+                continue;
+            };
+            out.push(match command {
+                ScreenCommand::OpenPicker { picker } => ("open", picker),
+                ScreenCommand::Publish { picker, .. } => ("publish", picker),
+                ScreenCommand::CancelPicker { picker } => ("cancel", picker),
+                ScreenCommand::Stop => ("stop", 0),
+            });
+        }
+        out
     }
 }

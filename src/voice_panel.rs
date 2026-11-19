@@ -114,6 +114,10 @@ pub struct VoicePanel {
     /// Publications of the displayed room from the account WebSocket; the
     /// call's runtime owns `streams` for the room it is in.
     room_streams: Vec<Publication>,
+    /// Permission Stream of the displayed room, confirmed by the channel list.
+    can_stream: bool,
+    /// Screen-share picker, on-air card and preview.
+    screen: ScreenShareUi,
     /// False while the authoritative channel ACL is being reloaded. Both the
     /// room roster and the call worker's roster/streams stay hidden until the
     /// fresh channel list confirms access again.
@@ -144,6 +148,12 @@ pub struct VoicePanel {
     dock_focus: Vec<FocusHandle>,
     dock_visible: bool,
     stream_focus: Vec<FocusHandle>,
+    /// Focus handles of the «Экран» toolbar action and the on-air stop
+    /// action. Index 0 is the on-air stop action, index 1 the toolbar button.
+    screen_focus: Vec<FocusHandle>,
+    /// Focus handles of the source picker. A separate range cannot collide
+    /// with the toolbar (`screen_focus[1]`) or the on-air card (`screen_focus[0]`).
+    picker_focus: Vec<FocusHandle>,
     member_focus: Vec<FocusHandle>,
     player_actions: Vec<FocusHandle>,
     room_size: (f32, f32),
@@ -161,6 +171,10 @@ pub struct VoicePanel {
     /// the power poller so an idle window has no timer.
     call_handler: Option<Box<dyn Fn(&mut gpui::App)>>,
     palette: Palette,
+    /// Test-only gate override: the capture stack and codec of the host must
+    /// not decide whether a keyboard-path test can run.
+    #[cfg(test)]
+    test_share_gate: Option<Result<(), &'static str>>,
 }
 
 impl VoicePanel {
@@ -232,6 +246,8 @@ impl VoicePanel {
             input_generation: 0,
             streams: Vec::new(),
             room_streams: Vec::new(),
+            can_stream: false,
+            screen: ScreenShareUi::default(),
             access_confirmed: true,
             frame: None,
             stream_status: String::new(),
@@ -259,6 +275,8 @@ impl VoicePanel {
                 .collect(),
             dock_visible: false,
             stream_focus: (0..8).map(|_| cx.focus_handle()).collect(),
+            screen_focus: (0..2).map(|_| cx.focus_handle()).collect(),
+            picker_focus: (0..32).map(|_| cx.focus_handle()).collect(),
             member_focus: (0..16).map(|_| cx.focus_handle()).collect(),
             player_actions: (0..3).map(|_| cx.focus_handle()).collect(),
             room_size: (0.0, 0.0),
@@ -270,6 +288,8 @@ impl VoicePanel {
             speaking_handler: None,
             call_handler: None,
             palette: crate::theme::dark_palette(),
+            #[cfg(test)]
+            test_share_gate: None,
         }
     }
 
@@ -564,6 +584,7 @@ impl VoicePanel {
         }
         self.handle.take();
         self.close_player();
+        self.reset_screen();
         self.call_channel = 0;
         self.phase = CallPhase::Idle;
         self.status.clear();
@@ -877,10 +898,14 @@ impl VoicePanel {
                 handle.set_viewport(width, height);
             }
         }
+        let preview_changed = self.take_screen_preview();
         let Some(handle) = &self.handle else {
+            if preview_changed {
+                cx.notify();
+            }
             return;
         };
-        let mut changed = false;
+        let mut changed = preview_changed;
         let mut updates = Vec::new();
         while let Some(update) = handle.try_update() {
             updates.push(update);
@@ -915,6 +940,16 @@ impl VoicePanel {
         if active {
             for (index, action) in VOICE_ACTIONS.iter().enumerate() {
                 ring.push((action.id, self.action_focus[index].clone()));
+            }
+            ring.push(("voice-screen", self.screen_focus[1].clone()));
+            if matches!(
+                self.screen.sharing.phase,
+                voxhold_media::publisher::Phase::Publishing
+                    | voxhold_media::publisher::Phase::Live
+                    | voxhold_media::publisher::Phase::Stopping
+                    | voxhold_media::publisher::Phase::Failed
+            ) {
+                ring.push(("screen-stop", self.screen_focus[0].clone()));
             }
         } else {
             ring.push(("voice-join", self.join_focus.clone()));
@@ -1094,6 +1129,8 @@ impl VoicePanel {
 mod colors;
 mod controls;
 mod player;
+mod screen_share;
+use screen_share::ScreenShareUi;
 #[cfg(test)]
 mod test_support;
 mod updates;

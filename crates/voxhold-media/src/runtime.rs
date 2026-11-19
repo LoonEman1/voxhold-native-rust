@@ -42,6 +42,7 @@ use updates::Updates;
 pub use updates::VoiceUpdate;
 
 mod requests;
+mod screen;
 mod test_support;
 use requests::{
     InputRequest, Pending, Requests, StreamCommand, set_input_request, set_stream_command,
@@ -64,6 +65,13 @@ pub struct VoiceHandle {
     /// Capture permission is independent of the socket worker, so leave, a
     /// released PTT key or logout silences the track immediately.
     capture: Arc<CaptureGate>,
+    /// Last local preview of the screen publication. The publisher engine
+    /// writes it; the on-air card takes it.
+    screen_preview: Arc<crate::screen_capture::PreviewStore>,
+    /// Ids for the picker and its listings. `u64` so a stale answer can never
+    /// replace a newer one.
+    screen_picker: Arc<AtomicU64>,
+    source_generation: Arc<AtomicU64>,
     attempt: u64,
     worker: Option<thread::JoinHandle<()>>,
     finished: Arc<(Mutex<bool>, Condvar)>,
@@ -84,9 +92,13 @@ impl VoiceHandle {
         let frame = Arc::new(Mutex::new(None));
         let capture = Arc::new(CaptureGate::default());
         let finished = Arc::new((Mutex::new(false), Condvar::new()));
+        let screen_preview = Arc::new(crate::screen_capture::PreviewStore::default());
+        let screen_picker = Arc::new(AtomicU64::new(1));
+        let source_generation = Arc::new(AtomicU64::new(1));
         let (worker_requests, worker_updates) = (requests.clone(), updates.clone());
         let (worker_frame, worker_finished) = (frame.clone(), finished.clone());
         let worker_capture = capture.clone();
+        let worker_preview = screen_preview.clone();
         let worker = thread::Builder::new()
             .name("voxhold-voice-session".into())
             .spawn(move || {
@@ -100,6 +112,7 @@ impl VoiceHandle {
                     worker_updates,
                     worker_frame,
                     worker_capture,
+                    worker_preview,
                 );
                 if let Ok(mut done) = worker_finished.0.lock() {
                     *done = true;
@@ -112,6 +125,9 @@ impl VoiceHandle {
             updates,
             frame,
             capture,
+            screen_preview,
+            screen_picker,
+            source_generation,
             attempt,
             worker: Some(worker),
             finished,
@@ -286,6 +302,12 @@ struct Live {
     output_working: bool,
     stream: Option<StreamViewer>,
     stream_selection: Option<u64>,
+    /// Screen-share state machine of this socket session. It survives viewer
+    /// switches and never survives a reconnect.
+    publisher: crate::publisher::Publisher,
+    /// The capture and peer of the current publishing attempt.
+    screen: Option<crate::publisher::engine::PublisherEngine>,
+    screen_preview: Arc<crate::screen_capture::PreviewStore>,
     render: VideoFrame,
     viewport: (u32, u32),
     local_level: Option<f64>,
@@ -480,6 +502,10 @@ impl Live {
     }
 
     async fn send_signal(&mut self, signal: Signal) -> Result<(), SessionEnd> {
+        // The live stand test needs the exact signaling the session sent and
+        // the answer mid; the test-only probe is empty in every other build.
+        #[cfg(test)]
+        crate::live_probe::record_signal(signal.kind, &signal.data);
         self.send(signal.kind, signal.data, signal.request_id.as_deref())
             .await
     }
@@ -631,6 +657,7 @@ async fn run_session(
     updates: Arc<Updates>,
     frame: Arc<Mutex<Option<StreamFrame>>>,
     capture: Arc<CaptureGate>,
+    screen_preview: Arc<crate::screen_capture::PreviewStore>,
 ) -> SessionEnd {
     let config = match client.webrtc_config().await {
         Ok(config) => config,
@@ -683,12 +710,17 @@ async fn run_session(
         output_working: true,
         stream: None,
         stream_selection: None,
+        publisher: crate::publisher::Publisher::new(controller.server_id, controller.channel_id),
+        screen: None,
+        screen_preview,
         render: VideoFrame::default(),
         viewport: requests.viewport(),
         local_level: None,
         frame,
         updates,
     };
+    live.publisher
+        .set_connection(controller.resume_connection_id.clone());
     let mut tick = tokio::time::interval(Duration::from_millis(25));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
@@ -700,6 +732,11 @@ async fn run_session(
                     // Stopping the media worker applies the same latch again
                     // and releases the device before the leave handshake.
                     let _ = live.media.command(Command::Stop);
+                    // The screen capture has one owner: this attempt. Release
+                    // it before the socket can stall on the leave handshake.
+                    if let Err(end) = live.abandon_screen(viewer).await {
+                        return end;
+                    }
                     let outcomes = viewer.leave(Instant::now());
                     let _ = live.apply(outcomes, viewer).await;
                     live.send_leave().await;
@@ -745,6 +782,15 @@ async fn run_session(
                         return end;
                     }
                 }
+                Pending::Screen(command) => {
+                    if let Err(end) = live
+                        .handle_screen_command(command, controller, viewer)
+                        .await
+                    {
+                        return end;
+                    }
+                }
+                Pending::ScreenSources(request) => live.list_screen_sources(request),
                 Pending::Output(output) => {
                     live.output = output.clone();
                     if let Some(stream) = &mut live.stream {
@@ -838,15 +884,32 @@ async fn run_session(
                 let Ok(event) = event else { return SessionEnd::Recover };
                 if event.kind.starts_with("stream.")
                     || (event.kind == "error"
-                        && event.request_id.starts_with("native-stream-"))
+                        && (event.request_id.starts_with("native-stream-")
+                            || event.request_id.starts_with("native-screen-")))
                 {
+                    let now = Instant::now();
                     let outcomes = viewer.on_server_event(
                         &event.kind,
                         &event.request_id,
                         &event.data,
-                        Instant::now(),
+                        now,
                     );
                     if let Err(end) = live.apply(outcomes, viewer).await {
+                        return end;
+                    }
+                    // The publisher filters by its own attempt; a viewer event
+                    // never reaches it as a start. `stream.left` releases the
+                    // viewer and lets the waiting publication start.
+                    if let Err(end) = live
+                        .on_screen_signal(
+                            &event.kind,
+                            &event.request_id,
+                            &event.data,
+                            now,
+                            viewer,
+                        )
+                        .await
+                    {
                         return end;
                     }
                     // `stream.watching` refreshes the publication in the list.
@@ -863,6 +926,8 @@ async fn run_session(
                 live.media.set_joined(controller.joined);
                 live.media
                     .set_server_allowed(!controller.server_muted && !controller.controls.deafened);
+                live.publisher
+                    .set_connection(controller.resume_connection_id.clone());
                 // The viewer follows the confirmed voice state, not the socket:
                 // a fresh join re-watches the selected publication.
                 let outcomes = viewer.set_joined(controller.joined, Instant::now());
@@ -881,8 +946,12 @@ async fn run_session(
             }
             _ = tick.tick() => {
                 live.viewport = requests.viewport();
-                let outcomes = viewer.tick(Instant::now());
+                let now = Instant::now();
+                let outcomes = viewer.tick(now);
                 if let Err(end) = live.apply(outcomes, viewer).await {
+                    return end;
+                }
+                if let Err(end) = live.tick_screen(now, viewer).await {
                     return end;
                 }
                 match live.drain_voice_media(controller).await {
@@ -910,6 +979,7 @@ fn run(
     updates: Arc<Updates>,
     frame: Arc<Mutex<Option<StreamFrame>>>,
     capture: Arc<CaptureGate>,
+    screen_preview: Arc<crate::screen_capture::PreviewStore>,
 ) {
     let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -937,8 +1007,15 @@ fn run(
             updates.clone(),
             frame.clone(),
             capture.clone(),
+            screen_preview.clone(),
         ));
         controller.joined = false;
+        // A reconnect never resumes a screen publication: the attempt belonged
+        // to the socket session that just ended.
+        screen_preview.clear();
+        updates.push(VoiceUpdate::ScreenShare(
+            crate::publisher::Sharing::default(),
+        ));
         let outcomes = viewer.transport_ended(Instant::now());
         for outcome in outcomes {
             match outcome {
@@ -1025,6 +1102,11 @@ fn run(
                     }
                     Pending::StreamMute(selection, muted) => {
                         let _ = viewer.set_muted(selection, muted);
+                    }
+                    Pending::Screen(_) | Pending::ScreenSources(_) => {
+                        // No session, no publisher and no capture: a picker
+                        // action of the previous attempt is dropped. The UI
+                        // cannot reach these states without a live call.
                     }
                     Pending::Power(_) => {
                         // No engine exists between attempts: the next session

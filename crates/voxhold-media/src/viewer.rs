@@ -175,11 +175,22 @@ impl Viewer {
         self.intent.as_ref().is_some_and(|intent| intent.muted)
     }
 
+    /// A `stream.leave` is still waiting for its acknowledgement.
+    pub fn leaving(&self) -> bool {
+        self.pending_leave.is_some()
+    }
+
     /// `voice.joined`/transport state. On a reconnect the old engine, catalog
     /// and leave request are gone; the selected publication stays and is
     /// watched again only after both a fresh snapshot and the join confirm.
     pub fn set_joined(&mut self, joined: bool, now: Instant) -> Vec<Outcome> {
         if !joined {
+            // A snapshot may arrive before `ready` on the same socket. Until
+            // the first `voice.joined` there is no transport to end, so a
+            // repeated pre-join `false` must not discard that snapshot.
+            if !self.joined {
+                return Vec::new();
+            }
             return self.transport_ended(now);
         }
         if self.joined == joined {

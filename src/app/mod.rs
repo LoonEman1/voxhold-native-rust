@@ -49,6 +49,8 @@ pub(crate) mod ui;
 #[cfg(test)]
 mod voice_form_tests;
 mod voice_ops;
+#[cfg(test)]
+mod voice_screen_tests;
 mod voice_settings_ops;
 #[cfg(test)]
 mod voice_settings_tests;
@@ -466,6 +468,14 @@ impl Voxhold {
                 "shift-tab",
                 crate::voice_panel::VoiceTabPrev,
                 Some("VoiceRoom"),
+            ),
+            // The screen picker is a modal over the room; its own context is
+            // deeper, so Tab cycles the picker ring instead of the room.
+            gpui::KeyBinding::new("tab", crate::voice_panel::VoiceTab, Some("ScreenPicker")),
+            gpui::KeyBinding::new(
+                "shift-tab",
+                crate::voice_panel::VoiceTabPrev,
+                Some("ScreenPicker"),
             ),
         ]);
         let history_list = Self::new_history_list(ListAlignment::Bottom, cx);

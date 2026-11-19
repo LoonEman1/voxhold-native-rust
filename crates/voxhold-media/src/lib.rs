@@ -5,6 +5,8 @@ pub mod controller;
 pub mod dsp;
 pub mod mixer;
 pub mod preview;
+pub mod publisher;
+pub mod screen_capture;
 mod video;
 pub mod viewer;
 mod voice;
@@ -656,3 +658,8 @@ mod tests {
 pub mod devices;
 pub mod runtime;
 pub mod stream;
+
+#[cfg(test)]
+mod live_probe;
+#[cfg(test)]
+mod live_tests;

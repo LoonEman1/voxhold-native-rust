@@ -1,6 +1,7 @@
 //! Bounded request/update behaviour of the voice session.
 
 use super::*;
+use crate::runtime::requests::ScreenCommand;
 use std::collections::HashMap;
 
 fn publication(connection: &str) -> Publication {
@@ -15,6 +16,60 @@ fn publication(connection: &str) -> Publication {
         viewer_count: 1,
         started_at_ms: 1,
     }
+}
+
+#[test]
+fn screen_commands_keep_their_order_and_listings_keep_the_newest_generation() {
+    use crate::publisher::{Codec, PublishRequest, Quality};
+    use crate::screen_capture::{ScreenSource, SourceKind};
+
+    let requests = Requests::default();
+    let request = PublishRequest {
+        source: ScreenSource {
+            id: 1,
+            kind: SourceKind::Monitor,
+            title: "Экран 1".into(),
+            display_id: -1,
+            width: 1920,
+            height: 1080,
+        },
+        quality: Quality::default(),
+        codec: Codec::Vp8,
+    };
+    // Opening the picker must reach the worker before the chosen source.
+    crate::runtime::requests::push_screen(&requests, ScreenCommand::OpenPicker { picker: 1 });
+    crate::runtime::requests::push_screen(
+        &requests,
+        ScreenCommand::Publish {
+            picker: 1,
+            request,
+            stream_permission: true,
+            slot_available: true,
+        },
+    );
+    assert!(matches!(
+        requests.take(),
+        Some(Pending::Screen(ScreenCommand::OpenPicker { picker: 1 }))
+    ));
+    assert!(matches!(
+        requests.take(),
+        Some(Pending::Screen(ScreenCommand::Publish { picker: 1, .. }))
+    ));
+
+    // A late older listing cannot replace a newer one of the same kind.
+    crate::runtime::requests::set_source_request(&requests, SourceKind::Monitor, 4);
+    crate::runtime::requests::set_source_request(&requests, SourceKind::Monitor, 3);
+    crate::runtime::requests::set_source_request(&requests, SourceKind::Window, 7);
+    let first = requests.take();
+    let second = requests.take();
+    let generations: Vec<u64> = [first, second]
+        .into_iter()
+        .filter_map(|pending| match pending {
+            Some(Pending::ScreenSources(request)) => Some(request.generation),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(generations, vec![4, 7], "newest listing per kind only");
 }
 
 #[test]
@@ -345,4 +400,124 @@ fn a_burst_of_device_notices_stays_bounded() {
         count += 1;
     }
     assert_eq!(count, super::updates::UPDATE_CAPACITY);
+}
+
+fn screen_request() -> crate::publisher::PublishRequest {
+    use crate::publisher::{Codec, Quality};
+    use crate::screen_capture::{ScreenSource, SourceKind};
+    crate::publisher::PublishRequest {
+        source: ScreenSource {
+            id: 1,
+            kind: SourceKind::Monitor,
+            title: "Экран 1".into(),
+            display_id: -1,
+            width: 1920,
+            height: 1080,
+        },
+        quality: Quality::default(),
+        codec: Codec::Vp8,
+    }
+}
+
+fn screen_publisher() -> crate::publisher::Publisher {
+    use crate::publisher::Access;
+    let mut publisher = crate::publisher::Publisher::new(1, 10);
+    publisher.set_connection(Some("me".into()));
+    publisher.set_access(Access {
+        joined: true,
+        stream_permission: true,
+        slots_available: true,
+    });
+    publisher
+}
+
+#[test]
+fn a_failed_engine_start_cancels_the_attempt_without_stream_start() {
+    use crate::publisher::{Outcome as PublisherOutcome, Phase};
+    let now = Instant::now();
+    let mut publisher = screen_publisher();
+    publisher.begin_picker(1);
+    let mut outcomes = publisher.publish(1, screen_request(), false, now);
+    assert!(matches!(
+        outcomes.as_slice(),
+        [PublisherOutcome::StartEngine { .. }]
+    ));
+    let PublisherOutcome::StartEngine { request, .. } = outcomes.remove(0) else {
+        unreachable!()
+    };
+    // The substitutable engine starter fails: the attempt must be cancelled
+    // whole, with neither `stream.start` nor a compensating `stream.stop`.
+    let (engine, failure) = super::screen::start_engine::<()>(&mut publisher, request, now, |_| {
+        Err("движок не создан".to_string())
+    });
+    assert!(engine.is_none());
+    outcomes.extend(failure);
+    assert!(
+        !outcomes
+            .iter()
+            .any(|outcome| matches!(outcome, PublisherOutcome::Send(signal) if signal.kind == "stream.start")),
+        "a failed start must not reach the server: {outcomes:?}"
+    );
+    assert!(
+        !outcomes
+            .iter()
+            .any(|outcome| matches!(outcome, PublisherOutcome::Send(signal) if signal.kind == "stream.stop")),
+        "no start was sent, so no stop is sent: {outcomes:?}"
+    );
+    assert_eq!(publisher.sharing().phase, Phase::Failed);
+    assert!(publisher.sharing().error.is_some());
+    assert!(
+        publisher
+            .tick(now + crate::publisher::ANSWER_TIMEOUT)
+            .is_empty(),
+        "the failed start leaves no deadline"
+    );
+}
+
+#[test]
+fn a_pending_viewer_switch_is_left_before_the_screen_publication() {
+    use crate::publisher::Outcome as PublisherOutcome;
+    let now = Instant::now();
+    let mut viewer = Viewer::new(1, 10);
+    viewer.on_server_event(
+        "stream.snapshot",
+        "",
+        &serde_json::json!({"streams": [publication("a"), publication("b")]}),
+        now,
+    );
+    viewer.set_joined(true, now);
+    let started = viewer.select(&publication("a"), 1, now);
+    assert!(
+        started
+            .iter()
+            .any(|outcome| matches!(outcome, ViewerOutcome::Start { selection: 1, .. })),
+        "A starts: {started:?}"
+    );
+
+    // B is selected while A is still leaving: no `watching()` but a live
+    // intent and an unacknowledged `stream.leave`.
+    let switching = viewer.select(&publication("b"), 2, now);
+    assert!(viewer.leaving(), "the switch waits for stream.left");
+    assert!(viewer.watching().is_none());
+    assert!(switching.iter().any(
+        |outcome| matches!(outcome, ViewerOutcome::Send(signal) if signal.kind == "stream.leave")
+    ));
+    assert!(super::screen::viewer_conflicts(&viewer));
+
+    let mut publisher = screen_publisher();
+    publisher.begin_picker(1);
+    let outcomes = publisher.publish(1, screen_request(), true, now);
+    assert!(
+        matches!(outcomes[0], PublisherOutcome::LeaveViewer),
+        "the pending switch is a conflict: {outcomes:?}"
+    );
+    assert!(
+        !outcomes
+            .iter()
+            .any(|outcome| matches!(outcome, PublisherOutcome::StartEngine { .. })),
+        "the capture waits for the viewer to be gone: {outcomes:?}"
+    );
+    // Once the leave is acknowledged the publication starts.
+    let left = publisher.viewer_left(now + Duration::from_millis(50));
+    assert!(matches!(left[0], PublisherOutcome::StartEngine { .. }));
 }

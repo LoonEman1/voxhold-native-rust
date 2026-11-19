@@ -853,7 +853,8 @@ impl VoicePanel {
 
 impl VoicePanel {
     /// The «Экран» button inside the room toolbar. The reason of a disabled
-    /// state is rendered next to the toolbar by the room body.
+    /// state is rendered next to the toolbar by the room body. The button keeps
+    /// the web `CallControls` shape: a vertical icon above the label.
     pub(super) fn screen_share_button(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let c = self.colors();
         let enabled = self.share_gate().is_ok();
@@ -871,12 +872,15 @@ impl VoicePanel {
         div()
             .id("voice-screen")
             .debug_selector(|| "voice-screen".into())
-            .h_full()
-            .w(px(44.))
+            .w(px(voice_room::TOOLBAR_BUTTON_WIDTH))
+            .h(px(voice_room::TOOLBAR_BUTTON_HEIGHT))
+            .flex_shrink_0()
             .flex()
+            .flex_col()
             .items_center()
             .justify_center()
-            .rounded(px(10.))
+            .gap(px(3.))
+            .rounded(px(9.))
             .bg(rgb(if active { c.danger_bg } else { c.surface }))
             .border_1()
             .border_color(rgb(if active { c.danger } else { c.line }))
@@ -888,7 +892,18 @@ impl VoicePanel {
                     panel.open_screen_share(cx);
                 }
             }))
-            .child(img("icons/monitor.svg").w(px(16.)).h(px(16.)))
+            .child(super::view::vector_icon(
+                "icons/monitor.svg",
+                16.,
+                rgb(color),
+            ))
+            .child(
+                div()
+                    .text_size(px(9.))
+                    .line_height(px(10.))
+                    .truncate()
+                    .child("Экран"),
+            )
             .into_any_element()
     }
 

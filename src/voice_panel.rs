@@ -7,7 +7,8 @@
 
 use crate::theme::Palette;
 use crate::voice_room::{
-    self, CallPhase, Hotkey, Rect, Tone, VoiceAction, PLAYER_DEFAULT_WIDTH, VOICE_ACTIONS,
+    self, CallPhase, Hotkey, Rect, Tone, VoiceAction, DOCK_ACTIONS, PLAYER_DEFAULT_WIDTH,
+    TOOLBAR_ACTIONS, VOICE_ACTIONS,
 };
 use gpui::{
     div, img, prelude::*, px, rgb, Context, FocusHandle, MouseButton, RenderImage, Subscription,
@@ -285,9 +286,7 @@ impl VoicePanel {
             action_focus: (0..VOICE_ACTIONS.len())
                 .map(|_| cx.focus_handle())
                 .collect(),
-            dock_focus: (0..VOICE_ACTIONS.len())
-                .map(|_| cx.focus_handle())
-                .collect(),
+            dock_focus: (0..DOCK_ACTIONS.len()).map(|_| cx.focus_handle()).collect(),
             dock_visible: false,
             stream_focus: (0..8).map(|_| cx.focus_handle()).collect(),
             screen_focus: (0..3).map(|_| cx.focus_handle()).collect(),
@@ -892,14 +891,14 @@ impl VoicePanel {
         }
     }
 
-    /// `(mic, deafen, records, leave)` active flags for the dock buttons.
-    pub fn action_active_flags(&self) -> [bool; 4] {
-        [
-            self.self_muted || self.server_muted,
-            self.controls.deafened,
-            false,
-            true,
-        ]
+    /// Active state of one action, shared by the room toolbar and the dock.
+    pub fn action_active_flag(&self, action_id: &str) -> bool {
+        match action_id {
+            "voice-mic" => self.self_muted || self.server_muted,
+            "voice-deaf" => self.controls.deafened,
+            "voice-leave" => true,
+            _ => false,
+        }
     }
 
     pub fn player_fullscreen(&self) -> bool {
@@ -953,10 +952,16 @@ impl VoicePanel {
         let mut ring = Vec::new();
         let active = self.call_channel != 0 && self.call_channel == self.room;
         if active {
-            for (index, action) in VOICE_ACTIONS.iter().enumerate() {
-                ring.push((action.id, self.action_focus[index].clone()));
+            // The ring follows the painted toolbar: microphone, sound, screen,
+            // records, leave. A focus entry exists only for a painted action.
+            for id in TOOLBAR_ACTIONS {
+                if id == "voice-screen" {
+                    ring.push(("voice-screen", self.screen_focus[1].clone()));
+                } else if let Some(index) = VOICE_ACTIONS.iter().position(|action| action.id == id)
+                {
+                    ring.push((VOICE_ACTIONS[index].id, self.action_focus[index].clone()));
+                }
             }
-            ring.push(("voice-screen", self.screen_focus[1].clone()));
             if matches!(
                 self.screen.sharing.phase,
                 voxhold_media::publisher::Phase::Publishing
@@ -1009,8 +1014,8 @@ impl VoicePanel {
             ring.push(("stream-close", self.player_actions[2].clone()));
         }
         if self.dock_visible && self.call_channel != 0 {
-            for (index, action) in VOICE_ACTIONS.iter().enumerate() {
-                ring.push((action.id, self.dock_focus[index].clone()));
+            for (index, id) in DOCK_ACTIONS.iter().enumerate() {
+                ring.push((dock_focus_id(id), self.dock_focus[index].clone()));
             }
         }
         ring
@@ -1133,6 +1138,16 @@ impl VoicePanel {
             .get(&user_id)
             .cloned()
             .unwrap_or_else(|| format!("Участник {user_id}"))
+    }
+}
+
+/// Focus id of a dock action. The room toolbar owns `voice-mic` and friends, so
+/// the dock entries are named separately even when both are painted.
+fn dock_focus_id(action_id: &str) -> &'static str {
+    match action_id {
+        "voice-mic" => "dock-voice-mic",
+        "voice-deaf" => "dock-voice-deaf",
+        _ => "dock-voice-leave",
     }
 }
 

@@ -162,10 +162,27 @@ async fn a_call_survives_navigation_and_moves_to_the_dock(cx: &mut TestAppContex
     draw(&mut visual);
     view.read_with(&*visual, |v, app| {
         assert!(v.voice_room_visible(), "the call room is shown");
-        assert!(!v.voice_dock_visible(app), "no dock while the room is open");
+        assert!(
+            v.voice_dock_visible(app),
+            "the dock stays under the channel list for the whole call"
+        );
     });
+    assert!(
+        visual.debug_bounds("voice-dock").is_some(),
+        "the dock is painted even while the active room is open"
+    );
+    assert!(
+        visual.debug_bounds("dock-voice-mic").is_some()
+            && visual.debug_bounds("dock-voice-deaf").is_some()
+            && visual.debug_bounds("dock-voice-leave").is_some(),
+        "the dock paints microphone, sound and leave"
+    );
+    assert!(
+        visual.debug_bounds("dock-voice-records").is_none(),
+        "«Записи» is a room action, not a dock action"
+    );
 
-    // Browse another voice room: the call stays in room 7 and gets a dock.
+    // Browse another voice room: the call stays in room 7 and the same dock.
     visual.update(|window, app| {
         view.update(app, |v, cx| {
             v.channel = 8;
@@ -200,7 +217,7 @@ async fn a_call_survives_navigation_and_moves_to_the_dock(cx: &mut TestAppContex
         assert!(v.voice_dock_visible(app));
     });
 
-    // Returning to the call room hides the dock and keeps the same attempt.
+    // Returning to the call room keeps the dock and the same attempt.
     visual.update(|window, app| {
         view.update(app, |v, cx| {
             v.channel = 7;
@@ -210,8 +227,9 @@ async fn a_call_survives_navigation_and_moves_to_the_dock(cx: &mut TestAppContex
     draw(&mut visual);
     view.read_with(&*visual, |v, app| {
         assert!(v.voice_room_visible());
-        assert!(!v.voice_dock_visible(app));
+        assert!(v.voice_dock_visible(app), "the dock does not disappear");
     });
+    assert!(visual.debug_bounds("voice-dock").is_some());
 }
 
 #[gpui::test]
@@ -231,15 +249,90 @@ async fn tab_and_shift_tab_walk_the_room_actions(cx: &mut TestAppContext) {
     visual.simulate_keystrokes("tab");
     assert_eq!(focused(&mut visual), Some("voice-deaf"));
     visual.simulate_keystrokes("tab");
+    assert_eq!(
+        focused(&mut visual),
+        Some("voice-screen"),
+        "screen follows sound in the web order"
+    );
+    visual.simulate_keystrokes("tab");
     assert_eq!(focused(&mut visual), Some("voice-records"));
+    visual.simulate_keystrokes("tab");
+    assert_eq!(focused(&mut visual), Some("voice-leave"), "leave is last");
+    visual.simulate_keystrokes("tab");
+    assert_eq!(
+        focused(&mut visual),
+        Some("voice-local"),
+        "then the audible participant card"
+    );
+    visual.simulate_keystrokes("tab");
+    assert_eq!(
+        focused(&mut visual),
+        Some("dock-voice-mic"),
+        "the painted dock follows the room"
+    );
     visual.simulate_keystrokes("shift-tab");
     assert_eq!(
         focused(&mut visual),
-        Some("voice-deaf"),
+        Some("voice-local"),
         "Shift+Tab walks backwards"
     );
     visual.simulate_keystrokes("shift-tab");
+    assert_eq!(focused(&mut visual), Some("voice-leave"));
+    visual.simulate_keystrokes("shift-tab");
+    assert_eq!(focused(&mut visual), Some("voice-records"));
+    visual.simulate_keystrokes("shift-tab");
+    assert_eq!(focused(&mut visual), Some("voice-screen"));
+    visual.simulate_keystrokes("shift-tab");
+    assert_eq!(focused(&mut visual), Some("voice-deaf"));
+    visual.simulate_keystrokes("shift-tab");
     assert_eq!(focused(&mut visual), Some("voice-mic"));
+}
+
+#[gpui::test]
+async fn the_room_toolbar_paints_the_web_action_order(cx: &mut TestAppContext) {
+    fn button(visual: &mut VisualTestContext, id: &'static str) -> (f32, f32, f32, f32) {
+        let bounds = visual
+            .debug_bounds(id)
+            .unwrap_or_else(|| panic!("{id} is painted"));
+        (
+            f32::from(bounds.origin.x),
+            f32::from(bounds.origin.y),
+            f32::from(bounds.size.width),
+            f32::from(bounds.size.height),
+        )
+    }
+    let (mut visual, _view, _voice) = fixture(cx);
+    draw(&mut visual);
+    let mic = button(&mut visual, "voice-action-0");
+    let sound = button(&mut visual, "voice-action-1");
+    let screen = button(&mut visual, "voice-screen");
+    let records = button(&mut visual, "voice-action-3");
+    let leave = button(&mut visual, "voice-action-4");
+    assert!(
+        mic.0 < sound.0 && sound.0 < screen.0 && screen.0 < records.0 && records.0 < leave.0,
+        "mic, sound, screen, records, leave; leave is last"
+    );
+    assert!(
+        visual.debug_bounds("voice-action-2").is_none(),
+        "camera is not implemented and leaves no dead placeholder"
+    );
+    for (id, x, y, w, h) in [
+        ("mic", mic.0, mic.1, mic.2, mic.3),
+        ("sound", sound.0, sound.1, sound.2, sound.3),
+        ("screen", screen.0, screen.1, screen.2, screen.3),
+        ("records", records.0, records.1, records.2, records.3),
+        ("leave", leave.0, leave.1, leave.2, leave.3),
+    ] {
+        assert!(
+            (w - crate::voice_room::TOOLBAR_BUTTON_WIDTH).abs() < 1.0,
+            "{id} is 46 px wide, got {w}"
+        );
+        assert!(
+            (h - crate::voice_room::TOOLBAR_BUTTON_HEIGHT).abs() < 1.0,
+            "{id} is 45 px high, got {h}"
+        );
+        assert!(x.is_finite() && y.is_finite());
+    }
 }
 
 #[gpui::test]
@@ -470,7 +563,10 @@ async fn the_room_and_player_use_the_real_layout_coordinates(cx: &mut TestAppCon
     let toolbar = visual
         .debug_bounds("voice-action-0")
         .expect("toolbar buttons are painted");
-    assert!(f32::from(toolbar.size.width) > 60.0);
+    assert!(
+        (f32::from(toolbar.size.width) - 46.0).abs() < 1.0,
+        "the web action is 46 px wide: {toolbar:?}"
+    );
     voice.read_with(&*visual, |panel, _| {
         let (_, height) = panel.test_room_size();
         assert!(height > 120.0);

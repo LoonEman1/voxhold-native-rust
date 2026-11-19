@@ -100,23 +100,51 @@ fn card_grid_matches_go_sizes_and_columns() {
 }
 
 #[test]
-fn the_toolbar_keeps_the_go_action_order_and_inset() {
+fn the_toolbar_keeps_the_web_action_order_and_button_size() {
     let toolbar = Rect::new(100.0, 700.0, 330.0, 61.0);
     let buttons = toolbar_buttons(toolbar, true);
-    assert_eq!(buttons.len(), 4);
-    let ids: Vec<_> = VOICE_ACTIONS.iter().map(|action| action.id).collect();
+    assert_eq!(buttons.len(), TOOLBAR_ACTIONS.len());
     assert_eq!(
-        ids,
-        vec!["voice-mic", "voice-deaf", "voice-records", "voice-leave"]
+        TOOLBAR_ACTIONS,
+        [
+            "voice-mic",
+            "voice-deaf",
+            "voice-screen",
+            "voice-records",
+            "voice-leave"
+        ],
+        "leave stays last; camera, record and chat are not implemented yet"
     );
-    assert_eq!(buttons[0].x, toolbar.x + 7.0);
-    assert_eq!(buttons[0].y, toolbar.y + 7.0);
-    assert!(buttons[0].right() < buttons[1].x);
-    assert!((buttons[3].right() - (toolbar.right() - 7.0)).abs() < 0.01);
-    // The dock has no labels and no inset.
+    assert_eq!(buttons[0].w, TOOLBAR_BUTTON_WIDTH);
+    assert_eq!(buttons[0].h, TOOLBAR_BUTTON_HEIGHT);
+    assert!(
+        buttons[0].x > toolbar.x,
+        "the row is inset like the web bar"
+    );
+    assert!(buttons[4].right() < toolbar.right());
+    assert!(
+        buttons.windows(2).all(|pair| pair[0].right() < pair[1].x),
+        "the painted order matches the ring order"
+    );
+    // The dock is a three-cell row with no labels.
     let dock = toolbar_buttons(Rect::new(0.0, 0.0, 200.0, 31.0), false);
+    assert_eq!(dock.len(), DOCK_ACTIONS.len());
+    assert_eq!(DOCK_ACTIONS, ["voice-mic", "voice-deaf", "voice-leave"]);
     assert_eq!(dock[0].x, 0.0);
     assert_eq!(dock[0].y, 0.0);
+    assert!((dock[2].right() - 200.0).abs() < 0.01);
+}
+
+#[test]
+fn the_dock_has_no_records_action() {
+    assert_eq!(DOCK_ACTIONS.len(), 3);
+    assert!(!DOCK_ACTIONS.contains(&"voice-records"));
+    assert_eq!(DOCK_ACTIONS[DOCK_ACTIONS.len() - 1], "voice-leave");
+    assert_eq!(
+        voice_action("voice-records").map(|action| action.label),
+        Some("Записи"),
+        "records stay available in the room toolbar"
+    );
 }
 
 #[test]

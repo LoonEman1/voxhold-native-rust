@@ -13,7 +13,7 @@ use crate::voice_panel::RoomAccess;
 #[cfg(feature = "voxhold-media")]
 use crate::voice_room::{Hotkey, PlayerKey};
 #[cfg(feature = "voxhold-media")]
-use gpui::{img, prelude::*, px, rgb};
+use gpui::{prelude::*, px, rgb};
 #[cfg(feature = "voxhold-media")]
 use std::collections::HashMap;
 
@@ -319,20 +319,16 @@ impl Voxhold {
         self.voice_room = 0;
     }
 
-    /// Sidebar dock while the call runs in another channel or conversation.
+    /// Sidebar dock for the whole call. It sits under the channel list even
+    /// while the active voice room is open; only the end of the call hides it.
     pub(super) fn voice_dock_visible(&self, cx: &gpui::App) -> bool {
-        let Some(panel) = &self.voice else {
-            return false;
-        };
-        let panel = panel.read(cx);
-        panel.call_channel() != 0
-            && (self.conversation.is_some()
-                || self.voice_room != panel.call_channel()
-                || !self.voice_room_visible())
+        self.voice
+            .as_ref()
+            .is_some_and(|panel| panel.read(cx).call_channel() != 0)
     }
 
     /// Compact 98 px dock under the channel list: call status, room name and
-    /// the same four actions in the Go order.
+    /// the three web `VoiceDock` actions (microphone, sound, leave).
     pub(super) fn voice_dock(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let voice = self.voice.clone()?;
         if !self.voice_dock_visible(cx) {
@@ -343,17 +339,23 @@ impl Voxhold {
         }
         let panel = voice.read(cx);
         let (status, tone) = crate::voice_room::dock_status(panel.phase());
-        let active = panel.action_active_flags();
         let name = self
             .channels
             .iter()
             .find(|channel| channel.id == panel.call_channel())
             .map(|channel| channel.name.clone())
             .unwrap_or_default();
-        let focuses: Vec<_> = (0..4).map(|index| panel.dock_focus(index)).collect();
-        let icons: Vec<_> = crate::voice_room::VOICE_ACTIONS
+        let dock_actions = crate::voice_room::DOCK_ACTIONS;
+        let focuses: Vec<_> = (0..dock_actions.len())
+            .map(|index| panel.dock_focus(index))
+            .collect();
+        let icons: Vec<_> = dock_actions
             .iter()
-            .map(|action| panel.action_icon_for(action.id))
+            .map(|id| panel.action_icon_for(id))
+            .collect();
+        let active: Vec<_> = dock_actions
+            .iter()
+            .map(|id| panel.action_active_flag(id))
             .collect();
         voice.update(cx, |panel, _| panel.set_dock_visible(true));
         let colors = crate::voice_panel::VoiceColors::resolve(self.palette);
@@ -362,18 +364,26 @@ impl Voxhold {
             crate::voice_room::Tone::Danger => colors.danger,
             crate::voice_room::Tone::Muted => colors.muted,
         };
-        let mut actions = div().h(px(31.)).flex().gap(px(5.));
-        for (index, action) in crate::voice_room::VOICE_ACTIONS.iter().enumerate() {
-            let id = action.id;
+        let mut actions = div()
+            .h(px(crate::voice_room::DOCK_BUTTON_HEIGHT))
+            .flex()
+            .gap(px(crate::voice_room::DOCK_BUTTON_GAP));
+        for (index, id) in dock_actions.into_iter().enumerate() {
+            let icon_color = if active[index] {
+                colors.danger
+            } else {
+                colors.muted
+            };
             actions = actions.child(
                 div()
                     .id(("voice-dock-action", index))
+                    .debug_selector(move || format!("dock-{id}").into())
                     .h_full()
                     .flex_1()
                     .flex()
                     .items_center()
                     .justify_center()
-                    .rounded(px(9.))
+                    .rounded(px(8.))
                     .cursor_pointer()
                     .bg(rgb(if active[index] {
                         colors.danger_bg
@@ -387,7 +397,7 @@ impl Voxhold {
                         colors.line
                     }))
                     .track_focus(&focuses[index])
-                    .child(img(icons[index]).w(px(15.)).h(px(15.)))
+                    .child(super::ui::icon(icons[index], 16., rgb(icon_color)))
                     .on_click(cx.listener(move |view, _, window, cx| {
                         let Some(voice) = &view.voice else {
                             return;
@@ -395,7 +405,6 @@ impl Voxhold {
                         voice.update(cx, |panel, cx| match id {
                             "voice-mic" => panel.mute(cx),
                             "voice-deaf" => panel.deafen(cx),
-                            "voice-records" => panel.trigger_recordings(window, cx),
                             _ => panel.leave_in_window(window, cx),
                         });
                         view.refresh_voice_call(window, cx);
@@ -437,7 +446,7 @@ impl Voxhold {
                     .items_center()
                     .gap_2()
                     .h(px(20.))
-                    .child(img("icons/headphones.svg").w(px(12.)).h(px(12.)))
+                    .child(super::ui::icon("icons/volume.svg", 12., rgb(colors.muted)))
                     .child(
                         div()
                             .text_size(px(12.))

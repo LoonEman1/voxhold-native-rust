@@ -15,12 +15,17 @@ pub const ROOM_BOTTOM: f32 = 15.0;
 /// Go `layoutVoiceActions`: toolbar `min(width, 330)` wide, 61 high.
 pub const TOOLBAR_MAX_WIDTH: f32 = 330.0;
 pub const TOOLBAR_HEIGHT: f32 = 61.0;
-#[cfg(test)]
-pub const TOOLBAR_GAP: f32 = 5.0;
-#[cfg(test)]
-pub const TOOLBAR_INSET_LABELS: f32 = 7.0;
-/// Go `layoutVoiceDock`: 98 px tall.
+/// Web `.call-controls > button:has(small)`: a 46x45 vertical button with a
+/// 3 px icon/label gap. The labels keep every action readable at the narrow
+/// toolbar width without shrinking the icon.
+pub const TOOLBAR_BUTTON_WIDTH: f32 = 46.0;
+pub const TOOLBAR_BUTTON_HEIGHT: f32 = 45.0;
+pub const TOOLBAR_BUTTON_GAP: f32 = 5.0;
+/// Go `layoutVoiceDock`: 98 px tall. The action row is the web three-column
+/// grid of 31 px cells with a 5 px gap.
 pub const DOCK_HEIGHT: f32 = 98.0;
+pub const DOCK_BUTTON_HEIGHT: f32 = 31.0;
+pub const DOCK_BUTTON_GAP: f32 = 5.0;
 /// Go `floatingStreamBox`.
 pub const PLAYER_DEFAULT_WIDTH: f32 = 360.0;
 pub const PLAYER_MIN_WIDTH: f32 = 260.0;
@@ -278,7 +283,8 @@ pub struct VoiceAction {
     pub toggle: bool,
 }
 
-/// Go `layoutVoiceActions`: one order for the toolbar and the dock.
+/// The toggle and navigation actions shared by the toolbar and the dock.
+/// `TOOLBAR_ACTIONS` and `DOCK_ACTIONS` fix where each one appears.
 pub const VOICE_ACTIONS: [VoiceAction; 4] = [
     VoiceAction {
         id: "voice-mic",
@@ -306,23 +312,60 @@ pub const VOICE_ACTIONS: [VoiceAction; 4] = [
     },
 ];
 
-/// Toolbar action rectangles in Go order and inset. Pure geometry used by the
-/// layout tests; the live toolbar uses flex with the same gap and inset.
+/// Web `VoiceDock` order: exactly microphone, sound and leave. «Записи» is a
+/// room toolbar action, not a dock action.
+pub const DOCK_ACTIONS: [&str; 3] = ["voice-mic", "voice-deaf", "voice-leave"];
+
+/// Web `CallControls` order. Camera (W06), start recording (W07) and chat
+/// (W05a) are not implemented in this client yet, so no dead placeholders are
+/// painted: the available actions follow the web order and leave stays last.
+pub const TOOLBAR_ACTIONS: [&str; 5] = [
+    "voice-mic",
+    "voice-deaf",
+    "voice-screen",
+    "voice-records",
+    "voice-leave",
+];
+
+#[cfg(test)]
+pub fn voice_action(id: &str) -> Option<&'static VoiceAction> {
+    VOICE_ACTIONS.iter().find(|action| action.id == id)
+}
+
+/// Toolbar action rectangles in the web order, and the three dock cells. Pure
+/// geometry used by the layout tests; the live elements use flex with the same
+/// sizes, gap and inset.
 #[cfg(test)]
 pub fn toolbar_buttons(toolbar: Rect, labels: bool) -> Vec<Rect> {
-    let inset = if labels { TOOLBAR_INSET_LABELS } else { 0.0 };
-    let count = VOICE_ACTIONS.len() as f32;
-    let width = (toolbar.w - inset * 2.0 - TOOLBAR_GAP * (count - 1.0)).max(1.0) / count;
-    (0..VOICE_ACTIONS.len())
-        .map(|index| {
-            Rect::new(
-                toolbar.x + inset + index as f32 * (width + TOOLBAR_GAP),
-                toolbar.y + inset,
-                width,
-                (toolbar.h - 2.0 * inset).max(1.0),
-            )
-        })
-        .collect()
+    if labels {
+        let count = TOOLBAR_ACTIONS.len();
+        let total = count as f32 * TOOLBAR_BUTTON_WIDTH + (count as f32 - 1.0) * TOOLBAR_BUTTON_GAP;
+        let left = toolbar.x + ((toolbar.w - total) / 2.0).max(0.0);
+        let top = toolbar.y + ((toolbar.h - TOOLBAR_BUTTON_HEIGHT) / 2.0).max(0.0);
+        (0..count)
+            .map(|index| {
+                Rect::new(
+                    left + index as f32 * (TOOLBAR_BUTTON_WIDTH + TOOLBAR_BUTTON_GAP),
+                    top,
+                    TOOLBAR_BUTTON_WIDTH,
+                    TOOLBAR_BUTTON_HEIGHT,
+                )
+            })
+            .collect()
+    } else {
+        let count = DOCK_ACTIONS.len();
+        let width = ((toolbar.w - (count as f32 - 1.0) * DOCK_BUTTON_GAP) / count as f32).max(1.0);
+        (0..count)
+            .map(|index| {
+                Rect::new(
+                    toolbar.x + index as f32 * (width + DOCK_BUTTON_GAP),
+                    toolbar.y,
+                    width,
+                    toolbar.h,
+                )
+            })
+            .collect()
+    }
 }
 
 /// Microphone is closed until the join is confirmed, while the user is muted,

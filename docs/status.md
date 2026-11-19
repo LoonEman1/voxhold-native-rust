@@ -778,7 +778,7 @@ release p50/p95 1/1 мкс. Лимитер восстанавливается с
 
 ## Срез W03 (19 ноября 2026, ревью PASS)
 
-Ветка `codex/w03-screen-publish`, PR [#23](https://github.com/LoonEman1/voxhold-native-rust/pull/23) (draft), база `fbbab95`, коммиты `78f89d3`, `aedd22b`, `7fd24e1`. Эталоны: backend `9b29fdd6d5dc818b7408e4892b8e68b27d123831`, frontend `ed7cb00ae12398753a8ef48a5a33b864e20cb04c`.
+Ветка `codex/w03-screen-publish`, PR [#23](https://github.com/LoonEman1/voxhold-native-rust/pull/23) merged в `dev` (`79f1e51`), база `fbbab95`, коммиты `78f89d3`, `aedd22b`, `7fd24e1`, `9cab47e`, `f33175c`, `4836f0a`. Эталоны: backend `9b29fdd6d5dc818b7408e4892b8e68b27d123831`, frontend `ed7cb00ae12398753a8ef48a5a33b864e20cb04c`.
 
 - `voxhold-media`: `publisher` (состояния `Idle → Picking → Publishing → Live → Stopping` + `Failed`), `publisher/engine` (отдельный peer и поток, `NativeVideoSource(is_screencast=true)`, `add_track` до `set_remote_description`, VP8, лимит битрейта, stats из `OutboundRtpStats`), `screen_capture` (`DesktopCapturer` мониторы/окна, фильтр своего процесса, BGRA→I420, bounded latest, preview ≤640 px/4 МиБ, watchdog).
 - Сигнализация: `stream.start` только после готового движка; ответ на серверный `stream.webrtc_offer`; `stream.webrtc_answer`/`stream.ice_candidate`/`stream.stop`; фильтрация чужих `stream.stopped`, `request_id` на попытку, тегированный `stream.left` как ack на stop.
@@ -788,3 +788,16 @@ release p50/p95 1/1 мкс. Лимитер восстанавливается с
 - Проверки: fmt; `cargo test --workspace --locked` — API 11, media 179 (11 ignored), приложение 353 (1 ignored), 0 failed; release build; размеры 223 файла (1000/1200); `git diff --check`; UTF-8/BOM/U+FFFD/mojibake — чисто.
 - Ревью: раунд 1 — не PASS (P1-1/P1-2/P1-3 + P2), исправление `aedd22b`; раунд 2 — PASS на `aedd22b`; раунд 3 на `7fd24e1` — P0/P1 нет, единственный P2 (warning `had_engine` в non-test сборке), исправлен `f33175c`; раунд 4 — PASS.
 - Осталось: браузерный viewer без микрофона; hot-unplug/минимизация окна, DPI 125/150, sleep/resume, TURN, задержка и FPS/CPU/GPU-замеры не проверялись; HDR/P2P/audio/запись — вне этапа.
+
+## Срез W04a (19 ноября 2026, ревью PASS)
+
+Ветка `codex/w04a-system-audio`, PR [#24](https://github.com/LoonEman1/voxhold-native-rust/pull/24), база `dev` `79f1e51` (merge W03), коммиты `740941c`, `9333eda`, `7440ab6`. Эталоны: backend `9b29fdd6d5dc818b7408e4892b8e68b27d123831`, frontend `ed7cb00ae12398753a8ef48a5a33b864e20cb04c`.
+
+- `system_audio.rs`, `system_audio/{format,wasapi}.rs`: WASAPI loopback default render endpoint в shared mode, 48 кГц stereo i16, float/PCM16/24/32, 44,1→48 кГц, сведение 5.1/7.1 в L/R (center/surround −3 дБ, LFE не включается осознанно), перенос остатка пакета, тишина без данных, bounded очередь, повторное открытие устройства, все ожидания с дедлайнами. Ручной `#[ignore]`-тест: `48000 Гц · 2 канала · 32 бит float`, тон 440 Гц даёт `blocks=118 peak=8000 dropped=0`.
+- `publisher/engine.rs`, `engine/audio.rs`: audio-track (`NativeAudioSource`, EC/NS/AGC выключены) добавляется после video, `has_audio` в `stream.start` равен фактически открытому loopback, аудио ограничено 64–320 кбит/с; mic остаётся в голосовом пире (`CaptureGate`/PTT не затрагиваются), preview «Ваш экран» без звука.
+- `publisher/quality.rs`, UI: пресеты «Рабочий стол / Игры / Фильмы / Своё» меняют FPS и видео-битрейт; смена качества в эфире — подтверждённый `stream.stop`, ожидание ack/дедлайна и новый `stream.start`; «на лету» не применяется, кнопка «Качество» доступна только в `Live`. Пока проба устройства не ответила, Start/Restart заблокированы и тумблер не показывает «Включён».
+- P2 после ревью: многоканальный downmix, хвосты WASAPI, фоновая проба устройства (не блокирует UI), юнит-тест тишины, усиленное разделение mic/system, видимость кнопки; A/V offset и source-change записаны как ограничение до perf-этапа.
+- Live stand: join 50 мс, Live 302–803 мс, `has_audio=true`, 97 audio packets, измерено 1,2–126,7 кбит/с при лимите 128; restart — Live за 302–855 мс, attempt 1→2; viewer получил 108–121 audio packet и 3–17 кадров; stop → Idle 50–150 мс.
+- Проверки: `cargo test --workspace --locked` — API 11, media 199 (12 ignored), приложение 360 (1 ignored), 0 failed; release; 230 файлов в лимитах; `git diff --check`; UTF-8/BOM/U+FFFD — чисто.
+- Ревью: раунд 1 — PASS + 7 P2; раунд 2 — PASS после исправлений, найден новый P2 (Start при незавершённой пробе); `7440ab6` закрывает его; раунд 3 — PASS.
+- Не проверено: слышимый звук в колонках/у зрителя, web-viewer (микрофон браузера), физический 5.1/7.1, отключение/смена default-устройства, 1080p/60, полный 320 кбит/с, DPI 125/150, смена качества при уже подключённом зрителе. Loopback захватывает собственный звук Voxhold — ограничение Windows, показано в UI.

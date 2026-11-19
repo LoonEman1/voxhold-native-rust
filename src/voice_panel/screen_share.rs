@@ -2,15 +2,29 @@
 //! on-air card. All decisions belong to the media runtime; this file renders
 //! its state and forwards explicit user intents.
 //!
-//! Only settings that the SDR publication really applies are shown: 720p or
-//! 1080p, 30 or 60 FPS, 0,5–16 Мбит/с in 0,1 steps and the confirmed codec.
-//! P2P, HDR and system audio belong to later tasks and have no widgets here.
+//! Only settings that the SDR publication really applies are shown: the four
+//! web presets, 720p or 1080p, 30/60 FPS, 0,5–16 Мбит/с, the six Opus audio
+//! bitrates and the confirmed codec. P2P, HDR and the web «Содержание»
+//! (degradation preference) are absent because the pinned engine or backend
+//! cannot apply them.
 
 use super::*;
 use voxhold_media::publisher::{
-    Codec, Phase, PublishRequest, Quality, Resolution, Sharing, MAX_CHANNEL_PUBLISHERS,
+    Codec, Phase, Preset, PublishRequest, Quality, Resolution, Sharing, AUDIO_BITRATES,
+    MAX_CHANNEL_PUBLISHERS,
 };
 use voxhold_media::screen_capture::{self, ScreenSource, SourceKind};
+use voxhold_media::system_audio::{self, AudioDeviceInfo};
+
+/// Windows loopback sees every render session of the endpoint, including this
+/// application's own room and player. State it instead of promising otherwise.
+pub(crate) const SYSTEM_AUDIO_WARNING: &str =
+    "Системный звук записывается через loopback всего устройства вывода: в него попадут голос комнаты и плеер Voxhold. Windows не позволяет исключить звук отдельного приложения.";
+/// The backend has no runtime reconfigure; the dialog must warn honestly.
+pub(crate) const RESTART_WARNING: &str =
+    "Изменение качества перезапустит трансляцию: текущая сессия будет остановлена, зрители увидят новое подключение.";
+/// A Start pressed before the endpoint probe answered; cleared by the answer.
+pub(crate) const AUDIO_PENDING_REASON: &str = "Дождитесь проверки системного звука.";
 
 /// The account socket always authenticates with `multi_streams: true`
 /// (`crates/voxhold-api/src/lib.rs:638`), so the client capability is known.
@@ -29,6 +43,10 @@ pub(super) enum ShareKey {
     Fps(u32),
     BitrateDown,
     BitrateUp,
+    Preset(Preset),
+    Audio,
+    AudioBitrateDown,
+    AudioBitrateUp,
     Cancel,
     Start,
 }
@@ -49,6 +67,14 @@ pub(super) struct ScreenShareUi {
     pub(super) resolution: Resolution,
     pub(super) fps: u32,
     pub(super) bitrate_kbps: u32,
+    pub(super) audio_enabled: bool,
+    pub(super) audio_bitrate_kbps: u32,
+    pub(super) audio_availability: Option<Result<AudioDeviceInfo, String>>,
+    /// The dialog was opened from the live card to change quality. Start then
+    /// becomes a confirmed stop+start, never a live reconfigure.
+    pub(super) restart: bool,
+    /// The request of the accepted attempt. A restart prefills from it.
+    pub(super) last_request: Option<PublishRequest>,
     pub(super) busy: bool,
     pub(super) error: String,
     pub(super) sharing: Sharing,
@@ -74,9 +100,14 @@ impl Default for ScreenShareUi {
             monitor_error: String::new(),
             window_error: String::new(),
             selected: None,
-            resolution: Resolution::P720,
+            resolution: Resolution::P1080,
             fps: 30,
-            bitrate_kbps: 4000,
+            bitrate_kbps: 6000,
+            audio_enabled: true,
+            audio_bitrate_kbps: 128,
+            audio_availability: None,
+            restart: false,
+            last_request: None,
             busy: false,
             error: String::new(),
             sharing: Sharing::default(),
@@ -109,11 +140,12 @@ impl ScreenShareUi {
         }
     }
 
-    fn quality(&self) -> Quality {
+    pub(super) fn quality(&self) -> Quality {
         Quality {
             resolution: self.resolution,
             fps: self.fps,
             bitrate_kbps: self.bitrate_kbps,
+            audio_bitrate_kbps: self.audio_bitrate_kbps,
         }
     }
 
@@ -123,6 +155,57 @@ impl ScreenShareUi {
             .quality
             .unwrap_or_else(|| self.quality())
             .describe()
+    }
+
+    pub(super) fn audio_available(&self) -> bool {
+        matches!(self.audio_availability, Some(Ok(_)))
+    }
+
+    /// Availability and the real mix format, shown before the start.
+    pub(super) fn audio_status(&self) -> String {
+        match &self.audio_availability {
+            None => "Проверяем устройство вывода…".into(),
+            Some(Ok(device)) => format!("{} · {}", device.label, device.format),
+            Some(Err(error)) => format!("Системный звук недоступен: {error}"),
+        }
+    }
+
+    /// Whether the publication will really request the audio track.
+    pub(super) fn audio_requested(&self) -> bool {
+        self.audio_enabled && self.audio_available()
+    }
+
+    /// The toggle may claim «Включён» only for the track that will really be
+    /// published; a pending probe has not confirmed the endpoint yet.
+    pub(super) fn audio_toggle_label(&self) -> &'static str {
+        if self.audio_requested() {
+            "Включён"
+        } else {
+            "Выключен"
+        }
+    }
+
+    /// The honest on-air sound line. The measured rate comes from the RTP
+    /// stats; before the first sample only the configured maximum is shown.
+    pub(super) fn sound_label(&self) -> String {
+        if !self.sharing.has_audio {
+            return "Без звука".into();
+        }
+        let max = self
+            .sharing
+            .quality
+            .map(|quality| quality.audio_bitrate_kbps)
+            .unwrap_or(self.audio_bitrate_kbps);
+        match self.sharing.stats {
+            Some(stats) if stats.audio_kbps > 0.0 => {
+                format!("Звук ~{:.0} из до {} кбит/с", stats.audio_kbps, max)
+            }
+            _ => format!("Звук до {max} кбит/с"),
+        }
+    }
+
+    pub(super) fn restart_warning(&self) -> Option<&'static str> {
+        self.restart.then_some(RESTART_WARNING)
     }
 }
 
@@ -219,16 +302,94 @@ impl VoicePanel {
         }
         self.release_push_to_talk();
         self.screen.open = true;
+        self.screen.restart = false;
         self.screen.busy = false;
         self.screen.error.clear();
         self.screen.selected = None;
+        self.screen.last_request = None;
         self.screen.kind = SourceKind::Monitor;
+        // A fresh publication defaults to system audio; the background probe
+        // fills in availability and disables the toggle if the endpoint fails.
+        // The previous picker's answer must not leak into this one: Start
+        // stays locked until the new probe settles.
+        self.screen.audio_enabled = true;
+        self.screen.audio_availability = None;
+        self.begin_audio_probe(cx);
         self.screen.focus_placed = false;
         if let Some(handle) = &self.handle {
             self.screen.picker = handle.begin_screen_picker();
         }
         self.request_screen_sources(cx);
         cx.notify();
+    }
+
+    /// Open the quality dialog from the live card. The source is locked; the
+    /// backend only applies the change through a stop and a new start.
+    pub(super) fn open_screen_settings(&mut self, cx: &mut Context<Self>) {
+        if self.screen.sharing.phase != Phase::Live {
+            return;
+        }
+        self.release_push_to_talk();
+        let sharing = self.screen.sharing.clone();
+        if let Some(quality) = sharing.quality {
+            self.screen.resolution = quality.resolution;
+            self.screen.fps = quality.fps;
+            self.screen.bitrate_kbps = quality.bitrate_kbps;
+            self.screen.audio_bitrate_kbps = quality.audio_bitrate_kbps;
+        }
+        self.screen.audio_enabled = sharing.has_audio;
+        self.begin_audio_probe(cx);
+        if self.screen.selected.is_none() {
+            self.screen.selected = self
+                .screen
+                .last_request
+                .as_ref()
+                .map(|request| request.source.clone());
+        }
+        self.screen.restart = true;
+        self.screen.open = true;
+        self.screen.busy = false;
+        self.screen.error.clear();
+        self.screen.focus_placed = false;
+        cx.notify();
+    }
+
+    /// Probe the render endpoint on the background executor. COM plus a
+    /// driver call can take up to two seconds, so the click must only start a
+    /// task and repaint; the result lands when it still matches the newest
+    /// request. A device failure disables the audio toggle, a success leaves
+    /// the user's choice alone.
+    fn begin_audio_probe(&mut self, cx: &mut Context<Self>) {
+        self.screen_audio_probe = self.screen_audio_probe.wrapping_add(1);
+        let generation = self.screen_audio_probe;
+        #[cfg(test)]
+        let injected = self.test_audio_probe.take();
+        let task = cx.background_spawn(async move {
+            #[cfg(test)]
+            if let Some(probe) = injected {
+                return probe();
+            }
+            system_audio::probe()
+        });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let _ = this.update(cx, |panel, cx| {
+                if panel.screen_audio_probe != generation {
+                    return;
+                }
+                if result.is_err() {
+                    panel.screen.audio_enabled = false;
+                }
+                panel.screen.audio_availability = Some(result);
+                // The blocked-Start reason is no longer true; any other error
+                // stays until the next intent.
+                if panel.screen.error == AUDIO_PENDING_REASON {
+                    panel.screen.error.clear();
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// Close the picker. Before Start this only cancels the picker and leaves
@@ -239,8 +400,16 @@ impl VoicePanel {
         if !self.screen.open {
             return;
         }
-        let committed = self.screen.busy || self.share_active();
+        let restart_open = self.screen.restart;
+        // The live publication existed before this dialog; closing it without
+        // pressing Restart must leave the stream untouched.
+        let committed = if restart_open {
+            self.screen.busy
+        } else {
+            self.screen.busy || self.share_active()
+        };
         self.screen.open = false;
+        self.screen.restart = false;
         self.screen.busy = false;
         self.screen.error.clear();
         self.screen.selected = None;
@@ -248,7 +417,9 @@ impl VoicePanel {
         if let Some(handle) = &self.handle {
             if committed {
                 handle.stop_screen_share();
-            } else {
+            } else if !restart_open {
+                // A restart dialog never opened a picker, so there is nothing
+                // to cancel and the live publication stays untouched.
                 handle.cancel_screen_picker(self.screen.picker);
             }
         }
@@ -290,46 +461,83 @@ impl VoicePanel {
         cx.notify();
     }
 
-    fn start_screen_share(&mut self, cx: &mut Context<Self>) {
+    /// Start is possible only after the endpoint probe answered: committing
+    /// while the answer is pending would publish video without the requested
+    /// system audio.
+    pub(super) fn screen_can_start(&self) -> bool {
+        self.screen.selected.is_some()
+            && !self.screen.busy
+            && !Codec::available().is_empty()
+            && self.screen.audio_availability.is_some()
+            && (!self.screen.restart || self.screen.sharing.phase == Phase::Live)
+    }
+
+    pub(super) fn start_screen_share(&mut self, cx: &mut Context<Self>) {
         if self.screen.busy {
             return;
         }
-        if let Err(reason) = self.share_gate() {
-            // An active publication is not an error for this button; its card
-            // owns the status and the stop action.
-            if !self.share_active() {
-                self.screen.error = reason.to_owned();
-            }
+        if self.screen.audio_availability.is_none() {
+            self.screen.error = AUDIO_PENDING_REASON.into();
             cx.notify();
             return;
+        }
+        if let Err(reason) = self.share_gate() {
+            // The live quality dialog is allowed to pass the "already live"
+            // gate: it replaces the current attempt only through a confirmed
+            // stop+start. Every other gate (join, permission, slot, capture)
+            // still blocks it.
+            let restart_bypass = self.screen.restart && reason == "Трансляция уже идёт.";
+            if !restart_bypass {
+                // An active publication is not an error for this button; its
+                // card owns the status and the stop action.
+                if !self.share_active() {
+                    self.screen.error = reason.to_owned();
+                }
+                cx.notify();
+                return;
+            }
         }
         let Some(source) = self.screen.selected.clone() else {
             self.screen.error = "Выберите монитор или окно.".into();
             cx.notify();
             return;
         };
+        if self.screen.restart && self.screen.sharing.phase != Phase::Live {
+            self.screen.error = "Трансляция уже не идёт; откройте выбор экрана заново.".into();
+            self.screen.open = false;
+            self.screen.restart = false;
+            cx.notify();
+            return;
+        }
         let request = PublishRequest {
             source,
             quality: self.screen.quality(),
             codec: Codec::Vp8,
+            audio: self.screen.audio_requested(),
         };
         let Some(handle) = &self.handle else {
             self.screen.error = "Голосовое соединение уже закрыто.".into();
             cx.notify();
             return;
         };
-        handle.publish_screen(
-            self.screen.picker,
-            request,
-            self.can_stream,
-            self.active_publishers_in_room() < MAX_CHANNEL_PUBLISHERS,
-        );
+        let slot_available = self.active_publishers_in_room() < MAX_CHANNEL_PUBLISHERS;
+        if self.screen.restart {
+            handle.restart_screen_share(request.clone(), self.can_stream, slot_available);
+        } else {
+            handle.publish_screen(
+                self.screen.picker,
+                request.clone(),
+                self.can_stream,
+                slot_available,
+            );
+        }
+        self.screen.last_request = Some(request);
         self.screen.busy = true;
         self.screen.error.clear();
         cx.notify();
     }
 
-    fn stop_screen_share(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn stop_screen_share(&mut self, cx: &mut Context<Self>) {
         if let Some(handle) = &self.handle {
             handle.stop_screen_share();
         }
@@ -342,6 +550,39 @@ impl VoicePanel {
         cx.notify();
     }
 
+    pub(super) fn apply_preset(&mut self, preset: Preset, cx: &mut Context<Self>) {
+        let quality = preset.apply(self.screen.quality());
+        self.screen.fps = quality.fps;
+        self.screen.bitrate_kbps = quality.bitrate_kbps;
+        cx.notify();
+    }
+
+    /// Step through the six web values; the list is short and ordered.
+    fn change_audio_bitrate(&mut self, forward: bool, cx: &mut Context<Self>) {
+        if !self.screen.audio_enabled || !self.screen.audio_available() {
+            return;
+        }
+        let current = AUDIO_BITRATES
+            .iter()
+            .position(|rate| *rate == self.screen.audio_bitrate_kbps)
+            .unwrap_or(2);
+        let next = if forward {
+            (current + 1).min(AUDIO_BITRATES.len() - 1)
+        } else {
+            current.saturating_sub(1)
+        };
+        self.screen.audio_bitrate_kbps = AUDIO_BITRATES[next];
+        cx.notify();
+    }
+
+    pub(super) fn toggle_system_audio(&mut self, cx: &mut Context<Self>) {
+        if !self.screen.audio_available() {
+            return;
+        }
+        self.screen.audio_enabled = !self.screen.audio_enabled;
+        cx.notify();
+    }
+
     /// Apply one runtime update. Returns whether the panel must repaint.
     pub(super) fn apply_screen_update(&mut self, update: VoiceUpdate) -> bool {
         match update {
@@ -349,6 +590,17 @@ impl VoicePanel {
                 let previous = self.screen.sharing.phase;
                 self.screen.sharing = sharing;
                 let phase = self.screen.sharing.phase;
+                if self.screen.sharing.restarting && self.screen.open {
+                    // The stop of the quality change is committed; the card
+                    // now shows the restart and the dialog must not allow a
+                    // second action.
+                    self.screen.open = false;
+                    self.screen.restart = false;
+                    self.screen.busy = false;
+                }
+                if phase == Phase::Idle || phase == Phase::Failed {
+                    self.screen.restart = false;
+                }
                 if matches!(phase, Phase::Publishing | Phase::Live) && self.screen.open {
                     // The attempt is accepted by the worker; the card in the
                     // room now owns the status and the stop action.
@@ -546,6 +798,7 @@ impl VoicePanel {
             stats.describe()
         });
         let quality = self.screen.quality_label();
+        let sound = self.screen.sound_label();
         let mut card = div()
             .id("screen-on-air")
             .debug_selector(|| "screen-on-air".into())
@@ -620,21 +873,52 @@ impl VoicePanel {
                     .text_size(px(10.))
                     .text_color(rgb(c.muted))
                     .truncate()
+                    .debug_selector(|| "screen-on-air-quality".into())
                     .child(match stats {
                         Some(stats) => format!("{quality} · {stats}"),
-                        None => quality.clone(),
+                        None => format!("{quality} · {sound}"),
                     }),
             );
         if sharing.phase != Phase::Stopping {
-            let focus = self.screen_focus[0].clone();
-            card = card.child(
+            let mut actions = div()
+                .absolute()
+                .left(px(10.))
+                .top(px(rect.h - 36.))
+                .w(px((rect.w - 20.).max(0.)))
+                .h(px(28.))
+                .flex()
+                .gap_1();
+            // The dialog only applies changes while the stream is Live; in
+            // Publishing the action would be inert, so it is not shown.
+            if sharing.phase == Phase::Live {
+                let quality_focus = self.screen_focus[2].clone();
+                actions = actions.child(
+                    div()
+                        .id("screen-quality")
+                        .debug_selector(|| "screen-quality".into())
+                        .flex_1()
+                        .h_full()
+                        .rounded(px(8.))
+                        .border_1()
+                        .border_color(rgb(c.line))
+                        .text_color(rgb(c.fg))
+                        .text_size(px(11.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .cursor_pointer()
+                        .track_focus(&quality_focus)
+                        .on_click(cx.listener(|panel, _, _, cx| panel.open_screen_settings(cx)))
+                        .child("Качество"),
+                );
+            }
+            let stop_focus = self.screen_focus[0].clone();
+            actions = actions.child(
                 div()
                     .id("screen-stop")
-                    .absolute()
-                    .left(px(10.))
-                    .top(px(rect.h - 36.))
-                    .w(px((rect.w - 20.).max(0.)))
-                    .h(px(28.))
+                    .debug_selector(|| "screen-stop".into())
+                    .flex_1()
+                    .h_full()
                     .rounded(px(8.))
                     .border_1()
                     .border_color(rgb(c.danger))
@@ -644,10 +928,11 @@ impl VoicePanel {
                     .items_center()
                     .justify_center()
                     .cursor_pointer()
-                    .track_focus(&focus)
+                    .track_focus(&stop_focus)
                     .on_click(cx.listener(|panel, _, _, cx| panel.stop_screen_share(cx)))
-                    .child("Завершить трансляцию"),
+                    .child("Завершить"),
             );
+            card = card.child(actions);
         }
         Some(card.into_any_element())
     }

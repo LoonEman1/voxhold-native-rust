@@ -134,7 +134,7 @@ fn wait_joined(handle: &VoiceHandle, label: &str) -> (Duration, Vec<Publication>
 }
 
 /// Publish the first monitor through the public runtime path and wait for Live.
-fn publish_monitor(handle: &VoiceHandle) -> (Duration, Sharing) {
+fn publish_monitor(handle: &VoiceHandle) -> (Duration, Sharing, screen_capture::ScreenSource) {
     let sources = match screen_capture::list_sources(SourceKind::Monitor) {
         Ok(sources) => sources,
         Err(error) => panic!("live: monitor listing failed: {error}"),
@@ -143,6 +143,23 @@ fn publish_monitor(handle: &VoiceHandle) -> (Duration, Sharing) {
         Some(source) => source,
         None => panic!("live: the desktop has no monitor source to publish"),
     };
+    let source_for_restart = source.clone();
+    // Use the real loopback only when this host has a default render endpoint.
+    // Without one the stand proof still creates the video publication and says
+    // so, instead of failing a machine that has no output device.
+    let audio = match crate::system_audio::probe() {
+        Ok(device) => {
+            println!(
+                "live: system audio device: {} ({})",
+                device.label, device.format
+            );
+            true
+        }
+        Err(error) => {
+            println!("live: system audio SKIP — {error}");
+            false
+        }
+    };
     let picker = handle.begin_screen_picker();
     let request = PublishRequest {
         source,
@@ -150,8 +167,10 @@ fn publish_monitor(handle: &VoiceHandle) -> (Duration, Sharing) {
             resolution: Resolution::P720,
             fps: 30,
             bitrate_kbps: 4000,
+            audio_bitrate_kbps: 128,
         },
         codec: Codec::Vp8,
+        audio,
     };
     handle.publish_screen(picker, request, true, true);
 
@@ -161,7 +180,7 @@ fn publish_monitor(handle: &VoiceHandle) -> (Duration, Sharing) {
         while let Some(update) = handle.try_update() {
             match update {
                 VoiceUpdate::ScreenShare(sharing) => match sharing.phase {
-                    Phase::Live => return (started.elapsed(), sharing),
+                    Phase::Live => return (started.elapsed(), sharing, source_for_restart),
                     Phase::Failed => panic!(
                         "live: publication failed before Live: {}",
                         sharing.error.unwrap_or_default()
@@ -182,11 +201,68 @@ fn publish_monitor(handle: &VoiceHandle) -> (Duration, Sharing) {
     }
 }
 
+/// The backend has no runtime reconfigure, so the quality change runs through
+/// the real stop+start. Returns the new Live snapshot and its timing.
+fn restart_quality(
+    handle: &VoiceHandle,
+    source: screen_capture::ScreenSource,
+    previous_attempt: u64,
+    audio: bool,
+) -> (Duration, Sharing) {
+    let request = PublishRequest {
+        source,
+        quality: Quality {
+            resolution: Resolution::P720,
+            fps: 30,
+            bitrate_kbps: 2500,
+            audio_bitrate_kbps: 128,
+        },
+        codec: Codec::Vp8,
+        audio,
+    };
+    handle.restart_screen_share(request, true, true);
+    let started = Instant::now();
+    let deadline = started + LIVE_BUDGET;
+    let mut saw_stopping = false;
+    loop {
+        while let Some(update) = handle.try_update() {
+            match update {
+                VoiceUpdate::ScreenShare(sharing) => match sharing.phase {
+                    Phase::Stopping => saw_stopping = true,
+                    Phase::Publishing => saw_stopping = true,
+                    Phase::Live if sharing.attempt > previous_attempt => {
+                        assert!(
+                            saw_stopping,
+                            "live: the restart reached Live without a stop snapshot"
+                        );
+                        return (started.elapsed(), sharing);
+                    }
+                    Phase::Failed => panic!(
+                        "live: quality restart failed: {}",
+                        sharing.error.unwrap_or_default()
+                    ),
+                    _ => {}
+                },
+                VoiceUpdate::Ended(Some(error)) => {
+                    panic!("live: voice session ended during the quality restart: {error}")
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "live: the quality restart did not reach Live within {LIVE_BUDGET:?}"
+        );
+        thread::sleep(POLL);
+    }
+}
+
 /// Wait until both the public stats and the cumulative RTP counters are real,
 /// and then for a second sample whose packet counter grew, so the numbers prove
 /// continuous sending instead of a single burst at connect time.
 fn wait_stats(handle: &VoiceHandle, mut sharing: Sharing) -> (Sharing, crate::live_probe::Sample) {
     let deadline = Instant::now() + STATS_BUDGET;
+    let want_audio = sharing.has_audio;
     let mut first: Option<crate::live_probe::Sample> = None;
     loop {
         while let Some(update) = handle.try_update() {
@@ -209,10 +285,18 @@ fn wait_stats(handle: &VoiceHandle, mut sharing: Sharing) -> (Sharing, crate::li
         if let Some(stats) = sharing.stats {
             if stats.fps > 0.0 {
                 if let Some(sample) = crate::live_probe::sample() {
-                    if sample.frames_encoded > 0 && sample.packets_sent > 0 {
+                    if sample.frames_encoded > 0
+                        && sample.packets_sent > 0
+                        && (!want_audio || sample.audio_packets_sent > 0)
+                    {
                         match &first {
                             None => first = Some(sample),
-                            Some(previous) if sample.packets_sent > previous.packets_sent => {
+                            Some(previous)
+                                if sample.packets_sent > previous.packets_sent
+                                    && (!want_audio
+                                        || sample.audio_packets_sent
+                                            > previous.audio_packets_sent) =>
+                            {
                                 return (sharing, sample);
                             }
                             Some(_) => {}
@@ -372,7 +456,7 @@ fn live_stand_publishes_a_monitor_and_a_viewer_decodes_frames() {
     let (joined, _catalog) = wait_joined(&publisher, "publisher");
     println!("live: publisher joined in {joined:?}");
 
-    let (live_after, sharing) = publish_monitor(&publisher);
+    let (live_after, sharing, source) = publish_monitor(&publisher);
     let quality = sharing.quality.unwrap_or_default();
     println!(
         "live: ScreenShare Live after {live_after:?}; requested {} · {} FPS · {} kbit/s · codec {}",
@@ -385,14 +469,33 @@ fn live_stand_publishes_a_monitor_and_a_viewer_decodes_frames() {
     let (sharing, sample) = wait_stats(&publisher, sharing);
     let stats = sharing.stats.expect("live stats");
     println!(
-        "live: answer_mid={:?} · encoded {}×{} · {:.1} FPS · frames_encoded={} · packets_sent={}",
+        "live: answer_mid={:?} · encoded {}×{} · {:.1} FPS · frames_encoded={} · packets_sent={} · has_audio={} · audio_packets={} · audio_kbps={:.1}",
         sample.answer_mid,
         sample.width,
         sample.height,
         stats.fps,
         sample.frames_encoded,
         sample.packets_sent,
+        sharing.has_audio,
+        sample.audio_packets_sent,
+        sample.audio_kbps,
     );
+    if sharing.has_audio {
+        assert!(
+            sample.audio_packets_sent > 0,
+            "has_audio:true must produce real audio RTP packets"
+        );
+        assert!(
+            sample.audio_kbps > 0.0,
+            "the measured audio bitrate must be positive"
+        );
+        println!(
+            "live: system audio requested at {} kbit/s max, measured {:.1} kbit/s",
+            quality.audio_bitrate_kbps, sample.audio_kbps
+        );
+    } else {
+        println!("live: system audio SKIP — the publication has no audio track");
+    }
     assert_eq!(
         (sample.width, sample.height),
         (1280, 720),
@@ -403,6 +506,28 @@ fn live_stand_publishes_a_monitor_and_a_viewer_decodes_frames() {
         (1280, 720),
         "the public stats must report the real encoded size"
     );
+
+    // A quality change during the broadcast: the backend has no runtime
+    // reconfigure, so this must be a confirmed stop+start with a new attempt.
+    let attempt = sharing.attempt;
+    let (restart_after, restarted) =
+        restart_quality(&publisher, source, attempt, sharing.has_audio);
+    println!(
+        "live: quality restart reached Live after {restart_after:?}; attempt {} -> {}; {} · {} FPS · {} kbit/s · has_audio={}",
+        attempt,
+        restarted.attempt,
+        restarted
+            .quality
+            .map(|quality| quality.resolution.wire())
+            .unwrap_or("none"),
+        restarted.quality.map(|quality| quality.fps).unwrap_or(0),
+        restarted
+            .quality
+            .map(|quality| quality.bitrate_kbps)
+            .unwrap_or(0),
+        restarted.has_audio,
+    );
+    assert!(restarted.attempt > attempt, "the restart is a new attempt");
 
     // The second scenario is optional: without a second account the publisher
     // proof above is still complete.
@@ -433,6 +558,25 @@ fn live_stand_publishes_a_monitor_and_a_viewer_decodes_frames() {
             width > 0 && height > 0,
             "live: the viewer frame has no size"
         );
+        if publication.has_audio {
+            let deadline = Instant::now() + STATS_BUDGET;
+            let packets = loop {
+                let packets = crate::live_probe::sample()
+                    .map(|sample| sample.viewer_audio_packets)
+                    .unwrap_or(0);
+                if packets > 0 {
+                    break packets;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "live: the viewer received no audio packet within {STATS_BUDGET:?}"
+                );
+                thread::sleep(POLL);
+            };
+            println!("live: viewer received {packets} audio packets");
+        } else {
+            println!("live: viewer audio SKIP — the publication has no audio track");
+        }
         viewer.leave_stream(1);
         drop(viewer);
     } else {
@@ -462,19 +606,20 @@ fn live_stand_publishes_a_monitor_and_a_viewer_decodes_frames() {
         "live: stop reached Idle in {stopped:?}; signals start={starts} answer={answers} stop={stops}; engines started={} stopped={}",
         final_sample.engines_started, final_sample.engines_stopped
     );
-    assert_eq!(starts, 1, "exactly one stream.start must be sent");
+    // One publication plus one confirmed quality restart.
+    assert_eq!(starts, 2, "one start per attempt and no extra start");
     assert!(
-        answers >= 1,
-        "the publisher must send its answer (with a viewer the viewer also answers)"
+        answers >= 2,
+        "the publisher must answer both attempts (with a viewer the viewer also answers)"
     );
-    assert_eq!(stops, 1, "exactly one stream.stop must be sent");
+    assert_eq!(stops, 2, "one stop per attempt and no extra stop");
     assert_eq!(
-        final_sample.engines_started, 1,
-        "the runtime must create exactly one capture engine"
+        final_sample.engines_started, 2,
+        "the runtime must create one capture engine per attempt"
     );
     assert_eq!(
-        final_sample.engines_stopped, 1,
-        "the runtime must release the capture engine"
+        final_sample.engines_stopped, 2,
+        "the runtime must release both capture engines"
     );
     assert!(
         final_sample

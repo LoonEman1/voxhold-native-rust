@@ -884,6 +884,13 @@ impl Session {
                     }
                 }
                 RtcStats::InboundRtp(inbound) if inbound.stream.kind == "audio" => {
+                    // Only the dedicated stream-viewer peer carries the
+                    // publication's audio; the room voice peer must not be
+                    // counted as screen audio in the live proof.
+                    #[cfg(test)]
+                    if self.viewer.is_some() {
+                        crate::live_probe::record_viewer_audio(inbound.received.packets_received);
+                    }
                     let track_id = inbound.inbound.track_identifier;
                     if track_id.is_empty() {
                         continue;

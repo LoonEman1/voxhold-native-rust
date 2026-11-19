@@ -469,3 +469,16 @@ backend/браузер, TURN/ICE на втором ПК, DPI 125/150, запис
 - Ревью: раунд 1 — не PASS (P1-1: наследование `stop_sent`/`connected`; P1-2: `stream.start` после провала старта; P1-3: очередь 16 и зависание `Drop`), исправление `aedd22b`; раунд 2 — PASS; раунд 3 на `7fd24e1` — P0/P1 нет, единственный P2 (warning `had_engine`), исправление `f33175c`; раунд 4 — PASS.
 - Проверки: fmt; тесты API 11 / media 179 (11 ignored) / app 353 (1 ignored), 0 failed; release; 223 файла в лимитах; кодировка чистая; мутации track/stop/viewer/reset падают на нужных тестах.
 - Осталось: браузерный viewer без микрофона, TURN/внешний backend, hot-unplug, DPI 125/150, sleep/resume, задержка и FPS/CPU/GPU-замеры; HDR/P2P/system audio/запись — W04a/W04b/W11/W12.
+
+### W04a — системный звук и качество — журнал PR #24
+
+Ветка `codex/w04a-system-audio`, база `dev` `79f1e51` (merge W03), PR [#24](https://github.com/LoonEman1/voxhold-native-rust/pull/24); эталоны backend `9b29fdd6d5dc818b7408e4892b8e68b27d123831`, frontend `ed7cb00ae12398753a8ef48a5a33b864e20cb04c`.
+
+- `system_audio.rs` + `system_audio/{format,wasapi}.rs`: WASAPI loopback default render endpoint в shared mode, 48 кГц stereo i16, конверсия float/PCM16/24/32 и 44,1→48 кГц, downmix 5.1/7.1 (center/surround −3 дБ, LFE не включается), перенос хвоста пакета, тишина, bounded очередь, reopen устройства, COM на потоке захвата, все таймауты ограничены. Ручной тест: default render `48000/2/32f`, тон `blocks=118 peak=8000`.
+- `publisher/engine.rs` + `engine/audio.rs`: `NativeAudioSource` 48 кГц stereo, EC/NS/AGC off, audio m-line после video, `has_audio` фактический, лимит 64–320; mic отдельно; preview без звука.
+- `publisher/quality.rs` + UI: пресеты FPS/битрейт, аудио 64–320, restart = один `stream.stop` + новый `stream.start` после ack; поздние события старой попытки игнорируются, revoke завершает. Пока асинхронная проба устройства не ответила, Start/Restart заблокированы, тумблер «Включён» не показывается.
+- P2-фиксы: `9333eda` (downmix, remainder, фоновая проба, тест тишины, mic/system separation с реальным gate, кнопка «Качество» только в Live) и `7440ab6` (Start при незавершённой пробе); A/V offset зафиксирован как ограничение.
+- Live: join 50 мс, Live 302–803 мс, 97 audio packets, 1,2–126,7 кбит/с при 128, restart 302–855 мс, viewer 108–121 audio packet и 3–17 кадров, stop 50–150 мс.
+- Проверки: 570 тестов (11/199/360), release, 230 файлов, кодировка; мутации downmix/remainder/probe/silence/stream-id/quality/pending-start падают на нужных тестах.
+- Ревью: раунд 1 — PASS + 7 P2; раунд 2 — PASS + новый P2; раунд 3 — PASS после `7440ab6`.
+- Осталось: слышимый звук, web-viewer, физический 5.1/7.1, отключение устройства, 1080p/60, 320 кбит/с, DPI, смена качества при активном зрителе; A/V offset и source-change — perf-этап.

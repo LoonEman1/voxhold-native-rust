@@ -23,6 +23,7 @@ fn request() -> PublishRequest {
         source: source(),
         quality: Quality::default(),
         codec: Codec::Vp8,
+        audio: false,
     }
 }
 
@@ -62,7 +63,7 @@ fn start_signal(outcomes: &[Outcome]) -> &Signal {
 fn publishing(publisher: &mut Publisher, now: Instant) -> Vec<Outcome> {
     publisher.begin_picker(1);
     let mut outcomes = publisher.publish(1, request(), false, now);
-    outcomes.extend(publisher.engine_ready(now));
+    outcomes.extend(publisher.engine_ready(now, request().audio));
     outcomes
 }
 
@@ -208,6 +209,7 @@ fn live_needs_both_the_connection_and_a_sent_frame() {
             height: 720,
             sources: 1,
             limitation: crate::publisher::engine::QualityLimitation::None,
+            ..PublishStats::default()
         }),
         now,
     );
@@ -234,7 +236,7 @@ fn a_viewer_is_left_before_the_capture_starts() {
     // `stream.left` arrives well before the five-second contract.
     let started = publisher.viewer_left(now + Duration::from_millis(200));
     assert!(matches!(started[0], Outcome::StartEngine { .. }));
-    let ready = publisher.engine_ready(now + Duration::from_millis(200));
+    let ready = publisher.engine_ready(now + Duration::from_millis(200), false);
     assert_eq!(start_signal(&ready).kind, "stream.start");
 }
 
@@ -255,7 +257,7 @@ fn a_missing_stream_left_still_starts_after_the_five_second_contract() {
     );
     let started = publisher.tick(now + LEAVE_TIMEOUT);
     assert!(matches!(started[0], Outcome::StartEngine { .. }));
-    let ready = publisher.engine_ready(now + LEAVE_TIMEOUT);
+    let ready = publisher.engine_ready(now + LEAVE_TIMEOUT, false);
     assert_eq!(start_signal(&ready).kind, "stream.start");
 }
 
@@ -537,46 +539,7 @@ fn ice_from_the_server_reaches_the_engine_only_while_publishing() {
     );
 }
 
-#[test]
-fn quality_values_are_clamped_to_the_web_ranges() {
-    assert_eq!(
-        Quality {
-            resolution: Resolution::P720,
-            fps: 144,
-            bitrate_kbps: 999,
-        }
-        .clamped()
-        .fps,
-        60
-    );
-    assert_eq!(
-        Quality {
-            resolution: Resolution::P720,
-            fps: 15,
-            bitrate_kbps: 99,
-        }
-        .clamped(),
-        Quality {
-            resolution: Resolution::P720,
-            fps: 30,
-            bitrate_kbps: 500,
-        }
-    );
-    assert_eq!(
-        Quality {
-            resolution: Resolution::P1080,
-            fps: 30,
-            bitrate_kbps: 20_001,
-        }
-        .clamped()
-        .bitrate_kbps,
-        16_000
-    );
-    assert_eq!(
-        Quality::default().describe(),
-        "1280 × 720 · 30 FPS · 4,0 Мбит/с"
-    );
-}
+mod quality;
 
 #[test]
 fn the_ui_snapshot_follows_every_phase() {
@@ -586,7 +549,7 @@ fn the_ui_snapshot_follows_every_phase() {
     publisher.begin_picker(1);
     assert_eq!(publisher.sharing().phase, Phase::Picking);
     publisher.publish(1, request(), false, now);
-    publisher.engine_ready(now);
+    publisher.engine_ready(now, false);
     assert_eq!(publisher.sharing().phase, Phase::Publishing);
     assert_eq!(
         publisher.sharing().quality.map(Quality::describe),
@@ -633,7 +596,7 @@ fn a_new_picker_after_a_failure_sends_its_own_stream_stop() {
     assert_eq!(publisher.phase(), Phase::Picking);
     assert!(matches!(opened.as_slice(), [Outcome::State(_)]));
     let mut publish = publisher.publish(2, request(), false, second_now);
-    publish.extend(publisher.engine_ready(second_now));
+    publish.extend(publisher.engine_ready(second_now, false));
     assert!(
         sends(&publish)
             .iter()
@@ -682,7 +645,7 @@ fn a_new_attempt_after_live_needs_its_own_connection_and_frame() {
     let second_now = now + Duration::from_secs(1);
     publisher.begin_picker(2);
     let mut publish = publisher.publish(2, request(), false, second_now);
-    publish.extend(publisher.engine_ready(second_now));
+    publish.extend(publisher.engine_ready(second_now, false));
     assert_eq!(
         publisher.phase(),
         Phase::Publishing,
@@ -825,10 +788,12 @@ fn begin_picker_resets_the_previous_attempt_snapshot_immediately() {
     let stats = PublishStats {
         fps: 30.0,
         dropped: 2,
+        // Audio fields are not part of this snapshot test.
         width: 1280,
         height: 720,
         sources: 1,
         limitation: crate::publisher::engine::QualityLimitation::None,
+        ..PublishStats::default()
     };
     publisher.on_engine(EngineEvent::Stats(stats), now);
     assert_eq!(publisher.sharing().stats, Some(stats));

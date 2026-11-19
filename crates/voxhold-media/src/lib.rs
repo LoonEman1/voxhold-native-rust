@@ -7,6 +7,7 @@ pub mod mixer;
 pub mod preview;
 pub mod publisher;
 pub mod screen_capture;
+pub mod system_audio;
 mod video;
 pub mod viewer;
 mod voice;

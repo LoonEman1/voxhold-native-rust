@@ -68,8 +68,10 @@ fn request() -> PublishRequest {
             resolution: Resolution::P720,
             fps: 30,
             bitrate_kbps: 500,
+            audio_bitrate_kbps: 128,
         },
         codec: Codec::Vp8,
+        audio: false,
     }
 }
 
@@ -79,6 +81,7 @@ fn start(script: Script) -> PublisherEngine {
         Vec::new(),
         "all".into(),
         Box::new(ScriptedProducer { script, tick: 0 }),
+        None,
         Arc::new(PreviewStore::default()),
     )
     .expect("synthetic engine")

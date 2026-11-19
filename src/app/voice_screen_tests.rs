@@ -3,6 +3,14 @@
 
 use crate::voice_room::CallPhase;
 use gpui::TestAppContext;
+use std::{
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::{Duration, Instant},
+};
+use voxhold_media::system_audio::AudioDeviceInfo;
 
 fn source() -> voxhold_media::screen_capture::ScreenSource {
     voxhold_media::screen_capture::ScreenSource {
@@ -45,6 +53,22 @@ fn focused(
     voice: &gpui::Entity<crate::voice_panel::VoicePanel>,
 ) -> Option<String> {
     visual.update(|window, app| voice.read(app).test_focused_share(window))
+}
+
+/// Bounded wait for a background result on the GPUI test loop.
+fn wait_for(
+    visual: &mut gpui::VisualTestContext,
+    voice: &gpui::Entity<crate::voice_panel::VoicePanel>,
+    mut done: impl FnMut(&crate::voice_panel::VoicePanel) -> bool,
+) {
+    for _ in 0..800 {
+        visual.run_until_parked();
+        if voice.read_with(&*visual, |panel, _| done(panel)) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    panic!("the background screen-audio probe did not finish");
 }
 
 fn publication(index: usize) -> voxhold_media::controller::Publication {
@@ -297,6 +321,141 @@ async fn cancel_while_busy_never_enqueues_a_cancel_and_the_close_is_a_stop(
 }
 
 #[gpui::test]
+async fn the_live_quality_dialog_warns_and_restarts_with_the_new_values(cx: &mut TestAppContext) {
+    use voxhold_media::publisher::{Phase, Preset, Quality, Resolution, Sharing};
+    let (mut visual, _view, voice) = super::voice_tests::fixture(cx);
+    draw(&mut visual);
+    visual.update(|_window, app| {
+        voice.update(app, |panel, cx| {
+            panel.test_attach_detached_handle();
+            let sharing = Sharing {
+                phase: Phase::Live,
+                live: true,
+                quality: Some(Quality {
+                    resolution: Resolution::P720,
+                    fps: 30,
+                    bitrate_kbps: 4000,
+                    audio_bitrate_kbps: 128,
+                }),
+                has_audio: true,
+                ..Sharing::default()
+            };
+            panel.test_open_screen_settings(source(), sharing, cx);
+            assert!(panel.screen_share_open(), "the live dialog opened");
+            assert!(panel.test_screen_restart());
+            assert!(
+                panel.test_restart_warning().is_some(),
+                "a live change must warn about the restart"
+            );
+            assert!(panel.test_sound_label().contains("128"));
+            // The preset changes only the applied fps/bitrate; audio is a
+            // separate field and can be turned off.
+            panel.test_apply_preset(Preset::Games, cx);
+            panel.test_toggle_system_audio(cx);
+            let request = panel.test_screen_request();
+            assert_eq!(request.quality.fps, 60);
+            assert_eq!(request.quality.bitrate_kbps, 12_000);
+            assert_eq!(request.quality.resolution, Resolution::P720);
+            assert!(!request.audio);
+            assert_eq!(request.source, source());
+        });
+    });
+    for _ in 0..40 {
+        if focused(&mut visual, &voice).as_deref() == Some("Start") {
+            break;
+        }
+        visual.simulate_keystrokes("tab");
+    }
+    assert_eq!(focused(&mut visual, &voice).as_deref(), Some("Start"));
+    visual.simulate_keystrokes("enter");
+    let commands = visual
+        .update(|_window, app| voice.update(app, |panel, _| panel.test_take_screen_commands()));
+    assert_eq!(
+        commands,
+        vec![("restart", 0)],
+        "Start in the live dialog queues exactly one restart"
+    );
+    voice.read_with(&*visual, |panel, _| {
+        assert!(panel.screen_share_busy(), "the restart is committed");
+    });
+}
+
+#[gpui::test]
+async fn closing_the_live_quality_dialog_keeps_the_stream(cx: &mut TestAppContext) {
+    use voxhold_media::publisher::{Phase, Quality, Sharing};
+    let (mut visual, _view, voice) = super::voice_tests::fixture(cx);
+    draw(&mut visual);
+    visual.update(|_window, app| {
+        voice.update(app, |panel, cx| {
+            panel.test_attach_detached_handle();
+            panel.test_open_screen_settings(
+                source(),
+                Sharing {
+                    phase: Phase::Live,
+                    live: true,
+                    quality: Some(Quality::default()),
+                    has_audio: true,
+                    ..Sharing::default()
+                },
+                cx,
+            );
+            assert!(panel.screen_share_open());
+        });
+    });
+    visual.simulate_keystrokes("escape");
+    draw(&mut visual);
+    let commands = visual
+        .update(|_window, app| voice.update(app, |panel, _| panel.test_take_screen_commands()));
+    assert!(
+        commands.is_empty(),
+        "closing the live quality dialog must not stop or cancel: {commands:?}"
+    );
+    voice.read_with(&*visual, |panel, _| {
+        assert!(!panel.screen_share_open());
+        assert_eq!(panel.test_screen_phase(), Phase::Live);
+    });
+}
+
+#[gpui::test]
+async fn the_on_air_sound_line_reports_measured_and_missing_audio(cx: &mut TestAppContext) {
+    use voxhold_media::publisher::{Phase, Quality, Sharing};
+    let (visual, _view, voice) = super::voice_tests::fixture(cx);
+    visual.update(|_window, app| {
+        voice.update(app, |panel, _| {
+            let quality = Quality::default();
+            panel.test_set_screen_sharing(Sharing {
+                phase: Phase::Live,
+                live: true,
+                quality: Some(quality),
+                has_audio: true,
+                stats: Some(voxhold_media::publisher::engine::PublishStats {
+                    audio_active: true,
+                    audio_kbps: 96.0,
+                    ..Default::default()
+                }),
+                ..Sharing::default()
+            });
+            assert!(
+                panel.test_sound_label().contains("96"),
+                "the card must show the measured audio rate"
+            );
+            panel.test_set_screen_sharing(Sharing {
+                phase: Phase::Live,
+                live: true,
+                quality: Some(quality),
+                has_audio: false,
+                ..Sharing::default()
+            });
+            assert_eq!(panel.test_sound_label(), "Без звука");
+            assert!(
+                !panel.test_screen_request().audio,
+                "an unavailable track is never requested"
+            );
+        });
+    });
+}
+
+#[gpui::test]
 async fn the_disabled_reason_is_hidden_while_a_share_is_active(cx: &mut TestAppContext) {
     use voxhold_media::publisher::{Phase, Sharing};
     let (visual, _view, voice) = super::voice_tests::fixture(cx);
@@ -320,6 +479,272 @@ async fn the_disabled_reason_is_hidden_while_a_share_is_active(cx: &mut TestAppC
             assert_eq!(
                 panel.test_screen_reason(),
                 Some("Нет доступа к голосовому каналу.")
+            );
+        });
+    });
+}
+
+#[gpui::test]
+async fn the_endpoint_probe_never_blocks_the_screen_share_click(cx: &mut TestAppContext) {
+    let (mut visual, _view, voice) = super::voice_tests::fixture(cx);
+    let entered = Arc::new(AtomicBool::new(false));
+    let flag = entered.clone();
+    visual.update(|_window, app| {
+        voice.update(app, |panel, cx| {
+            panel.test_attach_detached_handle();
+            panel.test_set_share_gate(Ok(()));
+            panel.test_set_audio_probe(Arc::new(move || {
+                flag.store(true, Ordering::SeqCst);
+                // Stands in for a stalled COM/driver call. The real probe is
+                // bounded at two seconds; the click must not wait even 350 ms.
+                std::thread::sleep(Duration::from_millis(350));
+                Ok(AudioDeviceInfo {
+                    id: "slow".into(),
+                    label: "Медленное устройство".into(),
+                    format: "48000 Гц · 2 канала · 16 бит PCM".into(),
+                })
+            }));
+            let started = Instant::now();
+            panel.test_open_screen_share(cx);
+            let elapsed = started.elapsed();
+            assert!(panel.screen_share_open(), "the picker opened");
+            assert!(
+                elapsed < Duration::from_millis(150),
+                "the click waited for the endpoint probe: {elapsed:?}"
+            );
+            assert!(
+                panel.test_audio_pending(),
+                "a synchronous probe would already have an answer here"
+            );
+            assert!(
+                panel.test_audio_status().contains("Проверяем"),
+                "the picker must show the pending state"
+            );
+        });
+    });
+    wait_for(&mut visual, &voice, |panel| !panel.test_audio_pending());
+    assert!(
+        entered.load(Ordering::SeqCst),
+        "the injected probe did not run on a background task"
+    );
+    voice.read_with(&*visual, |panel, _| {
+        assert!(
+            panel.test_audio_status().contains("Медленное устройство"),
+            "the background answer must reach the picker: {}",
+            panel.test_audio_status()
+        );
+    });
+}
+
+#[gpui::test]
+async fn a_pending_audio_probe_blocks_start_and_never_publishes_video_only(
+    cx: &mut TestAppContext,
+) {
+    let (mut visual, _view, voice) = super::voice_tests::fixture(cx);
+    let device = || AudioDeviceInfo {
+        id: "slow".into(),
+        label: "Медленное устройство".into(),
+        format: "48000 Гц · 2 канала · 16 бит PCM".into(),
+    };
+
+    // The answer is still pending: a Start here would publish video with
+    // `audio == false` although the user asked for system sound.
+    visual.update(|_window, app| {
+        voice.update(app, |panel, cx| {
+            panel.test_attach_detached_handle();
+            panel.test_set_share_gate(Ok(()));
+            panel.test_set_audio_probe(Arc::new(move || {
+                std::thread::sleep(Duration::from_millis(250));
+                Ok(device())
+            }));
+            panel.test_open_screen_share(cx);
+            panel.test_select_screen_source(source(), cx);
+            assert!(panel.test_audio_pending());
+            let opened = panel.test_take_screen_commands();
+            assert_eq!(opened.len(), 1, "one picker open: {opened:?}");
+            assert_eq!(opened[0].0, "open");
+            assert!(
+                !panel.test_can_start(),
+                "Start must wait for the endpoint probe"
+            );
+            panel.test_start_screen_share(cx);
+            assert!(
+                panel.test_take_screen_commands().is_empty(),
+                "a pending probe must not commit a video-only publication"
+            );
+            assert!(!panel.screen_share_busy(), "no publish attempt started");
+            assert_eq!(panel.test_audio_toggle_label(), "Выключен");
+        });
+    });
+
+    wait_for(&mut visual, &voice, |panel| !panel.test_audio_pending());
+
+    visual.update(|_window, app| {
+        voice.update(app, |panel, cx| {
+            assert_eq!(panel.test_audio_toggle_label(), "Включён");
+            assert!(panel.test_can_start());
+            panel.test_start_screen_share(cx);
+            let commands = panel.test_take_screen_commands();
+            assert_eq!(commands.len(), 1, "one publish intent: {commands:?}");
+            assert_eq!(commands[0].0, "publish");
+            assert!(
+                panel.test_screen_request().audio,
+                "the confirmed endpoint must be requested"
+            );
+        });
+    });
+
+    // Reopen with a probe that fails: the picker must stay honest about the
+    // missing track and still publish without audio.
+    visual.update(|_window, app| {
+        voice.update(app, |panel, cx| {
+            panel.test_set_audio_probe(Arc::new(|| {
+                std::thread::sleep(Duration::from_millis(250));
+                Err("Нет устройства вывода".to_owned())
+            }));
+            panel.test_open_screen_share(cx);
+            panel.test_select_screen_source(source(), cx);
+            assert!(panel.test_audio_pending());
+            let opened = panel.test_take_screen_commands();
+            assert_eq!(opened.len(), 1, "one picker open: {opened:?}");
+            assert_eq!(opened[0].0, "open");
+            assert_eq!(panel.test_audio_toggle_label(), "Выключен");
+            assert!(
+                !panel.test_can_start(),
+                "a repeated probe blocks Start until it answers"
+            );
+            panel.test_start_screen_share(cx);
+            assert!(
+                panel.test_take_screen_commands().is_empty(),
+                "a pending re-probe must not commit"
+            );
+        });
+    });
+
+    wait_for(&mut visual, &voice, |panel| !panel.test_audio_pending());
+
+    visual.update(|_window, app| {
+        voice.update(app, |panel, cx| {
+            assert!(
+                panel.test_audio_status().contains("Нет устройства вывода"),
+                "the failure reason stays visible: {}",
+                panel.test_audio_status()
+            );
+            assert_eq!(panel.test_audio_toggle_label(), "Выключен");
+            assert!(
+                panel.test_can_start(),
+                "Start is allowed without audio after a failed probe"
+            );
+            panel.test_start_screen_share(cx);
+            let commands = panel.test_take_screen_commands();
+            assert_eq!(commands.len(), 1, "one publish intent: {commands:?}");
+            assert_eq!(commands[0].0, "publish");
+            assert!(
+                !panel.test_screen_request().audio,
+                "a failed endpoint must not be requested"
+            );
+        });
+    });
+}
+
+#[gpui::test]
+async fn the_quality_action_is_rendered_only_while_the_stream_is_live(cx: &mut TestAppContext) {
+    use voxhold_media::publisher::{Phase, Sharing};
+    let (mut visual, _view, voice) = super::voice_tests::fixture(cx);
+    visual.update(|_window, app| {
+        voice.update(app, |panel, _| {
+            panel.test_set_screen_sharing(Sharing {
+                phase: Phase::Publishing,
+                live: false,
+                ..Sharing::default()
+            });
+        });
+    });
+    draw(&mut visual);
+    assert!(
+        visual.debug_bounds("screen-stop").is_some(),
+        "the publishing card is on screen"
+    );
+    assert!(
+        visual.debug_bounds("screen-quality").is_none(),
+        "Publishing must not show a quality action that would do nothing"
+    );
+
+    visual.update(|_window, app| {
+        voice.update(app, |panel, _| {
+            panel.test_set_screen_sharing(Sharing {
+                phase: Phase::Live,
+                live: true,
+                ..Sharing::default()
+            });
+        });
+    });
+    draw(&mut visual);
+    assert!(
+        visual.debug_bounds("screen-quality").is_some(),
+        "Live must offer the restart dialog"
+    );
+}
+
+#[gpui::test]
+async fn sharing_and_stopping_leave_the_microphone_gate_and_ptt_untouched(cx: &mut TestAppContext) {
+    let (mut visual, _view, voice) = super::voice_tests::fixture(cx);
+    draw(&mut visual);
+    visual.update(|_window, app| {
+        voice.update(app, |panel, cx| {
+            panel.test_attach_detached_handle();
+            panel.set_stream_permission(true);
+            panel.test_set_share_gate(Ok(()));
+            // The microphone is open through push-to-talk: the sharing path
+            // must not close it, latch the gate or emit a mic control update.
+            panel.set_push_to_talk(true);
+            panel.set_push_to_talk_held(true);
+            assert!(panel.test_ptt_held(), "the microphone is transmitting");
+            panel.test_prepare_screen_publish(source());
+            assert!(
+                panel.test_ptt_held(),
+                "preparing the source must not release push-to-talk"
+            );
+            // Drain the control snapshot caused by enabling push-to-talk.
+            let _ = panel.test_take_audio_snapshot();
+            panel.test_start_screen_share(cx);
+            assert!(
+                panel.test_ptt_held(),
+                "the publish handler itself must not release push-to-talk"
+            );
+        });
+    });
+    let commands = visual
+        .update(|_window, app| voice.update(app, |panel, _| panel.test_take_screen_commands()));
+    assert_eq!(commands, vec![("publish", 7)]);
+    visual.update(|_window, app| {
+        voice.update(app, |panel, _| {
+            assert!(
+                panel.test_ptt_held(),
+                "starting the share must not release push-to-talk"
+            );
+            assert!(
+                panel.test_take_audio_snapshot().is_none(),
+                "starting the share must not push new mic/gate controls"
+            );
+        });
+    });
+
+    visual.update(|_window, app| {
+        voice.update(app, |panel, cx| panel.test_stop_screen_share(cx));
+    });
+    let commands = visual
+        .update(|_window, app| voice.update(app, |panel, _| panel.test_take_screen_commands()));
+    assert_eq!(commands, vec![("stop", 0)]);
+    visual.update(|_window, app| {
+        voice.update(app, |panel, _| {
+            assert!(
+                panel.test_ptt_held(),
+                "stopping the share must not release push-to-talk"
+            );
+            assert!(
+                panel.test_take_audio_snapshot().is_none(),
+                "stopping the share must not push new mic/gate controls"
             );
         });
     });

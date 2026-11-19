@@ -118,6 +118,9 @@ pub struct VoicePanel {
     can_stream: bool,
     /// Screen-share picker, on-air card and preview.
     screen: ScreenShareUi,
+    /// Monotonic id of the newest screen-audio probe. A slower, older probe
+    /// must not overwrite the availability of a newer dialog.
+    screen_audio_probe: u64,
     /// False while the authoritative channel ACL is being reloaded. Both the
     /// room roster and the call worker's roster/streams stay hidden until the
     /// fresh channel list confirms access again.
@@ -148,8 +151,9 @@ pub struct VoicePanel {
     dock_focus: Vec<FocusHandle>,
     dock_visible: bool,
     stream_focus: Vec<FocusHandle>,
-    /// Focus handles of the «Экран» toolbar action and the on-air stop
-    /// action. Index 0 is the on-air stop action, index 1 the toolbar button.
+    /// Focus handles of the «Экран» toolbar action and the on-air actions.
+    /// Index 0 is the on-air stop action, index 1 the toolbar button, index 2
+    /// the live quality action.
     screen_focus: Vec<FocusHandle>,
     /// Focus handles of the source picker. A separate range cannot collide
     /// with the toolbar (`screen_focus[1]`) or the on-air card (`screen_focus[0]`).
@@ -175,6 +179,12 @@ pub struct VoicePanel {
     /// not decide whether a keyboard-path test can run.
     #[cfg(test)]
     test_share_gate: Option<Result<(), &'static str>>,
+    /// Test-only replacement for the blocking endpoint probe. It runs on the
+    /// same background task as the real one.
+    #[cfg(test)]
+    test_audio_probe: Option<
+        Arc<dyn Fn() -> Result<voxhold_media::system_audio::AudioDeviceInfo, String> + Send + Sync>,
+    >,
 }
 
 impl VoicePanel {
@@ -248,6 +258,7 @@ impl VoicePanel {
             room_streams: Vec::new(),
             can_stream: false,
             screen: ScreenShareUi::default(),
+            screen_audio_probe: 0,
             access_confirmed: true,
             frame: None,
             stream_status: String::new(),
@@ -275,7 +286,7 @@ impl VoicePanel {
                 .collect(),
             dock_visible: false,
             stream_focus: (0..8).map(|_| cx.focus_handle()).collect(),
-            screen_focus: (0..2).map(|_| cx.focus_handle()).collect(),
+            screen_focus: (0..3).map(|_| cx.focus_handle()).collect(),
             picker_focus: (0..32).map(|_| cx.focus_handle()).collect(),
             member_focus: (0..16).map(|_| cx.focus_handle()).collect(),
             player_actions: (0..3).map(|_| cx.focus_handle()).collect(),
@@ -290,6 +301,8 @@ impl VoicePanel {
             palette: crate::theme::dark_palette(),
             #[cfg(test)]
             test_share_gate: None,
+            #[cfg(test)]
+            test_audio_probe: None,
         }
     }
 

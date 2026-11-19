@@ -47,6 +47,7 @@ impl VoiceHandle {
             out.push(match command {
                 ScreenCommand::OpenPicker { picker } => ("open", picker),
                 ScreenCommand::Publish { picker, .. } => ("publish", picker),
+                ScreenCommand::Restart { .. } => ("restart", 0),
                 ScreenCommand::CancelPicker { picker } => ("cancel", picker),
                 ScreenCommand::Stop => ("stop", 0),
             });

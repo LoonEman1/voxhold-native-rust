@@ -98,8 +98,10 @@ fn request() -> PublishRequest {
             resolution: Resolution::P720,
             fps: 30,
             bitrate_kbps: 2500,
+            audio_bitrate_kbps: 128,
         },
         codec: Codec::Vp8,
+        audio: false,
     }
 }
 
@@ -175,6 +177,7 @@ fn loopback_with_frame_size(frame_size: (u32, u32)) {
             "all".into(),
             false,
             frame_size,
+            None,
         )
         .expect("publisher engine");
         engine.offer(offer_sdp.clone()).expect("offer command");

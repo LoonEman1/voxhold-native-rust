@@ -26,6 +26,12 @@ pub(crate) struct Sample {
     pub packets_sent: u64,
     pub width: u32,
     pub height: u32,
+    /// Cumulative audio RTP packets and the measured audio bitrate.
+    pub audio_packets_sent: u64,
+    pub audio_kbps: f32,
+    /// Largest cumulative audio packet counter the viewer's peer reported for
+    /// an inbound audio track. Zero when the viewer received no audio.
+    pub viewer_audio_packets: u64,
     /// Signaling kinds the session really sent, in order.
     pub signals: Vec<&'static str>,
     /// Capture engines the runtime created and released; the release happens
@@ -79,7 +85,14 @@ pub(crate) fn record_signal(kind: &'static str, data: &Value) {
 }
 
 /// One outbound statistics sample of the publisher engine.
-pub(crate) fn record_outbound(frames: u32, packets: u64, width: u32, height: u32) {
+pub(crate) fn record_outbound(
+    frames: u32,
+    packets: u64,
+    width: u32,
+    height: u32,
+    audio_packets: u64,
+    audio_kbps: f32,
+) {
     if !ENABLED.load(Ordering::Relaxed) {
         return;
     }
@@ -91,12 +104,30 @@ pub(crate) fn record_outbound(frames: u32, packets: u64, width: u32, height: u32
     };
     sample.frames_encoded = frames;
     sample.packets_sent = packets;
+    sample.audio_packets_sent = audio_packets;
+    sample.audio_kbps = audio_kbps;
     if width > 0 {
         sample.width = width;
     }
     if height > 0 {
         sample.height = height;
     }
+}
+
+/// The dedicated stream-viewer peer sees the publication's audio as an
+/// inbound RTP stream. Only the cumulative counter is kept; no audio content
+/// or track id. The room voice peer is excluded by the caller.
+pub(crate) fn record_viewer_audio(packets: u64) {
+    if !ENABLED.load(Ordering::Relaxed) {
+        return;
+    }
+    let Ok(mut sample) = SAMPLE.lock() else {
+        return;
+    };
+    let Some(sample) = sample.as_mut() else {
+        return;
+    };
+    sample.viewer_audio_packets = sample.viewer_audio_packets.max(packets);
 }
 
 pub(crate) fn record_engine_started() {

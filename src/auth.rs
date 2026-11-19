@@ -191,6 +191,16 @@ pub struct AuthLayout {
     pub terms: Rect,
 }
 
+/// Smallest top margin a short client area may squeeze the card to. The mobile
+/// brand strip sits at `card.y + pad` and the theme toggle at `y = 22`, so the
+/// card still has to start below the window edge to keep both readable.
+const MIN_AUTH_TOP: f32 = 8.0;
+
+/// The confirmed-origin row above the login card: `y = 22`, height 32. When the
+/// card is pulled up, it must not cover that row.
+const TOP_STRIP_Y: f32 = 22.0;
+const TOP_STRIP_HEIGHT: f32 = 32.0;
+
 pub fn layout_auth(w: f32, h: f32, instance: bool, has_error: bool) -> AuthLayout {
     let w = if w.is_finite() { w.max(0.0) } else { 0.0 };
     let h = if h.is_finite() { h.max(0.0) } else { 0.0 };
@@ -241,6 +251,24 @@ pub fn layout_auth(w: f32, h: f32, instance: bool, has_error: bool) -> AuthLayou
     }
     let card_height = content_height + 2.0 * pad;
     let card_y = top.max(top + (h - top - bottom - card_height) / 2.0);
+    // A short client area must not push the primary button out of the window.
+    // On mobile the +63 px brand strip and the +25 px checkbox row make the
+    // address card taller than the reference assumes, so when the centred card
+    // does not fit the top margin is reduced (never below the step's floor)
+    // until the card ends as high as the height allows. Normal 900/800 px
+    // windows fit already and keep the exact reference centring. The login
+    // step reserves the top strip for the confirmed origin, so its floor is
+    // higher than the address step's.
+    let clamp_floor = if instance {
+        MIN_AUTH_TOP
+    } else {
+        TOP_STRIP_Y + TOP_STRIP_HEIGHT
+    };
+    let card_y = if card_y + card_height > h {
+        (h - card_height).max(clamp_floor)
+    } else {
+        card_y
+    };
     let card = Rect::new(card_x, card_y, card_width, card_height);
     let mut x = card_x + pad;
     let mut y = card_y + pad;
@@ -274,7 +302,7 @@ pub fn layout_auth(w: f32, h: f32, instance: bool, has_error: bool) -> AuthLayou
     let origin_y = if card_y - 48.0 >= 60.0 {
         card_y - 48.0
     } else {
-        22.0
+        TOP_STRIP_Y
     };
     let origin_right = if origin_y < 60.0 {
         (w - 68.0).min(card.right())
@@ -286,7 +314,7 @@ pub fn layout_auth(w: f32, h: f32, instance: bool, has_error: bool) -> AuthLayou
         origin_left,
         origin_y,
         (origin_right - origin_left).max(0.0),
-        32.0,
+        TOP_STRIP_HEIGHT,
     );
     let error_y = if instance {
         primary.bottom() + 12.0
@@ -544,6 +572,98 @@ mod tests {
         // The login step keeps its original geometry and has no checkbox.
         let login = layout_auth(1280.0, 900.0, false, false);
         assert!(login.remember.is_empty());
+    }
+
+    #[test]
+    fn a_short_window_pulls_the_card_up_so_the_primary_button_stays_visible() {
+        // 390x390 and the minimum 320x360: the instance card is 366 px tall
+        // (253 px content + 63 px brand strip + 2 * 25 px padding), so the
+        // reference centring used to push «Продолжить» 21 px below the client.
+        // The clamp moves the card up to its minimum top margin instead.
+        for (width, height) in [(390.0, 390.0), (320.0, 360.0)] {
+            for has_error in [false, true] {
+                let layout = layout_auth(width, height, true, has_error);
+                assert!(
+                    layout.primary.bottom() <= height,
+                    "{width}x{height}: «Продолжить» leaves the client (bottom {})",
+                    layout.primary.bottom()
+                );
+                assert!(
+                    layout.card.y >= MIN_AUTH_TOP,
+                    "{width}x{height}: card starts at {}",
+                    layout.card.y
+                );
+                assert!(
+                    layout.card.y <= 70.0,
+                    "{width}x{height}: a short window only moves the card up"
+                );
+                assert!(
+                    layout.user.bottom() <= layout.remember.y
+                        && layout.remember.bottom() <= layout.primary.y,
+                    "{width}x{height}: the rows overlap after the clamp"
+                );
+                assert!(
+                    layout.brand.bottom() <= layout.user.y,
+                    "{width}x{height}: the brand covers the address field"
+                );
+                assert!(
+                    !overlaps(layout.toggle, layout.brand),
+                    "{width}x{height}: the toggle covers the mobile brand"
+                );
+            }
+        }
+        // The card itself is 366 px tall, which is 6 px more than the 360 px
+        // client; only the button can be guaranteed. 390x390 fits the card
+        // exactly at its minimum margin.
+        let tight = layout_auth(390.0, 390.0, true, false);
+        assert!(tight.card.bottom() <= 390.0);
+        assert!((tight.card.y - 24.0).abs() < 0.01);
+
+        // Normal heights keep the reference geometry untouched.
+        for (width, height) in [
+            (1280.0, 900.0),
+            (900.0, 800.0),
+            (720.0, 900.0),
+            (560.0, 800.0),
+        ] {
+            let layout = layout_auth(width, height, true, false);
+            assert!(
+                layout.card.bottom() <= height,
+                "{width}x{height}: a fitting card must not be clipped"
+            );
+            assert!(
+                layout.card.y >= 70.0,
+                "{width}x{height}: the card moved above its normal top margin"
+            );
+            assert!(layout.primary.bottom() <= height);
+        }
+    }
+
+    #[test]
+    fn save_error_text_fits_the_narrow_error_box() {
+        // The error row is painted with 12 px side padding, an 8 px gap and a
+        // 16 px «×» glyph. 13 px Inter advances at most ~8 px per Cyrillic
+        // character, a deliberately pessimistic bound. The phrase must wrap to
+        // two lines and two lines must fit the 40 px row at 320 px width.
+        let layout = layout_auth(320.0, 360.0, true, true);
+        let inner = (layout.error.w - 2.0 * 12.0 - 16.0 - 8.0).max(1.0);
+        let chars = crate::instance_prefs::SAVE_ERROR.chars().count() as f32;
+        let lines = (chars * 8.0 / inner).ceil();
+        assert!(
+            lines <= 2.0,
+            "«{}» needs {lines} lines in {inner} px",
+            crate::instance_prefs::SAVE_ERROR
+        );
+        assert!(
+            lines * 13.0 * 1.35 <= layout.error.h,
+            "two lines do not fit the {} px row",
+            layout.error.h
+        );
+        // The same box is fully visible at 390x600, where the save error is
+        // actually read.
+        let roomy = layout_auth(390.0, 600.0, true, true);
+        assert!(roomy.error.bottom() <= 600.0);
+        assert!(roomy.error.w >= 200.0);
     }
 
     #[test]

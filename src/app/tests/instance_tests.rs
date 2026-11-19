@@ -319,6 +319,7 @@ async fn the_painted_box_stays_inside_the_card_at_every_breakpoint(cx: &mut Test
         (720.0, 900.0),
         (1280.0, 900.0),
         (390.0, 600.0),
+        (390.0, 390.0),
         (320.0, 360.0),
     ] {
         visual.simulate_resize(size(px(width), px(height)));
@@ -346,6 +347,132 @@ async fn the_painted_box_stays_inside_the_card_at_every_breakpoint(cx: &mut Test
                 && y + h <= layout.primary.y,
             "{width}x{height}: painted checkbox leaves its free row"
         );
+        // The short-window clamp must keep «Продолжить» inside the client, not
+        // only inside the (possibly clipped) card.
+        let primary = visual
+            .debug_bounds("auth-primary")
+            .unwrap_or_else(|| panic!("{width}x{height}: primary button is painted"));
+        let primary_bottom = f32::from(primary.origin.y) + f32::from(primary.size.height);
+        assert!(
+            primary_bottom <= height + 0.5,
+            "{width}x{height}: painted primary ends at {primary_bottom}"
+        );
     }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[gpui::test]
+async fn clicking_the_label_toggles_the_box(cx: &mut TestAppContext) {
+    cx.update(|cx| gpui_component::init(cx));
+    let dir = scratch("label");
+    let path = dir.join("instance.json");
+    let (window, view) = open(cx, "", &dir, path.clone());
+    let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
+    visual.run_until_parked();
+    assert!(!remembered(&view, &visual));
+
+    draw(&mut visual);
+    let bounds = visual
+        .debug_bounds("auth-remember-instance")
+        .expect("the checkbox row is painted");
+    // The 18 px box is followed by an 8 px gap and the «Запомнить адрес»
+    // label; click the label itself, not the box or the empty row centre.
+    let label = point(
+        bounds.origin.x + px(18. + 8. + 30.),
+        bounds.origin.y + bounds.size.height / 2.0,
+    );
+    click(&mut visual, label);
+    visual.run_until_parked();
+    assert!(
+        remembered(&view, &visual),
+        "a click on the label must toggle the preference"
+    );
+    draw(&mut visual);
+    assert!(
+        visual.debug_bounds("auth-remember-check").is_some(),
+        "the box is painted checked"
+    );
+
+    click(&mut visual, label);
+    visual.run_until_parked();
+    assert!(!remembered(&view, &visual), "the label toggles back");
+    assert!(
+        !path.exists(),
+        "toggling alone must not write the preference"
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[gpui::test]
+async fn logout_keeps_the_remember_box_on_the_address_step(cx: &mut TestAppContext) {
+    use crate::auth_session::{now_unix, Session};
+
+    cx.update(|cx| gpui_component::init(cx));
+    let dir = scratch("logout-remember");
+    let path = dir.join("instance.json");
+    InstancePrefs {
+        remember: true,
+        instance: Some("http://127.0.0.1:1".into()),
+    }
+    .save(&path)
+    .unwrap();
+    let (window, view) = open(cx, "", &dir, path.clone());
+    let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
+    visual.run_until_parked();
+    assert!(remembered(&view, &visual));
+
+    // The state a successful login leaves behind: one signed-in session.
+    visual.update(|_window, app| {
+        view.update(app, |v, cx| {
+            v.session = Some(
+                Session::new(
+                    "http://127.0.0.1:1".into(),
+                    1,
+                    "alice".into(),
+                    "token-1".into(),
+                    now_unix() + 3600,
+                )
+                .expect("session"),
+            );
+            v.session_epoch = v.session_epoch.wrapping_add(1);
+            cx.notify();
+        });
+    });
+
+    visual.update(|window, app| {
+        view.update(app, |v, cx| v.logout(window, cx));
+    });
+    visual.run_until_parked();
+
+    let (screen, remember) =
+        view.read_with(&*visual, |v, _| (v.auth.screen, v.auth.remember_instance));
+    assert_eq!(
+        screen,
+        auth::AuthScreen::Login,
+        "logout shows the login step"
+    );
+    assert!(remember, "logout must keep the saved choice");
+
+    // «Назад» returns to the address step with the same checked box.
+    visual.update(|window, app| {
+        view.update(app, |v, cx| v.back_to_instance(window, cx));
+    });
+    draw(&mut visual);
+    let (screen, origin) = view.read_with(&*visual, |v, _| (v.auth.screen, v.auth.origin.clone()));
+    assert_eq!(screen, auth::AuthScreen::Instance);
+    assert_eq!(origin, "http://127.0.0.1:1");
+    assert!(remembered(&view, &visual));
+    // `debug_bounds` accumulates every selector painted during the test, so
+    // this confirms the checked icon was rendered on the address step; the
+    // state assertion above is the behavioural guarantee.
+    assert!(
+        visual.debug_bounds("auth-remember-check").is_some(),
+        "the address step paints the box checked again"
+    );
+    // Logout itself never rewrites the preference file.
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "{\"remember_instance\":true,\"instance\":\"http://127.0.0.1:1\"}"
+    );
     std::fs::remove_dir_all(dir).unwrap();
 }

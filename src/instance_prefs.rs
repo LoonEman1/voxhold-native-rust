@@ -9,8 +9,11 @@
 use std::path::{Path, PathBuf};
 
 /// Readable failure text shown by the address step. A failed write never
-/// cancels the confirmed origin or the transition to the login step.
-pub const SAVE_ERROR: &str = "Не удалось сохранить адрес. Проверьте доступ к файлу настроек.";
+/// cancels the confirmed origin or the transition to the login step. The
+/// phrase is short enough to wrap onto two 13 px lines inside the narrowest
+/// error box (320 px window), so the reason stays readable instead of being
+/// clipped by the row.
+pub const SAVE_ERROR: &str = "Не удалось сохранить адрес: нет доступа.";
 
 /// Local instance preference. One owner for both the checkbox and the origin.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -343,6 +346,58 @@ mod tests {
         assert_eq!(
             InstancePrefs::load(&path),
             prefs(true, Some("https://chat.example.org"))
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_read_only_target_reports_an_error_and_keeps_the_old_document() {
+        // Restores write access when dropped, so a failing assertion cannot
+        // leave a read-only file that blocks the temporary directory cleanup.
+        struct ReadWrite(PathBuf);
+
+        impl Drop for ReadWrite {
+            fn drop(&mut self) {
+                if let Ok(metadata) = std::fs::metadata(&self.0) {
+                    let mut permissions = metadata.permissions();
+                    permissions.set_readonly(false);
+                    let _ = std::fs::set_permissions(&self.0, permissions);
+                }
+            }
+        }
+
+        let (dir, path) = scratch("instance.json");
+        prefs(true, Some("https://chat.example.org"))
+            .save(&path)
+            .unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&path, permissions).unwrap();
+        let guard = ReadWrite(path.clone());
+
+        let result = prefs(true, Some("https://chat.example.org:8443")).save(&path);
+
+        // Restore write access before any assertion can unwind.
+        drop(guard);
+        assert!(
+            result.is_err(),
+            "a read-only target must report a failure, not skip the write"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "the previous document must stay byte-for-byte intact"
+        );
+        let entries: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            entries,
+            vec!["instance.json".to_string()],
+            "the failed rename must remove its temporary file"
         );
         std::fs::remove_dir_all(dir).unwrap();
     }

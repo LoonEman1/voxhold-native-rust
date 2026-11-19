@@ -758,7 +758,10 @@ impl Voxhold {
                             .items_center()
                             .justify_center()
                             .child(if checked {
-                                icon("icons/check.svg", 12., ink(p.accent_button_ink))
+                                div()
+                                    .debug_selector(|| "auth-remember-check".into())
+                                    .child(icon("icons/check.svg", 12., ink(p.accent_button_ink)))
+                                    .into_any_element()
                             } else {
                                 div().into_any_element()
                             }),
@@ -786,6 +789,7 @@ impl Voxhold {
         root = root.child(
             div()
                 .id("auth-primary")
+                .debug_selector(|| "auth-primary".into())
                 .absolute()
                 .left(px(l.primary.x))
                 .top(px(l.primary.y))

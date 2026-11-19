@@ -1,9 +1,9 @@
 use super::*;
 
 impl Voxhold {
-    pub(super) fn auth_error_row(&self, rect: layout::Rect) -> AnyElement {
+    pub(super) fn auth_error_row(&self, rect: layout::Rect, cx: &mut Context<Self>) -> AnyElement {
         let p = self.palette;
-        div()
+        let mut row = div()
             .absolute()
             .left(px(rect.x))
             .top(px(rect.y))
@@ -26,11 +26,30 @@ impl Voxhold {
             .child(
                 div()
                     .flex_1()
+                    .min_w(px(0.))
+                    .truncate()
                     .text_size(px(13.))
                     .text_color(ink(p.error_text))
                     .child(self.auth.status.clone()),
-            )
-            .into_any_element()
+            );
+        // A transient automatic failure keeps the record, so the same login
+        // can be retried without retyping the address. The link only appears
+        // for the short transient text, which still fits the row.
+        if self.auth.auto_retry && self.auto_record.is_some() {
+            row = row.child(
+                div()
+                    .id("auth-retry-login")
+                    .debug_selector(|| "auth-retry-login".into())
+                    .flex_none()
+                    .text_size(px(12.))
+                    .font_weight(gpui::FontWeight::BOLD)
+                    .text_color(ink(p.lime))
+                    .cursor_pointer()
+                    .on_click(cx.listener(|s, _, window, cx| s.retry_auto_login(window, cx)))
+                    .child("Повторить вход"),
+            );
+        }
+        row.into_any_element()
     }
 
     pub(super) fn auth_field(
@@ -601,8 +620,8 @@ impl Voxhold {
                     div()
                         .id("auth-back")
                         .absolute()
-                        .left(px(l.card.x))
-                        .top(px((l.card.y - 28.0).max(8.0)))
+                        .left(px(l.back.x))
+                        .top(px(l.back.y))
                         .cursor_pointer()
                         .flex()
                         .items_center()
@@ -612,6 +631,22 @@ impl Voxhold {
                         .on_click(cx.listener(|s, _, window, cx| s.back_to_instance(window, cx)))
                         .child(icon("icons/up.svg", 12., ink(p.muted)))
                         .child("Назад"),
+                )
+                // The confirmed origin of this step. It is plain text, not a
+                // new control: the address is changed through «Назад». Its own
+                // measured column starts after the link and wraps, so a long
+                // address is fully visible and cannot cover the link or the
+                // theme toggle.
+                .child(
+                    div()
+                        .absolute()
+                        .left(px(l.origin.x))
+                        .top(px(l.origin.y))
+                        .w(px(l.origin.w))
+                        .line_height(px(15.))
+                        .text_size(px(12.))
+                        .text_color(ink(p.muted))
+                        .child(self.auth.origin.clone()),
                 )
                 // Every label is positioned in client coordinates directly, not
                 // inside another absolutely positioned container.
@@ -708,14 +743,120 @@ impl Voxhold {
         if instance {
             let field = self.instance.clone();
             root = root.child(self.auth_field(&field, l.user, compact, cx));
+            // A separate checkbox under the address field. It owns only the
+            // preference; the origin is written after the form is confirmed.
+            let checked = self.auth.remember_instance;
+            let box_bg = if checked { p.lime } else { p.field_bg };
+            let box_border = if checked { p.lime } else { p.field_border };
+            root = root.child(
+                div()
+                    .id("auth-remember-instance")
+                    .debug_selector(|| "auth-remember-instance".into())
+                    .absolute()
+                    .left(px(l.remember.x))
+                    .top(px(l.remember.y))
+                    .w(px(l.remember.w))
+                    .h(px(l.remember.h))
+                    .cursor_pointer()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .on_click(cx.listener(|s, _, _, cx| {
+                        s.auth.remember_instance = !s.auth.remember_instance;
+                        cx.notify();
+                    }))
+                    .child(
+                        div()
+                            .w(px(18.))
+                            .h(px(18.))
+                            .rounded(px(4.))
+                            .bg(ink(box_bg))
+                            .border_1()
+                            .border_color(ink(box_border))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(if checked {
+                                div()
+                                    .debug_selector(|| "auth-remember-check".into())
+                                    .child(icon("icons/check.svg", 12., ink(p.accent_button_ink)))
+                                    .into_any_element()
+                            } else {
+                                div().into_any_element()
+                            }),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(13.))
+                            .text_color(ink(p.muted))
+                            .child("Запомнить адрес"),
+                    ),
+            );
         } else {
             let username = self.username.clone();
             let password = self.password.clone();
             root = root.child(self.auth_field(&username, l.user, compact, cx));
             root = root.child(self.auth_field(&password, l.password, compact, cx));
+            // «Запомнить вход» lives on the password label row so the login
+            // card keeps the reference geometry. Both the 18 px box and the
+            // caption toggle the same preference.
+            let checked = self.auth.remember_login;
+            let box_bg = if checked { p.lime } else { p.field_bg };
+            let box_border = if checked { p.lime } else { p.field_border };
+            root = root.child(
+                div()
+                    .id("auth-remember-login")
+                    .debug_selector(|| "auth-remember-login".into())
+                    .absolute()
+                    .left(px(l.remember_login.x))
+                    .top(px(l.remember_login.y))
+                    .w(px(l.remember_login.w))
+                    .h(px(l.remember_login.h))
+                    .cursor_pointer()
+                    .flex()
+                    .items_center()
+                    .justify_end()
+                    .gap(px(8.))
+                    .on_click(cx.listener(|s, _, _, cx| {
+                        // Toggling owns the automatic attempt: a late success
+                        // for the old state must never enter the workspace.
+                        s.auto_attempt = s.auto_attempt.wrapping_add(1);
+                        s.auth.auto_login = false;
+                        s.auth.auto_retry = false;
+                        s.auto_record = None;
+                        s.auth.remember_login = !s.auth.remember_login;
+                        cx.notify();
+                    }))
+                    .child(
+                        div()
+                            .w(px(18.))
+                            .h(px(18.))
+                            .rounded(px(4.))
+                            .bg(ink(box_bg))
+                            .border_1()
+                            .border_color(ink(box_border))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(if checked {
+                                div()
+                                    .debug_selector(|| "auth-remember-login-check".into())
+                                    .child(icon("icons/check.svg", 12., ink(p.accent_button_ink)))
+                                    .into_any_element()
+                            } else {
+                                div().into_any_element()
+                            }),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(ink(p.muted))
+                            .child("Запомнить вход"),
+                    ),
+            );
         }
         // Primary action: "Продолжить" on the address step, then sign-in.
-        let busy = self.auth.busy;
+        let busy = self.auth.busy || self.auth.auto_login;
         let accent = if busy {
             rgba((p.lime << 8) | 0x8c)
         } else {
@@ -724,6 +865,7 @@ impl Voxhold {
         root = root.child(
             div()
                 .id("auth-primary")
+                .debug_selector(|| "auth-primary".into())
                 .absolute()
                 .left(px(l.primary.x))
                 .top(px(l.primary.y))
@@ -754,7 +896,7 @@ impl Voxhold {
                 }),
         );
         if !self.auth.status.is_empty() {
-            root = root.child(self.auth_error_row(l.error));
+            root = root.child(self.auth_error_row(l.error, cx));
         }
         root.into_any_element()
     }

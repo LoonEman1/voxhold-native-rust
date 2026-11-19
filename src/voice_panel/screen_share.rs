@@ -25,6 +25,9 @@ pub(crate) const RESTART_WARNING: &str =
     "Изменение качества перезапустит трансляцию: текущая сессия будет остановлена, зрители увидят новое подключение.";
 /// A Start pressed before the endpoint probe answered; cleared by the answer.
 pub(crate) const AUDIO_PENDING_REASON: &str = "Дождитесь проверки системного звука.";
+/// A session rotation restarts the call lease, so the old publication cannot
+/// survive it. Say that plainly instead of letting the card disappear.
+pub(crate) const SCREEN_ROTATION_NOTICE: &str = "Трансляция остановлена после обновления сессии.";
 
 /// The account socket always authenticates with `multi_streams: true`
 /// (`crates/voxhold-api/src/lib.rs:638`), so the client capability is known.
@@ -216,6 +219,12 @@ impl VoicePanel {
 
     pub fn screen_share_open(&self) -> bool {
         self.screen.open
+    }
+
+    /// The room-level screen-share message, if any. Today it is the explicit
+    /// notice that a session rotation stopped the broadcast.
+    pub fn screen_share_notice(&self) -> Option<&str> {
+        (!self.screen_notice.is_empty()).then_some(self.screen_notice.as_str())
     }
 
     /// Whether a Start was pressed and the worker has not answered yet.
@@ -534,6 +543,9 @@ impl VoicePanel {
         self.screen.last_request = Some(request);
         self.screen.busy = true;
         self.screen.error.clear();
+        // A new publication replaces the old state, so the notice about the
+        // broadcast a rotation stopped no longer describes this room.
+        self.screen_notice.clear();
         cx.notify();
     }
 

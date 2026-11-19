@@ -48,25 +48,31 @@ impl Voxhold {
             )
             .child(
                 div()
-                    .id("inbox-open")
+                    .id("messages-open")
+                    .debug_selector(|| "messages-open".into())
                     .w(px(48.))
                     .h(px(48.))
                     .rounded(px(14.))
-                    .bg(ink(p.surface))
+                    .bg(if self.personal_mode {
+                        ink(p.selection)
+                    } else {
+                        ink(p.surface)
+                    })
                     .flex()
                     .items_center()
                     .justify_center()
                     .cursor_pointer()
-                    .child(icon("icons/inbox.svg", 18., ink(p.muted)))
-                    .on_click(cx.listener(|s, _, _, cx| {
-                        s.show_inbox = !s.show_inbox;
-                        if s.show_inbox {
-                            s.show_search = false;
-                            s.message_menu = None;
-                            s.forward = None;
-                            s.refresh_recents(cx);
+                    .child(icon(
+                        "icons/message.svg",
+                        18.,
+                        ink(if self.personal_mode { p.fg } else { p.muted }),
+                    ))
+                    .on_click(cx.listener(|s, _, window, cx| {
+                        if s.personal_mode {
+                            s.return_to_channels(window, cx);
+                        } else {
+                            s.enter_personal_mode(window, cx);
                         }
-                        cx.notify();
                     })),
             );
         rail.child(div().flex_1())
@@ -94,6 +100,20 @@ impl Voxhold {
     pub(super) fn open_server(&mut self, id: i64, window: &mut Window, cx: &mut Context<Self>) {
         self.show_servers = false;
         self.show_inbox = false;
+        if self.personal_mode {
+            self.personal_mode = false;
+            self.personal_return = None;
+            self.messaging.epoch = self.messaging.epoch.wrapping_add(1);
+            self.messaging.clear_search();
+            self.messaging.creator = None;
+            self._creator_subscriptions.clear();
+            self.messaging.notifications = None;
+            self.messaging.older_request = None;
+            self.messaging.open_request = None;
+            self.conversation = None;
+            self.channel = 0;
+            self.reset_personal_chat(window, cx);
+        }
         self.close_stale_settings(id, 0, window, cx);
         if self.server != id
             || self.access_pending

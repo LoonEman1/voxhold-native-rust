@@ -700,13 +700,7 @@ impl Voxhold {
         cx.spawn_in(window, async move |this, window| {
             let result = task.await;
             let _ = this.update_in(window, |s, window, cx| {
-                if s.generation != generation
-                    || s.access_generation != access
-                    || s.refresh_request != Some(request)
-                    || s.chat_key() != chat
-                    || s.server != server
-                    || s.channel != channel
-                {
+                if !s.accepts_refresh_reply(request, generation, access, chat, server, channel) {
                     return;
                 }
                 s.refresh_request = None;
@@ -739,10 +733,10 @@ impl Voxhold {
                         voxhold_api::Error::Http(403) | voxhold_api::Error::Http(404)
                             if conversation =>
                         {
-                            s.messages.clear();
-                            s.history_keys.clear();
-                            s.history_list.reset(0);
-                            s.error = "Диалог недоступен.".into();
+                            // A revoked or deleted conversation owns no
+                            // ChatKey: clear pending sends/drafts and let the
+                            // index answer reconcile the missing row.
+                            s.clear_active_conversation(Some("Диалог недоступен."), window, cx);
                             s.refresh_recents(cx);
                         }
                         voxhold_api::Error::Http(403) | voxhold_api::Error::Http(404) => {
@@ -811,6 +805,26 @@ impl Voxhold {
         }
     }
 
+    /// Guard for one history refresh answer. A clear/leave/403 bumps the
+    /// generation and request slot, so its late answer cannot repaint.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn accepts_refresh_reply(
+        &self,
+        request: u64,
+        generation: u64,
+        access: u64,
+        chat: draft::ChatKey,
+        server: i64,
+        channel: i64,
+    ) -> bool {
+        self.refresh_request == Some(request)
+            && self.generation == generation
+            && self.access_generation == access
+            && self.chat_key() == chat
+            && self.server == server
+            && self.channel == channel
+    }
+
     pub(super) fn load_older(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.loading_older
             || !self.has_more
@@ -877,7 +891,8 @@ impl Voxhold {
                     Err(voxhold_api::Error::Http(403) | voxhold_api::Error::Http(404))
                         if conversation =>
                     {
-                        s.older_error = "Диалог недоступен.".into();
+                        s.clear_active_conversation(Some("Диалог недоступен."), window, cx);
+                        s.refresh_recents(cx);
                     }
                     Err(voxhold_api::Error::Http(403) | voxhold_api::Error::Http(404)) => {
                         s.invalidate_access(window, cx);

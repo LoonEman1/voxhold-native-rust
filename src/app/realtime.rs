@@ -660,9 +660,12 @@ impl Voxhold {
             "conversation.message" if !self.access_pending => {
                 if let Ok(message) = serde_json::from_value::<Message>(data.clone()) {
                     if self.in_conversation() && message.conversation_id == self.channel {
-                        self.merge_message(true, message);
+                        self.merge_message(true, message.clone());
                         self.trim_history(false);
                     }
+                    // The rail/sidebar index follows another device even when
+                    // the active window is a different conversation.
+                    self.note_conversation_message(&message);
                 }
                 effect.recents = true;
             }
@@ -685,6 +688,9 @@ impl Voxhold {
                     && data["conversation_id"].as_i64() == Some(self.channel);
                 if matches {
                     effect.resync = true;
+                    // The next index answer updates the row when it still
+                    // exists and clears the active ChatKey when it is gone.
+                    self.conversations_reconcile = true;
                 }
                 effect.recents = true;
             }
@@ -700,8 +706,21 @@ impl Voxhold {
                     }
                 }
             }
-            "conversation.notification" | "conversation.read" => {
+            "conversation.notification" => {
                 effect.recents = true;
+            }
+            "conversation.read" => {
+                if let Some(id) = data["conversation_id"].as_i64() {
+                    self.note_conversation_read(id);
+                }
+                effect.recents = true;
+            }
+            "conversation.settings" => {
+                if let (Some(id), Some(muted)) =
+                    (data["conversation_id"].as_i64(), data["muted"].as_bool())
+                {
+                    self.apply_conversation_settings(id, muted);
+                }
             }
             "attachments.changed" if !self.access_pending => {
                 if data["channel_id"].as_i64() == Some(self.channel) {

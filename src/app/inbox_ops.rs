@@ -2,62 +2,6 @@ use super::*;
 use crate::inbox::{conversation_peer, conversation_title, ConversationTile};
 
 impl Voxhold {
-    /// Go `RefreshRecentConversations`: one request at a time, a new request
-    /// during one in flight is coalesced into a single follow-up.
-    pub(super) fn refresh_recents(&mut self, cx: &mut Context<Self>) {
-        let Some(client) = self.client.clone() else {
-            return;
-        };
-        if self.recents_request.is_some() {
-            self.recents_again = true;
-            return;
-        }
-        self.action_seq = self.action_seq.wrapping_add(1);
-        let request = self.action_seq;
-        self.recents_request = Some(request);
-        if let Some(inbox) = &self.inbox {
-            inbox.update(cx, |inbox, cx| inbox.set_loading(true, cx));
-        }
-        let runtime = self.runtime.clone();
-        let session = self.session_generation;
-        let task =
-            cx.background_spawn(async move { runtime.block_on(client.recent_conversations()) });
-        cx.spawn(async move |this, cx| {
-            let result = task.await;
-            if let Some(this) = this.upgrade() {
-                this.update(cx, |s, cx| {
-                    if s.session_generation != session || s.recents_request != Some(request) {
-                        return;
-                    }
-                    s.recents_request = None;
-                    match result {
-                        Ok(values) => {
-                            s.conversations = values;
-                            if let Some(inbox) = &s.inbox {
-                                let error = String::new();
-                                inbox.update(cx, |inbox, cx| inbox.set_error(error, cx));
-                            }
-                        }
-                        Err(error) => {
-                            if let Some(inbox) = &s.inbox {
-                                inbox.update(cx, |inbox, cx| {
-                                    inbox.set_loading(false, cx);
-                                    inbox.set_error(error.to_string(), cx);
-                                });
-                            }
-                        }
-                    }
-                    if std::mem::take(&mut s.recents_again) {
-                        s.refresh_recents(cx);
-                    }
-                    cx.notify();
-                })
-                .ok();
-            }
-        })
-        .detach();
-    }
-
     /// Build the popup rows, including the peer avatar requested from the
     /// shared bounded cache when the server member list exposes a version.
     pub(super) fn inbox_tiles(
@@ -142,6 +86,10 @@ impl Voxhold {
         self.show_search = false;
         self.show_inbox = false;
         self.show_channels = false;
+        self.messaging.clear_leave();
+        self.messaging.notifications = None;
+        self.messaging.creator = None;
+        self._creator_subscriptions.clear();
         self.message_menu = None;
         self.forward = None;
         self.editing = None;
@@ -154,6 +102,7 @@ impl Voxhold {
         self.hovered_message = 0;
         self.hovered_action = None;
         let id = conversation.id;
+        self.conversation_select_seq = self.conversation_select_seq.wrapping_add(1);
         self.conversation = Some(conversation);
         self.channel = id;
         let key = self.chat_key();
@@ -215,6 +164,7 @@ impl Voxhold {
         self.error.clear();
         self.update_channel_subscription(false);
         self.refresh_history(window, cx);
+        self.load_conversation_notifications(cx);
         cx.notify();
     }
 }

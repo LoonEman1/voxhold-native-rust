@@ -29,6 +29,18 @@ impl Voxhold {
 
     pub(super) fn select_server(&mut self, id: i64, window: &mut Window, cx: &mut Context<Self>) {
         let Some(c) = self.client.clone() else { return };
+        if self.personal_mode {
+            self.personal_mode = false;
+            self.personal_return = None;
+            self.messaging.epoch = self.messaging.epoch.wrapping_add(1);
+            self.messaging.clear_search();
+            self.messaging.creator = None;
+            self._creator_subscriptions.clear();
+            self.messaging.notifications = None;
+            self.messaging.older_request = None;
+            self.messaging.open_request = None;
+            self.conversation = None;
+        }
         let previous = self.chat_key();
         if previous.channel != 0 {
             let text = self.composer.read(cx).value().to_string();

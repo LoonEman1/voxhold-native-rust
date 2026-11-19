@@ -2,6 +2,7 @@ use super::*;
 
 impl Render for Voxhold {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.finish_personal_cleanup(window, cx);
         let viewport = window.viewport_size();
         self.viewport = (viewport.width.into(), viewport.height.into());
         if !self.ui_scale_pinned {
@@ -240,7 +241,8 @@ impl Render for Voxhold {
             None
         };
         let channels_open = !mobile || self.show_channels;
-        let l = layout::compute_layout(vw, vh, self.shell, channels_open, self.show_members);
+        let members_open = self.show_members && !self.personal_mode;
+        let l = layout::compute_layout(vw, vh, self.shell, channels_open, members_open);
         #[cfg(feature = "voxhold-media")]
         self.sync_push_to_talk_block(cx);
         #[cfg(feature = "voxhold-media")]
@@ -256,13 +258,16 @@ impl Render for Voxhold {
                     .child(self.rail(cx)),
             );
         }
+        let personal_empty = self.personal_mode && self.conversation.is_none();
         let selected = self.channels.iter().find(|c| c.id == self.channel).cloned();
         let readable = self.conversation.is_some() || self.channel_chat_readable(self.channel);
         let writable = self.conversation.is_some() || self.channel_chat_writable(self.channel);
         let thread_active = self.show_thread && self.thread.is_some();
-        let voice_room = self.voice_room_visible();
+        let voice_room = !personal_empty && self.voice_room_visible();
         let room_chat = voice_room && self.voice_chat_open();
-        let history = if voice_room {
+        let history = if personal_empty {
+            self.personal_center(window, cx)
+        } else if voice_room {
             div().into_any_element()
         } else if thread_active {
             div()
@@ -273,7 +278,13 @@ impl Render for Voxhold {
         } else {
             self.render_history(window, cx, l.chat, mobile, false)
         };
-        let title = if let Some(conversation) = &self.conversation {
+        let title = if personal_empty {
+            if self.messaging.creator.is_some() {
+                "Новый разговор".into()
+            } else {
+                "Сообщения".into()
+            }
+        } else if let Some(conversation) = &self.conversation {
             inbox::conversation_title(conversation, self.self_user_id)
         } else {
             selected
@@ -299,137 +310,318 @@ impl Render for Voxhold {
         };
         let mut chat = div().relative().size_full().flex().flex_col().bg(ink(p.bg));
         let show_labels = l.chat.w > 860.0 && !mobile;
-        let header = div()
-            .h(px(if mobile { 58. } else { 67. }))
-            .px(px(16.))
-            .items_center()
-            .bg(ink(p.surface))
-            .border_b_1()
-            .border_color(ink(p.line))
-            .flex()
-            .justify_between()
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_3()
-                    .when(mobile, |row| {
-                        row.child(
-                            div()
-                                .id("channels-toggle")
-                                .cursor_pointer()
-                                .text_color(ink(p.muted))
-                                .on_click(cx.listener(|s, _, _, cx| {
-                                    s.show_channels = !s.show_channels;
-                                    cx.notify();
-                                }))
-                                .child(icon("icons/menu.svg", 18., ink(p.muted))),
-                        )
-                    })
-                    .child(
-                        div()
-                            .text_size(px(15.))
-                            .font_weight(gpui::FontWeight::BOLD)
-                            .child(title),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_3()
-                    .text_size(px(13.))
-                    .text_color(ink(p.muted))
-                    .child(self.update_icon(cx))
-                    .when(
-                        voice_room
-                            && !self.access_pending
-                            && self.voice_chat_available(self.channel),
-                        |row| {
-                            let color = if room_chat { p.fg } else { p.muted };
+        let header: AnyElement = if personal_empty {
+            div()
+                .h(px(if mobile { 58. } else { 67. }))
+                .px(px(16.))
+                .items_center()
+                .bg(ink(p.surface))
+                .border_b_1()
+                .border_color(ink(p.line))
+                .flex()
+                .justify_between()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_3()
+                        .when(mobile, |row| {
                             row.child(
                                 div()
-                                    .id("toggle-room-chat")
-                                    .debug_selector(|| "toggle-room-chat".into())
-                                    .px(px(7.))
-                                    .py(px(4.))
-                                    .rounded(px(7.))
+                                    .id("messages-toggle")
+                                    .cursor_pointer()
+                                    .text_color(ink(p.muted))
+                                    .on_click(cx.listener(|s, _, _, cx| {
+                                        s.show_channels = !s.show_channels;
+                                        cx.notify();
+                                    }))
+                                    .child(icon("icons/menu.svg", 18., ink(p.muted))),
+                            )
+                        })
+                        .child(
+                            div()
+                                .text_size(px(15.))
+                                .font_weight(gpui::FontWeight::BOLD)
+                                .child(title),
+                        ),
+                )
+                .child(
+                    div()
+                        .id("messages-return")
+                        .debug_selector(|| "messages-return".into())
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .cursor_pointer()
+                        .text_size(px(13.))
+                        .text_color(ink(p.muted))
+                        .on_click(cx.listener(|s, _, window, cx| s.return_to_channels(window, cx)))
+                        .child(icon("icons/hash.svg", 16., ink(p.muted)))
+                        .child("К каналам"),
+                )
+                .into_any_element()
+        } else {
+            div()
+                .h(px(if mobile { 58. } else { 67. }))
+                .px(px(16.))
+                .items_center()
+                .bg(ink(p.surface))
+                .border_b_1()
+                .border_color(ink(p.line))
+                .flex()
+                .justify_between()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_3()
+                        .when(mobile, |row| {
+                            row.child(
+                                div()
+                                    .id("channels-toggle")
+                                    .cursor_pointer()
+                                    .text_color(ink(p.muted))
+                                    .on_click(cx.listener(|s, _, _, cx| {
+                                        s.show_channels = !s.show_channels;
+                                        cx.notify();
+                                    }))
+                                    .child(icon("icons/menu.svg", 18., ink(p.muted))),
+                            )
+                        })
+                        .child(
+                            div()
+                                .text_size(px(15.))
+                                .font_weight(gpui::FontWeight::BOLD)
+                                .child(title),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_3()
+                        .text_size(px(13.))
+                        .text_color(ink(p.muted))
+                        .child(self.update_icon(cx))
+                        .when(self.personal_mode, |row| {
+                            row.child(
+                                div()
+                                    .id("messages-return")
+                                    .debug_selector(|| "messages-return".into())
                                     .flex()
                                     .items_center()
                                     .gap_2()
                                     .cursor_pointer()
-                                    .bg(ink(if room_chat { p.selection } else { p.surface }))
-                                    .text_color(ink(color))
                                     .on_click(cx.listener(|s, _, window, cx| {
-                                        s.toggle_voice_chat(window, cx)
+                                        s.return_to_channels(window, cx)
                                     }))
-                                    .child(icon("icons/chat.svg", 16., ink(color)))
-                                    .when(show_labels, |button| button.child("Чат")),
+                                    .child(icon("icons/hash.svg", 16., ink(p.muted)))
+                                    .when(show_labels, |button| button.child("К каналам")),
                             )
-                        },
-                    )
-                    .child(
-                        div()
-                            .id("toggle-search")
-                            .debug_selector(|| "toggle-search".into())
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .cursor_pointer()
-                            .on_click(cx.listener(|s, _, window, cx| {
-                                s.open_search_popup(false, window, cx)
-                            }))
-                            .child(icon("icons/search.svg", 16., ink(p.muted)))
-                            .when(show_labels, |button| button.child("Поиск")),
-                    )
-                    .when(self.server != 0 && self.conversation.is_none(), |row| {
-                        row.child(
-                            div()
-                                .id("toggle-recordings")
-                                .flex()
-                                .items_center()
-                                .gap_2()
-                                .cursor_pointer()
-                                .track_focus(&self.recordings_entry_focus)
-                                .tab_index(0)
-                                .on_click(cx.listener(|s, _, window, cx| {
-                                    s.toggle_recordings("header", window, cx)
-                                }))
-                                .child(icon("icons/inbox.svg", 16., ink(p.muted)))
-                                .when(show_labels, |button| button.child("Записи")),
+                        })
+                        .when(
+                            voice_room
+                                && !self.access_pending
+                                && self.voice_chat_available(self.channel),
+                            |row| {
+                                let color = if room_chat { p.fg } else { p.muted };
+                                row.child(
+                                    div()
+                                        .id("toggle-room-chat")
+                                        .debug_selector(|| "toggle-room-chat".into())
+                                        .px(px(7.))
+                                        .py(px(4.))
+                                        .rounded(px(7.))
+                                        .flex()
+                                        .items_center()
+                                        .gap_2()
+                                        .cursor_pointer()
+                                        .bg(ink(if room_chat { p.selection } else { p.surface }))
+                                        .text_color(ink(color))
+                                        .on_click(cx.listener(|s, _, window, cx| {
+                                            s.toggle_voice_chat(window, cx)
+                                        }))
+                                        .child(icon("icons/chat.svg", 16., ink(color)))
+                                        .when(show_labels, |button| button.child("Чат")),
+                                )
+                            },
                         )
-                    })
-                    .when(!self.conversation.is_some(), |row| {
-                        row.child(
-                            div()
-                                .id("toggle-pins")
-                                .flex()
-                                .items_center()
-                                .gap_2()
-                                .cursor_pointer()
-                                .on_click(cx.listener(|s, _, window, cx| {
-                                    s.open_search_popup(true, window, cx)
-                                }))
-                                .child(icon("icons/pin.svg", 16., ink(p.muted)))
-                                .when(show_labels, |button| button.child("Закрепы")),
+                        .when(!self.personal_mode, |row| {
+                            row.child(
+                                div()
+                                    .id("toggle-search")
+                                    .debug_selector(|| "toggle-search".into())
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .cursor_pointer()
+                                    .on_click(cx.listener(|s, _, window, cx| {
+                                        s.open_search_popup(false, window, cx)
+                                    }))
+                                    .child(icon("icons/search.svg", 16., ink(p.muted)))
+                                    .when(show_labels, |button| button.child("Поиск")),
+                            )
+                        })
+                        .when(
+                            self.server != 0 && !self.personal_mode && self.conversation.is_none(),
+                            |row| {
+                                row.child(
+                                    div()
+                                        .id("toggle-recordings")
+                                        .flex()
+                                        .items_center()
+                                        .gap_2()
+                                        .cursor_pointer()
+                                        .track_focus(&self.recordings_entry_focus)
+                                        .tab_index(0)
+                                        .on_click(cx.listener(|s, _, window, cx| {
+                                            s.toggle_recordings("header", window, cx)
+                                        }))
+                                        .child(icon("icons/inbox.svg", 16., ink(p.muted)))
+                                        .when(show_labels, |button| button.child("Записи")),
+                                )
+                            },
                         )
-                    })
-                    .child(
-                        div()
-                            .id("members-toggle")
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .cursor_pointer()
-                            .on_click(cx.listener(|s, _, _, cx| {
-                                let open = !s.show_members;
-                                s.set_members_open(open, cx);
-                            }))
-                            .child(icon("icons/people.svg", 16., ink(p.muted)))
-                            .when(show_labels, |button| button.child("Участники")),
-                    ),
-            );
+                        .when(!self.personal_mode && !self.conversation.is_some(), |row| {
+                            row.child(
+                                div()
+                                    .id("toggle-pins")
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .cursor_pointer()
+                                    .on_click(cx.listener(|s, _, window, cx| {
+                                        s.open_search_popup(true, window, cx)
+                                    }))
+                                    .child(icon("icons/pin.svg", 16., ink(p.muted)))
+                                    .when(show_labels, |button| button.child("Закрепы")),
+                            )
+                        })
+                        .when(!self.personal_mode, |row| {
+                            row.child(
+                                div()
+                                    .id("members-toggle")
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .cursor_pointer()
+                                    .on_click(cx.listener(|s, _, _, cx| {
+                                        let open = !s.show_members;
+                                        s.set_members_open(open, cx);
+                                    }))
+                                    .child(icon("icons/people.svg", 16., ink(p.muted)))
+                                    .when(show_labels, |button| button.child("Участники")),
+                            )
+                        })
+                        .when(self.in_conversation(), |row| {
+                            let note = self
+                                .messaging
+                                .notifications
+                                .as_ref()
+                                .filter(|note| note.id == self.channel);
+                            let loaded = note.is_some_and(|note| note.loaded);
+                            let pending = note.is_some_and(|note| note.pending);
+                            let muted = note
+                                .map(|note| note.muted)
+                                .or_else(|| self.conversation.as_ref().map(|row| row.muted))
+                                .unwrap_or(false);
+                            let label = if pending {
+                                "…"
+                            } else if muted {
+                                "Без звука"
+                            } else {
+                                "Уведомления"
+                            };
+                            row.child(
+                                div()
+                                    .id("conversation-mute")
+                                    .debug_selector(|| "conversation-mute".into())
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .cursor_pointer()
+                                    .when(!loaded || pending, |button| button.opacity(0.55))
+                                    .on_click(cx.listener(|s, _, _, cx| {
+                                        if s.messaging
+                                            .notifications
+                                            .as_ref()
+                                            .is_some_and(|note| note.loaded && !note.pending)
+                                        {
+                                            s.toggle_conversation_mute(cx);
+                                        }
+                                    }))
+                                    .child(icon("icons/bell.svg", 16., ink(p.muted)))
+                                    .when(show_labels, |button| button.child(label)),
+                            )
+                            .when(
+                                self.conversation.as_ref().is_some_and(|chat| !chat.direct),
+                                |row| {
+                                    row.child(
+                                        div()
+                                            .id("conversation-leave")
+                                            .debug_selector(|| "conversation-leave".into())
+                                            .flex()
+                                            .items_center()
+                                            .gap_2()
+                                            .cursor_pointer()
+                                            .text_color(ink(p.danger))
+                                            .on_click(cx.listener(|s, _, _, cx| {
+                                                s.request_leave_conversation(cx)
+                                            }))
+                                            .child("Покинуть беседу"),
+                                    )
+                                },
+                            )
+                        }),
+                )
+                .into_any_element()
+        };
         chat = chat.child(header);
+        if self.in_conversation()
+            && (self.messaging.leave_confirm || !self.messaging.leave_error.is_empty())
+        {
+            let mut bar = div()
+                .px(px(16.))
+                .py(px(6.))
+                .flex()
+                .items_center()
+                .gap_3()
+                .text_size(px(12.))
+                .border_b_1()
+                .border_color(ink(p.line))
+                .child("Покинуть беседу?");
+            if !self.messaging.leave_error.is_empty() {
+                bar = bar.child(
+                    div()
+                        .text_color(ink(p.danger))
+                        .child(self.messaging.leave_error.clone()),
+                );
+            }
+            bar = bar
+                .child(
+                    div()
+                        .id("conversation-leave-yes")
+                        .debug_selector(|| "conversation-leave-yes".into())
+                        .cursor_pointer()
+                        .text_color(ink(p.danger))
+                        .on_click(
+                            cx.listener(|s, _, window, cx| {
+                                s.confirm_leave_conversation(window, cx)
+                            }),
+                        )
+                        .child("Да"),
+                )
+                .child(
+                    div()
+                        .id("conversation-leave-no")
+                        .debug_selector(|| "conversation-leave-no".into())
+                        .cursor_pointer()
+                        .text_color(ink(p.muted))
+                        .on_click(cx.listener(|s, _, _, cx| s.cancel_leave_conversation(cx)))
+                        .child("Нет"),
+                );
+            chat = chat.child(bar);
+        }
         chat = chat.child(history);
         if self.access_pending {
             let status = div().p_2().text_color(ink(p.muted));
@@ -551,22 +743,28 @@ impl Render for Voxhold {
                                 s.show_channels = !s.show_channels;
                                 cx.notify();
                             }))
-                            .child("Каналы"),
+                            .child(if self.personal_mode {
+                                "Сообщения"
+                            } else {
+                                "Каналы"
+                            }),
                     )
-                    .child(
-                        div()
-                            .id("bottom-members")
-                            .flex_1()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .cursor_pointer()
-                            .on_click(cx.listener(|s, _, _, cx| {
-                                let open = !s.show_members;
-                                s.set_members_open(open, cx);
-                            }))
-                            .child("Участники"),
-                    )
+                    .when(!self.personal_mode, |row| {
+                        row.child(
+                            div()
+                                .id("bottom-members")
+                                .flex_1()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .cursor_pointer()
+                                .on_click(cx.listener(|s, _, _, cx| {
+                                    let open = !s.show_members;
+                                    s.set_members_open(open, cx);
+                                }))
+                                .child("Участники"),
+                        )
+                    })
                     .child(
                         div()
                             .id("bottom-settings")
@@ -597,6 +795,11 @@ impl Render for Voxhold {
             );
         }
         if l.is_channels_open() {
+            let panel = if self.personal_mode {
+                self.messages_panel(window, cx)
+            } else {
+                self.channels_panel(window, cx)
+            };
             root = root.child(
                 div()
                     .absolute()
@@ -605,7 +808,7 @@ impl Render for Voxhold {
                     .w(px(l.channels.w))
                     .h(px(l.channels.h))
                     .shadow_lg()
-                    .child(self.channels_panel(window, cx)),
+                    .child(panel),
             );
         }
         if l.is_members_open() {

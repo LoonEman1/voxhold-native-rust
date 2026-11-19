@@ -1,7 +1,12 @@
 mod channel;
 mod client_extra;
+mod conversations;
 mod recordings;
 mod session;
+pub use conversations::{
+    valid_cursor, ConversationNotification, ConversationPage, ConversationSearchHit,
+    ConversationSearchPage, MAX_LIMIT, MAX_NAME_RUNES, MAX_QUERY_RUNES, MAX_USERS,
+};
 use futures_util::{SinkExt, StreamExt};
 pub use recordings::{
     Recording, RecordingList, RECORDING_DELETED, RECORDING_FAILED, RECORDING_LOCAL_ONLY,
@@ -320,12 +325,12 @@ impl Client {
         )
         .await
     }
+    /// The popup/rail keeps the R04 single-page view; the paged personal index
+    /// uses `conversations_page` instead.
     pub async fn recent_conversations(&self) -> Result<Vec<Conversation>> {
-        let v: Value = self
-            .request(Method::GET, "/api/v1/me/conversations?limit=13", None)
-            .await?;
-        let rows: Vec<Conversation> = serde_json::from_value(v["conversations"].clone())?;
-        Ok(rows
+        let page = self.conversations_page(13, None).await?;
+        Ok(page
+            .conversations
             .into_iter()
             .filter(|c| c.id > 0 && !c.saved)
             .take(12)

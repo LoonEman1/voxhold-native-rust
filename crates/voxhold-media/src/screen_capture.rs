@@ -32,7 +32,7 @@ pub const MAX_PREVIEW_BYTES: usize = 4 * 1024 * 1024;
 const MAX_CAPTURE_SIDE: u32 = 4096;
 
 /// What kind of source is captured.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum SourceKind {
     Monitor,
     Window,
@@ -71,6 +71,132 @@ impl ScreenSource {
             self.title.clone()
         }
     }
+
+    /// The stable identity of the source: the category plus the capturer id.
+    /// Titles, sizes and list order are presentation data and never identity.
+    pub fn source_id(&self) -> SourceId {
+        SourceId {
+            kind: self.kind,
+            id: self.id,
+        }
+    }
+}
+
+/// Identity of one capture source for the whole picker lifetime.
+///
+/// A window id is its `HWND`; a monitor id is the capturer's screen id. Both
+/// stay stable across re-enumerations, so selection, focus, labels and the
+/// publish request all bind to this value instead of a position or a whole
+/// [`ScreenSource`] snapshot.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct SourceId {
+    pub kind: SourceKind,
+    pub id: u64,
+}
+
+impl std::fmt::Debug for SourceId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let kind = match self.kind {
+            SourceKind::Monitor => "monitor",
+            SourceKind::Window => "window",
+        };
+        write!(f, "{kind}:{}", self.id)
+    }
+}
+
+/// One monitor as Windows enumerates it. The device name is the only string
+/// that can be matched against the capturer's own source title.
+#[cfg_attr(not(windows), allow(dead_code))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct MonitorDescriptor {
+    pub device: String,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// Match a capturer source title to the monitor descriptor it names.
+///
+/// The pinned capturer does not report a usable display id on every host, so
+/// list order must never attach metadata. An exact device substring wins;
+/// otherwise the display number at the end of the device name is matched
+/// against a number in the title. An absent or ambiguous match is `None`, so
+/// the caller keeps the size unknown instead of borrowing a neighbour's.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn monitor_descriptor_for_title<'a>(
+    title: &str,
+    monitors: &'a [MonitorDescriptor],
+) -> Option<&'a MonitorDescriptor> {
+    let title = title.trim().to_lowercase();
+    if title.is_empty() {
+        return None;
+    }
+    let named: Vec<&MonitorDescriptor> = monitors
+        .iter()
+        .filter(|monitor| {
+            let device = monitor.device.trim().to_lowercase();
+            !device.is_empty() && title.contains(&device)
+        })
+        .collect();
+    if !named.is_empty() {
+        // Only a unique longest device name is trusted, so a device that is a
+        // prefix of another one cannot pick the wrong monitor.
+        let longest = named
+            .iter()
+            .max_by_key(|monitor| monitor.device.len())
+            .copied()?;
+        let tied = named
+            .iter()
+            .filter(|monitor| monitor.device.len() == longest.device.len())
+            .count();
+        return (tied == 1).then_some(longest);
+    }
+    // Fall back to the display number, e.g. `\\.\DISPLAY2` -> 2.
+    let numbers = title_numbers(&title);
+    let mut matched = monitors.iter().filter(|monitor| {
+        display_number(&monitor.device).is_some_and(|number| numbers.contains(&number))
+    });
+    let first = matched.next()?;
+    matched.next().is_none().then_some(first)
+}
+
+/// Trailing number of a device name such as `\\.\DISPLAY2`.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn display_number(device: &str) -> Option<u64> {
+    let digits: String = device
+        .chars()
+        .rev()
+        .take_while(|character| character.is_ascii_digit())
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+    if digits.is_empty() {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+/// Every number that appears in a title, in order.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn title_numbers(title: &str) -> Vec<u64> {
+    let mut numbers = Vec::new();
+    let mut current = String::new();
+    for character in title.chars() {
+        if character.is_ascii_digit() {
+            current.push(character);
+        } else if !current.is_empty() {
+            if let Ok(number) = current.parse::<u64>() {
+                numbers.push(number);
+            }
+            current.clear();
+        }
+    }
+    if !current.is_empty() {
+        if let Ok(number) = current.parse::<u64>() {
+            numbers.push(number);
+        }
+    }
+    numbers
 }
 
 /// Enumerate monitors or windows for the picker.
@@ -589,7 +715,7 @@ mod windows {
         let sources = capturer.get_source_list();
         let own = own_process_windows();
         let monitors = match kind {
-            SourceKind::Monitor => monitor_names(),
+            SourceKind::Monitor => monitor_descriptors(),
             SourceKind::Window => Vec::new(),
         };
         let mut result = Vec::with_capacity(sources.len());
@@ -599,18 +725,26 @@ mod windows {
             match kind {
                 SourceKind::Monitor => {
                     // The pinned capturer reports `display_id = -1` on this
-                    // host, so the name/size are matched by the capturer's
-                    // source order. That is a known limitation: a reordered
-                    // source list can attach a neighbour's size to a monitor
-                    // until the capturer exposes a stable display id.
-                    let (name, width, height) = monitors
-                        .get(id as usize)
-                        .cloned()
-                        .unwrap_or_else(|| (format!("Экран {}", id + 1), 0, 0));
+                    // host. Metadata is matched by the capturer's own title,
+                    // never by list position: an unmatched title keeps the
+                    // size unknown instead of taking a neighbour's.
+                    let title = title.trim().to_owned();
+                    let matched = monitor_descriptor_for_title(&title, &monitors);
+                    let (width, height) = matched
+                        .map(|monitor| (monitor.width, monitor.height))
+                        .unwrap_or((0, 0));
+                    let title = if title.is_empty() {
+                        matched
+                            .map(|monitor| monitor.device.trim().to_owned())
+                            .filter(|device| !device.is_empty())
+                            .unwrap_or_else(|| format!("Экран {}", id + 1))
+                    } else {
+                        title
+                    };
                     result.push(ScreenSource {
                         id,
                         kind,
-                        title: name,
+                        title,
                         display_id: source.display_id(),
                         width,
                         height,
@@ -667,7 +801,7 @@ mod windows {
         _rect: *mut RECT,
         lparam: LPARAM,
     ) -> BOOL {
-        let list = unsafe { &mut *(lparam.0 as *mut Vec<(String, u32, u32)>) };
+        let list = unsafe { &mut *(lparam.0 as *mut Vec<MonitorDescriptor>) };
         let mut info = MONITORINFOEXW {
             monitorInfo: MONITORINFO {
                 cbSize: std::mem::size_of::<MONITORINFOEXW>() as u32,
@@ -691,23 +825,20 @@ mod windows {
                 device.push(char::from_u32(u32::from(unit)).unwrap_or('?'));
             }
             let rect = info.monitorInfo.rcMonitor;
-            let name = if device.is_empty() {
-                format!("Экран {}", list.len() + 1)
-            } else {
-                format!("Экран {} ({device})", list.len() + 1)
-            };
-            list.push((
-                name,
-                (rect.right - rect.left).max(0) as u32,
-                (rect.bottom - rect.top).max(0) as u32,
-            ));
+            list.push(MonitorDescriptor {
+                device,
+                width: (rect.right - rect.left).max(0) as u32,
+                height: (rect.bottom - rect.top).max(0) as u32,
+            });
         }
         BOOL(1)
     }
 
-    /// Display names and sizes in the same order the capturer lists monitors.
-    fn monitor_names() -> Vec<(String, u32, u32)> {
-        let mut list: Vec<(String, u32, u32)> = Vec::new();
+    /// Monitor descriptors in enumeration order. The order is only a cache
+    /// detail; [`monitor_descriptor_for_title`] matches a capturer source by
+    /// its device name, never by this position.
+    fn monitor_descriptors() -> Vec<MonitorDescriptor> {
+        let mut list: Vec<MonitorDescriptor> = Vec::new();
         unsafe {
             let _ = EnumDisplayMonitors(
                 None,

@@ -13,7 +13,7 @@ use voxhold_media::publisher::{
     Codec, Phase, Preset, PublishRequest, Quality, Resolution, Sharing, AUDIO_BITRATES,
     MAX_CHANNEL_PUBLISHERS,
 };
-use voxhold_media::screen_capture::{self, ScreenSource, SourceKind};
+use voxhold_media::screen_capture::{self, ScreenSource, SourceId, SourceKind};
 use voxhold_media::system_audio::{self, AudioDeviceInfo};
 
 /// Windows loopback sees every render session of the endpoint, including this
@@ -25,6 +25,10 @@ pub(crate) const RESTART_WARNING: &str =
     "Изменение качества перезапустит трансляцию: текущая сессия будет остановлена, зрители увидят новое подключение.";
 /// A Start pressed before the endpoint probe answered; cleared by the answer.
 pub(crate) const AUDIO_PENDING_REASON: &str = "Дождитесь проверки системного звука.";
+/// The selected identity is gone from the current snapshot; the publish path
+/// repeats this check, so a stale dialog never sends a request.
+pub(crate) const SOURCE_GONE_REASON: &str =
+    "Выбранный источник больше недоступен. Обновите список и выберите источник снова.";
 
 /// The account socket always authenticates with `multi_streams: true`
 /// (`crates/voxhold-api/src/lib.rs:638`), so the client capability is known.
@@ -35,7 +39,8 @@ pub(crate) const MULTI_STREAMS_SUPPORTED: bool = true;
 /// element runs it, exactly like the settings modal.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ShareKey {
-    Source(usize),
+    /// A picker row, bound to the stable `kind + capturer id`, never a position.
+    Source(SourceId),
     Monitors,
     Windows,
     Refresh,
@@ -63,7 +68,8 @@ pub(super) struct ScreenShareUi {
     pub(super) window_loading: bool,
     pub(super) monitor_error: String,
     pub(super) window_error: String,
-    pub(super) selected: Option<ScreenSource>,
+    /// Stable identity of the chosen source, resolved from the current snapshot.
+    pub(super) selected: Option<SourceId>,
     pub(super) resolution: Resolution,
     pub(super) fps: u32,
     pub(super) bitrate_kbps: u32,
@@ -120,9 +126,45 @@ impl Default for ScreenShareUi {
 
 impl ScreenShareUi {
     fn sources(&self) -> &[ScreenSource] {
-        match self.kind {
+        self.snapshot(self.kind)
+    }
+
+    fn snapshot(&self, kind: SourceKind) -> &[ScreenSource] {
+        match kind {
             SourceKind::Monitor => &self.monitors,
             SourceKind::Window => &self.windows,
+        }
+    }
+
+    /// Resolve an identity in its snapshot; a duplicate id resolves to `None`.
+    pub(super) fn source_for(&self, id: SourceId) -> Option<&ScreenSource> {
+        let mut found = self
+            .snapshot(id.kind)
+            .iter()
+            .filter(|item| item.id == id.id);
+        let source = found.next()?;
+        found.next().is_none().then_some(source)
+    }
+
+    /// The selected source as the current snapshot describes it.
+    pub(super) fn selected_source(&self) -> Option<&ScreenSource> {
+        self.selected.and_then(|id| self.source_for(id))
+    }
+
+    /// Whether the selection is in the visible category and still present.
+    pub(super) fn selection_is_current(&self) -> bool {
+        matches!(self.selected, Some(id) if id.kind == self.kind && self.source_for(id).is_some())
+    }
+
+    /// Drop a selection the newest snapshot no longer contains.
+    fn retain_selection(&mut self, kind: SourceKind, sources: &[ScreenSource]) {
+        let Some(id) = self.selected else { return };
+        if id.kind != kind {
+            return;
+        }
+        if sources.iter().filter(|item| item.id == id.id).count() != 1 {
+            self.selected = None;
+            self.error = SOURCE_GONE_REASON.into();
         }
     }
 
@@ -339,13 +381,9 @@ impl VoicePanel {
         }
         self.screen.audio_enabled = sharing.has_audio;
         self.begin_audio_probe(cx);
-        if self.screen.selected.is_none() {
-            self.screen.selected = self
-                .screen
-                .last_request
-                .as_ref()
-                .map(|request| request.source.clone());
-        }
+        // A restart is bound to the confirmed live source, even when the
+        // current snapshot is empty or still describes another category.
+        self.screen.bind_confirmed_live_source();
         self.screen.restart = true;
         self.screen.open = true;
         self.screen.busy = false;
@@ -456,16 +494,33 @@ impl VoicePanel {
         cx.notify();
     }
 
-    fn select_screen_source(&mut self, source: ScreenSource, cx: &mut Context<Self>) {
-        self.screen.selected = Some(source);
+    pub(super) fn select_screen_source(&mut self, id: SourceId, cx: &mut Context<Self>) {
+        // A row may only select a source the current snapshot really offers.
+        if id.kind != self.screen.kind || self.screen.source_for(id).is_none() {
+            return;
+        }
+        self.screen.selected = Some(id);
+        self.screen.error.clear();
+        cx.notify();
+    }
+
+    /// Switch the picker category; a selection of the other one is dropped.
+    pub(super) fn change_share_kind(&mut self, kind: SourceKind, cx: &mut Context<Self>) {
+        if self.screen.kind == kind {
+            return;
+        }
+        self.screen.kind = kind;
+        if self.screen.selected.is_some_and(|id| id.kind != kind) {
+            self.screen.selected = None;
+        }
         cx.notify();
     }
 
     /// Start is possible only after the endpoint probe answered: committing
     /// while the answer is pending would publish video without the requested
-    /// system audio.
+    /// system audio. The source must still be in the visible snapshot.
     pub(super) fn screen_can_start(&self) -> bool {
-        self.screen.selected.is_some()
+        self.screen.selection_is_current()
             && !self.screen.busy
             && !Codec::available().is_empty()
             && self.screen.audio_availability.is_some()
@@ -497,8 +552,19 @@ impl VoicePanel {
                 return;
             }
         }
-        let Some(source) = self.screen.selected.clone() else {
+        let Some(id) = self.screen.selected else {
             self.screen.error = "Выберите монитор или окно.".into();
+            cx.notify();
+            return;
+        };
+        // The dialog may be stale: build the request from the row that exists now.
+        let source = self
+            .screen
+            .source_for(id)
+            .filter(|_| id.kind == self.screen.kind)
+            .cloned();
+        let Some(source) = source else {
+            self.screen.error = SOURCE_GONE_REASON.into();
             cx.notify();
             return;
         };
@@ -647,17 +713,7 @@ impl VoicePanel {
                         self.screen.monitor_generation = generation;
                         self.screen.monitor_loading = false;
                         self.screen.monitor_error = error.unwrap_or_default();
-                        if self
-                            .screen
-                            .selected
-                            .as_ref()
-                            .is_some_and(|selected| selected.kind == SourceKind::Monitor)
-                            && !sources
-                                .iter()
-                                .any(|item| Some(item) == self.screen.selected.as_ref())
-                        {
-                            self.screen.selected = None;
-                        }
+                        self.screen.retain_selection(SourceKind::Monitor, &sources);
                         // The non-active kind still refreshes its cache; the
                         // picker reads it when the user switches tabs.
                         self.screen.monitors = sources;
@@ -666,20 +722,14 @@ impl VoicePanel {
                         self.screen.window_generation = generation;
                         self.screen.window_loading = false;
                         self.screen.window_error = error.unwrap_or_default();
-                        if self
-                            .screen
-                            .selected
-                            .as_ref()
-                            .is_some_and(|selected| selected.kind == SourceKind::Window)
-                            && !sources
-                                .iter()
-                                .any(|item| Some(item) == self.screen.selected.as_ref())
-                        {
-                            self.screen.selected = None;
-                        }
+                        self.screen.retain_selection(SourceKind::Window, &sources);
                         self.screen.windows = sources;
                     }
                     _ => return false,
+                }
+                // A stale picker answer must not unbind the confirmed source.
+                if self.screen.restart {
+                    self.screen.bind_confirmed_live_source();
                 }
                 true
             }
@@ -715,6 +765,15 @@ impl VoicePanel {
         // A ring larger than the handle range reuses the last handle; the
         // visible rows stay reachable and no index overlaps the toolbar.
         self.picker_focus[index.min(self.picker_focus.len() - 1)].clone()
+    }
+
+    /// Element id of one source row, named by `kind + id` so a reorder keeps focus.
+    pub(super) fn source_element_id(id: SourceId) -> gpui::ElementId {
+        let name = match id.kind {
+            SourceKind::Monitor => "share-source-monitor",
+            SourceKind::Window => "share-source-window",
+        };
+        gpui::ElementId::from((name, id.id))
     }
 }
 

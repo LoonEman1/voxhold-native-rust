@@ -8,6 +8,48 @@ use crate::theme;
 use voxhold_media::publisher::{Codec, Preset, Resolution};
 use voxhold_media::screen_capture::ScreenSource;
 
+impl ScreenShareUi {
+    /// Bind the restart dialog to the attempt that is already live.
+    ///
+    /// The capture engine accepted this identity, so it is known available
+    /// until the engine itself reports a failure: this is the one exception
+    /// to the "must be in the current snapshot" rule that guards a normal
+    /// Start. A refresh that already describes the source with a newer title
+    /// or size keeps that row, so the restart request uses the current data.
+    pub(super) fn bind_confirmed_live_source(&mut self) {
+        let Some(live) = self
+            .last_request
+            .as_ref()
+            .map(|request| request.source.clone())
+        else {
+            return;
+        };
+        self.kind = live.kind;
+        self.selected = Some(live.source_id());
+        let snapshot = match live.kind {
+            SourceKind::Monitor => &mut self.monitors,
+            SourceKind::Window => &mut self.windows,
+        };
+        // Keep the first current row with this id and drop duplicates: a
+        // duplicated identity does not resolve, and the live source must.
+        let mut kept = false;
+        snapshot.retain(|item| {
+            if item.id != live.id {
+                return true;
+            }
+            let keep = !kept;
+            kept = true;
+            keep
+        });
+        if !kept {
+            snapshot.push(live);
+        }
+        if self.error == SOURCE_GONE_REASON {
+            self.error.clear();
+        }
+    }
+}
+
 impl VoicePanel {
     fn choice(
         &self,
@@ -61,7 +103,7 @@ impl VoicePanel {
     fn source_row(
         &self,
         source: &ScreenSource,
-        index: usize,
+        id: SourceId,
         selected: bool,
         enabled: bool,
         focus: FocusHandle,
@@ -69,9 +111,8 @@ impl VoicePanel {
     ) -> gpui::AnyElement {
         let c = self.colors();
         let description = source.describe();
-        let clicked = source.clone();
         let mut row = div()
-            .id(("share-source", index))
+            .id(Self::source_element_id(id))
             .h(px(40.))
             .w_full()
             .px(px(10.))
@@ -84,11 +125,9 @@ impl VoicePanel {
             .gap_2()
             .track_focus(&focus);
         if enabled {
-            row =
-                row.cursor_pointer()
-                    .on_click(cx.listener(move |panel, _, _, cx| {
-                        panel.select_screen_source(clicked.clone(), cx)
-                    }));
+            row = row
+                .cursor_pointer()
+                .on_click(cx.listener(move |panel, _, _, cx| panel.select_screen_source(id, cx)));
         }
         row.child(img("icons/monitor.svg").w(px(16.)).h(px(16.)))
             .child(
@@ -160,7 +199,7 @@ impl VoicePanel {
             .child(self.choice("Обновить", false, refresh_focus, ShareKey::Refresh, cx));
 
         let sources: Vec<ScreenSource> = self.screen.sources().to_vec();
-        let selected = self.screen.selected.clone();
+        let selected = self.screen.selected;
         let mut list = div()
             .id("share-sources")
             .h(px(236.))
@@ -185,12 +224,19 @@ impl VoicePanel {
                     .child(text.to_owned()),
             );
         }
-        for (index, source) in sources.iter().enumerate() {
-            let focus = row(self, &mut ring, ShareKey::Source(index));
-            let is_selected = selected.as_ref() == Some(source);
+        for source in sources.iter() {
+            let id = source.source_id();
+            // Focus belongs to the source, not to the row position: the
+            // keyed handle survives a reorder and follows the same id.
+            let focus = window
+                .use_keyed_state(Self::source_element_id(id), cx, |_, cx| cx.focus_handle())
+                .read(cx)
+                .clone();
+            ring.push((focus.clone(), ShareKey::Source(id)));
+            let is_selected = selected == Some(id);
             list = list.child(self.source_row(
                 source,
-                index,
+                id,
                 is_selected,
                 !self.screen.restart,
                 focus,
@@ -584,14 +630,8 @@ impl VoicePanel {
     }
     fn activate_share(&mut self, key: ShareKey, cx: &mut Context<Self>) {
         match key {
-            ShareKey::Monitors => {
-                self.screen.kind = SourceKind::Monitor;
-                cx.notify();
-            }
-            ShareKey::Windows => {
-                self.screen.kind = SourceKind::Window;
-                cx.notify();
-            }
+            ShareKey::Monitors => self.change_share_kind(SourceKind::Monitor, cx),
+            ShareKey::Windows => self.change_share_kind(SourceKind::Window, cx),
             ShareKey::Refresh => self.refresh_screen_sources(cx),
             ShareKey::Resolution(resolution) => {
                 self.screen.resolution = resolution;
@@ -615,12 +655,10 @@ impl VoicePanel {
                 }
             }
             ShareKey::Start => self.start_screen_share(cx),
-            ShareKey::Source(index) => {
-                // The click handler carries the source itself; the keyboard
-                // path selects by position so Enter works on a focused row.
-                if let Some(source) = self.screen.sources().get(index).cloned() {
-                    self.select_screen_source(source, cx);
-                }
+            ShareKey::Source(id) => {
+                // The row is selected by its stable identity, so Enter on a
+                // focused row still selects it after the list is reordered.
+                self.select_screen_source(id, cx);
             }
         }
     }

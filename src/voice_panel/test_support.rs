@@ -3,7 +3,7 @@
 
 use super::*;
 use voxhold_media::publisher::Sharing;
-use voxhold_media::screen_capture::ScreenSource;
+use voxhold_media::screen_capture::{ScreenSource, SourceId, SourceKind};
 
 impl VoicePanel {
     /// Install a handle that has no worker or socket, so `refresh_capture`
@@ -39,23 +39,47 @@ impl VoicePanel {
     /// Open the picker without the OS capture gate and with a fixed list, so
     /// the keyboard and cancel paths are testable on any host.
     pub fn test_open_screen_picker(&mut self, source: ScreenSource) {
-        self.test_share_gate = Some(Ok(()));
-        self.screen = ScreenShareUi::default();
-        self.screen.open = true;
-        self.screen.picker = 7;
-        self.screen.kind = voxhold_media::screen_capture::SourceKind::Monitor;
-        self.screen.monitors = vec![source.clone()];
-        self.screen.monitor_loading = false;
-        self.screen.monitor_generation = 1;
-        self.screen.window_loading = false;
-        self.screen.window_generation = 1;
-        self.screen.selected = Some(source.clone());
+        let kind = source.kind;
+        let id = source.source_id();
+        self.test_open_screen_picker_with(kind, vec![source.clone()], Some(id));
         self.screen.last_request = Some(voxhold_media::publisher::PublishRequest {
             source,
             quality: self.screen.quality(),
             codec: voxhold_media::publisher::Codec::Vp8,
             audio: false,
         });
+    }
+
+    /// Open the picker with a controlled list and an optional selection, so
+    /// reorder/invalid-refresh cases use the same state as the worker answer.
+    pub fn test_open_screen_picker_with(
+        &mut self,
+        kind: SourceKind,
+        sources: Vec<ScreenSource>,
+        selected: Option<SourceId>,
+    ) {
+        self.test_share_gate = Some(Ok(()));
+        self.screen = ScreenShareUi::default();
+        self.screen.open = true;
+        self.screen.picker = 7;
+        self.screen.kind = kind;
+        match kind {
+            SourceKind::Monitor => {
+                self.screen.monitors = sources;
+                self.screen.monitor_loading = false;
+                self.screen.monitor_generation = 1;
+                self.screen.window_loading = false;
+                self.screen.window_generation = 1;
+            }
+            SourceKind::Window => {
+                self.screen.windows = sources;
+                self.screen.window_loading = false;
+                self.screen.window_generation = 1;
+                self.screen.monitor_loading = false;
+                self.screen.monitor_generation = 1;
+            }
+        }
+        self.screen.selected = selected;
         self.screen.audio_availability = Some(Ok(voxhold_media::system_audio::AudioDeviceInfo {
             id: "test".into(),
             label: "Устройство вывода по умолчанию".into(),
@@ -127,9 +151,69 @@ impl VoicePanel {
     }
 
     /// Select the source after the production «Экран» path opened the picker.
+    /// The row is added to the current snapshot when absent, because the
+    /// production handler only selects rows the list already offers.
     pub fn test_select_screen_source(&mut self, source: ScreenSource, cx: &mut Context<Self>) {
-        self.screen.selected = Some(source);
-        cx.notify();
+        let id = source.source_id();
+        match id.kind {
+            SourceKind::Monitor if !self.screen.monitors.iter().any(|item| item.id == id.id) => {
+                self.screen.monitors.push(source);
+            }
+            SourceKind::Window if !self.screen.windows.iter().any(|item| item.id == id.id) => {
+                self.screen.windows.push(source);
+            }
+            _ => {}
+        }
+        self.select_screen_source(id, cx);
+    }
+
+    /// Switch the picker category exactly like the tab action does.
+    pub fn test_switch_share_kind(&mut self, kind: SourceKind, cx: &mut Context<Self>) {
+        self.change_share_kind(kind, cx);
+    }
+
+    /// The stable identity the picker would publish, if any.
+    pub fn test_selected_source_id(&self) -> Option<SourceId> {
+        self.screen.selected
+    }
+
+    /// The selected row as the current snapshot describes it, not a copy
+    /// remembered at selection time.
+    pub fn test_selected_source(&self) -> Option<ScreenSource> {
+        self.screen.selected_source().cloned()
+    }
+
+    /// Feed a source answer exactly as the media worker does, including the
+    /// generation check and the refresh invalidation.
+    pub fn test_apply_screen_sources(&mut self, kind: SourceKind, sources: Vec<ScreenSource>) {
+        let generation = match kind {
+            SourceKind::Monitor => self.screen.monitor_generation + 1,
+            SourceKind::Window => self.screen.window_generation + 1,
+        };
+        self.apply_screen_update(VoiceUpdate::ScreenSources {
+            generation,
+            kind,
+            sources,
+            error: None,
+        });
+    }
+
+    /// Replace the cached list without the refresh invalidation, to model a
+    /// Start that races a refresh which has not been applied yet.
+    pub fn test_replace_screen_list_without_refresh(
+        &mut self,
+        kind: SourceKind,
+        sources: Vec<ScreenSource>,
+    ) {
+        match kind {
+            SourceKind::Monitor => self.screen.monitors = sources,
+            SourceKind::Window => self.screen.windows = sources,
+        }
+    }
+
+    /// The picker's error line.
+    pub fn test_screen_error(&self) -> &str {
+        &self.screen.error
     }
 
     /// Open the live quality dialog with the publication already Live.
@@ -148,20 +232,58 @@ impl VoicePanel {
         self.open_screen_settings(cx);
     }
 
+    /// Open the live quality dialog exactly like the on-air card does, on the
+    /// state a test set up itself. The picker snapshot is not touched.
+    pub fn test_open_live_screen_settings(&mut self, cx: &mut Context<Self>) {
+        // The live card reaches this dialog while the publication is Live, so
+        // the normal gate answers "already live".
+        self.test_share_gate = Some(Err("Трансляция уже идёт."));
+        self.open_screen_settings(cx);
+    }
+
+    /// Record the accepted attempt exactly as the publish handler does. This
+    /// is the request a restart dialog must bind to.
+    pub fn test_set_screen_last_request(&mut self, source: ScreenSource) {
+        self.screen.last_request = Some(voxhold_media::publisher::PublishRequest {
+            source,
+            quality: self.screen.quality(),
+            codec: voxhold_media::publisher::Codec::Vp8,
+            audio: false,
+        });
+    }
+
+    /// Put the live dialog back into the pending endpoint-probe state, so a
+    /// test can observe that Start waits for the repeated probe answer.
+    pub fn test_set_screen_audio_pending(
+        &mut self,
+        probe: Arc<
+            dyn Fn() -> Result<voxhold_media::system_audio::AudioDeviceInfo, String> + Send + Sync,
+        >,
+    ) {
+        self.screen.audio_availability = None;
+        self.test_audio_probe = Some(probe);
+    }
+
+    /// The category the picker dialog shows.
+    pub fn test_share_kind(&self) -> SourceKind {
+        self.screen.kind
+    }
+
     /// The quality/audio fields the picker will send.
     pub fn test_screen_request(&self) -> voxhold_media::publisher::PublishRequest {
         let mut request = self.screen.last_request.clone().unwrap_or_else(|| {
+            let source = self.screen.selected_source().cloned().unwrap_or(
+                voxhold_media::screen_capture::ScreenSource {
+                    id: 0,
+                    kind: voxhold_media::screen_capture::SourceKind::Monitor,
+                    title: String::new(),
+                    display_id: -1,
+                    width: 0,
+                    height: 0,
+                },
+            );
             voxhold_media::publisher::PublishRequest {
-                source: self.screen.selected.clone().unwrap_or(
-                    voxhold_media::screen_capture::ScreenSource {
-                        id: 0,
-                        kind: voxhold_media::screen_capture::SourceKind::Monitor,
-                        title: String::new(),
-                        display_id: -1,
-                        width: 0,
-                        height: 0,
-                    },
-                ),
+                source,
                 quality: self.screen.quality(),
                 codec: voxhold_media::publisher::Codec::Vp8,
                 audio: self.screen.audio_requested(),
@@ -233,7 +355,8 @@ impl VoicePanel {
             .unwrap_or_default()
     }
 
-    /// Debug label of the focused picker element, e.g. `Source(0)` or `Start`.
+    /// Debug label of the focused picker element, e.g. `Source(monitor:3)` or
+    /// `Start`.
     pub fn test_focused_share(&self, window: &Window) -> Option<String> {
         self.screen
             .ring

@@ -280,3 +280,75 @@ fn a_real_desktop_capture_delivers_a_frame() {
         "the window list must not mix monitor sources"
     );
 }
+
+fn descriptor(device: &str, width: u32, height: u32) -> MonitorDescriptor {
+    MonitorDescriptor {
+        device: device.into(),
+        width,
+        height,
+    }
+}
+
+#[test]
+fn a_monitor_title_matches_its_own_device_name() {
+    let monitors = [
+        descriptor(r"\\.\DISPLAY1", 1920, 1080),
+        descriptor(r"\\.\DISPLAY2", 2560, 1440),
+    ];
+    let matched = monitor_descriptor_for_title(r"Экран (\\.\DISPLAY2)", &monitors)
+        .expect("the device name is in the title");
+    assert_eq!((matched.width, matched.height), (2560, 1440));
+}
+
+#[test]
+fn a_monitor_title_matches_the_display_number_not_the_list_order() {
+    // The list starts with DISPLAY2, so position-based metadata would attach
+    // the 2560×1440 size to the title that names DISPLAY1.
+    let monitors = [
+        descriptor(r"\\.\DISPLAY2", 2560, 1440),
+        descriptor(r"\\.\DISPLAY1", 1920, 1080),
+    ];
+    let matched = monitor_descriptor_for_title("Screen 1", &monitors).expect("display number");
+    assert_eq!((matched.width, matched.height), (1920, 1080));
+}
+
+#[test]
+fn an_unmatched_or_ambiguous_monitor_title_never_borrows_a_size() {
+    let monitors = [
+        descriptor(r"\\.\DISPLAY1", 1920, 1080),
+        descriptor(r"\\.\DISPLAY2", 2560, 1440),
+    ];
+    assert!(
+        monitor_descriptor_for_title("Документ", &monitors).is_none(),
+        "a title without a device name or number has no known size"
+    );
+    assert!(monitor_descriptor_for_title("   ", &monitors).is_none());
+
+    // Two devices end in the same number: guessing either one would attach a
+    // neighbour's size.
+    let ambiguous = [
+        descriptor(r"\\.\DISPLAY1", 1920, 1080),
+        descriptor(r"\\.\MONITOR1", 1280, 720),
+    ];
+    assert!(monitor_descriptor_for_title("Screen 1", &ambiguous).is_none());
+}
+
+#[test]
+fn a_monitor_source_identity_ignores_its_mutable_label() {
+    let source = ScreenSource {
+        id: 7,
+        kind: SourceKind::Monitor,
+        title: "Экран 1".into(),
+        display_id: -1,
+        width: 1920,
+        height: 1080,
+    };
+    let renamed = ScreenSource {
+        title: "Другое имя".into(),
+        width: 800,
+        height: 600,
+        ..source.clone()
+    };
+    assert_eq!(source.source_id(), renamed.source_id());
+    assert_ne!(source.describe(), renamed.describe());
+}

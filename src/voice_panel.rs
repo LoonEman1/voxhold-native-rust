@@ -154,6 +154,10 @@ pub struct VoicePanel {
     action_focus: Vec<FocusHandle>,
     dock_focus: Vec<FocusHandle>,
     dock_visible: bool,
+    /// Whether the shell painted the room pane this frame. The room actions,
+    /// join button, participant cards and stream tiles are only mounted while
+    /// it is true, so they must not stay in the Tab ring otherwise.
+    room_painted: bool,
     stream_focus: Vec<FocusHandle>,
     /// Focus handles of the «Экран» toolbar action and the on-air actions.
     /// Index 0 is the on-air stop action, index 1 the toolbar button, index 2
@@ -288,6 +292,7 @@ impl VoicePanel {
                 .collect(),
             dock_focus: (0..DOCK_ACTIONS.len()).map(|_| cx.focus_handle()).collect(),
             dock_visible: false,
+            room_painted: false,
             stream_focus: (0..8).map(|_| cx.focus_handle()).collect(),
             screen_focus: (0..3).map(|_| cx.focus_handle()).collect(),
             picker_focus: (0..32).map(|_| cx.focus_handle()).collect(),
@@ -871,9 +876,18 @@ impl VoicePanel {
     }
 
     /// The sidebar dock renders outside the room pane, but its focus handles
-    /// belong to the same Tab ring.
+    /// belong to the same Tab ring. The shell resets this at the start of a
+    /// frame and `voice_dock()` raises it again only when it really paints, so
+    /// an unpainted dock can never leave entries in the ring.
     pub fn set_dock_visible(&mut self, visible: bool) {
         self.dock_visible = visible;
+    }
+
+    /// Mirrors the shell's room-pane predicate for the same frame. This is not
+    /// the same as an active call: a text channel or another voice room shows
+    /// the dock only, with no room toolbar or participant cards to focus.
+    pub fn set_room_painted(&mut self, painted: bool) {
+        self.room_painted = painted;
     }
 
     pub fn dock_focus(&self, index: usize) -> FocusHandle {
@@ -950,62 +964,71 @@ impl VoicePanel {
 
     fn focus_ring(&self) -> Vec<(&'static str, FocusHandle)> {
         let mut ring = Vec::new();
-        let active = self.call_channel != 0 && self.call_channel == self.room;
-        if active {
-            // The ring follows the painted toolbar: microphone, sound, screen,
-            // records, leave. A focus entry exists only for a painted action.
-            for id in TOOLBAR_ACTIONS {
-                if id == "voice-screen" {
-                    ring.push(("voice-screen", self.screen_focus[1].clone()));
-                } else if let Some(index) = VOICE_ACTIONS.iter().position(|action| action.id == id)
-                {
-                    ring.push((VOICE_ACTIONS[index].id, self.action_focus[index].clone()));
+        // Room entries exist only for elements the shell actually painted.
+        // The room pane is hidden on a text channel, another room or a DM, and
+        // its toolbar, join button, cards and streams are unmounted then.
+        if self.room_painted {
+            let active = self.call_channel != 0 && self.call_channel == self.room;
+            if active {
+                // The ring follows the painted toolbar: microphone, sound,
+                // screen, records, leave. A focus entry exists only for a
+                // painted action.
+                for id in TOOLBAR_ACTIONS {
+                    if id == "voice-screen" {
+                        ring.push(("voice-screen", self.screen_focus[1].clone()));
+                    } else if let Some(index) =
+                        VOICE_ACTIONS.iter().position(|action| action.id == id)
+                    {
+                        ring.push((VOICE_ACTIONS[index].id, self.action_focus[index].clone()));
+                    }
+                }
+                if matches!(
+                    self.screen.sharing.phase,
+                    voxhold_media::publisher::Phase::Publishing
+                        | voxhold_media::publisher::Phase::Live
+                        | voxhold_media::publisher::Phase::Stopping
+                        | voxhold_media::publisher::Phase::Failed
+                ) {
+                    ring.push(("screen-stop", self.screen_focus[0].clone()));
+                }
+            } else {
+                ring.push(("voice-join", self.join_focus.clone()));
+            }
+            for (index, publication) in self
+                .room_streams()
+                .iter()
+                .filter(|publication| publication.channel_id == self.room)
+                .take(self.stream_focus.len())
+                .enumerate()
+            {
+                if self.call_active() && self.call_channel == self.room {
+                    ring.push((
+                        if self.watching.as_ref().is_some_and(|current| {
+                            current.publisher_connection_id == publication.publisher_connection_id
+                        }) {
+                            "stream-full"
+                        } else {
+                            "stream-watch"
+                        },
+                        self.stream_focus[index].clone(),
+                    ));
                 }
             }
-            if matches!(
-                self.screen.sharing.phase,
-                voxhold_media::publisher::Phase::Publishing
-                    | voxhold_media::publisher::Phase::Live
-                    | voxhold_media::publisher::Phase::Stopping
-                    | voxhold_media::publisher::Phase::Failed
-            ) {
-                ring.push(("screen-stop", self.screen_focus[0].clone()));
-            }
-        } else {
-            ring.push(("voice-join", self.join_focus.clone()));
-        }
-        for (index, publication) in self
-            .room_streams()
-            .iter()
-            .filter(|publication| publication.channel_id == self.room)
-            .take(self.stream_focus.len())
-            .enumerate()
-        {
-            if self.call_active() && self.call_channel == self.room {
-                ring.push((
-                    if self.watching.as_ref().is_some_and(|current| {
-                        current.publisher_connection_id == publication.publisher_connection_id
-                    }) {
-                        "stream-full"
-                    } else {
-                        "stream-watch"
-                    },
-                    self.stream_focus[index].clone(),
-                ));
+            let roster = self.visible_roster();
+            let mut card = 0;
+            for participant in roster {
+                if !self.audio_for(&participant.connection_id) {
+                    continue;
+                }
+                let Some(handle) = self.member_focus.get(card) else {
+                    break;
+                };
+                ring.push(("voice-local", handle.clone()));
+                card += 1;
             }
         }
-        let roster = self.visible_roster();
-        let mut card = 0;
-        for participant in roster {
-            if !self.audio_for(&participant.connection_id) {
-                continue;
-            }
-            let Some(handle) = self.member_focus.get(card) else {
-                break;
-            };
-            ring.push(("voice-local", handle.clone()));
-            card += 1;
-        }
+        // The floating player is a shell-level overlay and is not tied to the
+        // room pane, so it keeps its entries independently.
         if self.player_open {
             if self.has_audio() {
                 ring.push(("stream-audio", self.player_actions[0].clone()));

@@ -6,6 +6,12 @@ use voxhold_media::publisher::Sharing;
 use voxhold_media::screen_capture::{ScreenSource, SourceId, SourceKind};
 
 impl VoicePanel {
+    /// Ids in the current Tab ring, in cycle order. Tests compare these with
+    /// painted `debug_selector` bounds so an unmounted handle cannot hide.
+    pub fn test_focus_ring_ids(&self) -> Vec<&'static str> {
+        self.focus_ring().into_iter().map(|(id, _)| id).collect()
+    }
+
     /// Install a handle that has no worker or socket, so `refresh_capture`
     /// queues the snapshot exactly as the live path would.
     pub fn test_attach_detached_handle(&mut self) {

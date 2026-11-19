@@ -29,7 +29,7 @@ fn channel(id: i64, name: &str, kind: &str) -> voxhold_api::Channel {
     }
 }
 
-fn participant(connection: &str, user: i64) -> Participant {
+pub(super) fn participant(connection: &str, user: i64) -> Participant {
     Participant {
         connection_id: connection.into(),
         user_id: user,
@@ -56,7 +56,7 @@ fn publication(channel_id: i64, publisher: &str, user: i64) -> Publication {
     }
 }
 
-fn draw(visual: &mut VisualTestContext) {
+pub(super) fn draw(visual: &mut VisualTestContext) {
     visual.update(|window, app| {
         window.refresh();
         window.draw(app).clear();
@@ -86,10 +86,30 @@ pub(super) fn fixture(
     Entity<Voxhold>,
     Entity<voice_panel::VoicePanel>,
 ) {
+    fixture_with(cx, None, true)
+}
+
+/// Same fixture with an optional initial window width and an optional idle
+/// call. A test that checks "not painted" can build the window at its final
+/// size or with an idle call before the first frame, so the dock selector was
+/// never mounted. GPUI's test frame keeps stale `debug_bounds` for a selector
+/// once it has been painted.
+pub(super) fn fixture_with(
+    cx: &mut TestAppContext,
+    width: Option<f32>,
+    active: bool,
+) -> (
+    &'static mut VisualTestContext,
+    Entity<Voxhold>,
+    Entity<voice_panel::VoicePanel>,
+) {
     cx.update(|cx| gpui_component::init(cx));
     let client = client();
     let (window, view) = super::settings_tests::make_app(cx, client.clone());
     let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
+    if let Some(width) = width {
+        visual.simulate_resize(gpui::size(gpui::px(width), gpui::px(760.)));
+    }
     let voice = visual.update(|window, cx| {
         let panel = cx.new(|cx| voice_panel::VoicePanel::new(client, 1, 7, false, window, cx));
         let mut rooms = std::collections::HashMap::new();
@@ -113,12 +133,16 @@ pub(super) fn fixture(
             panel.set_rooms(rooms);
             panel.set_self_user(1);
             panel.set_room_state(7, Vec::new(), Vec::new());
-            panel.test_set_call(
-                7,
-                CallPhase::Connected,
-                vec![participant("alice", 1), participant("bob", 2)],
-                vec!["alice".into()],
-            );
+            if active {
+                panel.test_set_call(
+                    7,
+                    CallPhase::Connected,
+                    vec![participant("alice", 1), participant("bob", 2)],
+                    vec!["alice".into()],
+                );
+            } else {
+                panel.test_set_call(0, CallPhase::Idle, Vec::new(), Vec::new());
+            }
         });
         view.update(cx, |v, cx| {
             cx.notify();
@@ -144,7 +168,7 @@ pub(super) fn fixture(
             v.server = 1;
             v.voice = Some(panel.clone());
             v.voice_room = 7;
-            v.voice_channel = 7;
+            v.voice_channel = if active { 7 } else { 0 };
             v.channel = 7;
             v.access_pending = false;
             cx.notify();

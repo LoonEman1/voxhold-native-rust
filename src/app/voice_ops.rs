@@ -321,6 +321,11 @@ impl Voxhold {
 
     /// Sidebar dock for the whole call. It sits under the channel list even
     /// while the active voice room is open; only the end of the call hides it.
+    /// On mobile/narrow layouts the channel panel is a closed overlay, so the
+    /// dock stays the overlay's surface: it is painted only while that panel
+    /// is open, and the central room controls remain the call surface. The
+    /// flag is reset by the shell each frame so a closed overlay cannot keep
+    /// dock handles in the Tab ring.
     pub(super) fn voice_dock_visible(&self, cx: &gpui::App) -> bool {
         self.voice
             .as_ref()

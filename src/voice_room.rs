@@ -327,6 +327,55 @@ pub const TOOLBAR_ACTIONS: [&str; 5] = [
     "voice-leave",
 ];
 
+/// Palette entries the toolbar action decision needs. The view resolves them
+/// from `VoiceColors`; the decision itself stays pure and testable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ActionColors {
+    pub surface: u32,
+    pub line: u32,
+    pub muted: u32,
+    pub danger: u32,
+    pub danger_bg: u32,
+    /// Text drawn on the coral leave fill.
+    pub on_danger: u32,
+}
+
+/// Visual decision for one toolbar cell. Painting only maps these values to
+/// element properties, so the leave/coral and mute/danger rules cannot drift
+/// between the view and the tests.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ActionStyle {
+    pub fill: u32,
+    pub border: u32,
+    pub text: u32,
+    /// Extra left offset before leave; every other action sits flush.
+    pub margin_left: f32,
+    pub active: bool,
+}
+
+pub fn toolbar_action_style(id: &str, active: bool, c: ActionColors) -> ActionStyle {
+    let leave = id == "voice-leave";
+    ActionStyle {
+        fill: if leave {
+            c.danger
+        } else if active {
+            c.danger_bg
+        } else {
+            c.surface
+        },
+        border: if active || leave { c.danger } else { c.line },
+        text: if leave {
+            c.on_danger
+        } else if active {
+            c.danger
+        } else {
+            c.muted
+        },
+        margin_left: if leave { 5.0 } else { 0.0 },
+        active,
+    }
+}
+
 #[cfg(test)]
 pub fn voice_action(id: &str) -> Option<&'static VoiceAction> {
     VOICE_ACTIONS.iter().find(|action| action.id == id)

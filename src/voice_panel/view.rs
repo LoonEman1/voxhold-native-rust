@@ -51,14 +51,18 @@ impl VoicePanel {
     ) -> impl IntoElement {
         let c = self.colors();
         let active = self.action_active(action);
-        let leave = action.id == "voice-leave";
-        let color = if leave {
-            rgb(0xffffff)
-        } else if active {
-            rgb(c.danger)
-        } else {
-            rgb(c.muted)
-        };
+        let style = voice_room::toolbar_action_style(
+            action.id,
+            active,
+            voice_room::ActionColors {
+                surface: c.surface,
+                line: c.line,
+                muted: c.muted,
+                danger: c.danger,
+                danger_bg: c.danger_bg,
+                on_danger: 0xffffff,
+            },
+        );
         let action_id = action.id;
         div()
             .id(("voice-action", slot))
@@ -73,19 +77,15 @@ impl VoicePanel {
             .gap(px(3.))
             .rounded(px(9.))
             .cursor_pointer()
-            .when(leave, |button| button.ml(px(5.)))
-            .bg(rgb(if leave {
-                c.danger
-            } else if active {
-                c.danger_bg
-            } else {
-                c.surface
-            }))
+            .when(style.margin_left > 0.0, |button| {
+                button.ml(px(style.margin_left))
+            })
+            .bg(rgb(style.fill))
             .border_1()
-            .border_color(rgb(if active || leave { c.danger } else { c.line }))
-            .text_color(color)
+            .border_color(rgb(style.border))
+            .text_color(rgb(style.text))
             .track_focus(&self.action_focus[action_index])
-            .child(vector_icon(self.action_icon(action), 16., color))
+            .child(vector_icon(self.action_icon(action), 16., rgb(style.text)))
             .child(
                 div()
                     .text_size(px(9.))

@@ -47,6 +47,8 @@ mod theme_ops;
 mod thread_ops;
 pub(crate) mod ui;
 #[cfg(test)]
+mod voice_dock_tests;
+#[cfg(test)]
 mod voice_form_tests;
 mod voice_ops;
 #[cfg(test)]

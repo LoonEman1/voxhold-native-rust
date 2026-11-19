@@ -148,6 +148,45 @@ fn the_dock_has_no_records_action() {
 }
 
 #[test]
+fn toolbar_visuals_keep_leave_coral_and_toggles_tinted() {
+    let colors = ActionColors {
+        surface: 0x1e1e1b,
+        line: 0x363630,
+        muted: 0x9a9a90,
+        danger: 0xe06b5f,
+        danger_bg: 0x2a1c1a,
+        on_danger: 0xffffff,
+    };
+    // Leave is the coral filled action with light text and the web 5 px gap,
+    // and it stays the last toolbar entry.
+    let leave = toolbar_action_style("voice-leave", true, colors);
+    assert_eq!(leave.fill, colors.danger);
+    assert_eq!(leave.border, colors.danger);
+    assert_eq!(leave.text, colors.on_danger);
+    assert_eq!(leave.margin_left, 5.0);
+    assert!(leave.active);
+    assert_eq!(TOOLBAR_ACTIONS.last(), Some(&"voice-leave"));
+
+    // An inactive microphone or sound sits on the surface with muted text.
+    for id in ["voice-mic", "voice-deaf"] {
+        let idle = toolbar_action_style(id, false, colors);
+        assert_eq!(idle.fill, colors.surface, "{id} idle fill");
+        assert_eq!(idle.border, colors.line, "{id} idle border");
+        assert_eq!(idle.text, colors.muted, "{id} idle text");
+        assert_eq!(idle.margin_left, 0.0, "{id} has no extra gap");
+        assert!(!idle.active);
+
+        // When toggled on it uses danger text on the danger background.
+        let on = toolbar_action_style(id, true, colors);
+        assert_eq!(on.fill, colors.danger_bg, "{id} active fill");
+        assert_eq!(on.border, colors.danger, "{id} active border");
+        assert_eq!(on.text, colors.danger, "{id} active text");
+        assert_eq!(on.margin_left, 0.0);
+        assert!(on.active);
+    }
+}
+
+#[test]
 fn room_and_dock_titles_follow_the_call_phase() {
     assert_eq!(
         room_status(CallPhase::Idle),

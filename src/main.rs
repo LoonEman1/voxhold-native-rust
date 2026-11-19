@@ -27,6 +27,7 @@ mod recordings;
 mod recordings_dialog;
 mod search;
 mod server_settings;
+mod session_store;
 mod settings;
 #[cfg(test)]
 mod test_support;
@@ -83,6 +84,7 @@ fn parse_args() -> (String, Option<std::path::PathBuf>, f32, f32) {
 fn main() {
     let (server, layout_path, width, height) = parse_args();
     let instance_path = instance_prefs::InstancePrefs::default_path();
+    let session_path = session_store::SessionStore::default_path();
     Application::new()
         .with_assets(assets::Assets::discover())
         .run(move |cx: &mut App| {
@@ -96,6 +98,7 @@ fn main() {
             let prefill = server.clone();
             let layout_path = layout_path.clone();
             let instance_path = instance_path.clone();
+            let session_path = session_path.clone();
             cx.open_window(
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
@@ -115,6 +118,7 @@ fn main() {
                             &prefill,
                             layout_path.clone(),
                             instance_path.clone(),
+                            session_path.clone(),
                         )
                     });
                     #[cfg(feature = "voxhold-media")]

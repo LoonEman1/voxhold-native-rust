@@ -51,7 +51,13 @@ fn open(
     dir: &Path,
     instance: PathBuf,
 ) -> (gpui::WindowHandle<Root>, Entity<Voxhold>) {
-    super::add_auth_window_with(cx, prefill, dir.join("workspace-layout.json"), instance)
+    super::add_auth_window_with(
+        cx,
+        prefill,
+        dir.join("workspace-layout.json"),
+        instance,
+        dir.join("sessions.bin"),
+    )
 }
 
 fn value(view: &Entity<Voxhold>, visual: &VisualTestContext) -> String {

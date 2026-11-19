@@ -112,7 +112,7 @@ pub fn canonical_origin(raw: &str) -> Option<String> {
 /// Unique temporary file in the target directory, flushed and renamed over the
 /// destination. A failed rename removes the temporary file and leaves the
 /// previous document untouched.
-fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent)?;

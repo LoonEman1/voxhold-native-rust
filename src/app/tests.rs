@@ -11,11 +11,21 @@ fn add_auth_window_with(
     prefill: &str,
     shell: std::path::PathBuf,
     instance: std::path::PathBuf,
+    sessions: std::path::PathBuf,
 ) -> (gpui::WindowHandle<Root>, Entity<Voxhold>) {
     let slot: std::rc::Rc<std::cell::RefCell<Option<Entity<Voxhold>>>> = Default::default();
     let captured = slot.clone();
     let window = cx.add_window(move |window, cx| {
-        let view = cx.new(|cx| Voxhold::new(window, cx, prefill, Some(shell), Some(instance)));
+        let view = cx.new(|cx| {
+            Voxhold::new(
+                window,
+                cx,
+                prefill,
+                Some(shell),
+                Some(instance),
+                Some(sessions),
+            )
+        });
         *captured.borrow_mut() = Some(view.clone());
         Root::new(view.into(), window, cx)
     });
@@ -34,6 +44,7 @@ fn add_auth_window(cx: &mut TestAppContext) -> (gpui::WindowHandle<Root>, Entity
         "",
         dir.join("workspace-layout.json"),
         dir.join("instance.json"),
+        dir.join("sessions.bin"),
     )
 }
 
@@ -927,4 +938,5 @@ mod followup2;
 mod instance_tests;
 mod media;
 mod r04;
+mod remember_tests;
 mod review;

@@ -1,6 +1,7 @@
 mod action_io;
 mod admin_view;
 mod auth_view;
+mod auto_login;
 mod avatar_ops;
 mod channel_ops;
 mod channel_view;
@@ -71,7 +72,7 @@ use crate::voice_panel;
 use crate::{
     attachments, auth, auth_session, background, channel_settings, draft, inbox, instance_prefs,
     layout, links, media, members, message_tools, personal_settings, reactions, recordings,
-    recordings_dialog, search, server_settings, theme, thread_panel, window_chrome,
+    recordings_dialog, search, server_settings, session_store, theme, thread_panel, window_chrome,
 };
 use ui::{icon, ink};
 
@@ -200,6 +201,22 @@ pub(crate) struct Voxhold {
     /// One periodic expiry/refresh timer while a session exists. Dropping the
     /// task cancels it.
     session_clock: Option<gpui::Task<()>>,
+    /// Optional «Запомнить вход» storage. It is created once and cloned into
+    /// every background operation.
+    session_store: session_store::SessionStore,
+    /// Monotonic id of the current automatic login attempt. A late answer from
+    /// another attempt, a closed login screen or a toggled box is discarded.
+    auto_attempt: u64,
+    /// The token known to be stored, used to catch up when a rotation write is
+    /// lost and the next refresh must accept the older record.
+    last_stored_token: Option<String>,
+    /// Visible workspace notice when saving or deleting the record failed.
+    remember_error: String,
+    /// The kept record that «Повторить» uses without asking for the address.
+    auto_record: Option<session_store::RememberedSession>,
+    /// Bumped when a session ends, so a late save cannot recreate a record
+    /// after an explicit logout.
+    store_epoch: std::sync::Arc<std::sync::atomic::AtomicU64>,
     self_user_id: i64,
     search: Option<Entity<search::SearchPanel>>,
     show_search: bool,
@@ -482,6 +499,7 @@ impl Voxhold {
         prefill: &str,
         shell_path: Option<std::path::PathBuf>,
         instance_path: Option<std::path::PathBuf>,
+        session_path: Option<std::path::PathBuf>,
     ) -> Self {
         #[cfg(feature = "voxhold-media")]
         cx.bind_keys([
@@ -556,6 +574,12 @@ impl Voxhold {
             session_epoch: 0,
             session_gate: auth_session::RefreshGate::default(),
             session_clock: None,
+            session_store: session_store::SessionStore::new(session_path),
+            auto_attempt: 0,
+            last_stored_token: None,
+            remember_error: String::new(),
+            auto_record: None,
+            store_epoch: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             self_user_id: 0,
             search: None,
             show_search: false,

@@ -6938,6 +6938,7 @@ dependencies = [
  "gpui-component",
  "image",
  "raw-window-handle",
+ "serde",
  "serde_json",
  "smallvec",
  "tokio",
@@ -6945,6 +6946,8 @@ dependencies = [
  "uuid",
  "voxhold-api",
  "voxhold-media",
+ "windows-sys 0.61.2",
+ "zeroize",
 ]
 
 [[package]]

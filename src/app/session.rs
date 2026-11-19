@@ -26,15 +26,24 @@ impl Voxhold {
         });
         self.username
             .update(cx, |input, cx| input.focus(window, cx));
+        // The origin is confirmed. A remembered session may be checked now;
+        // the attempt is entirely in the background and never blocks the form.
+        self.begin_auto_login(window, cx);
         cx.notify();
     }
 
-    /// Back to the address step; keeps the confirmed origin.
+    /// Back to the address step; keeps the confirmed origin. An automatic
+    /// attempt belongs to the login step, so it is cancelled logically; its
+    /// late answer is ignored by the attempt id.
     #[allow(dead_code)]
     pub(super) fn back_to_instance(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.auth.busy {
             return;
         }
+        self.auto_attempt = self.auto_attempt.wrapping_add(1);
+        self.auth.auto_login = false;
+        self.auth.auto_retry = false;
+        self.auto_record = None;
         self.auth.screen = auth::AuthScreen::Instance;
         self.auth.status.clear();
         self.password
@@ -48,10 +57,24 @@ impl Voxhold {
     pub(super) fn submit_login(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let user = self.username.read(cx).value().to_string();
         let pass = self.password.read(cx).value().to_string();
+        // An empty form must not cancel a running automatic attempt; a filled
+        // one supersedes it below.
+        if self.auth.auto_login && (user.trim().chars().count() < 3 || pass.chars().count() < 8) {
+            cx.notify();
+            return;
+        }
         let Some(request) = self.auth.submit_login(&user, &pass) else {
             cx.notify();
             return;
         };
+        // A manual attempt owns the screen now. Any automatic answer that is
+        // still in flight can no longer enter the workspace or touch the box.
+        self.auto_attempt = self.auto_attempt.wrapping_add(1);
+        self.auth.auto_login = false;
+        self.auth.auto_retry = false;
+        self.auto_record = None;
+        self.remember_error.clear();
+        let remember = self.auth.remember_login;
         self.error.clear();
         cx.notify();
         let attempt = request.attempt;
@@ -94,75 +117,97 @@ impl Voxhold {
                 };
                 s.password
                     .update(cx, |input, cx| input.set_value("", window, cx));
-                let runtime = s.runtime.clone();
-                let attachment_client = c.clone();
-                let drafts = s.drafts.clone();
-                let attachments = cx.new(|cx| {
-                    attachments::Attachments::new(attachment_client, runtime, drafts, window, cx)
-                });
-                // The composer's send button and file row depend on the draft
-                // owned by this child entity; a notify keeps both in step.
-                cx.observe_in(&attachments, window, |_s, _attachments, _window, cx| {
-                    cx.notify();
-                })
-                .detach();
-                s.attachments = Some(attachments);
-                s.personal = Some(personal_settings::PersonalSettings::new(window, cx));
-                s.server_settings = Some(server_settings::ServerSettings::new(window, cx));
-                s.channel_settings = Some(channel_settings::ChannelSettings::new(window, cx));
-                s.channel_notifications = Some(channel_settings::ChannelNotifications::new());
-                s.inbox = Some(cx.new(|_| inbox::Inbox::new()));
-                let inbox = s.inbox.clone().expect("inbox");
-                let weak = cx.entity().downgrade();
-                inbox.update(cx, |inbox, _| {
-                    inbox.set_select_handler(Box::new(move |id, window, cx| {
-                        if let Some(view) = weak.upgrade() {
-                            view.update(cx, |view, cx| {
-                                if let Some(conversation) = view
-                                    .conversations
-                                    .iter()
-                                    .find(|conversation| conversation.id == id)
-                                    .cloned()
-                                {
-                                    view.select_conversation(conversation, window, cx);
-                                }
-                            });
-                        }
-                    }));
-                });
-                let weak = cx.entity().downgrade();
-                inbox.update(cx, |inbox, _| {
-                    inbox.set_refresh_handler(Box::new(move |_window, cx| {
-                        if let Some(view) = weak.upgrade() {
-                            view.update(cx, |view, cx| view.refresh_recents(cx));
-                        }
-                    }));
-                });
-                s.self_user_id = login_session.user_id();
-                s.auth.username = login_session.username().to_owned();
-                s.active_profile_save = None;
-                s.notification_saves.clear();
-                s.client = Some(c.clone());
-                s.adopt_session(login_session, window, cx);
-                s.start_realtime(c, window, cx);
-                s.servers = servers;
-                s.personal = Some(personal_settings::PersonalSettings::new(window, cx));
-                s.server_settings = Some(server_settings::ServerSettings::new(window, cx));
-                s.channel_settings = Some(channel_settings::ChannelSettings::new(window, cx));
-                s.channel_notifications = Some(channel_settings::ChannelNotifications::new());
-                s.auth.status = "Choose a server".into();
-                // Go selects the first server after login; an empty list leaves
-                // the workspace on its empty state. This also gives narrow
-                // layouts a working channel list even without the rail.
-                s.shell_initialized = false;
-                let first_server = s.servers.first().map(|server| server.id);
-                if let Some(id) = first_server {
-                    s.select_server(id, window, cx);
-                }
-                cx.notify();
+                let origin = login_session.origin().to_owned();
+                let account = login_session.username().to_owned();
+                let user_id = login_session.user_id();
+                let token = login_session.token().to_owned();
+                let expires_at = login_session.expires_at();
+                s.enter_workspace(c, servers, login_session, window, cx);
+                s.remember_manual_login(
+                    remember, origin, account, user_id, token, expires_at, window, cx,
+                );
             });
         })
         .detach();
+    }
+
+    /// The single successful completion of a sign-in, used by the password
+    /// form and by the remembered session. Everything that belongs to a new
+    /// session is installed here, so both paths cannot drift apart.
+    pub(super) fn enter_workspace(
+        &mut self,
+        c: Client,
+        servers: Vec<Server>,
+        login_session: crate::auth_session::Session,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let runtime = self.runtime.clone();
+        let attachment_client = c.clone();
+        let drafts = self.drafts.clone();
+        let attachments = cx.new(|cx| {
+            attachments::Attachments::new(attachment_client, runtime, drafts, window, cx)
+        });
+        // The composer's send button and file row depend on the draft owned by
+        // this child entity; a notify keeps both in step.
+        cx.observe_in(&attachments, window, |_s, _attachments, _window, cx| {
+            cx.notify();
+        })
+        .detach();
+        self.attachments = Some(attachments);
+        self.personal = Some(personal_settings::PersonalSettings::new(window, cx));
+        self.server_settings = Some(server_settings::ServerSettings::new(window, cx));
+        self.channel_settings = Some(channel_settings::ChannelSettings::new(window, cx));
+        self.channel_notifications = Some(channel_settings::ChannelNotifications::new());
+        self.inbox = Some(cx.new(|_| inbox::Inbox::new()));
+        let inbox = self.inbox.clone().expect("inbox");
+        let weak = cx.entity().downgrade();
+        inbox.update(cx, |inbox, _| {
+            inbox.set_select_handler(Box::new(move |id, window, cx| {
+                if let Some(view) = weak.upgrade() {
+                    view.update(cx, |view, cx| {
+                        if let Some(conversation) = view
+                            .conversations
+                            .iter()
+                            .find(|conversation| conversation.id == id)
+                            .cloned()
+                        {
+                            view.select_conversation(conversation, window, cx);
+                        }
+                    });
+                }
+            }));
+        });
+        let weak = cx.entity().downgrade();
+        inbox.update(cx, |inbox, _| {
+            inbox.set_refresh_handler(Box::new(move |_window, cx| {
+                if let Some(view) = weak.upgrade() {
+                    view.update(cx, |view, cx| view.refresh_recents(cx));
+                }
+            }));
+        });
+        self.self_user_id = login_session.user_id();
+        self.auth.username = login_session.username().to_owned();
+        self.active_profile_save = None;
+        self.notification_saves.clear();
+        self.client = Some(c.clone());
+        self.adopt_session(login_session, window, cx);
+        self.start_realtime(c, window, cx);
+        self.servers = servers;
+        self.personal = Some(personal_settings::PersonalSettings::new(window, cx));
+        self.server_settings = Some(server_settings::ServerSettings::new(window, cx));
+        self.channel_settings = Some(channel_settings::ChannelSettings::new(window, cx));
+        self.channel_notifications = Some(channel_settings::ChannelNotifications::new());
+        self.auth.status = "Choose a server".into();
+        // Go selects the first server after login; an empty list leaves
+        // the workspace on its empty state. This also gives narrow
+        // layouts a working channel list even without the rail.
+        self.shell_initialized = false;
+        let first_server = self.servers.first().map(|server| server.id);
+        if let Some(id) = first_server {
+            self.select_server(id, window, cx);
+        }
+        cx.notify();
     }
 
     /// A real logout: the local session and every job that belongs to it are
@@ -175,7 +220,14 @@ impl Voxhold {
             .session
             .as_mut()
             .and_then(|session| session.take_revocation());
+        // The remembered record belongs to the session being closed. The
+        // delete is local only, so an offline logout still forgets it.
+        let stored = self
+            .session
+            .as_ref()
+            .map(|session| (session.origin().to_owned(), session.username().to_owned()));
         self.end_session(window, cx, String::new());
+        self.forget_stored(stored);
         if let Some(revocation) = revocation {
             let runtime = self.runtime.clone();
             runtime.spawn(async move {
@@ -189,18 +241,32 @@ impl Voxhold {
     }
 
     /// A confirmed loss of the session (expired token or `401` on refresh).
-    /// The token is invalid, so only local state is cleared.
+    /// The token is invalid, so only local state is cleared. The remembered
+    /// record cannot be used any more and is deleted even when offline.
     fn expire_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let stored = self
+            .session
+            .as_ref()
+            .map(|session| (session.origin().to_owned(), session.username().to_owned()));
         if let Some(session) = self.session.as_mut() {
             session.invalidate();
         }
         self.end_session(window, cx, "Сессия истекла. Войдите снова.".into());
+        self.forget_stored(stored);
     }
 
     /// Drop the whole signed-in state. `reason` is shown on the login screen;
     /// an empty reason is a normal logout.
     fn end_session(&mut self, window: &mut Window, cx: &mut Context<Self>, reason: String) {
         self.stop_session_clock();
+        // Any late store write that started before this point must not apply,
+        // and no automatic attempt may finish after the session ended.
+        self.store_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.auto_attempt = self.auto_attempt.wrapping_add(1);
+        self.last_stored_token = None;
+        self.auto_record = None;
+        self.remember_error.clear();
         let origin = self
             .session
             .as_ref()
@@ -431,7 +497,7 @@ impl Voxhold {
                 .as_mut()
                 .is_some_and(|session| session.handle_unauthorized(&token));
             if matched {
-                self.end_session(window, cx, "Сессия истекла. Войдите снова.".into());
+                self.expire_session(window, cx);
                 return false;
             }
         }
@@ -524,12 +590,31 @@ impl Voxhold {
             Retry,
             Ignore,
         }
+        let mut rotation: Option<(String, String, String, String, i64)> = None;
         let step = match result {
             Ok(update) => {
+                let before = self.session.as_ref().map(|session| {
+                    (
+                        session.token().to_owned(),
+                        session.origin().to_owned(),
+                        session.username().to_owned(),
+                    )
+                });
                 let rotated = self.session.as_mut().is_some_and(|session| {
                     session.apply_rotation(generation, update.token, update.expires_at)
                 });
                 if rotated {
+                    if let (Some((old_token, origin, account)), Some(session)) =
+                        (before, self.session.as_ref())
+                    {
+                        rotation = Some((
+                            old_token,
+                            origin,
+                            account,
+                            session.token().to_owned(),
+                            session.expires_at(),
+                        ));
+                    }
                     Step::Rotated
                 } else {
                     Step::Ignore
@@ -557,6 +642,11 @@ impl Voxhold {
             Step::Rotated => {
                 self.session_gate.succeeded(generation);
                 self.apply_rotated_token(window, cx);
+                if let Some((old_token, origin, account, new_token, expires_at)) = rotation {
+                    self.persist_rotation(
+                        epoch, origin, account, old_token, new_token, expires_at, window, cx,
+                    );
+                }
             }
             Step::Terminal => self.expire_session(window, cx),
             Step::Retry => {

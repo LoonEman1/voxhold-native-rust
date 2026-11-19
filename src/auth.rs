@@ -44,6 +44,15 @@ pub struct AuthState {
     /// The «Запомнить адрес» checkbox. The value is persisted only after the
     /// address step is confirmed; toggling alone never writes a file.
     pub remember_instance: bool,
+    /// The «Запомнить вход» checkbox on the password label row. It only marks
+    /// the intent; the record is written after a successful login.
+    pub remember_login: bool,
+    /// A stored session is being checked right now. The form stays usable and
+    /// a manual attempt supersedes it.
+    pub auto_login: bool,
+    /// The last automatic attempt kept the record but could not reach the
+    /// server. The login card then offers «Повторить».
+    pub auto_retry: bool,
     login_attempt: u64,
 }
 
@@ -56,6 +65,9 @@ impl AuthState {
             status: String::new(),
             busy: false,
             remember_instance: false,
+            remember_login: false,
+            auto_login: false,
+            auto_retry: false,
             login_attempt: 0,
         }
     }
@@ -188,6 +200,9 @@ pub struct AuthLayout {
     pub origin: Rect,
     pub username_label: Rect,
     pub password_label: Rect,
+    /// «Запомнить вход» on the password label row. Empty on the address step:
+    /// the login card keeps its reference height and field positions.
+    pub remember_login: Rect,
     pub terms: Rect,
 }
 
@@ -337,6 +352,20 @@ pub fn layout_auth(w: f32, h: f32, instance: bool, has_error: bool) -> AuthLayou
     let brand = Rect::new(if story == 0.0 { x } else { brand_y }, brand_y, 39.0, 39.0);
     let username_label = Rect::new(x, user.y - 25.0, width, 17.0);
     let password_label = Rect::new(x, password.y - 25.0, width, 17.0);
+    // «Запомнить вход» shares the password label row. The 18 px box, an 8 px
+    // gap and the label need 118 px; the row is right-aligned so the «Пароль»
+    // caption on the left is never covered and no vertical space is added.
+    let remember_login = if instance {
+        Rect::new(0.0, 0.0, 0.0, 0.0)
+    } else {
+        let row = 118.0f32.min(width.max(0.0));
+        Rect::new(
+            x + (width - row).max(0.0),
+            password_label.y - 0.5,
+            row,
+            18.0,
+        )
+    };
     // Keep offsets used by the heading stable across renders.
     if instance {
         y += 0.0;
@@ -361,6 +390,7 @@ pub fn layout_auth(w: f32, h: f32, instance: bool, has_error: bool) -> AuthLayou
         origin,
         username_label,
         password_label,
+        remember_login,
         terms,
     }
 }
@@ -664,6 +694,41 @@ mod tests {
         let roomy = layout_auth(390.0, 600.0, true, true);
         assert!(roomy.error.bottom() <= 600.0);
         assert!(roomy.error.w >= 200.0);
+    }
+
+    #[test]
+    fn remember_login_stays_on_the_password_label_row() {
+        for (width, height) in [
+            (320.0, 360.0),
+            (390.0, 760.0),
+            (720.0, 900.0),
+            (1280.0, 900.0),
+        ] {
+            for has_error in [false, true] {
+                let layout = layout_auth(width, height, false, has_error);
+                let row = layout.remember_login;
+                assert_eq!(row.h, 18.0);
+                assert!(row.w > 100.0, "{width}x{height}: row is {} wide", row.w);
+                assert!(
+                    row.x >= layout.password_label.x
+                        && row.right() <= layout.password_label.right(),
+                    "{width}x{height}: the checkbox leaves the label row"
+                );
+                assert!(
+                    (row.y - (layout.password_label.y - 0.5)).abs() < 0.01,
+                    "{width}x{height}: the checkbox moved off the label row"
+                );
+                // The row sits between the password field and the button, and
+                // the caption on the left keeps at least 40 px of clear space.
+                assert!(row.bottom() <= layout.password.y);
+                assert!(row.x - layout.password_label.x >= 40.0);
+                assert!(row.y >= layout.card.y && row.bottom() <= layout.card.bottom());
+            }
+            // The address step has no login checkbox and keeps its geometry.
+            assert!(layout_auth(width, height, true, false)
+                .remember_login
+                .is_empty());
+        }
     }
 
     #[test]

@@ -7,8 +7,13 @@
 //! because there is no render reference, while keeping the WinMM preview/test
 //! tone as real actions. The exact sentences live in `voice_form_text` so they
 //! stay testable without a UI query API.
+//!
+//! Layout follows the web `voice-settings__section` cards: devices with two
+//! compact selectors, levels, bitrate presets, interface sounds, microphone
+//! processing, input mode/hotkeys and a collapsed «Подробнее» diagnostics block
+//! that owns the capture-chain note, the capability rows and the long notes.
 
-use super::settings_view::ButtonKind;
+use super::settings_view::{settings_card_metrics, ButtonKind};
 use super::*;
 use crate::audio_capabilities::{capabilities_for, Support};
 use crate::voice_settings::{device_choices, BITRATES};
@@ -19,10 +24,37 @@ use gpui::ElementId;
 /// when the dialog is resized.
 const METER_WIDTH: f32 = 220.0;
 
+/// Minimum usable form width for the two device selectors to sit side by side.
+/// The web grid switches at the modal width; here the number is compared with
+/// the real settings form width, so it follows the dialog instead of the
+/// window.
+const TWO_COLUMN_FORM_WIDTH: f32 = 540.0;
+
 /// Slider id for one participant. It is the stable user id, not the row index,
 /// so a roster change cannot move a value to a neighbour.
 pub(super) fn user_volume_slider_id(user: i64) -> String {
     format!("user-volume-{user}")
+}
+
+/// Adjacent endpoint ids for one device selector. `ids` starts with the empty
+/// system default, exactly like `device_choices`. A saved id that is no longer
+/// listed (hot-unplug) is kept visible by the caller, but both arrows recover
+/// to the first valid choice instead of selecting a row by index.
+pub(super) fn adjacent_device_ids(ids: &[String], selected: &str) -> (String, String) {
+    let fallback = ids.first().cloned().unwrap_or_default();
+    let Some(index) = ids.iter().position(|id| id == selected) else {
+        return (fallback.clone(), fallback);
+    };
+    let previous = if index == 0 {
+        ids[0].clone()
+    } else {
+        ids[index - 1].clone()
+    };
+    let next = ids
+        .get(index + 1)
+        .cloned()
+        .unwrap_or_else(|| ids[index].clone());
+    (previous, next)
 }
 
 /// The measured mixer line shown in the voice tab. It depends on both the
@@ -60,6 +92,7 @@ impl Voxhold {
             self.voice_settings.devices_error.clone()
         };
         let prefs = self.voice_settings.prefs.clone();
+        let diagnostics_open = self.voice_settings.diagnostics_open;
         #[cfg(feature = "voxhold-media")]
         let applied = self.voice.as_ref().and_then(|panel| {
             panel.read(cx).applied_audio().map(|audio| {
@@ -107,60 +140,70 @@ impl Voxhold {
             .is_some_and(|panel| panel.read(cx).call_active());
         #[cfg(not(feature = "voxhold-media"))]
         let in_call = false;
-        let (input_names, input_ids, input_current) = device_choices(&prefs, &devices, true);
-        let (output_names, output_ids, output_current) = device_choices(&prefs, &devices, false);
+        let (_, input_ids, input_current) = device_choices(&prefs, &devices, true);
+        let (_, output_ids, output_current) = device_choices(&prefs, &devices, false);
+        // The two-column decision follows the painted settings form, not a
+        // window size guess: the same numbers the overlay uses for its card.
+        let form_width = settings_card_metrics(self.viewport, self.ui_scale).form_width();
+        let wide = form_width >= TWO_COLUMN_FORM_WIDTH;
 
-        let mut root = div().flex().flex_col().gap(px(14.)).child(self.heading(
+        let mut root = div().flex().flex_col().gap(px(12.)).child(self.heading(
             "Голос и звук",
-            "Устройства, битрейт и обработка микрофона применяются к звонку без перезапуска комнаты; ниже показан фактический тракт.",
+            "Устройства, битрейт и обработка микрофона применяются к звонку без перезапуска комнаты.",
         ));
 
-        root = root
-            .child(self.heading(
-                "Устройства",
-                "Выберите, откуда брать голос и куда выводить звук комнаты.",
-            ))
-            .child(self.form_text(&format!("Устройство ввода · {input_current}"), false));
-        for index in 0..input_names.len() {
-            root = root.child(self.settings_button(
-                ElementId::Name(format!("audio-in-{index}").into()),
-                input_names[index].clone(),
-                if input_names[index] == input_current {
-                    ButtonKind::Tab
-                } else {
-                    ButtonKind::Secondary
-                },
-                input_names[index] == input_current,
-                false,
-                // The endpoint id captured at draw time, not the row index: a
-                // refreshed list would otherwise select another device.
-                SettingsAct::Personal(personal_settings::Action::SelectInput(
-                    input_ids[index].clone(),
-                )),
-                window,
-                cx,
-            ));
+        // Devices: two compact selectors and the refresh action inside one
+        // card, as in the web `voice-device-grid` and its heading button.
+        let input_selector = self.voice_device_selector(
+            "audio-in",
+            "Устройство ввода",
+            &input_ids,
+            &prefs.input,
+            &input_current,
+            true,
+            window,
+            cx,
+        );
+        let output_selector = self.voice_device_selector(
+            "audio-out",
+            "Устройство вывода",
+            &output_ids,
+            &prefs.output,
+            &output_current,
+            false,
+            window,
+            cx,
+        );
+        let selectors = if wide {
+            div()
+                .w_full()
+                .flex()
+                .items_start()
+                .gap(px(12.))
+                .child(div().flex_1().min_w(px(0.)).child(input_selector))
+                .child(div().flex_1().min_w(px(0.)).child(output_selector))
+        } else {
+            div()
+                .w_full()
+                .flex()
+                .flex_col()
+                .gap(px(10.))
+                .child(input_selector)
+                .child(output_selector)
+        };
+        let mut devices_body = div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap(px(8.))
+            .child(selectors);
+        if !devices_error.is_empty() {
+            devices_body = devices_body.child(self.form_text(&devices_error, true));
         }
-        root = root.child(self.form_text(&format!("Устройство вывода · {output_current}"), false));
-        for index in 0..output_names.len() {
-            root = root.child(self.settings_button(
-                ElementId::Name(format!("audio-out-{index}").into()),
-                output_names[index].clone(),
-                if output_names[index] == output_current {
-                    ButtonKind::Tab
-                } else {
-                    ButtonKind::Secondary
-                },
-                output_names[index] == output_current,
-                false,
-                SettingsAct::Personal(personal_settings::Action::SelectOutput(
-                    output_ids[index].clone(),
-                )),
-                window,
-                cx,
-            ));
+        if !device_notice.is_empty() {
+            devices_body = devices_body.child(self.form_text(&device_notice, false));
         }
-        root = root.child(self.settings_button(
+        let refresh = self.settings_button(
             ElementId::Name("audio-refresh".into()),
             if loading {
                 "Обновляем…"
@@ -173,14 +216,29 @@ impl Voxhold {
             SettingsAct::Personal(personal_settings::Action::RefreshDevices),
             window,
             cx,
+        );
+        root = root.child(self.settings_card(
+            "voice-devices-card",
+            "Устройства",
+            "Выберите, откуда брать голос и куда выводить звук комнаты.",
+            Some(refresh.into_any_element()),
+            devices_body.into_any_element(),
         ));
 
-        root = root
-            .child(self.separator())
-            .child(self.heading(
-                "Уровни звука",
-                "Громкость микрофона применяется в software-тракте до Opus. При platform-fallback действует встроенная обработка ADM.",
-            ))
+        // Levels: the microphone slider, its meter directly underneath, the
+        // preview action and explanation, then the output volume.
+        let meter_explanation = if in_call {
+            "В звонке индикатор показывает pre-gate уровень активного тракта с учётом усиления микрофона и mute: закрытый микрофон даёт 0, gate к индикатору не применяется."
+        } else if capabilities.microphone_preview == Support::Applied {
+            "Вне звонка индикатор показывает предпросмотр WinMM с выбранного устройства, умноженный на сохранённое усиление; коралловая риска — планка, к предпросмотру gate не применяется."
+        } else {
+            "Предпросмотр микрофона недоступен в этой сборке."
+        };
+        let mut levels = div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap(px(12.))
             .child(self.settings_slider(
                 "input-volume",
                 "Громкость микрофона",
@@ -206,19 +264,10 @@ impl Voxhold {
                 cx,
             ));
         if !preview_error.is_empty() {
-            root = root.child(self.form_text(&preview_error, true));
+            levels = levels.child(self.form_text(&preview_error, true));
         }
-        root = root.child(self.form_text(
-            if in_call {
-                "В звонке индикатор показывает pre-gate уровень активного тракта с учётом усиления микрофона и mute: закрытый микрофон даёт 0, gate к индикатору не применяется."
-            } else if capabilities.microphone_preview == Support::Applied {
-                "Вне звонка индикатор показывает предпросмотр WinMM с выбранного устройства, умноженный на сохранённое усиление; коралловая риска — планка, к предпросмотру gate не применяется."
-            } else {
-                "Предпросмотр микрофона недоступен в этой сборке."
-            },
-            false,
-        ));
-        root = root
+        levels = levels
+            .child(self.form_text(meter_explanation, false))
             .child(self.settings_slider(
                 "output-volume",
                 "Громкость вывода",
@@ -231,6 +280,14 @@ impl Voxhold {
                 cx,
             ))
             .child(self.form_text(crate::voice_form_text::OUTPUT_VOLUME_NOTE, false));
+        root = root.child(self.settings_card(
+            "voice-levels-card",
+            "Уровни звука",
+            "Громкость микрофона применяется в software-тракте до Opus. При platform-fallback действует встроенная обработка ADM.",
+            None,
+            levels.into_any_element(),
+        ));
+
         // Per-user room volume: the stable key is the user id, so a reconnect
         // that changes connection ids does not move a volume to another person.
         #[cfg(feature = "voxhold-media")]
@@ -248,36 +305,36 @@ impl Voxhold {
                 })
                 .unwrap_or_default();
             if !rows.is_empty() {
+                let mut participants = div().w_full().flex().flex_col().gap(px(8.));
                 if software_mixer {
-                    root = root.child(self.form_text(
+                    participants = participants.child(self.form_text(
                         "Громкость участника 0–200 % применяется программным микшером комнаты; локальный mute — отдельный признак.",
                         false,
                     ));
                 } else if mixer_was_software {
-                    root = root.child(self.form_text(
+                    participants = participants.child(self.form_text(
                         "Микшер остановлен или перезапускается: усиление участников сейчас не применяется, работает только mute.",
                         true,
                     ));
                 } else {
-                    root = root.child(self.form_text(
+                    participants = participants.child(self.form_text(
                         "Программный микшер не открылся: усиление участников не применяется, доступен только mute.",
                         true,
                     ));
                 }
-                root = root.child(self.form_text(
+                participants = participants.child(self.form_text(
                     "Уровень после микса измеряется в микшере; значения p95 и underrun видны в комнате.",
                     false,
                 ));
                 if let Some(stats) = &mixer_stats {
-                    root = root.child(self.form_text(stats, false));
+                    participants = participants.child(self.form_text(stats, false));
                 }
                 for (user, name, volume) in rows {
                     // The id is the stable user id, not a row index: a roster
                     // change during a drag cannot move the value to a neighbour.
                     let id = user_volume_slider_id(user);
-                    root = root
-                        .child(self.form_text(&name, false))
-                        .child(self.settings_slider(
+                    participants = participants.child(self.form_text(&name, false)).child(
+                        self.settings_slider(
                             &id,
                             "Громкость участника",
                             volume,
@@ -289,39 +346,35 @@ impl Voxhold {
                             },
                             window,
                             cx,
-                        ));
+                        ),
+                    );
                 }
+                root = root.child(self.settings_card(
+                    "voice-participants-card",
+                    "Громкость участников",
+                    "Отдельная громкость каждого собеседника в комнате.",
+                    None,
+                    participants.into_any_element(),
+                ));
             }
         }
-        root = root.child(self.form_text(
-            &format!("Качество передачи · {} Кбит/с", prefs.bitrate),
-            false,
-        ));
-        root = root.child(
-            self.voice_segments(
-                "bitrate",
-                BITRATES.iter().map(|bitrate| bitrate.to_string()).collect(),
-                BITRATES
-                    .iter()
-                    .position(|bitrate| *bitrate == prefs.bitrate),
-                |index| {
-                    SettingsAct::Personal(personal_settings::Action::SetBitrate(BITRATES[index]))
-                },
-                window,
-                cx,
-            ),
-        );
-        root = root.child(self.form_text(
-            "Это максимальный битрейт Opus. При нестабильной сети WebRTC может временно снизить его автоматически.",
-            false,
+
+        // Quality: six Opus presets, one row of six or two rows of three.
+        let quality = self.voice_bitrate_presets(wide, prefs.bitrate, window, cx);
+        root = root.child(self.settings_card(
+            "voice-quality-card",
+            "Качество передачи",
+            "Максимальный битрейт Opus; ползунки уровней выше не меняют этот предел.",
+            None,
+            quality,
         ));
 
-        root = root
-            .child(self.separator())
-            .child(self.heading(
-                "Звуки интерфейса",
-                "Короткие сигналы о подключении, микрофоне и звуке. Слышите их только вы.",
-            ))
+        // Interface sounds.
+        let mut sounds = div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap(px(10.))
             .child(self.settings_toggle(
                 ElementId::Name("sounds".into()),
                 "Звуки подключения и микрофона",
@@ -333,7 +386,7 @@ impl Voxhold {
                 cx,
             ));
         if prefs.sounds {
-            root = root
+            sounds = sounds
                 .child(self.settings_slider(
                     "sound-volume",
                     "Громкость сигналов",
@@ -360,92 +413,78 @@ impl Voxhold {
                     cx,
                 ));
             if !tone_error.is_empty() {
-                root = root.child(self.form_text(&tone_error, true));
+                sounds = sounds.child(self.form_text(&tone_error, true));
             }
         }
+        root = root.child(self.settings_card(
+            "voice-sounds-card",
+            "Звуки интерфейса",
+            "Короткие сигналы о подключении, микрофоне и звуке. Слышите их только вы.",
+            None,
+            sounds.into_any_element(),
+        ));
 
-        root = root
-            .child(self.separator())
-            .child(self.heading("Обработка микрофона", ""))
-            .child(self.voice_segments(
-                "noise-mode",
-                vec!["Автоматически".into(), "С нижней планкой".into()],
-                Some(if prefs.noise_mode == "threshold" {
-                    1
-                } else {
-                    0
-                }),
-                |index| SettingsAct::Personal(personal_settings::Action::SetNoiseMode(index)),
-                window,
-                cx,
-            ));
+        // Microphone processing stays a real card outside the diagnostics.
+        let mut processing =
+            div()
+                .w_full()
+                .flex()
+                .flex_col()
+                .gap(px(10.))
+                .child(self.voice_segments(
+                    "noise-mode",
+                    vec!["Автоматически".into(), "С нижней планкой".into()],
+                    Some(if prefs.noise_mode == "threshold" {
+                        1
+                    } else {
+                        0
+                    }),
+                    |index| SettingsAct::Personal(personal_settings::Action::SetNoiseMode(index)),
+                    window,
+                    cx,
+                ));
         if prefs.noise_mode == "threshold" {
-            root = root.child(self.settings_slider(
-                "noise-gate",
-                "Планка шума",
-                prefs.noise_gate,
-                100,
-                |value| SettingsAct::Personal(personal_settings::Action::SetVolume("noise", value)),
-                window,
-                cx,
-            ));
+            processing = processing
+                .child(self.settings_slider(
+                    "noise-gate",
+                    "Планка шума",
+                    prefs.noise_gate,
+                    100,
+                    |value| {
+                        SettingsAct::Personal(personal_settings::Action::SetVolume("noise", value))
+                    },
+                    window,
+                    cx,
+                ))
+                .child(self.form_text(
+                    "Коралловая линия на индикаторе — планка. Всё левее неё передаётся как тишина: помолчите и поднимайте ползунок, пока уровень в тишине не окажется слева от линии.",
+                    false,
+                ));
         }
-        let capture_note = match applied {
-            Some(("software", noise_mode, echo, agc, _)) => {
-                crate::voice_form_text::software_capture_note(noise_mode, echo, agc)
-            }
-            Some(_) => crate::voice_form_text::PLATFORM_CAPTURE_NOTE.to_owned(),
-            None => crate::voice_form_text::PENDING_CAPTURE_NOTE.to_owned(),
-        };
-        root = root
-            .child(self.form_text(&capture_note, false))
-            .child(self.voice_capability(
-                "Эхоподавление",
-                capabilities.echo_cancellation,
-                crate::voice_form_text::echo_cancellation_note(capabilities.echo_cancellation),
-            ))
-            .child(self.settings_toggle(
-                ElementId::Name("auto-gain".into()),
-                "Автоматическое усиление",
-                crate::voice_form_text::AUTO_GAIN_DESCRIPTION,
-                prefs.auto_gain,
-                capabilities.auto_gain == Support::Automatic,
-                SettingsAct::Personal(personal_settings::Action::ToggleAutoGain),
-                window,
-                cx,
-            ))
-            .child(self.voice_capability(
-                "Шумоподавление",
-                capabilities.noise_suppression,
-                "auto — APM NS; threshold — программный gate; platform ADM применяет своё NS",
-            ))
-            .child(self.voice_capability(
-                "Усиление микрофона",
-                capabilities.input_gain,
-                crate::voice_form_text::input_gain_note(capabilities.input_gain),
-            ))
-            .child(self.voice_capability(
-                "Планка шума",
-                capabilities.noise_gate,
-                crate::voice_form_text::noise_gate_note(capabilities.noise_gate),
-            ))
-            .child(self.voice_capability(
-                "Громкость вывода",
-                capabilities.output_gain,
-                crate::voice_form_text::OUTPUT_GAIN_NOTE,
-            ))
-            .child(self.voice_capability(
-                "Качество передачи",
-                capabilities.bitrate,
-                "максимальный битрейт Opus применяется сразу",
-            ))
-            .child(self.form_text(
-                "Тракт по умолчанию — software 48 кГц mono; при отказе WinMM движок переходит на platform ADM и сообщает об этом. AEC в software-пути недоступно без render-reference.",
-                false,
-            ));
-        root = root
-            .child(self.separator())
-            .child(self.heading("Режим ввода и горячие клавиши", ""))
+        processing = processing.child(self.settings_toggle(
+            ElementId::Name("auto-gain".into()),
+            "Автоматическое усиление",
+            crate::voice_form_text::AUTO_GAIN_DESCRIPTION,
+            prefs.auto_gain,
+            capabilities.auto_gain == Support::Automatic,
+            SettingsAct::Personal(personal_settings::Action::ToggleAutoGain),
+            window,
+            cx,
+        ));
+        root = root.child(self.settings_card(
+            "voice-processing-card",
+            "Обработка микрофона",
+            "Настройки передаются движку при захвате выбранного устройства.",
+            None,
+            processing.into_any_element(),
+        ));
+
+        // Input mode and hotkeys.
+        let mut input_card = div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap(px(8.))
             .child(self.settings_option(
                 ElementId::Name("input-mode-voice".into()),
                 "Постоянный микрофон",
@@ -466,21 +505,99 @@ impl Voxhold {
                 window,
                 cx,
             ))
-            .child(self.voice_shortcuts(window, cx));
-        root = root.child(self.form_text(
-            "Сочетания действуют, пока окно Voxhold активно: в этой сборке нет глобального перехвата клавиатуры (RegisterHotKey/WH_KEYBOARD_LL), поэтому «глобальный» режим не заявляется.",
-            false,
-        ));
+            .child(self.voice_shortcuts(window, cx))
+            .child(self.form_text(
+                "Сочетания действуют, пока окно Voxhold активно: в этой сборке нет глобального перехвата клавиатуры (RegisterHotKey/WH_KEYBOARD_LL), поэтому «глобальный» режим не заявляется.",
+                false,
+            ));
         if !prefs.shortcuts_valid() {
-            root = root
+            input_card = input_card
                 .child(self.form_text("Назначьте разные сочетания для каждого действия.", true));
         }
-        if !device_notice.is_empty() {
-            root = root.child(self.form_text(&device_notice, false));
+        root = root.child(self.settings_card(
+            "voice-input-card",
+            "Режим ввода и горячие клавиши",
+            "",
+            None,
+            input_card.into_any_element(),
+        ));
+
+        // Diagnostics: collapsed by default; only explanation rows live here.
+        let capture_note = match applied {
+            Some(("software", noise_mode, echo, agc, _)) => {
+                crate::voice_form_text::software_capture_note(noise_mode, echo, agc)
+            }
+            Some(_) => crate::voice_form_text::PLATFORM_CAPTURE_NOTE.to_owned(),
+            None => crate::voice_form_text::PENDING_CAPTURE_NOTE.to_owned(),
+        };
+        let mut diagnostics = div().w_full().flex().flex_col().gap(px(8.));
+        if diagnostics_open {
+            diagnostics = diagnostics
+                .child(self.voice_note("voice-capture-note", &capture_note, false))
+                .child(self.voice_capability(
+                    "cap-echo",
+                    "Эхоподавление",
+                    capabilities.echo_cancellation,
+                    crate::voice_form_text::echo_cancellation_note(capabilities.echo_cancellation),
+                ))
+                .child(self.voice_capability(
+                    "cap-noise",
+                    "Шумоподавление",
+                    capabilities.noise_suppression,
+                    "auto — APM NS; threshold — программный gate; platform ADM применяет своё NS",
+                ))
+                .child(self.voice_capability(
+                    "cap-gain",
+                    "Усиление микрофона",
+                    capabilities.input_gain,
+                    crate::voice_form_text::input_gain_note(capabilities.input_gain),
+                ))
+                .child(self.voice_capability(
+                    "cap-gate",
+                    "Планка шума",
+                    capabilities.noise_gate,
+                    crate::voice_form_text::noise_gate_note(capabilities.noise_gate),
+                ))
+                .child(self.voice_capability(
+                    "cap-output",
+                    "Громкость вывода",
+                    capabilities.output_gain,
+                    crate::voice_form_text::OUTPUT_GAIN_NOTE,
+                ))
+                .child(self.voice_capability(
+                    "cap-bitrate",
+                    "Качество передачи",
+                    capabilities.bitrate,
+                    "максимальный битрейт Opus применяется сразу",
+                ))
+                .child(self.voice_note(
+                    "voice-chain-note",
+                    "Тракт по умолчанию — software 48 кГц mono; при отказе WinMM движок переходит на platform ADM и сообщает об этом. AEC в software-пути недоступно без render-reference.",
+                    false,
+                ));
         }
-        if !devices_error.is_empty() {
-            root = root.child(self.form_text(&devices_error, true));
-        }
+        let diagnostics_toggle = self.settings_button(
+            ElementId::Name("voice-diagnostics-toggle".into()),
+            if diagnostics_open {
+                "Свернуть"
+            } else {
+                "Подробнее"
+            },
+            ButtonKind::Secondary,
+            false,
+            false,
+            SettingsAct::Personal(personal_settings::Action::ToggleVoiceDiagnostics),
+            window,
+            cx,
+        );
+        root = root.child(self.settings_card(
+            "voice-diagnostics-card",
+            "Диагностика",
+            "Фактический тракт захвата и доступность обработки.",
+            Some(diagnostics_toggle.into_any_element()),
+            diagnostics.into_any_element(),
+        ));
+
         root = root.child(self.separator()).child(
             div()
                 .flex()
@@ -507,6 +624,150 @@ impl Voxhold {
                 )),
         );
         root.into_any_element()
+    }
+
+    /// One compact device selector: label, then the current name between the
+    /// prev/next affordances. The choice is the endpoint id captured from
+    /// `device_choices`, never the row index, so a refreshed list cannot slide
+    /// the selection to another row.
+    fn voice_device_selector(
+        &mut self,
+        prefix: &'static str,
+        label: &str,
+        ids: &[String],
+        selected: &str,
+        current: &str,
+        input: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let p = self.palette;
+        let (previous, next) = adjacent_device_ids(ids, selected);
+        let action = |id: String| {
+            if input {
+                personal_settings::Action::SelectInput(id)
+            } else {
+                personal_settings::Action::SelectOutput(id)
+            }
+        };
+        let selector_id = format!("{prefix}-selector");
+        let name_id = format!("{prefix}-name");
+        let unavailable = current == "Устройство недоступно";
+        let previous = self
+            .settings_button(
+                ElementId::Name(format!("{prefix}-prev").into()),
+                "‹",
+                ButtonKind::Secondary,
+                false,
+                false,
+                SettingsAct::Personal(action(previous)),
+                window,
+                cx,
+            )
+            .h(px(32.))
+            .w(px(32.))
+            .px(px(0.));
+        let next = self
+            .settings_button(
+                ElementId::Name(format!("{prefix}-next").into()),
+                "›",
+                ButtonKind::Secondary,
+                false,
+                false,
+                SettingsAct::Personal(action(next)),
+                window,
+                cx,
+            )
+            .h(px(32.))
+            .w(px(32.))
+            .px(px(0.));
+        div()
+            .w_full()
+            .min_w(px(0.))
+            .flex()
+            .flex_col()
+            .gap(px(6.))
+            .child(
+                div()
+                    .text_size(px(12.))
+                    .font_weight(gpui::FontWeight::BOLD)
+                    .text_color(ink(p.muted))
+                    .child(label.to_owned()),
+            )
+            .child(
+                div()
+                    .id(ElementId::Name(selector_id.clone().into()))
+                    .debug_selector(move || selector_id.clone())
+                    .w_full()
+                    .h(px(40.))
+                    .px(px(4.))
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .rounded(px(9.))
+                    .border_1()
+                    .border_color(ink(p.line))
+                    .bg(ink(p.bg))
+                    .child(previous)
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .truncate()
+                            .px(px(4.))
+                            .text_size(px(13.))
+                            .text_color(ink(if unavailable { p.danger } else { p.fg }))
+                            .debug_selector(move || name_id.clone())
+                            .child(current.to_owned()),
+                    )
+                    .child(next),
+            )
+            .into_any_element()
+    }
+
+    /// Six Opus presets, as in the web `.voice-bitrate-setting`: one row of six
+    /// on a wide form, two rows of three when the form is narrow. The selected
+    /// preset uses the primary (lime) style so the active value is unambiguous.
+    fn voice_bitrate_presets(
+        &mut self,
+        wide: bool,
+        bitrate: i64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let columns = if wide { BITRATES.len() } else { 3 };
+        let mut body = div().w_full().flex().flex_col().gap(px(8.));
+        for row in BITRATES.chunks(columns) {
+            let mut line = div().w_full().flex().gap_2();
+            for value in row {
+                let index = BITRATES
+                    .iter()
+                    .position(|preset| preset == value)
+                    .unwrap_or(0);
+                let selected = bitrate == *value;
+                let button = self.settings_button(
+                    ElementId::Name(format!("bitrate-{index}").into()),
+                    format!("{value} кбит/с"),
+                    if selected {
+                        ButtonKind::Primary
+                    } else {
+                        ButtonKind::Secondary
+                    },
+                    selected,
+                    false,
+                    SettingsAct::Personal(personal_settings::Action::SetBitrate(*value)),
+                    window,
+                    cx,
+                );
+                line = line.child(div().flex_1().min_w(px(0.)).child(button.w_full()));
+            }
+            body = body.child(line);
+        }
+        body.child(self.form_text(
+            "Это максимальный битрейт Opus. При нестабильной сети WebRTC может временно снизить его автоматически.",
+            false,
+        ))
+        .into_any_element()
     }
 
     /// Go `voiceShortcuts`: one row per action with the current binding. While
@@ -641,8 +902,24 @@ impl Voxhold {
             .into_any_element()
     }
 
+    /// A note with a debug selector, so the layout tests can prove that the
+    /// diagnostics block reveals and hides the technical text.
+    fn voice_note(&self, id: &'static str, text: &str, danger: bool) -> AnyElement {
+        div()
+            .w_full()
+            .debug_selector(move || id.to_string())
+            .child(self.form_text(text, danger))
+            .into_any_element()
+    }
+
     /// One capability row: a label, a short support tag and the honest note.
-    fn voice_capability(&self, label: &str, support: Support, note: &str) -> AnyElement {
+    fn voice_capability(
+        &self,
+        id: &'static str,
+        label: &str,
+        support: Support,
+        note: &str,
+    ) -> AnyElement {
         let p = self.palette;
         let tag = match support {
             Support::Applied => "применяется",
@@ -655,6 +932,8 @@ impl Voxhold {
             Support::Unavailable => p.danger,
         };
         div()
+            .id(ElementId::Name(id.into()))
+            .debug_selector(move || id.to_string())
             .w_full()
             .flex()
             .flex_col()

@@ -132,6 +132,7 @@ impl Voxhold {
         let key_action = action.clone();
         let debug_row = key.clone();
         let debug_track = format!("{key}-track");
+        let debug_value = format!("{key}-value");
         let id_field = key.clone();
         let id_track = format!("{key}-track");
         div()
@@ -142,10 +143,33 @@ impl Voxhold {
             .flex_col()
             .gap_1()
             .child(
+                // Web `voice-range`: label on the left, the percentage on the
+                // right. Only the header changes; the track below keeps the
+                // measured geometry the pointer math uses.
                 div()
-                    .text_size(px(13.))
-                    .font_weight(gpui::FontWeight::BOLD)
-                    .child(format!("{label} · {value}%")),
+                    .w_full()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .truncate()
+                            .text_size(px(13.))
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .child(label.to_owned()),
+                    )
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .text_size(px(12.))
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .text_color(ink(p.lime))
+                            .debug_selector(move || debug_value.clone())
+                            .child(format!("{value}%")),
+                    ),
             )
             .child(
                 div()

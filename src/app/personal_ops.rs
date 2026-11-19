@@ -663,6 +663,7 @@ impl Voxhold {
             | Action::SetNoiseMode(_)
             | Action::SetInputMode(_)
             | Action::ToggleAutoGain
+            | Action::ToggleVoiceDiagnostics
             | Action::ResetVoice
             | Action::TestMicrophone
             | Action::TestTone => {}

@@ -82,6 +82,11 @@ impl Voxhold {
                 self.apply_voice_snapshot(cx);
                 cx.notify();
             }
+            Action::ToggleVoiceDiagnostics => {
+                // View-only state: the section must not touch the saved file.
+                self.voice_settings.diagnostics_open = !self.voice_settings.diagnostics_open;
+                cx.notify();
+            }
             Action::ResetVoice => {
                 // Go resets to `defaultVoicePreferences()` and therefore also
                 // clears both selected devices.

@@ -339,6 +339,9 @@ pub struct VoiceSettings {
     pub device_notice: String,
     /// Shortcut currently being recorded: 0 mute, 1 deafen, 2 push-to-talk.
     pub recording_shortcut: Option<usize>,
+    /// The voice tab's «Подробнее» block. Collapsed by default; it only hides
+    /// explanation rows, every control stays reachable outside it.
+    pub diagnostics_open: bool,
     pub tone_pending: bool,
     pub tone_error: String,
     /// Bumped whenever the meter task must stop or restart.
@@ -375,6 +378,7 @@ impl Default for VoiceSettings {
             preview_pending: false,
             device_notice: String::new(),
             recording_shortcut: None,
+            diagnostics_open: false,
             tone_pending: false,
             tone_error: String::new(),
             meter_epoch: 0,

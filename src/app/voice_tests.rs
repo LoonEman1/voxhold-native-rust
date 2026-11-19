@@ -942,7 +942,7 @@ fn voice_room_colors_follow_the_theme() {
 async fn the_decoder_viewport_tracks_the_fullscreen_picture(cx: &mut TestAppContext) {
     let (mut visual, _view, voice) = fixture(cx);
     draw(&mut visual);
-    visual.update(|_window, app| {
+    visual.update(|window, app| {
         voice.update(app, |panel, _| {
             panel.test_attach_detached_handle();
             panel.set_scale(1.0);
@@ -953,18 +953,19 @@ async fn the_decoder_viewport_tracks_the_fullscreen_picture(cx: &mut TestAppCont
                 Some((358, 202)),
                 "the floating player keeps its own picture, not the whole window"
             );
-            panel.test_set_fullscreen(true);
-            panel.test_sync_viewport();
+            // The production fullscreen action must request the fullscreen
+            // picture on its own; the test adds no manual viewport sync.
+            panel.player_toggle_fullscreen(window);
+            assert!(panel.player_fullscreen());
             assert_eq!(
                 panel.test_take_viewport(),
                 Some((1920, 1018)),
                 "fullscreen decodes to the full picture surface"
             );
-            panel.test_sync_viewport();
             assert_eq!(
                 panel.test_take_viewport(),
                 None,
-                "an unchanged viewport is not queued again"
+                "the toggle must not request the same viewport twice"
             );
             panel.set_scale(2.0);
             assert_eq!(
@@ -978,7 +979,42 @@ async fn the_decoder_viewport_tracks_the_fullscreen_picture(cx: &mut TestAppCont
     visual.update(|window, app| {
         voice.update(app, |panel, _| {
             panel.exit_fullscreen(window);
+            assert!(!panel.player_fullscreen());
             assert_eq!(panel.test_take_viewport(), Some((716, 405)));
+        });
+    });
+}
+
+#[gpui::test]
+async fn a_room_resize_requests_only_the_changed_picture_surface(cx: &mut TestAppContext) {
+    let (mut visual, _view, voice) = fixture(cx);
+    draw(&mut visual);
+    visual.update(|_window, app| {
+        voice.update(app, |panel, _| {
+            panel.test_attach_detached_handle();
+            panel.set_scale(1.0);
+            panel.test_open_player(publication(7, "alice", 1));
+            panel.set_player_area_and_place(crate::voice_room::Rect::new(0., 0., 1920., 1080.));
+            assert_eq!(panel.test_take_viewport(), Some((358, 202)));
+            // A narrower room clamps the floating box, so the picture surface
+            // really changes even though the player was already placed.
+            panel.set_player_area_and_place(crate::voice_room::Rect::new(0., 0., 300., 600.));
+            assert_eq!(
+                panel.test_take_viewport(),
+                Some((282, 159)),
+                "a resize between two non-empty rects requests the new surface"
+            );
+            // Repeating the same rect changes nothing and must not wake the
+            // worker with a duplicate size.
+            panel.set_player_area_and_place(crate::voice_room::Rect::new(0., 0., 300., 600.));
+            assert_eq!(
+                panel.test_take_viewport(),
+                None,
+                "an unchanged repeat is not requested"
+            );
+            // Widening the room restores the default floating width.
+            panel.set_player_area_and_place(crate::voice_room::Rect::new(0., 0., 1920., 1080.));
+            assert_eq!(panel.test_take_viewport(), Some((358, 202)));
         });
     });
 }

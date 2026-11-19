@@ -10,7 +10,7 @@
 use crate::{
     Command, Controls, Event, IceServer, Media, VideoFrame,
     controller::{Action, Publication, Signal, VoiceController},
-    stream::{EngineUpdate, StreamViewer},
+    stream::StreamViewer,
     viewer::{Outcome as ViewerOutcome, Viewer},
     voice::CaptureGate,
 };
@@ -41,9 +41,11 @@ mod updates;
 use updates::Updates;
 pub use updates::VoiceUpdate;
 
+mod engine;
 mod requests;
 mod screen;
 mod test_support;
+use engine::{EngineEffect, apply_engine_update};
 use requests::{
     InputRequest, Pending, Requests, StreamCommand, set_input_request, set_stream_command,
 };
@@ -359,35 +361,6 @@ impl Live {
         }
     }
 
-    /// Move the freshly decoded frame into the last-value slot, reclaiming the
-    /// buffer the UI has not taken yet so steady state does not allocate.
-    fn publish_frame(&mut self, selection: u64) {
-        let mut next = self
-            .frame
-            .lock()
-            .ok()
-            .and_then(|mut slot| {
-                // A frame from another selection is not a buffer to reclaim.
-                slot.take()
-                    .filter(|frame| frame.selection == selection)
-                    .map(|frame| frame.bgra)
-            })
-            .unwrap_or_default();
-        if next.len() < self.render.bgra.len() {
-            next.resize(self.render.bgra.len(), 0);
-        }
-        let (width, height) = (self.render.width(), self.render.height());
-        std::mem::swap(&mut next, &mut self.render.bgra);
-        if let Ok(mut slot) = self.frame.lock() {
-            *slot = Some(StreamFrame {
-                selection,
-                width,
-                height,
-                bgra: next,
-            });
-        }
-    }
-
     async fn drain_voice_media(
         &mut self,
         controller: &mut VoiceController,
@@ -461,35 +434,28 @@ impl Live {
                 return Ok(true);
             };
             let now = Instant::now();
-            let outcomes = match update {
-                EngineUpdate::Frame => {
-                    if let Some(selection) = viewer.watching().map(|watching| watching.selection) {
-                        self.publish_frame(selection);
+            let outcomes =
+                match apply_engine_update(&self.frame, &mut self.render, viewer, update, now) {
+                    EngineEffect::Outcomes(outcomes) => outcomes,
+                    EngineEffect::Output {
+                        applied,
+                        working,
+                        error,
+                    } => {
+                        // The applied endpoint may be the previous one after a
+                        // rollback. Updating both values lets a repeated request
+                        // retry instead of being skipped as unchanged.
+                        self.output = applied;
+                        self.output_working = working;
+                        if let Some(selection) =
+                            viewer.watching().map(|watching| watching.selection)
+                        {
+                            self.updates
+                                .push(VoiceUpdate::StreamAudio { selection, error });
+                        }
+                        Vec::new()
                     }
-                    viewer.on_frame()
-                }
-                EngineUpdate::Answer(sdp) => viewer.on_answer(sdp),
-                EngineUpdate::Ice(candidate) => viewer.on_ice(candidate),
-                EngineUpdate::State(state) => viewer.on_engine_state(state, now),
-                EngineUpdate::Error(message) => viewer.on_engine_error(&message, now),
-                EngineUpdate::Output {
-                    applied,
-                    audible: _,
-                    working,
-                    error,
-                } => {
-                    // The applied endpoint may be the previous one after a
-                    // rollback. Updating both values lets a repeated request
-                    // retry instead of being skipped as unchanged.
-                    self.output = applied;
-                    self.output_working = working;
-                    if let Some(selection) = viewer.watching().map(|watching| watching.selection) {
-                        self.updates
-                            .push(VoiceUpdate::StreamAudio { selection, error });
-                    }
-                    Vec::new()
-                }
-            };
+                };
             if !self.apply(outcomes, viewer).await? {
                 return Ok(false);
             }

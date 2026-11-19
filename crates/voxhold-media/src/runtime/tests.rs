@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::runtime::requests::ScreenCommand;
+use crate::stream::EngineUpdate;
 use std::collections::HashMap;
 
 fn publication(connection: &str) -> Publication {
@@ -473,6 +474,99 @@ fn a_failed_engine_start_cancels_the_attempt_without_stream_start() {
             .tick(now + crate::publisher::ANSWER_TIMEOUT)
             .is_empty(),
         "the failed start leaves no deadline"
+    );
+}
+
+#[test]
+fn a_cached_repaint_does_not_confirm_a_recovering_stream() {
+    let now = Instant::now();
+    let a = publication("a");
+    let mut viewer = Viewer::new(1, 10);
+    viewer.on_server_event(
+        "stream.snapshot",
+        "",
+        &serde_json::json!({"streams": [a.clone()]}),
+        now,
+    );
+    viewer.set_joined(true, now);
+    let started = viewer.select(&a, 1, now);
+    assert!(
+        started
+            .iter()
+            .any(|outcome| matches!(outcome, ViewerOutcome::Start { selection: 1, .. })),
+        "the viewer must be watching before recovery: {started:?}"
+    );
+    // A working picture first, then the engine reports a broken transport and
+    // arms the recovery deadline.
+    assert!(viewer.on_frame().iter().any(|outcome| matches!(
+        outcome,
+        ViewerOutcome::Connected {
+            selection: 1,
+            connected: true
+        }
+    )));
+    let recovering = viewer.on_engine_state("disconnected", now);
+    assert!(recovering.iter().any(|outcome| matches!(
+        outcome,
+        ViewerOutcome::Connected {
+            selection: 1,
+            connected: false
+        }
+    )));
+    assert!(viewer.watching().unwrap().recovering);
+
+    // The last decoded frame is still in the store. A viewport-only re-read
+    // must surface as a repaint, not as a fresh RTP frame.
+    let (mut stream, _commands, events, video) = StreamViewer::detached_for_tests();
+    assert!(video.publish_i420(libwebrtc::video_frame::I420Buffer::new_black(320, 180)));
+    events.push(crate::Event::Frame);
+    let mut render = crate::VideoFrame::default();
+    assert!(matches!(
+        stream.poll(&mut render, 160, 90),
+        Some(EngineUpdate::Frame)
+    ));
+    // Only the picture surface changes now; no RTP frame is queued.
+    assert!(matches!(
+        stream.poll(&mut render, 320, 278),
+        Some(EngineUpdate::Repaint)
+    ));
+
+    // Exactly what `drain_viewer` does for the cached update: publish the
+    // picture without any viewer transition.
+    let slot = Mutex::new(None);
+    let EngineEffect::Outcomes(outcomes) =
+        apply_engine_update(&slot, &mut render, &mut viewer, EngineUpdate::Repaint, now)
+    else {
+        panic!("a repaint is a picture update, not an audio-output result");
+    };
+    assert!(
+        outcomes.is_empty(),
+        "a repaint must not emit status or Connected: {outcomes:?}"
+    );
+    let frame = slot
+        .lock()
+        .unwrap()
+        .take()
+        .expect("the repaint must reach the picture slot");
+    assert_eq!((frame.selection, frame.width, frame.height), (1, 320, 180));
+
+    let watching = viewer
+        .watching()
+        .expect("the recovering stream stays selected");
+    assert!(watching.recovering, "a repaint must not clear recovery");
+    assert!(
+        !watching.connected,
+        "a repaint must not report the stream as connected"
+    );
+    // The deadline armed by `on_engine_state` is still live: the runtime tick
+    // still closes and restarts instead of leaving a frozen "connected" view.
+    let expired = viewer.tick(now + crate::viewer::START_TIMEOUT + Duration::from_millis(1));
+    assert!(!expired.is_empty(), "the recovery deadline must still fire");
+    assert!(
+        expired
+            .iter()
+            .any(|outcome| matches!(outcome, ViewerOutcome::Close)),
+        "the failed attempt is closed: {expired:?}"
     );
 }
 

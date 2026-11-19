@@ -7,7 +7,13 @@ use std::time::Duration;
 /// An engine event that belongs to the current attempt. Signaling is returned
 /// without request ids; `viewer` stamps the attempt's ids.
 pub enum EngineUpdate {
+    /// A fresh RTP frame was decoded. Only this update confirms the
+    /// connection and ends recovery.
     Frame,
+    /// The cached last frame was re-read at a new viewport size. It refreshes
+    /// the picture only: connection state, status text and the recovery
+    /// deadline must stay exactly as they were.
+    Repaint,
     Answer(String),
     Ice(Candidate),
     State(&'static str),
@@ -68,6 +74,41 @@ impl StreamViewer {
         })
     }
 
+    /// Headless engine for crate tests: no worker and no socket. It keeps the
+    /// real `Events` queue and `VideoStore`, so `poll` takes the production
+    /// path without decoding or a device.
+    #[cfg(test)]
+    pub(crate) fn detached_for_tests() -> (
+        Self,
+        tokio::sync::mpsc::Receiver<Command>,
+        std::sync::Arc<crate::Events>,
+        std::sync::Arc<crate::video::VideoStore>,
+    ) {
+        let (commands, receiver) = tokio::sync::mpsc::channel(8);
+        let events = std::sync::Arc::new(crate::Events::default());
+        let video = std::sync::Arc::new(crate::video::VideoStore::default());
+        let media = Media {
+            commands,
+            events: events.clone(),
+            capture: std::sync::Arc::new(crate::voice::CaptureGate::default()),
+            video: video.clone(),
+            worker: None,
+        };
+        (
+            Self {
+                media,
+                muted: false,
+                requested_output: None,
+                applied_output: None,
+                output_working: true,
+                viewport: (0, 0),
+            },
+            receiver,
+            events,
+            video,
+        )
+    }
+
     pub fn set_muted(&mut self, muted: bool) -> Result<(), String> {
         self.media
             .command(Command::ViewAudio { muted })
@@ -122,22 +163,29 @@ impl StreamViewer {
     /// Non-blocking: one queued engine event per call, so a burst of frames
     /// cannot starve signaling or the voice session on the same worker.
     ///
-    /// A changed viewport re-reads the frame `VideoStore` already holds. The
-    /// read is size-aware, so an unchanged size reports nothing and the caller
-    /// settles instead of polling in a loop.
+    /// A queued event always wins: a fresh RTP frame is reported as `Frame`.
+    /// Only when the queue is empty does a changed viewport re-read the frame
+    /// `VideoStore` already holds, and that is reported as `Repaint`, never as
+    /// a connection-confirming `Frame`. The read is size-aware, so an
+    /// unchanged size reports nothing and the caller settles instead of
+    /// polling in a loop.
     pub fn poll(
         &mut self,
         frame: &mut VideoFrame,
         width: u32,
         height: u32,
     ) -> Option<EngineUpdate> {
-        if (width, height) != self.viewport {
-            self.viewport = (width, height);
-            if self.media.read_video(frame, width, height) {
-                return Some(EngineUpdate::Frame);
+        let Some(event) = self.media.poll(Duration::ZERO) else {
+            // No engine event: the only remaining reason to touch the
+            // decoder is a new picture surface for the cached frame.
+            if (width, height) != self.viewport {
+                self.viewport = (width, height);
+                if self.media.read_video(frame, width, height) {
+                    return Some(EngineUpdate::Repaint);
+                }
             }
-        }
-        let event = self.media.poll(Duration::ZERO)?;
+            return None;
+        };
         match event {
             Event::Frame => self
                 .media
@@ -177,7 +225,7 @@ impl StreamViewer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Event, Events, Media, VideoFrame, video::VideoStore, voice::CaptureGate};
+    use crate::{Event, Events, VideoFrame, video::VideoStore};
     use std::sync::Arc;
     use tokio::sync::mpsc;
 
@@ -189,30 +237,11 @@ mod tests {
         Arc<Events>,
         Arc<VideoStore>,
     ) {
-        let (commands, receiver) = mpsc::channel(8);
-        let events = Arc::new(Events::default());
-        let video = Arc::new(VideoStore::default());
-        let media = Media {
-            commands,
-            events: events.clone(),
-            capture: Arc::new(CaptureGate::default()),
-            video: video.clone(),
-            worker: None,
-        };
+        let (mut viewer, receiver, events, video) = StreamViewer::detached_for_tests();
         let output = output.map(str::to_owned);
-        (
-            StreamViewer {
-                media,
-                muted: false,
-                requested_output: output.clone(),
-                applied_output: output,
-                output_working: true,
-                viewport: (0, 0),
-            },
-            receiver,
-            events,
-            video,
-        )
+        viewer.requested_output = output.clone();
+        viewer.applied_output = output;
+        (viewer, receiver, events, video)
     }
 
     #[test]
@@ -278,6 +307,7 @@ mod tests {
         assert!(video.publish_i420(libwebrtc::video_frame::I420Buffer::new_black(320, 180)));
         events.push(Event::Frame);
         let mut frame = VideoFrame::default();
+        // A queued fresh RTP frame wins over the viewport re-read.
         assert!(matches!(
             viewer.poll(&mut frame, 160, 90),
             Some(EngineUpdate::Frame)
@@ -285,10 +315,11 @@ mod tests {
         assert_eq!((frame.width(), frame.height()), (160, 90));
 
         // Fullscreen: no `Event::Frame` is queued, only the picture surface
-        // changed. The viewer must re-read the frame it already decodes.
+        // changed. The viewer must re-read the frame it already decodes, as a
+        // repaint rather than a connection-confirming fresh frame.
         assert!(matches!(
             viewer.poll(&mut frame, 320, 278),
-            Some(EngineUpdate::Frame)
+            Some(EngineUpdate::Repaint)
         ));
         assert_eq!((frame.width(), frame.height()), (320, 180));
 

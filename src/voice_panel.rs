@@ -1081,11 +1081,6 @@ impl VoicePanel {
     }
 
     #[cfg(test)]
-    pub fn test_set_fullscreen(&mut self, fullscreen: bool) {
-        self.player_fullscreen = fullscreen;
-    }
-
-    #[cfg(test)]
     pub fn test_controls(&self) -> &Controls {
         &self.controls
     }

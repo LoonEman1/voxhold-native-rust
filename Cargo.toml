@@ -6,7 +6,13 @@ license.workspace = true
 
 [workspace]
 resolver = "2"
-members = ["crates/voxhold-api", "crates/voxhold-media"]
+members = [
+    "crates/voxhold-api",
+    "crates/voxhold-media",
+    "crates/voxhold-update",
+    "crates/voxhold-updater",
+    "crates/voxhold-release",
+]
 
 [workspace.package]
 license = "Apache-2.0"

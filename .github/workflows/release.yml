@@ -34,6 +34,7 @@ jobs:
   windows-release:
     runs-on: windows-latest
     env:
+      CARGO_PROFILE_TEST_DEBUG: "0"
       CHANNEL: ${{ github.event.inputs.channel || 'beta' }}
       WINDOWS_CERT_PFX_BASE64: ${{ secrets.WINDOWS_CERT_PFX_BASE64 }}
       WINDOWS_CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}

@@ -25,7 +25,7 @@ git config --local core.hooksPath .githooks
 
 Тот же скрипт `scripts/check-file-sizes.ps1` запускается в Windows CI по всем отслеживаемым файлам; исключения и обоснования ведутся в `scripts/file-size-exceptions.txt`.
 
-В GitHub Actions workflow **Windows** проверяет форматирование и запускает тесты всего workspace с включённым медиа для каждого PR. После успешных тестов на `dev` и `main` он публикует артефакт `voxhold-windows` с release EXE и каталогом `assets/`. Когда этот workflow попадёт в `main`, собрать такой же архив для другой ветки можно вручную через **Actions → Windows → Run workflow**.
+В GitHub Actions workflow **Windows** проверяет ограничения размера файлов при каждом запуске. Если изменены только `README.md`, `AGENTS.md` или Markdown-файлы в `docs/`, Rust-тесты и упаковка пропускаются. Для остальных изменений workflow проверяет форматирование и запускает тесты всего workspace с включённым медиа. После успешных тестов на `dev` и `main` он публикует артефакт `voxhold-windows` с release EXE и каталогом `assets/`. Когда этот workflow попадёт в `main`, полный прогон и сборку архива для другой ветки можно запустить через **Actions → Windows → Run workflow**.
 
 Клиент требует HTTPS, кроме localhost и loopback. Токен сессии хранится в памяти; не записывайте его и пароли в журналы или тестовые данные. Производительность относительно прежнего клиента не измерялась. См. [архитектуру](docs/architecture.md).
 

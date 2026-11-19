@@ -1,43 +1,65 @@
-//! Restart-dialog regressions: the live quality dialog binds to the source the
-//! capture engine already accepted, while a normal Start still needs a row in
-//! the current list.
+//! Restart-dialog regressions: the live quality dialog is bound to the source
+//! the capture engine already accepted, while a normal Start still needs a row
+//! in the current list. The confirmed identity lives in `last_request` only;
+//! the enumeration caches never contain or inject it.
 
 use super::voice_screen_tests::{draw, focused, monitor, wait_for, window};
 use gpui::TestAppContext;
 use std::sync::Arc;
 use std::time::Duration;
+use voxhold_media::publisher::{Phase, Quality, Sharing};
 use voxhold_media::screen_capture::SourceKind;
 use voxhold_media::system_audio::AudioDeviceInfo;
+
+fn device() -> AudioDeviceInfo {
+    AudioDeviceInfo {
+        id: "test".into(),
+        label: "Устройство вывода по умолчанию".into(),
+        format: "48000 Гц · 2 канала · 16 бит PCM".into(),
+    }
+}
+
+fn live_sharing() -> Sharing {
+    Sharing {
+        phase: Phase::Live,
+        live: true,
+        quality: Some(Quality::default()),
+        has_audio: true,
+        ..Sharing::default()
+    }
+}
+
+/// Bound restart state on top of a controlled picker snapshot.
+fn open_restart(
+    panel: &mut crate::voice_panel::VoicePanel,
+    snapshot: Vec<voxhold_media::screen_capture::ScreenSource>,
+    live: voxhold_media::screen_capture::ScreenSource,
+    cx: &mut gpui::Context<crate::voice_panel::VoicePanel>,
+) {
+    panel.test_attach_detached_handle();
+    panel.test_open_screen_picker_with(SourceKind::Window, snapshot, None);
+    panel.test_set_screen_sharing(live_sharing());
+    panel.test_set_screen_last_request(live);
+    panel.test_open_live_screen_settings(cx);
+}
 
 #[gpui::test]
 async fn a_live_window_restart_binds_to_the_confirmed_source_with_an_empty_list(
     cx: &mut TestAppContext,
 ) {
-    use voxhold_media::publisher::{Phase, Quality, Sharing};
     let (mut visual, _view, voice) = super::voice_tests::fixture(cx);
     draw(&mut visual);
     let live = window(11, "Документ");
     visual.update(|_window, app| {
         voice.update(app, |panel, cx| {
             panel.test_attach_detached_handle();
-            // The captured window is not in the picker list: its answer is
-            // empty/stale, as it is after the window set changed.
             panel.test_open_screen_picker_with(SourceKind::Window, Vec::new(), None);
+            // The live dialog repeats the endpoint probe; Start must wait.
             panel.test_set_screen_audio_pending(Arc::new(|| {
                 std::thread::sleep(Duration::from_millis(150));
-                Ok(AudioDeviceInfo {
-                    id: "test".into(),
-                    label: "Устройство вывода по умолчанию".into(),
-                    format: "48000 Гц · 2 канала · 16 бит PCM".into(),
-                })
+                Ok(device())
             }));
-            panel.test_set_screen_sharing(Sharing {
-                phase: Phase::Live,
-                live: true,
-                quality: Some(Quality::default()),
-                has_audio: true,
-                ..Sharing::default()
-            });
+            panel.test_set_screen_sharing(live_sharing());
             panel.test_set_screen_last_request(live.clone());
             panel.test_open_live_screen_settings(cx);
 
@@ -54,9 +76,14 @@ async fn a_live_window_restart_binds_to_the_confirmed_source_with_an_empty_list(
                 "the restart is bound to the confirmed live identity"
             );
             assert_eq!(
+                panel.test_screen_source_count(SourceKind::Window),
+                0,
+                "the confirmed source is never injected into the enumeration cache"
+            );
+            assert_eq!(
                 panel.test_selected_source(),
-                Some(live.clone()),
-                "the confirmed live row is inserted into the empty list"
+                None,
+                "there is no cached row, only the confirmed identity"
             );
             assert!(
                 !panel.test_can_start(),
@@ -113,54 +140,140 @@ async fn a_live_window_restart_binds_to_the_confirmed_source_with_an_empty_list(
 }
 
 #[gpui::test]
-async fn a_live_restart_uses_the_current_row_and_survives_a_stale_refresh(cx: &mut TestAppContext) {
-    use voxhold_media::publisher::{Phase, Quality, Sharing};
+async fn restart_rows_are_inert_for_mouse_and_keyboard(cx: &mut TestAppContext) {
     let (mut visual, _view, voice) = super::voice_tests::fixture(cx);
     draw(&mut visual);
     let live = window(11, "Документ");
-    let renamed = window(11, "Документ · обновлён");
-    let sharing = Sharing {
-        phase: Phase::Live,
-        live: true,
-        quality: Some(Quality::default()),
-        has_audio: false,
-        ..Sharing::default()
-    };
+    let other = window(12, "Другой документ");
     visual.update(|_window, app| {
         voice.update(app, |panel, cx| {
-            panel.test_attach_detached_handle();
-            // A refresh already described the live window with a newer title;
-            // the restart must keep that row instead of the remembered copy.
-            panel.test_open_screen_picker_with(SourceKind::Window, vec![renamed.clone()], None);
-            panel.test_set_screen_sharing(sharing.clone());
-            panel.test_set_screen_last_request(live.clone());
-            panel.test_open_live_screen_settings(cx);
-            assert_eq!(panel.test_share_kind(), SourceKind::Window);
+            // Both rows are cached, so a normal picker could select either.
+            open_restart(panel, vec![live.clone(), other.clone()], live.clone(), cx);
+
             assert_eq!(
-                panel.test_selected_source(),
-                Some(renamed.clone()),
-                "a present row keeps its newer title and size"
+                panel.test_selected_source_id(),
+                Some(live.source_id()),
+                "the confirmed live identity wins over the cached rows"
             );
+            // A click on the other row must not move the restart.
+            panel.test_try_select_screen_source(other.clone(), cx);
+            assert_eq!(
+                panel.test_selected_source_id(),
+                Some(live.source_id()),
+                "a click on a cached row is rejected in restart mode"
+            );
+            assert_eq!(
+                panel.test_screen_source_count(SourceKind::Window),
+                2,
+                "rejecting the row leaves the cache untouched"
+            );
+        });
+    });
+
+    // Tab through a full ring: no source row may become focusable, so Enter
+    // can never route to `select_screen_source` either.
+    for _ in 0..40 {
+        visual.simulate_keystrokes("tab");
+        if let Some(name) = focused(&mut visual, &voice) {
+            assert!(
+                !name.starts_with("Source("),
+                "a restart source row must stay out of the focus ring: {name}"
+            );
+        }
+    }
+    for _ in 0..40 {
+        if focused(&mut visual, &voice).as_deref() == Some("Start") {
+            break;
+        }
+        visual.simulate_keystrokes("tab");
+    }
+    assert_eq!(focused(&mut visual, &voice).as_deref(), Some("Start"));
+    visual.simulate_keystrokes("enter");
+    let commands = visual
+        .update(|_window, app| voice.update(app, |panel, _| panel.test_take_screen_commands()));
+    assert_eq!(commands, vec![("restart", 0)]);
+    voice.read_with(&*visual, |panel, _| {
+        assert_eq!(
+            panel.test_selected_source_id(),
+            Some(live.source_id()),
+            "the restart still targets the live source after keyboard traversal"
+        );
+        assert_eq!(panel.test_screen_request().source, live);
+    });
+}
+
+#[gpui::test]
+async fn a_restart_ignores_the_category_and_refresh_with_a_stale_snapshot(cx: &mut TestAppContext) {
+    let (mut visual, _view, voice) = super::voice_tests::fixture(cx);
+    draw(&mut visual);
+    let live = window(11, "Документ");
+    visual.update(|_window, app| {
+        voice.update(app, |panel, cx| {
+            // The snapshot is empty from the start: the engine accepted the
+            // window, but the enumeration does not describe it any more.
+            open_restart(panel, Vec::new(), live.clone(), cx);
+            assert!(panel.test_can_start(), "the confirmed restart may start");
+
+            let before = panel.test_source_generations();
+            panel.test_switch_share_kind(SourceKind::Monitor, cx);
+            assert_eq!(
+                panel.test_share_kind(),
+                SourceKind::Window,
+                "a restart is source-locked, so the category cannot change"
+            );
+            panel.test_refresh_screen_sources(cx);
+            assert_eq!(
+                panel.test_source_generations(),
+                before,
+                "refresh is inert while the restart is bound"
+            );
+
+            // A stale/empty answer must not clear the confirmed identity or
+            // disable Start.
+            panel.test_apply_screen_sources(SourceKind::Window, Vec::new());
+            assert_eq!(panel.test_selected_source_id(), Some(live.source_id()));
             assert!(panel.test_can_start());
+            assert!(
+                panel.test_screen_error().is_empty(),
+                "a stale answer must not claim the live source is gone"
+            );
+
             panel.test_start_screen_share(cx);
             let commands = panel.test_take_screen_commands();
             assert_eq!(commands, vec![("restart", 0)]);
             assert_eq!(
                 panel.test_screen_request().source,
-                renamed,
-                "the restart request is built from the current row"
+                live,
+                "the restart uses the confirmed source, not the snapshot"
             );
+        });
+    });
+}
+
+#[gpui::test]
+async fn a_restart_keeps_the_confirmed_identity_when_the_row_was_renamed(cx: &mut TestAppContext) {
+    let (mut visual, _view, voice) = super::voice_tests::fixture(cx);
+    draw(&mut visual);
+    let live = window(11, "Документ");
+    let renamed = window(11, "Документ · обновлён");
+    visual.update(|_window, app| {
+        voice.update(app, |panel, cx| {
+            // A refresh already described the live window with a newer title;
+            // the restart row and request stay bound to the accepted identity.
+            open_restart(panel, vec![renamed.clone()], live.clone(), cx);
+            assert_eq!(panel.test_selected_source_id(), Some(live.source_id()));
+            assert_eq!(
+                panel.test_selected_source(),
+                Some(renamed),
+                "the cached row keeps its newer title"
+            );
+            assert!(panel.test_can_start());
 
             // An answer that lost the live window must not unbind the restart:
             // the capture engine accepted the source and only it can report
             // the failure.
-            panel.test_open_screen_picker_with(SourceKind::Window, Vec::new(), None);
-            panel.test_set_screen_sharing(sharing.clone());
-            panel.test_set_screen_last_request(live.clone());
-            panel.test_open_live_screen_settings(cx);
             panel.test_apply_screen_sources(SourceKind::Window, Vec::new());
             assert_eq!(panel.test_selected_source_id(), Some(live.source_id()));
-            assert_eq!(panel.test_selected_source(), Some(live.clone()));
             assert!(
                 panel.test_can_start(),
                 "the confirmed live source stays startable"
@@ -169,6 +282,56 @@ async fn a_live_restart_uses_the_current_row_and_survives_a_stale_refresh(cx: &m
                 panel.test_screen_error().is_empty(),
                 "a stale refresh must not claim the live source is gone"
             );
+
+            panel.test_start_screen_share(cx);
+            let commands = panel.test_take_screen_commands();
+            assert_eq!(commands, vec![("restart", 0)]);
+            assert_eq!(
+                panel.test_screen_request().source,
+                live,
+                "the restart request is built from the accepted source"
+            );
+        });
+    });
+}
+
+#[gpui::test]
+async fn a_normal_picker_after_a_restart_starts_with_no_rows(cx: &mut TestAppContext) {
+    let (mut visual, _view, voice) = super::voice_tests::fixture(cx);
+    draw(&mut visual);
+    let live = window(11, "Документ");
+    visual.update(|_window, app| {
+        voice.update(app, |panel, cx| {
+            open_restart(panel, vec![live.clone()], live.clone(), cx);
+            assert_eq!(panel.test_selected_source_id(), Some(live.source_id()));
+
+            // Closing the restart dialog leaves the live stream alone.
+            panel.test_close_screen_share(cx);
+            assert!(!panel.screen_share_open());
+            assert_eq!(panel.test_screen_phase(), Phase::Live);
+            assert!(panel.test_take_screen_commands().is_empty());
+
+            // A fresh picker must not inherit the confirmed row before the
+            // new enumeration arrives.
+            panel.test_set_share_gate(Ok(()));
+            panel.test_set_audio_probe(Arc::new(|| Ok(device())));
+            panel.test_open_screen_share(cx);
+            assert!(panel.screen_share_open());
+            assert!(!panel.test_screen_restart());
+            assert_eq!(panel.test_selected_source_id(), None);
+            assert_eq!(panel.test_screen_source_count(SourceKind::Monitor), 0);
+            assert_eq!(panel.test_screen_source_count(SourceKind::Window), 0);
+            assert_eq!(panel.test_selected_source(), None);
+
+            // The old confirmed id is not selectable until it is part of a
+            // fresh answer. A normal picker may switch category again.
+            panel.test_switch_share_kind(SourceKind::Window, cx);
+            panel.test_try_select_screen_source(live.clone(), cx);
+            assert_eq!(panel.test_selected_source_id(), None);
+
+            panel.test_apply_screen_sources(SourceKind::Window, vec![live.clone()]);
+            panel.test_try_select_screen_source(live.clone(), cx);
+            assert_eq!(panel.test_selected_source_id(), Some(live.source_id()));
         });
     });
 }

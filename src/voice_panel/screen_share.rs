@@ -156,8 +156,28 @@ impl ScreenShareUi {
         matches!(self.selected, Some(id) if id.kind == self.kind && self.source_for(id).is_some())
     }
 
-    /// Drop a selection the newest snapshot no longer contains.
+    /// The confirmed live source of a restart dialog. It comes from the
+    /// accepted request only; enumeration answers never define or inject it.
+    pub(super) fn restart_source(&self) -> Option<&ScreenSource> {
+        if !self.restart {
+            return None;
+        }
+        self.last_request.as_ref().map(|request| &request.source)
+    }
+
+    /// Whether the restart still points at the identity the engine accepted.
+    /// The snapshot is irrelevant: the live source may be absent from it.
+    pub(super) fn restart_is_confirmed(&self) -> bool {
+        self.restart_source()
+            .is_some_and(|source| self.selected == Some(source.source_id()))
+    }
+
+    /// Drop a selection the newest snapshot no longer contains. A restart is
+    /// bound to the accepted source, so a background answer never clears it.
     fn retain_selection(&mut self, kind: SourceKind, sources: &[ScreenSource]) {
+        if self.restart {
+            return;
+        }
         let Some(id) = self.selected else { return };
         if id.kind != kind {
             return;
@@ -350,6 +370,13 @@ impl VoicePanel {
         self.screen.selected = None;
         self.screen.last_request = None;
         self.screen.kind = SourceKind::Monitor;
+        // A new picker starts with no rows: an identity from the previous
+        // answer (or a confirmed live source) must not be selectable while
+        // the fresh lists load.
+        self.screen.monitors.clear();
+        self.screen.windows.clear();
+        self.screen.monitor_error.clear();
+        self.screen.window_error.clear();
         // A fresh publication defaults to system audio; the background probe
         // fills in availability and disables the toggle if the endpoint fails.
         // The previous picker's answer must not leak into this one: Start
@@ -381,10 +408,11 @@ impl VoicePanel {
         }
         self.screen.audio_enabled = sharing.has_audio;
         self.begin_audio_probe(cx);
-        // A restart is bound to the confirmed live source, even when the
-        // current snapshot is empty or still describes another category.
-        self.screen.bind_confirmed_live_source();
         self.screen.restart = true;
+        // The restart dialog is bound to the confirmed live source here, and
+        // only here: the identity stays in `last_request`, never in the
+        // enumeration caches, so the current snapshot may be empty or stale.
+        self.screen.bind_confirmed_live_source();
         self.screen.open = true;
         self.screen.busy = false;
         self.screen.error.clear();
@@ -451,6 +479,11 @@ impl VoicePanel {
         self.screen.busy = false;
         self.screen.error.clear();
         self.screen.selected = None;
+        // No row of this dialog may survive into the next picker. The
+        // confirmed live identity stays in `last_request` for the quality
+        // dialog, not in the enumeration caches.
+        self.screen.monitors.clear();
+        self.screen.windows.clear();
         self.screen.focus_placed = false;
         if let Some(handle) = &self.handle {
             if committed {
@@ -474,7 +507,11 @@ impl VoicePanel {
         self.screen.window_generation = handle.screen_sources(SourceKind::Window);
     }
 
-    fn refresh_screen_sources(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn refresh_screen_sources(&mut self, cx: &mut Context<Self>) {
+        // A restart is source-locked: the enumeration cannot change it.
+        if self.screen.restart {
+            return;
+        }
         match self.screen.kind {
             SourceKind::Monitor => {
                 if let Some(handle) = &self.handle {
@@ -495,6 +532,11 @@ impl VoicePanel {
     }
 
     pub(super) fn select_screen_source(&mut self, id: SourceId, cx: &mut Context<Self>) {
+        // A restart is bound to the confirmed live source: no cached row,
+        // clicked or reached by Enter, may move it elsewhere.
+        if self.screen.restart {
+            return;
+        }
         // A row may only select a source the current snapshot really offers.
         if id.kind != self.screen.kind || self.screen.source_for(id).is_none() {
             return;
@@ -506,6 +548,10 @@ impl VoicePanel {
 
     /// Switch the picker category; a selection of the other one is dropped.
     pub(super) fn change_share_kind(&mut self, kind: SourceKind, cx: &mut Context<Self>) {
+        // A restart is source-locked, so the category cannot change.
+        if self.screen.restart {
+            return;
+        }
         if self.screen.kind == kind {
             return;
         }
@@ -518,9 +564,15 @@ impl VoicePanel {
 
     /// Start is possible only after the endpoint probe answered: committing
     /// while the answer is pending would publish video without the requested
-    /// system audio. The source must still be in the visible snapshot.
+    /// system audio. A normal Start needs its id in the visible snapshot; a
+    /// restart needs only the confirmed identity of the live attempt.
     pub(super) fn screen_can_start(&self) -> bool {
-        self.screen.selection_is_current()
+        let source_ready = if self.screen.restart {
+            self.screen.restart_is_confirmed()
+        } else {
+            self.screen.selection_is_current()
+        };
+        source_ready
             && !self.screen.busy
             && !Codec::available().is_empty()
             && self.screen.audio_availability.is_some()
@@ -557,24 +609,44 @@ impl VoicePanel {
             cx.notify();
             return;
         };
-        // The dialog may be stale: build the request from the row that exists now.
-        let source = self
-            .screen
-            .source_for(id)
-            .filter(|_| id.kind == self.screen.kind)
-            .cloned();
-        let Some(source) = source else {
-            self.screen.error = SOURCE_GONE_REASON.into();
-            cx.notify();
-            return;
+        let source = if self.screen.restart {
+            // The restart is locked to the source the engine already accepted.
+            // The current snapshot may be empty, stale or describe a renamed
+            // row; none of that may move the restart to another source.
+            if self.screen.sharing.phase != Phase::Live {
+                self.screen.error = "Трансляция уже не идёт; откройте выбор экрана заново.".into();
+                self.screen.open = false;
+                self.screen.restart = false;
+                self.screen.focus_placed = false;
+                cx.notify();
+                return;
+            }
+            let Some(live) = self.screen.restart_source().cloned() else {
+                self.screen.error = SOURCE_GONE_REASON.into();
+                cx.notify();
+                return;
+            };
+            if live.source_id() != id {
+                self.screen.error = SOURCE_GONE_REASON.into();
+                cx.notify();
+                return;
+            }
+            live
+        } else {
+            // The dialog may be stale: build the request from the row that
+            // exists now, and refuse an absent or duplicated id.
+            let source = self
+                .screen
+                .source_for(id)
+                .filter(|_| id.kind == self.screen.kind)
+                .cloned();
+            let Some(source) = source else {
+                self.screen.error = SOURCE_GONE_REASON.into();
+                cx.notify();
+                return;
+            };
+            source
         };
-        if self.screen.restart && self.screen.sharing.phase != Phase::Live {
-            self.screen.error = "Трансляция уже не идёт; откройте выбор экрана заново.".into();
-            self.screen.open = false;
-            self.screen.restart = false;
-            cx.notify();
-            return;
-        }
         let request = PublishRequest {
             source,
             quality: self.screen.quality(),
@@ -726,10 +798,6 @@ impl VoicePanel {
                         self.screen.windows = sources;
                     }
                     _ => return false,
-                }
-                // A stale picker answer must not unbind the confirmed source.
-                if self.screen.restart {
-                    self.screen.bind_confirmed_live_source();
                 }
                 true
             }

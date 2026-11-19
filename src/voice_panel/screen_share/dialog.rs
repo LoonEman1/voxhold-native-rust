@@ -14,36 +14,19 @@ impl ScreenShareUi {
     /// The capture engine accepted this identity, so it is known available
     /// until the engine itself reports a failure: this is the one exception
     /// to the "must be in the current snapshot" rule that guards a normal
-    /// Start. A refresh that already describes the source with a newer title
-    /// or size keeps that row, so the restart request uses the current data.
+    /// Start. The identity lives only in `last_request`; it is never inserted
+    /// into the enumeration caches, so a later normal picker cannot select it.
     pub(super) fn bind_confirmed_live_source(&mut self) {
+        self.selected = None;
         let Some(live) = self
             .last_request
             .as_ref()
-            .map(|request| request.source.clone())
+            .map(|request| request.source.source_id())
         else {
             return;
         };
         self.kind = live.kind;
-        self.selected = Some(live.source_id());
-        let snapshot = match live.kind {
-            SourceKind::Monitor => &mut self.monitors,
-            SourceKind::Window => &mut self.windows,
-        };
-        // Keep the first current row with this id and drop duplicates: a
-        // duplicated identity does not resolve, and the live source must.
-        let mut kept = false;
-        snapshot.retain(|item| {
-            if item.id != live.id {
-                return true;
-            }
-            let keep = !kept;
-            kept = true;
-            keep
-        });
-        if !kept {
-            snapshot.push(live);
-        }
+        self.selected = Some(live);
         if self.error == SOURCE_GONE_REASON {
             self.error.clear();
         }
@@ -106,7 +89,7 @@ impl VoicePanel {
         id: SourceId,
         selected: bool,
         enabled: bool,
-        focus: FocusHandle,
+        focus: Option<FocusHandle>,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let c = self.colors();
@@ -122,8 +105,10 @@ impl VoicePanel {
             .bg(rgb(if selected { c.avatar_bg } else { c.surface }))
             .flex()
             .items_center()
-            .gap_2()
-            .track_focus(&focus);
+            .gap_2();
+        if let Some(focus) = focus {
+            row = row.track_focus(&focus);
+        }
         if enabled {
             row = row
                 .cursor_pointer()
@@ -175,31 +160,33 @@ impl VoicePanel {
             handle
         };
 
-        // Tabs and refresh.
-        let monitor_focus = row(self, &mut ring, ShareKey::Monitors);
-        let window_focus = row(self, &mut ring, ShareKey::Windows);
-        let refresh_focus = row(self, &mut ring, ShareKey::Refresh);
+        // Tabs and refresh. A restart is source-locked: the category and the
+        // enumeration are not part of its decision, so they are neither
+        // painted nor reachable by keyboard.
         let mut tabs = div().flex().items_center().gap_2();
-        tabs = tabs
-            .child(self.choice(
-                "Мониторы",
-                self.screen.kind == SourceKind::Monitor,
-                monitor_focus,
-                ShareKey::Monitors,
-                cx,
-            ))
-            .child(self.choice(
-                "Окна",
-                self.screen.kind == SourceKind::Window,
-                window_focus,
-                ShareKey::Windows,
-                cx,
-            ))
-            .child(div().flex_1())
-            .child(self.choice("Обновить", false, refresh_focus, ShareKey::Refresh, cx));
+        if !self.screen.restart {
+            let monitor_focus = row(self, &mut ring, ShareKey::Monitors);
+            let window_focus = row(self, &mut ring, ShareKey::Windows);
+            let refresh_focus = row(self, &mut ring, ShareKey::Refresh);
+            tabs = tabs
+                .child(self.choice(
+                    "Мониторы",
+                    self.screen.kind == SourceKind::Monitor,
+                    monitor_focus,
+                    ShareKey::Monitors,
+                    cx,
+                ))
+                .child(self.choice(
+                    "Окна",
+                    self.screen.kind == SourceKind::Window,
+                    window_focus,
+                    ShareKey::Windows,
+                    cx,
+                ))
+                .child(div().flex_1())
+                .child(self.choice("Обновить", false, refresh_focus, ShareKey::Refresh, cx));
+        }
 
-        let sources: Vec<ScreenSource> = self.screen.sources().to_vec();
-        let selected = self.screen.selected;
         let mut list = div()
             .id("share-sources")
             .h(px(236.))
@@ -208,40 +195,45 @@ impl VoicePanel {
             .flex()
             .flex_col()
             .gap_2();
-        if sources.is_empty() {
-            let text = if self.screen.loading() {
-                "Ищем источники…"
-            } else if !self.screen.error().is_empty() {
-                self.screen.error()
-            } else {
-                "Источников нет. Обновите список."
-            };
-            list = list.child(
-                div()
-                    .p(px(10.))
-                    .text_size(px(12.))
-                    .text_color(rgb(c.muted))
-                    .child(text.to_owned()),
-            );
-        }
-        for source in sources.iter() {
-            let id = source.source_id();
-            // Focus belongs to the source, not to the row position: the
-            // keyed handle survives a reorder and follows the same id.
-            let focus = window
-                .use_keyed_state(Self::source_element_id(id), cx, |_, cx| cx.focus_handle())
-                .read(cx)
-                .clone();
-            ring.push((focus.clone(), ShareKey::Source(id)));
-            let is_selected = selected == Some(id);
-            list = list.child(self.source_row(
-                source,
-                id,
-                is_selected,
-                !self.screen.restart,
-                focus,
-                cx,
-            ));
+        if self.screen.restart {
+            // Locked context: only the confirmed live source is painted, and
+            // it is inert. It is not part of the focus ring, so neither Tab
+            // nor a click can move the restart onto another cached source.
+            if let Some(live) = self.screen.restart_source().cloned() {
+                let id = live.source_id();
+                list = list.child(self.source_row(&live, id, true, false, None, cx));
+            }
+        } else {
+            let sources: Vec<ScreenSource> = self.screen.sources().to_vec();
+            let selected = self.screen.selected;
+            if sources.is_empty() {
+                let text = if self.screen.loading() {
+                    "Ищем источники…"
+                } else if !self.screen.error().is_empty() {
+                    self.screen.error()
+                } else {
+                    "Источников нет. Обновите список."
+                };
+                list = list.child(
+                    div()
+                        .p(px(10.))
+                        .text_size(px(12.))
+                        .text_color(rgb(c.muted))
+                        .child(text.to_owned()),
+                );
+            }
+            for source in sources.iter() {
+                let id = source.source_id();
+                // Focus belongs to the source, not to the row position: the
+                // keyed handle survives a reorder and follows the same id.
+                let focus = window
+                    .use_keyed_state(Self::source_element_id(id), cx, |_, cx| cx.focus_handle())
+                    .read(cx)
+                    .clone();
+                ring.push((focus.clone(), ShareKey::Source(id)));
+                let is_selected = selected == Some(id);
+                list = list.child(self.source_row(source, id, is_selected, true, Some(focus), cx));
+            }
         }
 
         // Quality: only values the SDR publication applies.

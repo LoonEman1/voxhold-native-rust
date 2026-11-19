@@ -167,9 +167,42 @@ impl VoicePanel {
         self.select_screen_source(id, cx);
     }
 
+    /// Attempt a selection exactly as a row click does, without adding the id
+    /// to the snapshot first. Used to prove an absent identity is rejected.
+    pub fn test_try_select_screen_source(&mut self, source: ScreenSource, cx: &mut Context<Self>) {
+        self.select_screen_source(source.source_id(), cx);
+    }
+
+    /// The close intent shared by Cancel, Escape and the backdrop.
+    pub fn test_close_screen_share(&mut self, cx: &mut Context<Self>) {
+        self.close_screen_share(cx);
+    }
+
     /// Switch the picker category exactly like the tab action does.
     pub fn test_switch_share_kind(&mut self, kind: SourceKind, cx: &mut Context<Self>) {
         self.change_share_kind(kind, cx);
+    }
+
+    /// Run the picker refresh exactly like the «Обновить» action does.
+    pub fn test_refresh_screen_sources(&mut self, cx: &mut Context<Self>) {
+        self.refresh_screen_sources(cx);
+    }
+
+    /// The source request generations, used to observe that refresh was inert.
+    pub fn test_source_generations(&self) -> (u64, u64) {
+        (
+            self.screen.monitor_generation,
+            self.screen.window_generation,
+        )
+    }
+
+    /// Number of rows cached for a category. A restart must not add the
+    /// confirmed source here; a fresh picker must start at zero.
+    pub fn test_screen_source_count(&self, kind: SourceKind) -> usize {
+        match kind {
+            SourceKind::Monitor => self.screen.monitors.len(),
+            SourceKind::Window => self.screen.windows.len(),
+        }
     }
 
     /// The stable identity the picker would publish, if any.

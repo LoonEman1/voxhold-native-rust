@@ -919,8 +919,20 @@ http_active,thumb_bytes,link_bytes,recording_bytes,workers,peers,live_textures
 | `R07b` | В dev · PR [#22](https://github.com/LoonEman1/voxhold-native-rust/pull/22) | `e1c0ff2` (merge `1547fa1`): software WinMM 48 кГц → APM → gate/gain → Opus, platform ADM fallback, typed DSP/`SelectInput`, endpoint IDs; тесты и release локально; живой звук/DPI не проверены | — |
 | `W02b` | Ревью PASS в PR [#21](https://github.com/LoonEman1/voxhold-native-rust/pull/21) · ветка `codex/w-extensions` | [`f7d142e`](https://github.com/LoonEman1/voxhold-native-rust/commit/f7d142e62980ebd13642a9ead6e34434ca930052) (`644fbb9` + merge `fc9817d` с R07b + два раунда ревью): снимок голосовых настроек, форма «Голос и звук», слайдеры 0–200/0–100, endpoint IDs, фоновая запись с flush; живое аудио, физический DPI и backend не проверены | — |
 | `W02c` | Ревью PASS в PR [#21](https://github.com/LoonEman1/voxhold-native-rust/pull/21) · ветка `codex/w-extensions` | [`12c4b2d`](https://github.com/LoonEman1/voxhold-native-rust/commit/12c4b2d093b638aea41895e74dfc3cf86ff4c058) (`b097c0f` … `180df01` + пять раундов ревью): первый sink проходит общую машину `Opening/Unstable/Stable/AdmFallback` через `adopt_initial_playout`, общий бюджет, стабильность 2 с/50 блоков, сброс окна **и фазы** при смене девайса, одно сообщение на переход, PCM-проверка ADM только при входящих дорожках, финальный отчёт `running:false`, `Tap` с явными пропусками; живое аудио, сон, TURN/ICE и DPI не проверены | — |
-| `W03`–`W12b` | К выполнению в отдельных ветках от `dev`; следующий — `W03` | [Порядок работы](w-workflow.md) | — |
+| `W03` | Реализация и live-проверка готовы · PR [#23](https://github.com/LoonEman1/voxhold-native-rust/pull/23) (draft) · ветка `codex/w03-screen-publish`; ревью №3 не завершено (сессия прервана) | `7fd24e1`: публикатор SDR через SFU, Windows-захват, UI, live-проверка на Docker-стенде (публикатор → Pion → viewer, 10 кадров/152 пакета, 18 декодированных), исправлен баг раннего `stream.snapshot`; браузерный viewer без микрофона не проверен | — |
+| `W04a`–`W12b` | К выполнению в отдельных ветках от `dev`; следующий — `W04a` | [Порядок работы](w-workflow.md) | — |
 | `W13` (`R08`) | Итоговая приёмка после всех этапов реализации | — | — |
+
+### Локальный стенд для проверки медиа (Docker)
+
+Публикацию, просмотр и сигнализацию можно проверять без production-стенда на локальном Docker-стенде. Он собирается из копий закреплённых ревизий (`git archive` в `target/stand`, исходные репозитории не изменяются), данные лежат в `target/stand/data`, конфиг — `target/stand/backend.env`, команды и ловушки — `target/stand/README.md`.
+
+- Backend `9b29fdd6d5dc818b7408e4892b8e68b27d123831`: user-defined bridge, публикация `127.0.0.1:8080`, UDP 50000/50001 на loopback и `WEBRTC_PUBLIC_IP=127.0.0.1`. Host networking в Docker Desktop на Windows не отдаёт контейнеру loopback хоста — использовать bridge с пробросом портов.
+- Frontend `ed7cb00ae12398753a8ef48a5a33b864e20cb04c`: образ собирается внутри `node:24-alpine` (Node на хосте не нужен), nginx слушает `127.0.0.1:3000` и проксирует `/api/` вместе с WebSocket в контейнер backend.
+- Первичные данные: bootstrap создаёт instance, owner и сервер; дальше создаются голосовой канал, invite-link с `allow_registration` и второй аккаунт. Проверено: `GET /healthz` → 204, вход в веб-клиент, публикатор Rust → Pion SFU → Rust-viewer с реальными кадрами, stop без утечки capture.
+- Полный live-сценарий: `cargo test -p voxhold-media live_stand_publishes_a_monitor_and_a_viewer_decodes_frames -- --ignored --nocapture` с `VOXHOLD_STAND_*` env. Тест `#[ignore]`, без креденшелов печатает SKIP, все ожидания с дедлайнами.
+
+Ограничения: loopback без TURN/HTTPS и без внешних клиентов; web-viewer требует разрешение на микрофон (backend разрешает `stream.watch` только из того же голосового канала); клики по нативному GUI не автоматизируются. Стенд не заменяет финальную приёмку `W13` на реальном backend/браузере.
 
 ### Журнал по этапам
 

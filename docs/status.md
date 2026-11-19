@@ -775,3 +775,16 @@ release p50/p95 1/1 мкс. Лимитер восстанавливается с
 после fallback на железе, hot-unplug, живой backend/браузер, TURN/ICE на втором
 ПК, DPI 125/150, запись W07 через `Tap` (подписка есть, потребителя в этой
 задаче нет).
+
+## Срез W03 (19 ноября 2026, реализация и live; ревью №3 не завершено)
+
+Ветка `codex/w03-screen-publish`, PR [#23](https://github.com/LoonEman1/voxhold-native-rust/pull/23) (draft), база `fbbab95`, коммиты `78f89d3`, `aedd22b`, `7fd24e1`. Эталоны: backend `9b29fdd6d5dc818b7408e4892b8e68b27d123831`, frontend `ed7cb00ae12398753a8ef48a5a33b864e20cb04c`.
+
+- `voxhold-media`: `publisher` (состояния `Idle → Picking → Publishing → Live → Stopping` + `Failed`), `publisher/engine` (отдельный peer и поток, `NativeVideoSource(is_screencast=true)`, `add_track` до `set_remote_description`, VP8, лимит битрейта, stats из `OutboundRtpStats`), `screen_capture` (`DesktopCapturer` мониторы/окна, фильтр своего процесса, BGRA→I420, bounded latest, preview ≤640 px/4 МиБ, watchdog).
+- Сигнализация: `stream.start` только после готового движка; ответ на серверный `stream.webrtc_offer`; `stream.webrtc_answer`/`stream.ice_candidate`/`stream.stop`; фильтрация чужих `stream.stopped`, `request_id` на попытку, тегированный `stream.left` как ack на stop.
+- UI: «Экран» в toolbar с гейтом (`Stream`, join, слот <8, `multi_streams`), модалка «Поделиться экраном» (только SDR и подтверждённый VP8), карточка «Ваш экран» с превью, LIVE, качеством и «Завершить трансляцию»; фокус и клавиатура пикера.
+- Live-проверка на Docker-стенде: join 50 мс, `Live` 252 мс, `answer_mid=0`, 1280×720, `frames_encoded=10`/`packets_sent=152` (растут), viewer декодировал 18 кадров за 2.01 с, stop за 151 мс, `start=1 stop=1`, движок освобождён. Это проверка формата, не заявление о производительности.
+- Live-тест вскрыл и исправил реальный баг viewer'а: `stream.snapshot` приходит до `ready`, а `set_joined(false)` вызывал `transport_ended()` и выбрасывал снапшот; теперь до первого join это no-op, добавлен регрессионный тест.
+- Проверки: fmt; `cargo test --workspace --locked` — API 11, media 179 (11 ignored), приложение 353 (1 ignored), 0 failed; release build; размеры 223 файла (1000/1200); `git diff --check`; UTF-8/BOM/U+FFFD/mojibake — чисто.
+- Ревью: раунд 1 — не PASS (P1-1/P1-2/P1-3 + P2), исправление `aedd22b`; раунд 2 — PASS на `aedd22b`; раунд 3 на `7fd24e1` (live-коммит) **не завершён**: сессия прервана, результат нужно получить завтра.
+- Осталось: завершить ревью №3; браузерный viewer без микрофона; hot-unplug/минимизация окна, DPI 125/150, sleep/resume, TURN, задержка и FPS/CPU/GPU-замеры не проверялись; HDR/P2P/audio/запись — вне этапа.

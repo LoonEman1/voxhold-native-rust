@@ -455,3 +455,17 @@ p95 20–38 мкс за пять прогонов (у ревьюера 16/21), r
 Не проверено: живое аудио и слышимый микс, реальный сон/пробуждение,
 повторное включение ADM после fallback на железе, hot-unplug, живой
 backend/браузер, TURN/ICE на втором ПК, DPI 125/150, запись W07 через `Tap`.
+
+### W03 — публикация экрана через SFU (SDR) — журнал PR #23
+
+Ветка `codex/w03-screen-publish`, база `fbbab95` (`dev` `ad0a9e8` + docs), PR [#23](https://github.com/LoonEman1/voxhold-native-rust/pull/23); эталоны backend `9b29fdd6d5dc818b7408e4892b8e68b27d123831`, frontend `ed7cb00ae12398753a8ef48a5a33b864e20cb04c`.
+
+- `crates/voxhold-media/src/publisher.rs`, `publisher/engine.rs`, `publisher/engine/{loopback,lifecycle,capture}_tests.rs`: состояния попытки, двухфазный старт (`stream.start` только после готового движка), ответ на серверный offer, ICE, stop/left/closed, очередь 64 и нефатальное переполнение ICE, `Drop` закрывает канал до `join`. Loopback-тест фиксирует mid/`a=sendonly` и приход кадров.
+- `crates/voxhold-media/src/screen_capture.rs`: `libwebrtc::desktop_capturer::DesktopCapturer` (2 монитора/14 окон на проверочной машине), фильтр окон своего процесса, BGRA→I420 box-downscale, bounded latest, preview ≤640 px/4 МиБ, `Temporary` ждёт watchdog, `Permanent` терминален.
+- `crates/voxhold-media/src/runtime/screen.rs`, `runtime.rs`: проводка команд пикера, generation листингов, `ScreenShare`-апдейты, освобождение capture при leave, конфликт с pending viewer, test-support seam.
+- UI: `src/voice_panel/screen_share.rs`, `screen_share/dialog.rs`, `view.rs`, `app/{mod,shell_view,voice_ops}.rs` — кнопка «Экран», модалка только с SDR-настройками и подтверждённым VP8, карточка «Ваш экран», фокус/клавиатура, cancel/stop, причина disabled в активной фазе.
+- `live_tests.rs` + `live_probe.rs`: `#[ignore]` live-тест на Docker-стенде, публикатор и viewer через реальный Pion, все ожидания с дедлайнами. Прогон: join 50 мс, Live 252 мс, `answer_mid=0`, 10 кадров/152 пакета, viewer 18 кадров за 2.01 с, stop 151 мс.
+- Найден и исправлен дефект R07a: снапшот до `ready` выбрасывался `set_joined(false)`; регрессия `viewer::tests::a_snapshot_that_arrives_before_ready_starts_after_the_join`.
+- Ревью: раунд 1 — не PASS (P1-1: наследование `stop_sent`/`connected`; P1-2: `stream.start` после провала старта; P1-3: очередь 16 и зависание `Drop`), исправление `aedd22b`; раунд 2 — PASS; раунд 3 на `7fd24e1` начат, но **не завершён** (сессия прервана) — результат и возможные правки продолжать завтра.
+- Проверки: fmt; тесты API 11 / media 179 (11 ignored) / app 353 (1 ignored), 0 failed; release; 223 файла в лимитах; кодировка чистая; мутации track/stop/viewer/reset падают на нужных тестах.
+- Осталось: завершить ревью №3, браузерный viewer без микрофона, TURN/внешний backend, hot-unplug, DPI 125/150, sleep/resume, задержка и FPS/CPU/GPU-замеры; HDR/P2P/system audio/запись — W04a/W04b/W11/W12.

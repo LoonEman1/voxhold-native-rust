@@ -502,6 +502,10 @@ impl Live {
     }
 
     async fn send_signal(&mut self, signal: Signal) -> Result<(), SessionEnd> {
+        // The live stand test needs the exact signaling the session sent and
+        // the answer mid; the test-only probe is empty in every other build.
+        #[cfg(test)]
+        crate::live_probe::record_signal(signal.kind, &signal.data);
         self.send(signal.kind, signal.data, signal.request_id.as_deref())
             .await
     }

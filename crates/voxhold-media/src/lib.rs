@@ -658,3 +658,8 @@ mod tests {
 pub mod devices;
 pub mod runtime;
 pub mod stream;
+
+#[cfg(test)]
+mod live_probe;
+#[cfg(test)]
+mod live_tests;

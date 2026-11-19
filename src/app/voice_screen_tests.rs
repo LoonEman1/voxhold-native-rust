@@ -227,6 +227,76 @@ async fn escape_after_start_stops_the_committed_publication(cx: &mut TestAppCont
 }
 
 #[gpui::test]
+async fn cancel_while_busy_never_enqueues_a_cancel_and_the_close_is_a_stop(
+    cx: &mut TestAppContext,
+) {
+    let (mut visual, _view, voice) = super::voice_tests::fixture(cx);
+    draw(&mut visual);
+    open_picker(&mut visual, &voice);
+
+    // Select the source and commit the attempt with the keyboard.
+    for _ in 0..3 {
+        visual.simulate_keystrokes("tab");
+    }
+    assert_eq!(focused(&mut visual, &voice), Some("Source(0)".to_owned()));
+    visual.simulate_keystrokes("enter");
+    for _ in 0..24 {
+        if focused(&mut visual, &voice).as_deref() == Some("Start") {
+            break;
+        }
+        visual.simulate_keystrokes("tab");
+    }
+    assert_eq!(focused(&mut visual, &voice), Some("Start".to_owned()));
+    visual.simulate_keystrokes("enter");
+    let published = visual
+        .update(|_window, app| voice.update(app, |panel, _| panel.test_take_screen_commands()));
+    assert_eq!(published, vec![("publish", 7)]);
+    voice.read_with(&*visual, |panel, _| {
+        assert!(panel.screen_share_busy(), "the attempt is committed")
+    });
+
+    // Walk to the Cancel button and activate it while the attempt is busy.
+    for _ in 0..24 {
+        if focused(&mut visual, &voice).as_deref() == Some("Cancel") {
+            break;
+        }
+        visual.simulate_keystrokes("tab");
+    }
+    assert_eq!(focused(&mut visual, &voice), Some("Cancel".to_owned()));
+    visual.simulate_keystrokes("enter");
+    let commands = visual
+        .update(|_window, app| voice.update(app, |panel, _| panel.test_take_screen_commands()));
+    assert!(
+        commands.iter().all(|(kind, _)| *kind != "cancel"),
+        "Cancel after Start must never reach the worker as a cancel: {commands:?}"
+    );
+    assert!(
+        commands.is_empty(),
+        "the disabled Cancel button is inert while the attempt is busy: {commands:?}"
+    );
+
+    // The dialog's close intent (Escape is the same path as the backdrop) is
+    // the only way out while busy: exactly one stop and no cancel.
+    visual.simulate_keystrokes("escape");
+    draw(&mut visual);
+    let commands = visual
+        .update(|_window, app| voice.update(app, |panel, _| panel.test_take_screen_commands()));
+    assert!(
+        commands.iter().all(|(kind, _)| *kind != "cancel"),
+        "closing a committed attempt is not a cancel: {commands:?}"
+    );
+    assert_eq!(
+        commands,
+        vec![("stop", 0)],
+        "a committed close is exactly one stop: {commands:?}"
+    );
+    voice.read_with(&*visual, |panel, _| {
+        assert!(!panel.screen_share_open());
+        assert!(!panel.screen_share_busy());
+    });
+}
+
+#[gpui::test]
 async fn the_disabled_reason_is_hidden_while_a_share_is_active(cx: &mut TestAppContext) {
     use voxhold_media::publisher::{Phase, Sharing};
     let (visual, _view, voice) = super::voice_tests::fixture(cx);

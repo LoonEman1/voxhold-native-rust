@@ -806,3 +806,37 @@ fn transport_end_before_join_still_publishes_recovery_for_the_selection() {
             .any(|outcome| matches!(outcome, Outcome::Start { selection: 7, .. }))
     );
 }
+
+#[test]
+fn a_snapshot_that_arrives_before_ready_starts_after_the_join() {
+    let now = Instant::now();
+    let a = publication("a", 1);
+    let mut viewer = Viewer::new(1, 10);
+    // The pinned backend enqueues the snapshot during socket registration,
+    // before `ready`; the runtime reports the still-unjoined voice state on
+    // every non-stream event that follows.
+    let listed = snapshot(&mut viewer, &[a.clone()], now);
+    assert!(
+        matches!(listed.as_slice(), [Outcome::Catalog]),
+        "the snapshot reaches the panel: {listed:?}"
+    );
+    let still_unjoined = viewer.set_joined(false, now);
+    assert!(
+        still_unjoined.is_empty(),
+        "there is no transport to end before the first join: {still_unjoined:?}"
+    );
+    assert_eq!(
+        viewer.catalog().list().len(),
+        1,
+        "the pre-join snapshot is the authoritative list of this socket"
+    );
+
+    viewer.select_intent(a.clone(), 4);
+    let joined = viewer.set_joined(true, now);
+    assert!(
+        joined
+            .iter()
+            .any(|outcome| matches!(outcome, Outcome::Start { selection: 4, .. })),
+        "the retained snapshot must start the selection after voice.joined: {joined:?}"
+    );
+}

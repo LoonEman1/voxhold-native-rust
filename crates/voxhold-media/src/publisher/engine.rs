@@ -672,9 +672,7 @@ async fn outbound_stats(peer: &PeerConnection, counters: &FrameCounters) -> Opti
     let dropped = counters.dropped.load(Ordering::Relaxed);
     let outbound = match tokio::time::timeout(STATS_TIMEOUT, peer.get_stats()).await {
         Ok(Ok(stats)) => stats.into_iter().find_map(|stat| match stat {
-            RtcStats::OutboundRtp(outbound) if outbound.stream.kind == "video" => {
-                Some(outbound.outbound)
-            }
+            RtcStats::OutboundRtp(outbound) if outbound.stream.kind == "video" => Some(outbound),
             _ => None,
         }),
         _ => None,
@@ -689,21 +687,29 @@ async fn outbound_stats(peer: &PeerConnection, counters: &FrameCounters) -> Opti
             limitation: QualityLimitation::None,
         });
     };
+    let stream = outbound.outbound;
+    #[cfg(test)]
+    crate::live_probe::record_outbound(
+        stream.frames_encoded,
+        outbound.sent.packets_sent,
+        stream.frame_width,
+        stream.frame_height,
+    );
     Some(PublishStats {
-        fps: outbound.frames_per_second as f32,
+        fps: stream.frames_per_second as f32,
         dropped,
-        width: if outbound.frame_width > 0 {
-            outbound.frame_width
+        width: if stream.frame_width > 0 {
+            stream.frame_width
         } else {
             capture_width
         },
-        height: if outbound.frame_height > 0 {
-            outbound.frame_height
+        height: if stream.frame_height > 0 {
+            stream.frame_height
         } else {
             capture_height
         },
         sources: 1,
-        limitation: QualityLimitation::from_reason(outbound.quality_limitation_reason),
+        limitation: QualityLimitation::from_reason(stream.quality_limitation_reason),
     })
 }
 

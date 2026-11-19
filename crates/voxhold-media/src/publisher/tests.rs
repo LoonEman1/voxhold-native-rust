@@ -802,3 +802,78 @@ fn an_untagged_stream_left_does_not_end_our_stop_wait() {
     assert!(!publisher.tick(now + STOP_TIMEOUT).is_empty());
     assert_eq!(publisher.phase(), Phase::Idle);
 }
+
+#[test]
+fn begin_picker_resets_the_previous_attempt_snapshot_immediately() {
+    let now = Instant::now();
+    let mut publisher = publisher();
+    let outcomes = publishing(&mut publisher, now);
+    let start_id = start_signal(&outcomes)
+        .request_id
+        .clone()
+        .expect("start id");
+
+    // A live attempt with measured counters, then a terminal server error.
+    publisher.on_engine(
+        EngineEvent::State(crate::publisher::Connection::Connected),
+        now,
+    );
+    publisher.on_engine(
+        EngineEvent::State(crate::publisher::Connection::FirstFrame),
+        now,
+    );
+    let stats = PublishStats {
+        fps: 30.0,
+        dropped: 2,
+        width: 1280,
+        height: 720,
+        sources: 1,
+        limitation: crate::publisher::engine::QualityLimitation::None,
+    };
+    publisher.on_engine(EngineEvent::Stats(stats), now);
+    assert_eq!(publisher.sharing().stats, Some(stats));
+    let failed = publisher.on_server_event("error", &start_id, &json!({"code": "forbidden"}), now);
+    assert_eq!(publisher.phase(), Phase::Failed);
+    assert!(
+        sends(&failed)
+            .iter()
+            .any(|signal| signal.kind == "stream.stop"),
+        "the failed attempt stops its own publication"
+    );
+    // The previous attempt leaves the confirmation latches, the error and (as
+    // a late engine sample could) the stats behind. Seeding the stats directly
+    // also proves that `begin_picker` resets the snapshot itself instead of
+    // relying on the duplicate cleanup in `start()`.
+    assert!(publisher.start_sent && publisher.stop_sent);
+    assert!(publisher.sharing().error.is_some());
+    publisher.stats = Some(stats);
+
+    let opened = publisher.begin_picker(2);
+    assert!(
+        matches!(opened.as_slice(), [Outcome::State(_)]),
+        "{opened:?}"
+    );
+
+    // This is the state the panel reads right after the picker was opened. It
+    // must not inherit anything from the failed attempt.
+    let snapshot = publisher.sharing();
+    assert_eq!(snapshot.phase, Phase::Picking);
+    assert_eq!(snapshot.attempt, 2);
+    assert!(!snapshot.live);
+    assert_eq!(snapshot.error, None);
+    assert_eq!(snapshot.stats, None);
+    assert_eq!(snapshot.quality, None);
+    assert_eq!(snapshot.codec, None);
+    assert!(!publisher.start_sent, "start_sent must be reset");
+    assert!(!publisher.stop_sent, "stop_sent must be reset");
+    assert!(publisher.request.is_none(), "the old request must be gone");
+    assert!(
+        publisher.started.is_none(),
+        "the old publisher id must be gone"
+    );
+    assert!(
+        publisher.deadline.is_none() && publisher.stop_deadline.is_none(),
+        "the old deadlines must be gone"
+    );
+    assert_eq!(publisher.picker, Some(2), "the new picker owns the attempt");
+}

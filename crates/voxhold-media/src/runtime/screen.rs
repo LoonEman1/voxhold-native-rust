@@ -93,7 +93,7 @@ impl Live {
             match outcome {
                 PublisherOutcome::StartEngine { request, .. } => {
                     // A new attempt never shares a capture with the old one.
-                    self.screen = None;
+                    self.release_engine();
                     let servers = self.servers.clone();
                     let policy = self.policy.clone();
                     let preview = self.screen_preview.clone();
@@ -104,12 +104,16 @@ impl Live {
                         move |request| PublisherEngine::start(request, servers, policy, preview),
                     );
                     self.screen = engine;
+                    #[cfg(test)]
+                    if self.screen.is_some() {
+                        crate::live_probe::record_engine_started();
+                    }
                     for outcome in outcomes.into_iter().rev() {
                         work.push_front(outcome);
                     }
                 }
                 PublisherOutcome::StopEngine => {
-                    self.screen = None;
+                    self.release_engine();
                     self.screen_preview.clear();
                 }
                 PublisherOutcome::LeaveViewer => {
@@ -169,9 +173,22 @@ impl Live {
     pub(super) async fn abandon_screen(&mut self, viewer: &mut Viewer) -> Result<(), SessionEnd> {
         let outcomes = self.publisher.abandon();
         let _ = self.apply_screen(outcomes, viewer).await?;
-        self.screen = None;
+        self.release_engine();
         self.screen_preview.clear();
         Ok(())
+    }
+
+    /// Drop the capture engine of the previous attempt. `PublisherEngine::drop`
+    /// closes the command channel and joins the capture thread, so the release
+    /// reported to the live test means the capture is really gone.
+    fn release_engine(&mut self) {
+        let previous = self.screen.take();
+        let had_engine = previous.is_some();
+        drop(previous);
+        #[cfg(test)]
+        if had_engine {
+            crate::live_probe::record_engine_stopped();
+        }
     }
 }
 

@@ -185,6 +185,12 @@ impl Viewer {
     /// watched again only after both a fresh snapshot and the join confirm.
     pub fn set_joined(&mut self, joined: bool, now: Instant) -> Vec<Outcome> {
         if !joined {
+            // A snapshot may arrive before `ready` on the same socket. Until
+            // the first `voice.joined` there is no transport to end, so a
+            // repeated pre-join `false` must not discard that snapshot.
+            if !self.joined {
+                return Vec::new();
+            }
             return self.transport_ended(now);
         }
         if self.joined == joined {

@@ -739,9 +739,15 @@ impl VoicePanel {
                 if phase == Phase::Idle || phase == Phase::Failed {
                     self.screen.restart = false;
                 }
-                if matches!(phase, Phase::Publishing | Phase::Live) && self.screen.open {
-                    // The attempt is accepted by the worker; the card in the
-                    // room now owns the status and the stop action.
+                if matches!(phase, Phase::Publishing | Phase::Live)
+                    && self.screen.open
+                    && (self.screen.busy || previous != phase)
+                {
+                    // Either this dialog committed the attempt (busy) or the
+                    // phase really changed: the card in the room now owns the
+                    // status and the stop action. A periodic stats update in
+                    // the same phase must not close an uncommitted restart
+                    // dialog, or its Start could never be reached.
                     self.screen.open = false;
                     self.screen.busy = false;
                     self.screen.focus_placed = false;

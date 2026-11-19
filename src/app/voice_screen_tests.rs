@@ -955,6 +955,82 @@ async fn start_with_a_removed_source_is_refused_before_the_refresh(cx: &mut Test
 }
 
 #[gpui::test]
+async fn the_accepted_publish_update_closes_the_committed_picker(cx: &mut TestAppContext) {
+    use voxhold_media::publisher::{Phase, Sharing};
+    let (mut visual, _view, voice) = super::voice_tests::fixture(cx);
+    draw(&mut visual);
+    open_picker(&mut visual, &voice);
+    visual.update(|_window, app| {
+        voice.update(app, |panel, cx| {
+            assert!(panel.test_can_start());
+            panel.test_start_screen_share(cx);
+            assert!(panel.screen_share_busy(), "the attempt is committed");
+            let commands = panel.test_take_screen_commands();
+            assert_eq!(commands, vec![("publish", 7)]);
+
+            assert!(panel.test_apply_screen_sharing(Sharing {
+                phase: Phase::Publishing,
+                live: false,
+                ..Sharing::default()
+            }));
+            assert!(
+                !panel.screen_share_open(),
+                "the accepted publish closes the committed picker"
+            );
+            assert!(!panel.screen_share_busy());
+        });
+    });
+}
+
+#[gpui::test]
+async fn a_duplicate_source_id_is_never_selected_or_published(cx: &mut TestAppContext) {
+    let (mut visual, _view, voice) = super::voice_tests::fixture(cx);
+    draw(&mut visual);
+    let first = monitor(3, "Экран A", 1920, 1080);
+    let duplicate = monitor(3, "Экран A · дубль", 1920, 1080);
+    let id = first.source_id();
+    visual.update(|_window, app| {
+        voice.update(app, |panel, cx| {
+            panel.test_attach_detached_handle();
+            // A normal worker answer may describe the same (kind,id) twice.
+            // The selection is still held by identity, as after a click on the
+            // row before the duplicated snapshot arrived.
+            panel.test_open_screen_picker_with(
+                SourceKind::Monitor,
+                vec![first.clone(), duplicate.clone()],
+                Some(id),
+            );
+            assert_eq!(panel.test_selected_source_id(), Some(id));
+            assert!(
+                !panel.test_can_start(),
+                "an ambiguous identity cannot be started"
+            );
+            panel.test_start_screen_share(cx);
+            assert!(
+                panel.test_take_screen_commands().is_empty(),
+                "a duplicated id must never reach the worker"
+            );
+            assert_eq!(
+                panel.test_screen_error(),
+                panel.test_source_gone_reason(),
+                "the duplicate refusal is visible"
+            );
+
+            // The worker repeats the same duplicated answer: the selection is
+            // invalidated through `retain_selection`, not silently repaired.
+            panel.test_apply_screen_sources(SourceKind::Monitor, vec![first, duplicate]);
+            assert_eq!(
+                panel.test_selected_source_id(),
+                None,
+                "a duplicated snapshot clears the ambiguous selection"
+            );
+            assert!(!panel.test_can_start());
+            assert_eq!(panel.test_screen_error(), panel.test_source_gone_reason());
+        });
+    });
+}
+
+#[gpui::test]
 async fn keyboard_focus_follows_the_source_id_across_a_reorder(cx: &mut TestAppContext) {
     let (mut visual, _view, voice) = super::voice_tests::fixture(cx);
     draw(&mut visual);

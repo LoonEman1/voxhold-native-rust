@@ -249,6 +249,11 @@ impl VoicePanel {
         &self.screen.error
     }
 
+    /// The visible refusal for an absent or duplicated source identity.
+    pub fn test_source_gone_reason(&self) -> &'static str {
+        super::screen_share::SOURCE_GONE_REASON
+    }
+
     /// Open the live quality dialog with the publication already Live.
     pub fn test_open_screen_settings(
         &mut self,
@@ -378,6 +383,12 @@ impl VoicePanel {
     /// Replace the screen-share snapshot as a worker update would.
     pub fn test_set_screen_sharing(&mut self, sharing: Sharing) {
         self.screen.sharing = sharing;
+    }
+
+    /// Apply a screen-share runtime update exactly as the publisher emits it
+    /// (including the live stats sample every second).
+    pub fn test_apply_screen_sharing(&mut self, sharing: Sharing) -> bool {
+        self.apply_screen_update(VoiceUpdate::ScreenShare(sharing))
     }
 
     /// Queued screen actions of the detached handle, as (kind, picker) pairs.

@@ -296,6 +296,79 @@ async fn a_restart_keeps_the_confirmed_identity_when_the_row_was_renamed(cx: &mu
 }
 
 #[gpui::test]
+async fn a_same_phase_live_stats_update_keeps_an_uncommitted_restart_dialog_open(
+    cx: &mut TestAppContext,
+) {
+    let (mut visual, _view, voice) = super::voice_tests::fixture(cx);
+    draw(&mut visual);
+    let live = window(11, "Документ");
+    visual.update(|_window, app| {
+        voice.update(app, |panel, cx| {
+            open_restart(panel, vec![live.clone()], live.clone(), cx);
+            assert!(panel.screen_share_open());
+            assert!(panel.test_screen_restart());
+            assert!(panel.test_can_start());
+
+            // The publisher emits fresh stats every second while Live. That
+            // update is not an answer to Start: it must not close an
+            // uncommitted restart dialog or unbind its Start.
+            let sampled = Sharing {
+                phase: Phase::Live,
+                live: true,
+                quality: Some(Quality::default()),
+                has_audio: true,
+                stats: Some(voxhold_media::publisher::engine::PublishStats {
+                    audio_active: true,
+                    audio_kbps: 96.0,
+                    ..Default::default()
+                }),
+                ..Sharing::default()
+            };
+            assert!(panel.test_apply_screen_sharing(sampled));
+            assert!(
+                panel.screen_share_open(),
+                "a same-phase stats update must leave the dialog open"
+            );
+            assert!(
+                panel.test_screen_restart(),
+                "the restart stays bound to the live source"
+            );
+            assert!(panel.test_can_start(), "Start must stay reachable");
+
+            panel.test_start_screen_share(cx);
+            let commands = panel.test_take_screen_commands();
+            assert_eq!(
+                commands,
+                vec![("restart", 0)],
+                "Start queues exactly one restart: {commands:?}"
+            );
+            assert!(panel.screen_share_busy(), "the restart is committed");
+
+            // Once committed, the accepted live update closes the dialog as
+            // before and the room card takes over the status.
+            let accepted = Sharing {
+                phase: Phase::Live,
+                live: true,
+                quality: Some(Quality::default()),
+                has_audio: true,
+                stats: Some(voxhold_media::publisher::engine::PublishStats {
+                    audio_active: true,
+                    audio_kbps: 97.0,
+                    ..Default::default()
+                }),
+                ..Sharing::default()
+            };
+            panel.test_apply_screen_sharing(accepted);
+            assert!(
+                !panel.screen_share_open(),
+                "the committed dialog closes on the accepted live update"
+            );
+            assert!(!panel.screen_share_busy());
+        });
+    });
+}
+
+#[gpui::test]
 async fn a_normal_picker_after_a_restart_starts_with_no_rows(cx: &mut TestAppContext) {
     let (mut visual, _view, voice) = super::voice_tests::fixture(cx);
     draw(&mut visual);

@@ -5,6 +5,7 @@ mod assets;
 mod attachments;
 mod audio_capabilities;
 mod auth;
+mod auth_session;
 mod background;
 mod channel_settings;
 mod clipboard;

@@ -905,6 +905,7 @@ async fn paste_and_drop_add_only_metadata_to_the_draft(cx: &mut TestAppContext) 
     std::fs::remove_file(path).unwrap();
 }
 
+mod auth_session_tests;
 mod fixes;
 mod followup;
 mod followup2;

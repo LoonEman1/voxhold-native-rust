@@ -586,6 +586,27 @@ impl VoicePanel {
         self.leave_call(cx);
     }
 
+    /// Install a client that already carries a rotated token. The next join
+    /// uses it; an active call is restarted through `rejoin_call`.
+    pub fn set_client(&mut self, client: Client) {
+        self.client = client;
+    }
+
+    /// Restart the call that is already active in `channel` with the current
+    /// client and access snapshot. The normal leave/join path is used, so the
+    /// server sees one clean lease and media never runs on the old credential.
+    pub fn rejoin_call(&mut self, channel: i64, cx: &mut Context<Self>) {
+        if channel <= 0 {
+            return;
+        }
+        self.leave_call(cx);
+        let viewing = self.room;
+        self.room = channel;
+        self.join(cx);
+        self.room = viewing;
+        cx.notify();
+    }
+
     /// Normal leave: stream session and voice session are both released and
     /// the room falls back to the join button.
     pub fn leave_call(&mut self, cx: &mut Context<Self>) {

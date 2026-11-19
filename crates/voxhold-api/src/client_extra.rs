@@ -647,12 +647,13 @@ impl Client {
             .header(reqwest::header::CONTENT_LENGTH, size)
             .timeout(Duration::from_secs(180))
             .body(reqwest::Body::wrap_stream(stream));
-        if !self.token.is_empty() {
-            request = request.bearer_auth(self.token.as_ref());
+        let token = self.auth.token();
+        if !token.is_empty() {
+            request = request.bearer_auth(token.as_ref());
         }
         let response = request.send().await.map_err(|_| Error::Network)?;
         if !response.status().is_success() {
-            return Err(Error::Http(response.status().as_u16()));
+            return Err(self.refused(response.status().as_u16(), &token));
         }
         let bytes = read_capped(response, 1 << 20).await?;
         let result: Attachment = serde_json::from_slice(&bytes)?;
@@ -690,12 +691,13 @@ impl Client {
             .http
             .get(self.url(&format!("/api/v1/attachments/{id}/content"))?)
             .timeout(Duration::from_secs(180));
-        if !self.token.is_empty() {
-            request = request.bearer_auth(self.token.as_ref());
+        let token = self.auth.token();
+        if !token.is_empty() {
+            request = request.bearer_auth(token.as_ref());
         }
         let mut response = request.send().await.map_err(|_| Error::Network)?;
         if response.status() != reqwest::StatusCode::OK {
-            return Err(Error::Http(response.status().as_u16()));
+            return Err(self.refused(response.status().as_u16(), &token));
         }
         let mut written = 0u64;
         while let Some(chunk) = response.chunk().await.map_err(|_| Error::Network)? {
@@ -712,8 +714,9 @@ impl Client {
             .http
             .request(method.clone(), url)
             .timeout(Duration::from_secs(180));
-        if !self.token.is_empty() {
-            r = r.bearer_auth(self.token.as_ref());
+        let token = self.auth.token();
+        if !token.is_empty() {
+            r = r.bearer_auth(token.as_ref());
         }
         if method == Method::PUT {
             r = r
@@ -722,7 +725,7 @@ impl Client {
         }
         let res = r.send().await.map_err(|_| Error::Network)?;
         if !res.status().is_success() {
-            return Err(Error::Http(res.status().as_u16()));
+            return Err(self.refused(res.status().as_u16(), &token));
         }
         read_capped(res, max).await
     }

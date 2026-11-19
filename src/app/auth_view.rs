@@ -613,6 +613,21 @@ impl Voxhold {
                         .child(icon("icons/up.svg", 12., ink(p.muted)))
                         .child("Назад"),
                 )
+                // The confirmed origin of this step. It is plain text, not a
+                // new control: the address is changed through «Назад».
+                .child(
+                    div()
+                        .absolute()
+                        .left(px(l.card.x))
+                        .top(px((l.card.y - 28.0).max(8.0)))
+                        .w(px(l.card.w))
+                        .flex()
+                        .justify_end()
+                        .text_size(px(12.))
+                        .text_color(ink(p.muted))
+                        .truncate()
+                        .child(self.auth.origin.clone()),
+                )
                 // Every label is positioned in client coordinates directly, not
                 // inside another absolutely positioned container.
                 .child(

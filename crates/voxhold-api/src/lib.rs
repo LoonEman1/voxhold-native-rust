@@ -1,5 +1,6 @@
 mod client_extra;
 mod recordings;
+mod session;
 use futures_util::{SinkExt, StreamExt};
 pub use recordings::{
     Recording, RecordingList, RECORDING_DELETED, RECORDING_FAILED, RECORDING_LOCAL_ONLY,
@@ -8,6 +9,8 @@ pub use recordings::{
 use reqwest::{Method, Url};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
+use session::AuthShared;
+pub use session::{LoginSession, SessionUpdate};
 use std::{fmt, net::IpAddr, time::Duration};
 
 #[derive(Debug)]
@@ -59,7 +62,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub struct Client {
     base: Url,
     http: reqwest::Client,
-    token: std::sync::Arc<str>,
+    auth: std::sync::Arc<AuthShared>,
 }
 impl Client {
     pub fn new(raw: &str) -> Result<Self> {
@@ -91,14 +94,30 @@ impl Client {
         Ok(Self {
             base,
             http,
-            token: std::sync::Arc::from(""),
+            auth: std::sync::Arc::new(AuthShared::default()),
         })
     }
-    pub fn set_token(&mut self, token: String) {
-        self.token = token.into();
+    /// Attach the current token and return it so a refusal can name the exact
+    /// credential that the server rejected.
+    fn authorized(
+        &self,
+        request: reqwest::RequestBuilder,
+    ) -> (reqwest::RequestBuilder, std::sync::Arc<str>) {
+        let token = self.auth.token();
+        let request = if token.is_empty() {
+            request
+        } else {
+            request.bearer_auth(token.as_ref())
+        };
+        (request, token)
     }
-    pub fn token(&self) -> &str {
-        &self.token
+    /// Record a `401` against the token that was actually sent. The response
+    /// body is never read here, so no personal content reaches a log.
+    fn refused(&self, status: u16, token: &str) -> Error {
+        if status == 401 {
+            self.auth.note_unauthorized(token);
+        }
+        Error::Http(status)
     }
     fn url(&self, path: &str) -> Result<Url> {
         if !path.starts_with('/') || path.starts_with("//") {
@@ -129,16 +148,13 @@ impl Client {
         body: Option<Value>,
         max: usize,
     ) -> Result<(Vec<u8>, Option<String>)> {
-        let mut r = self.http.request(method, self.url(path)?);
-        if !self.token.is_empty() {
-            r = r.bearer_auth(self.token.as_ref());
-        }
+        let (mut r, token) = self.authorized(self.http.request(method, self.url(path)?));
         if let Some(b) = body {
             r = r.json(&b);
         }
         let mut response = r.send().await.map_err(|_| Error::Network)?;
         if !response.status().is_success() {
-            return Err(Error::Http(response.status().as_u16()));
+            return Err(self.refused(response.status().as_u16(), &token));
         }
         let etag = response
             .headers()
@@ -168,21 +184,6 @@ impl Client {
     }
     pub async fn action(&self, method: Method, path: &str, body: Option<Value>) -> Result<()> {
         self.bytes(method, path, body, 4 << 20).await?;
-        Ok(())
-    }
-    pub async fn login(&mut self, username: &str, password: &str) -> Result<()> {
-        let v: Value = self
-            .request(
-                Method::POST,
-                "/api/v1/auth/login",
-                Some(json!({"username":username,"password":password})),
-            )
-            .await?;
-        let token = v["session"]["token"]
-            .as_str()
-            .filter(|s| !s.is_empty())
-            .ok_or(Error::InvalidResponse("Сервер не вернул сессию."))?;
-        self.token = std::sync::Arc::from(token);
         Ok(())
     }
     pub async fn servers(&self) -> Result<Vec<Server>> {
@@ -632,10 +633,11 @@ impl Client {
             tokio_tungstenite::connect_async_with_config(u.as_str(), Some(config), false)
                 .await
                 .map_err(|e| Error::WebSocket(e.to_string()))?;
+        let token = self.auth.token();
         let mut s = VoiceSocket { socket };
         s.send(
             "auth",
-            json!({"token":self.token.as_ref(),"multi_streams":true}),
+            json!({"token":token.as_ref(),"multi_streams":true}),
             None,
         )
         .await?;

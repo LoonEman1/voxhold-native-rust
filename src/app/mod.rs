@@ -69,9 +69,9 @@ use voxhold_api::{Channel, ChannelSubscription, Client, Member, Message, Server}
 #[cfg(feature = "voxhold-media")]
 use crate::voice_panel;
 use crate::{
-    attachments, auth, background, channel_settings, draft, inbox, layout, links, media, members,
-    message_tools, personal_settings, reactions, recordings, recordings_dialog, search,
-    server_settings, theme, thread_panel, window_chrome,
+    attachments, auth, auth_session, background, channel_settings, draft, inbox, layout, links,
+    media, members, message_tools, personal_settings, reactions, recordings, recordings_dialog,
+    search, server_settings, theme, thread_panel, window_chrome,
 };
 use ui::{icon, ink};
 
@@ -189,6 +189,17 @@ pub(crate) struct Voxhold {
     password: Entity<InputState>,
     composer: Entity<InputState>,
     client: Option<Client>,
+    /// The signed-in session: identity, token, expiry and rotation generation.
+    /// It is the only place that owns these values.
+    session: Option<auth_session::Session>,
+    /// Changes on every login and local end of the session; a late refresh or
+    /// 401 from another login is discarded.
+    session_epoch: u64,
+    /// Single-flight and bounded retry state for `POST /auth/refresh`.
+    session_gate: auth_session::RefreshGate,
+    /// One periodic expiry/refresh timer while a session exists. Dropping the
+    /// task cancels it.
+    session_clock: Option<gpui::Task<()>>,
     self_user_id: i64,
     search: Option<Entity<search::SearchPanel>>,
     show_search: bool,
@@ -420,6 +431,13 @@ impl Drop for Voxhold {
         // The window is going away, so the debounced voice save will never get
         // its timer: write the newest snapshot now (atomic, one small file).
         self.voice_settings.flush();
+        // Closing the window ends the local work but is not a logout: no
+        // server revocation is sent, and the session is simply dropped. The
+        // sends and timers that belong to the window are cancelled with it.
+        for (_, pending) in self.pending_sends.drain() {
+            pending.abort.abort();
+        }
+        self.stop_session_clock();
         self.stop_realtime();
     }
 }
@@ -510,6 +528,10 @@ impl Voxhold {
                     .placeholder("Написать сообщение")
             }),
             client: None,
+            session: None,
+            session_epoch: 0,
+            session_gate: auth_session::RefreshGate::default(),
+            session_clock: None,
             self_user_id: 0,
             search: None,
             show_search: false,

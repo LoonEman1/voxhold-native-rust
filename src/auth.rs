@@ -66,11 +66,15 @@ impl AuthState {
             return None;
         }
         let origin = raw.trim();
-        if voxhold_api::Client::new(origin).is_err() {
-            self.status = "Введите корректный HTTPS-адрес инстанса".into();
-            return None;
-        }
-        self.origin = origin.to_string();
+        let client = match voxhold_api::Client::new(origin) {
+            Ok(client) => client,
+            Err(_) => {
+                self.status = "Введите корректный HTTPS-адрес инстанса".into();
+                return None;
+            }
+        };
+        // Keep one canonical origin: no trailing slash and no default port.
+        self.origin = client.origin();
         self.status.clear();
         self.screen = AuthScreen::Login;
         Some(self.origin.clone())
@@ -485,6 +489,24 @@ mod tests {
         );
         assert!(auth.submit_login(" abc ", "short").is_none());
         assert_eq!(auth.status, "Введите пароль (не менее 8 символов)");
+    }
+
+    #[test]
+    fn instance_origin_is_normalized() {
+        let mut auth = AuthState::new("");
+        let origin = auth
+            .submit_instance("  http://127.0.0.1:8080/  ")
+            .expect("loopback HTTP is allowed");
+        assert_eq!(origin, "http://127.0.0.1:8080");
+        assert_eq!(auth.origin, "http://127.0.0.1:8080");
+
+        let mut secure = AuthState::new("");
+        assert_eq!(
+            secure
+                .submit_instance("https://chat.example.org:443/")
+                .as_deref(),
+            Some("https://chat.example.org")
+        );
     }
 
     #[test]

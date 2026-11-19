@@ -808,49 +808,6 @@ impl Voxhold {
         .into_any_element()
     }
 
-    /// Go `voiceShortcuts`: one row per action with the current binding. While
-    /// recording, the row that owns the recorder says "Нажмите…" and the next
-    /// key-down in the settings card becomes the binding.
-    fn voice_shortcuts(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        let prefs = self.voice_settings.prefs.clone();
-        let recording = self.voice_settings.recording_shortcut;
-        let rows = [
-            (0usize, "Микрофон вкл/выкл", prefs.mute.clone()),
-            (1, "Звук вкл/выкл", prefs.deafen.clone()),
-            (2, "Нажми и говори", prefs.push_to_talk.clone()),
-        ];
-        let mut column = div().w_full().flex().flex_col().gap(px(6.));
-        for (field, title, value) in rows {
-            let active = recording == Some(field);
-            let label = if active {
-                "Нажмите сочетание…".to_owned()
-            } else {
-                format!("{title}: {}", crate::voice_settings::shortcut_label(&value))
-            };
-            column = column.child(self.settings_button(
-                ElementId::Name(format!("voice-shortcut-{field}").into()),
-                label,
-                if active {
-                    ButtonKind::Tab
-                } else {
-                    ButtonKind::Secondary
-                },
-                active,
-                false,
-                SettingsAct::Personal(personal_settings::Action::RecordShortcut(field)),
-                window,
-                cx,
-            ));
-        }
-        if recording.is_some() {
-            column = column.child(self.form_text(
-                "Нажмите сочетание клавиш или Escape, чтобы отменить.",
-                false,
-            ));
-        }
-        column.into_any_element()
-    }
-
     /// Go `f.segments`: one row of equal-width mode buttons. The selected
     /// segment uses the tab kind so the active mode is unambiguous.
     fn voice_segments(

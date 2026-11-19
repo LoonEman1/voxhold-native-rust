@@ -78,9 +78,23 @@ pub const OUTPUT_VOLUME_NOTE: &str = "Общая громкость примен
 pub const AUTO_GAIN_DESCRIPTION: &str =
     "APM в software-пути выравнивает голос; platform ADM применяет своё усиление, которое здесь не измеряется";
 
+/// Sentence shown while the recorder stays open after a combination is
+/// rejected because another voice action already owns it.
+pub fn shortcut_conflict_message(action: &str) -> String {
+    format!("Сочетание уже занято: {action}. Нажмите другое.")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_rejected_hotkey_names_the_owning_action() {
+        assert_eq!(
+            shortcut_conflict_message("Звук вкл/выкл"),
+            "Сочетание уже занято: Звук вкл/выкл. Нажмите другое."
+        );
+    }
 
     #[test]
     fn the_platform_note_never_claims_echo_cancellation() {

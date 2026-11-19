@@ -39,6 +39,7 @@ mod settings_slider_tests;
 #[cfg(test)]
 mod settings_tests;
 mod settings_view;
+mod settings_voice_shortcuts;
 mod settings_voice_view;
 mod shell_view;
 #[cfg(test)]

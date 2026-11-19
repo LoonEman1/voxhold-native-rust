@@ -9,13 +9,21 @@ impl Voxhold {
             self.server,
             self.channel,
             self.access_generation,
+            self.chat_scope_epoch,
         );
         let painted = self.painted_read.clone();
         let weak = cx.entity().downgrade();
         window.on_next_frame(move |window, cx| {
             if let Some(this) = weak.upgrade() {
                 this.update(cx, |s, cx| {
-                    if (s.chat_key(), s.server, s.channel, s.access_generation) != scope {
+                    if (
+                        s.chat_key(),
+                        s.server,
+                        s.channel,
+                        s.access_generation,
+                        s.chat_scope_epoch,
+                    ) != scope
+                    {
                         return;
                     }
                     s.read_scheduled = false;
@@ -71,11 +79,7 @@ impl Voxhold {
             || self
                 .read_retry_at
                 .is_some_and(|at| at > std::time::Instant::now())
-            || (!conversation
-                && !self
-                    .channels
-                    .iter()
-                    .any(|c| c.id == self.channel && c.has_history()))
+            || (!conversation && !self.channel_chat_readable(self.channel))
         {
             return;
         }
@@ -164,13 +168,7 @@ impl Voxhold {
         cx: &mut Context<Self>,
     ) {
         let conversation = self.in_conversation();
-        if self.access_pending
-            || (!conversation
-                && !self
-                    .channels
-                    .iter()
-                    .any(|channel| channel.id == self.channel && channel.has_history()))
-        {
+        if self.access_pending || (!conversation && !self.channel_chat_readable(self.channel)) {
             return;
         }
         let Some(message) = self.message_snapshot(message_id) else {
@@ -678,13 +676,7 @@ impl Voxhold {
             self.access_generation,
         );
         let chat = self.chat_key();
-        if self.access_pending
-            || (!conversation
-                && !self
-                    .channels
-                    .iter()
-                    .any(|c| c.id == channel && c.has_history()))
-        {
+        if self.access_pending || (!conversation && !self.channel_chat_readable(channel)) {
             return;
         }
         if self.refresh_request.is_some() {

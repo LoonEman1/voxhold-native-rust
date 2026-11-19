@@ -37,15 +37,189 @@ impl Voxhold {
         if self.conversation.is_some() {
             return !self.access_pending && self.channel > 0;
         }
-        !self.access_pending
-            && self
-                .channels
-                .iter()
-                .any(|channel| channel.id == self.channel && channel.writable())
+        !self.access_pending && self.channel_chat_writable(self.channel)
     }
 
     pub(super) fn is_sending(&self) -> bool {
         self.pending_sends.contains_key(&self.chat_key())
+    }
+
+    /// Reply bar, character counter, error and the composer row. The channel
+    /// column and the docked room chat paint the same controls with a slightly
+    /// tighter margin in the narrow panel.
+    pub(super) fn render_composer(&mut self, cx: &mut Context<Self>, compact: bool) -> AnyElement {
+        let p = self.palette;
+        let pad = if compact { 10. } else { 18. };
+        let mut body = div().flex().flex_col();
+        let text = self.composer.read(cx).value().to_string();
+        let files = self.drafts.borrow().files(self.chat_key());
+        let reading = self
+            .attachments
+            .as_ref()
+            .is_some_and(|attachments| attachments.read(cx).is_reading());
+        let attachments_ready = self.attachments.is_some() && !self.is_sending() && !reading;
+        let valid = draft::validate_send(&text, &files).is_ok();
+        let can_send = valid && !self.is_sending() && !reading && !self.access_pending;
+        let reply_id = self.drafts.borrow().reply(self.chat_key());
+        if reply_id > 0 {
+            let (author, excerpt) = self
+                .messages
+                .iter()
+                .find(|message| message.id == reply_id)
+                .map(|message| {
+                    (
+                        message.author.username.clone(),
+                        message.content.replace('\n', " "),
+                    )
+                })
+                .unwrap_or_else(|| ("Сообщение".into(), format!("#{reply_id}")));
+            body = body.child(
+                div()
+                    .mx(px(pad))
+                    .mb(px(4.))
+                    .px(px(10.))
+                    .py(px(5.))
+                    .rounded(px(7.))
+                    .bg(ink(p.surface))
+                    .border_l_2()
+                    .border_color(ink(p.lime))
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .truncate()
+                            .text_size(px(11.))
+                            .text_color(ink(p.muted))
+                            .child(format!("Ответ: {author} · {excerpt}")),
+                    )
+                    .child(
+                        div()
+                            .id("clear-reply")
+                            .cursor_pointer()
+                            .text_size(px(11.))
+                            .text_color(ink(p.muted))
+                            .on_click(cx.listener(|s, _, _, cx| s.clear_reply(cx)))
+                            .child("Убрать"),
+                    ),
+            );
+        }
+        if let Some(counter) = draft::counter(&text) {
+            body = body.child(
+                div()
+                    .px(px(pad))
+                    .pb(px(2.))
+                    .text_size(px(12.))
+                    .text_color(ink(p.muted))
+                    .child(counter),
+            );
+        }
+        if !self.composer_error.is_empty() {
+            body = body.child(
+                div()
+                    .px(px(pad))
+                    .pb(px(2.))
+                    .text_size(px(12.))
+                    .text_color(ink(p.danger))
+                    .child(self.composer_error.clone()),
+            );
+        }
+        let send_button = div()
+            .id("send")
+            .w(px(if compact { 96. } else { 112. }))
+            .h(px(40.))
+            .rounded(px(11.))
+            .bg(ink(if can_send { p.lime } else { p.surface }))
+            .text_color(ink(if can_send { 0x10100f } else { p.muted }))
+            .font_weight(gpui::FontWeight::BOLD)
+            .text_size(px(14.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .gap_2()
+            .when(can_send, |button| {
+                button
+                    .cursor_pointer()
+                    .on_click(cx.listener(|s, _, w, cx| s.send(w, cx)))
+            })
+            .child(if self.is_sending() {
+                "Отправка…".into_any_element()
+            } else {
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(icon(
+                        "icons/send.svg",
+                        16.,
+                        ink(if can_send { 0x10100f } else { p.muted }),
+                    ))
+                    .child("Отправить")
+                    .into_any_element()
+            });
+        body.child(
+            div()
+                .px(px(pad))
+                .py(px(12.))
+                .flex()
+                .items_end()
+                .gap_2()
+                .when(attachments_ready, |row| {
+                    row.child(
+                        div()
+                            .id("attach-files")
+                            .w(px(37.))
+                            .h(px(37.))
+                            .rounded(px(10.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .cursor_pointer()
+                            .on_click(cx.listener(|s, _, _, cx| {
+                                if let Some(attachments) = &s.attachments {
+                                    attachments.update(cx, |panel, cx| panel.pick(cx));
+                                }
+                            }))
+                            .child(icon("icons/paperclip.svg", 17., ink(p.muted))),
+                    )
+                })
+                .child(
+                    div()
+                        .flex_1()
+                        .min_h(px(47.))
+                        .key_context("Composer")
+                        .on_action(cx.listener(|s, _: &composer::ComposerSend, window, cx| {
+                            // While the viewer is open it owns the
+                            // keyboard, like Go `imageViewerEvent`.
+                            if s.media.viewer.is_some() {
+                                return;
+                            }
+                            s.send(window, cx);
+                        }))
+                        .on_action(cx.listener(
+                            |s, _: &composer::ComposerPasteFiles, _window, cx| {
+                                if s.media.viewer.is_some() {
+                                    return;
+                                }
+                                if !s.paste_attachments(cx) {
+                                    // The clipboard has no files: let the
+                                    // input widget paste ordinary text.
+                                    cx.dispatch_action(&gpui_component::input::Paste);
+                                }
+                            },
+                        ))
+                        .child(
+                            TextInput::new(&self.composer)
+                                .font_family("Inter")
+                                .text_size(px(14.))
+                                .h_full(),
+                        ),
+                )
+                .child(send_button),
+        )
+        .into_any_element()
     }
 
     /// Go `Editor.OnSubmit` / `Model.Send`: validate the draft, freeze one

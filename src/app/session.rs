@@ -303,6 +303,7 @@ impl Voxhold {
             self.voice_rooms.clear();
             self.voice_streams.clear();
             self.voice_unconfirmed.clear();
+            self.voice_chat_rooms.clear();
         }
         self.close_recordings(false, window, cx);
         self.recording_access_epoch = self.recording_access_epoch.wrapping_add(1);
@@ -690,12 +691,7 @@ impl Voxhold {
         self.stop_realtime();
         if let Some(client) = self.client.clone() {
             self.start_realtime(client, window, cx);
-            let has_history = self.conversation.is_none()
-                && self
-                    .channels
-                    .iter()
-                    .any(|channel| channel.id == self.channel && channel.has_history());
-            self.update_channel_subscription(has_history);
+            self.refresh_chat_subscription();
         }
         #[cfg(feature = "voxhold-media")]
         if let Some(panel) = self.voice.clone() {

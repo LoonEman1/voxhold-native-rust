@@ -1,3 +1,4 @@
+mod channel;
 mod client_extra;
 mod recordings;
 mod session;
@@ -476,17 +477,6 @@ dto!(Channel {
     can_publish: bool,
     unread_count: i64
 });
-impl Channel {
-    pub fn readable(&self) -> bool {
-        self.permissions & 1 != 0
-    }
-    pub fn has_history(&self) -> bool {
-        self.readable() && !self.e2ee_required && (self.kind == "text" || self.kind == "news")
-    }
-    pub fn writable(&self) -> bool {
-        self.has_history() && self.permissions & 2 != 0 && (self.kind != "news" || self.can_publish)
-    }
-}
 dto!(Author {
     user_id: i64,
     username: String
@@ -972,20 +962,6 @@ mod tests {
         assert!(c.url("//evil.test/x").is_err());
         assert!(c.url("https://evil.test").is_err());
         assert_eq!(c.url("/api/v1/ws").unwrap().host_str(), Some("example.com"));
-    }
-    #[test]
-    fn permissions() {
-        let mut c = Channel {
-            kind: "news".into(),
-            permissions: 3,
-            ..Default::default()
-        };
-        assert!(c.has_history());
-        assert!(!c.writable());
-        c.can_publish = true;
-        assert!(c.writable());
-        c.e2ee_required = true;
-        assert!(!c.has_history());
     }
 }
 #[cfg(test)]

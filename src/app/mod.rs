@@ -30,6 +30,9 @@ mod recordings_ops_tests;
 #[cfg(test)]
 mod recordings_tests;
 mod recordings_view;
+mod room_chat;
+#[cfg(all(feature = "voxhold-media", test))]
+mod room_chat_tests;
 mod server_ops;
 mod session;
 #[cfg(test)]
@@ -314,6 +317,11 @@ pub(crate) struct Voxhold {
     /// Channel shown in the room pane; independent from the call channel.
     #[cfg(feature = "voxhold-media")]
     voice_room: i64,
+    /// Rooms whose chat panel the user opened, keyed by `(server, channel)`.
+    /// Membership survives navigation and is pruned when the channel stops
+    /// being readable.
+    #[cfg(feature = "voxhold-media")]
+    voice_chat_rooms: std::collections::HashSet<(i64, i64)>,
     /// Channel of the active call, mirrored from the panel for the dock.
     #[cfg(feature = "voxhold-media")]
     voice_channel: i64,
@@ -336,6 +344,9 @@ pub(crate) struct Voxhold {
     messages: Vec<Message>,
     history_list: ListState,
     history_keys: Vec<HistoryKey>,
+    /// Bumped when the room chat opens or closes so a read scheduled for the
+    /// previous surface cannot mark anything visible.
+    chat_scope_epoch: u64,
     before: Option<i64>,
     has_more: bool,
     history_has_newer: bool,
@@ -663,6 +674,8 @@ impl Voxhold {
             #[cfg(feature = "voxhold-media")]
             voice_room: 0,
             #[cfg(feature = "voxhold-media")]
+            voice_chat_rooms: std::collections::HashSet::new(),
+            #[cfg(feature = "voxhold-media")]
             voice_channel: 0,
             #[cfg(feature = "voxhold-media")]
             voice_unconfirmed: std::collections::HashSet::new(),
@@ -676,6 +689,7 @@ impl Voxhold {
             messages: vec![],
             history_list,
             history_keys: Vec::new(),
+            chat_scope_epoch: 0,
             before: None,
             has_more: false,
             history_has_newer: false,

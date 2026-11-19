@@ -8,8 +8,9 @@
 //! unpack  --zip <zip> --out <dir>
 //! delta   --base <zip> --target <zip> --out <delta.zip>
 //! manifest --full <zip> --setup <exe> --version <v> --notes-file <file> --out <dir>
-//!          [--channel beta] [--min-windows 10.0.19041] [--published-at <rfc3339>]
-//!          [--delta <delta.zip>]... [--authenticode] [--key-file <pkcs8.b64>]
+//!          [--channel beta] [--base-url <url>] [--min-windows 10.0.19041]
+//!          [--published-at <rfc3339>] [--delta <delta.zip>]...
+//!          [--authenticode] [--key-file <pkcs8.b64>]
 //! verify  --manifest <latest.json> --sig <latest.json.sig>
 //!          [--pubkey <base64>] [--pubkey-file <file>]
 //!          [--full <zip>] [--setup <exe>] [--delta <delta.zip>]...
@@ -28,7 +29,12 @@ use semver::Version;
 use voxhold_update::manifest::{DeltaEntry, FullPackage, Manifest, SetupPackage, BETA_CHANNEL};
 use voxhold_update::package::{self, sha256_hex};
 use voxhold_update::timefmt::format_rfc3339;
+use voxhold_update::urls::validate_update_url;
 use voxhold_update::verify::{self, UpdatePublicKey};
+
+/// Base of the pinned GitHub release assets.
+const DEFAULT_RELEASE_BASE: &str =
+    "https://github.com/LoonEman1/voxhold-native-rust/releases/download";
 
 fn main() -> ExitCode {
     match run(std::env::args().skip(1).collect()) {
@@ -200,6 +206,7 @@ fn manifest(options: &Options) -> Result<(), String> {
         Some(value) => value.to_string(),
         None => format_rfc3339(now_seconds()),
     };
+    let base = base_url(options)?;
 
     let full_bytes =
         std::fs::read(&full_path).map_err(|error| format!("{}: {error}", full_path.display()))?;
@@ -231,10 +238,7 @@ fn manifest(options: &Options) -> Result<(), String> {
             ));
         }
         deltas.push(DeltaEntry {
-            url: release_url(
-                &channel,
-                &format!("VoxHold-delta-{}.zip", delta.from_version),
-            ),
+            url: asset_url(&base, &format!("VoxHold-delta-{}.zip", delta.from_version))?,
             from_version: delta.from_version,
             from_package_sha256: delta.base_package_sha256,
             size: bytes.len() as u64,
@@ -251,13 +255,13 @@ fn manifest(options: &Options) -> Result<(), String> {
         notes,
         authenticode,
         full: FullPackage {
-            url: release_url(&channel, "VoxHold-portable.zip"),
+            url: asset_url(&base, "VoxHold-portable.zip")?,
             size: full_bytes.len() as u64,
             sha256: full_sha.clone(),
             package_sha256: full_sha,
         },
         setup: SetupPackage {
-            url: release_url(&channel, "VoxHold-Setup.exe"),
+            url: asset_url(&base, "VoxHold-Setup.exe")?,
             size: setup_bytes.len() as u64,
             sha256: sha256_hex(&setup_bytes),
         },
@@ -374,8 +378,22 @@ fn signing_key(options: &Options) -> Result<String, String> {
     }
 }
 
-fn release_url(channel: &str, asset: &str) -> String {
-    format!("https://github.com/LoonEman1/voxhold-native-rust/releases/download/{channel}/{asset}")
+fn base_url(options: &Options) -> Result<String, String> {
+    let base = match options.optional("base-url") {
+        Some(value) => value.trim().trim_end_matches('/').to_string(),
+        None => {
+            let channel = options.optional("channel").unwrap_or(BETA_CHANNEL);
+            format!("{DEFAULT_RELEASE_BASE}/{channel}")
+        }
+    };
+    validate_update_url(&base).map_err(|error| format!("invalid --base-url: {}", error.code()))?;
+    Ok(base)
+}
+
+fn asset_url(base: &str, asset: &str) -> Result<String, String> {
+    let url = format!("{}/{asset}", base.trim_end_matches('/'));
+    validate_update_url(&url).map_err(|error| format!("invalid {asset} URL: {}", error.code()))?;
+    Ok(url)
 }
 
 fn now_seconds() -> u64 {
@@ -383,4 +401,95 @@ fn now_seconds() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn options(values: &[(&str, &str)]) -> Options {
+        let mut map: HashMap<String, Vec<String>> = HashMap::new();
+        for (name, value) in values {
+            map.entry((*name).to_string())
+                .or_default()
+                .push((*value).to_string());
+        }
+        Options {
+            values: map,
+            flags: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn base_url_accepts_https_and_loopback_http() {
+        let opts = options(&[("base-url", "http://127.0.0.1:8123/")]);
+        assert_eq!(base_url(&opts).unwrap(), "http://127.0.0.1:8123");
+        let url = asset_url("http://127.0.0.1:8123", "VoxHold-portable.zip").unwrap();
+        assert_eq!(url, "http://127.0.0.1:8123/VoxHold-portable.zip");
+
+        let opts = options(&[("base-url", "https://example.invalid/assets/")]);
+        assert_eq!(
+            asset_url(&base_url(&opts).unwrap(), "latest.json").unwrap(),
+            "https://example.invalid/assets/latest.json"
+        );
+    }
+
+    #[test]
+    fn base_url_rejects_remote_http_and_other_schemes() {
+        for value in ["http://example.invalid/assets", "ftp://127.0.0.1/assets"] {
+            let opts = options(&[("base-url", value)]);
+            assert!(base_url(&opts).is_err(), "{value}");
+        }
+    }
+
+    #[test]
+    fn manifest_uses_the_base_url_and_still_signs() {
+        let temp = tempfile::tempdir().unwrap();
+        let payload = temp.path().join("payload");
+        std::fs::create_dir_all(&payload).unwrap();
+        std::fs::write(payload.join("Voxhold.exe"), b"binary").unwrap();
+        let full = temp.path().join("VoxHold-portable.zip");
+        std::fs::write(&full, package::pack(&payload, "0.2.0").unwrap()).unwrap();
+        let setup = temp.path().join("VoxHold-Setup.exe");
+        std::fs::write(&setup, b"setup").unwrap();
+        let notes = temp.path().join("notes.md");
+        std::fs::write(&notes, "Что нового").unwrap();
+        let out = temp.path().join("dist");
+        let (private, public) = verify::generate_keypair().unwrap();
+        let key_file = temp.path().join("key.b64");
+        std::fs::write(&key_file, private).unwrap();
+
+        run(vec![
+            "manifest".into(),
+            "--full".into(),
+            full.to_string_lossy().into_owned(),
+            "--setup".into(),
+            setup.to_string_lossy().into_owned(),
+            "--version".into(),
+            "0.2.0".into(),
+            "--notes-file".into(),
+            notes.to_string_lossy().into_owned(),
+            "--out".into(),
+            out.to_string_lossy().into_owned(),
+            "--base-url".into(),
+            "http://127.0.0.1:8123".into(),
+            "--key-file".into(),
+            key_file.to_string_lossy().into_owned(),
+        ])
+        .unwrap();
+
+        let bytes = std::fs::read(out.join("latest.json")).unwrap();
+        let signature = std::fs::read_to_string(out.join("latest.json.sig")).unwrap();
+        let key = UpdatePublicKey::from_base64(&public).unwrap();
+        let manifest = verify::verify_and_parse(&key, &bytes, &signature).unwrap();
+        assert_eq!(manifest.version, "0.2.0");
+        assert_eq!(
+            manifest.full.url,
+            "http://127.0.0.1:8123/VoxHold-portable.zip"
+        );
+        assert_eq!(
+            manifest.setup.url,
+            "http://127.0.0.1:8123/VoxHold-Setup.exe"
+        );
+    }
 }

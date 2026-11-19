@@ -81,6 +81,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
+          $env:VOXHOLD_BUILD_VERSION = $env:VERSION
           $webrtcBuild = cargo build --release --locked -p voxhold-native-rust --message-format=json-render-diagnostics |
             ForEach-Object { ConvertFrom-Json -InputObject $_ } |
             Where-Object { $_.reason -eq 'build-script-executed' -and $_.package_id -match '#webrtc-sys@' }

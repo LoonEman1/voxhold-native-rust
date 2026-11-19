@@ -357,6 +357,20 @@ pub async fn cleanup_version(root: &Path, version: &str) -> Result<()> {
 /// next start retries the skipped ones. Only a failure to enumerate `root`
 /// itself is reported as [`UpdateError::Io`].
 pub fn cleanup_stale(root: &Path, keep_version: Option<&str>) -> Result<usize> {
+    match keep_version {
+        Some(version) => cleanup_stale_keeping(root, &[version]),
+        None => cleanup_stale_keeping(root, &[]),
+    }
+}
+
+/// Remove leftovers while keeping several version directories.
+///
+/// The application needs this on the first start after an update: the version
+/// directory of the running build still holds `helper.exe` and the handshake
+/// file, while a different directory may hold a staged update that must stay
+/// available to the user. Keeping both cannot be expressed with a single
+/// `keep_version`.
+pub fn cleanup_stale_keeping(root: &Path, keep_versions: &[&str]) -> Result<usize> {
     let entries = match std::fs::read_dir(root) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
@@ -370,7 +384,7 @@ pub fn cleanup_stale(root: &Path, keep_version: Option<&str>) -> Result<usize> {
         };
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if keep_version == Some(name.as_ref()) {
+        if keep_versions.iter().any(|keep| *keep == name.as_ref()) {
             continue;
         }
         let path = entry.path();

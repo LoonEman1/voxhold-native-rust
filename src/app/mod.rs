@@ -47,6 +47,10 @@ mod tests;
 mod theme_ops;
 mod thread_ops;
 pub(crate) mod ui;
+mod update_ops;
+#[cfg(test)]
+mod update_tests;
+mod update_view;
 #[cfg(test)]
 mod voice_form_tests;
 mod voice_ops;
@@ -417,6 +421,9 @@ pub(crate) struct Voxhold {
     notification_saves: std::collections::HashMap<(i64, i64), u64>,
     busy: bool,
     generation: u64,
+    /// Update controller: background check, staging, helper launch and the
+    /// header popup. It never blocks the UI thread.
+    update: update_ops::UpdateUi,
     drafts: draft::Shared,
     auth: auth::AuthState,
     palette: theme::Palette,
@@ -724,6 +731,7 @@ impl Voxhold {
             notification_saves: Default::default(),
             busy: false,
             generation: 0,
+            update: update_ops::UpdateUi::new(),
             drafts: draft::Drafts::shared(),
             auth: {
                 let mut auth = auth::AuthState::with_prefill(&start_address);

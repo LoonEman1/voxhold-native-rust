@@ -33,6 +33,7 @@ mod settings;
 mod test_support;
 mod theme;
 mod thread_panel;
+mod update;
 mod voice_form_text;
 #[cfg(feature = "voxhold-media")]
 mod voice_panel;
@@ -47,12 +48,21 @@ use gpui_component::Root;
 pub(crate) use app::ui::{icon, ink};
 pub(crate) use app::Voxhold;
 
-fn parse_args() -> (String, Option<std::path::PathBuf>, f32, f32) {
+fn parse_args_from<I: Iterator<Item = String>>(
+    args: I,
+) -> (
+    String,
+    Option<std::path::PathBuf>,
+    f32,
+    f32,
+    Option<std::path::PathBuf>,
+) {
     let mut server = String::new();
     let mut layout_path = layout::Settings::default_path();
     let mut width = 1280.0f32;
     let mut height = 900.0f32;
-    let mut args = std::env::args().skip(1);
+    let mut handshake = None;
+    let mut args = args;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "-server" | "--server" => {
@@ -75,14 +85,29 @@ fn parse_args() -> (String, Option<std::path::PathBuf>, f32, f32) {
                     height = (value as f32).max(360.0);
                 }
             }
+            "--update-handshake" => {
+                if let Some(value) = args.next() {
+                    handshake = Some(std::path::PathBuf::from(value));
+                }
+            }
             _ => {}
         }
     }
-    (server, layout_path, width, height)
+    (server, layout_path, width, height, handshake)
+}
+
+fn parse_args() -> (
+    String,
+    Option<std::path::PathBuf>,
+    f32,
+    f32,
+    Option<std::path::PathBuf>,
+) {
+    parse_args_from(std::env::args().skip(1))
 }
 
 fn main() {
-    let (server, layout_path, width, height) = parse_args();
+    let (server, layout_path, width, height, handshake) = parse_args();
     let instance_path = instance_prefs::InstancePrefs::default_path();
     let session_path = session_store::SessionStore::default_path();
     Application::new()
@@ -99,6 +124,7 @@ fn main() {
             let layout_path = layout_path.clone();
             let instance_path = instance_path.clone();
             let session_path = session_path.clone();
+            let handshake = handshake.clone();
             cx.open_window(
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
@@ -123,10 +149,48 @@ fn main() {
                     });
                     #[cfg(feature = "voxhold-media")]
                     view.update(cx, |view, cx| view.install_power(window, cx));
+                    // The helper waits for this file after the swap. It is
+                    // written only once the window is up; a failure is shown
+                    // in the workspace instead of being swallowed. Write it
+                    // before the startup cleanup so that cleanup can protect
+                    // the staging directory by its handshake marker.
+                    if let Some(path) = handshake.as_ref() {
+                        if let Err(error) = update::write_handshake(path) {
+                            eprintln!("voxhold-update: cannot write handshake: {error}");
+                            view.update(cx, |view, cx| {
+                                view.report_handshake_failure(
+                                    "не удалось записать файл подтверждения".into(),
+                                );
+                                cx.notify();
+                            });
+                        }
+                    }
+                    view.update(cx, |view, cx| view.start_update(handshake.is_some(), cx));
                     cx.new(|cx| Root::new(view.into(), window, cx))
                 },
             )
             .expect("failed to open window");
             cx.activate(true);
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_the_update_handshake_argument() {
+        let args = vec![
+            "--update-handshake".to_string(),
+            r"C:\Temp\handshake.ok".to_string(),
+        ];
+        let (_, _, _, _, handshake) = parse_args_from(args.into_iter());
+        assert_eq!(
+            handshake.as_deref(),
+            Some(std::path::Path::new(r"C:\Temp\handshake.ok"))
+        );
+        let (_, _, _, _, missing) =
+            parse_args_from(vec!["--update-handshake".to_string()].into_iter());
+        assert!(missing.is_none());
+    }
 }

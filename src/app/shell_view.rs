@@ -64,6 +64,11 @@ impl Render for Voxhold {
                             cx.stop_propagation();
                             return;
                         }
+                        if s.update.panel_open {
+                            s.close_update_panel(cx);
+                            cx.stop_propagation();
+                            return;
+                        }
                         s.show_search = false;
                         s.message_menu = None;
                         s.forward = None;
@@ -336,6 +341,7 @@ impl Render for Voxhold {
                     .gap_3()
                     .text_size(px(13.))
                     .text_color(ink(p.muted))
+                    .child(self.update_icon(cx))
                     .child(
                         div()
                             .id("toggle-search")
@@ -638,6 +644,9 @@ impl Render for Voxhold {
                 .h(px(l.chat.h))
                 .child(chat),
         );
+        if self.update.panel_open {
+            root = root.child(self.update_panel(l.chat, mobile, cx));
+        }
         if mobile {
             root = root.child(
                 div()

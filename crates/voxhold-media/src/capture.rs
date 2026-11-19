@@ -3,21 +3,24 @@
 //! Ported from the local Go `media/src/capture.rs` (blob
 //! `eac53c0e9883cc53c262815ae971fc1366d3d37e`, base `09c82b9`).
 //!
-//! Windows is captured with `waveIn` at 48 kHz mono 16-bit. The settings list
-//! stores the Core Audio endpoint id (`DRV_QUERYFUNCTIONINSTANCEID`); a legacy
-//! `index:name` or older PnP interface id is migrated by a unique name. WebRTC's
+//! Windows is captured with `waveIn` at 48 kHz mono 16-bit. The driver signals
+//! a Win32 event when its 20 ms buffers complete; that readiness only fills a
+//! bounded jitter buffer. A separate 10 ms deadline in [`timeline`] decides
+//! when exactly one 480-sample block leaves, so a late poll cannot reorder or
+//! burst the frames. The settings list stores the Core Audio endpoint id
+//! (`DRV_QUERYFUNCTIONINSTANCEID`); a legacy `index:name` or older PnP
+//! interface id is migrated by a unique name. WebRTC's
 //! platform ADM keeps only the playout side
 //! here: capture is ours so the gate, gain and mute are provable over the exact
 //! PCM that reaches Opus. Platform ADM is used only when no WinMM input opens.
 
 use std::{
-    collections::VecDeque,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread::{self, JoinHandle},
-    time::Duration,
+    time::Instant,
 };
 
 use libwebrtc::{
@@ -35,12 +38,15 @@ use crate::{
 pub const SAMPLE_RATE: u32 = 48_000;
 pub const CHANNELS: u32 = 1;
 pub const BLOCK: usize = (SAMPLE_RATE / 100) as usize;
+/// Four 20 ms buffers are queued in the driver. They are only readiness: the
+/// 10 ms output cadence belongs to [`timeline::PcmJitter`].
 const BUFFERS: usize = 4;
-/// Bounded PCM queue: twenty 10 ms blocks (200 ms). A stalled consumer drops
-/// whole blocks and counts them instead of growing latency without bound.
-const MAX_PENDING_BLOCKS: usize = 20;
-const MAX_PENDING: usize = BLOCK * MAX_PENDING_BLOCKS;
 const LEVEL_INTERVAL: u32 = 5;
+
+mod timeline;
+
+pub use timeline::CaptureStats;
+use timeline::{PcmJitter, Tick};
 
 /// Whether a saved microphone id still resolves to a current WinMM input.
 /// `Session::check_devices` uses this because a working WinMM capture is not
@@ -61,81 +67,110 @@ pub fn input_available(_id: &str) -> bool {
 /// build measures it, so neither path reports AEC as applied.
 pub const ECHO_CANCELLATION_AVAILABLE: bool = false;
 
-/// Bounded sample queue between the WinMM buffers and the 10 ms DSP blocks.
-/// The audio thread never grows it: an overflow discards the oldest block,
-/// which is exactly the latency that would otherwise accumulate.
-#[derive(Default)]
-pub struct PcmBuffer {
-    samples: VecDeque<i16>,
-    dropped_blocks: u64,
-    /// Permission generation of every queued sample. Blocks from an older
-    /// generation are dropped instead of being replayed under the new one.
-    generation: u64,
+/// Distinct WinMM readiness results. A wait that returns anything else is an
+/// error instead of being mistaken for "nothing completed yet".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WaitOutcome {
+    Signaled,
+    Timeout,
+    Error,
 }
 
-impl PcmBuffer {
-    pub fn with_capacity() -> Self {
-        Self {
-            samples: VecDeque::with_capacity(MAX_PENDING + BLOCK),
-            dropped_blocks: 0,
-            generation: 0,
+/// Outcome of one synchronous `NativeAudioSource::capture_frame` poll.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SourceSend {
+    Ok,
+    Error,
+    Pending,
+}
+
+fn classify_source<T, E>(result: Option<Result<T, E>>) -> SourceSend {
+    match result {
+        Some(Ok(_)) => SourceSend::Ok,
+        Some(Err(_)) => SourceSend::Error,
+        // `queue_size_ms == 0` documents a synchronous path. A `Pending`
+        // future is unexpected but counted, never silently dropped.
+        None => SourceSend::Pending,
+    }
+}
+
+fn record_source(stats: &mut CaptureStats, send: SourceSend) {
+    match send {
+        SourceSend::Ok => stats.source_ok += 1,
+        SourceSend::Error => stats.source_errors += 1,
+        SourceSend::Pending => stats.source_pending += 1,
+    }
+}
+
+/// Count a wait result. Only `Signaled` and the normal `Timeout` keep the
+/// capture alive; an error is returned so the caller can report a driver
+/// failure and let the session run its recovery ladder.
+fn record_wait(stats: &mut CaptureStats, outcome: WaitOutcome) -> bool {
+    match outcome {
+        WaitOutcome::Signaled => true,
+        WaitOutcome::Timeout => {
+            stats.wait_timeouts += 1;
+            true
+        }
+        WaitOutcome::Error => {
+            stats.wait_errors += 1;
+            false
         }
     }
+}
 
-    /// Append one completed driver buffer. The generation is captured before
-    /// the driver is read, so a buffer that started before a mute/unmute edge
-    /// cannot inherit the new permission just because the epoch changed while
-    /// `completed()` was running.
-    pub fn push(&mut self, chunk: &[i16], generation: u64) {
-        if generation != self.generation {
-            // The driver queue may still contain a block from the previous
-            // state; discard it together with everything already copied.
-            self.samples.clear();
-            self.generation = generation;
-        }
-        for sample in chunk {
-            while self.samples.len() >= MAX_PENDING {
-                for _ in 0..BLOCK {
-                    self.samples.pop_front();
-                }
-                self.dropped_blocks += 1;
-            }
-            self.samples.push_back(*sample);
-        }
-    }
+/// Counters shared with `MicCapture::stats()` without an audio-thread lock.
+#[derive(Default)]
+struct SharedStats {
+    captured_blocks: AtomicU64,
+    source_ok: AtomicU64,
+    source_errors: AtomicU64,
+    source_pending: AtomicU64,
+    underruns: AtomicU64,
+    overflow_blocks: AtomicU64,
+    dropped_blocks: AtomicU64,
+    late_ticks: AtomicU64,
+    wait_timeouts: AtomicU64,
+    wait_errors: AtomicU64,
+    driver_errors: AtomicU64,
+}
 
-    pub fn pop_block(&mut self, block: &mut [i16; BLOCK], generation: u64) -> bool {
-        if self.generation != generation {
-            self.samples.clear();
-            return false;
-        }
-        if self.samples.len() < BLOCK {
-            return false;
-        }
-        for sample in block.iter_mut() {
-            *sample = self.samples.pop_front().unwrap_or(0);
-        }
-        true
-    }
-
-    /// Mute and capture restart must not replay samples captured before the
-    /// control change.
-    pub fn clear(&mut self) {
-        self.samples.clear();
-    }
-
-    pub fn dropped_blocks(&self) -> u64 {
+impl SharedStats {
+    fn publish(&self, stats: &CaptureStats) {
+        self.captured_blocks
+            .store(stats.captured_blocks, Ordering::Relaxed);
+        self.source_ok.store(stats.source_ok, Ordering::Relaxed);
+        self.source_errors
+            .store(stats.source_errors, Ordering::Relaxed);
+        self.source_pending
+            .store(stats.source_pending, Ordering::Relaxed);
+        self.underruns.store(stats.underruns, Ordering::Relaxed);
+        self.overflow_blocks
+            .store(stats.overflow_blocks, Ordering::Relaxed);
         self.dropped_blocks
+            .store(stats.dropped_blocks, Ordering::Relaxed);
+        self.late_ticks.store(stats.late_ticks, Ordering::Relaxed);
+        self.wait_timeouts
+            .store(stats.wait_timeouts, Ordering::Relaxed);
+        self.wait_errors.store(stats.wait_errors, Ordering::Relaxed);
+        self.driver_errors
+            .store(stats.driver_errors, Ordering::Relaxed);
     }
 
-    #[cfg(test)]
-    pub fn len(&self) -> usize {
-        self.samples.len()
-    }
-
-    #[cfg(test)]
-    pub fn first(&self) -> Option<i16> {
-        self.samples.front().copied()
+    fn snapshot(&self) -> CaptureStats {
+        CaptureStats {
+            captured_blocks: self.captured_blocks.load(Ordering::Relaxed),
+            source_ok: self.source_ok.load(Ordering::Relaxed),
+            source_errors: self.source_errors.load(Ordering::Relaxed),
+            source_pending: self.source_pending.load(Ordering::Relaxed),
+            underruns: self.underruns.load(Ordering::Relaxed),
+            overflow_blocks: self.overflow_blocks.load(Ordering::Relaxed),
+            dropped_blocks: self.dropped_blocks.load(Ordering::Relaxed),
+            late_ticks: self.late_ticks.load(Ordering::Relaxed),
+            wait_timeouts: self.wait_timeouts.load(Ordering::Relaxed),
+            wait_errors: self.wait_errors.load(Ordering::Relaxed),
+            driver_errors: self.driver_errors.load(Ordering::Relaxed),
+        }
     }
 }
 
@@ -219,7 +254,10 @@ pub struct MicCapture {
     events: Arc<Events>,
     stop: Arc<AtomicBool>,
     failed: Arc<AtomicBool>,
-    progress: Arc<std::sync::atomic::AtomicU64>,
+    /// Lock-free counters published by the capture thread. `progress` used to
+    /// be a separate block count, which let a driver stall hide behind
+    /// synthesized blocks; the real-PCM count lives in `CaptureStats`.
+    stats: Arc<SharedStats>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -241,7 +279,7 @@ impl MicCapture {
             events,
             stop: Arc::new(AtomicBool::new(false)),
             failed: Arc::new(AtomicBool::new(false)),
-            progress: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            stats: Arc::new(SharedStats::default()),
             thread: None,
         }
     }
@@ -256,9 +294,16 @@ impl MicCapture {
         self.failed.load(Ordering::Acquire)
     }
 
-    /// Monotonic count of processed blocks, used to detect a stalled driver.
+    /// Monotonic count of real captured 480-sample blocks, used to detect a
+    /// stalled driver. Fade/silence blocks never advance it.
     pub fn progress(&self) -> u64 {
-        self.progress.load(Ordering::Acquire)
+        self.stats().captured_blocks
+    }
+
+    /// Aggregate capture counters, including underruns, overflow, late ticks
+    /// and source/wait errors. Contains no PCM or personal content.
+    pub fn stats(&self) -> CaptureStats {
+        self.stats.snapshot()
     }
 
     #[cfg(test)]
@@ -273,6 +318,7 @@ impl MicCapture {
         self.stop();
         self.stop = Arc::new(AtomicBool::new(false));
         self.failed = Arc::new(AtomicBool::new(false));
+        self.stats = Arc::new(SharedStats::default());
         let id = self.id;
         let source = self.source.clone();
         let params = self.params.clone();
@@ -281,16 +327,19 @@ impl MicCapture {
         let events = self.events.clone();
         let stop = self.stop.clone();
         let failed = self.failed.clone();
-        let progress = self.progress.clone();
+        let stats = self.stats.clone();
         self.thread = Some(
             thread::Builder::new()
                 .name("voxhold-mic".into())
                 .spawn(move || {
                     capture_loop(
-                        id, device, source, params, epoch, gate, events, stop, failed, progress,
+                        id, device, source, params, epoch, gate, events, stop, failed, stats,
                     )
                 })
-                .map_err(|_| "Не удалось запустить поток микрофона.".to_owned())?,
+                .map_err(|_| {
+                    "РќРµ СѓРґР°Р»РѕСЃСЊ Р·Р°РїСѓСЃС‚РёС‚СЊ РїРѕС‚РѕРє РјРёРєСЂРѕС„РѕРЅР°."
+                        .to_owned()
+                })?,
         );
         Ok(())
     }
@@ -319,13 +368,17 @@ fn capture_loop(
     events: Arc<Events>,
     stop: Arc<AtomicBool>,
     failed: Arc<AtomicBool>,
-    progress: Arc<std::sync::atomic::AtomicU64>,
+    shared: Arc<SharedStats>,
 ) {
     let mut processor = BlockProcessor::default();
-    let mut pending = PcmBuffer::with_capacity();
+    let mut jitter = PcmJitter::new();
     let mut block = [0_i16; BLOCK];
-    let mut source_dropped = 0_u64;
+    let mut counters = CaptureStats::default();
     let mut ticks = 0_u32;
+    // Both are assigned by every tick that emits a block; `Tick::None` never
+    // reads them.
+    let mut level: f64;
+    let mut muted: bool;
     let mut permission = PermissionEpoch::new(&epoch);
     let mut acknowledged = false;
     while !stop.load(Ordering::Acquire) {
@@ -340,10 +393,11 @@ fn capture_loop(
             // gate that this generation is safe to transmit. The initial
             // acknowledgement also covers a capture started while the gate
             // was already open.
-            pending.clear();
+            jitter.reset(generation);
             source.clear_buffer();
             processor.reset();
             if !device.flush() {
+                counters.driver_errors += 1;
                 failed.store(true, Ordering::Release);
                 break;
             }
@@ -355,67 +409,128 @@ fn capture_loop(
         if let Some(gate) = &gate {
             gate.acknowledge(capture, generation);
         }
-        device.completed(|samples| pending.push(samples, generation));
+        // Driver readiness only fills the bounded jitter buffer. It never
+        // decides when a block leaves: that is the 10 ms tick below.
+        device.completed(|samples| jitter.push(samples, generation));
         if device.failed() {
+            counters.driver_errors += 1;
             failed.store(true, Ordering::Release);
             break;
         }
-        loop {
-            // Do not hand any block to Opus after a generation change until
-            // the driver queue has been flushed at the top of the outer loop.
-            if epoch.load(Ordering::Acquire) != generation {
-                pending.clear();
-                source.clear_buffer();
-                processor.reset();
-                break;
+        if epoch.load(Ordering::Acquire) != generation {
+            // The control edge happened while the driver queue was being
+            // read. Everything just tagged with the old generation is stale:
+            // drop it and flush the driver before the next emission.
+            jitter.reset(epoch.load(Ordering::Acquire));
+            source.clear_buffer();
+            processor.reset();
+            publish_stats(&shared, &counters, &jitter);
+            continue;
+        }
+        match jitter.tick(Instant::now(), &mut block) {
+            Tick::None => {}
+            Tick::Send => {
+                let current = params
+                    .lock()
+                    .map(|value| value.clone())
+                    .unwrap_or_else(|_| AudioParams {
+                        // A poisoned parameter lock must never unmute the mic.
+                        muted: true,
+                        ..AudioParams::default()
+                    });
+                let (metered, silenced) = processor.process(&mut block, &current);
+                if epoch.load(Ordering::Acquire) != generation {
+                    // The epoch changed while the block was being processed.
+                    // Do not hand it to Opus; the next pass flushes the driver
+                    // and rebuilds the reserve under the new permission.
+                    dsp::silence(&mut block);
+                    jitter.reset(epoch.load(Ordering::Acquire));
+                    source.clear_buffer();
+                    processor.reset();
+                    publish_stats(&shared, &counters, &jitter);
+                    continue;
+                }
+                jitter.note_last_sample(block[BLOCK - 1]);
+                deliver(&source, &block, &mut counters);
+                counters.captured_blocks += 1;
+                level = f64::from(metered);
+                muted = silenced;
+                report_level(&events, &mut ticks, level, muted, &counters, &jitter);
             }
-            if !pending.pop_block(&mut block, generation) {
-                break;
-            }
-            let current = params
-                .lock()
-                .map(|value| value.clone())
-                .unwrap_or_else(|_| AudioParams {
-                    // A poisoned parameter lock must never unmute the mic.
-                    muted: true,
-                    ..AudioParams::default()
-                });
-            let (level, muted) = processor.process(&mut block, &current);
-            if epoch.load(Ordering::Acquire) != generation {
-                dsp::silence(&mut block);
-                pending.clear();
-                source.clear_buffer();
-                processor.reset();
-                break;
-            }
-            let frame = AudioFrame {
-                data: std::borrow::Cow::Borrowed(&block),
-                sample_rate: SAMPLE_RATE,
-                num_channels: CHANNELS,
-                samples_per_channel: BLOCK as u32,
-            };
-            if poll_once(source.capture_frame(&frame)).is_none() {
-                source_dropped += 1;
-            }
-            progress.fetch_add(1, Ordering::Release);
-            ticks += 1;
-            if ticks % LEVEL_INTERVAL == 0 {
-                events.push(Event::InputLevel {
-                    level: f64::from(level),
-                    muted,
-                    dropped: pending.dropped_blocks() + source_dropped,
-                });
+            Tick::Fade => {
+                // Synthesized fade: count it as an output block so a source
+                // error is not lost, but never as physical capture progress.
+                let silenced = params.lock().map(|value| value.muted).unwrap_or(true);
+                if silenced {
+                    dsp::silence(&mut block);
+                }
+                deliver(&source, &block, &mut counters);
+                level = 0.0;
+                muted = silenced;
+                report_level(&events, &mut ticks, level, muted, &counters, &jitter);
             }
         }
-        thread::sleep(Duration::from_millis(5));
+        publish_stats(&shared, &counters, &jitter);
+        // The event wait is bounded so a mute/PTT epoch is noticed promptly;
+        // the deadline is still the output clock, not this timeout.
+        let wait = jitter.wait_duration(Instant::now());
+        if !record_wait(&mut counters, device.wait(wait)) {
+            failed.store(true, Ordering::Release);
+            break;
+        }
     }
     // The shared gate source must not replay a stale block after a restart or
     // a mute that raced with the last capture.
     source.clear_buffer();
     device.close();
     if device.failed() {
+        counters.driver_errors += 1;
         failed.store(true, Ordering::Release);
     }
+    publish_stats(&shared, &counters, &jitter);
+}
+
+/// One synchronous source poll, with Ok/Err/Pending counted separately.
+fn deliver(source: &NativeAudioSource, block: &[i16; BLOCK], counters: &mut CaptureStats) {
+    let frame = AudioFrame {
+        data: std::borrow::Cow::Borrowed(block),
+        sample_rate: SAMPLE_RATE,
+        num_channels: CHANNELS,
+        samples_per_channel: BLOCK as u32,
+    };
+    record_source(
+        counters,
+        classify_source(poll_once(source.capture_frame(&frame))),
+    );
+}
+
+fn report_level(
+    events: &Events,
+    ticks: &mut u32,
+    level: f64,
+    muted: bool,
+    counters: &CaptureStats,
+    jitter: &PcmJitter,
+) {
+    *ticks += 1;
+    if *ticks % LEVEL_INTERVAL != 0 {
+        return;
+    }
+    events.push(Event::InputLevel {
+        level,
+        muted,
+        dropped: jitter.dropped_blocks() + counters.source_errors + counters.source_pending,
+    });
+}
+
+fn publish_stats(shared: &SharedStats, counters: &CaptureStats, jitter: &PcmJitter) {
+    shared.publish(&CaptureStats {
+        underruns: jitter.underruns(),
+        overflow_blocks: jitter.overflow_blocks(),
+        dropped_blocks: jitter.dropped_blocks(),
+        late_ticks: jitter.late_ticks(),
+        ..*counters
+    });
 }
 
 /// Tracks the last permission epoch so the capture loop can drop queued audio
@@ -469,10 +584,22 @@ struct WinIn;
 #[cfg(not(windows))]
 impl WinIn {
     fn open(_input: Option<&str>) -> Result<Self, String> {
-        Err("Захват микрофона доступен только в Windows.".into())
+        Err("Р—Р°С…РІР°С‚ РјРёРєСЂРѕС„РѕРЅР° РґРѕСЃС‚СѓРїРµРЅ С‚РѕР»СЊРєРѕ РІ Windows.".into())
     }
 
     fn completed(&mut self, _sink: impl FnMut(&[i16])) {}
+
+    fn flush(&mut self) -> bool {
+        false
+    }
+
+    fn failed(&self) -> bool {
+        true
+    }
+
+    fn wait(&mut self, _timeout: std::time::Duration) -> WaitOutcome {
+        WaitOutcome::Error
+    }
 
     fn close(&mut self) {}
 }
@@ -489,486 +616,4 @@ pub fn source_options() -> AudioSourceOptions {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn pcm_buffer_is_bounded_and_counts_dropped_blocks() {
-        let mut buffer = PcmBuffer::with_capacity();
-        for block_index in 0..=MAX_PENDING_BLOCKS {
-            let block = vec![block_index as i16; BLOCK];
-            buffer.push(&block, 0);
-        }
-        assert_eq!(buffer.len(), MAX_PENDING);
-        assert_eq!(buffer.dropped_blocks(), 1);
-        assert_eq!(
-            buffer.first(),
-            Some(1),
-            "the oldest block was discarded, not the newest"
-        );
-        let mut block = [0_i16; BLOCK];
-        assert!(buffer.pop_block(&mut block, 0));
-        assert!(block.iter().all(|sample| *sample == 1));
-    }
-
-    #[test]
-    fn clearing_the_queue_removes_stale_samples() {
-        let mut buffer = PcmBuffer::with_capacity();
-        buffer.push(&vec![9_000_i16; BLOCK], 0);
-        buffer.clear();
-        // A discontinuity/restart starts from the next captured block, not
-        // from the samples that were already queued.
-        buffer.push(&vec![222_i16; BLOCK], 0);
-        let mut block = [0_i16; BLOCK];
-        assert!(buffer.pop_block(&mut block, 0));
-        assert!(block.iter().all(|sample| *sample == 222));
-        assert!(!buffer.pop_block(&mut block, 0));
-    }
-
-    #[test]
-    fn mute_silences_the_next_block_and_does_not_replay_the_tail() {
-        let speech = vec![8_000_i16; BLOCK];
-        let background = vec![20_i16; BLOCK];
-        let mut processor = BlockProcessor::default();
-        let params = AudioParams {
-            mode: NoiseMode::Threshold,
-            gate_percent: 15,
-            auto_gain_control: false,
-            ..AudioParams::default()
-        };
-        for _ in 0..10 {
-            let mut block = speech.clone();
-            processor.process(&mut block, &params);
-        }
-        let muted = AudioParams {
-            muted: true,
-            ..params.clone()
-        };
-        let mut block = background.clone();
-        let (_, silenced) = processor.process(&mut block, &muted);
-        assert!(silenced);
-        assert!(block.iter().all(|sample| *sample == 0));
-        // Unmuting starts from a closed gate, even though the previous block
-        // was speech: the background must not leak old energy.
-        let mut block = background;
-        processor.process(&mut block, &params);
-        assert!(block.iter().all(|sample| *sample == 0));
-    }
-
-    #[test]
-    fn processing_key_rebuilds_the_apm_only_when_processing_changes() {
-        let mut processor = BlockProcessor::default();
-        let mut block = [0_i16; BLOCK];
-        processor.process(&mut block, &AudioParams::default());
-        let key = processor.key.clone();
-        processor.process(
-            &mut block,
-            &AudioParams {
-                gate_percent: 42,
-                ..AudioParams::default()
-            },
-        );
-        assert_eq!(
-            processor.key, key,
-            "a gate change must keep the APM instance"
-        );
-        processor.process(
-            &mut block,
-            &AudioParams {
-                mode: NoiseMode::Threshold,
-                ..AudioParams::default()
-            },
-        );
-        assert!(!processor.key.as_ref().unwrap().noise_suppression);
-        assert!(
-            !ECHO_CANCELLATION_AVAILABLE,
-            "AEC is only reported when a render reference exists"
-        );
-    }
-
-    #[test]
-    fn every_supported_gain_level_is_clamped_and_bounded() {
-        for percent in [0_u32, 50, 100, 200] {
-            let mut block = vec![10_000_i16; BLOCK];
-            let peak = dsp::apply_gain(&mut block, percent as f32 / 100.0);
-            let expected = 10_000.0 / 32_768.0 * percent as f32 / 100.0;
-            assert!((peak - expected).abs() < 0.001, "{percent}%: {peak}");
-            assert!(
-                block
-                    .iter()
-                    .all(|sample| (-32_768..=32_767).contains(sample))
-            );
-        }
-        let mut saturated = vec![30_000_i16; BLOCK];
-        dsp::apply_gain(&mut saturated, 2.0);
-        assert!(
-            saturated.iter().all(|sample| *sample == 32_767),
-            "200% must clamp at full scale"
-        );
-    }
-
-    #[test]
-    fn synthetic_capture_matrix_matches_the_report() {
-        let input = crate::dsp::fixture(SAMPLE_RATE);
-        let rms = |samples: &[i16]| crate::dsp::dbfs(samples).unwrap_or(-120.0);
-        let section = |from: f32, to: f32| {
-            let start = (SAMPLE_RATE as f32 * from) as usize;
-            let end = (SAMPLE_RATE as f32 * to) as usize;
-            input[start..end].to_vec()
-        };
-        let run = |params: &AudioParams, muted_from: Option<f32>| {
-            let mut processor = BlockProcessor::default();
-            let mut output = Vec::with_capacity(input.len());
-            let mut clipped = 0_usize;
-            let mut block = [0_i16; BLOCK];
-            for (index, chunk) in input.chunks(BLOCK).enumerate() {
-                if chunk.len() < BLOCK {
-                    break;
-                }
-                block.copy_from_slice(chunk);
-                let mut params = params.clone();
-                if muted_from.is_some_and(|from| index as f32 * 0.01 >= from) {
-                    params.muted = true;
-                }
-                processor.process(&mut block, &params);
-                clipped += block.iter().filter(|sample| **sample == 32_767).count();
-                output.extend_from_slice(&block);
-            }
-            (output, clipped)
-        };
-        let report = |name: &str, params: &AudioParams| {
-            let (output, clipped) = run(params, None);
-            let out = |from, to| rms(&section_of(&output, from, to, SAMPLE_RATE));
-            println!(
-                "{name:10} dry {:6.1} / out noise1 {:6.1}, tone {:6.1}, noise2 {:6.1}, clipped {clipped}",
-                rms(&section(0.5, 1.5)),
-                out(0.6, 1.4),
-                out(1.6, 2.4),
-                out(2.9, 3.4)
-            );
-            output
-        };
-        let auto = report(
-            "auto",
-            &AudioParams {
-                auto_gain_control: false,
-                ..AudioParams::default()
-            },
-        );
-        assert!(rms(&section_of(&auto, 0.6, 1.4, SAMPLE_RATE)) < rms(&section(0.5, 1.5)) - 3.0);
-        let bypass = report(
-            "threshold0",
-            &AudioParams {
-                mode: NoiseMode::Threshold,
-                gate_percent: 0,
-                auto_gain_control: false,
-                ..AudioParams::default()
-            },
-        );
-        assert!(
-            (rms(&section_of(&bypass, 0.6, 1.4, SAMPLE_RATE)) - rms(&section(0.5, 1.5))).abs()
-                < 4.0,
-            "threshold=0 bypasses the gate; only the always-on HPF may change the noise level"
-        );
-        let gated = report(
-            "threshold15",
-            &AudioParams {
-                mode: NoiseMode::Threshold,
-                gate_percent: 15,
-                auto_gain_control: false,
-                ..AudioParams::default()
-            },
-        );
-        assert!(rms(&section_of(&gated, 0.6, 1.4, SAMPLE_RATE)) < -80.0);
-        assert!(rms(&section_of(&gated, 1.6, 2.4, SAMPLE_RATE)) > -20.0);
-        assert!(
-            rms(&section_of(&gated, 2.9, 3.4, SAMPLE_RATE)) < -80.0,
-            "the gate must close after the 180 ms hold and 60 ms release"
-        );
-        for percent in [0_u32, 50, 100, 200] {
-            let (output, _) = run(
-                &AudioParams {
-                    mode: NoiseMode::Threshold,
-                    gate_percent: 0,
-                    input_gain: percent as f32 / 100.0,
-                    auto_gain_control: false,
-                    ..AudioParams::default()
-                },
-                None,
-            );
-            let tone = rms(&section_of(&output, 1.6, 2.4, SAMPLE_RATE));
-            println!("gain {percent:3}% tone {tone:6.1} dBFS");
-            let expected = -15.1 + 20.0 * (percent as f32 / 100.0).max(0.000_1).log10();
-            if percent == 0 {
-                assert!(tone < -100.0, "0 % must be silence");
-            } else {
-                assert!(
-                    (tone - expected).abs() < 1.0,
-                    "gain {percent}%: {tone} vs {expected}"
-                );
-            }
-        }
-        let (muted, clipped) = run(&AudioParams::default(), Some(1.0));
-        assert!(clipped == 0);
-        assert!(
-            muted
-                .iter()
-                .skip(SAMPLE_RATE as usize)
-                .all(|sample| *sample == 0),
-            "PTT release, deafen and server mute must be silent after the last block"
-        );
-    }
-
-    fn section_of(samples: &[i16], from: f32, to: f32, rate: u32) -> Vec<i16> {
-        let start = (rate as f32 * from) as usize;
-        let end = (rate as f32 * to) as usize;
-        samples[start..end].to_vec()
-    }
-
-    #[test]
-    fn dsp_timing_report() {
-        use std::time::Instant;
-        let mut processor = BlockProcessor::default();
-        let params = AudioParams {
-            mode: NoiseMode::Auto,
-            auto_gain_control: false,
-            ..AudioParams::default()
-        };
-        let mut timings = Vec::with_capacity(2_000);
-        let mut block = [0_i16; BLOCK];
-        for _ in 0..2_100 {
-            // Warm-up is included in the first 100 samples and discarded.
-            for sample in block.iter_mut() {
-                *sample = 1_000;
-            }
-            let started = Instant::now();
-            processor.process(&mut block, &params);
-            timings.push(started.elapsed().as_secs_f64() * 1e6);
-        }
-        timings.drain(..100);
-        timings.sort_by(f64::total_cmp);
-        let pick = |p: f64| timings[((timings.len() - 1) as f64 * p) as usize];
-        println!(
-            "DSP block 10 ms: p50 {:.1} us, p95 {:.1} us, p99 {:.1} us, max {:.1} us",
-            pick(0.50),
-            pick(0.95),
-            pick(0.99),
-            timings.last().unwrap()
-        );
-        println!(
-            "Algorithmic input latency: one 10 ms block + WinMM 20 ms buffers + no extra NativeAudioSource queue (queue_size_ms = 0); the bounded 200 ms queue is a stall guard, not steady-state latency"
-        );
-        assert!(pick(0.99) < 5_000.0, "DSP block must fit in real time");
-    }
-
-    #[test]
-    #[cfg(windows)]
-    #[ignore = "opens the default Windows microphone; run manually"]
-    fn software_capture_reaches_the_native_source() {
-        let params = Arc::new(Mutex::new(AudioParams {
-            muted: false,
-            ..AudioParams::default()
-        }));
-        let events = Arc::new(Events::default());
-        let source = NativeAudioSource::new(source_options(), SAMPLE_RATE, CHANNELS, 0);
-        let epoch = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let mut mic = MicCapture::new(source, params, epoch, None, events.clone());
-        mic.start(None).expect("default microphone");
-        thread::sleep(Duration::from_millis(600));
-        mic.stop();
-        let mut levels = 0;
-        let mut dropped = 0;
-        while let Some(event) = events.poll(Duration::ZERO) {
-            if let Event::InputLevel { dropped: count, .. } = event {
-                levels += 1;
-                dropped = dropped.max(count);
-            }
-        }
-        assert!(levels > 0, "capture produced no input_level events");
-        println!("input levels {levels}, dropped blocks {dropped}");
-    }
-
-    #[test]
-    fn permission_epoch_discards_queued_audio_across_fast_ptt() {
-        let epoch = std::sync::atomic::AtomicU64::new(0);
-        let mut permission = PermissionEpoch::new(&epoch);
-        let mut pending = PcmBuffer::with_capacity();
-        pending.push(&vec![9_000_i16; BLOCK], 0);
-        // Press and release between two polls restores the boolean state but
-        // still advances the epoch twice.
-        epoch.fetch_add(1, Ordering::SeqCst);
-        epoch.fetch_add(1, Ordering::SeqCst);
-        assert!(permission.changed(epoch.load(Ordering::Acquire)));
-        pending.clear();
-        let mut block = [0_i16; BLOCK];
-        assert!(!pending.pop_block(&mut block, 2), "old audio was discarded");
-        pending.push(&vec![222_i16; BLOCK], 2);
-        assert!(pending.pop_block(&mut block, 2));
-        assert!(block.iter().all(|sample| *sample == 222));
-        // End-to-end view of the same transition: the first processed block
-        // after the flush comes from the post-transition buffer, not from the
-        // 9 000-amplitude audio captured before unmute.
-        let mut processor = BlockProcessor::default();
-        processor.reset();
-        for (index, sample) in block.iter_mut().enumerate() {
-            *sample = if index % 2 == 0 { 222 } else { -222 };
-        }
-        let params = AudioParams {
-            mode: NoiseMode::Threshold,
-            gate_percent: 0,
-            auto_gain_control: false,
-            ..AudioParams::default()
-        };
-        processor.process(&mut block, &params);
-        assert!(
-            block.iter().all(|sample| sample.abs() < 400),
-            "stale pre-unmute audio reached the output: {:?}",
-            &block[..4]
-        );
-        assert!(!permission.changed(epoch.load(Ordering::Acquire)));
-    }
-
-    #[test]
-    fn a_block_read_before_a_generation_change_is_not_sent_after_unmute() {
-        let mut pending = PcmBuffer::with_capacity();
-        // The driver buffer was captured while muted, so the loop tagged it
-        // with generation 7 before calling `completed()`. The mute is released
-        // while that call is still running; the generation reaches 8.
-        pending.push(&vec![12_345_i16; BLOCK], 7);
-        let mut block = [0_i16; BLOCK];
-        assert!(
-            !pending.pop_block(&mut block, 8),
-            "a buffer tagged with the old generation must not pass the new epoch check"
-        );
-        assert!(
-            block.iter().all(|sample| *sample == 0),
-            "no stale sample may be left in the output block"
-        );
-        // After the queue is reset, only a block read under the new
-        // generation is eligible.
-        pending.push(&vec![222_i16; BLOCK], 8);
-        assert!(pending.pop_block(&mut block, 8));
-        assert!(block.iter().all(|sample| *sample == 222));
-    }
-
-    #[test]
-    #[cfg(windows)]
-    fn saved_winmm_device_is_resolved_by_endpoint_or_unique_name() {
-        let devices = vec![
-            winmm::DeviceInfo {
-                index: 0,
-                name: "Speakers".into(),
-                endpoint: Some("endpoint-0".into()),
-                legacy_interface: Some("interface-0".into()),
-            },
-            winmm::DeviceInfo {
-                index: 1,
-                name: "USB Headset".into(),
-                endpoint: Some("endpoint-1".into()),
-                legacy_interface: Some("interface-1".into()),
-            },
-        ];
-        assert_eq!(
-            winmm::choose_device(Some("0:USB Headset"), &devices)
-                .unwrap()
-                .index,
-            1,
-            "indexes shift; the saved name still identifies the device"
-        );
-        assert_eq!(
-            winmm::choose_device(Some("endpoint-1"), &devices)
-                .unwrap()
-                .index,
-            1,
-            "new preferences use the stable endpoint id"
-        );
-        assert_eq!(
-            winmm::choose_device(Some("interface-1"), &devices)
-                .unwrap()
-                .index,
-            1,
-            "a legacy PnP interface id saved by an older build still migrates"
-        );
-        assert_eq!(
-            winmm::choose_device(Some("1:USB"), &devices).unwrap().index,
-            1,
-            "legacy truncated names are resolved by a unique prefix"
-        );
-        assert_eq!(
-            winmm::choose_device(None, &devices).unwrap().index,
-            winmm::WAVE_MAPPER,
-            "an empty preference is the Windows default"
-        );
-        assert!(winmm::choose_device(Some("0:Gone"), &devices).is_err());
-        assert!(
-            winmm::choose_device(Some("0:"), &devices).is_err(),
-            "a legacy id without a name must not open a reused index"
-        );
-        let same_name = vec![
-            winmm::DeviceInfo {
-                index: 3,
-                name: "USB Mic".into(),
-                endpoint: Some("endpoint-3".into()),
-                legacy_interface: Some("interface-3".into()),
-            },
-            winmm::DeviceInfo {
-                index: 0,
-                name: "USB Mic".into(),
-                endpoint: Some("endpoint-0".into()),
-                legacy_interface: Some("interface-0".into()),
-            },
-        ];
-        assert!(
-            winmm::choose_device(Some("3:USB Mic"), &same_name).is_err(),
-            "a legacy duplicate name must ask the user to choose again"
-        );
-        assert_eq!(
-            winmm::choose_device(Some("endpoint-0"), &same_name)
-                .unwrap()
-                .index,
-            0,
-            "the endpoint id distinguishes identical names"
-        );
-    }
-
-    #[test]
-    #[cfg(windows)]
-    #[ignore = "opens the default Windows microphone; run manually"]
-    fn winmm_flush_restarts_the_driver_queue() {
-        let mut device = WinIn::open(None).expect("default microphone");
-        thread::sleep(Duration::from_millis(120));
-        let mut before = 0;
-        device.completed(|samples| before += samples.len());
-        assert!(before > 0, "the driver returned no samples before flush");
-        assert!(device.flush(), "flush must restart the capture queue");
-        thread::sleep(Duration::from_millis(120));
-        let mut after = 0;
-        device.completed(|samples| after += samples.len());
-        assert!(after > 0, "the driver returned no samples after flush");
-        device.close();
-        assert!(!device.failed(), "a normal close must succeed");
-    }
-
-    #[test]
-    #[cfg(windows)]
-    #[ignore = "opens the default Windows microphone; run manually"]
-    fn winmm_capture_delivers_blocks() {
-        let mut device = WinIn::open(None).expect("default microphone");
-        let started = std::time::Instant::now();
-        let mut samples = 0;
-        while started.elapsed() < Duration::from_millis(600) {
-            device.completed(|chunk| samples += chunk.len());
-            thread::sleep(Duration::from_millis(5));
-        }
-        device.close();
-        println!("captured {samples} samples in 600 ms");
-        assert!(
-            samples >= (SAMPLE_RATE as usize / 5),
-            "captured only {samples} samples"
-        );
-        assert!(
-            samples <= SAMPLE_RATE as usize,
-            "captured duplicate buffers: {samples} samples"
-        );
-    }
-}
+mod tests;

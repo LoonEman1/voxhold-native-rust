@@ -1,9 +1,16 @@
 use std::{collections::VecDeque, ptr, thread::sleep, time::Duration};
 
+use super::WaitOutcome;
+
 pub(super) const WAVE_MAPPER: u32 = 0xFFFF_FFFF;
 const WAVE_FORMAT_PCM: u16 = 1;
-const CALLBACK_NULL: usize = 0;
+/// `CALLBACK_EVENT`: `dwCallback` is a Win32 event handle that the driver
+/// signals when a buffer completes. Readiness then comes from a real wait
+/// instead of a fixed sleep poll.
+const CALLBACK_EVENT: usize = 0x0005_0000;
 const WHDR_DONE: u32 = 0x0000_0001;
+const WAIT_OBJECT_0: u32 = 0x0000_0000;
+const WAIT_TIMEOUT: u32 = 0x0000_0102;
 const WAVERR_BADFORMAT: u32 = 32;
 const MMSYSERR_BADDEVICEID: u32 = 2;
 const MMSYSERR_ALLOCATED: u32 = 4;
@@ -62,6 +69,42 @@ unsafe extern "system" {
     fn waveInStart(handle: usize) -> u32;
     fn waveInReset(handle: usize) -> u32;
     fn waveInClose(handle: usize) -> u32;
+    /// Raise the process timer resolution for the 10 ms wait. Without this,
+    /// an unraised Windows timer can round a 10 ms `WaitForSingleObject` up to
+    /// ~15.6 ms, which would make the output cadence skip ticks.
+    fn timeBeginPeriod(period: u32) -> u32;
+    fn timeEndPeriod(period: u32) -> u32;
+}
+
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn CreateEventW(
+        attributes: *const std::ffi::c_void,
+        manual_reset: i32,
+        initial_state: i32,
+        name: *const u16,
+    ) -> usize;
+    fn WaitForSingleObject(handle: usize, milliseconds: u32) -> u32;
+    fn ResetEvent(handle: usize) -> i32;
+    fn CloseHandle(handle: usize) -> i32;
+}
+
+/// Map a `WaitForSingleObject` result to the two expected outcomes. Any other
+/// value (`WAIT_FAILED`, a non-event wait code, an abandoned mutex, ...) is an
+/// error, never "no data yet".
+fn wait_outcome(code: u32) -> WaitOutcome {
+    match code {
+        WAIT_OBJECT_0 => WaitOutcome::Signaled,
+        WAIT_TIMEOUT => WaitOutcome::Timeout,
+        _ => WaitOutcome::Error,
+    }
+}
+
+/// `WaitForSingleObject` takes whole milliseconds. Round up so the last
+/// fraction of a 10 ms deadline cannot become a zero-timeout busy poll, while
+/// an exact zero still returns immediately.
+fn wait_millis(timeout: Duration) -> u32 {
+    ((timeout.as_nanos() + 999_999) / 1_000_000).min(u128::from(u32::MAX)) as u32
 }
 
 #[derive(Clone, Debug)]
@@ -211,6 +254,11 @@ fn front_ready(queued: &VecDeque<usize>, mut done: impl FnMut(usize) -> bool) ->
 
 pub struct WinIn {
     handle: usize,
+    /// Auto-reset event given to the driver via `CALLBACK_EVENT`.
+    event: usize,
+    /// Whether this instance raised the process timer resolution and must
+    /// balance it on close.
+    timer_raised: bool,
     buffers: Vec<Box<[i16; super::BLOCK * 2]>>,
     headers: Box<[WaveHdr]>,
     /// Header indexes in the order they were queued. The driver may complete
@@ -238,9 +286,27 @@ impl WinIn {
             bits_per_sample: 16,
             cb_size: 0,
         };
+        // The event must exist before `waveInOpen`: with `CALLBACK_EVENT` the
+        // driver stores this handle and signals it on every completion.
+        let event = unsafe { CreateEventW(ptr::null(), 0, 0, ptr::null()) };
+        if event == 0 {
+            return Err("Не удалось создать событие микрофона.".into());
+        }
         let mut handle = 0_usize;
-        let code = unsafe { waveInOpen(&mut handle, chosen.index, &format, CALLBACK_NULL, 0, 0) };
+        let code = unsafe {
+            waveInOpen(
+                &mut handle,
+                chosen.index,
+                &format,
+                event,
+                0,
+                CALLBACK_EVENT as u32,
+            )
+        };
         if code != 0 {
+            unsafe {
+                CloseHandle(event);
+            }
             return Err(device_error(code));
         }
         let actual = actual_device(handle);
@@ -257,6 +323,7 @@ impl WinIn {
         if !identity_ok {
             unsafe {
                 waveInClose(handle);
+                CloseHandle(event);
             }
             return Err("Выбранное устройство ввода недоступно.".into());
         }
@@ -279,6 +346,8 @@ impl WinIn {
             .into_boxed_slice();
         let mut device = Self {
             handle,
+            event,
+            timer_raised: false,
             buffers,
             headers,
             queued: VecDeque::with_capacity(super::BUFFERS),
@@ -308,6 +377,10 @@ impl WinIn {
             device.close();
             return Err("Не удалось запустить захват микрофона.".into());
         }
+        // Only needed while this capture runs; `close` balances it.
+        if unsafe { timeBeginPeriod(1) } == 0 {
+            device.timer_raised = true;
+        }
         Ok(device)
     }
 
@@ -325,6 +398,43 @@ impl WinIn {
         self.failed
     }
 
+    /// Bounded wait on the driver completion event. This is the only
+    /// readiness mechanism: `Signaled` means at least one buffer may have
+    /// completed, `Timeout` is the normal "no completion yet" result, and any
+    /// unexpected kernel result is an error.
+    pub fn wait(&mut self, timeout: Duration) -> WaitOutcome {
+        if self.failed || self.handle == 0 || self.event == 0 {
+            return WaitOutcome::Error;
+        }
+        let outcome =
+            wait_outcome(unsafe { WaitForSingleObject(self.event, wait_millis(timeout)) });
+        if outcome == WaitOutcome::Error {
+            self.failed = true;
+        }
+        outcome
+    }
+
+    fn reset_event(&mut self) -> bool {
+        if self.event == 0 {
+            return false;
+        }
+        if unsafe { ResetEvent(self.event) } == 0 {
+            self.failed = true;
+            return false;
+        }
+        true
+    }
+
+    fn close_event(&mut self) {
+        if self.event == 0 {
+            return;
+        }
+        if unsafe { CloseHandle(self.event) } == 0 {
+            self.failed = true;
+        }
+        self.event = 0;
+    }
+
     /// Discard every driver buffer captured before a control transition and
     /// restart the queue. Used by mute/PTT changes so a 20 ms buffer that
     /// started before unmute cannot cross into the new state.
@@ -334,6 +444,12 @@ impl WinIn {
         }
         if unsafe { waveInReset(self.handle) } != 0 {
             self.failed = true;
+            return false;
+        }
+        // Reset marks every queued buffer done and may leave the event
+        // signaled. Clear it before requeueing so the next wait reflects a
+        // real completion, not the flush.
+        if !self.reset_event() {
             return false;
         }
         self.queued.clear();
@@ -383,7 +499,18 @@ impl WinIn {
     }
 
     pub fn close(&mut self) {
+        self.close_device();
+        if self.timer_raised {
+            unsafe {
+                timeEndPeriod(1);
+            }
+            self.timer_raised = false;
+        }
+    }
+
+    fn close_device(&mut self) {
         if self.handle == 0 {
+            self.close_event();
             return;
         }
         let mut reset = 1;
@@ -395,8 +522,16 @@ impl WinIn {
             sleep(Duration::from_millis(2));
         }
         if reset != 0 {
+            // The driver may still own the handle and signal the event.
+            // Dropping the event here could race with a reused handle; Drop
+            // leaks it together with the driver-owned buffers.
             self.failed = true;
             return;
+        }
+        // Recording is stopped, so no new completion can signal the event.
+        // Clear and close it on every remaining path, including failures.
+        if !self.reset_event() {
+            self.failed = true;
         }
         self.queued.clear();
         for index in 0..self.prepared {
@@ -404,16 +539,19 @@ impl WinIn {
             if unsafe { waveInUnprepareHeader(self.handle, header, self.size) } != 0 {
                 self.failed = true;
                 self.prepared = 0;
+                self.close_event();
                 return;
             }
         }
         if unsafe { waveInClose(self.handle) } != 0 {
             self.failed = true;
             self.prepared = 0;
+            self.close_event();
             return;
         }
         self.handle = 0;
         self.prepared = 0;
+        self.close_event();
     }
 }
 
@@ -425,6 +563,9 @@ impl Drop for WinIn {
             // safe option; freeing now would be a use-after-free in winmm.
             std::mem::forget(std::mem::take(&mut self.buffers));
             std::mem::forget(std::mem::take(&mut self.headers));
+            // The driver may still signal this handle; leaving it open is
+            // safer than closing a handle the driver can reuse.
+            self.event = 0;
         }
     }
 }
@@ -449,5 +590,24 @@ mod tests {
         assert_eq!(front_ready(&queued, |index| index == 3), Some(3));
         let empty: VecDeque<usize> = VecDeque::new();
         assert_eq!(front_ready(&empty, |_| true), None);
+    }
+
+    #[test]
+    fn only_signaled_and_timeout_are_expected_wait_results() {
+        assert_eq!(wait_outcome(WAIT_OBJECT_0), WaitOutcome::Signaled);
+        assert_eq!(wait_outcome(WAIT_TIMEOUT), WaitOutcome::Timeout);
+        assert_eq!(wait_outcome(0xFFFF_FFFF), WaitOutcome::Error);
+        // WAIT_ABANDONED is not valid for an event and must not be treated
+        // as "nothing completed".
+        assert_eq!(wait_outcome(0x0000_0080), WaitOutcome::Error);
+    }
+
+    #[test]
+    fn wait_millis_rounds_up_instead_of_polling() {
+        assert_eq!(wait_millis(Duration::ZERO), 0);
+        assert_eq!(wait_millis(Duration::from_nanos(1)), 1);
+        assert_eq!(wait_millis(Duration::from_micros(500)), 1);
+        assert_eq!(wait_millis(Duration::from_millis(10)), 10);
+        assert_eq!(wait_millis(Duration::from_micros(10_001)), 11);
     }
 }

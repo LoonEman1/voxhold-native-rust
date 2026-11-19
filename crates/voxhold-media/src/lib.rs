@@ -178,7 +178,8 @@ pub enum Event {
         level: f64,
     },
     /// Pre-gate software-capture meter. `dropped` counts whole 10 ms blocks
-    /// discarded by the bounded PCM queue or a stalled `NativeAudioSource`.
+    /// discarded by the bounded jitter queue, an epoch/mute flush, or a
+    /// `NativeAudioSource` send that failed or unexpectedly stayed pending.
     InputLevel {
         level: f64,
         muted: bool,

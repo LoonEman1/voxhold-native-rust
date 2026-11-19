@@ -293,6 +293,7 @@ impl Voxhold {
         // it before the session it belongs to goes away.
         self.voice_settings.flush();
         self.session_generation = self.session_generation.wrapping_add(1);
+        self.end_update_session();
         self.active_profile_save = None;
         self.notification_saves.clear();
         #[cfg(feature = "voxhold-media")]

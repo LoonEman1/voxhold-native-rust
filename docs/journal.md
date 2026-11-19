@@ -482,3 +482,24 @@ backend/браузер, TURN/ICE на втором ПК, DPI 125/150, запис
 - Проверки: 570 тестов (11/199/360), release, 230 файлов, кодировка; мутации downmix/remainder/probe/silence/stream-id/quality/pending-start падают на нужных тестах.
 - Ревью: раунд 1 — PASS + 7 P2; раунд 2 — PASS + новый P2; раунд 3 — PASS после `7440ab6`.
 - Осталось: слышимый звук, web-viewer, физический 5.1/7.1, отключение устройства, 1080p/60, 320 кбит/с, DPI, смена качества при активном зрителе; A/V offset и source-change — perf-этап.
+
+### W09e–W09g — сессия, запомненный инстанс и вход — PR #25
+
+Ветка `codex/w09e-session`, merge `a6292cd`; база `276de4b`. Проверки: fmt; `cargo test --workspace --locked` (API 13 + WS, media 199 + 12 ignored, app 464 + 1 ignored, 0 failed); release; лимиты файлов. Три независимых ревью, финальный PASS на `92ba059`.
+
+- `W09e` (`f343eec`): `Session` — единственный владелец user/token/expiry/generation; login `{user,session}`, refresh `{token,expires_at}`, logout Bearer; refresh за 5 минут, single-flight, bounded backoff; 401 называет фактически отправленный token; 401 текущего токена во время своей ротации откладывается; после rotate перезапускаются account WS, подписка канала и голос; logout локально завершает WS/медиа/голос/pending sends и делает один best-effort POST.
+- `W09f` (`167211c`): `%APPDATA%\Voxhold\instance.json`, только канонический origin, атомарная запись; галочка «Запомнить адрес»; CLI `-server` приоритетнее; битая запись и ошибка save читаемы; карточка поднимается в низком окне.
+- `W09g` (`92ba059`): DPAPI CurrentUser `sessions.bin`, magic+entropy, зануление расшифрованного буфера; запись привязана к точному origin и account; автовход после подтверждения адреса, retry при сети, очистка при 401/logout; поколение store проверяется под in-process и named lock; refresh обновляет запись; реальный WS-тест двух origin.
+- Не проверено: живой backend/Docker, ручной GUI, два Windows-пользователя/процесса, физический DPI, реальная ротация на сервере.
+
+### W12b — канал обновлений, Setup и portable ZIP — PR #26
+
+Ветка `codex/w12b-updates`, `52b30ea`; база `dev` `a6292cd`. Проверки: fmt; `cargo test --workspace --locked` (782 passed, 0 failed, 13 ignored); release; лимиты файлов 274; локальный pack/delta/manifest/verify (дельта ≈1,6 % полного), подмена подписи/пакета отклоняется. Ревью core и UI — PASS после раундов P1/P2.
+
+- `crates/voxhold-update`: строгий schema-1 manifest, Ed25519 до парсинга, HTTPS/loopback, semver/downgrade/channel/min_windows, детерминированный ZIP, `package.json`, дельта copy/replace/блочный патч, `VerifiedManifest`, staging `%LOCALAPPDATA%\VoxHold\updates`, `Range`/206, SHA/размеры, full fallback, cleanup, apply/backup/rollback/helper relocation/handshake.
+- `crates/voxhold-updater`: helper вне заменяемого каталога, абсолютные пути, `--detached` только внутренний, GUI subsystem, backup cleanup, best-effort stale cleanup.
+- `crates/voxhold-release`: keygen/pack/unpack/delta/manifest (`--base-url`)/verify.
+- Приложение: `build.rs` версия/ключ, `src/update.rs`, иконка/панель в шапке, check при старте/6 ч/вручную, download/cancel/progress, skip version, ready/install, handshake, startup cleanup, `VOXHOLD_UPDATE_BASE` для локальной приёмки.
+- CI `release.yml`: одна Windows x64 сборка → portable ZIP + per-user Setup.exe (Inno), Authenticode при секретах, дельта от предыдущего `beta`, manifest+sign последним.
+- Ключ: публичный в `crates/voxhold-update/update-pubkey.txt`, приватный в GitHub secret `VOXHOLD_UPDATE_SIGNING_KEY` и вне репозитория; Authenticode-сертификата нет (`authenticode:false`).
+- Не проверено: реальный A→B из Setup и ZIP на чистой Windows, компиляция Inno/установка/удаление, Authenticode/SmartScreen, реальный GitHub-канал, живой GUI/DPI и настоящий helper-процесс.

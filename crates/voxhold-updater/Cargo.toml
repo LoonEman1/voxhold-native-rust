@@ -1,0 +1,15 @@
+﻿[package]
+name = "voxhold-updater"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+description = "Small helper that waits for Voxhold to exit and applies a staged update"
+
+[dependencies]
+voxhold-update = { path = "../voxhold-update" }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Threading"] }
+
+[dev-dependencies]
+tempfile = "3"

@@ -6938,6 +6938,7 @@ dependencies = [
  "gpui-component",
  "image",
  "raw-window-handle",
+ "semver",
  "serde",
  "serde_json",
  "smallvec",
@@ -6946,8 +6947,47 @@ dependencies = [
  "uuid",
  "voxhold-api",
  "voxhold-media",
+ "voxhold-update",
  "windows-sys 0.61.2",
  "zeroize",
+]
+
+[[package]]
+name = "voxhold-release"
+version = "0.1.0"
+dependencies = [
+ "semver",
+ "tempfile",
+ "voxhold-update",
+]
+
+[[package]]
+name = "voxhold-update"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "hex",
+ "reqwest",
+ "ring",
+ "semver",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "url",
+ "windows-sys 0.61.2",
+ "zip",
+]
+
+[[package]]
+name = "voxhold-updater"
+version = "0.1.0"
+dependencies = [
+ "tempfile",
+ "voxhold-update",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

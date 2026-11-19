@@ -296,10 +296,10 @@ impl VoicePanel {
         self.screen.selected = None;
         self.screen.last_request = None;
         self.screen.kind = SourceKind::Monitor;
-        self.screen.audio_availability = Some(system_audio::probe());
-        if !self.screen.audio_available() {
-            self.screen.audio_enabled = false;
-        }
+        // A fresh publication defaults to system audio; the background probe
+        // fills in availability and disables the toggle if the endpoint fails.
+        self.screen.audio_enabled = true;
+        self.begin_audio_probe(cx);
         self.screen.focus_placed = false;
         if let Some(handle) = &self.handle {
             self.screen.picker = handle.begin_screen_picker();
@@ -323,10 +323,7 @@ impl VoicePanel {
             self.screen.audio_bitrate_kbps = quality.audio_bitrate_kbps;
         }
         self.screen.audio_enabled = sharing.has_audio;
-        self.screen.audio_availability = Some(system_audio::probe());
-        if !self.screen.audio_available() {
-            self.screen.audio_enabled = false;
-        }
+        self.begin_audio_probe(cx);
         if self.screen.selected.is_none() {
             self.screen.selected = self
                 .screen
@@ -340,6 +337,39 @@ impl VoicePanel {
         self.screen.error.clear();
         self.screen.focus_placed = false;
         cx.notify();
+    }
+
+    /// Probe the render endpoint on the background executor. COM plus a
+    /// driver call can take up to two seconds, so the click must only start a
+    /// task and repaint; the result lands when it still matches the newest
+    /// request. A device failure disables the audio toggle, a success leaves
+    /// the user's choice alone.
+    fn begin_audio_probe(&mut self, cx: &mut Context<Self>) {
+        self.screen_audio_probe = self.screen_audio_probe.wrapping_add(1);
+        let generation = self.screen_audio_probe;
+        #[cfg(test)]
+        let injected = self.test_audio_probe.take();
+        let task = cx.background_spawn(async move {
+            #[cfg(test)]
+            if let Some(probe) = injected {
+                return probe();
+            }
+            system_audio::probe()
+        });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let _ = this.update(cx, |panel, cx| {
+                if panel.screen_audio_probe != generation {
+                    return;
+                }
+                if result.is_err() {
+                    panel.screen.audio_enabled = false;
+                }
+                panel.screen.audio_availability = Some(result);
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// Close the picker. Before Start this only cancels the picker and leaves
@@ -411,7 +441,7 @@ impl VoicePanel {
         cx.notify();
     }
 
-    fn start_screen_share(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn start_screen_share(&mut self, cx: &mut Context<Self>) {
         if self.screen.busy {
             return;
         }
@@ -471,7 +501,7 @@ impl VoicePanel {
         cx.notify();
     }
 
-    fn stop_screen_share(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn stop_screen_share(&mut self, cx: &mut Context<Self>) {
         if let Some(handle) = &self.handle {
             handle.stop_screen_share();
         }
@@ -822,11 +852,14 @@ impl VoicePanel {
                 .h(px(28.))
                 .flex()
                 .gap_1();
-            if matches!(sharing.phase, Phase::Publishing | Phase::Live) {
+            // The dialog only applies changes while the stream is Live; in
+            // Publishing the action would be inert, so it is not shown.
+            if sharing.phase == Phase::Live {
                 let quality_focus = self.screen_focus[2].clone();
                 actions = actions.child(
                     div()
                         .id("screen-quality")
+                        .debug_selector(|| "screen-quality".into())
                         .flex_1()
                         .h_full()
                         .rounded(px(8.))
@@ -847,6 +880,7 @@ impl VoicePanel {
             actions = actions.child(
                 div()
                     .id("screen-stop")
+                    .debug_selector(|| "screen-stop".into())
                     .flex_1()
                     .h_full()
                     .rounded(px(8.))

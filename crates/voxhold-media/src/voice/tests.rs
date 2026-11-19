@@ -1,6 +1,99 @@
 use super::*;
 use libwebrtc::{MediaType, rtp_sender::VideoEncoderBackend, video_codec::VideoCodec};
 
+struct SilentSystemAudio;
+
+impl crate::system_audio::AudioProducer for SilentSystemAudio {
+    fn next_block(&mut self) -> Option<Vec<i16>> {
+        None
+    }
+
+    fn failure(&self) -> Option<String> {
+        None
+    }
+
+    fn dropped(&self) -> u64 {
+        0
+    }
+}
+
+/// A real microphone track is attached to the gate of the voice session; a
+/// screen publication with its own system-audio producer starts and stops
+/// beside it. The gate permission and PTT decision must survive untouched.
+#[test]
+fn a_screen_publication_never_touches_the_microphone_gate() {
+    use libwebrtc::audio_source::{AudioSourceOptions, native::NativeAudioSource};
+
+    let factory = PeerConnectionFactory::default();
+    let source = NativeAudioSource::new(
+        AudioSourceOptions {
+            echo_cancellation: false,
+            noise_suppression: false,
+            auto_gain_control: false,
+        },
+        crate::system_audio::SAMPLE_RATE,
+        2,
+        200,
+    );
+    let track = factory.create_audio_track("voxhold-microphone", source);
+    let gate = CaptureGate::default();
+    gate.attach(track);
+    gate.set_joined(true);
+    gate.set_server_allowed(true);
+    gate.set_local(true);
+    assert!(gate.enabled(), "the microphone is allowed to transmit");
+    let epoch = gate.permission_epoch().load(Ordering::SeqCst);
+
+    let engine = crate::publisher::engine::PublisherEngine::start_synthetic(
+        crate::publisher::PublishRequest {
+            source: crate::screen_capture::ScreenSource {
+                id: 0,
+                kind: crate::screen_capture::SourceKind::Monitor,
+                title: "synthetic".into(),
+                display_id: -1,
+                width: 640,
+                height: 360,
+            },
+            quality: crate::publisher::Quality {
+                resolution: crate::publisher::Resolution::P720,
+                fps: 30,
+                bitrate_kbps: 1_000,
+                audio_bitrate_kbps: 64,
+            },
+            codec: crate::publisher::Codec::Vp8,
+            audio: true,
+        },
+        Vec::new(),
+        "all".into(),
+        false,
+        (320, 180),
+        Some(Box::new(SilentSystemAudio)),
+    )
+    .expect("publisher engine");
+
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(
+        gate.enabled(),
+        "the running publication must not close the microphone gate"
+    );
+    assert_eq!(
+        gate.permission_epoch().load(Ordering::SeqCst),
+        epoch,
+        "the publication must not change the gate generation"
+    );
+
+    drop(engine);
+    assert!(
+        gate.enabled(),
+        "stopping the share must leave the microphone gate open"
+    );
+    assert_eq!(
+        gate.permission_epoch().load(Ordering::SeqCst),
+        epoch,
+        "stopping the share must not latch the microphone"
+    );
+}
+
 #[test]
 fn installed_webrtc_build_has_voxhold_web_codecs() {
     let factory = PeerConnectionFactory::default();

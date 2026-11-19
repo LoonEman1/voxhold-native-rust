@@ -134,6 +134,26 @@ fn next_block(shared: &Shared) -> Option<Vec<i16>> {
     shared.blocks.lock().ok()?.pop_front()
 }
 
+/// Reassembles converted WASAPI packets into exactly [`BLOCK_SAMPLES`]
+/// blocks. A loopback packet is often shorter than 10 ms, so a per-packet
+/// `chunks` loop silently dropped the tail; the remainder is carried until
+/// the next packet completes it.
+#[derive(Default)]
+struct BlockBuffer {
+    pending: Vec<i16>,
+}
+
+impl BlockBuffer {
+    fn push(&mut self, samples: &[i16], mut emit: impl FnMut(Vec<i16>)) {
+        self.pending.extend_from_slice(samples);
+        while self.pending.len() >= BLOCK_SAMPLES {
+            let tail = self.pending.split_off(BLOCK_SAMPLES);
+            let block = std::mem::replace(&mut self.pending, tail);
+            emit(block);
+        }
+    }
+}
+
 /// One loopback capture of the default render endpoint.
 pub struct SystemAudio {
     shared: Arc<Shared>,
@@ -298,6 +318,68 @@ mod tests {
         shared.fail("устройство исчезло");
         shared.fail("другая ошибка");
         assert_eq!(shared.failure().as_deref(), Some("устройство исчезло"));
+    }
+
+    fn stereo_packet(frames: usize, left: i16, right: i16) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(frames * 4);
+        for _ in 0..frames {
+            bytes.extend_from_slice(&left.to_le_bytes());
+            bytes.extend_from_slice(&right.to_le_bytes());
+        }
+        bytes
+    }
+
+    /// A 240-frame packet is 5 ms. The old per-packet `chunks(960)` loop threw
+    /// its 480 samples away and the next 720-frame packet lost another 480.
+    /// The carry buffer must deliver two complete blocks and lose nothing.
+    #[test]
+    fn a_short_wasapi_packet_carries_its_tail_into_the_next_packet() {
+        let format = format::SourceFormat {
+            sample_rate: SAMPLE_RATE,
+            channels: 2,
+            bits: 16,
+            block_align: 4,
+            float: false,
+            mask: 0x3,
+        };
+        let mut converter = format::Converter::new(format);
+        let mut blocks = BlockBuffer::default();
+        let mut delivered = Vec::new();
+        let mut scratch = Vec::new();
+
+        let first = stereo_packet(240, 1_000, -1_000);
+        converter.convert(&first, false, &mut scratch);
+        assert_eq!(scratch.len(), 480, "240 frames are half a block");
+        blocks.push(&scratch, |block| delivered.push(block));
+        assert!(delivered.is_empty(), "no partial block may be published");
+
+        scratch.clear();
+        let second = stereo_packet(720, 2_000, -2_000);
+        converter.convert(&second, false, &mut scratch);
+        assert_eq!(scratch.len(), 1_440, "720 frames are one and a half blocks");
+        blocks.push(&scratch, |block| delivered.push(block));
+
+        assert_eq!(delivered.len(), 2, "480 + 1440 samples are two blocks");
+        assert_eq!(
+            delivered.iter().map(Vec::len).sum::<usize>(),
+            1_920,
+            "no sample may be dropped at a packet boundary"
+        );
+        // Blocks are interleaved. The first 240 frames of the first block are
+        // the carried packet; the rest is the second packet (whose first
+        // frame interpolates from the carry at fraction 0).
+        assert_eq!(&delivered[0][..2], &[1_000, -1_000]);
+        assert_eq!(&delivered[0][958..], &[2_000, -2_000]);
+        assert!(
+            delivered[0]
+                .chunks(2)
+                .all(|pair| pair == [1_000, -1_000] || pair == [2_000, -2_000]),
+            "the first block mixes both packets"
+        );
+        assert!(
+            delivered[1].chunks(2).all(|pair| pair == [2_000, -2_000]),
+            "the second block is entirely the later packet"
+        );
     }
 }
 

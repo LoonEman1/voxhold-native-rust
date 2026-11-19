@@ -102,6 +102,9 @@ impl QualityLimitation {
 /// Measured counters of the publishing path. FPS, resolution and limitation
 /// come from `OutboundRtpStats`; the drop counter belongs to the capture slot.
 /// There is no CPU or GPU percentage probe in this build, so none is invented.
+/// A/V offset and source-change events are also absent: W04a publishes one
+/// source, and the A/V synchronization/perf stage will add measured values
+/// rather than an estimate here.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PublishStats {
     /// Encoded frames per second reported by the outbound RTP stats.

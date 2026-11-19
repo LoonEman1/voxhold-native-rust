@@ -33,7 +33,7 @@ use windows::{
 };
 
 use super::{
-    AudioDeviceInfo, BLOCK_SAMPLES, Shared,
+    AudioDeviceInfo, BLOCK_SAMPLES, BlockBuffer, Shared,
     format::{Converter, SourceFormat},
     join_bounded, push_block,
 };
@@ -139,8 +139,10 @@ fn parse_mix(pointer: *const WAVEFORMATEX) -> Result<SourceFormat, Failure> {
     // The endpoint owns this allocation while `MixFormat` is alive.
     let format = unsafe { *pointer };
     let tag = format.wFormatTag;
+    let mut mask = 0;
     let float = if tag == WAVE_FORMAT_EXTENSIBLE {
         let extensible = unsafe { *(pointer.cast::<WAVEFORMATEXTENSIBLE>()) };
+        mask = extensible.dwChannelMask;
         let subformat = extensible.SubFormat;
         if subformat == KSDATAFORMAT_SUBTYPE_IEEE_FLOAT {
             true
@@ -182,6 +184,7 @@ fn parse_mix(pointer: *const WAVEFORMATEX) -> Result<SourceFormat, Failure> {
         bits,
         block_align: format.nBlockAlign,
         float,
+        mask,
     })
 }
 
@@ -241,6 +244,7 @@ fn map_capture_error(error: windows::core::Error) -> Failure {
 fn capture(shared: &Shared, opened: &Opened) -> Failure {
     let mut converter = Converter::new(opened.format);
     let mut scratch = Vec::with_capacity(BLOCK_SAMPLES * 4);
+    let mut blocks = BlockBuffer::default();
     let mut next_device_check = Instant::now() + DEVICE_CHECK;
     loop {
         if shared.stopping() {
@@ -280,11 +284,7 @@ fn capture(shared: &Shared, opened: &Opened) -> Failure {
             // With the silent flag the payload is undefined; the converter
             // advances the timeline and emits zeros without reading it.
             converter.convert(packet, silent, &mut scratch);
-            for chunk in scratch.chunks(BLOCK_SAMPLES) {
-                if chunk.len() == BLOCK_SAMPLES {
-                    push_block(shared, chunk.to_vec());
-                }
-            }
+            blocks.push(&scratch, |block| push_block(shared, block));
         }
         if let Err(error) = unsafe { opened.capture.ReleaseBuffer(frames) } {
             return map_capture_error(error);

@@ -71,13 +71,41 @@ impl AudioMeter {
 /// packet (nothing is playing), a silent frame keeps the RTP timeline and the
 /// audio m-line continuous. A real device failure is reported to the state
 /// machine instead of being disguised as silence.
+/// One 10 ms frame from whatever the producer returned. `None`, a wrong
+/// length or a failed source become exactly one silent block: the RTP timeline
+/// and the audio m-line continue, and the counter records why. A real device
+/// failure is reported to the state machine before this runs instead of being
+/// disguised as silence.
+pub(super) fn frame_for(
+    captured: Option<Vec<i16>>,
+    counters: &AudioCounters,
+) -> AudioFrame<'static> {
+    const SILENCE: [i16; BLOCK_SAMPLES] = [0; BLOCK_SAMPLES];
+    match captured {
+        Some(data) if data.len() == BLOCK_SAMPLES => AudioFrame {
+            data: std::borrow::Cow::Owned(data),
+            sample_rate: SAMPLE_RATE,
+            num_channels: CHANNELS,
+            samples_per_channel: (BLOCK_SAMPLES / CHANNELS as usize) as u32,
+        },
+        _ => {
+            counters.silent.fetch_add(1, Ordering::Relaxed);
+            AudioFrame {
+                data: std::borrow::Cow::Borrowed(&SILENCE),
+                sample_rate: SAMPLE_RATE,
+                num_channels: CHANNELS,
+                samples_per_channel: (BLOCK_SAMPLES / CHANNELS as usize) as u32,
+            }
+        }
+    }
+}
+
 pub(super) async fn audio_loop(
     mut producer: Box<dyn AudioProducer>,
     source: NativeAudioSource,
     events: Arc<EventQueue>,
     counters: Arc<AudioCounters>,
 ) {
-    const SILENCE: [i16; BLOCK_SAMPLES] = [0; BLOCK_SAMPLES];
     let mut next = time::Instant::now() + BLOCK_INTERVAL;
     loop {
         time::sleep_until(next).await;
@@ -95,23 +123,7 @@ pub(super) async fn audio_loop(
             .dropped
             .store(producer.dropped(), Ordering::Relaxed);
         let captured = producer.next_block();
-        let frame = match captured {
-            Some(data) if data.len() == BLOCK_SAMPLES => AudioFrame {
-                data: std::borrow::Cow::Owned(data),
-                sample_rate: SAMPLE_RATE,
-                num_channels: CHANNELS,
-                samples_per_channel: (BLOCK_SAMPLES / CHANNELS as usize) as u32,
-            },
-            _ => {
-                counters.silent.fetch_add(1, Ordering::Relaxed);
-                AudioFrame {
-                    data: std::borrow::Cow::Borrowed(&SILENCE),
-                    sample_rate: SAMPLE_RATE,
-                    num_channels: CHANNELS,
-                    samples_per_channel: (BLOCK_SAMPLES / CHANNELS as usize) as u32,
-                }
-            }
-        };
+        let frame = frame_for(captured, &counters);
         match time::timeout(AUDIO_PUSH_TIMEOUT, source.capture_frame(&frame)).await {
             Ok(Ok(())) => {}
             Ok(Err(_)) => return,

@@ -54,6 +54,59 @@ impl VoicePanel {
             label: "Устройство вывода по умолчанию".into(),
             format: "48000 Гц · 2 канала · 16 бит PCM".into(),
         }));
+        // Keep the endpoint probe off the real device: it still runs on the
+        // production background task, just with a deterministic answer.
+        self.test_audio_probe = Some(Arc::new(|| {
+            Ok(voxhold_media::system_audio::AudioDeviceInfo {
+                id: "test".into(),
+                label: "Устройство вывода по умолчанию".into(),
+                format: "48000 Гц · 2 канала · 16 бит PCM".into(),
+            })
+        }));
+    }
+
+    /// Production path of the «Экран» click, for the non-blocking probe test.
+    pub fn test_open_screen_share(&mut self, cx: &mut Context<Self>) {
+        self.open_screen_share(cx);
+    }
+
+    /// The publish intent without the picker keyboard path.
+    pub fn test_start_screen_share(&mut self, cx: &mut Context<Self>) {
+        self.start_screen_share(cx);
+    }
+
+    /// Select a source and close the picker surface, so a test can exercise
+    /// the publish/stop handoff without the dialog taking keyboard focus.
+    pub fn test_prepare_screen_publish(&mut self, source: ScreenSource) {
+        self.test_open_screen_picker(source);
+        self.screen.open = false;
+    }
+
+    /// The stop intent, exactly as the on-air card sends it.
+    pub fn test_stop_screen_share(&mut self, cx: &mut Context<Self>) {
+        self.stop_screen_share(cx);
+    }
+
+    /// Install a probe with controlled timing. It runs on the same background
+    /// task as the real `system_audio::probe`, so a slow answer cannot be
+    /// mistaken for a synchronous call.
+    pub fn test_set_audio_probe(
+        &mut self,
+        probe: Arc<
+            dyn Fn() -> Result<voxhold_media::system_audio::AudioDeviceInfo, String> + Send + Sync,
+        >,
+    ) {
+        self.test_audio_probe = Some(probe);
+    }
+
+    /// Whether the picker is still waiting for the background probe.
+    pub fn test_audio_pending(&self) -> bool {
+        self.screen.audio_availability.is_none()
+    }
+
+    /// The availability line the picker paints.
+    pub fn test_audio_status(&self) -> String {
+        self.screen.audio_status()
     }
 
     /// Open the live quality dialog with the publication already Live.

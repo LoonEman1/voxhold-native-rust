@@ -118,6 +118,9 @@ pub struct VoicePanel {
     can_stream: bool,
     /// Screen-share picker, on-air card and preview.
     screen: ScreenShareUi,
+    /// Monotonic id of the newest screen-audio probe. A slower, older probe
+    /// must not overwrite the availability of a newer dialog.
+    screen_audio_probe: u64,
     /// False while the authoritative channel ACL is being reloaded. Both the
     /// room roster and the call worker's roster/streams stay hidden until the
     /// fresh channel list confirms access again.
@@ -176,6 +179,12 @@ pub struct VoicePanel {
     /// not decide whether a keyboard-path test can run.
     #[cfg(test)]
     test_share_gate: Option<Result<(), &'static str>>,
+    /// Test-only replacement for the blocking endpoint probe. It runs on the
+    /// same background task as the real one.
+    #[cfg(test)]
+    test_audio_probe: Option<
+        Arc<dyn Fn() -> Result<voxhold_media::system_audio::AudioDeviceInfo, String> + Send + Sync>,
+    >,
 }
 
 impl VoicePanel {
@@ -249,6 +258,7 @@ impl VoicePanel {
             room_streams: Vec::new(),
             can_stream: false,
             screen: ScreenShareUi::default(),
+            screen_audio_probe: 0,
             access_confirmed: true,
             frame: None,
             stream_status: String::new(),
@@ -291,6 +301,8 @@ impl VoicePanel {
             palette: crate::theme::dark_palette(),
             #[cfg(test)]
             test_share_gate: None,
+            #[cfg(test)]
+            test_audio_probe: None,
         }
     }
 

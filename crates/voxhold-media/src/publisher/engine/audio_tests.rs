@@ -567,6 +567,34 @@ fn silence_keeps_the_audio_track_flowing() {
 }
 
 #[test]
+fn a_missing_block_becomes_exactly_one_960_sample_silent_frame() {
+    use super::audio::{AudioCounters, frame_for};
+    let counters = AudioCounters::default();
+    let frame = frame_for(None, &counters);
+    assert_eq!(frame.data.len(), BLOCK_SAMPLES, "exactly one 10 ms block");
+    assert_eq!(frame.data.len(), 960);
+    assert_eq!(frame.samples_per_channel, BLOCK_FRAMES);
+    assert_eq!(frame.num_channels, CHANNELS);
+    assert!(
+        frame.data.iter().all(|sample| *sample == 0),
+        "the mapped silence must contain no stale audio"
+    );
+    assert_eq!(counters.silent.load(Ordering::Relaxed), 1);
+
+    // A short block is not padded with old data and is still mapped to one
+    // silent frame; a full block passes through and does not count.
+    let short = frame_for(Some(vec![9; BLOCK_SAMPLES - 2]), &counters);
+    assert_eq!(short.data.len(), 960);
+    assert!(short.data.iter().all(|sample| *sample == 0));
+    assert_eq!(counters.silent.load(Ordering::Relaxed), 2);
+
+    let real = frame_for(Some(vec![9; BLOCK_SAMPLES]), &counters);
+    assert_eq!(real.data.len(), 960);
+    assert_eq!(real.data[0], 9);
+    assert_eq!(counters.silent.load(Ordering::Relaxed), 2);
+}
+
+#[test]
 fn the_system_audio_and_a_microphone_are_different_tracks() {
     block_on(async {
         let system = run(
@@ -583,6 +611,27 @@ fn the_system_audio_and_a_microphone_are_different_tracks() {
         assert_ne!(
             system_id, microphone.track_id,
             "the system audio and the microphone must never share a track"
+        );
+        // The stream identity, not just an unrelated peer's track id, proves
+        // the two paths stay apart: the publisher answers on the screen
+        // stream, the voice peer on the voice stream.
+        let system_audio = section(&system.answer, "m=audio").expect("system audio section");
+        let mic_audio = section(&microphone.offer, "m=audio").expect("microphone audio section");
+        assert!(
+            system_audio.contains("a=msid:voxhold-screen"),
+            "the system track must belong to the screen stream: {system_audio}"
+        );
+        assert!(
+            !system_audio.contains("voxhold-voice"),
+            "the system m-line must not claim the voice stream: {system_audio}"
+        );
+        assert!(
+            mic_audio.contains("a=msid:voxhold-voice"),
+            "the microphone must belong to the voice stream: {mic_audio}"
+        );
+        assert!(
+            !mic_audio.contains("voxhold-screen"),
+            "the microphone m-line must not claim the screen stream: {mic_audio}"
         );
         let system_low = goertzel(&system.decoded, 400.0);
         let system_mic = goertzel(&system.decoded, 2000.0);
@@ -605,6 +654,7 @@ fn the_system_audio_and_a_microphone_are_different_tracks() {
 struct MicrophoneRun {
     track_id: String,
     decoded: Vec<i16>,
+    offer: String,
 }
 
 /// A plain sender/receiver pair like the voice peer: one microphone track,
@@ -656,6 +706,7 @@ async fn microphone_run(frequency: f64, duration: Duration) -> Result<Microphone
         .create_offer(OfferOptions::default())
         .await
         .map_err(|_| "mic offer")?;
+    let offer_sdp = offer.to_string();
     sender
         .set_local_description(offer.clone())
         .await
@@ -723,5 +774,9 @@ async fn microphone_run(frequency: f64, duration: Duration) -> Result<Microphone
     let decoded = decoded.lock().unwrap().clone();
     sender.close();
     receiver.close();
-    Ok(MicrophoneRun { track_id, decoded })
+    Ok(MicrophoneRun {
+        track_id,
+        decoded,
+        offer: offer_sdp,
+    })
 }

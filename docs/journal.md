@@ -504,3 +504,14 @@ backend/браузер, TURN/ICE на втором ПК, DPI 125/150, запис
 - Ключ: публичный в `crates/voxhold-update/update-pubkey.txt`, приватный в GitHub secret `VOXHOLD_UPDATE_SIGNING_KEY` и вне репозитория; Authenticode-сертификата нет (`authenticode:false`).
 - Не проверено: реальный A→B из Setup и ZIP на чистой Windows, компиляция Inno/установка/удаление, Authenticode/SmartScreen, реальный GitHub-канал, живой GUI/DPI и настоящий helper-процесс.
 - Интеграция: PR #26 влит в `dev` коммитом `78a7cb3`; ревью и тесты пройдены на `2ceb420`. Реальный A→B, Inno и Authenticode остаются обязательными сценариями `W13`.
+
+### W05a — текстовый чат голосовой комнаты — PR #27
+
+Ветка `codex/w05a-room-chat` от `78a7cb3`, коммит `6345627`; эталоны backend `9b29fdd`, frontend `ed7cb00`. Проверки: fmt; `cargo test --workspace --locked` — 791 passed, 0 failed, 13 ignored (API 15, media 199/12 ignored, app 497/1 ignored, release 3, update 72, updater 5); release; лимиты файлов 277.
+
+- `src/app/room_chat.rs`: открытие/закрытие панели для выбранной комнаты, `ChatKey::channel(server, room)`, `chat_scope_epoch`, док/стек-панель, очистка при отзыве доступа; `Channel::chat_readable/chat_writable` в `crates/voxhold-api/src/channel.rs` с сохранением E2EE-политики.
+- `src/app/shell_view.rs` + `composer.rs`: переключатель «Чат», общий composer и history в доке; `history_view` учитывает 48 px заголовок панели.
+- `src/app/workspace.rs`, `history_ops.rs`, `history_actions.rs`, `session.rs`, `message_tools.rs`: подписка и read только для видимой разрешённой ленты, epoch для отложенного read, prune после подтверждённого списка каналов, права действий для комнаты.
+- `src/layout.rs`: `voice_chat_layout` — 300/34%/440 справа на широком окне, непалящее наложение на узком; `VoicePanel` получает фактический размер.
+- Ревью диапазона `78a7cb3..6345627` — PASS, P0/P1 нет. P2: единственный переключатель без подписи на широком окне; недоступные «Закрепы» комнаты; снапшот без снятия подписки при отзыве Read; неполное покрытие failure-path; cfg-стабы без `voxhold-media`.
+- Не проверено: живой backend/POST/WS, ручной GUI и DPI, сравнение кадров web ↔ native; P2 вынесены на последующие правки/`W13`.

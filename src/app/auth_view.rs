@@ -26,6 +26,8 @@ impl Voxhold {
             .child(
                 div()
                     .flex_1()
+                    .min_w(px(0.))
+                    .truncate()
                     .text_size(px(13.))
                     .text_color(ink(p.error_text))
                     .child(self.auth.status.clone()),

@@ -9,15 +9,15 @@
 
 use super::*;
 use crate::auth_session::{now_unix, Session};
-use crate::session_store::{RememberedSession, SessionStore};
+use crate::session_store::{accounts_match, RememberedSession, SessionStore, StoreError};
 
 /// A short text that fits the error row next to the «Повторить вход» link.
-const TRANSIENT_REASON: &str = "Нет связи с сервером.";
+const TRANSIENT_REASON: &str = "Нет связи.";
 const EXPIRED_REASON: &str = "Сессия истекла. Войдите снова.";
 const WRONG_USER_REASON: &str = "Сохранённый вход другого аккаунта.";
 const FAILED_REASON: &str = "Не удалось восстановить вход.";
 const SAVE_ERROR: &str = "Не удалось сохранить вход: нет доступа.";
-const DELETE_ERROR: &str = "Не удалось удалить сохранённый вход.";
+pub(super) const DELETE_ERROR: &str = "Не удалось удалить сохранённый вход.";
 
 /// The answer of the one background network step.
 pub(super) enum AutoNetwork {
@@ -57,7 +57,7 @@ impl Voxhold {
         let store = self.session_store.clone();
         let rt = self.runtime.clone();
         let task = cx.background_spawn(async move {
-            rt.block_on(async move { store.load_for_origin(&origin) })
+            rt.block_on(async move { store.load_for_origin(&origin, now_unix()) })
         });
         cx.spawn_in(window, async move |this, window| {
             let result = task.await;
@@ -88,7 +88,7 @@ impl Voxhold {
             }
             Ok(Some(record)) if record.is_expired(now_unix()) => {
                 // A stale record is useless; drop it before the user types.
-                self.forget_record(record.origin.clone(), record.account.clone());
+                self.forget_record(record.origin.clone(), record.account.clone(), window, cx);
                 self.auth.remember_login = false;
                 self.auto_record = None;
             }
@@ -110,7 +110,7 @@ impl Voxhold {
         cx: &mut Context<Self>,
     ) {
         if record.is_expired(now_unix()) {
-            self.forget_record(record.origin.clone(), record.account.clone());
+            self.forget_record(record.origin.clone(), record.account.clone(), window, cx);
             self.auth.auto_login = false;
             self.auth.remember_login = false;
             self.auto_record = None;
@@ -210,8 +210,9 @@ impl Voxhold {
         cx.notify();
     }
 
-    /// After a manual login: write the record when the box was checked at
-    /// submit, otherwise remove any record for the same origin and account.
+    /// After a manual login: write the record when the box is checked, otherwise
+    /// remove any record for the same origin and account. The flag is read when
+    /// the answer arrives, so toggling the box during the request decides.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn remember_manual_login(
         &mut self,
@@ -225,15 +226,11 @@ impl Voxhold {
         cx: &mut Context<Self>,
     ) {
         let session_epoch = self.session_epoch;
-        let store_epoch = self.store_epoch.clone();
-        let expected_epoch = store_epoch.load(std::sync::atomic::Ordering::SeqCst);
+        let expected_epoch = self.session_store.epoch();
         let store = self.session_store.clone();
         let rt = self.runtime.clone();
         let task = cx.background_spawn(async move {
             rt.block_on(async move {
-                if store_epoch.load(std::sync::atomic::Ordering::SeqCst) != expected_epoch {
-                    return Ok(None);
-                }
                 if remember {
                     let record = RememberedSession {
                         origin,
@@ -243,9 +240,17 @@ impl Voxhold {
                         expires_at,
                         saved_at: now_unix(),
                     };
-                    store.save(&record).map(|_| Some(token))
+                    match store.save(&record, expected_epoch) {
+                        Ok(()) => Ok(Some(token)),
+                        // The session ended while this save was queued.
+                        Err(StoreError::Stale) => Ok(None),
+                        Err(error) => Err(error),
+                    }
                 } else {
-                    store.delete(&origin, &account).map(|_| None)
+                    match store.delete(&origin, &account, expected_epoch) {
+                        Ok(()) | Err(StoreError::Stale) => Ok(None),
+                        Err(error) => Err(error),
+                    }
                 }
             })
         });
@@ -300,17 +305,24 @@ impl Voxhold {
             }
         }
         let store = self.session_store.clone();
-        let store_epoch = self.store_epoch.clone();
-        let expected_epoch = store_epoch.load(std::sync::atomic::Ordering::SeqCst);
+        let expected_epoch = self.session_store.epoch();
         let rt = self.runtime.clone();
         let token_for_ui = new_token.clone();
         let task = cx.background_spawn(async move {
             rt.block_on(async move {
-                if store_epoch.load(std::sync::atomic::Ordering::SeqCst) != expected_epoch {
-                    return false;
-                }
                 let tokens: Vec<&str> = accepted.iter().map(String::as_str).collect();
-                store.update_after_refresh(&origin, &account, &tokens, &new_token, expires_at)
+                match store.update_after_refresh(
+                    &origin,
+                    &account,
+                    &tokens,
+                    &new_token,
+                    expires_at,
+                    expected_epoch,
+                ) {
+                    Ok(updated) => updated,
+                    // A logout or a new login owns the file now.
+                    Err(_) => false,
+                }
             })
         });
         cx.spawn_in(window, async move |this, window| {
@@ -329,18 +341,60 @@ impl Voxhold {
     }
 
     /// Delete the record of the session that just ended. `None` (no session)
-    /// is a no-op; the delete itself is local, so it also works offline.
-    pub(super) fn forget_stored(&self, stored: Option<(String, String)>) {
+    /// is a no-op; the delete itself is local, so it also works offline. A
+    /// failure is retried once and then shown, never dropped.
+    pub(super) fn forget_stored(
+        &self,
+        stored: Option<(String, String)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if let Some((origin, account)) = stored {
-            self.forget_record(origin, account);
+            self.forget_record(origin, account, window, cx);
         }
     }
 
-    fn forget_record(&self, origin: String, account: String) {
+    fn forget_record(
+        &self,
+        origin: String,
+        account: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let store = self.session_store.clone();
-        self.runtime.spawn(async move {
-            let _ = store.delete(&origin, &account);
+        let expected_epoch = store.epoch();
+        let session_epoch = self.session_epoch;
+        let rt = self.runtime.clone();
+        let task = cx.background_spawn(async move {
+            rt.block_on(async move {
+                let mut result = store.delete(&origin, &account, expected_epoch);
+                if matches!(result, Err(StoreError::Lock) | Err(StoreError::Io)) {
+                    result = store.delete(&origin, &account, expected_epoch);
+                }
+                result
+            })
         });
+        cx.spawn_in(window, async move |this, window| {
+            let result = task.await;
+            let _ = this.update_in(window, |s, _window, cx| {
+                // A new login owns the screen now; its state must not receive
+                // an error from the session that ended before it.
+                if s.session_epoch != session_epoch {
+                    return;
+                }
+                if result.is_ok() || result == Err(StoreError::Stale) {
+                    return;
+                }
+                let message = DELETE_ERROR.to_string();
+                if s.session.is_none() {
+                    s.auth.status = message;
+                } else {
+                    s.remember_error = message;
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn auto_still_owns(&self, attempt: u64) -> bool {
@@ -354,6 +408,9 @@ impl Voxhold {
 /// The background network step. Nothing here touches GPUI state; only the
 /// final enum crosses back to the UI thread.
 async fn auto_network(store: &SessionStore, record: RememberedSession) -> AutoNetwork {
+    // Every delete in this attempt belongs to the generation that started it;
+    // a logout that bumps the generation makes a late delete harmless.
+    let expected_epoch = store.epoch();
     let mut client = match Client::new(&record.origin) {
         Ok(client) => client,
         Err(_) => {
@@ -366,20 +423,15 @@ async fn auto_network(store: &SessionStore, record: RememberedSession) -> AutoNe
     client.set_token(record.token.clone());
     let profile = match client.profile().await {
         Ok(profile) => profile,
-        Err(error) => return auto_error(store, &record, &error),
+        Err(error) => return auto_error(store, &record, &error, expected_epoch),
     };
     let servers = match client.servers().await {
         Ok(servers) => servers,
-        Err(error) => return auto_error(store, &record, &error),
+        Err(error) => return auto_error(store, &record, &error, expected_epoch),
     };
-    if profile.user_id != record.user_id
-        || !record
-            .account
-            .trim()
-            .eq_ignore_ascii_case(profile.username.trim())
-    {
+    if profile.user_id != record.user_id || !accounts_match(&record.account, &profile.username) {
         // A record that now answers as another user is not this login.
-        let _ = store.delete(&record.origin, &record.account);
+        let _ = store.delete(&record.origin, &record.account, expected_epoch);
         return AutoNetwork::WrongUser;
     }
     let Some(session) = Session::new(
@@ -408,10 +460,11 @@ fn auto_error(
     store: &SessionStore,
     record: &RememberedSession,
     error: &voxhold_api::Error,
+    expected_epoch: u64,
 ) -> AutoNetwork {
     match error {
         voxhold_api::Error::Http(401) => {
-            let _ = store.delete(&record.origin, &record.account);
+            let _ = store.delete(&record.origin, &record.account, expected_epoch);
             AutoNetwork::Unauthorized
         }
         voxhold_api::Error::Network

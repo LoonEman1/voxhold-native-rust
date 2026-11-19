@@ -41,6 +41,30 @@ fn store(dir: &Path) -> SessionStore {
     SessionStore::new(Some(dir.join("sessions.bin")))
 }
 
+/// The tests exercise the user-visible paths, not the generation barrier, so
+/// they write at the current generation. The barrier itself is tested in
+/// `session_store::tests`.
+trait StoreNow {
+    fn save_now(&self, record: &RememberedSession) -> Result<(), crate::session_store::StoreError>;
+    fn load_now(
+        &self,
+        origin: &str,
+    ) -> Result<Option<RememberedSession>, crate::session_store::StoreError>;
+}
+
+impl StoreNow for SessionStore {
+    fn save_now(&self, record: &RememberedSession) -> Result<(), crate::session_store::StoreError> {
+        self.save(record, self.epoch())
+    }
+
+    fn load_now(
+        &self,
+        origin: &str,
+    ) -> Result<Option<RememberedSession>, crate::session_store::StoreError> {
+        self.load_for_origin(origin, now_unix())
+    }
+}
+
 fn record(origin: &str, account: &str, user_id: i64, token: &str, ttl: i64) -> RememberedSession {
     RememberedSession {
         origin: origin.into(),
@@ -171,7 +195,7 @@ async fn a_stored_session_enters_without_a_password(cx: &mut TestAppContext) {
     let store = store(&dir);
     // The account case differs from the profile answer; it must still match.
     store
-        .save(&record(&server.base, "NEVA", 7, "token-stored", 3_600))
+        .save_now(&record(&server.base, "NEVA", 7, "token-stored", 3_600))
         .unwrap();
     let (window, view) = open(cx, "", &dir);
     let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
@@ -216,7 +240,7 @@ async fn a_401_deletes_the_record_and_asks_for_the_password(cx: &mut TestAppCont
     let dir = scratch("auto-401");
     let store = store(&dir);
     store
-        .save(&record(&server.base, "neva", 7, "token-dead", 3_600))
+        .save_now(&record(&server.base, "neva", 7, "token-dead", 3_600))
         .unwrap();
     let (window, view) = open(cx, "", &dir);
     let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
@@ -232,7 +256,7 @@ async fn a_401_deletes_the_record_and_asks_for_the_password(cx: &mut TestAppCont
         assert!(v.client.is_none());
         assert!(!v.auth.remember_login);
     });
-    assert!(store.load_for_origin(&server.base).unwrap().is_none());
+    assert!(store.load_now(&server.base).unwrap().is_none());
     std::fs::remove_dir_all(dir).unwrap();
 }
 
@@ -247,7 +271,7 @@ async fn a_network_failure_keeps_the_record_and_retry_signs_in(cx: &mut TestAppC
     let dir = scratch("auto-retry");
     let store = store(&dir);
     store
-        .save(&record(&server.base, "neva", 7, "token-kept", 3_600))
+        .save_now(&record(&server.base, "neva", 7, "token-kept", 3_600))
         .unwrap();
     let (window, view) = open(cx, "", &dir);
     let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
@@ -255,10 +279,10 @@ async fn a_network_failure_keeps_the_record_and_retry_signs_in(cx: &mut TestAppC
 
     confirm(&mut visual, &view, &server.base);
     wait_for(&mut visual, &view, |v| {
-        v.auth.auto_retry && v.auth.status == "Нет связи с сервером."
+        v.auth.auto_retry && v.auth.status == "Нет связи."
     });
     let kept = store
-        .load_for_origin(&server.base)
+        .load_now(&server.base)
         .unwrap()
         .expect("the record survives a network failure");
     assert_eq!(kept.token, "token-kept");
@@ -296,7 +320,7 @@ async fn a_record_for_another_user_is_deleted(cx: &mut TestAppContext) {
     let dir = scratch("wrong-user");
     let store = store(&dir);
     store
-        .save(&record(&server.base, "neva", 7, "token-other", 3_600))
+        .save_now(&record(&server.base, "neva", 7, "token-other", 3_600))
         .unwrap();
     let (window, view) = open(cx, "", &dir);
     let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
@@ -306,7 +330,7 @@ async fn a_record_for_another_user_is_deleted(cx: &mut TestAppContext) {
     wait_for(&mut visual, &view, |v| {
         !v.auth.auto_login && v.auth.status.contains("другого аккаунта")
     });
-    assert!(store.load_for_origin(&server.base).unwrap().is_none());
+    assert!(store.load_now(&server.base).unwrap().is_none());
     view.read_with(&*visual, |v, _| assert!(v.session.is_none()));
     std::fs::remove_dir_all(dir).unwrap();
 }
@@ -318,7 +342,7 @@ async fn unchecking_during_the_flight_blocks_the_late_success(cx: &mut TestAppCo
     let dir = scratch("uncheck-flight");
     let store = store(&dir);
     store
-        .save(&record(&server.base, "neva", 7, "token-flight", 3_600))
+        .save_now(&record(&server.base, "neva", 7, "token-flight", 3_600))
         .unwrap();
     let (window, view) = open(cx, "", &dir);
     let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
@@ -332,7 +356,7 @@ async fn unchecking_during_the_flight_blocks_the_late_success(cx: &mut TestAppCo
             v.auth.remember_login = true;
             v.auth.auto_login = true;
             v.auto_attempt = 7;
-            v.auto_record = store.load_for_origin(&server.base).unwrap();
+            v.auto_record = store.load_now(&server.base).unwrap();
 
             // Exactly what the painted box does: the attempt id moves and the
             // preference turns off.
@@ -367,7 +391,7 @@ async fn unchecking_during_the_flight_blocks_the_late_success(cx: &mut TestAppCo
         });
     });
     assert!(
-        store.load_for_origin(&server.base).unwrap().is_some(),
+        store.load_now(&server.base).unwrap().is_some(),
         "unchecking cancels the attempt but does not delete the record"
     );
     std::fs::remove_dir_all(dir).unwrap();
@@ -380,7 +404,7 @@ async fn an_expired_record_is_deleted_without_a_request(cx: &mut TestAppContext)
     let dir = scratch("expired");
     let store = store(&dir);
     store
-        .save(&record(&server.base, "neva", 7, "token-old", -10))
+        .save_now(&record(&server.base, "neva", 7, "token-old", -10))
         .unwrap();
     let (window, view) = open(cx, "", &dir);
     let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
@@ -425,7 +449,7 @@ async fn the_address_and_login_boxes_are_independent_in_all_four_combinations(
         wait_for(&mut visual, &view, |v| v.session.is_some());
         wait_store(&mut visual, &store, |store| {
             if login {
-                store.load_for_origin(&server.base).unwrap().is_some()
+                store.load_now(&server.base).unwrap().is_some()
             } else {
                 store.load_all().unwrap().is_empty()
             }
@@ -442,7 +466,7 @@ async fn the_address_and_login_boxes_are_independent_in_all_four_combinations(
             assert_eq!(instance, "{\"remember_instance\":false}");
         }
         if login {
-            let saved = store.load_for_origin(&server.base).unwrap().unwrap();
+            let saved = store.load_now(&server.base).unwrap().unwrap();
             assert_eq!(saved.account, "neva");
             assert_eq!(saved.user_id, 7);
             assert_eq!(saved.token, "token-manual");
@@ -462,7 +486,7 @@ async fn an_unchecked_manual_login_removes_a_matching_record(cx: &mut TestAppCon
     let dir = scratch("manual-unchecked");
     let store = store(&dir);
     store
-        .save(&record(&server.base, "neva", 7, "token-old", 3_600))
+        .save_now(&record(&server.base, "neva", 7, "token-old", 3_600))
         .unwrap();
     let (window, view) = open(cx, "", &dir);
     let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
@@ -539,7 +563,7 @@ async fn rotation_updates_the_record_and_the_next_one_catches_up(cx: &mut TestAp
     let dir = scratch("rotation");
     let store = store(&dir);
     store
-        .save(&record(&server.base, "neva", 7, "token-1", 3_600))
+        .save_now(&record(&server.base, "neva", 7, "token-1", 3_600))
         .unwrap();
     let (window, view) = open(cx, &server.base, &dir);
     let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
@@ -600,7 +624,7 @@ async fn logout_deletes_the_record_even_without_the_server(cx: &mut TestAppConte
     let dir = scratch("logout");
     let store = store(&dir);
     store
-        .save(&record(&server.base, "neva", 7, "token-1", 3_600))
+        .save_now(&record(&server.base, "neva", 7, "token-1", 3_600))
         .unwrap();
     let (window, view) = open(cx, &server.base, &dir);
     let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
@@ -629,7 +653,7 @@ async fn closing_the_window_keeps_the_remembered_login(cx: &mut TestAppContext) 
     let dir = scratch("drop");
     let store = store(&dir);
     let saved = record("http://127.0.0.1:1", "neva", 7, "token-1", 3_600);
-    store.save(&saved).unwrap();
+    store.save_now(&saved).unwrap();
     let (window, _view) = open(cx, "", &dir);
     let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
     visual.run_until_parked();
@@ -667,7 +691,7 @@ async fn a_damaged_blob_falls_back_to_the_password_and_can_be_repaired(cx: &mut 
     wait_for(&mut visual, &view, |v| v.session.is_some());
     wait_store(&mut visual, &store, |store| {
         store
-            .load_for_origin(&server.base)
+            .load_now(&server.base)
             .unwrap()
             .is_some_and(|record| record.token == "token-manual")
     });
@@ -691,7 +715,7 @@ async fn two_origins_never_exchange_their_bearer(cx: &mut TestAppContext) {
     let dir = scratch("two-origins");
     let store = store(&dir);
     store
-        .save(&record(&first.base, "neva", 7, "token-first", 3_600))
+        .save_now(&record(&first.base, "neva", 7, "token-first", 3_600))
         .unwrap();
     let (window, view) = open(cx, &second.base, &dir);
     let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
@@ -810,3 +834,6 @@ async fn the_login_checkbox_is_painted_on_the_password_label_row(cx: &mut TestAp
     }
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+mod edge_tests;
+mod epoch_tests;

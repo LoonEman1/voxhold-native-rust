@@ -214,9 +214,6 @@ pub(crate) struct Voxhold {
     remember_error: String,
     /// The kept record that «Повторить» uses without asking for the address.
     auto_record: Option<session_store::RememberedSession>,
-    /// Bumped when a session ends, so a late save cannot recreate a record
-    /// after an explicit logout.
-    store_epoch: std::sync::Arc<std::sync::atomic::AtomicU64>,
     self_user_id: i64,
     search: Option<Entity<search::SearchPanel>>,
     show_search: bool,
@@ -579,7 +576,6 @@ impl Voxhold {
             last_stored_token: None,
             remember_error: String::new(),
             auto_record: None,
-            store_epoch: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             self_user_id: 0,
             search: None,
             show_search: false,

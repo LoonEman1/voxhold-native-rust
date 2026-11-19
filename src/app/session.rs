@@ -74,7 +74,6 @@ impl Voxhold {
         self.auth.auto_retry = false;
         self.auto_record = None;
         self.remember_error.clear();
-        let remember = self.auth.remember_login;
         self.error.clear();
         cx.notify();
         let attempt = request.attempt;
@@ -123,6 +122,9 @@ impl Voxhold {
                 let token = login_session.token().to_owned();
                 let expires_at = login_session.expires_at();
                 s.enter_workspace(c, servers, login_session, window, cx);
+                // The box may have been toggled while the answer was in flight;
+                // the state at completion decides, not the state at submit.
+                let remember = s.auth.remember_login;
                 s.remember_manual_login(
                     remember, origin, account, user_id, token, expires_at, window, cx,
                 );
@@ -227,7 +229,7 @@ impl Voxhold {
             .as_ref()
             .map(|session| (session.origin().to_owned(), session.username().to_owned()));
         self.end_session(window, cx, String::new());
-        self.forget_stored(stored);
+        self.forget_stored(stored, window, cx);
         if let Some(revocation) = revocation {
             let runtime = self.runtime.clone();
             runtime.spawn(async move {
@@ -252,17 +254,17 @@ impl Voxhold {
             session.invalidate();
         }
         self.end_session(window, cx, "Сессия истекла. Войдите снова.".into());
-        self.forget_stored(stored);
+        self.forget_stored(stored, window, cx);
     }
 
     /// Drop the whole signed-in state. `reason` is shown on the login screen;
     /// an empty reason is a normal logout.
     fn end_session(&mut self, window: &mut Window, cx: &mut Context<Self>, reason: String) {
         self.stop_session_clock();
-        // Any late store write that started before this point must not apply,
-        // and no automatic attempt may finish after the session ended.
-        self.store_epoch
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        // Any write that captured the previous generation must not apply: a
+        // save still queued from before the logout cannot revive the record,
+        // and a delete from this session cannot remove a later login.
+        self.session_store.bump_epoch();
         self.auto_attempt = self.auto_attempt.wrapping_add(1);
         self.last_stored_token = None;
         self.auto_record = None;
@@ -419,6 +421,9 @@ impl Voxhold {
     ) {
         self.session = Some(session);
         self.session_epoch = self.session_epoch.wrapping_add(1);
+        // A new login owns a fresh store generation, so a delete that was
+        // queued by the previous session is stale even if it runs later.
+        self.session_store.bump_epoch();
         self.session_gate.reset();
         self.start_session_clock(window, cx);
     }

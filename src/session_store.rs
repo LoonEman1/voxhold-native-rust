@@ -10,8 +10,15 @@
 //! windows or two processes cannot drop each other's records. A record is keyed
 //! by the exact origin (scheme, host and port) and the account without regard
 //! to case; the token only ever goes back to that origin.
+//!
+//! The store also owns a generation counter. A background write captures it and
+//! passes it back; a logout or a new login bumps it, so a write that was queued
+//! before the change is refused with [`StoreError::Stale`] instead of reviving
+//! or deleting the session that replaced it. Loading is bounded (256 KiB, 16
+//! records) and every record is validated before it is returned.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
@@ -26,6 +33,11 @@ const ENTROPY: &[u8] = b"VoxHold session v1";
 const MUTEX_NAME: &str = "Local\\VoxHold.SessionStore.v1";
 /// How long a writer waits for another process before giving up.
 const LOCK_TIMEOUT_MS: u32 = 5_000;
+/// The largest file worth decrypting. Sixteen records are a few kilobytes; a
+/// bigger file is damage, not a record list.
+const MAX_FILE_BYTES: u64 = 256 * 1024;
+/// How many remembered logins one file may hold. The oldest are dropped first.
+const MAX_RECORDS: usize = 16;
 
 /// One remembered login. The token is the credential, so the manual `Debug`
 /// below always prints `<redacted>`; no error or log line carries it either.
@@ -74,6 +86,9 @@ pub enum StoreError {
     Io,
     /// A record that cannot be stored (empty origin, account or token).
     Invalid,
+    /// The session that scheduled this write has already ended; nothing was
+    /// written and nothing was deleted.
+    Stale,
     /// DPAPI or the named mutex is not available on this platform.
     #[allow(dead_code)]
     Unsupported,
@@ -86,6 +101,7 @@ impl std::fmt::Display for StoreError {
             StoreError::Lock => "хранилище сессий занято",
             StoreError::Io => "хранилище сессий недоступно",
             StoreError::Invalid => "некорректная запись сессии",
+            StoreError::Stale => "сессия уже завершена",
             StoreError::Unsupported => "хранилище сессий не поддерживается",
         })
     }
@@ -94,11 +110,13 @@ impl std::fmt::Display for StoreError {
 impl std::error::Error for StoreError {}
 
 /// One owner for the file. `Clone` is cheap and every clone shares the same
-/// in-process lock; the named mutex is taken per operation.
+/// in-process lock and generation counter; the named mutex is taken per
+/// operation.
 #[derive(Clone)]
 pub struct SessionStore {
     path: Option<PathBuf>,
     lock: Arc<Mutex<()>>,
+    epoch: Arc<AtomicU64>,
 }
 
 impl SessionStore {
@@ -106,7 +124,21 @@ impl SessionStore {
         Self {
             path,
             lock: Arc::new(Mutex::new(())),
+            epoch: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// The current generation of the signed-in session. A background write
+    /// captures this value and passes it back, so a logout that happens while
+    /// the write is queued invalidates it instead of resurrecting the record.
+    pub fn epoch(&self) -> u64 {
+        self.epoch.load(Ordering::SeqCst)
+    }
+
+    /// End the current generation. Every write that captured an older value is
+    /// refused with [`StoreError::Stale`]; returns the new generation.
+    pub fn bump_epoch(&self) -> u64 {
+        self.epoch.fetch_add(1, Ordering::SeqCst) + 1
     }
 
     /// `%APPDATA%\Voxhold\sessions.bin`, with the same fallbacks as the other
@@ -119,14 +151,31 @@ impl SessionStore {
         Some(base.join("Voxhold").join("sessions.bin"))
     }
 
-    /// The newest record for this exact origin. A different scheme, host or
-    /// port never matches, so a token cannot travel to another instance.
-    pub fn load_for_origin(&self, origin: &str) -> Result<Option<RememberedSession>, StoreError> {
+    /// The newest usable record for this exact origin. A different scheme, host
+    /// or port never matches, so a token cannot travel to another instance.
+    ///
+    /// A record that has already expired is only returned when every record for
+    /// the origin is expired: the newest stale one is then handed back so the
+    /// caller can delete it. This keeps a dead newer record from hiding an
+    /// older token that still works.
+    pub fn load_for_origin(
+        &self,
+        origin: &str,
+        now: i64,
+    ) -> Result<Option<RememberedSession>, StoreError> {
         let records = self.load_all()?;
-        Ok(records
+        let matching: Vec<RememberedSession> = records
             .into_iter()
             .filter(|record| record.origin == origin)
-            .max_by_key(|record| record.saved_at))
+            .collect();
+        if let Some(valid) = matching
+            .iter()
+            .filter(|record| !record.is_expired(now))
+            .max_by_key(|record| record.saved_at)
+        {
+            return Ok(Some(valid.clone()));
+        }
+        Ok(matching.into_iter().max_by_key(|record| record.saved_at))
     }
 
     pub fn load_all(&self) -> Result<Vec<RememberedSession>, StoreError> {
@@ -142,27 +191,29 @@ impl SessionStore {
 
     /// Insert or replace the record for `(origin, account)`. A corrupt file is
     /// treated as empty: a manual login with the box checked may repair it.
-    pub fn save(&self, record: &RememberedSession) -> Result<(), StoreError> {
-        if record.origin.trim().is_empty()
-            || record.account.trim().is_empty()
-            || record.token.is_empty()
-            || record.user_id <= 0
-            || record.expires_at <= 0
-        {
+    /// `expected_epoch` must still be the current generation.
+    pub fn save(&self, record: &RememberedSession, expected_epoch: u64) -> Result<(), StoreError> {
+        if !valid_record(record) {
             return Err(StoreError::Invalid);
         }
-        self.write_records(|records| {
+        self.write_records(expected_epoch, |records| {
             records.retain(|current| !same_key(current, &record.origin, &record.account));
             records.push(record.clone());
+            trim_records(records);
             true
         })
         .map(|_| ())
     }
 
     /// Drop the record for `(origin, account)`. Account comparison ignores
-    /// case; the origin is exact.
-    pub fn delete(&self, origin: &str, account: &str) -> Result<(), StoreError> {
-        self.write_records(|records| {
+    /// case; the origin is exact. `expected_epoch` must still be current.
+    pub fn delete(
+        &self,
+        origin: &str,
+        account: &str,
+        expected_epoch: u64,
+    ) -> Result<(), StoreError> {
+        self.write_records(expected_epoch, |records| {
             let before = records.len();
             records.retain(|current| !same_key(current, origin, account));
             records.len() != before
@@ -174,7 +225,7 @@ impl SessionStore {
     /// record still belongs to this account and carries one of the accepted
     /// tokens. Returns whether the file changed. A failed attempt leaves the
     /// record untouched so the next rotation can catch up with the previous
-    /// stored token.
+    /// stored token. A stale generation changes nothing.
     pub fn update_after_refresh(
         &self,
         origin: &str,
@@ -182,9 +233,10 @@ impl SessionStore {
         accepted_tokens: &[&str],
         new_token: &str,
         expires_at: i64,
-    ) -> bool {
+        expected_epoch: u64,
+    ) -> Result<bool, StoreError> {
         if new_token.is_empty() || expires_at <= 0 {
-            return false;
+            return Ok(false);
         }
         let accepted: Vec<&str> = accepted_tokens
             .iter()
@@ -192,9 +244,9 @@ impl SessionStore {
             .filter(|token| !token.is_empty())
             .collect();
         if accepted.is_empty() {
-            return false;
+            return Ok(false);
         }
-        self.write_records(|records| {
+        self.write_records(expected_epoch, |records| {
             let Some(record) = records
                 .iter_mut()
                 .find(|record| same_key(record, origin, account))
@@ -208,13 +260,16 @@ impl SessionStore {
             record.expires_at = expires_at;
             true
         })
-        .unwrap_or(false)
     }
 
-    /// Serialize one read-modify-write under both locks. The closure returns
-    /// whether it changed anything; the file is rewritten only when it did.
+    /// Serialize one read-modify-write under both locks. The generation is
+    /// checked only after the locks are held, so a logout that bumped it while
+    /// this write waited for the file cannot be overwritten by a late save.
+    /// The closure returns whether it changed anything; the file is rewritten
+    /// only when it did.
     fn write_records(
         &self,
+        expected_epoch: u64,
         change: impl FnOnce(&mut Vec<RememberedSession>) -> bool,
     ) -> Result<bool, StoreError> {
         let Some(path) = &self.path else {
@@ -225,6 +280,9 @@ impl SessionStore {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let _named = NamedLock::acquire()?;
+        if self.epoch() != expected_epoch {
+            return Err(StoreError::Stale);
+        }
         let mut records = match read_records(path) {
             Ok(records) => records,
             // A manual save or a logout may replace a damaged file. A failed
@@ -241,11 +299,42 @@ impl SessionStore {
 }
 
 fn same_key(record: &RememberedSession, origin: &str, account: &str) -> bool {
-    record.origin == origin && account_eq(&record.account, account)
+    record.origin == origin && accounts_match(&record.account, account)
 }
 
-fn account_eq(left: &str, right: &str) -> bool {
-    left.trim() == right.trim() || left.trim().to_lowercase() == right.trim().to_lowercase()
+/// Account comparison shared by the store and the automatic login: trim and a
+/// Unicode-aware lower case, so «Нева» and «нева» are the same account. The
+/// backend applies NFKC plus lower case; the local file never needs the
+/// normalization form because both sides go through this one function.
+pub(crate) fn accounts_match(left: &str, right: &str) -> bool {
+    let (left, right) = (left.trim(), right.trim());
+    left == right || left.to_lowercase() == right.to_lowercase()
+}
+
+/// One record as it is allowed to leave the file: a canonical origin, a real
+/// account and token, and a positive identity and expiry.
+fn valid_record(record: &RememberedSession) -> bool {
+    !record.account.trim().is_empty()
+        && !record.token.is_empty()
+        && record.user_id > 0
+        && record.expires_at > 0
+        && canonical_origin(&record.origin).is_some_and(|origin| origin == record.origin)
+}
+
+fn canonical_origin(origin: &str) -> Option<String> {
+    voxhold_api::Client::new(origin)
+        .ok()
+        .map(|client| client.origin())
+}
+
+/// Keep the newest `MAX_RECORDS` records. Only a file over the limit is sorted,
+/// so an ordinary two-record file keeps its insertion order.
+fn trim_records(records: &mut Vec<RememberedSession>) {
+    if records.len() <= MAX_RECORDS {
+        return;
+    }
+    records.sort_by(|left, right| right.saved_at.cmp(&left.saved_at));
+    records.truncate(MAX_RECORDS);
 }
 
 fn read_records(path: &Path) -> Result<Vec<RememberedSession>, StoreError> {
@@ -254,6 +343,12 @@ fn read_records(path: &Path) -> Result<Vec<RememberedSession>, StoreError> {
         if !parent.as_os_str().is_empty() && parent.exists() && !parent.is_dir() {
             return Err(StoreError::Io);
         }
+    }
+    match std::fs::metadata(path) {
+        Ok(metadata) if metadata.len() > MAX_FILE_BYTES => return Err(StoreError::Corrupt),
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(_) => return Err(StoreError::Io),
     }
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
@@ -264,7 +359,12 @@ fn read_records(path: &Path) -> Result<Vec<RememberedSession>, StoreError> {
         return Err(StoreError::Corrupt);
     }
     let plain = unprotect(&bytes[MAGIC.len()..])?;
-    serde_json::from_slice::<Vec<RememberedSession>>(&plain).map_err(|_| StoreError::Corrupt)
+    let mut records = serde_json::from_slice::<Vec<RememberedSession>>(&plain)
+        .map_err(|_| StoreError::Corrupt)?;
+    // A single damaged record must not take the whole list down with it.
+    records.retain(valid_record);
+    trim_records(&mut records);
+    Ok(records)
 }
 
 fn write_records_file(path: &Path, records: &[RememberedSession]) -> Result<(), StoreError> {
@@ -351,6 +451,9 @@ fn unprotect(blob: &[u8]) -> Result<Zeroizing<Vec<u8>>, StoreError> {
         std::slice::from_raw_parts(output.pbData, output.cbData as usize).to_vec()
     });
     unsafe {
+        // The decrypted copy is already wrapped in `Zeroizing`; the DPAPI buffer
+        // still holds the same plaintext until it is freed, so wipe it first.
+        std::ptr::write_bytes(output.pbData, 0, output.cbData as usize);
         LocalFree(output.pbData as *mut core::ffi::c_void);
     }
     Ok(bytes)
@@ -419,329 +522,4 @@ impl NamedLock {
 }
 
 #[cfg(all(test, windows))]
-mod tests {
-    use super::*;
-
-    fn scratch(name: &str) -> (PathBuf, PathBuf) {
-        let dir = std::env::temp_dir().join(format!(
-            "voxhold-session-store-{}-{}-{name}",
-            std::process::id(),
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        (dir.clone(), dir.join("sessions.bin"))
-    }
-
-    fn record(origin: &str, account: &str, token: &str) -> RememberedSession {
-        RememberedSession {
-            origin: origin.into(),
-            account: account.into(),
-            user_id: 7,
-            token: token.into(),
-            expires_at: crate::auth_session::now_unix() + 3_600,
-            saved_at: crate::auth_session::now_unix(),
-        }
-    }
-
-    #[test]
-    fn a_record_round_trips_through_dpapi_without_plaintext() {
-        let (dir, path) = scratch("roundtrip");
-        let store = SessionStore::new(Some(path.clone()));
-        let saved = record("https://chat.example.org:8443", "neva", "token-secret");
-        store.save(&saved).unwrap();
-
-        let bytes = std::fs::read(&path).unwrap();
-        assert_eq!(&bytes[..MAGIC.len()], MAGIC);
-        assert!(
-            !bytes
-                .windows(saved.token.len())
-                .any(|w| w == saved.token.as_bytes()),
-            "the file must not contain the token"
-        );
-        assert_eq!(store.load_all().unwrap(), vec![saved.clone()]);
-        assert_eq!(
-            store
-                .load_for_origin("https://chat.example.org:8443")
-                .unwrap(),
-            Some(saved)
-        );
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn a_missing_file_is_empty_and_a_bad_magic_is_corrupt() {
-        let (dir, path) = scratch("magic");
-        let store = SessionStore::new(Some(path.clone()));
-        assert!(store.load_all().unwrap().is_empty());
-
-        std::fs::write(&path, b"not our file").unwrap();
-        assert_eq!(store.load_all(), Err(StoreError::Corrupt));
-        std::fs::write(&path, MAGIC).unwrap();
-        assert_eq!(store.load_all(), Err(StoreError::Corrupt));
-
-        let mut foreign = MAGIC.to_vec();
-        foreign.extend_from_slice(b"garbage blob");
-        std::fs::write(&path, &foreign).unwrap();
-        assert_eq!(store.load_all(), Err(StoreError::Corrupt));
-        // A save repairs a damaged file instead of refusing the login.
-        let saved = record("https://chat.example.org", "neva", "token-1");
-        store.save(&saved).unwrap();
-        assert_eq!(store.load_all().unwrap(), vec![saved]);
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn a_valid_blob_with_broken_json_is_corrupt_without_a_panic() {
-        let (dir, path) = scratch("json");
-        let mut bytes = MAGIC.to_vec();
-        bytes.extend_from_slice(&protect(b"not json").unwrap());
-        std::fs::write(&path, bytes).unwrap();
-        let store = SessionStore::new(Some(path));
-        assert_eq!(store.load_all(), Err(StoreError::Corrupt));
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn the_origin_including_the_port_must_match_exactly() {
-        let (dir, path) = scratch("origin");
-        let store = SessionStore::new(Some(path));
-        let first = record("https://chat.example.org:8443", "neva", "token-a");
-        let second = record("https://chat.example.org:9443", "neva", "token-b");
-        store.save(&first).unwrap();
-        store.save(&second).unwrap();
-
-        assert_eq!(
-            store
-                .load_for_origin("https://chat.example.org:8443")
-                .unwrap(),
-            Some(first)
-        );
-        assert_eq!(
-            store
-                .load_for_origin("https://chat.example.org:9443")
-                .unwrap(),
-            Some(second)
-        );
-        assert!(store
-            .load_for_origin("https://chat.example.org")
-            .unwrap()
-            .is_none());
-        assert!(store
-            .load_for_origin("http://chat.example.org:8443")
-            .unwrap()
-            .is_none());
-        assert_eq!(store.load_all().unwrap().len(), 2);
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn the_account_ignores_case_and_save_replaces_the_same_key() {
-        let (dir, path) = scratch("account");
-        let store = SessionStore::new(Some(path));
-        store
-            .save(&record("https://chat.example.org", "Neva", "token-1"))
-            .unwrap();
-        store
-            .save(&record("https://chat.example.org", "neva", "token-2"))
-            .unwrap();
-        let all = store.load_all().unwrap();
-        assert_eq!(all.len(), 1, "one record per origin and account");
-        assert_eq!(all[0].token, "token-2");
-
-        store.delete("https://chat.example.org", "NEVA").unwrap();
-        assert!(store.load_all().unwrap().is_empty());
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn expiry_is_visible_so_the_caller_can_delete_the_record() {
-        let (dir, path) = scratch("expired");
-        let store = SessionStore::new(Some(path));
-        let mut saved = record("https://chat.example.org", "neva", "token-1");
-        saved.expires_at = 100;
-        store.save(&saved).unwrap();
-        let loaded = store.load_all().unwrap();
-        assert!(loaded[0].is_expired(101));
-        assert!(!loaded[0].is_expired(99));
-        store.delete(&saved.origin, &saved.account).unwrap();
-        assert!(store.load_all().unwrap().is_empty());
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn rotation_only_replaces_an_accepted_token_and_the_previous_one_can_catch_up() {
-        let (dir, path) = scratch("rotation");
-        let store = SessionStore::new(Some(path));
-        store
-            .save(&record("https://chat.example.org", "neva", "token-1"))
-            .unwrap();
-
-        assert!(!store.update_after_refresh(
-            "https://chat.example.org",
-            "neva",
-            &["token-9"],
-            "token-2",
-            5_000
-        ));
-        assert_eq!(store.load_all().unwrap()[0].token, "token-1");
-
-        assert!(store.update_after_refresh(
-            "https://chat.example.org",
-            "neva",
-            &["token-1"],
-            "token-2",
-            5_000
-        ));
-        let saved = store.load_all().unwrap();
-        assert_eq!(saved[0].token, "token-2");
-        assert_eq!(saved[0].expires_at, 5_000);
-
-        // The first update was lost: the next rotation still knows the token
-        // that was actually stored and catches up with it.
-        assert!(store.update_after_refresh(
-            "https://chat.example.org",
-            "neva",
-            &["token-3", "token-2"],
-            "token-4",
-            6_000
-        ));
-        assert_eq!(store.load_all().unwrap()[0].token, "token-4");
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn rotation_never_touches_another_origin_or_account() {
-        let (dir, path) = scratch("rotation-other");
-        let store = SessionStore::new(Some(path));
-        store
-            .save(&record("https://chat.example.org:8443", "neva", "token-1"))
-            .unwrap();
-        assert!(!store.update_after_refresh(
-            "https://chat.example.org:9443",
-            "neva",
-            &["token-1"],
-            "token-2",
-            5_000
-        ));
-        assert!(!store.update_after_refresh(
-            "https://chat.example.org:8443",
-            "bob",
-            &["token-1"],
-            "token-2",
-            5_000
-        ));
-        assert_eq!(store.load_all().unwrap()[0].token, "token-1");
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn two_threads_saving_and_deleting_keep_every_other_record() {
-        let (dir, path) = scratch("threads");
-        let store = SessionStore::new(Some(path));
-        let start = std::sync::Barrier::new(2);
-        std::thread::scope(|scope| {
-            for worker in 0..2 {
-                let store = store.clone();
-                let start = &start;
-                scope.spawn(move || {
-                    start.wait();
-                    for index in 0..20 {
-                        let account = format!("user-{worker}-{index}");
-                        store
-                            .save(&record(
-                                "https://chat.example.org",
-                                &account,
-                                &format!("token-{worker}-{index}"),
-                            ))
-                            .unwrap();
-                        if index % 2 == 0 {
-                            store.delete("https://chat.example.org", &account).unwrap();
-                        }
-                    }
-                });
-            }
-        });
-        // Each worker leaves ten records; the other thread's records survive.
-        assert_eq!(store.load_all().unwrap().len(), 20);
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn a_read_only_file_reports_an_error_and_stays_intact() {
-        struct ReadWrite(PathBuf);
-
-        impl Drop for ReadWrite {
-            fn drop(&mut self) {
-                if let Ok(metadata) = std::fs::metadata(&self.0) {
-                    let mut permissions = metadata.permissions();
-                    permissions.set_readonly(false);
-                    let _ = std::fs::set_permissions(&self.0, permissions);
-                }
-            }
-        }
-
-        let (dir, path) = scratch("readonly");
-        let store = SessionStore::new(Some(path.clone()));
-        store
-            .save(&record("https://chat.example.org", "neva", "token-1"))
-            .unwrap();
-        let before = std::fs::read(&path).unwrap();
-        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
-        permissions.set_readonly(true);
-        std::fs::set_permissions(&path, permissions).unwrap();
-        let guard = ReadWrite(path.clone());
-
-        let result = store.save(&record("https://chat.example.org", "neva", "token-2"));
-
-        drop(guard);
-        assert_eq!(result, Err(StoreError::Io));
-        assert_eq!(std::fs::read(&path).unwrap(), before);
-        let entries: Vec<_> = std::fs::read_dir(&dir)
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-            .collect();
-        assert_eq!(entries, vec!["sessions.bin".to_string()]);
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn an_unavailable_directory_reports_an_error() {
-        let (dir, path) = scratch("unavailable");
-        // The parent is a file, so neither the directory nor the temp file can
-        // be created; the call must fail rather than pretend success.
-        let blocker = dir.join("blocker");
-        std::fs::write(&blocker, b"x").unwrap();
-        let store = SessionStore::new(Some(blocker.join("sessions.bin")));
-        assert!(store
-            .save(&record("https://chat.example.org", "neva", "token-1"))
-            .is_err());
-        assert_eq!(store.load_all(), Err(StoreError::Io));
-        std::fs::remove_dir_all(dir).unwrap();
-        let _ = path;
-    }
-
-    #[test]
-    fn a_disabled_store_is_a_quiet_no_op() {
-        let store = SessionStore::new(None);
-        assert!(store.load_all().unwrap().is_empty());
-        assert!(store
-            .save(&record("https://chat.example.org", "neva", "token-1"))
-            .is_ok());
-        assert!(!store.update_after_refresh(
-            "https://chat.example.org",
-            "neva",
-            &["token-1"],
-            "token-2",
-            5_000
-        ));
-    }
-
-    #[test]
-    fn debug_output_never_prints_the_token() {
-        let saved = record("https://chat.example.org", "neva", "token-secret");
-        let debug = format!("{saved:?}");
-        assert!(debug.contains("<redacted>"), "{debug}");
-        assert!(!debug.contains("token-secret"), "{debug}");
-        assert!(debug.contains("neva"), "{debug}");
-    }
-}
+mod tests;

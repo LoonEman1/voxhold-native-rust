@@ -183,9 +183,18 @@ impl Voxhold {
             .is_some_and(|panel| panel.read(cx).call_active());
         #[cfg(not(feature = "voxhold-media"))]
         let in_call = false;
-        // The slider follows the same decision as the sent controls: outside a
-        // call the stored value is editable for the next join, in a call only
-        // a path that applies the numeric gain (the software mixer) is.
+        // The capability row and the slider describe the playback path, not
+        // the capture chain: a software microphone can be played by the
+        // platform ADM, and a platform microphone can coexist with the running
+        // software mixer. Only the panel knows which path owns the room now.
+        #[cfg(feature = "voxhold-media")]
+        let output_gain_path = self
+            .voice
+            .as_ref()
+            .map(|panel| panel.read(cx).output_gain_path())
+            .unwrap_or(crate::audio_capabilities::OutputGainPath::Software);
+        #[cfg(not(feature = "voxhold-media"))]
+        let output_gain_path = crate::audio_capabilities::OutputGainPath::Software;
         #[cfg(feature = "voxhold-media")]
         let output_gain_applied = self
             .voice
@@ -193,6 +202,18 @@ impl Voxhold {
             .is_none_or(|panel| panel.read(cx).output_gain_applied());
         #[cfg(not(feature = "voxhold-media"))]
         let output_gain_applied = true;
+        #[cfg(feature = "voxhold-media")]
+        let output_support = if output_gain_applied {
+            Support::Applied
+        } else {
+            Support::Unavailable
+        };
+        // Without the media crate nothing is applied, whatever path the form
+        // would name.
+        #[cfg(not(feature = "voxhold-media"))]
+        let output_support = capabilities.output_gain;
+        let output_gain_note = crate::voice_form_text::output_gain_note(output_gain_path);
+        let output_volume_note = crate::voice_form_text::output_volume_note(output_gain_path);
         let output_editable = output_gain_editable(in_call, output_gain_applied);
         let (_, input_ids, input_current) = device_choices(&prefs, &devices, true);
         let (_, output_ids, output_current) = device_choices(&prefs, &devices, false);
@@ -336,8 +357,15 @@ impl Voxhold {
                     window,
                     cx,
                 ))
-                .child(self.form_text(crate::voice_form_text::OUTPUT_VOLUME_NOTE, false))
+                .child(self.form_text(output_volume_note, false))
         } else {
+            // The ADM id is kept for the established layout test; a transient
+            // mixer outage gets its own selector because it is not the ADM.
+            let note_id = if output_gain_path == crate::audio_capabilities::OutputGainPath::Adm {
+                "output-volume-adm-note"
+            } else {
+                "output-volume-path-note"
+            };
             levels
                 .child(self.settings_slider_disabled(
                     "output-volume",
@@ -350,11 +378,7 @@ impl Voxhold {
                     window,
                     cx,
                 ))
-                .child(self.voice_note(
-                    "output-volume-adm-note",
-                    crate::voice_form_text::OUTPUT_VOLUME_ADM_NOTE,
-                    false,
-                ))
+                .child(self.voice_note(note_id, output_volume_note, false))
         };
         root = root.child(self.settings_card(
             "voice-levels-card",
@@ -637,8 +661,8 @@ impl Voxhold {
                 .child(self.voice_capability(
                     "cap-output",
                     "Громкость вывода",
-                    capabilities.output_gain,
-                    crate::voice_form_text::OUTPUT_GAIN_NOTE,
+                    output_support,
+                    output_gain_note,
                 ))
                 .child(self.voice_capability(
                     "cap-bitrate",
@@ -935,62 +959,6 @@ impl Voxhold {
             .child(track)
             .into_any_element()
     }
-
-    /// A note with a debug selector, so the layout tests can prove that the
-    /// diagnostics block reveals and hides the technical text.
-    fn voice_note(&self, id: &'static str, text: &str, danger: bool) -> AnyElement {
-        div()
-            .w_full()
-            .debug_selector(move || id.to_string())
-            .child(self.form_text(text, danger))
-            .into_any_element()
-    }
-
-    /// One capability row: a label, a short support tag and the honest note.
-    fn voice_capability(
-        &self,
-        id: &'static str,
-        label: &str,
-        support: Support,
-        note: &str,
-    ) -> AnyElement {
-        let p = self.palette;
-        let tag = match support {
-            Support::Applied => "применяется",
-            Support::Automatic => "автоматически",
-            Support::Unavailable => "недоступно",
-        };
-        let tag_color = match support {
-            Support::Applied => p.lime,
-            Support::Automatic => p.muted,
-            Support::Unavailable => p.danger,
-        };
-        div()
-            .id(ElementId::Name(id.into()))
-            .debug_selector(move || id.to_string())
-            .w_full()
-            .flex()
-            .flex_col()
-            .gap(px(1.))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(div().text_size(px(13.)).child(format!("{label} · ")))
-                    .child(
-                        div()
-                            .text_size(px(12.))
-                            .text_color(ink(tag_color))
-                            .child(tag.to_owned()),
-                    ),
-            )
-            .child(
-                div()
-                    .text_size(px(12.))
-                    .text_color(ink(p.muted))
-                    .child(note.to_owned()),
-            )
-            .into_any_element()
-    }
 }
+
+mod notes;

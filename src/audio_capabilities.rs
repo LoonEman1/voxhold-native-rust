@@ -2,6 +2,30 @@
 //! conservative answer is "nothing is applied", so the form still builds and
 //! no switch promises an effect it cannot have.
 
+/// Which path owns room playback right now, for the numeric output gain.
+///
+/// The capture chain does not decide this: a software microphone can be played
+/// by the platform ADM, and a platform microphone can coexist with the running
+/// software mixer. The panel reports the live decision, and the settings form
+/// and its sentences read it instead of `capabilities_for`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OutputGainPath {
+    /// The software mixer is open and applies the participant percentages.
+    Software,
+    /// The platform ADM owns the room; only real mute/deafen applies.
+    Adm,
+    /// No live path applies the numeric gain right now: the mixer is opening,
+    /// retrying or suspended, and the ADM does not play the room either.
+    Unavailable,
+}
+
+impl OutputGainPath {
+    /// Whether the stored 0–200 % reaches the played room on this path.
+    pub fn applies_numeric_gain(self) -> bool {
+        matches!(self, Self::Software)
+    }
+}
+
 #[cfg(feature = "voxhold-media")]
 pub use voxhold_media::capabilities::*;
 

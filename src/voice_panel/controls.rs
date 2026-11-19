@@ -2,6 +2,8 @@
 //! selection ids and player state stay in `voice_panel.rs`.
 
 use super::*;
+use crate::audio_capabilities::OutputGainPath;
+use voxhold_media::mixer::PlayoutPhase;
 
 impl VoicePanel {
     /// The folded capture decision of the last `refresh_capture`: true means
@@ -99,31 +101,62 @@ impl VoicePanel {
         self.refresh_capture();
     }
 
-    /// The system ADM owns playback: it has no numeric bus gain, so the room
-    /// percentage must not be sent at all. A `platform` capture is the same
-    /// path even if a stale flag still says software.
-    fn adm_playback(&self) -> bool {
-        self.applied_audio
-            .as_ref()
-            .is_some_and(|audio| audio.capture == "platform" || !audio.software_mixer)
+    /// Which path owns room playback right now, as far as the numeric gain is
+    /// concerned. The capture chain is not the answer: a software microphone
+    /// can be played by the ADM, and a platform microphone can coexist with
+    /// the running software mixer.
+    pub fn output_gain_path(&self) -> OutputGainPath {
+        let Some(audio) = self.applied_audio.as_ref() else {
+            // No path reported yet (outside a call or before the first
+            // `Audio` event): the software mixer is the default chain and the
+            // stored percentage is what the next join will use.
+            return OutputGainPath::Software;
+        };
+        if self.power_paused {
+            // Suspend released the sink; neither the mixer nor the ADM
+            // plays the room until the resume handler reopens it.
+            return OutputGainPath::Unavailable;
+        }
+        if let Some(stats) = &self.playout {
+            if stats.phase == PlayoutPhase::AdmFallback {
+                // The recovery budget was spent; the platform ADM owns the
+                // room and only the real mute/deafen applies.
+                return OutputGainPath::Adm;
+            }
+            if stats.running {
+                return OutputGainPath::Software;
+            }
+            // The mixer opened before and is now in its bounded
+            // Opening/Unstable retry. The `software_mixer` flag in the stale
+            // `Audio` report is false there, but the ADM does not play the
+            // room either: the numeric gain is only temporarily unavailable.
+            return OutputGainPath::Unavailable;
+        }
+        if audio.software_mixer {
+            // A live flag without a playout report yet: the mixer is starting.
+            OutputGainPath::Software
+        } else {
+            // The session never opened a software mixer; the ADM plays.
+            OutputGainPath::Adm
+        }
     }
 
-    /// The room percentage that reaches the engine. Outside a known path and
-    /// on the software mixer it is the stored value; on the ADM it is `None`,
-    /// so only the real mute/deafen flag applies.
+    /// The room percentage that reaches the engine. The ADM has no numeric bus
+    /// gain, so it gets `None` and only the real mute/deafen flag applies. A
+    /// transiently unavailable mixer keeps the stored value, which the mixer
+    /// reads when it reopens.
     fn output_gain_for_path(&self) -> Option<f64> {
-        if self.adm_playback() {
-            None
-        } else {
-            self.saved_output_gain
+        match self.output_gain_path() {
+            OutputGainPath::Adm => None,
+            OutputGainPath::Software | OutputGainPath::Unavailable => self.saved_output_gain,
         }
     }
 
     /// Whether the stored room percentage is applied by the active path. The
-    /// settings slider uses the same decision as the sent controls, so it
-    /// cannot promise an effect the path ignores.
+    /// settings slider and its sentence use the same decision as the sent
+    /// controls, so they cannot promise an effect the path ignores.
     pub fn output_gain_applied(&self) -> bool {
-        !self.adm_playback()
+        self.output_gain_path().applies_numeric_gain()
     }
 
     /// Re-evaluate the room gain after the engine reported another playback

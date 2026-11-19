@@ -146,6 +146,9 @@ impl VoicePanel {
             }
             VoiceUpdate::Playout(stats) => {
                 self.playout = Some(stats);
+                // A final `AdmFallback` report or a reopened mixer changes the
+                // playback path: keep the sent numeric gain in step.
+                self.sync_output_gain();
             }
             VoiceUpdate::Ended(error) => {
                 self.handle.take();

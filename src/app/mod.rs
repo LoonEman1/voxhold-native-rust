@@ -1,6 +1,7 @@
 mod action_io;
 mod admin_view;
 mod auth_view;
+mod auto_login;
 mod avatar_ops;
 mod channel_ops;
 mod channel_view;
@@ -69,9 +70,9 @@ use voxhold_api::{Channel, ChannelSubscription, Client, Member, Message, Server}
 #[cfg(feature = "voxhold-media")]
 use crate::voice_panel;
 use crate::{
-    attachments, auth, background, channel_settings, draft, inbox, layout, links, media, members,
-    message_tools, personal_settings, reactions, recordings, recordings_dialog, search,
-    server_settings, theme, thread_panel, window_chrome,
+    attachments, auth, auth_session, background, channel_settings, draft, inbox, instance_prefs,
+    layout, links, media, members, message_tools, personal_settings, reactions, recordings,
+    recordings_dialog, search, server_settings, session_store, theme, thread_panel, window_chrome,
 };
 use ui::{icon, ink};
 
@@ -189,6 +190,30 @@ pub(crate) struct Voxhold {
     password: Entity<InputState>,
     composer: Entity<InputState>,
     client: Option<Client>,
+    /// The signed-in session: identity, token, expiry and rotation generation.
+    /// It is the only place that owns these values.
+    session: Option<auth_session::Session>,
+    /// Changes on every login and local end of the session; a late refresh or
+    /// 401 from another login is discarded.
+    session_epoch: u64,
+    /// Single-flight and bounded retry state for `POST /auth/refresh`.
+    session_gate: auth_session::RefreshGate,
+    /// One periodic expiry/refresh timer while a session exists. Dropping the
+    /// task cancels it.
+    session_clock: Option<gpui::Task<()>>,
+    /// Optional «Запомнить вход» storage. It is created once and cloned into
+    /// every background operation.
+    session_store: session_store::SessionStore,
+    /// Monotonic id of the current automatic login attempt. A late answer from
+    /// another attempt, a closed login screen or a toggled box is discarded.
+    auto_attempt: u64,
+    /// The token known to be stored, used to catch up when a rotation write is
+    /// lost and the next refresh must accept the older record.
+    last_stored_token: Option<String>,
+    /// Visible workspace notice when saving or deleting the record failed.
+    remember_error: String,
+    /// The kept record that «Повторить» uses without asking for the address.
+    auto_record: Option<session_store::RememberedSession>,
     self_user_id: i64,
     search: Option<Entity<search::SearchPanel>>,
     show_search: bool,
@@ -400,6 +425,9 @@ pub(crate) struct Voxhold {
     system_light: bool,
     shell: layout::Settings,
     shell_path: Option<std::path::PathBuf>,
+    /// Local "remember instance" preference. `None` or an empty path means the
+    /// write is a no-op (tests); the shipped app always has a real path.
+    instance_path: Option<std::path::PathBuf>,
     shell_initialized: bool,
     drag: Option<SplitterDrag>,
     viewport: (f32, f32),
@@ -420,6 +448,13 @@ impl Drop for Voxhold {
         // The window is going away, so the debounced voice save will never get
         // its timer: write the newest snapshot now (atomic, one small file).
         self.voice_settings.flush();
+        // Closing the window ends the local work but is not a logout: no
+        // server revocation is sent, and the session is simply dropped. The
+        // sends and timers that belong to the window are cancelled with it.
+        for (_, pending) in self.pending_sends.drain() {
+            pending.abort.abort();
+        }
+        self.stop_session_clock();
         self.stop_realtime();
     }
 }
@@ -460,6 +495,8 @@ impl Voxhold {
         cx: &mut Context<Self>,
         prefill: &str,
         shell_path: Option<std::path::PathBuf>,
+        instance_path: Option<std::path::PathBuf>,
+        session_path: Option<std::path::PathBuf>,
     ) -> Self {
         #[cfg(feature = "voxhold-media")]
         cx.bind_keys([
@@ -486,6 +523,22 @@ impl Voxhold {
             .as_deref()
             .map(layout::Settings::load)
             .unwrap_or_default();
+        let saved_instance = instance_path
+            .as_deref()
+            .map(instance_prefs::InstancePrefs::load)
+            .unwrap_or_default();
+        let prefill = prefill.trim();
+        // An explicit CLI target always wins over the saved address. The saved
+        // checkbox state is kept, but the saved origin never replaces what the
+        // operator typed. Without a CLI target a valid remembered origin fills
+        // the field and the screen still waits for confirmation.
+        let (start_address, start_remember) = if !prefill.is_empty() {
+            (prefill.to_string(), saved_instance.remember)
+        } else if saved_instance.remember {
+            (saved_instance.instance.clone().unwrap_or_default(), true)
+        } else {
+            (String::new(), false)
+        };
         let recent_reactions = reactions::SharedRecents::default();
         let reaction_picker =
             cx.new(|cx| reactions::ReactionPicker::new(recent_reactions.clone(), window, cx));
@@ -497,7 +550,11 @@ impl Voxhold {
             .map(crate::voice_settings::path_from_layout);
         let view = Self {
             runtime: std::sync::Arc::new(tokio::runtime::Runtime::new().expect("Tokio runtime")),
-            instance: cx.new(|cx| InputState::new(window, cx).placeholder("https://example.com")),
+            instance: cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder("https://example.com")
+                    .default_value(start_address.clone())
+            }),
             username: cx.new(|cx| InputState::new(window, cx).placeholder("например, neva")),
             password: cx.new(|cx| {
                 InputState::new(window, cx)
@@ -510,6 +567,15 @@ impl Voxhold {
                     .placeholder("Написать сообщение")
             }),
             client: None,
+            session: None,
+            session_epoch: 0,
+            session_gate: auth_session::RefreshGate::default(),
+            session_clock: None,
+            session_store: session_store::SessionStore::new(session_path),
+            auto_attempt: 0,
+            last_stored_token: None,
+            remember_error: String::new(),
+            auto_record: None,
             self_user_id: 0,
             search: None,
             show_search: false,
@@ -659,13 +725,18 @@ impl Voxhold {
             busy: false,
             generation: 0,
             drafts: draft::Drafts::shared(),
-            auth: auth::AuthState::with_prefill(prefill),
+            auth: {
+                let mut auth = auth::AuthState::with_prefill(&start_address);
+                auth.remember_instance = start_remember;
+                auth
+            },
             palette: theme::Palette::resolve(theme_mode, system_light),
             theme_mode,
             theme_path,
             system_light,
             shell,
             shell_path,
+            instance_path,
             shell_initialized: false,
             drag: None,
             viewport: (0.0, 0.0),

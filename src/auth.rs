@@ -12,12 +12,25 @@ pub enum AuthScreen {
     Login,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct LoginRequest {
     pub attempt: u64,
     pub origin: String,
     pub username: String,
     pub password: String,
+}
+
+/// A derived `Debug` would print the password. Diagnostics keep the attempt and
+/// the identity, never the credential.
+impl std::fmt::Debug for LoginRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LoginRequest")
+            .field("attempt", &self.attempt)
+            .field("origin", &self.origin)
+            .field("username", &self.username)
+            .field("password", &"<redacted>")
+            .finish()
+    }
 }
 
 /// State that survives a repaint of the auth page.
@@ -28,6 +41,18 @@ pub struct AuthState {
     pub username: String,
     pub status: String,
     pub busy: bool,
+    /// The «Запомнить адрес» checkbox. The value is persisted only after the
+    /// address step is confirmed; toggling alone never writes a file.
+    pub remember_instance: bool,
+    /// The «Запомнить вход» checkbox on the password label row. It only marks
+    /// the intent; the record is written after a successful login.
+    pub remember_login: bool,
+    /// A stored session is being checked right now. The form stays usable and
+    /// a manual attempt supersedes it.
+    pub auto_login: bool,
+    /// The last automatic attempt kept the record but could not reach the
+    /// server. The login card then offers «Повторить».
+    pub auto_retry: bool,
     login_attempt: u64,
 }
 
@@ -39,12 +64,16 @@ impl AuthState {
             username: String::new(),
             status: String::new(),
             busy: false,
+            remember_instance: false,
+            remember_login: false,
+            auto_login: false,
+            auto_retry: false,
             login_attempt: 0,
         }
     }
 
-    /// The `-server` flag only prefills the address; the operator still
-    /// confirms it. Go keeps the same first screen.
+    /// The `-server` flag and a remembered origin only prefill the address; the
+    /// operator still confirms it. Go keeps the same first screen.
     pub fn with_prefill(prefill: &str) -> Self {
         Self::new(prefill)
     }
@@ -66,11 +95,15 @@ impl AuthState {
             return None;
         }
         let origin = raw.trim();
-        if voxhold_api::Client::new(origin).is_err() {
-            self.status = "Введите корректный HTTPS-адрес инстанса".into();
-            return None;
-        }
-        self.origin = origin.to_string();
+        let client = match voxhold_api::Client::new(origin) {
+            Ok(client) => client,
+            Err(_) => {
+                self.status = "Введите корректный HTTPS-адрес инстанса".into();
+                return None;
+            }
+        };
+        // Keep one canonical origin: no trailing slash and no default port.
+        self.origin = client.origin();
         self.status.clear();
         self.screen = AuthScreen::Login;
         Some(self.origin.clone())
@@ -153,14 +186,35 @@ pub struct AuthLayout {
     pub user: Rect,
     pub password: Rect,
     pub primary: Rect,
+    /// «Запомнить адрес» on the instance step. Empty on the login step, where
+    /// the geometry must stay identical to the reference.
+    pub remember: Rect,
     pub toggle: Rect,
     pub error: Rect,
     pub preview: Rect,
     pub brand: Rect,
+    /// The «Назад» link and the confirmed origin above the login card. They are
+    /// separate rectangles so the address can never sit under the link or the
+    /// theme toggle.
+    pub back: Rect,
+    pub origin: Rect,
     pub username_label: Rect,
     pub password_label: Rect,
+    /// «Запомнить вход» on the password label row. Empty on the address step:
+    /// the login card keeps its reference height and field positions.
+    pub remember_login: Rect,
     pub terms: Rect,
 }
+
+/// Smallest top margin a short client area may squeeze the card to. The mobile
+/// brand strip sits at `card.y + pad` and the theme toggle at `y = 22`, so the
+/// card still has to start below the window edge to keep both readable.
+const MIN_AUTH_TOP: f32 = 8.0;
+
+/// The confirmed-origin row above the login card: `y = 22`, height 32. When the
+/// card is pulled up, it must not cover that row.
+const TOP_STRIP_Y: f32 = 22.0;
+const TOP_STRIP_HEIGHT: f32 = 32.0;
 
 pub fn layout_auth(w: f32, h: f32, instance: bool, has_error: bool) -> AuthLayout {
     let w = if w.is_finite() { w.max(0.0) } else { 0.0 };
@@ -202,7 +256,7 @@ pub fn layout_auth(w: f32, h: f32, instance: bool, has_error: bool) -> AuthLayou
         content_height += 63.0;
     }
     if instance {
-        content_height = 228.0;
+        content_height = 253.0;
         if w <= 720.0 {
             content_height += 63.0;
         }
@@ -212,6 +266,24 @@ pub fn layout_auth(w: f32, h: f32, instance: bool, has_error: bool) -> AuthLayou
     }
     let card_height = content_height + 2.0 * pad;
     let card_y = top.max(top + (h - top - bottom - card_height) / 2.0);
+    // A short client area must not push the primary button out of the window.
+    // On mobile the +63 px brand strip and the +25 px checkbox row make the
+    // address card taller than the reference assumes, so when the centred card
+    // does not fit the top margin is reduced (never below the step's floor)
+    // until the card ends as high as the height allows. Normal 900/800 px
+    // windows fit already and keep the exact reference centring. The login
+    // step reserves the top strip for the confirmed origin, so its floor is
+    // higher than the address step's.
+    let clamp_floor = if instance {
+        MIN_AUTH_TOP
+    } else {
+        TOP_STRIP_Y + TOP_STRIP_HEIGHT
+    };
+    let card_y = if card_y + card_height > h {
+        (h - card_height).max(clamp_floor)
+    } else {
+        card_y
+    };
     let card = Rect::new(card_x, card_y, card_width, card_height);
     let mut x = card_x + pad;
     let mut y = card_y + pad;
@@ -220,17 +292,45 @@ pub fn layout_auth(w: f32, h: f32, instance: bool, has_error: bool) -> AuthLayou
     }
     let user;
     let mut password = Rect::new(0.0, 0.0, 0.0, 0.0);
+    let remember;
     let primary;
     if instance {
         user = Rect::new(x, y + 110.0, width, 47.0);
-        primary = Rect::new(x, y + 178.0, width, 50.0);
+        // The checkbox is a separate control under the address field. The
+        // primary button moves down by the row it adds, and the card grows by
+        // the same amount so nothing overlaps at any breakpoint.
+        remember = Rect::new(x, y + 169.0, width, 20.0);
+        primary = Rect::new(x, y + 203.0, width, 50.0);
     } else {
         user = Rect::new(x, y + heading_height + 51.0, width, 47.0);
         password = Rect::new(x, y + heading_height + 140.0, width, 47.0);
+        remember = Rect::new(0.0, 0.0, 0.0, 0.0);
         let error_offset = if has_error { 57.0 } else { 0.0 };
         primary = Rect::new(x, y + heading_height + 208.0 + error_offset, width, 50.0);
     }
     let toggle = Rect::new(w - 56.0, 22.0, 34.0, 34.0);
+    // The confirmed origin is plain text above the card. It gets its own row
+    // over the «Назад» link: a long address may wrap, but it never shares the
+    // link's box. When the card starts high enough the row sits above the link;
+    // otherwise it moves to the top strip and stops before the theme toggle.
+    let back = Rect::new(card_x, (card_y - 28.0).max(8.0), 54.0, 16.0);
+    let origin_y = if card_y - 48.0 >= 60.0 {
+        card_y - 48.0
+    } else {
+        TOP_STRIP_Y
+    };
+    let origin_right = if origin_y < 60.0 {
+        (w - 68.0).min(card.right())
+    } else {
+        card.right()
+    };
+    let origin_left = (card_x + 68.0).min(origin_right);
+    let origin = Rect::new(
+        origin_left,
+        origin_y,
+        (origin_right - origin_left).max(0.0),
+        TOP_STRIP_HEIGHT,
+    );
     let error_y = if instance {
         primary.bottom() + 12.0
     } else {
@@ -252,6 +352,20 @@ pub fn layout_auth(w: f32, h: f32, instance: bool, has_error: bool) -> AuthLayou
     let brand = Rect::new(if story == 0.0 { x } else { brand_y }, brand_y, 39.0, 39.0);
     let username_label = Rect::new(x, user.y - 25.0, width, 17.0);
     let password_label = Rect::new(x, password.y - 25.0, width, 17.0);
+    // «Запомнить вход» shares the password label row. The 18 px box, an 8 px
+    // gap and the label need 118 px; the row is right-aligned so the «Пароль»
+    // caption on the left is never covered and no vertical space is added.
+    let remember_login = if instance {
+        Rect::new(0.0, 0.0, 0.0, 0.0)
+    } else {
+        let row = 118.0f32.min(width.max(0.0));
+        Rect::new(
+            x + (width - row).max(0.0),
+            password_label.y - 0.5,
+            row,
+            18.0,
+        )
+    };
     // Keep offsets used by the heading stable across renders.
     if instance {
         y += 0.0;
@@ -267,12 +381,16 @@ pub fn layout_auth(w: f32, h: f32, instance: bool, has_error: bool) -> AuthLayou
         user,
         password,
         primary,
+        remember,
         toggle,
         error,
         preview,
         brand,
+        back,
+        origin,
         username_label,
         password_label,
+        remember_login,
         terms,
     }
 }
@@ -438,6 +556,182 @@ mod tests {
     }
 
     #[test]
+    fn remember_checkbox_stays_between_the_field_and_the_button() {
+        for (width, height) in [
+            (390.0, 760.0),
+            (560.0, 800.0),
+            (720.0, 900.0),
+            (1280.0, 900.0),
+            // A short window clamps the card to the top; the row must still
+            // stay inside the card and clear of both neighbours.
+            (390.0, 600.0),
+            // The minimum window size: the card itself may not fit, but the
+            // checkbox must stay inside the card and the client area.
+            (320.0, 360.0),
+        ] {
+            for has_error in [false, true] {
+                let layout = layout_auth(width, height, true, has_error);
+                let row = layout.remember;
+                assert!(
+                    row.w > 100.0,
+                    "{width}x{height}: checkbox column is {} wide",
+                    row.w
+                );
+                assert!(row.h >= 18.0, "{width}x{height}: checkbox row too short");
+                assert!(
+                    row.y >= layout.user.bottom(),
+                    "{width}x{height}: checkbox covers the address field"
+                );
+                assert!(
+                    row.bottom() <= layout.primary.y,
+                    "{width}x{height}: checkbox covers the button"
+                );
+                assert!(
+                    row.x >= layout.card.x
+                        && row.right() <= layout.card.right()
+                        && row.y >= layout.card.y
+                        && row.bottom() <= layout.card.bottom(),
+                    "{width}x{height}: checkbox leaves the card"
+                );
+                assert!(
+                    row.bottom() <= height && row.right() <= width,
+                    "{width}x{height}: checkbox leaves the client area"
+                );
+            }
+        }
+        // The login step keeps its original geometry and has no checkbox.
+        let login = layout_auth(1280.0, 900.0, false, false);
+        assert!(login.remember.is_empty());
+    }
+
+    #[test]
+    fn a_short_window_pulls_the_card_up_so_the_primary_button_stays_visible() {
+        // 390x390 and the minimum 320x360: the instance card is 366 px tall
+        // (253 px content + 63 px brand strip + 2 * 25 px padding), so the
+        // reference centring used to push «Продолжить» 21 px below the client.
+        // The clamp moves the card up to its minimum top margin instead.
+        for (width, height) in [(390.0, 390.0), (320.0, 360.0)] {
+            for has_error in [false, true] {
+                let layout = layout_auth(width, height, true, has_error);
+                assert!(
+                    layout.primary.bottom() <= height,
+                    "{width}x{height}: «Продолжить» leaves the client (bottom {})",
+                    layout.primary.bottom()
+                );
+                assert!(
+                    layout.card.y >= MIN_AUTH_TOP,
+                    "{width}x{height}: card starts at {}",
+                    layout.card.y
+                );
+                assert!(
+                    layout.card.y <= 70.0,
+                    "{width}x{height}: a short window only moves the card up"
+                );
+                assert!(
+                    layout.user.bottom() <= layout.remember.y
+                        && layout.remember.bottom() <= layout.primary.y,
+                    "{width}x{height}: the rows overlap after the clamp"
+                );
+                assert!(
+                    layout.brand.bottom() <= layout.user.y,
+                    "{width}x{height}: the brand covers the address field"
+                );
+                assert!(
+                    !overlaps(layout.toggle, layout.brand),
+                    "{width}x{height}: the toggle covers the mobile brand"
+                );
+            }
+        }
+        // The card itself is 366 px tall, which is 6 px more than the 360 px
+        // client; only the button can be guaranteed. 390x390 fits the card
+        // exactly at its minimum margin.
+        let tight = layout_auth(390.0, 390.0, true, false);
+        assert!(tight.card.bottom() <= 390.0);
+        assert!((tight.card.y - 24.0).abs() < 0.01);
+
+        // Normal heights keep the reference geometry untouched.
+        for (width, height) in [
+            (1280.0, 900.0),
+            (900.0, 800.0),
+            (720.0, 900.0),
+            (560.0, 800.0),
+        ] {
+            let layout = layout_auth(width, height, true, false);
+            assert!(
+                layout.card.bottom() <= height,
+                "{width}x{height}: a fitting card must not be clipped"
+            );
+            assert!(
+                layout.card.y >= 70.0,
+                "{width}x{height}: the card moved above its normal top margin"
+            );
+            assert!(layout.primary.bottom() <= height);
+        }
+    }
+
+    #[test]
+    fn save_error_text_fits_the_narrow_error_box() {
+        // The error row is painted with 12 px side padding, an 8 px gap and a
+        // 16 px «×» glyph. 13 px Inter advances at most ~8 px per Cyrillic
+        // character, a deliberately pessimistic bound. The phrase must wrap to
+        // two lines and two lines must fit the 40 px row at 320 px width.
+        let layout = layout_auth(320.0, 360.0, true, true);
+        let inner = (layout.error.w - 2.0 * 12.0 - 16.0 - 8.0).max(1.0);
+        let chars = crate::instance_prefs::SAVE_ERROR.chars().count() as f32;
+        let lines = (chars * 8.0 / inner).ceil();
+        assert!(
+            lines <= 2.0,
+            "«{}» needs {lines} lines in {inner} px",
+            crate::instance_prefs::SAVE_ERROR
+        );
+        assert!(
+            lines * 13.0 * 1.35 <= layout.error.h,
+            "two lines do not fit the {} px row",
+            layout.error.h
+        );
+        // The same box is fully visible at 390x600, where the save error is
+        // actually read.
+        let roomy = layout_auth(390.0, 600.0, true, true);
+        assert!(roomy.error.bottom() <= 600.0);
+        assert!(roomy.error.w >= 200.0);
+    }
+
+    #[test]
+    fn remember_login_stays_on_the_password_label_row() {
+        for (width, height) in [
+            (320.0, 360.0),
+            (390.0, 760.0),
+            (720.0, 900.0),
+            (1280.0, 900.0),
+        ] {
+            for has_error in [false, true] {
+                let layout = layout_auth(width, height, false, has_error);
+                let row = layout.remember_login;
+                assert_eq!(row.h, 18.0);
+                assert!(row.w > 100.0, "{width}x{height}: row is {} wide", row.w);
+                assert!(
+                    row.x >= layout.password_label.x
+                        && row.right() <= layout.password_label.right(),
+                    "{width}x{height}: the checkbox leaves the label row"
+                );
+                assert!(
+                    (row.y - (layout.password_label.y - 0.5)).abs() < 0.01,
+                    "{width}x{height}: the checkbox moved off the label row"
+                );
+                // The row sits between the password field and the button, and
+                // the caption on the left keeps at least 40 px of clear space.
+                assert!(row.bottom() <= layout.password.y);
+                assert!(row.x - layout.password_label.x >= 40.0);
+                assert!(row.y >= layout.card.y && row.bottom() <= layout.card.bottom());
+            }
+            // The address step has no login checkbox and keeps its geometry.
+            assert!(layout_auth(width, height, true, false)
+                .remember_login
+                .is_empty());
+        }
+    }
+
+    #[test]
     fn error_adds_a_row_and_moves_the_button() {
         let clean = layout_auth(1280.0, 900.0, false, false);
         let failed = layout_auth(1280.0, 900.0, false, true);
@@ -457,6 +751,53 @@ mod tests {
         assert_eq!(layout.card.x, 57.0);
     }
 
+    fn overlaps(a: Rect, b: Rect) -> bool {
+        a.x < b.right() && b.x < a.right() && a.y < b.bottom() && b.y < a.bottom()
+    }
+
+    #[test]
+    fn origin_never_covers_the_back_link_or_the_theme_toggle() {
+        for (width, height) in [
+            (390.0, 760.0),
+            (560.0, 800.0),
+            (720.0, 900.0),
+            (1280.0, 900.0),
+            // A short window clamps the card to the top; the origin row then
+            // moves to the top strip and must still stop before the toggle.
+            (390.0, 600.0),
+        ] {
+            let layout = layout_auth(width, height, false, false);
+            assert!(
+                layout.origin.w > 100.0,
+                "{width}x{height}: origin column is {} wide",
+                layout.origin.w
+            );
+            assert!(
+                !overlaps(layout.origin, layout.back),
+                "{width}x{height}: origin covers «Назад»"
+            );
+            assert!(
+                !overlaps(layout.origin, layout.toggle),
+                "{width}x{height}: origin covers the theme toggle"
+            );
+            assert!(
+                !overlaps(layout.origin, layout.card),
+                "{width}x{height}: origin covers the card"
+            );
+            assert!(
+                !overlaps(layout.origin, layout.brand),
+                "{width}x{height}: origin covers the mobile brand"
+            );
+            assert!(
+                layout.origin.right() <= width && layout.origin.bottom() <= height,
+                "{width}x{height}: origin leaves the client area"
+            );
+            // Two 15px lines plus the row itself: a long address may wrap, but
+            // the row reserves the room for it.
+            assert!(layout.origin.h >= 30.0);
+        }
+    }
+
     #[test]
     fn very_narrow_card_gets_an_extra_heading_row() {
         let layout = layout_auth(390.0, 760.0, false, false);
@@ -467,6 +808,7 @@ mod tests {
     #[test]
     fn submit_validates_like_go() {
         let mut auth = AuthState::new("");
+        assert!(!auth.remember_instance);
         assert_eq!(auth.submit_instance("http://example.com").as_deref(), None);
         assert_eq!(auth.status, "Введите корректный HTTPS-адрес инстанса");
         assert!(auth.is_instance());
@@ -488,6 +830,24 @@ mod tests {
     }
 
     #[test]
+    fn instance_origin_is_normalized() {
+        let mut auth = AuthState::new("");
+        let origin = auth
+            .submit_instance("  http://127.0.0.1:8080/  ")
+            .expect("loopback HTTP is allowed");
+        assert_eq!(origin, "http://127.0.0.1:8080");
+        assert_eq!(auth.origin, "http://127.0.0.1:8080");
+
+        let mut secure = AuthState::new("");
+        assert_eq!(
+            secure
+                .submit_instance("https://chat.example.org:443/")
+                .as_deref(),
+            Some("https://chat.example.org")
+        );
+    }
+
+    #[test]
     fn login_keeps_password_spaces_and_trims_the_user_name() {
         let mut auth = AuthState::new("");
         auth.submit_instance("https://chat.example.org");
@@ -497,6 +857,19 @@ mod tests {
         assert_eq!(request.username, "neva");
         assert_eq!(request.password, "  pass word  ");
         assert!(auth.busy);
+    }
+
+    #[test]
+    fn debug_output_never_prints_the_password() {
+        let mut auth = AuthState::new("");
+        auth.submit_instance("https://chat.example.org");
+        let request = auth
+            .submit_login("neva", "hunter2-secret")
+            .expect("valid form");
+        let debug = format!("{request:?}");
+        assert!(debug.contains("<redacted>"), "{debug}");
+        assert!(debug.contains("neva"), "{debug}");
+        assert!(!debug.contains("hunter2-secret"), "{debug}");
     }
 
     #[test]

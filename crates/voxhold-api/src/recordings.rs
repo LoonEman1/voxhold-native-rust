@@ -135,12 +135,13 @@ impl Client {
         let mut url = self.url(&format!("/api/v1/recordings/{id}/preview"))?;
         url.query_pairs_mut().append_pair("v", version);
         let mut request = self.http.get(url);
-        if !self.token.is_empty() {
-            request = request.bearer_auth(self.token.as_ref());
+        let token = self.auth.token();
+        if !token.is_empty() {
+            request = request.bearer_auth(token.as_ref());
         }
         let response = request.send().await.map_err(|_| Error::Network)?;
         if response.status() != reqwest::StatusCode::OK {
-            return Err(Error::Http(response.status().as_u16()));
+            return Err(self.refused(response.status().as_u16(), &token));
         }
         let media = response
             .headers()

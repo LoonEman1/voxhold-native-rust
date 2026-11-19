@@ -483,7 +483,7 @@ async fn the_output_row_follows_playback_not_the_capture_chain(cx: &mut TestAppC
 async fn a_retrying_or_suspended_mixer_is_not_reported_as_the_adm(cx: &mut TestAppContext) {
     use crate::audio_capabilities::OutputGainPath;
     use crate::voice_form_text::{
-        output_volume_note, OUTPUT_VOLUME_ADM_NOTE, OUTPUT_VOLUME_TEMP_NOTE,
+        output_gain_note, output_volume_note, OUTPUT_VOLUME_ADM_NOTE, OUTPUT_VOLUME_TEMP_NOTE,
     };
     use voxhold_media::mixer::{PlayoutPhase, PlayoutStats};
     let (mut visual, view, voice) = voice_call(cx);
@@ -601,6 +601,11 @@ async fn a_retrying_or_suspended_mixer_is_not_reported_as_the_adm(cx: &mut TestA
                 output_volume_note(panel.output_gain_path()),
                 OUTPUT_VOLUME_ADM_NOTE
             );
+            assert_eq!(
+                output_gain_note(panel.output_gain_path()),
+                OUTPUT_VOLUME_ADM_NOTE,
+                "the capability row follows the ADM path"
+            );
             let snapshot = panel
                 .test_take_audio_snapshot()
                 .expect("clearing the gain is forwarded");
@@ -611,11 +616,16 @@ async fn a_retrying_or_suspended_mixer_is_not_reported_as_the_adm(cx: &mut TestA
     view.read_with(&*visual, |v, _| {
         assert!(v.test_slider_focus("output-volume").is_none());
     });
+    // The ADM note selector was never painted before this draw (the earlier
+    // frames showed the transient path note), so it proves the Adm branch.
+    // The capability tag cannot: it was already `недоступно` for the
+    // transient outage, so a stale frame would satisfy it. The fresh-frame tag
+    // assertion lives in `the_first_adm_frame_paints...`; here the note
+    // mapping above is the direct check.
     assert!(
-        visual.debug_bounds("cap-output-tag-недоступно").is_some(),
-        "the spent budget shows the unavailable row"
+        visual.debug_bounds("output-volume-adm-note").is_some(),
+        "the spent budget paints the ADM sentence for the first time"
     );
-    assert!(visual.debug_bounds("output-volume-path-note").is_some());
 }
 
 #[gpui::test]

@@ -22,7 +22,12 @@ impl VoicePanel {
                 self.transition_phase(CallPhase::Connecting, cx);
                 self.status = "Подключение…".into();
                 self.applied_audio = None;
+                // The previous session's sink stopped; its report must not
+                // keep the room on the software path if this attempt opens
+                // without a mixer (ADM) or is still starting one.
+                self.playout = None;
                 self.controls.muted = true;
+                self.sync_output_gain();
                 self.release_push_to_talk();
             }
             VoiceUpdate::Connected => {
@@ -36,6 +41,11 @@ impl VoicePanel {
                 self.transition_phase(CallPhase::Reconnecting, cx);
                 self.status = "Восстанавливаем соединение…".into();
                 self.applied_audio = None;
+                // A `Playout` report is session state: the old sink is gone,
+                // and keeping its `running, Stable` snapshot would make the
+                // next session look software even when its mixer never opened
+                // and the ADM plays the room.
+                self.playout = None;
                 self.controls.muted = true;
                 // The next session starts before its playback path is known:
                 // hand it the stored percentage again.

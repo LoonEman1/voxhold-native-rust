@@ -24,6 +24,7 @@ fn request() -> PublishRequest {
         quality: Quality::default(),
         codec: Codec::Vp8,
         audio: false,
+        audio_scope: crate::system_audio::AudioScope::Device,
     }
 }
 
@@ -63,7 +64,7 @@ fn start_signal(outcomes: &[Outcome]) -> &Signal {
 fn publishing(publisher: &mut Publisher, now: Instant) -> Vec<Outcome> {
     publisher.begin_picker(1);
     let mut outcomes = publisher.publish(1, request(), false, now);
-    outcomes.extend(publisher.engine_ready(now, request().audio));
+    outcomes.extend(publisher.engine_ready(now, request().audio, None));
     outcomes
 }
 
@@ -236,7 +237,7 @@ fn a_viewer_is_left_before_the_capture_starts() {
     // `stream.left` arrives well before the five-second contract.
     let started = publisher.viewer_left(now + Duration::from_millis(200));
     assert!(matches!(started[0], Outcome::StartEngine { .. }));
-    let ready = publisher.engine_ready(now + Duration::from_millis(200), false);
+    let ready = publisher.engine_ready(now + Duration::from_millis(200), false, None);
     assert_eq!(start_signal(&ready).kind, "stream.start");
 }
 
@@ -257,7 +258,7 @@ fn a_missing_stream_left_still_starts_after_the_five_second_contract() {
     );
     let started = publisher.tick(now + LEAVE_TIMEOUT);
     assert!(matches!(started[0], Outcome::StartEngine { .. }));
-    let ready = publisher.engine_ready(now + LEAVE_TIMEOUT, false);
+    let ready = publisher.engine_ready(now + LEAVE_TIMEOUT, false, None);
     assert_eq!(start_signal(&ready).kind, "stream.start");
 }
 
@@ -549,7 +550,7 @@ fn the_ui_snapshot_follows_every_phase() {
     publisher.begin_picker(1);
     assert_eq!(publisher.sharing().phase, Phase::Picking);
     publisher.publish(1, request(), false, now);
-    publisher.engine_ready(now, false);
+    publisher.engine_ready(now, false, None);
     assert_eq!(publisher.sharing().phase, Phase::Publishing);
     assert_eq!(
         publisher.sharing().quality.map(Quality::describe),
@@ -596,7 +597,7 @@ fn a_new_picker_after_a_failure_sends_its_own_stream_stop() {
     assert_eq!(publisher.phase(), Phase::Picking);
     assert!(matches!(opened.as_slice(), [Outcome::State(_)]));
     let mut publish = publisher.publish(2, request(), false, second_now);
-    publish.extend(publisher.engine_ready(second_now, false));
+    publish.extend(publisher.engine_ready(second_now, false, None));
     assert!(
         sends(&publish)
             .iter()
@@ -645,7 +646,7 @@ fn a_new_attempt_after_live_needs_its_own_connection_and_frame() {
     let second_now = now + Duration::from_secs(1);
     publisher.begin_picker(2);
     let mut publish = publisher.publish(2, request(), false, second_now);
-    publish.extend(publisher.engine_ready(second_now, false));
+    publish.extend(publisher.engine_ready(second_now, false, None));
     assert_eq!(
         publisher.phase(),
         Phase::Publishing,

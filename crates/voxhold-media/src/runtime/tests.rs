@@ -37,6 +37,7 @@ fn screen_commands_keep_their_order_and_listings_keep_the_newest_generation() {
         quality: Quality::default(),
         codec: Codec::Vp8,
         audio: false,
+        audio_scope: crate::system_audio::AudioScope::Device,
     };
     // Opening the picker must reach the worker before the chosen source.
     crate::runtime::requests::push_screen(&requests, ScreenCommand::OpenPicker { picker: 1 });
@@ -419,6 +420,7 @@ fn screen_request() -> crate::publisher::PublishRequest {
         quality: Quality::default(),
         codec: Codec::Vp8,
         audio: false,
+        audio_scope: crate::system_audio::AudioScope::Device,
     }
 }
 

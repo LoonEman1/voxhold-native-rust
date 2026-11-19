@@ -171,6 +171,7 @@ fn publish_monitor(handle: &VoiceHandle) -> (Duration, Sharing, screen_capture::
         },
         codec: Codec::Vp8,
         audio,
+        audio_scope: crate::system_audio::AudioScope::Device,
     };
     handle.publish_screen(picker, request, true, true);
 
@@ -219,6 +220,7 @@ fn restart_quality(
         },
         codec: Codec::Vp8,
         audio,
+        audio_scope: crate::system_audio::AudioScope::Device,
     };
     handle.restart_screen_share(request, true, true);
     let started = Instant::now();

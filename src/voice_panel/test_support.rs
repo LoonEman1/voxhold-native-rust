@@ -63,6 +63,7 @@ impl VoicePanel {
             quality: self.screen.quality(),
             codec: voxhold_media::publisher::Codec::Vp8,
             audio: false,
+            audio_scope: voxhold_media::system_audio::AudioScope::Device,
         });
     }
 
@@ -100,6 +101,7 @@ impl VoicePanel {
             }
         }
         self.screen.selected = selected;
+        self.screen.reset_audio_scope(kind);
         self.screen.audio_availability = Some(Ok(voxhold_media::system_audio::AudioDeviceInfo {
             id: "test".into(),
             label: "Устройство вывода по умолчанию".into(),
@@ -416,6 +418,7 @@ impl VoicePanel {
             quality: self.screen.quality(),
             codec: voxhold_media::publisher::Codec::Vp8,
             audio: false,
+            audio_scope: voxhold_media::system_audio::AudioScope::Device,
         });
     }
 
@@ -454,10 +457,12 @@ impl VoicePanel {
                 quality: self.screen.quality(),
                 codec: voxhold_media::publisher::Codec::Vp8,
                 audio: self.screen.audio_requested(),
+                audio_scope: self.screen.audio_scope,
             }
         });
         request.quality = self.screen.quality();
         request.audio = self.screen.audio_requested();
+        request.audio_scope = self.screen.audio_scope;
         request
     }
 
@@ -489,6 +494,30 @@ impl VoicePanel {
 
     pub fn test_toggle_system_audio(&mut self, cx: &mut Context<Self>) {
         self.toggle_system_audio(cx);
+    }
+
+    /// The scope the next request carries.
+    pub fn test_audio_scope(&self) -> voxhold_media::system_audio::AudioScope {
+        self.screen.audio_scope
+    }
+
+    /// The sentence the picker prints about the selected scope.
+    pub fn test_audio_scope_sentence(&self) -> &'static str {
+        self.screen.audio_scope_sentence()
+    }
+
+    /// Whether the scope choices are active (audio really requested).
+    pub fn test_audio_scope_enabled(&self) -> bool {
+        self.screen.audio_requested()
+    }
+
+    /// Choose one scope exactly like the picker button does.
+    pub fn test_select_audio_scope(
+        &mut self,
+        scope: voxhold_media::system_audio::AudioScope,
+        cx: &mut Context<Self>,
+    ) {
+        self.select_audio_scope(scope, cx);
     }
 
     /// Replace the gate answer without a capture stack.

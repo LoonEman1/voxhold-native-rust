@@ -229,7 +229,7 @@ fn a_live_quality_change_is_one_confirmed_stop_and_one_new_start() {
     );
     assert_eq!(publisher.phase(), Phase::Publishing);
 
-    let ready = publisher.engine_ready(now, true);
+    let ready = publisher.engine_ready(now, true, Some("Только звук demo.exe (PID 42)".into()));
     let start = start_signal(&ready);
     assert_eq!(start.data["has_audio"], json!(true));
     assert_eq!(start.data["codec"], json!("vp8"));
@@ -242,6 +242,15 @@ fn a_live_quality_change_is_one_confirmed_stop_and_one_new_start() {
         "exactly one new start: {ready:?}"
     );
     assert!(publisher.sharing().has_audio);
+    assert_eq!(
+        publisher.sharing().audio_scope.as_deref(),
+        Some("Только звук demo.exe (PID 42)")
+    );
+    assert!(
+        start.data.get("audio_scope").is_none(),
+        "the backend contract has no scope field; it stays local: {:?}",
+        start.data
+    );
     assert_eq!(publisher.sharing().attempt, attempt + 1);
 
     // The stale-close filter is narrow: a real revocation still ends the

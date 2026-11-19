@@ -334,6 +334,8 @@ pub struct PublisherEngine {
     preview: Arc<PreviewStore>,
     ice_dropped: AtomicU64,
     has_audio: bool,
+    /// Actual scope of the opened system-audio capture.
+    audio_scope: Option<String>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -367,10 +369,21 @@ impl PublisherEngine {
         }
         // The loopback is opened before the engine reports itself ready, so
         // `stream.start` can carry the real `has_audio`. A missing endpoint is
-        // an explicit capability error, never a silent video-only stream.
+        // an explicit capability error, never a silent video-only stream. The
+        // user's scope is resolved here, on the preparation thread: a window
+        // becomes its process id and the whole-screen choice becomes an
+        // exclude-self process loopback. No failure falls back to the device.
+        let mut audio_scope = None;
         let audio: Option<Box<dyn AudioProducer>> = if request.audio {
-            match SystemAudio::start() {
-                Ok(capture) => Some(Box::new(capture)),
+            let scope = request
+                .audio_scope
+                .resolve(&request.source)
+                .map_err(|error| format!("Системный звук недоступен: {error}"))?;
+            match SystemAudio::start(scope) {
+                Ok(capture) => {
+                    audio_scope = Some(scope.describe());
+                    Some(Box::new(capture))
+                }
                 Err(error) => {
                     return Err(format!("Системный звук недоступен: {error}"));
                 }
@@ -387,6 +400,7 @@ impl PublisherEngine {
             policy,
             Box::new(DesktopProducer { capture, latest }),
             audio,
+            audio_scope,
             preview,
         )?;
         if cancelled.load(Ordering::SeqCst) {
@@ -415,6 +429,7 @@ impl PublisherEngine {
             policy,
             Box::new(SyntheticProducer::new(frame_size.0, frame_size.1, preview)),
             audio,
+            None,
             Arc::new(PreviewStore::default()),
         )
     }
@@ -425,12 +440,19 @@ impl PublisherEngine {
         self.has_audio
     }
 
+    /// Actual scope of the opened capture, for the local on-air line. `None`
+    /// when the attempt has no system audio.
+    pub fn audio_scope(&self) -> Option<String> {
+        self.audio_scope.clone()
+    }
+
     fn spawn(
         request: PublishRequest,
         servers: Vec<IceServer>,
         policy: String,
         producer: Box<dyn FrameProducer>,
         audio: Option<Box<dyn AudioProducer>>,
+        audio_scope: Option<String>,
         preview: Arc<PreviewStore>,
     ) -> Result<Self, String> {
         let has_audio = audio.is_some();
@@ -475,6 +497,7 @@ impl PublisherEngine {
                 preview,
                 ice_dropped: AtomicU64::new(0),
                 has_audio,
+                audio_scope: if has_audio { audio_scope } else { None },
                 thread: Some(thread),
             }),
             Ok(Err(message)) => {

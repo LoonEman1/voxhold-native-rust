@@ -272,7 +272,8 @@ impl Live {
         let prep = ScreenPrep::start(binding, Instant::now(), PREP_BUDGET, move |cancelled| {
             let engine = PublisherEngine::start(request, servers, policy, preview, cancelled)?;
             let has_audio = engine.has_audio();
-            Ok((engine, has_audio))
+            let audio_scope = engine.audio_scope();
+            Ok((engine, has_audio, audio_scope))
         })?;
         self.prep = Some(prep);
         Ok(())

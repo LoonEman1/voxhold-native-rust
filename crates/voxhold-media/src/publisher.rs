@@ -16,6 +16,7 @@
 
 use crate::controller::Signal;
 use crate::screen_capture::ScreenSource;
+use crate::system_audio::AudioScope;
 use crate::viewer::LEAVE_TIMEOUT;
 use serde_json::{Value, json};
 use std::{
@@ -65,39 +66,8 @@ impl Codec {
     }
 }
 
-/// Resolution choices of the SDR publisher, matching the web dialog.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Resolution {
-    #[default]
-    P720,
-    P1080,
-}
-
-impl Resolution {
-    pub fn size(self) -> (u32, u32) {
-        match self {
-            Self::P720 => (1280, 720),
-            Self::P1080 => (1920, 1080),
-        }
-    }
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::P720 => "1280 × 720",
-            Self::P1080 => "1920 × 1080",
-        }
-    }
-
-    pub fn wire(self) -> &'static str {
-        match self {
-            Self::P720 => "720p",
-            Self::P1080 => "1080p",
-        }
-    }
-}
-
 mod quality;
-pub use quality::{AUDIO_BITRATES, Preset, Quality, normalize_audio_bitrate};
+pub use quality::{AUDIO_BITRATES, Preset, Quality, Resolution, normalize_audio_bitrate};
 
 /// One capture attempt chosen in the picker.
 #[derive(Clone, Debug, PartialEq)]
@@ -109,6 +79,10 @@ pub struct PublishRequest {
     /// engine actually opened, so a missing loopback is an explicit failure
     /// instead of a silent video-only publication.
     pub audio: bool,
+    /// What the requested audio covers. Only used when `audio` is true; the
+    /// engine resolves it to a process id for this attempt. `stream.start` has
+    /// no scope field, so this stays a local engine parameter.
+    pub audio_scope: AudioScope,
 }
 
 /// The UI-facing snapshot. The panel never guesses a phase itself.
@@ -122,6 +96,9 @@ pub struct Sharing {
     /// The engine really added the system-audio track (and `stream.start`
     /// reported it), not merely that the user ticked the box.
     pub has_audio: bool,
+    /// Actual scope of the opened system-audio capture, as the engine reports
+    /// it (the real process/area). `None` when the track is not published.
+    pub audio_scope: Option<String>,
     /// A confirmed stop+start is in flight. The UI must warn that the stream
     /// will restart instead of claiming a live change.
     pub restarting: bool,
@@ -139,6 +116,7 @@ impl Default for Sharing {
             quality: None,
             codec: None,
             has_audio: false,
+            audio_scope: None,
             restarting: false,
             status: String::new(),
             error: None,
@@ -245,6 +223,8 @@ pub struct Publisher {
     ignore_stop_echo: bool,
     /// Actual system-audio track of the engine; reported by `stream.start`.
     has_audio: bool,
+    /// Actual scope of that track, for the local on-air line.
+    audio_scope: Option<String>,
     /// Picker id of the current attempt. A publish for another id is stale.
     picker: Option<u64>,
     sequence: u64,
@@ -284,6 +264,7 @@ impl Publisher {
             restarting: false,
             ignore_stop_echo: false,
             has_audio: false,
+            audio_scope: None,
             picker: None,
             sequence: 0,
             start_request: None,
@@ -313,6 +294,7 @@ impl Publisher {
             quality: self.request.as_ref().map(|request| request.quality),
             codec: self.request.as_ref().map(|request| request.codec),
             has_audio: self.has_audio,
+            audio_scope: self.audio_scope.clone(),
             restarting: self.restarting,
             status: self.status.clone(),
             error: self.error.clone(),
@@ -789,7 +771,14 @@ impl Publisher {
     ///
     /// `has_audio` is what the engine really opened, not the user's request:
     /// the backend adds exactly one recvonly audio m-line from this flag.
-    pub fn engine_ready(&mut self, now: Instant, has_audio: bool) -> Vec<Outcome> {
+    /// `audio_scope` is local only: the pinned `stream.start` contract has no
+    /// scope field, so it is shown on the local card and never sent.
+    pub fn engine_ready(
+        &mut self,
+        now: Instant,
+        has_audio: bool,
+        audio_scope: Option<String>,
+    ) -> Vec<Outcome> {
         if self.phase != Phase::Publishing || self.start_sent {
             return Vec::new();
         }
@@ -797,6 +786,7 @@ impl Publisher {
             return self.fail("Источник трансляции не выбран.", now);
         };
         self.has_audio = has_audio;
+        self.audio_scope = if has_audio { audio_scope } else { None };
         let signal = self.signal(
             "stream.start",
             json!({
@@ -850,6 +840,7 @@ impl Publisher {
         self.restarting = false;
         self.ignore_stop_echo = false;
         self.has_audio = false;
+        self.audio_scope = None;
         out.push(Outcome::State(self.sharing()));
         out
     }
@@ -890,6 +881,7 @@ impl Publisher {
         self.error = None;
         self.restarting = false;
         self.has_audio = false;
+        self.audio_scope = None;
         vec![
             Outcome::StartEngine {
                 attempt: self.attempt,
@@ -906,6 +898,7 @@ impl Publisher {
         self.restarting = false;
         self.ignore_stop_echo = false;
         self.has_audio = false;
+        self.audio_scope = None;
         self.picker = None;
         self.start_request = None;
         self.requests.clear();

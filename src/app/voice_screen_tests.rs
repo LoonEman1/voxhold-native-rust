@@ -45,7 +45,7 @@ pub(super) fn draw(visual: &mut gpui::VisualTestContext) {
 }
 
 /// Open the picker through the test seam and paint it once.
-fn open_picker(
+pub(super) fn open_picker(
     visual: &mut gpui::VisualTestContext,
     voice: &gpui::Entity<crate::voice_panel::VoicePanel>,
 ) {
@@ -479,6 +479,24 @@ async fn the_on_air_sound_line_reports_measured_and_missing_audio(cx: &mut TestA
                 phase: Phase::Live,
                 live: true,
                 quality: Some(quality),
+                has_audio: true,
+                audio_scope: Some("Только звук demo.exe (PID 42)".into()),
+                stats: Some(voxhold_media::publisher::engine::PublishStats {
+                    audio_active: true,
+                    audio_kbps: 96.0,
+                    ..Default::default()
+                }),
+                ..Sharing::default()
+            });
+            assert!(
+                panel.test_sound_label().contains("demo.exe"),
+                "the on-air line must name the actual scope: {}",
+                panel.test_sound_label()
+            );
+            panel.test_set_screen_sharing(Sharing {
+                phase: Phase::Live,
+                live: true,
+                quality: Some(quality),
                 has_audio: false,
                 ..Sharing::default()
             });
@@ -617,6 +635,9 @@ async fn a_pending_audio_probe_blocks_start_and_never_publishes_video_only(
 
     visual.update(|_window, app| {
         voice.update(app, |panel, cx| {
+            assert_eq!(panel.test_audio_toggle_label(), "Выключен");
+            // Audio is off by default now; enabling it is an explicit choice.
+            panel.test_toggle_system_audio(cx);
             assert_eq!(panel.test_audio_toggle_label(), "Включён");
             assert!(panel.test_can_start());
             panel.test_start_screen_share(cx);

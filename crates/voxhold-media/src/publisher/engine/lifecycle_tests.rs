@@ -40,6 +40,7 @@ fn fake_engine(
             preview: Arc::new(PreviewStore::default()),
             ice_dropped: AtomicU64::new(0),
             has_audio: false,
+            audio_scope: None,
             thread: Some(thread),
         },
         abort,

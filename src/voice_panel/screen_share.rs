@@ -16,12 +16,8 @@ use voxhold_media::publisher::{
 use voxhold_media::screen_capture::{
     self, PreviewFrame, ScreenSource, SourceId, SourceKind, ThumbnailError,
 };
-use voxhold_media::system_audio::{self, AudioDeviceInfo};
+use voxhold_media::system_audio::{self, AudioDeviceInfo, AudioScope};
 
-/// Windows loopback sees every render session of the endpoint, including this
-/// application's own room and player. State it instead of promising otherwise.
-pub(crate) const SYSTEM_AUDIO_WARNING: &str =
-    "Системный звук записывается через loopback всего устройства вывода: в него попадут голос комнаты и плеер Voxhold. Windows не позволяет исключить звук отдельного приложения.";
 /// The backend has no runtime reconfigure; the dialog must warn honestly.
 pub(crate) const RESTART_WARNING: &str =
     "Изменение качества перезапустит трансляцию: текущая сессия будет остановлена, зрители увидят новое подключение.";
@@ -69,6 +65,8 @@ pub(super) enum ShareKey {
     BitrateUp,
     Preset(Preset),
     Audio,
+    /// One offered capture scope of the system-audio track.
+    AudioScope(AudioScope),
     AudioBitrateDown,
     AudioBitrateUp,
     Cancel,
@@ -93,6 +91,9 @@ pub(super) struct ScreenShareUi {
     pub(super) fps: u32,
     pub(super) bitrate_kbps: u32,
     pub(super) audio_enabled: bool,
+    /// The scope the next request carries. Only meaningful when audio is on;
+    /// the provided source kind decides the default choice.
+    pub(super) audio_scope: AudioScope,
     pub(super) audio_bitrate_kbps: u32,
     pub(super) audio_availability: Option<Result<AudioDeviceInfo, String>>,
     /// The dialog was opened from the live card to change quality. Start then
@@ -153,7 +154,8 @@ impl Default for ScreenShareUi {
             resolution: Resolution::P1080,
             fps: 30,
             bitrate_kbps: 6000,
-            audio_enabled: true,
+            audio_enabled: false,
+            audio_scope: AudioScope::EverythingExceptSelf,
             audio_bitrate_kbps: 128,
             audio_availability: None,
             restart: false,
@@ -301,6 +303,7 @@ impl ScreenShareUi {
 
     /// The honest on-air sound line. The measured rate comes from the RTP
     /// stats; before the first sample only the configured maximum is shown.
+    /// The actual scope comes from the engine, not from the picker choice.
     pub(super) fn sound_label(&self) -> String {
         if !self.sharing.has_audio {
             return "Без звука".into();
@@ -310,11 +313,15 @@ impl ScreenShareUi {
             .quality
             .map(|quality| quality.audio_bitrate_kbps)
             .unwrap_or(self.audio_bitrate_kbps);
-        match self.sharing.stats {
+        let rate = match self.sharing.stats {
             Some(stats) if stats.audio_kbps > 0.0 => {
                 format!("Звук ~{:.0} из до {} кбит/с", stats.audio_kbps, max)
             }
             _ => format!("Звук до {max} кбит/с"),
+        };
+        match self.sharing.audio_scope.as_deref() {
+            Some(scope) if !scope.is_empty() => format!("{rate} · {scope}"),
+            _ => rate,
         }
     }
 
@@ -449,11 +456,14 @@ impl VoicePanel {
         // A new picker starts with no previews and a new epoch: a capture of
         // the previous dialog can finish, but its result is ignored.
         self.screen.clear_previews();
-        // A fresh publication defaults to system audio; the background probe
-        // fills in availability and disables the toggle if the endpoint fails.
-        // The previous picker's answer must not leak into this one: Start
-        // stays locked until the new probe settles.
-        self.screen.audio_enabled = true;
+        // A fresh publication starts without system sound: the whole endpoint
+        // is never published silently. Enabling it offers the safe default
+        // scope for the source kind. The background probe fills in
+        // availability and disables the toggle if the endpoint fails. The
+        // previous picker's answer must not leak into this one: Start stays
+        // locked until the new probe settles.
+        self.screen.audio_enabled = false;
+        self.screen.reset_audio_scope(SourceKind::Monitor);
         self.screen.audio_availability = None;
         self.begin_audio_probe(cx);
         self.screen.focus_placed = false;
@@ -481,6 +491,20 @@ impl VoicePanel {
             self.screen.audio_bitrate_kbps = quality.audio_bitrate_kbps;
         }
         self.screen.audio_enabled = sharing.has_audio;
+        // The restart carries the scope the live attempt accepted; if the
+        // previous request is unavailable, use the safe default of its kind.
+        let kind = self
+            .screen
+            .last_request
+            .as_ref()
+            .map(|request| request.source.kind)
+            .unwrap_or(self.screen.kind);
+        self.screen.audio_scope = self
+            .screen
+            .last_request
+            .as_ref()
+            .map(|request| request.audio_scope)
+            .unwrap_or_else(|| audio_scope::default_audio_scope(kind));
         self.begin_audio_probe(cx);
         self.screen.restart = true;
         // The restart dialog is bound to the confirmed live source here, and
@@ -646,6 +670,11 @@ impl VoicePanel {
         if self.screen.selected.is_some_and(|id| id.kind != kind) {
             self.screen.selected = None;
         }
+        // The safe default follows the source kind; an explicit whole-device
+        // choice survives a tab switch.
+        if self.screen.audio_scope != AudioScope::Device {
+            self.screen.reset_audio_scope(kind);
+        }
         // Only the visible category is captured. A batch for the hidden one
         // stops at its next check; its pending ids are dropped so switching
         // back requests them again instead of treating them as in flight.
@@ -745,6 +774,12 @@ impl VoicePanel {
             quality: self.screen.quality(),
             codec: Codec::Vp8,
             audio: self.screen.audio_requested(),
+            audio_scope: self.screen.effective_audio_scope(
+                self.screen
+                    .selected
+                    .map(|id| id.kind)
+                    .unwrap_or(self.screen.kind),
+            ),
         };
         let Some(handle) = &self.handle else {
             self.screen.error = "Голосовое соединение уже закрыто.".into();
@@ -813,6 +848,11 @@ impl VoicePanel {
             return;
         }
         self.screen.audio_enabled = !self.screen.audio_enabled;
+        if self.screen.audio_enabled {
+            // Enabling always starts from a scope the kind really offers.
+            let scope = self.screen.effective_audio_scope(self.screen.kind);
+            self.screen.audio_scope = scope;
+        }
         cx.notify();
     }
 
@@ -1016,185 +1056,9 @@ impl VoicePanel {
             )
             .into_any_element()
     }
-
-    /// Whether the local on-air card takes one room slot.
-    pub(super) fn screen_card_active(&self) -> bool {
-        matches!(
-            self.screen.sharing.phase,
-            Phase::Publishing | Phase::Live | Phase::Stopping | Phase::Failed
-        )
-    }
-
-    /// The card that replaces the local publication in the room grid while a
-    /// screen is on air. `None` when nothing is being published.
-    pub(super) fn screen_card(
-        &mut self,
-        rect: Rect,
-        cx: &mut Context<Self>,
-    ) -> Option<gpui::AnyElement> {
-        let sharing = self.screen.sharing.clone();
-        if !matches!(
-            sharing.phase,
-            Phase::Publishing | Phase::Live | Phase::Stopping | Phase::Failed
-        ) {
-            return None;
-        }
-        let c = self.colors();
-        let live = sharing.phase == Phase::Live;
-        let status = if live {
-            "В ЭФИРЕ".to_owned()
-        } else if sharing.phase == Phase::Failed {
-            "ОШИБКА".to_owned()
-        } else if sharing.phase == Phase::Stopping {
-            "ОСТАНОВКА…".to_owned()
-        } else {
-            sharing.status.clone()
-        };
-        let stats = sharing.stats.map(|stats| {
-            // FPS, drop, real resolution, limitation and source count come
-            // from OutboundRtpStats; this build has no GPU/CPU percentage.
-            stats.describe()
-        });
-        let quality = self.screen.quality_label();
-        let sound = self.screen.sound_label();
-        let mut card = div()
-            .id("screen-on-air")
-            .debug_selector(|| "screen-on-air".into())
-            .absolute()
-            .left(px(rect.x))
-            .top(px(rect.y))
-            .w(px(rect.w))
-            .h(px(rect.h))
-            .rounded(px(12.))
-            .bg(rgb(c.surface))
-            .border_1()
-            .border_color(rgb(if live { c.danger } else { c.line }))
-            .child(
-                div()
-                    .absolute()
-                    .left(px(12.))
-                    .top(px(12.))
-                    .px(px(8.))
-                    .py(px(2.))
-                    .rounded(px(5.))
-                    .bg(rgb(c.live_bg))
-                    .text_size(px(10.))
-                    .text_color(rgb(c.danger))
-                    .child(if live { "LIVE" } else { "ВАШ ЭКРАН" }),
-            )
-            .child(
-                div()
-                    .absolute()
-                    .right(px(12.))
-                    .top(px(12.))
-                    .text_size(px(10.))
-                    .text_color(rgb(c.muted))
-                    .truncate()
-                    .child(status),
-            )
-            .child(
-                div()
-                    .absolute()
-                    .left(px(10.))
-                    .top(px(34.))
-                    .w(px((rect.w - 20.).max(1.)))
-                    .h(px((rect.h - 108.).max(1.)))
-                    .rounded(px(8.))
-                    .overflow_hidden()
-                    .bg(rgb(0x080808))
-                    .when_some(self.screen.preview.clone(), |picture, image| {
-                        picture.child(
-                            img(image)
-                                .w_full()
-                                .h_full()
-                                .object_fit(gpui::ObjectFit::Contain),
-                        )
-                    }),
-            )
-            .child(
-                div()
-                    .absolute()
-                    .left(px(12.))
-                    .top(px(rect.h - 66.))
-                    .w(px((rect.w - 24.).max(0.)))
-                    .text_size(px(12.))
-                    .font_weight(gpui::FontWeight::BOLD)
-                    .truncate()
-                    .child("Ваш экран"),
-            )
-            .child(
-                div()
-                    .absolute()
-                    .left(px(12.))
-                    .top(px(rect.h - 50.))
-                    .w(px((rect.w - 24.).max(0.)))
-                    .text_size(px(10.))
-                    .text_color(rgb(c.muted))
-                    .truncate()
-                    .debug_selector(|| "screen-on-air-quality".into())
-                    .child(match stats {
-                        Some(stats) => format!("{quality} · {stats}"),
-                        None => format!("{quality} · {sound}"),
-                    }),
-            );
-        if sharing.phase != Phase::Stopping {
-            let mut actions = div()
-                .absolute()
-                .left(px(10.))
-                .top(px(rect.h - 36.))
-                .w(px((rect.w - 20.).max(0.)))
-                .h(px(28.))
-                .flex()
-                .gap_1();
-            // The dialog only applies changes while the stream is Live; in
-            // Publishing the action would be inert, so it is not shown.
-            if sharing.phase == Phase::Live {
-                let quality_focus = self.screen_focus[2].clone();
-                actions = actions.child(
-                    div()
-                        .id("screen-quality")
-                        .debug_selector(|| "screen-quality".into())
-                        .flex_1()
-                        .h_full()
-                        .rounded(px(8.))
-                        .border_1()
-                        .border_color(rgb(c.line))
-                        .text_color(rgb(c.fg))
-                        .text_size(px(11.))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .cursor_pointer()
-                        .track_focus(&quality_focus)
-                        .on_click(cx.listener(|panel, _, _, cx| panel.open_screen_settings(cx)))
-                        .child("Качество"),
-                );
-            }
-            let stop_focus = self.screen_focus[0].clone();
-            actions = actions.child(
-                div()
-                    .id("screen-stop")
-                    .debug_selector(|| "screen-stop".into())
-                    .flex_1()
-                    .h_full()
-                    .rounded(px(8.))
-                    .border_1()
-                    .border_color(rgb(c.danger))
-                    .text_color(rgb(c.danger))
-                    .text_size(px(11.))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .cursor_pointer()
-                    .track_focus(&stop_focus)
-                    .on_click(cx.listener(|panel, _, _, cx| panel.stop_screen_share(cx)))
-                    .child("Завершить"),
-            );
-            card = card.child(actions);
-        }
-        Some(card.into_any_element())
-    }
 }
 
+mod audio_scope;
+mod card;
 mod dialog;
 mod preview;

@@ -62,6 +62,7 @@ fn a_screen_publication_never_touches_the_microphone_gate() {
             },
             codec: crate::publisher::Codec::Vp8,
             audio: true,
+            audio_scope: crate::system_audio::AudioScope::Device,
         },
         Vec::new(),
         "all".into(),

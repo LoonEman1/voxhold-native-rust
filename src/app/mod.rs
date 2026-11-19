@@ -57,6 +57,8 @@ mod voice_form_tests;
 mod voice_gain_tests;
 mod voice_ops;
 #[cfg(test)]
+mod voice_screen_audio_tests;
+#[cfg(test)]
 mod voice_screen_preview_tests;
 #[cfg(test)]
 mod voice_screen_restart_tests;

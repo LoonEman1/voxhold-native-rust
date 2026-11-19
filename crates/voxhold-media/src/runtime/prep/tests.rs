@@ -67,6 +67,7 @@ fn screen_request() -> PublishRequest {
         quality: Quality::default(),
         codec: Codec::Vp8,
         audio: false,
+        audio_scope: crate::system_audio::AudioScope::Device,
     }
 }
 
@@ -131,7 +132,7 @@ fn a_delayed_preparation_does_not_block_the_session_requests() {
         Duration::from_secs(5),
         move |_| {
             std::thread::sleep(Duration::from_millis(250));
-            Ok((FakeEngine::new(&worker), false))
+            Ok((FakeEngine::new(&worker), false, None))
         },
     )
     .expect("the preparation thread starts");
@@ -160,7 +161,11 @@ fn stream_start_waits_for_the_prepared_engine() {
     let worker = DropCounter(dropped.0.clone());
     let mut prep = ScreenPrep::start(binding.clone(), now, Duration::from_secs(5), move |_| {
         std::thread::sleep(Duration::from_millis(150));
-        Ok((FakeEngine::new(&worker), true))
+        Ok((
+            FakeEngine::new(&worker),
+            true,
+            Some("Только звук test.exe (PID 1)".into()),
+        ))
     })
     .expect("the preparation thread starts");
 
@@ -184,6 +189,11 @@ fn stream_start_waits_for_the_prepared_engine() {
         "a successful start needs no compensating stop"
     );
     assert!(publisher.sharing().has_audio);
+    assert_eq!(
+        publisher.sharing().audio_scope.as_deref(),
+        Some("Только звук test.exe (PID 1)"),
+        "the prepared engine's real scope reaches the state machine"
+    );
 }
 
 #[test]
@@ -194,7 +204,7 @@ fn cancel_before_completion_drops_the_late_engine_without_stream_start() {
     let worker = DropCounter(dropped.0.clone());
     let prep = ScreenPrep::start(binding(1, "me"), now, Duration::from_secs(5), move |_| {
         std::thread::sleep(Duration::from_millis(150));
-        Ok((FakeEngine::new(&worker), false))
+        Ok((FakeEngine::new(&worker), false, None))
     })
     .expect("the preparation thread starts");
 
@@ -223,7 +233,7 @@ fn leave_and_access_loss_cancel_the_preparation() {
     let mut prep = Some(
         ScreenPrep::start(binding(1, "me"), now, Duration::from_secs(5), move |_| {
             std::thread::sleep(Duration::from_millis(100));
-            Ok((FakeEngine::new(&worker), false))
+            Ok((FakeEngine::new(&worker), false, None))
         })
         .expect("the preparation thread starts"),
     );
@@ -241,7 +251,7 @@ fn leave_and_access_loss_cancel_the_preparation() {
     let mut prep = Some(
         ScreenPrep::start(binding(1, "me"), now, Duration::from_secs(5), move |_| {
             std::thread::sleep(Duration::from_millis(100));
-            Ok((FakeEngine::new(&worker), false))
+            Ok((FakeEngine::new(&worker), false, None))
         })
         .expect("the preparation thread starts"),
     );
@@ -288,7 +298,7 @@ fn a_late_result_of_an_old_attempt_room_or_connection_is_rejected() {
         let dropped = DropCounter::default();
         let worker = DropCounter(dropped.0.clone());
         let mut prep = ScreenPrep::start(old.clone(), now, Duration::from_secs(5), move |_| {
-            Ok((FakeEngine::new(&worker), false))
+            Ok((FakeEngine::new(&worker), false, None))
         })
         .expect("the preparation thread starts");
         let event = wait_for(&mut prep, Duration::from_secs(2));
@@ -320,7 +330,7 @@ fn a_revoked_gate_rejects_the_prepared_engine() {
     let dropped = DropCounter::default();
     let worker = DropCounter(dropped.0.clone());
     let mut prep = ScreenPrep::start(binding.clone(), now, Duration::from_secs(5), move |_| {
-        Ok((FakeEngine::new(&worker), false))
+        Ok((FakeEngine::new(&worker), false, None))
     })
     .expect("the preparation thread starts");
     let event = wait_for(&mut prep, Duration::from_secs(2));
@@ -348,7 +358,7 @@ fn a_preparation_timeout_fails_visibly_and_releases_the_engine() {
     let worker = DropCounter(dropped.0.clone());
     let mut prep = ScreenPrep::start(binding.clone(), now, Duration::from_millis(60), move |_| {
         std::thread::sleep(Duration::from_millis(250));
-        Ok((FakeEngine::new(&worker), false))
+        Ok((FakeEngine::new(&worker), false, None))
     })
     .expect("the preparation thread starts");
     let event = wait_for(&mut prep, Duration::from_secs(2));
@@ -383,7 +393,7 @@ fn a_new_publish_replaces_the_pending_preparation() {
     let mut prep = Some(
         ScreenPrep::start(binding(1, "me"), now, Duration::from_secs(5), move |_| {
             std::thread::sleep(Duration::from_millis(150));
-            Ok((FakeEngine::new(&worker), false))
+            Ok((FakeEngine::new(&worker), false, None))
         })
         .expect("the preparation thread starts"),
     );
@@ -394,7 +404,7 @@ fn a_new_publish_replaces_the_pending_preparation() {
     let second = DropCounter::default();
     let worker = DropCounter(second.0.clone());
     let next = ScreenPrep::start(binding(1, "me"), now, Duration::from_secs(5), move |_| {
-        Ok((FakeEngine::new(&worker), false))
+        Ok((FakeEngine::new(&worker), false, None))
     })
     .expect("the replacement starts");
     let mut next = Some(next);
@@ -430,6 +440,7 @@ fn a_duplicate_ready_is_discarded_instead_of_replacing_the_accepted_engine() {
         PrepEvent::Ready {
             engine: FakeEngine::new(&accepted),
             has_audio: true,
+            audio_scope: Some("Только звук test.exe (PID 1)".into()),
         },
         now,
     );
@@ -445,6 +456,7 @@ fn a_duplicate_ready_is_discarded_instead_of_replacing_the_accepted_engine() {
         PrepEvent::Ready {
             engine: FakeEngine::new(&duplicate),
             has_audio: false,
+            audio_scope: None,
         },
         now,
     );
@@ -490,7 +502,7 @@ fn a_revocation_wins_over_a_ready_engine_the_session_has_not_observed() {
         ScreenPrep::start(binding, now, Duration::from_secs(5), move |_| {
             let engine = FakeEngine::new(&worker);
             flag.store(true, Ordering::SeqCst);
-            Ok((engine, false))
+            Ok((engine, false, None))
         })
         .expect("the preparation thread starts"),
     );

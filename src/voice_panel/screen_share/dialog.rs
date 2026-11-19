@@ -411,6 +411,8 @@ impl VoicePanel {
         let audio_focus = row(self, &mut ring, ShareKey::Audio);
         let audio_rate = format!("{} кбит/с", self.screen.audio_bitrate_kbps);
         let audio_status = self.screen.audio_status();
+        let scope_sentence = self.screen.audio_scope_sentence();
+        let scope_choices = audio_scope::audio_scope_choices(self.screen.kind);
         let quality_row = div()
             .flex()
             .flex_col()
@@ -550,11 +552,29 @@ impl VoicePanel {
                     ),
             )
             .when(audio_requested, |rows| {
-                rows.child(
+                let mut scope_row = div().flex().items_center().gap_2().child(
+                    div()
+                        .w(px(92.))
+                        .text_size(px(12.))
+                        .text_color(rgb(c.muted))
+                        .child("Что звучит"),
+                );
+                for (scope, label) in scope_choices {
+                    let focus = row(self, &mut ring, ShareKey::AudioScope(scope));
+                    scope_row = scope_row.child(self.choice_enabled(
+                        label,
+                        self.screen.audio_scope == scope,
+                        audio_available,
+                        focus,
+                        ShareKey::AudioScope(scope),
+                        cx,
+                    ));
+                }
+                rows.child(scope_row).child(
                     div()
                         .text_size(px(10.))
                         .text_color(rgb(c.muted))
-                        .child(SYSTEM_AUDIO_WARNING),
+                        .child(scope_sentence),
                 )
             })
             .child(
@@ -770,6 +790,7 @@ impl VoicePanel {
             ShareKey::BitrateUp => self.change_bitrate(100, cx),
             ShareKey::Preset(preset) => self.apply_preset(preset, cx),
             ShareKey::Audio => self.toggle_system_audio(cx),
+            ShareKey::AudioScope(scope) => self.select_audio_scope(scope, cx),
             ShareKey::AudioBitrateDown => self.change_audio_bitrate(false, cx),
             ShareKey::AudioBitrateUp => self.change_audio_bitrate(true, cx),
             ShareKey::Cancel => {

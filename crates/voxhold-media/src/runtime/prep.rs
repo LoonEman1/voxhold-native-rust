@@ -51,7 +51,11 @@ impl PrepBinding {
 
 /// One bounded result of the preparation worker.
 pub(super) enum PrepEvent<E> {
-    Ready { engine: E, has_audio: bool },
+    Ready {
+        engine: E,
+        has_audio: bool,
+        audio_scope: Option<String>,
+    },
     Failed(String),
     Timeout,
 }
@@ -81,7 +85,7 @@ impl<E> Default for PrepFinish<E> {
 pub(super) struct ScreenPrep<E: Send + 'static> {
     binding: PrepBinding,
     cancel: Arc<AtomicBool>,
-    result: Option<Receiver<Result<(E, bool), String>>>,
+    result: Option<Receiver<Result<(E, bool, Option<String>), String>>>,
     deadline: Instant,
     thread: Option<JoinHandle<()>>,
 }
@@ -116,7 +120,7 @@ impl<E: Send + 'static> ScreenPrep<E> {
         launch: F,
     ) -> Result<Self, String>
     where
-        F: FnOnce(&AtomicBool) -> Result<(E, bool), String> + Send + 'static,
+        F: FnOnce(&AtomicBool) -> Result<(E, bool, Option<String>), String> + Send + 'static,
     {
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = cancel.clone();
@@ -145,10 +149,14 @@ impl<E: Send + 'static> ScreenPrep<E> {
     pub(super) fn poll(&mut self, now: Instant) -> Option<PrepEvent<E>> {
         let received = self.result.as_ref()?.try_recv();
         match received {
-            Ok(Ok((engine, has_audio))) => {
+            Ok(Ok((engine, has_audio, audio_scope))) => {
                 self.result.take();
                 self.thread.take();
-                Some(PrepEvent::Ready { engine, has_audio })
+                Some(PrepEvent::Ready {
+                    engine,
+                    has_audio,
+                    audio_scope,
+                })
             }
             Ok(Err(message)) => {
                 self.result.take();
@@ -226,7 +234,11 @@ pub(super) fn finish_prep<E>(
     now: Instant,
 ) -> PrepFinish<E> {
     match event {
-        PrepEvent::Ready { engine, has_audio } => {
+        PrepEvent::Ready {
+            engine,
+            has_audio,
+            audio_scope,
+        } => {
             if !binding.same_attempt(current)
                 || publisher.sharing().attempt != binding.attempt
                 || publisher.phase() != Phase::Publishing
@@ -258,7 +270,7 @@ pub(super) fn finish_prep<E>(
             // was declined (the phase moved on or `stream.start` already left).
             // Installing it anyway would let a duplicate `Ready` replace the
             // accepted engine with an unnegotiated peer.
-            let outcomes = publisher.engine_ready(now, has_audio);
+            let outcomes = publisher.engine_ready(now, has_audio, audio_scope);
             if outcomes.is_empty() {
                 return PrepFinish {
                     discard: Some(engine),

@@ -2,7 +2,37 @@
 //! bitrate and the four web presets. Kept in its own module so the publisher
 //! state machine stays within the repository file-size budget.
 
-use super::Resolution;
+/// Resolution choices of the SDR publisher, matching the web dialog. Defined
+/// beside [`Quality`] so the state machine stays inside the file-size budget.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Resolution {
+    #[default]
+    P720,
+    P1080,
+}
+
+impl Resolution {
+    pub fn size(self) -> (u32, u32) {
+        match self {
+            Self::P720 => (1280, 720),
+            Self::P1080 => (1920, 1080),
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::P720 => "1280 × 720",
+            Self::P1080 => "1920 × 1080",
+        }
+    }
+
+    pub fn wire(self) -> &'static str {
+        match self {
+            Self::P720 => "720p",
+            Self::P1080 => "1080p",
+        }
+    }
+}
 
 /// Opus bitrate choices of the web dialog. The backend accepts 32–510 kbit/s,
 /// but the client shows the same six values as the web form.

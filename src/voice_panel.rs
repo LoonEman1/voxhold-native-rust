@@ -198,6 +198,21 @@ pub struct VoicePanel {
     test_audio_probe: Option<
         Arc<dyn Fn() -> Result<voxhold_media::system_audio::AudioDeviceInfo, String> + Send + Sync>,
     >,
+    /// Test-only thumbnail provider. `None` in tests keeps real desktop capture
+    /// out of the suite entirely; an injected provider runs on the same
+    /// background task as the production capture.
+    #[cfg(test)]
+    test_preview_provider: Option<
+        Arc<
+            dyn Fn(
+                    &voxhold_media::screen_capture::ScreenSource,
+                ) -> Result<
+                    voxhold_media::screen_capture::PreviewFrame,
+                    voxhold_media::screen_capture::ThumbnailError,
+                > + Send
+                + Sync,
+        >,
+    >,
 }
 
 impl VoicePanel {
@@ -318,6 +333,8 @@ impl VoicePanel {
             test_share_gate: None,
             #[cfg(test)]
             test_audio_probe: None,
+            #[cfg(test)]
+            test_preview_provider: None,
         }
     }
 

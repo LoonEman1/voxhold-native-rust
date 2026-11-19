@@ -3,7 +3,9 @@
 
 use super::*;
 use voxhold_media::publisher::Sharing;
-use voxhold_media::screen_capture::{ScreenSource, SourceId, SourceKind};
+use voxhold_media::screen_capture::{
+    PreviewFrame, ScreenSource, SourceId, SourceKind, ThumbnailError,
+};
 
 impl VoicePanel {
     /// Ids in the current Tab ring, in cycle order. Tests compare these with
@@ -65,7 +67,11 @@ impl VoicePanel {
         selected: Option<SourceId>,
     ) {
         self.test_share_gate = Some(Ok(()));
+        // A test picker is a new session too: the preview epoch moves so a
+        // result from the previous picker can never match it again.
+        let epoch = self.screen.preview_epoch.wrapping_add(1);
         self.screen = ScreenShareUi::default();
+        self.screen.preview_epoch = epoch;
         self.screen.open = true;
         self.screen.picker = 7;
         self.screen.kind = kind;
@@ -199,6 +205,120 @@ impl VoicePanel {
         (
             self.screen.monitor_generation,
             self.screen.window_generation,
+        )
+    }
+
+    /// Replace the background thumbnail capture with a deterministic provider.
+    /// Without it the suite never reaches the real desktop capturer.
+    pub fn test_set_preview_provider(
+        &mut self,
+        provider: Arc<dyn Fn(&ScreenSource) -> Result<PreviewFrame, ThumbnailError> + Send + Sync>,
+    ) {
+        self.test_preview_provider = Some(provider);
+    }
+
+    /// Inject one small fake thumbnail, exactly as an accepted background
+    /// result would insert it. No capture stack is involved.
+    pub fn test_inject_screen_preview(
+        &mut self,
+        source: &ScreenSource,
+        width: u32,
+        height: u32,
+    ) -> bool {
+        let frame = PreviewFrame {
+            width,
+            height,
+            bgra: vec![0x40; width as usize * height as usize * 4],
+        };
+        self.screen.insert_preview(source.source_id(), frame)
+    }
+
+    /// Inject a preview failure for one card without touching the selection.
+    pub fn test_inject_screen_preview_error(&mut self, source: &ScreenSource, message: &str) {
+        self.screen
+            .insert_preview_failure(source.source_id(), message.to_owned());
+    }
+
+    /// Queue a card as if a background capture were running for it.
+    pub fn test_queue_screen_preview(&mut self, source: &ScreenSource) {
+        self.screen.preview_pending.insert(source.source_id());
+    }
+
+    /// Run the production preview request against the current picker state, so
+    /// a test can model a refresh or a source-list update at an exact moment.
+    pub fn test_request_screen_previews(&mut self, cx: &mut Context<Self>) {
+        self.request_screen_previews(cx);
+    }
+
+    /// Whether a preview batch is marked active for the open picker.
+    pub fn test_preview_batch_active(&self) -> bool {
+        self.screen.preview_batching
+    }
+
+    /// Apply the end-of-batch guard rule for an explicit epoch, so a test can
+    /// model a batch that finishes after its session was replaced.
+    pub fn test_end_preview_batch(&mut self, epoch: u64) -> bool {
+        self.screen.end_preview_batch(epoch)
+    }
+
+    /// Deliver a result with an explicit epoch/identity, mirroring the
+    /// production acceptance check. The id is queued first so a test can model
+    /// a capture that was in flight when the snapshot changed.
+    pub fn test_deliver_screen_preview(
+        &mut self,
+        epoch: u64,
+        source: &ScreenSource,
+        ok: bool,
+    ) -> bool {
+        let id = source.source_id();
+        self.screen.preview_pending.insert(id);
+        let result = if ok {
+            Ok(PreviewFrame {
+                width: 8,
+                height: 8,
+                bgra: vec![0x20; 8 * 8 * 4],
+            })
+        } else {
+            Err(ThumbnailError::Timeout)
+        };
+        self.screen.finish_preview(epoch, id, result)
+    }
+
+    /// The current preview session epoch.
+    pub fn test_preview_epoch(&self) -> u64 {
+        self.screen.preview_epoch
+    }
+
+    /// Cached pictures and their summed BGRA bytes.
+    pub fn test_screen_preview_counts(&self) -> (usize, usize) {
+        (self.screen.previews.len(), self.screen.preview_bytes)
+    }
+
+    /// Pictures dropped by the count or byte bound.
+    pub fn test_screen_preview_rejected(&self) -> u32 {
+        self.screen.preview_rejected
+    }
+
+    /// Ids whose capture is still pending.
+    pub fn test_screen_preview_pending(&self) -> usize {
+        self.screen.preview_pending.len()
+    }
+
+    /// Cards painted by the last frame.
+    pub fn test_screen_preview_cards(&self) -> usize {
+        self.screen.preview_cards
+    }
+
+    /// The painted failure note of one card, if its capture failed.
+    pub fn test_screen_preview_error(&self, id: SourceId) -> Option<String> {
+        self.screen.preview_failures.get(&id).cloned()
+    }
+
+    /// The hard bounds the cache enforces, for a test assertion.
+    pub fn test_screen_preview_bounds(&self) -> (usize, usize) {
+        (
+            super::screen_share::MAX_SCREEN_PREVIEWS,
+            super::screen_share::MAX_SCREEN_PREVIEW_BYTES,
         )
     }
 

@@ -62,7 +62,7 @@ fn open_picker(
 }
 
 /// Open the picker with a controlled list and paint it once.
-fn open_picker_with(
+pub(super) fn open_picker_with(
     visual: &mut gpui::VisualTestContext,
     voice: &gpui::Entity<crate::voice_panel::VoicePanel>,
     kind: SourceKind,

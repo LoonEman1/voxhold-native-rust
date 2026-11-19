@@ -281,6 +281,71 @@ fn a_real_desktop_capture_delivers_a_frame() {
     );
 }
 
+#[test]
+fn a_bgra_thumbnail_is_downscaled_to_a_bounded_picture() {
+    // 16×8: red above, blue below. The preview is 8×4 and keeps the halves.
+    let mut source = solid(16, 8, 16 * 4, [0, 0, 255, 255]);
+    for y in 4..8 {
+        for x in 0..16 {
+            let at = y * 16 * 4 + x * 4;
+            source[at..at + 4].copy_from_slice(&[255, 0, 0, 255]);
+        }
+    }
+    let preview = preview_from_bgra(&source, 16, 8, 16 * 4, 8).expect("thumbnail");
+    assert_eq!((preview.width, preview.height), (8, 4));
+    assert_eq!(preview.bgra.len(), 8 * 4 * 4);
+    // Top row is red (B low, R high), bottom row is blue.
+    assert!(preview.bgra[0] < 30 && preview.bgra[2] > 200, "top");
+    let bottom = 3 * 8 * 4;
+    assert!(
+        preview.bgra[bottom] > 200 && preview.bgra[bottom + 2] < 30,
+        "bottom"
+    );
+    assert!(preview.bgra.iter().skip(3).step_by(4).all(|a| *a == 255));
+
+    // A caller cannot exceed the picker bound, and a small picture is never
+    // upscaled.
+    let wide = solid(400, 8, 400 * 4, [10, 20, 30, 255]);
+    let bounded = preview_from_bgra(&wide, 400, 8, 400 * 4, 10_000).expect("bounded");
+    assert_eq!(bounded.width, MAX_THUMBNAIL_WIDTH);
+    let small = preview_from_bgra(&source, 16, 8, 16 * 4, 16).expect("small");
+    assert_eq!((small.width, small.height), (16, 8));
+
+    // A short buffer, a too-small stride or a zero side is refused.
+    assert!(preview_from_bgra(&[], 16, 8, 16 * 4, 8).is_none());
+    assert!(preview_from_bgra(&source, 16, 8, 8, 8).is_none());
+    assert!(preview_from_bgra(&source, 0, 8, 16 * 4, 8).is_none());
+}
+
+/// Manual proof on a real desktop: one monitor or window delivers a thumbnail.
+/// Only dimensions are printed, never a source title. Run explicitly:
+/// `cargo test -p voxhold-media -- --ignored screen_capture`.
+#[cfg(windows)]
+#[test]
+#[ignore = "требует реальный рабочий стол; запускается вручную"]
+fn a_real_source_yields_a_bounded_thumbnail() {
+    let source = list_sources(SourceKind::Monitor)
+        .ok()
+        .and_then(|sources| sources.into_iter().next())
+        .or_else(|| {
+            list_sources(SourceKind::Window)
+                .ok()
+                .and_then(|sources| sources.into_iter().next())
+        })
+        .expect("no monitor or window source on this host");
+    let preview = capture_thumbnail(&source, MAX_THUMBNAIL_WIDTH).expect("thumbnail");
+    println!(
+        "thumbnail {}×{} ({:?} source kind)",
+        preview.width, preview.height, source.kind
+    );
+    assert!(preview.width >= 2 && preview.height >= 2);
+    assert!(preview.width <= MAX_THUMBNAIL_WIDTH);
+    assert_eq!(
+        preview.bgra.len(),
+        preview.width as usize * preview.height as usize * 4
+    );
+}
+
 fn descriptor(device: &str, width: u32, height: u32) -> MonitorDescriptor {
     MonitorDescriptor {
         device: device.into(),

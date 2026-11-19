@@ -16,11 +16,20 @@
 //!   slower consumer drops frames instead of growing a queue.
 //! - [`PreviewStore`] keeps one small BGRA picture for the local on-air card.
 //!   It is bounded by [`MAX_PREVIEW_BYTES`] and never grows while idle.
+//! - [`capture_thumbnail`] grabs one bounded BGRA picture for the picker grid.
+//!   It creates its own capturer, rejects a source that is no longer listed and
+//!   gives up after [`THUMBNAIL_TIMEOUT`]; it never queues more than one frame.
+//!
+//! The `libwebrtc 0.4.0` desktop capturer has no Windows system picker:
+//! `DesktopCapturerOptions::set_sck_system_picker` is compiled only for macOS.
+//! The picker therefore lists `get_source_list` itself and the local grid is
+//! the only chooser on Windows.
 
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
+use std::time::Duration;
 
 use libwebrtc::video_frame::{I420Buffer, VideoBuffer};
 
@@ -28,6 +37,12 @@ use libwebrtc::video_frame::{I420Buffer, VideoBuffer};
 pub const MAX_PREVIEW_WIDTH: u32 = 640;
 /// Upper bound of one stored preview picture. A bigger picture is rejected.
 pub const MAX_PREVIEW_BYTES: usize = 4 * 1024 * 1024;
+/// The picker thumbnail is never wider than this, so a grid of previews stays
+/// small even when the source is a 4K monitor.
+pub const MAX_THUMBNAIL_WIDTH: u32 = 320;
+/// One thumbnail attempt gives up after this long without a frame. The whole
+/// call is synchronous and meant for a background thread.
+pub const THUMBNAIL_TIMEOUT: Duration = Duration::from_millis(900);
 /// The same limits the viewer accepts; a captured frame is not bigger.
 const MAX_CAPTURE_SIDE: u32 = 4096;
 
@@ -216,6 +231,31 @@ pub fn list_sources(kind: SourceKind) -> Result<Vec<ScreenSource>, &'static str>
     }
 }
 
+/// Capture one small BGRA thumbnail for the picker card of `source`.
+///
+/// The identity is exactly `source.kind + source.id`, the same value used by
+/// `PublishRequest.source` and [`ScreenCapture::start`]. The capturer is
+/// created fresh, the exact source id is looked up in its current list (a
+/// missing id is [`ThumbnailError::Missing`], never a neighbour) and only one
+/// frame is kept. The call is bounded by [`THUMBNAIL_TIMEOUT`], includes no
+/// cursor and is safe to run on a background thread; it logs no title or
+/// picture content.
+pub fn capture_thumbnail(
+    source: &ScreenSource,
+    max_width: u32,
+) -> Result<PreviewFrame, ThumbnailError> {
+    let max_width = max_width.clamp(2, MAX_THUMBNAIL_WIDTH);
+    #[cfg(windows)]
+    {
+        windows::capture_thumbnail(source, max_width)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (source, max_width);
+        Err(ThumbnailError::Unavailable)
+    }
+}
+
 /// Whether this build can capture the desktop at all. It does not prove that
 /// the session has a monitor, so the picker still handles an empty list.
 pub fn capability() -> Result<(), &'static str> {
@@ -265,6 +305,37 @@ impl CaptureFailure {
             Self::Temporary => "temporary",
             Self::Permanent => "permanent",
             Self::Ended => "ended",
+        }
+    }
+}
+
+/// Why one picker thumbnail could not be produced. The picker shows
+/// [`Self::message`] on the card and never substitutes another source.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ThumbnailError {
+    /// No desktop capturer exists in this build or session.
+    Unavailable,
+    /// The exact `kind + id` is missing from the capturer's current list: the
+    /// window closed or the monitor was unplugged after the enumeration.
+    Missing,
+    /// The source delivered no frame within [`THUMBNAIL_TIMEOUT`].
+    Timeout,
+}
+
+impl ThumbnailError {
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::Unavailable => "Системный захват экрана недоступен.",
+            Self::Missing => "Выбранный источник захвата больше недоступен.",
+            Self::Timeout => "Предпросмотр источника не получен.",
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unavailable => "unavailable",
+            Self::Missing => "missing",
+            Self::Timeout => "timeout",
         }
     }
 }
@@ -673,6 +744,71 @@ pub fn preview_from_i420(source: &I420Buffer, max_width: u32) -> Option<PreviewF
     })
 }
 
+/// Downscale one BGRA desktop frame into a bounded preview, preserving the
+/// aspect ratio and never upscaling. The output is at most `max_width` wide
+/// (clamped to [`MAX_THUMBNAIL_WIDTH`]); each destination pixel averages its
+/// source box. The input may have row padding and the result has no padding.
+///
+/// The loop is bounded by the destination size and the source size is checked
+/// first, so a malformed frame returns `None` instead of indexing out of range.
+pub fn preview_from_bgra(
+    bgra: &[u8],
+    width: u32,
+    height: u32,
+    stride: u32,
+    max_width: u32,
+) -> Option<PreviewFrame> {
+    if width == 0 || height == 0 || stride < width.saturating_mul(4) {
+        return None;
+    }
+    if bgra.len() < stride as usize * height as usize {
+        return None;
+    }
+    let max_width = max_width.clamp(2, MAX_THUMBNAIL_WIDTH);
+    let (out_w, out_h) = fit_even(width, height, max_width, MAX_CAPTURE_SIDE);
+    if out_w == 0 || out_h == 0 {
+        return None;
+    }
+    let mut preview = vec![0_u8; out_w as usize * out_h as usize * 4];
+    for out_y in 0..out_h {
+        let y0 = ((u64::from(out_y) * u64::from(height)) / u64::from(out_h)) as u32;
+        let y1 = (((u64::from(out_y) + 1) * u64::from(height) / u64::from(out_h)) as u32)
+            .max(y0 + 1)
+            .min(height);
+        for out_x in 0..out_w {
+            let x0 = ((u64::from(out_x) * u64::from(width)) / u64::from(out_w)) as u32;
+            let x1 = (((u64::from(out_x) + 1) * u64::from(width) / u64::from(out_w)) as u32)
+                .max(x0 + 1)
+                .min(width);
+            let mut blue = 0_u32;
+            let mut green = 0_u32;
+            let mut red = 0_u32;
+            let mut samples = 0_u32;
+            for y in y0..y1 {
+                let row = y as usize * stride as usize;
+                for x in x0..x1 {
+                    let at = row + x as usize * 4;
+                    blue += u32::from(bgra[at]);
+                    green += u32::from(bgra[at + 1]);
+                    red += u32::from(bgra[at + 2]);
+                    samples += 1;
+                }
+            }
+            let samples = samples.max(1);
+            let at = (out_y as usize * out_w as usize + out_x as usize) * 4;
+            preview[at] = (blue / samples) as u8;
+            preview[at + 1] = (green / samples) as u8;
+            preview[at + 2] = (red / samples) as u8;
+            preview[at + 3] = 255;
+        }
+    }
+    Some(PreviewFrame {
+        width: out_w,
+        height: out_h,
+        bgra: preview,
+    })
+}
+
 #[cfg(windows)]
 mod windows {
     use super::*;
@@ -771,6 +907,58 @@ mod windows {
             }
         }
         Ok(result)
+    }
+
+    /// Capture exactly one preview frame for the picker. The capturer is local
+    /// to this call, so it cannot disturb a running publication. Only one frame
+    /// can enter the bounded channel; later callbacks are dropped.
+    pub(super) fn capture_thumbnail(
+        source: &ScreenSource,
+        max_width: u32,
+    ) -> Result<PreviewFrame, ThumbnailError> {
+        let mut options = DesktopCapturerOptions::new(source_type(source.kind));
+        // A cursor in a small card says nothing about the source and moves
+        // between attempts; the picker preview deliberately excludes it.
+        options.set_include_cursor(false);
+        let Some(mut capturer) = DesktopCapturer::new(options) else {
+            return Err(ThumbnailError::Unavailable);
+        };
+        let Some(selected) = capturer
+            .get_source_list()
+            .into_iter()
+            .find(|candidate| candidate.id() == source.id)
+        else {
+            return Err(ThumbnailError::Missing);
+        };
+        // The frame is only valid inside the callback, so the downscale and
+        // the copy both happen there. A one-slot channel bounds the memory.
+        let (sender, receiver) = std::sync::mpsc::sync_channel::<PreviewFrame>(1);
+        capturer.start_capture(Some(selected), move |result| {
+            if let Ok(frame) = result {
+                let width = frame.width().max(0) as u32;
+                let height = frame.height().max(0) as u32;
+                if let Some(preview) =
+                    preview_from_bgra(frame.data(), width, height, frame.stride(), max_width)
+                {
+                    let _ = sender.try_send(preview);
+                }
+            }
+        });
+        let deadline = Instant::now() + THUMBNAIL_TIMEOUT;
+        loop {
+            capturer.capture_frame();
+            match receiver.try_recv() {
+                Ok(preview) => return Ok(preview),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    return Err(ThumbnailError::Unavailable);
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+            if Instant::now() >= deadline {
+                return Err(ThumbnailError::Timeout);
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     /// `HWND` values of this process. Window sources are top-level windows, so

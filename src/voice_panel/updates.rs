@@ -14,7 +14,14 @@ impl VoicePanel {
             update,
             VoiceUpdate::ScreenShare(_) | VoiceUpdate::ScreenSources { .. }
         ) {
-            return self.apply_screen_update(update);
+            let sources = matches!(update, VoiceUpdate::ScreenSources { .. });
+            let repaint = self.apply_screen_update(update);
+            if sources {
+                // A fresh answer can add, remove or rename rows; only the
+                // visible category is queued, and cached/pending ids skip.
+                self.request_screen_previews(cx);
+            }
+            return repaint;
         }
         let mut repaint = true;
         match update {

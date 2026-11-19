@@ -83,55 +83,148 @@ impl VoicePanel {
         button.child(label).into_any_element()
     }
 
-    fn source_row(
+    /// One picker card. The root id, the click and the focus handle all use the
+    /// stable `kind + id`, never a grid position, so a reorder keeps both the
+    /// selection and the keyboard focus on the same source.
+    fn source_card(
         &self,
         source: &ScreenSource,
         id: SourceId,
         selected: bool,
         enabled: bool,
         focus: Option<FocusHandle>,
+        card_width: f32,
+        locked: bool,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let c = self.colors();
-        let description = source.describe();
-        let mut row = div()
-            .id(Self::source_element_id(id))
-            .h(px(40.))
+        let key = ScreenShareUi::source_kind_name(id);
+        let thumb = self.screen.previews.get(&id);
+        let failure = self.screen.preview_failures.get(&id);
+        let size = if source.width > 0 && source.height > 0 {
+            format!("{}×{}", source.width, source.height)
+        } else {
+            "Размер неизвестен".into()
+        };
+        let card_selector = format!("share-source-card-{key}-{}", id.id);
+        let thumb_selector = format!("share-thumb-{key}-{}", id.id);
+        let placeholder_selector = format!("share-thumb-placeholder-{key}-{}", id.id);
+        let error_selector = format!("share-thumb-error-{key}-{}", id.id);
+        let selected_selector = format!("share-selected-{key}-{}", id.id);
+
+        let mut picture = div()
             .w_full()
-            .px(px(10.))
+            .h(px(70.))
+            .flex_shrink_0()
+            .overflow_hidden()
+            .bg(rgb(0x080808))
+            .flex()
+            .items_center()
+            .justify_center();
+        if let Some(thumb) = thumb {
+            picture = picture.child(
+                div()
+                    .debug_selector(move || thumb_selector.clone())
+                    .w_full()
+                    .h_full()
+                    .child(
+                        img(thumb.image.clone())
+                            .w_full()
+                            .h_full()
+                            .object_fit(gpui::ObjectFit::Contain),
+                    ),
+            );
+        } else if failure.is_some() {
+            picture = picture.child(
+                div()
+                    .debug_selector(move || error_selector.clone())
+                    .text_size(px(10.))
+                    .text_color(rgb(c.danger))
+                    .child("Превью недоступно"),
+            );
+        } else {
+            picture = picture.child(
+                div()
+                    .debug_selector(move || placeholder_selector.clone())
+                    .text_size(px(10.))
+                    .text_color(rgb(c.muted))
+                    .child(if locked {
+                        "Текущий источник"
+                    } else {
+                        "Превью…"
+                    }),
+            );
+        }
+
+        let mut footer = div()
+            .flex()
+            .flex_col()
+            .gap(px(1.))
+            .p(px(6.))
+            .min_w(px(0.))
+            .child(
+                div()
+                    .text_size(px(11.))
+                    .font_weight(gpui::FontWeight::BOLD)
+                    .truncate()
+                    .child(source.title.clone()),
+            )
+            .child(
+                div()
+                    .text_size(px(9.))
+                    .text_color(rgb(c.muted))
+                    .truncate()
+                    .child(size),
+            );
+        if let Some(message) = failure {
+            footer = footer.child(
+                div()
+                    .text_size(px(9.))
+                    .text_color(rgb(c.danger))
+                    .truncate()
+                    .child(message.clone()),
+            );
+        }
+
+        let mut card = div()
+            .id(Self::source_element_id(id))
+            .debug_selector(move || card_selector.clone())
+            .w(px(card_width))
+            .h(px(124.))
+            .flex_shrink_0()
+            .relative()
+            .overflow_hidden()
             .rounded(px(9.))
             .border_1()
             .border_color(rgb(if selected { c.accent_text } else { c.line }))
             .bg(rgb(if selected { c.avatar_bg } else { c.surface }))
             .flex()
-            .items_center()
-            .gap_2();
+            .flex_col();
         if let Some(focus) = focus {
-            row = row.track_focus(&focus);
+            card = card.track_focus(&focus);
         }
         if enabled {
-            row = row
+            card = card
                 .cursor_pointer()
                 .on_click(cx.listener(move |panel, _, _, cx| panel.select_screen_source(id, cx)));
         }
-        row.child(img("icons/monitor.svg").w(px(16.)).h(px(16.)))
-            .child(
+        if selected {
+            card = card.child(
                 div()
-                    .flex_1()
-                    .min_w(px(0.))
-                    .text_size(px(12.))
-                    .truncate()
-                    .child(description),
-            )
-            .when(selected, |row| {
-                row.child(
-                    div()
-                        .text_size(px(10.))
-                        .text_color(rgb(c.accent_text))
-                        .child("ВЫБРАНО"),
-                )
-            })
-            .into_any_element()
+                    .debug_selector(move || selected_selector.clone())
+                    .absolute()
+                    .top(px(5.))
+                    .right(px(5.))
+                    .px(px(5.))
+                    .py(px(1.))
+                    .rounded(px(4.))
+                    .bg(rgb(c.accent))
+                    .text_color(rgb(c.ink))
+                    .text_size(px(8.))
+                    .child("ВЫБРАНО"),
+            );
+        }
+        card.child(picture).child(footer).into_any_element()
     }
 
     /// The full-window picker. `None` when it is closed.
@@ -187,25 +280,41 @@ impl VoicePanel {
                 .child(self.choice("Обновить", false, refresh_focus, ShareKey::Refresh, cx));
         }
 
+        // Two cards per row at the dialog's normal width, one when it has to
+        // shrink; the grid scrolls inside the same picker height as before.
+        let columns = if width >= 560.0 { 2 } else { 1 };
+        let inner_width = (width - 36.0).max(120.0);
+        let gap = 8.0_f32;
+        let card_width = if columns == 2 {
+            (inner_width - gap) / 2.0
+        } else {
+            inner_width
+        };
         let mut list = div()
             .id("share-sources")
+            .debug_selector(|| "share-sources".into())
             .h(px(236.))
             .w_full()
             .overflow_y_scroll()
             .flex()
             .flex_col()
-            .gap_2();
+            .gap(px(gap));
         if self.screen.restart {
             // Locked context: only the confirmed live source is painted, and
             // it is inert. It is not part of the focus ring, so neither Tab
             // nor a click can move the restart onto another cached source.
             if let Some(live) = self.screen.restart_source().cloned() {
                 let id = live.source_id();
-                list = list.child(self.source_row(&live, id, true, false, None, cx));
+                self.screen.preview_cards = 1;
+                list = list
+                    .child(self.source_card(&live, id, true, false, None, card_width, true, cx));
+            } else {
+                self.screen.preview_cards = 0;
             }
         } else {
             let sources: Vec<ScreenSource> = self.screen.sources().to_vec();
             let selected = self.screen.selected;
+            self.screen.preview_cards = sources.len();
             if sources.is_empty() {
                 let text = if self.screen.loading() {
                     "Ищем источники…"
@@ -222,9 +331,11 @@ impl VoicePanel {
                         .child(text.to_owned()),
                 );
             }
+            let mut rows: Vec<Vec<gpui::AnyElement>> = Vec::new();
+            let mut current: Vec<gpui::AnyElement> = Vec::new();
             for source in sources.iter() {
                 let id = source.source_id();
-                // Focus belongs to the source, not to the row position: the
+                // Focus belongs to the source, not to the grid position: the
                 // keyed handle survives a reorder and follows the same id.
                 let focus = window
                     .use_keyed_state(Self::source_element_id(id), cx, |_, cx| cx.focus_handle())
@@ -232,7 +343,29 @@ impl VoicePanel {
                     .clone();
                 ring.push((focus.clone(), ShareKey::Source(id)));
                 let is_selected = selected == Some(id);
-                list = list.child(self.source_row(source, id, is_selected, true, Some(focus), cx));
+                current.push(self.source_card(
+                    source,
+                    id,
+                    is_selected,
+                    true,
+                    Some(focus),
+                    card_width,
+                    false,
+                    cx,
+                ));
+                if current.len() == columns {
+                    rows.push(std::mem::take(&mut current));
+                }
+            }
+            if !current.is_empty() {
+                rows.push(current);
+            }
+            for cards in rows {
+                let mut grid_row = div().flex().items_start().gap(px(gap));
+                for card in cards {
+                    grid_row = grid_row.child(card);
+                }
+                list = list.child(grid_row);
             }
         }
 

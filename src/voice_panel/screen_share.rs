@@ -13,7 +13,9 @@ use voxhold_media::publisher::{
     Codec, Phase, Preset, PublishRequest, Quality, Resolution, Sharing, AUDIO_BITRATES,
     MAX_CHANNEL_PUBLISHERS,
 };
-use voxhold_media::screen_capture::{self, ScreenSource, SourceId, SourceKind};
+use voxhold_media::screen_capture::{
+    self, PreviewFrame, ScreenSource, SourceId, SourceKind, ThumbnailError,
+};
 use voxhold_media::system_audio::{self, AudioDeviceInfo};
 
 /// Windows loopback sees every render session of the endpoint, including this
@@ -34,6 +36,23 @@ pub(crate) const SOURCE_GONE_REASON: &str =
 /// (`crates/voxhold-api/src/lib.rs:638`), so the client capability is known.
 /// It still does not allow publishing more than one stream in this stage.
 pub(crate) const MULTI_STREAMS_SUPPORTED: bool = true;
+
+/// Width requested from the media layer for one picker card. The media layer
+/// clamps it again, so a caller cannot grow the cache.
+pub(super) const SCREEN_THUMBNAIL_WIDTH: u32 = 320;
+/// Hard bound of the picker preview cache: at most 64 cards.
+pub(super) const MAX_SCREEN_PREVIEWS: usize = 64;
+/// Hard bound of all BGRA bytes kept for picker previews.
+pub(super) const MAX_SCREEN_PREVIEW_BYTES: usize = 16 * 1024 * 1024;
+/// A picture that does not fit the cache still gets an honest card note.
+pub(super) const PREVIEW_MEMORY_REASON: &str = "Предпросмотр недоступен: превышен лимит памяти.";
+
+/// One cached card picture. `bytes` is the BGRA source size before the UI
+/// converted it to RGBA, so the budget stays comparable across sessions.
+pub(super) struct PreviewThumb {
+    pub(super) image: Arc<RenderImage>,
+    pub(super) bytes: usize,
+}
 
 /// One focusable action inside the picker. `Enter`/`Space` on a focused
 /// element runs it, exactly like the settings modal.
@@ -85,6 +104,31 @@ pub(super) struct ScreenShareUi {
     pub(super) error: String,
     pub(super) sharing: Sharing,
     pub(super) preview: Option<Arc<RenderImage>>,
+    /// Picker thumbnails keyed by the stable `kind + id`. The cache is bounded
+    /// by [`MAX_SCREEN_PREVIEWS`] and [`MAX_SCREEN_PREVIEW_BYTES`].
+    pub(super) previews: HashMap<SourceId, PreviewThumb>,
+    /// Cards whose thumbnail attempt failed. The message is painted on the
+    /// card; the selection and the publish request never change because of it.
+    pub(super) preview_failures: HashMap<SourceId, String>,
+    /// Ids whose thumbnail is being captured, so a refresh never queues the
+    /// same source twice.
+    pub(super) preview_pending: HashSet<SourceId>,
+    /// One preview batch is running for this picker. Only one batch may run at
+    /// a time; a request made while it is set returns, and the running batch
+    /// picks up newly visible rows at its next safe point and re-requests at
+    /// its end.
+    pub(super) preview_batching: bool,
+    /// Session epoch of the open picker. Closing it, a stop, a restart or a new
+    /// picker bumps this value; a late capture result is then ignored and no
+    /// further source is started.
+    pub(super) preview_epoch: u64,
+    /// BGRA bytes currently owned by `previews`.
+    pub(super) preview_bytes: usize,
+    /// Pictures dropped by the count or byte bound, kept for diagnostics/tests.
+    pub(super) preview_rejected: u32,
+    /// Cards painted by the last frame, so a layout test can prove one card per
+    /// source without relying on a single `debug_selector`.
+    pub(super) preview_cards: usize,
     pub(super) ring: Vec<(FocusHandle, ShareKey)>,
     /// Set once the dialog focused its first ring element. The flag is reset
     /// with the dialog, so a repaint never steals focus back from the user.
@@ -118,6 +162,14 @@ impl Default for ScreenShareUi {
             error: String::new(),
             sharing: Sharing::default(),
             preview: None,
+            previews: HashMap::new(),
+            preview_failures: HashMap::new(),
+            preview_pending: HashSet::new(),
+            preview_batching: false,
+            preview_epoch: 0,
+            preview_bytes: 0,
+            preview_rejected: 0,
+            preview_cards: 0,
             ring: Vec::new(),
             focus_placed: false,
         }
@@ -377,6 +429,9 @@ impl VoicePanel {
         self.screen.windows.clear();
         self.screen.monitor_error.clear();
         self.screen.window_error.clear();
+        // A new picker starts with no previews and a new epoch: a capture of
+        // the previous dialog can finish, but its result is ignored.
+        self.screen.clear_previews();
         // A fresh publication defaults to system audio; the background probe
         // fills in availability and disables the toggle if the endpoint fails.
         // The previous picker's answer must not leak into this one: Start
@@ -389,6 +444,7 @@ impl VoicePanel {
             self.screen.picker = handle.begin_screen_picker();
         }
         self.request_screen_sources(cx);
+        self.request_screen_previews(cx);
         cx.notify();
     }
 
@@ -413,6 +469,9 @@ impl VoicePanel {
         // only here: the identity stays in `last_request`, never in the
         // enumeration caches, so the current snapshot may be empty or stale.
         self.screen.bind_confirmed_live_source();
+        // A restart has no picker: release every thumbnail and bump the epoch
+        // so an earlier picker capture cannot land in this dialog.
+        self.screen.clear_previews();
         self.screen.open = true;
         self.screen.busy = false;
         self.screen.error.clear();
@@ -484,6 +543,9 @@ impl VoicePanel {
         // dialog, not in the enumeration caches.
         self.screen.monitors.clear();
         self.screen.windows.clear();
+        // Closing cancels the preview batch: the epoch moves, so a late answer
+        // is ignored, and the pictures/titles are released immediately.
+        self.screen.clear_previews();
         self.screen.focus_placed = false;
         if let Some(handle) = &self.handle {
             if committed {
@@ -528,6 +590,12 @@ impl VoicePanel {
                 }
             }
         }
+        // A refresh retries a failed thumbnail of the visible category; cached
+        // pictures and running attempts are kept, and an absent source is
+        // still requested only after its new answer describes it.
+        let kind = self.screen.kind;
+        self.screen.preview_failures.retain(|id, _| id.kind != kind);
+        self.request_screen_previews(cx);
         cx.notify();
     }
 
@@ -559,6 +627,11 @@ impl VoicePanel {
         if self.screen.selected.is_some_and(|id| id.kind != kind) {
             self.screen.selected = None;
         }
+        // Only the visible category is captured. A batch for the hidden one
+        // stops at its next check; its pending ids are dropped so switching
+        // back requests them again instead of treating them as in flight.
+        self.screen.preview_pending.retain(|id| id.kind == kind);
+        self.request_screen_previews(cx);
         cx.notify();
     }
 
@@ -618,6 +691,7 @@ impl VoicePanel {
                 self.screen.open = false;
                 self.screen.restart = false;
                 self.screen.focus_placed = false;
+                self.screen.clear_previews();
                 cx.notify();
                 return;
             }
@@ -679,6 +753,8 @@ impl VoicePanel {
         if let Some(handle) = &self.handle {
             handle.stop_screen_share();
         }
+        // A stop ends the picker session: no capture may start another card.
+        self.screen.clear_previews();
         cx.notify();
     }
 
@@ -735,6 +811,7 @@ impl VoicePanel {
                     self.screen.open = false;
                     self.screen.restart = false;
                     self.screen.busy = false;
+                    self.screen.clear_previews();
                 }
                 if phase == Phase::Idle || phase == Phase::Failed {
                     self.screen.restart = false;
@@ -751,6 +828,7 @@ impl VoicePanel {
                     self.screen.open = false;
                     self.screen.busy = false;
                     self.screen.focus_placed = false;
+                    self.screen.clear_previews();
                 }
                 if phase == Phase::Failed {
                     self.screen.busy = false;
@@ -760,6 +838,7 @@ impl VoicePanel {
                     // dialog calls `begin_picker` again.
                     if self.screen.open {
                         self.screen.open = false;
+                        self.screen.clear_previews();
                     }
                 }
                 if phase == Phase::Idle {
@@ -769,6 +848,7 @@ impl VoicePanel {
                         self.screen.open = false;
                         self.screen.busy = false;
                         self.screen.focus_placed = false;
+                        self.screen.clear_previews();
                         if previous != Phase::Idle {
                             self.screen.error =
                                 "Соединение было восстановлено, выберите экран снова.".into();
@@ -792,6 +872,8 @@ impl VoicePanel {
                         self.screen.monitor_loading = false;
                         self.screen.monitor_error = error.unwrap_or_default();
                         self.screen.retain_selection(SourceKind::Monitor, &sources);
+                        self.screen
+                            .retain_preview_snapshot(SourceKind::Monitor, &sources);
                         // The non-active kind still refreshes its cache; the
                         // picker reads it when the user switches tabs.
                         self.screen.monitors = sources;
@@ -801,6 +883,8 @@ impl VoicePanel {
                         self.screen.window_loading = false;
                         self.screen.window_error = error.unwrap_or_default();
                         self.screen.retain_selection(SourceKind::Window, &sources);
+                        self.screen
+                            .retain_preview_snapshot(SourceKind::Window, &sources);
                         self.screen.windows = sources;
                     }
                     _ => return false,
@@ -832,7 +916,11 @@ impl VoicePanel {
     /// Forget every screen-share surface: leaving the call or a revoked
     /// session must not keep a card, a picker or a stale preview.
     pub(super) fn reset_screen(&mut self) {
+        // The epoch must not fall back to a value an in-flight capture of the
+        // discarded dialog already holds.
+        let epoch = self.screen.preview_epoch.wrapping_add(1);
         self.screen = ScreenShareUi::default();
+        self.screen.preview_epoch = epoch;
     }
 
     fn share_focus(&self, index: usize) -> FocusHandle {
@@ -1087,3 +1175,4 @@ impl VoicePanel {
 }
 
 mod dialog;
+mod preview;

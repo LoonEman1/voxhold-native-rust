@@ -178,19 +178,26 @@ impl StreamViewer {
         let Some(event) = self.media.poll(Duration::ZERO) else {
             // No engine event: the only remaining reason to touch the
             // decoder is a new picture surface for the cached frame.
-            if (width, height) != self.viewport {
+            if (width, height) != self.viewport && self.media.read_video(frame, width, height) {
+                // Only a completed read counts. A failed attempt leaves the
+                // viewport unchanged so the next poll retries it.
                 self.viewport = (width, height);
-                if self.media.read_video(frame, width, height) {
-                    return Some(EngineUpdate::Repaint);
-                }
+                return Some(EngineUpdate::Repaint);
             }
             return None;
         };
         match event {
-            Event::Frame => self
-                .media
-                .read_video(frame, width, height)
-                .then_some(EngineUpdate::Frame),
+            Event::Frame => {
+                if !self.media.read_video(frame, width, height) {
+                    return None;
+                }
+                // The fresh frame now owns the picture surface, so the idle
+                // path must use this size as its baseline. Without it a
+                // later smaller viewport looks unchanged and the stale
+                // larger texture survives a fullscreen exit.
+                self.viewport = (width, height);
+                Some(EngineUpdate::Frame)
+            }
             Event::Answer { sdp } => Some(EngineUpdate::Answer(sdp)),
             Event::Ice(candidate) => Some(EngineUpdate::Ice(candidate)),
             Event::State { state } => Some(EngineUpdate::State(state)),
@@ -326,6 +333,81 @@ mod tests {
         // The same size reports nothing, so the worker settles after one
         // repaint instead of forcing frames in a loop.
         assert!(viewer.poll(&mut frame, 320, 278).is_none());
+    }
+
+    #[test]
+    fn a_cached_repaint_returns_to_the_window_after_a_fullscreen_frame() {
+        let (mut viewer, _commands, events, video) = headless(None);
+        assert!(video.publish_i420(libwebrtc::video_frame::I420Buffer::new_black(320, 180)));
+        events.push(Event::Frame);
+        let mut frame = VideoFrame::default();
+        // Floating window first.
+        assert!(matches!(
+            viewer.poll(&mut frame, 160, 90),
+            Some(EngineUpdate::Frame)
+        ));
+        assert_eq!((frame.width(), frame.height()), (160, 90));
+
+        // A fresh RTP frame arrives while fullscreen. The decode uses the
+        // fullscreen surface, so the cached baseline must move to 320x278.
+        events.push(Event::Frame);
+        assert!(matches!(
+            viewer.poll(&mut frame, 320, 278),
+            Some(EngineUpdate::Frame)
+        ));
+        assert_eq!((frame.width(), frame.height()), (320, 180));
+
+        // Leaving fullscreen queues no frame. The cached picture must be
+        // re-read at the window surface, not stay at the fullscreen size.
+        assert!(matches!(
+            viewer.poll(&mut frame, 160, 90),
+            Some(EngineUpdate::Repaint)
+        ));
+        assert_eq!((frame.width(), frame.height()), (160, 90));
+        assert!(viewer.poll(&mut frame, 160, 90).is_none());
+    }
+
+    #[test]
+    fn a_cached_repaint_shrinks_a_fullscreen_picture_back_to_the_window() {
+        let (mut viewer, _commands, events, video) = headless(None);
+        assert!(video.publish_i420(libwebrtc::video_frame::I420Buffer::new_black(320, 180)));
+        events.push(Event::Frame);
+        let mut frame = VideoFrame::default();
+        // The last decode happened at the fullscreen surface.
+        assert!(matches!(
+            viewer.poll(&mut frame, 320, 278),
+            Some(EngineUpdate::Frame)
+        ));
+        assert_eq!((frame.width(), frame.height()), (320, 180));
+
+        // Exiting fullscreen only changes the surface: the same picture is
+        // re-read smaller and reported as a repaint.
+        assert!(matches!(
+            viewer.poll(&mut frame, 160, 90),
+            Some(EngineUpdate::Repaint)
+        ));
+        assert_eq!((frame.width(), frame.height()), (160, 90));
+        assert!(viewer.poll(&mut frame, 160, 90).is_none());
+    }
+
+    #[test]
+    fn a_cached_repaint_retries_after_a_failed_read() {
+        let (mut viewer, _commands, events, video) = headless(None);
+        events.push(Event::Frame);
+        let mut frame = VideoFrame::default();
+        // Nothing was published, so the fresh frame cannot be decoded. The
+        // failed attempt must not record the viewport as applied.
+        assert!(viewer.poll(&mut frame, 160, 90).is_none());
+        assert!(matches!(viewer.viewport, (0, 0)));
+
+        // A later attempt at the same size must still read the picture
+        // instead of settling because the size looks unchanged.
+        assert!(video.publish_i420(libwebrtc::video_frame::I420Buffer::new_black(320, 180)));
+        assert!(matches!(
+            viewer.poll(&mut frame, 160, 90),
+            Some(EngineUpdate::Repaint)
+        ));
+        assert_eq!((frame.width(), frame.height()), (160, 90));
     }
 
     #[test]

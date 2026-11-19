@@ -346,6 +346,30 @@ fn a_real_source_yields_a_bounded_thumbnail() {
     );
 }
 
+/// Manual proof on a real desktop: the first window source yields a thumbnail
+/// of the same bounded shape. Only dimensions are printed, never a title. Run
+/// explicitly:
+/// `cargo test -p voxhold-media -- --ignored a_real_window_yields_a_bounded_thumbnail`.
+#[cfg(windows)]
+#[test]
+#[ignore = "требует реальный рабочий стол; запускается вручную"]
+fn a_real_window_yields_a_bounded_thumbnail() {
+    let source = list_sources(SourceKind::Window)
+        .expect("window list")
+        .into_iter()
+        .next()
+        .expect("no visible window source on this host");
+    assert_eq!(source.kind, SourceKind::Window);
+    let preview = capture_thumbnail(&source, MAX_THUMBNAIL_WIDTH).expect("window thumbnail");
+    println!("window thumbnail {}×{}", preview.width, preview.height);
+    assert!(preview.width >= 2 && preview.height >= 2);
+    assert!(preview.width <= MAX_THUMBNAIL_WIDTH);
+    assert_eq!(
+        preview.bgra.len(),
+        preview.width as usize * preview.height as usize * 4
+    );
+}
+
 fn descriptor(device: &str, width: u32, height: u32) -> MonitorDescriptor {
     MonitorDescriptor {
         device: device.into(),

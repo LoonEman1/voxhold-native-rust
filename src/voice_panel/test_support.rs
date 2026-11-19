@@ -239,11 +239,6 @@ impl VoicePanel {
             .insert_preview_failure(source.source_id(), message.to_owned());
     }
 
-    /// Queue a card as if a background capture were running for it.
-    pub fn test_queue_screen_preview(&mut self, source: &ScreenSource) {
-        self.screen.preview_pending.insert(source.source_id());
-    }
-
     /// Run the production preview request against the current picker state, so
     /// a test can model a refresh or a source-list update at an exact moment.
     pub fn test_request_screen_previews(&mut self, cx: &mut Context<Self>) {

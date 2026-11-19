@@ -358,6 +358,161 @@ async fn the_preview_cache_enforces_its_count_and_byte_bounds(cx: &mut TestAppCo
     });
 }
 
+/// Every session end moves the epoch and releases the cached bytes and pending
+/// ids: a stop, the live restart dialog and a Failed/Publishing answer all
+/// leave the bounded store empty, so the next picker starts from zero.
+#[gpui::test]
+async fn a_session_end_clears_the_preview_cache_and_moves_the_epoch(cx: &mut TestAppContext) {
+    use voxhold_media::publisher::{Phase, Sharing};
+    let (mut visual, _view, voice) = super::voice_tests::fixture_with(cx, Some(1400.), true);
+    draw(&mut visual);
+    let source = monitor(3, "Экран A", 1920, 1080);
+    let bytes = 8 * 8 * 4;
+
+    // A stop is an intent of the on-air card and ends the picker session.
+    open_picker_with(
+        &mut visual,
+        &voice,
+        SourceKind::Monitor,
+        vec![source.clone()],
+    );
+    let before_stop = voice.read_with(&*visual, |panel, _| panel.test_preview_epoch());
+    visual.update(|_window, app| {
+        voice.update(app, |panel, cx| {
+            assert!(panel.test_inject_screen_preview(&source, 8, 8));
+            assert_eq!(panel.test_screen_preview_counts(), (1, bytes));
+            panel.test_stop_screen_share(cx);
+            assert_ne!(
+                panel.test_preview_epoch(),
+                before_stop,
+                "a stop moves the preview epoch"
+            );
+            assert_eq!(
+                panel.test_screen_preview_counts(),
+                (0, 0),
+                "a stop drops the cached bytes"
+            );
+            assert_eq!(panel.test_screen_preview_pending(), 0);
+        });
+    });
+
+    // The live restart dialog has no picker grid: opening it must drop the
+    // captured cards and reject their late answers.
+    open_picker_with(
+        &mut visual,
+        &voice,
+        SourceKind::Monitor,
+        vec![source.clone()],
+    );
+    let before_restart = voice.read_with(&*visual, |panel, _| panel.test_preview_epoch());
+    visual.update(|_window, app| {
+        voice.update(app, |panel, cx| {
+            assert!(panel.test_inject_screen_preview(&source, 8, 8));
+            panel.test_set_screen_sharing(Sharing {
+                phase: Phase::Live,
+                live: true,
+                ..Sharing::default()
+            });
+            panel.test_set_screen_last_request(source.clone());
+            panel.test_open_live_screen_settings(cx);
+            assert!(panel.test_screen_restart(), "the restart dialog opened");
+            assert_ne!(
+                panel.test_preview_epoch(),
+                before_restart,
+                "the restart dialog moves the preview epoch"
+            );
+            assert_eq!(panel.test_screen_preview_counts(), (0, 0));
+            assert_eq!(panel.test_screen_preview_pending(), 0);
+        });
+    });
+
+    // A Failed answer closes the attempt and clears whatever the dialog held.
+    let before_failed = voice.read_with(&*visual, |panel, _| panel.test_preview_epoch());
+    visual.update(|_window, app| {
+        voice.update(app, |panel, _| {
+            assert!(panel.test_inject_screen_preview(&source, 8, 8));
+            assert!(panel.test_apply_screen_sharing(Sharing {
+                phase: Phase::Failed,
+                error: Some("Захват запрещён.".into()),
+                ..Sharing::default()
+            }));
+            assert_ne!(
+                panel.test_preview_epoch(),
+                before_failed,
+                "a failed attempt moves the preview epoch"
+            );
+            assert_eq!(panel.test_screen_preview_counts(), (0, 0));
+            assert_eq!(panel.test_screen_preview_pending(), 0);
+        });
+    });
+
+    // A Publishing answer is the other phase transition that closes the
+    // picker before Live arrives.
+    open_picker_with(
+        &mut visual,
+        &voice,
+        SourceKind::Monitor,
+        vec![source.clone()],
+    );
+    let before_publishing = voice.read_with(&*visual, |panel, _| panel.test_preview_epoch());
+    visual.update(|_window, app| {
+        voice.update(app, |panel, _| {
+            assert!(panel.test_inject_screen_preview(&source, 8, 8));
+            assert!(panel.test_apply_screen_sharing(Sharing {
+                phase: Phase::Publishing,
+                ..Sharing::default()
+            }));
+            assert!(!panel.screen_share_open());
+            assert_ne!(
+                panel.test_preview_epoch(),
+                before_publishing,
+                "a publishing phase moves the preview epoch"
+            );
+            assert_eq!(panel.test_screen_preview_counts(), (0, 0));
+            assert_eq!(panel.test_screen_preview_pending(), 0);
+        });
+    });
+}
+
+/// Replacing one card's picture must replace its byte accounting, not add to
+/// it: the cache keeps only the latest frame per id, so the freed budget stays
+/// available for the next card.
+#[gpui::test]
+async fn replacing_a_preview_does_not_inflate_the_byte_budget(cx: &mut TestAppContext) {
+    let (visual, _view, voice) = super::voice_tests::fixture(cx);
+    visual.update(|_window, app| {
+        voice.update(app, |panel, _| {
+            panel.test_open_screen_picker_with(SourceKind::Monitor, Vec::new(), None);
+            let source = monitor(3, "Экран A", 1920, 1080);
+            assert!(panel.test_inject_screen_preview(&source, 8, 8));
+            assert_eq!(
+                panel.test_screen_preview_counts(),
+                (1, 8 * 8 * 4),
+                "the first frame is counted once"
+            );
+            // The same id with a bigger frame replaces the old entry.
+            assert!(panel.test_inject_screen_preview(&source, 16, 16));
+            assert_eq!(
+                panel.test_screen_preview_counts(),
+                (1, 16 * 16 * 4),
+                "only the latest frame of a replaced id is counted"
+            );
+            // A full-size frame for another card is still accepted: the
+            // replacement did not leave a stale copy in the byte budget.
+            let other = monitor(5, "Экран B", 2560, 1440);
+            assert!(
+                panel.test_inject_screen_preview(&other, 320, 320),
+                "the budget was not inflated by the replacement"
+            );
+            assert_eq!(
+                panel.test_screen_preview_counts(),
+                (2, 16 * 16 * 4 + 320 * 320 * 4),
+                "the two live frames are the only bytes counted"
+            );
+        });
+    });
+}
+
 /// Refresh clears a failed card and retries only that source; the cached card
 /// is not captured again.
 #[gpui::test]

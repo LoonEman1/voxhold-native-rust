@@ -2,6 +2,7 @@ mod support;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use voxhold_update::error::UpdateError;
 
 use semver::Version;
 use support::{Route, TestServer};
@@ -238,6 +239,25 @@ async fn falls_back_to_full_without_base() {
     let requests = server.requests();
     assert!(requests.iter().any(|request| request.path == "/full.zip"));
     assert!(!requests.iter().any(|request| request.path == "/delta.zip"));
+}
+
+#[tokio::test]
+async fn rejects_a_package_with_a_different_version_than_the_signed_manifest() {
+    let temp = tempfile::tempdir().unwrap();
+    let packages = packages(temp.path());
+    let (install, _) = install_base(temp.path(), &packages.base);
+    let server = server_for(&packages);
+    let mut manifest = build_manifest(&server, &packages.target, None, None, None);
+    manifest.version = "0.3.0".into();
+    let manifest = verified(&manifest);
+    let root = temp.path().join("updates");
+
+    let outcome = stage_update(request(&manifest, &install, None, &root)).await;
+    assert!(matches!(
+        outcome,
+        StageOutcome::Failed(UpdateError::InvalidPackage(_))
+    ));
+    assert!(!root.join("0.3.0").exists());
 }
 
 #[tokio::test]

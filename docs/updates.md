@@ -21,15 +21,18 @@ https://github.com/LoonEman1/voxhold-native-rust/releases/download/beta/latest.j
 https://github.com/LoonEman1/voxhold-native-rust/releases/download/beta/latest.json.sig
 ```
 
-Ассеты релиза `beta`: `VoxHold-portable.zip`, `VoxHold-Setup.exe`,
-`VoxHold-delta-<from_version>.zip`, `latest.json.sig`, `latest.json`.
+В релизе `beta` находятся `latest.json` и `latest.json.sig`. Манифест
+указывает на файлы релиза `v<version>`. В нём доступны Setup, portable ZIP,
+опциональная дельта и копия подписанного манифеста.
 Токены не используются и не должны требоваться. Разрешён только HTTPS;
 исключение — HTTP на `127.0.0.1`, `::1` или `localhost` для локальной приёмки.
 URL с query-параметрами разрешены, но в логи и ошибки попадает только
 схема/хост/путь (`error::redact_url`).
 
-`latest.json` загружается последним, чтобы клиент не увидел версию с ещё не
-загруженными пакетами.
+GitHub публикует версионный релиз после проверки загруженных файлов. Затем
+CI обновляет подпись канала и `latest.json`. Старые URL пакетов продолжают
+отдавать те же байты, поэтому начатую загрузку можно закончить после выхода
+следующей версии.
 
 ## Схема `latest.json` (schema 1)
 
@@ -43,13 +46,13 @@ URL с query-параметрами разрешены, но в логи и ош
   "notes": "Что изменилось",
   "authenticode": true,
   "full": {
-    "url": "https://github.com/.../beta/VoxHold-portable.zip",
+    "url": "https://github.com/.../v0.2.0/VoxHold-portable.zip",
     "size": 12345678,
     "sha256": "<sha256 zip>",
     "package_sha256": "<sha256 zip>"
   },
   "setup": {
-    "url": "https://github.com/.../beta/VoxHold-Setup.exe",
+    "url": "https://github.com/.../v0.2.0/VoxHold-Setup.exe",
     "size": 2345678,
     "sha256": "<sha256 setup>"
   },
@@ -57,7 +60,7 @@ URL с query-параметрами разрешены, но в логи и ош
     {
       "from_version": "0.1.0",
       "from_package_sha256": "<sha256 base zip>",
-      "url": "https://github.com/.../beta/VoxHold-delta-0.1.0.zip",
+      "url": "https://github.com/.../v0.2.0/VoxHold-delta-0.1.0.zip",
       "size": 345678,
       "sha256": "<sha256 delta zip>"
     }
@@ -349,17 +352,17 @@ voxhold-updater --pid <pid> --target <install dir> --staged <updates\version> \
 ## Локальная приёмка A → B
 
 1. `cargo run -p voxhold-release -- keygen --out <вне-репозитория>`.
-2. Собрать пакеты A и B: `pack --dir <stage> --version 0.1.0 --out a.zip`
-   и то же для `0.2.0`. Клиент B соберите с
+2. Собрать A командой `pack --dir <stage-A> --version 0.1.0 --out a.zip`,
+   затем B той же командой с `--version 0.2.0 --out VoxHold-portable.zip`. Клиент B соберите с
    `VOXHOLD_BUILD_VERSION=0.2.0`, иначе он будет считать себя версией
    `CARGO_PKG_VERSION` и не увидит обновление.
-3. `delta --base a.zip --target b.zip --out d.zip`.
-4. Поднять loopback HTTP-сервер с `a.zip`, `b.zip`, `d.zip`, `Setup.exe`.
-5. `manifest --full b.zip --setup Setup.exe --version 0.2.0 --delta d.zip ...
+3. `delta --base a.zip --target VoxHold-portable.zip --out VoxHold-delta-0.1.0.zip`.
+4. Поднять loopback HTTP-сервер с `VoxHold-portable.zip`, `VoxHold-delta-0.1.0.zip`, `VoxHold-Setup.exe`.
+5. `manifest --full VoxHold-portable.zip --setup VoxHold-Setup.exe --version 0.2.0 --delta VoxHold-delta-0.1.0.zip ...
     --base-url http://127.0.0.1:<port>`; без флага используется закреплённый
     GitHub URL канала. База принимает HTTPS и loopback HTTP, остальные адреса
     отклоняются до подписи.
-6. `verify --manifest latest.json --sig latest.json.sig --full b.zip`.
+6. `verify --manifest latest.json --sig latest.json.sig --full VoxHold-portable.zip`.
 7. В тесте подписать манифест тестовым ключом, получить `VerifiedManifest`
    через `verify_and_parse` и вызвать `stage_update` с распакованным A;
    проверить, что скачалась дельта и `ready.json.method == "delta"`, а
@@ -372,24 +375,33 @@ HTTP допустим только для loopback; подпись провер�
 
 ## CI
 
-`.github/workflows/release.yml` запускается вручную (`version`, `channel`,
-`publish`) или тегом `v*`:
+Версия берётся из `[package].version` в `Cargo.toml` в формате `X.Y.Z`.
+Для следующего выпуска увеличьте её в `Cargo.toml` и `Cargo.lock`.
+После релизного PR `dev → main` GitHub Actions автоматически запускает
+публикацию при изменении `Cargo.toml`. Для повторной попытки можно
+перезапустить упавший job или выбрать **Actions → Release → Run workflow**
+на `main` с флагом `publish`. Тег `v<version>` создаёт CI.
 
-* собирает клиент, helper и release CLI;
-* подписывает `Voxhold.exe` и `voxhold-updater.exe` сертификатом из
-  `WINDOWS_CERT_PFX_BASE64`/`WINDOWS_CERT_PASSWORD` **до** упаковки ZIP;
-  без секретов выпускает `authenticode: false` с предупреждением;
-* собирает portable ZIP, ставит Inno Setup и собирает per-user
-  `VoxHold-Setup.exe` (`{localappdata}\Programs\VoxHold`, без admin);
-* скачивает предыдущий `VoxHold-portable.zip` из релиза канала и делает
-  дельту; при отсутствии базы или если дельта не меньше — пропускает;
-* формирует `latest.json`, подписывает `latest.json.sig`, проверяет
-  артефакты;
-* всегда загружает artifacts, а при `publish` — ассеты в релиз `beta`
-  (`gh release upload --clobber`), манифест последним.
+Workflow запускает тесты апдейтера и собирает x64-клиент с медиа, helper и
+release CLI. В общий комплект входят `Voxhold.exe`, `voxhold-updater.exe`,
+`assets/`, лицензии и `package.json`. CI проверяет совпадение файлов Setup и
+portable ZIP по SHA-256 и прогоняет замену файлов настоящим helper на обоих
+вариантах установки с подтверждением запуска окна. Для PR в `main` и
+ручного запуска без `publish` CI использует одноразовый ключ подписи и
+сохраняет файлы в Actions artifacts. Для PR в `dev` работает обычный
+workflow **Windows**.
 
-Секреты: `VOXHOLD_UPDATE_SIGNING_KEY`, `WINDOWS_CERT_PFX_BASE64`,
-`WINDOWS_CERT_PASSWORD`. Без ключа подписи публикация завершается ошибкой.
+При публикации CI проверяет подпись предыдущего версионного релиза и его
+ZIP. Он включает дельту, если та меньше полного архива. CI подписывает
+манифест, проверяет его встроенным публичным ключом и сравнивает SHA-256
+ассетов в GitHub со сборкой. Повтор запуска использует уже опубликованные
+байты `v<version>`. Канал `beta` обновляется после публикации этих пакетов.
+
+Для публикации нужен `VOXHOLD_UPDATE_SIGNING_KEY`, соответствующий ключу
+из `crates/voxhold-update/update-pubkey.txt`. Опциональные секреты
+`WINDOWS_CERT_PFX_BASE64` и `WINDOWS_CERT_PASSWORD` включают Authenticode
+для обоих EXE и Setup. Без сертификата остаётся подпись манифеста, а в
+манифесте указано `authenticode: false`.
 
 ## Ограничения
 
@@ -403,5 +415,6 @@ HTTP допустим только для loopback; подпись провер�
   клиента не поддерживается.
 * `--update-handshake` реализован в `main.rs`: файл пишется после открытия
   окна, ошибка записи видна в рабочей области.
-* Интеграция UI и helper'а проверяется unit/GPUI-тестами без реальной сети;
-  настоящий прогон A→B на чистой Windows остаётся отдельной приёмкой `W13`.
+* CI покрывает загрузку манифеста, дельту и полный архив тестами на loopback,
+  а запуск и замену файлов Windows — на временной установке. Приёмка `W13`
+  включает переход между двумя опубликованными версиями на чистой Windows.

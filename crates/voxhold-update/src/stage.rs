@@ -256,7 +256,7 @@ async fn stage_delta(
     tokio::fs::write(&package_path, &target)
         .await
         .map_err(|error| UpdateError::io(&package_path, error))?;
-    unpack_to(staging, target).await
+    unpack_to(staging, target, &request.manifest.version).await
 }
 
 async fn stage_full(request: &StageRequest<'_>, staging: &Path) -> Result<()> {
@@ -288,14 +288,24 @@ async fn stage_full(request: &StageRequest<'_>, staging: &Path) -> Result<()> {
     let bytes = tokio::fs::read(&package_path)
         .await
         .map_err(|error| UpdateError::io(&package_path, error))?;
-    unpack_to(staging, bytes).await
+    unpack_to(staging, bytes, &request.manifest.version).await
 }
 
-async fn unpack_to(staging: &Path, bytes: Vec<u8>) -> Result<()> {
+async fn unpack_to(staging: &Path, bytes: Vec<u8>, version: &str) -> Result<()> {
     let app = staging.join(APP_DIR);
-    tokio::task::spawn_blocking(move || package::unpack(&bytes, &app))
-        .await
-        .map_err(|error| UpdateError::Apply(format!("unpack task failed: {error}")))??;
+    let version = version.to_owned();
+    tokio::task::spawn_blocking(move || {
+        let index = package::unpack(&bytes, &app)?;
+        if index.version != version {
+            return Err(UpdateError::InvalidPackage(format!(
+                "package version {} does not match manifest version {version}",
+                index.version
+            )));
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|error| UpdateError::Apply(format!("unpack task failed: {error}")))??;
     Ok(())
 }
 

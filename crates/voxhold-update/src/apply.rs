@@ -114,27 +114,28 @@ pub fn apply_staged_with(
     if !exe.is_file() {
         return Err(UpdateError::NotStaged(exe));
     }
-    let old_index = read_package_json_from_dir(target_dir).ok();
     let backup = backup_path(target_dir);
 
     // Restore an interrupted swap or drop a backup left by an earlier run.
     cleanup_install_backup(target_dir)?;
+    let old_index = read_package_json_from_dir(target_dir).ok();
 
     let had_target = target_dir.exists();
     if had_target {
         rename_retry(target_dir, &backup)?;
     }
-    std::fs::create_dir_all(target_dir).map_err(|error| UpdateError::io(target_dir, error))?;
-
-    let result = populate(
-        target_dir,
-        staged_app,
-        &new_index,
-        old_index.as_ref(),
-        had_target,
-        &backup,
-    )
-    .and_then(|()| launch_and_wait(target_dir, exe_name, handshake_path, launcher, timeout));
+    let result = (|| {
+        std::fs::create_dir_all(target_dir).map_err(|error| UpdateError::io(target_dir, error))?;
+        populate(
+            target_dir,
+            staged_app,
+            &new_index,
+            old_index.as_ref(),
+            had_target,
+            &backup,
+        )?;
+        launch_and_wait(target_dir, exe_name, handshake_path, launcher, timeout)
+    })();
 
     match result {
         Ok(()) => {
@@ -147,11 +148,17 @@ pub fn apply_staged_with(
             Ok(ApplyOutcome { backup_removed })
         }
         Err(error) => {
-            let _ = std::fs::remove_dir_all(target_dir);
-            if had_target && backup.exists() {
-                let _ = std::fs::rename(&backup, target_dir);
-            }
+            let restored = if had_target {
+                rollback(target_dir).map(|_| ())
+            } else {
+                remove_dir_retry(target_dir)
+            };
             let _ = std::fs::remove_dir_all(staged_app);
+            if let Err(rollback_error) = restored {
+                return Err(UpdateError::Apply(format!(
+                    "{error}; rollback failed: {rollback_error}"
+                )));
+            }
             Err(error)
         }
     }
@@ -184,12 +191,18 @@ fn populate(
 
     if had_target && backup.exists() {
         let old_files: BTreeSet<String> = old_index
-            .map(|index| index.files.iter().map(|file| file.path.clone()).collect())
+            .map(|index| {
+                index
+                    .files
+                    .iter()
+                    .map(|file| file.path.to_lowercase())
+                    .collect()
+            })
             .unwrap_or_default();
         let new_files: BTreeSet<String> = new_index
             .files
             .iter()
-            .map(|file| file.path.clone())
+            .map(|file| file.path.to_lowercase())
             .collect();
         copy_user_files(backup, target_dir, &old_files, &new_files)?;
     }
@@ -226,10 +239,8 @@ fn copy_user_files(
                 .map(|component| component.as_os_str().to_string_lossy().into_owned())
                 .collect::<Vec<_>>()
                 .join("/");
-            if relative == PACKAGE_JSON
-                || old_files.contains(&relative)
-                || new_files.contains(&relative)
-            {
+            let key = relative.to_lowercase();
+            if key == PACKAGE_JSON || old_files.contains(&key) || new_files.contains(&key) {
                 continue;
             }
             let destination = target_dir.join(Path::new(&relative));
@@ -263,11 +274,13 @@ fn launch_and_wait(
         }
         match process.try_wait() {
             Ok(Some(code)) => {
-                if code != 0 {
-                    return Err(UpdateError::Apply(format!(
-                        "new version exited with code {code}"
-                    )));
+                // The child may have written the handshake after the first check.
+                if handshake_path.is_file() {
+                    return Ok(());
                 }
+                return Err(UpdateError::Apply(format!(
+                    "new version exited with code {code} before confirming startup"
+                )));
             }
             Ok(None) => {}
             Err(error) => {
@@ -470,6 +483,29 @@ mod tests {
         );
         assert!(!backup_path(&target).exists());
         assert!(!staged.exists());
+    }
+
+    #[test]
+    fn preserves_new_package_files_when_an_existing_path_differs_only_in_case() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("VoxHold");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("VOXHOLD.EXE"), b"old exe").unwrap();
+
+        let staged = temp.path().join("staged").join(APP_DIR);
+        install_package(&staged, "1.1.0", b"new exe");
+        apply_staged_with(
+            &target,
+            &staged,
+            "Voxhold.exe",
+            &temp.path().join("ready.handshake"),
+            &FakeLauncher { handshake: true },
+            Duration::from_millis(500),
+        )
+        .unwrap();
+
+        assert_eq!(fs::read(target.join("Voxhold.exe")).unwrap(), b"new exe");
+        assert_eq!(fs::read_dir(&target).unwrap().count(), 3);
     }
 
     #[test]

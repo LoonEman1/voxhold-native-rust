@@ -13,6 +13,7 @@ use tokio::{
 pub(super) enum Step {
     Command(Command),
     Stats,
+    Tracks,
     Stopped,
     Closed,
 }
@@ -20,12 +21,14 @@ pub(super) enum Step {
 pub(super) async fn next_step(
     commands: &mut mpsc::Receiver<Command>,
     stop: &Notify,
+    tracks: &Notify,
     stats: &mut Interval,
     stats_enabled: bool,
 ) -> Step {
     tokio::select! {
         biased;
         _ = stop.notified() => Step::Stopped,
+        _ = tracks.notified() => Step::Tracks,
         command = commands.recv() => match command {
             Some(command) => Step::Command(command),
             None => Step::Closed,
@@ -65,11 +68,12 @@ mod tests {
                     .unwrap();
             }
             let stop = Notify::new();
+            let tracks = Notify::new();
             stop.notify_one();
             let mut stats = idle_stats();
             // The offers are still queued, yet the close is processed first.
             assert!(matches!(
-                next_step(&mut receiver, &stop, &mut stats, false).await,
+                next_step(&mut receiver, &stop, &tracks, &mut stats, false).await,
                 Step::Stopped
             ));
             assert_eq!(receiver.len(), 8, "the stop must not drain the queue");
@@ -96,18 +100,19 @@ mod tests {
                 .await
                 .unwrap();
             let stop = Notify::new();
+            let tracks = Notify::new();
             let mut stats = idle_stats();
             assert!(matches!(
-                next_step(&mut receiver, &stop, &mut stats, false).await,
+                next_step(&mut receiver, &stop, &tracks, &mut stats, false).await,
                 Step::Command(Command::Offer { sdp }) if sdp == "first"
             ));
             drop(commands);
             assert!(matches!(
-                next_step(&mut receiver, &stop, &mut stats, false).await,
+                next_step(&mut receiver, &stop, &tracks, &mut stats, false).await,
                 Step::Command(Command::Ice(_))
             ));
             assert!(matches!(
-                next_step(&mut receiver, &stop, &mut stats, false).await,
+                next_step(&mut receiver, &stop, &tracks, &mut stats, false).await,
                 Step::Closed
             ));
         });

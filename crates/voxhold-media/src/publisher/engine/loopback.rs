@@ -4,7 +4,9 @@
 //! `internal/stream/manager.go` does for a single SDR rendition, and creates
 //! the offer. The real `PublisherEngine` answers it. The test then decodes on
 //! the SFU side, so a broken transceiver binding fails instead of only
-//! reporting "no error".
+//! reporting "no error". A live re-offer is exercised twice: a plain offer and
+//! a real `ice_restart` offer that must keep the m-line, be answered exactly
+//! once and leave the frames flowing.
 
 use std::{
     sync::{
@@ -107,6 +109,25 @@ fn request() -> PublishRequest {
     }
 }
 
+/// What the SFU does after the first answer has been applied and frames flow.
+#[derive(Clone, Copy)]
+enum Scenario {
+    /// A live bitrate change followed by a plain re-offer, as `startRecovery`
+    /// may send to a live publisher. The new offer is not an ICE restart.
+    Bitrate(Quality),
+    /// A real ICE restart: `OfferOptions::ice_restart` makes libwebrtc choose a
+    /// new ufrag/pwd on the same m-line.
+    IceRestart,
+}
+
+/// The session ICE ufrag of an SDP. A restart must change it; a plain re-offer
+/// keeps it.
+fn ice_ufrag(sdp: &str) -> Option<String> {
+    sdp.replace("\r\n", "\n")
+        .lines()
+        .find_map(|line| line.strip_prefix("a=ice-ufrag:").map(str::to_owned))
+}
+
 #[test]
 fn the_publisher_answer_keeps_the_offered_mid_and_sends_frames() {
     loopback_with_frame_size((1280, 720));
@@ -123,7 +144,15 @@ fn a_live_bitrate_change_reaches_the_negotiated_sender_without_renegotiation() {
         audio_bitrate_kbps: 64,
         ..request().quality
     };
-    loopback((1280, 720), Some(change));
+    loopback((1280, 720), Some(Scenario::Bitrate(change)));
+}
+
+/// A real ICE restart of a live publication: the SFU re-offers with
+/// `ice_restart`, the engine answers the new ufrag once on the same m-line,
+/// and frames keep reaching the SFU after the restart.
+#[test]
+fn an_ice_restart_is_answered_once_on_the_same_mid_and_keeps_frames_flowing() {
+    loopback((1280, 720), Some(Scenario::IceRestart));
 }
 
 /// A 21:9 monitor inside a 720p publication is encoded at 1280×540. The
@@ -138,7 +167,7 @@ fn loopback_with_frame_size(frame_size: (u32, u32)) {
     loopback(frame_size, None);
 }
 
-fn loopback(frame_size: (u32, u32), change: Option<Quality>) {
+fn loopback(frame_size: (u32, u32), scenario: Option<Scenario>) {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -180,6 +209,7 @@ fn loopback(frame_size: (u32, u32), change: Option<Quality>) {
             "the fake SFU must offer a recvonly video m-line"
         );
         let offer_mid = first_mid(&offer_sdp).expect("offered mid");
+        let initial_ufrag = ice_ufrag(&offer_sdp).expect("the initial offer has an ICE ufrag");
 
         let frames = Arc::new(AtomicU64::new(0));
         let track_slot: Arc<Mutex<Option<RtcVideoTrack>>> = Arc::new(Mutex::new(None));
@@ -203,6 +233,7 @@ fn loopback(frame_size: (u32, u32), change: Option<Quality>) {
         engine.offer(offer_sdp.clone()).expect("offer command");
 
         let mut answer: Option<String> = None;
+        let mut answer_ufrags: Vec<String> = Vec::new();
         let mut answers = 0_u32;
         let mut applied_answers = 0_u32;
         let mut expected_mid = offer_mid.clone();
@@ -212,13 +243,16 @@ fn loopback(frame_size: (u32, u32), change: Option<Quality>) {
         let mut frames_at_change = 0_u64;
         let mut reoffered = false;
         let mut frames_at_reoffer = 0_u64;
-        let budget = if change.is_some() { 30 } else { 20 };
+        let budget = if scenario.is_some() { 30 } else { 20 };
         let deadline = Instant::now() + Duration::from_secs(budget);
         while Instant::now() < deadline {
             while let Some(event) = engine.poll() {
                 match event {
                     crate::publisher::EngineEvent::Answer(sdp) => {
                         answers += 1;
+                        if let Some(ufrag) = ice_ufrag(&sdp) {
+                            answer_ufrags.push(ufrag);
+                        }
                         answer = Some(sdp);
                     }
                     crate::publisher::EngineEvent::Ice(candidate) => {
@@ -284,8 +318,8 @@ fn loopback(frame_size: (u32, u32), change: Option<Quality>) {
                 }
             }
             if applied_answers > 0 && frames.load(Ordering::SeqCst) > 0 {
-                match change {
-                    Some(next) if !change_applied => {
+                match scenario {
+                    Some(Scenario::Bitrate(next)) if !change_applied => {
                         // The negotiated sender is live; apply the new limit
                         // exactly like `Outcome::SetBitrate` does.
                         assert_eq!(
@@ -296,7 +330,7 @@ fn loopback(frame_size: (u32, u32), change: Option<Quality>) {
                         change_applied = true;
                         frames_at_change = frames.load(Ordering::SeqCst);
                     }
-                    Some(next) if !reoffered => {
+                    Some(Scenario::Bitrate(next)) if !reoffered => {
                         let expected = u64::from(next.bitrate_kbps) * 1000;
                         // The verified event and the readback-derived limits
                         // must agree before the SFU offers again.
@@ -318,6 +352,11 @@ fn loopback(frame_size: (u32, u32), change: Option<Quality>) {
                             let second_sdp = second.to_string();
                             expected_mid =
                                 first_mid(&second_sdp).expect("the re-offer keeps a mid");
+                            assert_eq!(
+                                ice_ufrag(&second_sdp).as_deref(),
+                                Some(initial_ufrag.as_str()),
+                                "a plain re-offer must not restart ICE"
+                            );
                             sfu.set_local_description(second)
                                 .await
                                 .expect("sfu second local offer");
@@ -326,7 +365,37 @@ fn loopback(frame_size: (u32, u32), change: Option<Quality>) {
                             frames_at_reoffer = frames.load(Ordering::SeqCst);
                         }
                     }
-                    Some(next) if reoffered => {
+                    Some(Scenario::IceRestart) if !reoffered => {
+                        // A real ICE restart: libwebrtc must choose a new
+                        // ufrag/pwd on the existing m-line.
+                        let second = sfu
+                            .create_offer(OfferOptions {
+                                ice_restart: true,
+                                offer_to_receive_audio: None,
+                                offer_to_receive_video: None,
+                            })
+                            .await
+                            .expect("ICE restart offer");
+                        let second_sdp = second.to_string();
+                        assert_ne!(
+                            ice_ufrag(&second_sdp).as_deref(),
+                            Some(initial_ufrag.as_str()),
+                            "the re-offer is not an ICE restart: the ufrag did not change"
+                        );
+                        assert_eq!(
+                            first_mid(&second_sdp).as_deref(),
+                            Some(offer_mid.as_str()),
+                            "the ICE restart moved the video m-line"
+                        );
+                        expected_mid = offer_mid.clone();
+                        sfu.set_local_description(second)
+                            .await
+                            .expect("sfu ICE restart local offer");
+                        engine.offer(second_sdp).expect("ICE restart offer command");
+                        reoffered = true;
+                        frames_at_reoffer = frames.load(Ordering::SeqCst);
+                    }
+                    Some(Scenario::Bitrate(next)) if reoffered => {
                         let expected = u64::from(next.bitrate_kbps) * 1000;
                         if applied_answers >= 2 && frames.load(Ordering::SeqCst) > frames_at_reoffer
                         {
@@ -335,6 +404,12 @@ fn loopback(frame_size: (u32, u32), change: Option<Quality>) {
                                 (expected, 0),
                                 "the re-offer reverted the live bitrate limit"
                             );
+                            break;
+                        }
+                    }
+                    Some(Scenario::IceRestart) if reoffered => {
+                        if applied_answers >= 2 && frames.load(Ordering::SeqCst) > frames_at_reoffer
+                        {
                             break;
                         }
                     }
@@ -368,26 +443,51 @@ fn loopback(frame_size: (u32, u32), change: Option<Quality>) {
             decoded > 0,
             "on_track fired but no frame was decoded on the SFU"
         );
-        if let Some(next) = change {
-            assert!(
-                change_verified,
-                "the engine never sent a verified Bitrate/Applied result"
-            );
-            assert_eq!(
-                engine.applied_bitrate_limits(),
-                (u64::from(next.bitrate_kbps) * 1000, 0),
-                "the readback of the negotiated sender does not match the live limit"
-            );
-            assert_eq!(
-                answers, 2,
-                "a live change and its re-offer need exactly one answer each"
-            );
-            assert!(
-                reoffered,
-                "the re-offer after a live change was never produced"
-            );
-        } else {
-            assert_eq!(answers, 1, "one offer needs exactly one answer");
+        match scenario {
+            Some(Scenario::Bitrate(next)) => {
+                assert!(
+                    change_verified,
+                    "the engine never sent a verified Bitrate/Applied result"
+                );
+                assert_eq!(
+                    engine.applied_bitrate_limits(),
+                    (u64::from(next.bitrate_kbps) * 1000, 0),
+                    "the readback of the negotiated sender does not match the live limit"
+                );
+                assert_eq!(
+                    answers, 2,
+                    "a live change and its re-offer need exactly one answer each"
+                );
+                assert!(
+                    reoffered,
+                    "the re-offer after a live change was never produced"
+                );
+            }
+            Some(Scenario::IceRestart) => {
+                assert!(reoffered, "the ICE restart offer was never produced");
+                assert_eq!(
+                    answers, 2,
+                    "a live ICE restart needs exactly one answer for its re-offer"
+                );
+                assert_eq!(
+                    applied_answers, 2,
+                    "the SFU applied the answer of each offer once"
+                );
+                assert_eq!(
+                    answer_ufrags.len(),
+                    2,
+                    "both answers must carry an ICE ufrag"
+                );
+                assert_ne!(
+                    answer_ufrags[0], answer_ufrags[1],
+                    "the engine answered the restart without restarting ICE"
+                );
+                assert!(
+                    frames.load(Ordering::SeqCst) > frames_at_reoffer,
+                    "frames did not continue after the ICE restart"
+                );
+            }
+            None => assert_eq!(answers, 1, "one offer needs exactly one answer"),
         }
 
         if let Some(reader) = reader {

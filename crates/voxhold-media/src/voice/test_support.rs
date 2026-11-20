@@ -40,7 +40,7 @@ impl Session {
             playout_suspended: false,
             playout_reconnects: 0,
             playout_open: open,
-            playout_tasks: Arc::new(Mutex::new(Vec::new())),
+            playout_tracks: Arc::new(Mutex::new(TrackSet::default())),
             runtime: tokio::runtime::Handle::current(),
             last_playout_report: now,
             speaking: HashMap::new(),

@@ -222,31 +222,29 @@ impl Voxhold {
             self.finish_action(state.message_id, "forward", &request);
             return;
         };
-        if let Some(current) = self.forward.as_mut() {
-            current.sending = true;
-            current.error.clear();
-        }
         let message_id = state.message_id;
         let source = state.source;
         let source_kind = state.source_kind;
         let destination_id = destination.id;
         let destination_kind = destination.kind.clone();
         let destination_server = destination.server_id;
-        // A retry of this recipient repeats the saved key; the first click on
-        // it creates one. The insert mutates `self.forward`, not the clone, so
-        // the next attempt reads the key back even after an error.
+        // One key per recipient inside this dialog: a retry of a failed
+        // recipient repeats it, while another recipient gets its own. Read and
+        // insert through `self.forward` so the request and the saved value
+        // cannot diverge, and never mint a UUID when a key already exists.
         let destination_key = (destination_kind.clone(), destination_id);
-        let key = state
+        let Some(current) = self.forward.as_mut() else {
+            self.finish_action(state.message_id, "forward", &request);
+            return;
+        };
+        current.sending = true;
+        current.error.clear();
+        let dialog_request = current.request;
+        let key = current
             .keys
-            .get(&destination_key)
-            .cloned()
-            .unwrap_or_else(|| format!("{:032x}", uuid::Uuid::new_v4().as_u128()));
-        if let Some(current) = self.forward.as_mut() {
-            current
-                .keys
-                .entry(destination_key)
-                .or_insert_with(|| key.clone());
-        }
+            .entry(destination_key)
+            .or_insert_with(|| format!("{:032x}", uuid::Uuid::new_v4().as_u128()))
+            .clone();
         let runtime = self.runtime.clone();
         let session = self.session_generation;
         let task = cx.background_spawn(async move {
@@ -267,9 +265,18 @@ impl Voxhold {
                     return;
                 }
                 s.finish_action(message_id, "forward", &request);
+                // A dialog opened for the same row after this POST started has
+                // its own request. The answer may settle history, but only the
+                // dialog that started the POST may change its own state.
+                let dialog_open = s
+                    .forward
+                    .as_ref()
+                    .is_some_and(|state| state.request == dialog_request);
                 match result {
                     Ok(message) => {
-                        s.forward = None;
+                        if dialog_open {
+                            s.forward = None;
+                        }
                         s.action_error = None;
                         s.action_notice = "╨Я╨╡╤А╨╡╤Б╨╗╨░╨╜╨╛".into();
                         let active = s.chat_key() == source;
@@ -289,9 +296,11 @@ impl Voxhold {
                         }
                     }
                     Err(error) => {
-                        if let Some(state) = s.forward.as_mut() {
-                            state.sending = false;
-                            state.error = error.to_string();
+                        if dialog_open {
+                            if let Some(state) = s.forward.as_mut() {
+                                state.sending = false;
+                                state.error = error.to_string();
+                            }
                         }
                         if error.status() == Some(403) {
                             s.recheck_channel_snapshot(window, cx);
@@ -302,5 +311,20 @@ impl Voxhold {
             });
         })
         .detach();
+    }
+
+    /// The frontend keeps the forward modal open while its POST is pending:
+    /// closing it would drop the per-recipient keys and a retry could duplicate
+    /// a send that the server may already have committed.
+    pub(super) fn forward_is_sending(&self) -> bool {
+        self.forward.as_ref().is_some_and(|state| state.sending)
+    }
+
+    pub(super) fn close_forward(&mut self, cx: &mut Context<Self>) {
+        if self.forward_is_sending() {
+            return;
+        }
+        self.forward = None;
+        cx.notify();
     }
 }

@@ -72,7 +72,8 @@ impl Render for Voxhold {
                         }
                         s.show_search = false;
                         s.message_menu = None;
-                        s.forward = None;
+                        // A pending forward keeps its modal and retry keys.
+                        s.close_forward(cx);
                         s.editing = None;
                         s.confirm_delete = None;
                         s.show_channels = false;

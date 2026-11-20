@@ -3,7 +3,7 @@
 //! a second message. A new dialog starts with fresh keys.
 
 use super::super::*;
-use super::{add_auth_window, message_json};
+use super::{add_auth_window, focus_field, message_json};
 use crate::test_support::{Reply, TestServer};
 use gpui::{Entity, TestAppContext, VisualTestContext};
 use std::time::Duration;
@@ -95,6 +95,14 @@ fn forward_bodies(server: &TestServer) -> Vec<serde_json::Value> {
         .filter(|request| request.method == "POST" && request.path == FORWARD)
         .map(|request| serde_json::from_slice(&request.body).unwrap())
         .collect()
+}
+
+fn saved_channel_key(v: &Voxhold) -> Option<String> {
+    v.forward
+        .as_ref()?
+        .keys
+        .get(&("channel".to_string(), 99))
+        .cloned()
 }
 
 /// The mock answers the first POST with `504`. The user clicks the same
@@ -225,4 +233,223 @@ async fn a_new_forward_operation_gets_a_new_key_after_success(cx: &mut TestAppCo
         bodies[0]["client_message_id"], bodies[1]["client_message_id"],
         "a new dialog is a new operation and must not reuse the old key"
     );
+}
+
+/// The close button, the backdrop and Escape must leave a pending forward
+/// dialog (and its saved key) intact. Once the failed POST settles, the retry
+/// repeats the key that was already on the wire.
+#[gpui::test]
+async fn a_pending_forward_dialog_cannot_be_closed_and_keeps_its_key(cx: &mut TestAppContext) {
+    cx.update(|cx| gpui_component::init(cx));
+    let (window, view) = add_auth_window(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
+    let destinations = destinations_json(&[destination("channel", 99)]);
+    let forwarded = message_json(510, 1, "forwarded").to_string();
+    let server = TestServer::spawn(vec![
+        Reply::new(200, &destinations).with_path(FORWARD_DESTINATIONS),
+        Reply::new(504, "{\"error\":\"gateway_timeout\"}"),
+        Reply::new(201, &forwarded),
+    ]);
+    visual.update(|_window, app| {
+        view.update(app, |v, _| {
+            install_channel_source(v, Client::new(&server.base).unwrap());
+        });
+    });
+    open_forward(&mut visual, &view, 42, 1);
+    // `forward_to` marks the dialog pending and stores the key before the POST
+    // task is polled, so these close attempts happen while it is sending.
+    click_destination(&mut visual, &view, 0);
+    assert!(view.read_with(&*visual, |v, _| v.forward_is_sending()));
+
+    // 1. The header close button.
+    visual.update(|_window, app| {
+        view.update(app, |v, cx| v.close_forward(cx));
+    });
+    let key = view
+        .read_with(&*visual, |v, _| saved_channel_key(v))
+        .expect("the close button must keep the pending dialog and its key");
+    assert!(!key.is_empty());
+
+    // 2. The backdrop dismiss.
+    visual.update(|_window, app| {
+        view.update(app, |v, cx| v.dismiss_overlays(cx));
+    });
+    view.read_with(&*visual, |v, _| {
+        assert!(
+            v.forward.is_some(),
+            "the backdrop must not drop a pending forward"
+        );
+        assert!(v.forward_is_sending());
+        assert_eq!(saved_channel_key(v).as_deref(), Some(key.as_str()));
+    });
+
+    // 3. Escape on the workspace. `simulate_keystrokes` dispatches the key and
+    // then pumps the executor, which settles the held 504 below; the key is
+    // delivered while the dialog is still sending.
+    focus_field(&mut visual, &view, |v| v.composer.clone());
+    visual.update(|window, app| {
+        window.draw(app).clear();
+    });
+    visual.simulate_keystrokes("escape");
+    view.read_with(&*visual, |v, _| {
+        assert!(
+            v.forward.is_some(),
+            "Escape must not drop a pending forward"
+        );
+        assert_eq!(saved_channel_key(v).as_deref(), Some(key.as_str()));
+    });
+
+    wait_failed(&mut visual, &view);
+    click_destination(&mut visual, &view, 0);
+    wait_entity(&mut visual, &view, |v| v.forward.is_none());
+
+    let bodies = forward_bodies(&server);
+    assert_eq!(bodies.len(), 2, "{:?}", server.requests());
+    assert_eq!(bodies[0]["client_message_id"].as_str(), Some(key.as_str()));
+    assert_eq!(
+        bodies[0]["client_message_id"], bodies[1]["client_message_id"],
+        "the blocked close must not lose the retry key"
+    );
+}
+
+/// A transport failure (`Network`, no HTTP status) is retried with the same
+/// key, not only an HTTP error such as `504`.
+#[gpui::test]
+async fn a_transport_error_keeps_the_key_for_the_retry(cx: &mut TestAppContext) {
+    cx.update(|cx| gpui_component::init(cx));
+    let (window, view) = add_auth_window(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
+    let destinations = destinations_json(&[destination("channel", 99)]);
+    let forwarded = message_json(511, 1, "forwarded").to_string();
+    let server = TestServer::spawn(vec![
+        Reply::new(200, &destinations).with_path(FORWARD_DESTINATIONS),
+        Reply::new(201, &forwarded),
+    ]);
+    let client = Client::new(&server.base).unwrap();
+    visual.update(|_window, app| {
+        view.update(app, |v, _| install_channel_source(v, client.clone()));
+    });
+    open_forward(&mut visual, &view, 42, 1);
+
+    // Nothing listens on the loopback port, so the POST fails without a status.
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            v.client = Some(Client::new("http://127.0.0.1:1").unwrap());
+            v.forward_to(0, window, cx);
+        });
+    });
+    wait_failed(&mut visual, &view);
+    let key = view.read_with(&*visual, |v, _| {
+        let state = v.forward.as_ref().expect("the dialog stays open");
+        assert_eq!(state.error, "Не удалось связаться с сервером.");
+        saved_channel_key(v).expect("the key is saved before the failed POST")
+    });
+
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            v.client = Some(client);
+            v.forward_to(0, window, cx);
+        });
+    });
+    wait_entity(&mut visual, &view, |v| v.forward.is_none());
+
+    let bodies = forward_bodies(&server);
+    assert_eq!(bodies.len(), 1, "{:?}", server.requests());
+    assert_eq!(
+        bodies[0]["client_message_id"].as_str(),
+        Some(key.as_str()),
+        "the retry after a network error repeats the saved key"
+    );
+}
+
+/// A late success of the previous dialog must not close a dialog opened later
+/// for the same row. The successful send still settles normally, but the new
+/// dialog owns its own state.
+#[gpui::test]
+async fn a_late_success_does_not_close_a_new_dialog_for_the_same_message(cx: &mut TestAppContext) {
+    cx.update(|cx| gpui_component::init(cx));
+    let (window, view) = add_auth_window(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
+    let destinations = destinations_json(&[destination("channel", 99)]);
+    let forwarded = message_json(512, 1, "late forward").to_string();
+    let server = TestServer::spawn(vec![
+        Reply::new(200, &destinations).with_path(FORWARD_DESTINATIONS),
+        Reply::new(201, &forwarded),
+        Reply::new(200, &destinations).with_path(FORWARD_DESTINATIONS),
+    ]);
+    visual.update(|_window, app| {
+        view.update(app, |v, _| {
+            install_channel_source(v, Client::new(&server.base).unwrap());
+        });
+    });
+    open_forward(&mut visual, &view, 42, 1);
+    // The POST task is spawned but not polled yet: replacing the dialog before
+    // the next executor step is the late-answer race the guard must survive.
+    click_destination(&mut visual, &view, 0);
+
+    // A new dialog for the same message replaces the pending one while the old
+    // POST is still in flight.
+    open_forward(&mut visual, &view, 42, 1);
+    let new_request = view.read_with(&*visual, |v, _| {
+        v.forward.as_ref().expect("the new dialog").request
+    });
+
+    wait_entity(&mut visual, &view, |v| {
+        !v.action_requests.contains_key("42:forward")
+    });
+    visual.run_until_parked();
+    view.read_with(&*visual, |v, _| {
+        let state = v
+            .forward
+            .as_ref()
+            .expect("the late success must not close the new dialog");
+        assert_eq!(state.request, new_request);
+        assert!(!state.sending);
+        assert!(state.error.is_empty());
+    });
+}
+
+/// A late error of the previous dialog must not paint itself into a dialog
+/// opened later for the same row.
+#[gpui::test]
+async fn a_late_error_does_not_show_in_a_new_dialog_for_the_same_message(cx: &mut TestAppContext) {
+    cx.update(|cx| gpui_component::init(cx));
+    let (window, view) = add_auth_window(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
+    let destinations = destinations_json(&[destination("channel", 99)]);
+    let server = TestServer::spawn(vec![
+        Reply::new(200, &destinations).with_path(FORWARD_DESTINATIONS),
+        Reply::new(504, "{\"error\":\"gateway_timeout\"}"),
+        Reply::new(200, &destinations).with_path(FORWARD_DESTINATIONS),
+    ]);
+    visual.update(|_window, app| {
+        view.update(app, |v, _| {
+            install_channel_source(v, Client::new(&server.base).unwrap());
+        });
+    });
+    open_forward(&mut visual, &view, 42, 1);
+    click_destination(&mut visual, &view, 0);
+
+    open_forward(&mut visual, &view, 42, 1);
+    let new_request = view.read_with(&*visual, |v, _| {
+        v.forward.as_ref().expect("the new dialog").request
+    });
+
+    wait_entity(&mut visual, &view, |v| {
+        !v.action_requests.contains_key("42:forward")
+    });
+    visual.run_until_parked();
+    view.read_with(&*visual, |v, _| {
+        let state = v
+            .forward
+            .as_ref()
+            .expect("the late error must not close the new dialog");
+        assert_eq!(state.request, new_request);
+        assert!(!state.sending);
+        assert!(
+            state.error.is_empty(),
+            "the old dialog's error must not paint here: {}",
+            state.error
+        );
+    });
 }

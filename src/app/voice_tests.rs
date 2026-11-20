@@ -1,0 +1,1146 @@
+//! GPUI regressions for the voice room, the dock and the stream player. They
+//! drive the real window event path (keys, focus, layout) and read the actual
+//! element bounds, not a hand-computed rectangle.
+
+use super::*;
+use crate::voice_room::CallPhase;
+use gpui::{Keystroke, TestAppContext, VisualTestContext};
+use voxhold_media::controller::{AppliedAudio, Participant, Publication};
+use voxhold_media::runtime::VoiceUpdate;
+
+fn client() -> voxhold_api::Client {
+    let mut client = voxhold_api::Client::new("http://127.0.0.1:1").unwrap();
+    client.set_token("token".into());
+    client
+}
+
+fn channel(id: i64, name: &str, kind: &str) -> voxhold_api::Channel {
+    voxhold_api::Channel {
+        id,
+        name: name.into(),
+        kind: kind.into(),
+        position: 0,
+        permissions: 1,
+        access_restricted: false,
+        e2ee_required: false,
+        comments_enabled: false,
+        can_publish: false,
+        unread_count: 0,
+    }
+}
+
+pub(super) fn participant(connection: &str, user: i64) -> Participant {
+    Participant {
+        connection_id: connection.into(),
+        user_id: user,
+        server_id: 1,
+        channel_id: 7,
+        self_mute: false,
+        self_deaf: false,
+        server_mute: false,
+        reconnecting: false,
+    }
+}
+
+fn publication(channel_id: i64, publisher: &str, user: i64) -> Publication {
+    Publication {
+        server_id: 1,
+        channel_id,
+        publisher_user_id: user,
+        publisher_connection_id: publisher.into(),
+        mode: "server".into(),
+        codec: "vp8".into(),
+        has_audio: true,
+        viewer_count: 2,
+        started_at_ms: 1,
+    }
+}
+
+pub(super) fn draw(visual: &mut VisualTestContext) {
+    visual.update(|window, app| {
+        window.refresh();
+        window.draw(app).clear();
+    });
+    visual.run_until_parked();
+}
+
+/// Focus the room after it has been mounted. A focus handle set before its
+/// element is painted does not own the keyboard in the test window.
+fn focus_room(visual: &mut VisualTestContext, voice: &Entity<voice_panel::VoicePanel>) {
+    for _ in 0..2 {
+        visual.update(|window, app| {
+            let focus = voice.read(app).focus_handle();
+            window.focus(&focus);
+            window.draw(app).clear();
+        });
+        visual.run_until_parked();
+    }
+}
+
+/// A window with two voice rooms and one text channel, an active call in room
+/// 7 and the matching panel entity.
+pub(super) fn fixture(
+    cx: &mut TestAppContext,
+) -> (
+    &'static mut VisualTestContext,
+    Entity<Voxhold>,
+    Entity<voice_panel::VoicePanel>,
+) {
+    fixture_with(cx, None, true)
+}
+
+/// Same fixture with an optional initial window width and an optional idle
+/// call. A test that checks "not painted" can build the window at its final
+/// size or with an idle call before the first frame, so the dock selector was
+/// never mounted. GPUI's test frame keeps stale `debug_bounds` for a selector
+/// once it has been painted.
+pub(super) fn fixture_with(
+    cx: &mut TestAppContext,
+    width: Option<f32>,
+    active: bool,
+) -> (
+    &'static mut VisualTestContext,
+    Entity<Voxhold>,
+    Entity<voice_panel::VoicePanel>,
+) {
+    cx.update(|cx| gpui_component::init(cx));
+    let client = client();
+    let (window, view) = super::settings_tests::make_app(cx, client.clone());
+    let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
+    if let Some(width) = width {
+        visual.simulate_resize(gpui::size(gpui::px(width), gpui::px(760.)));
+    }
+    let voice = visual.update(|window, cx| {
+        let panel = cx.new(|cx| voice_panel::VoicePanel::new(client, 1, 7, false, window, cx));
+        let mut rooms = std::collections::HashMap::new();
+        rooms.insert(
+            7,
+            crate::voice_panel::RoomAccess {
+                name: "Room A".into(),
+                readable: true,
+                e2ee: false,
+            },
+        );
+        rooms.insert(
+            8,
+            crate::voice_panel::RoomAccess {
+                name: "Room B".into(),
+                readable: true,
+                e2ee: false,
+            },
+        );
+        panel.update(cx, |panel, _| {
+            panel.set_rooms(rooms);
+            panel.set_self_user(1);
+            panel.set_room_state(7, Vec::new(), Vec::new());
+            if active {
+                panel.test_set_call(
+                    7,
+                    CallPhase::Connected,
+                    vec![participant("alice", 1), participant("bob", 2)],
+                    vec!["alice".into()],
+                );
+            } else {
+                panel.test_set_call(0, CallPhase::Idle, Vec::new(), Vec::new());
+            }
+        });
+        view.update(cx, |v, cx| {
+            cx.notify();
+            v.channels = vec![
+                channel(7, "Room A", "voice"),
+                channel(8, "Room B", "voice"),
+                channel(9, "Text", "text"),
+            ];
+            v.members = vec![
+                voxhold_api::Member {
+                    user_id: 1,
+                    username: "alice".into(),
+                    role: "member".into(),
+                    ..Default::default()
+                },
+                voxhold_api::Member {
+                    user_id: 2,
+                    username: "bob".into(),
+                    role: "member".into(),
+                    ..Default::default()
+                },
+            ];
+            v.server = 1;
+            v.voice = Some(panel.clone());
+            v.voice_room = 7;
+            v.voice_channel = if active { 7 } else { 0 };
+            v.channel = 7;
+            v.access_pending = false;
+            cx.notify();
+        });
+        let focus = panel.read(cx).focus_handle();
+        window.focus(&focus);
+        panel
+    });
+    (visual, view, voice)
+}
+
+#[gpui::test]
+async fn a_call_survives_navigation_and_moves_to_the_dock(cx: &mut TestAppContext) {
+    let (mut visual, view, voice) = fixture(cx);
+    draw(&mut visual);
+    view.read_with(&*visual, |v, app| {
+        assert!(v.voice_room_visible(), "the call room is shown");
+        assert!(
+            v.voice_dock_visible(app),
+            "the dock stays under the channel list for the whole call"
+        );
+    });
+    assert!(
+        visual.debug_bounds("voice-dock").is_some(),
+        "the dock is painted even while the active room is open"
+    );
+    assert!(
+        visual.debug_bounds("voice-dock-action-voice-mic").is_some()
+            && visual
+                .debug_bounds("voice-dock-action-voice-deaf")
+                .is_some()
+            && visual
+                .debug_bounds("voice-dock-action-voice-leave")
+                .is_some(),
+        "the dock paints microphone, sound and leave"
+    );
+    assert!(
+        visual
+            .debug_bounds("voice-dock-action-voice-records")
+            .is_none(),
+        "«Записи» is a room action, not a dock action"
+    );
+
+    // Browse another voice room: the call stays in room 7 and the same dock.
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            v.channel = 8;
+            v.open_voice_room(8, window, cx);
+        });
+    });
+    draw(&mut visual);
+    view.read_with(&*visual, |v, app| {
+        assert!(v.voice_room_visible());
+        assert!(v.voice_dock_visible(app));
+    });
+    assert!(
+        visual.debug_bounds("voice-dock").is_some(),
+        "the dock is painted under the channel list"
+    );
+    voice.read_with(&*visual, |panel, _| {
+        assert_eq!(panel.call_channel(), 7, "navigation must not end the call");
+        assert!(panel.call_active());
+    });
+
+    // A text channel keeps the call in the dock too.
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            v.channel = 9;
+            cx.notify();
+        });
+        let _ = window;
+    });
+    draw(&mut visual);
+    view.read_with(&*visual, |v, app| {
+        assert!(!v.voice_room_visible());
+        assert!(v.voice_dock_visible(app));
+    });
+
+    // Returning to the call room keeps the dock and the same attempt.
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            v.channel = 7;
+            v.open_voice_room(7, window, cx);
+        });
+    });
+    draw(&mut visual);
+    view.read_with(&*visual, |v, app| {
+        assert!(v.voice_room_visible());
+        assert!(v.voice_dock_visible(app), "the dock does not disappear");
+    });
+    assert!(visual.debug_bounds("voice-dock").is_some());
+}
+
+#[gpui::test]
+async fn tab_and_shift_tab_walk_the_room_actions(cx: &mut TestAppContext) {
+    let (mut visual, _view, voice) = fixture(cx);
+    draw(&mut visual);
+    focus_room(&mut visual, &voice);
+    let focused = |visual: &mut VisualTestContext| {
+        visual.update(|window, app| voice.read(app).focused_action(window))
+    };
+    visual.simulate_keystrokes("tab");
+    assert_eq!(
+        focused(&mut visual),
+        Some("voice-mic"),
+        "Tab starts at the first action"
+    );
+    visual.simulate_keystrokes("tab");
+    assert_eq!(focused(&mut visual), Some("voice-deaf"));
+    visual.simulate_keystrokes("tab");
+    assert_eq!(
+        focused(&mut visual),
+        Some("voice-screen"),
+        "screen follows sound in the web order"
+    );
+    visual.simulate_keystrokes("tab");
+    assert_eq!(focused(&mut visual), Some("voice-records"));
+    visual.simulate_keystrokes("tab");
+    assert_eq!(focused(&mut visual), Some("voice-leave"), "leave is last");
+    visual.simulate_keystrokes("tab");
+    assert_eq!(
+        focused(&mut visual),
+        Some("voice-local"),
+        "then the audible participant card"
+    );
+    visual.simulate_keystrokes("tab");
+    assert_eq!(
+        focused(&mut visual),
+        Some("voice-dock-action-voice-mic"),
+        "the painted dock follows the room"
+    );
+    visual.simulate_keystrokes("shift-tab");
+    assert_eq!(
+        focused(&mut visual),
+        Some("voice-local"),
+        "Shift+Tab walks backwards"
+    );
+    visual.simulate_keystrokes("shift-tab");
+    assert_eq!(focused(&mut visual), Some("voice-leave"));
+    visual.simulate_keystrokes("shift-tab");
+    assert_eq!(focused(&mut visual), Some("voice-records"));
+    visual.simulate_keystrokes("shift-tab");
+    assert_eq!(focused(&mut visual), Some("voice-screen"));
+    visual.simulate_keystrokes("shift-tab");
+    assert_eq!(focused(&mut visual), Some("voice-deaf"));
+    visual.simulate_keystrokes("shift-tab");
+    assert_eq!(focused(&mut visual), Some("voice-mic"));
+}
+
+#[gpui::test]
+async fn the_room_toolbar_paints_the_web_action_order(cx: &mut TestAppContext) {
+    fn button(visual: &mut VisualTestContext, id: &'static str) -> (f32, f32, f32, f32) {
+        let bounds = visual
+            .debug_bounds(id)
+            .unwrap_or_else(|| panic!("{id} is painted"));
+        (
+            f32::from(bounds.origin.x),
+            f32::from(bounds.origin.y),
+            f32::from(bounds.size.width),
+            f32::from(bounds.size.height),
+        )
+    }
+    let (mut visual, _view, _voice) = fixture(cx);
+    draw(&mut visual);
+    let mic = button(&mut visual, "voice-action-0");
+    let sound = button(&mut visual, "voice-action-1");
+    let screen = button(&mut visual, "voice-screen");
+    let records = button(&mut visual, "voice-action-3");
+    let leave = button(&mut visual, "voice-action-4");
+    assert!(
+        mic.0 < sound.0 && sound.0 < screen.0 && screen.0 < records.0 && records.0 < leave.0,
+        "mic, sound, screen, records, leave; leave is last"
+    );
+    assert!(
+        visual.debug_bounds("voice-action-2").is_none(),
+        "camera is not implemented and leaves no dead placeholder"
+    );
+    for (id, x, y, w, h) in [
+        ("mic", mic.0, mic.1, mic.2, mic.3),
+        ("sound", sound.0, sound.1, sound.2, sound.3),
+        ("screen", screen.0, screen.1, screen.2, screen.3),
+        ("records", records.0, records.1, records.2, records.3),
+        ("leave", leave.0, leave.1, leave.2, leave.3),
+    ] {
+        assert!(
+            (w - crate::voice_room::TOOLBAR_BUTTON_WIDTH).abs() < 1.0,
+            "{id} is 46 px wide, got {w}"
+        );
+        assert!(
+            (h - crate::voice_room::TOOLBAR_BUTTON_HEIGHT).abs() < 1.0,
+            "{id} is 45 px high, got {h}"
+        );
+        assert!(x.is_finite() && y.is_finite());
+    }
+}
+
+#[gpui::test]
+async fn escape_and_f_leave_fullscreen_without_leaving_the_call(cx: &mut TestAppContext) {
+    let (mut visual, view, voice) = fixture(cx);
+    draw(&mut visual);
+    focus_room(&mut visual, &voice);
+    visual.update(|window, app| {
+        voice.update(app, |panel, _| {
+            panel.test_open_player(publication(7, "alice", 1));
+            panel.player_toggle_fullscreen(window);
+        });
+    });
+    draw(&mut visual);
+    voice.read_with(&*visual, |panel, _| {
+        assert!(panel.player_fullscreen());
+    });
+    visual.simulate_keystrokes("escape");
+    draw(&mut visual);
+    voice.read_with(&*visual, |panel, _| {
+        assert!(!panel.player_fullscreen(), "Esc leaves fullscreen");
+        assert!(panel.call_active(), "the voice call stays");
+        assert!(panel.player_open(), "the floating player returns");
+    });
+    view.read_with(&*visual, |v, _| assert_eq!(v.voice_channel, 7));
+
+    // Fullscreen and F leave it again.
+    visual.update(|window, app| {
+        voice.update(app, |panel, _| panel.player_toggle_fullscreen(window));
+    });
+    draw(&mut visual);
+    visual.simulate_keystrokes("f");
+    draw(&mut visual);
+    voice.read_with(&*visual, |panel, _| {
+        assert!(!panel.player_fullscreen());
+        assert!(panel.call_active());
+    });
+}
+
+#[gpui::test]
+async fn push_to_talk_press_and_release_reach_the_panel(cx: &mut TestAppContext) {
+    let (mut visual, view, voice) = fixture(cx);
+    draw(&mut visual);
+    focus_room(&mut visual, &voice);
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            v.voice_settings.prefs.input_mode = "push_to_talk".into();
+            v.voice_settings.prefs.push_to_talk = "Space".into();
+            voice.update(cx, |panel, cx| {
+                panel.set_push_to_talk(true);
+                cx.notify();
+            });
+        });
+        let _ = window;
+    });
+    draw(&mut visual);
+    visual.simulate_event(gpui::KeyDownEvent {
+        keystroke: Keystroke::parse("space").unwrap(),
+        is_held: false,
+    });
+    voice.read_with(&*visual, |panel, _| {
+        assert!(panel.test_ptt_held(), "the configured key opens the hold");
+    });
+    visual.simulate_event(gpui::KeyUpEvent {
+        keystroke: Keystroke::parse("space").unwrap(),
+    });
+    voice.read_with(&*visual, |panel, _| {
+        assert!(!panel.test_ptt_held(), "the release closes the hold");
+    });
+
+    // Losing focus releases the hold too.
+    visual.simulate_event(gpui::KeyDownEvent {
+        keystroke: Keystroke::parse("space").unwrap(),
+        is_held: false,
+    });
+    visual.update(|window, app| {
+        voice.update(app, |panel, _| panel.release_push_to_talk());
+        let _ = window;
+    });
+    voice.read_with(&*visual, |panel, _| assert!(!panel.test_ptt_held()));
+
+    // Opening a modal blocks a new press.
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            v.show_search = true;
+            v.sync_push_to_talk_block(cx);
+        });
+        let _ = window;
+    });
+    visual.simulate_event(gpui::KeyDownEvent {
+        keystroke: Keystroke::parse("space").unwrap(),
+        is_held: false,
+    });
+    voice.read_with(&*visual, |panel, _| {
+        assert!(!panel.test_ptt_held(), "a modal owns the keyboard");
+    });
+}
+
+#[gpui::test]
+async fn room_snapshots_follow_the_server_and_open_with_their_streams(cx: &mut TestAppContext) {
+    let (mut visual, view, voice) = fixture(cx);
+    draw(&mut visual);
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            v.voice_rooms.insert((1, 8), vec![participant("carol", 3)]);
+            v.voice_streams
+                .insert((1, 8), vec![publication(8, "carol-screen", 3)]);
+            assert_eq!(v.voice_count(8), 1, "the cached room is counted");
+            assert!(v.voice_has_stream(8));
+            v.channel = 8;
+            v.open_voice_room(8, window, cx);
+        });
+    });
+    draw(&mut visual);
+    voice.read_with(&*visual, |panel, _| {
+        assert_eq!(panel.room(), 8);
+        assert_eq!(
+            panel.room_streams().len(),
+            1,
+            "room and streams move together"
+        );
+        assert_eq!(
+            panel.room_streams()[0].publisher_connection_id,
+            "carol-screen"
+        );
+    });
+
+    // Another server keeps its own (server, channel) snapshot, so switching
+    // does not need a new media event.
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            v.server = 2;
+            v.channels = vec![channel(30, "Server B voice", "voice")];
+            v.channel = 30;
+            v.voice_rooms.insert((2, 30), vec![participant("dave", 4)]);
+            v.voice_streams
+                .insert((2, 30), vec![publication(30, "dave-screen", 4)]);
+            v.open_voice_room(30, window, cx);
+        });
+    });
+    draw(&mut visual);
+    voice.read_with(&*visual, |panel, _| {
+        assert_eq!(panel.room(), 30);
+        assert_eq!(panel.room_streams().len(), 1);
+        assert_eq!(
+            panel.room_streams()[0].publisher_connection_id,
+            "dave-screen"
+        );
+    });
+}
+
+#[gpui::test]
+async fn push_to_talk_closes_when_a_required_modifier_is_released(cx: &mut TestAppContext) {
+    let (mut visual, view, voice) = fixture(cx);
+    draw(&mut visual);
+    focus_room(&mut visual, &voice);
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            v.voice_settings.prefs.input_mode = "push_to_talk".into();
+            v.voice_settings.prefs.push_to_talk = "Ctrl+Space".into();
+            voice.update(cx, |panel, cx| {
+                panel.set_push_to_talk(true);
+                cx.notify();
+            });
+        });
+        let _ = window;
+    });
+    draw(&mut visual);
+
+    // A fresh combination opens the hold.
+    visual.simulate_event(gpui::KeyDownEvent {
+        keystroke: Keystroke::parse("ctrl-space").unwrap(),
+        is_held: false,
+    });
+    voice.read_with(&*visual, |panel, _| assert!(panel.test_ptt_held()));
+
+    // Releasing only Ctrl breaks Ctrl+Space even though Space is still down.
+    visual.simulate_event(gpui::KeyUpEvent {
+        keystroke: Keystroke::parse("control").unwrap(),
+    });
+    voice.read_with(&*visual, |panel, _| {
+        assert!(
+            !panel.test_ptt_held(),
+            "the released modifier closes the hold"
+        )
+    });
+
+    // An auto-repeat of the main key must not reopen it.
+    visual.simulate_event(gpui::KeyDownEvent {
+        keystroke: Keystroke::parse("ctrl-space").unwrap(),
+        is_held: true,
+    });
+    voice.read_with(&*visual, |panel, _| {
+        assert!(!panel.test_ptt_held(), "auto-repeat never opens the hold")
+    });
+
+    // A modifier transition reported on its own also closes the hold.
+    visual.simulate_event(gpui::KeyDownEvent {
+        keystroke: Keystroke::parse("ctrl-space").unwrap(),
+        is_held: false,
+    });
+    visual.simulate_event(gpui::ModifiersChangedEvent {
+        modifiers: gpui::Modifiers {
+            control: false,
+            ..Default::default()
+        },
+        capslock: Default::default(),
+    });
+    voice.read_with(&*visual, |panel, _| {
+        assert!(!panel.test_ptt_held(), "ModifiersChanged releases the hold")
+    });
+}
+
+#[gpui::test]
+async fn the_room_and_player_use_the_real_layout_coordinates(cx: &mut TestAppContext) {
+    let (mut visual, view, voice) = fixture(cx);
+    draw(&mut visual);
+    let chat = view.read_with(&*visual, |v, _| {
+        layout::compute_layout(v.viewport.0, v.viewport.1, v.shell, true, v.show_members).chat
+    });
+    let viewport = visual
+        .debug_bounds("voice-room-viewport")
+        .expect("the card viewport is painted");
+    assert!(
+        (f32::from(viewport.size.width) - (chat.w - 48.0)).abs() < 2.0,
+        "Go keeps a 24 px inset on both sides: {viewport:?}"
+    );
+    let toolbar = visual
+        .debug_bounds("voice-action-0")
+        .expect("toolbar buttons are painted");
+    assert!(
+        (f32::from(toolbar.size.width) - 46.0).abs() < 1.0,
+        "the web action is 46 px wide: {toolbar:?}"
+    );
+    voice.read_with(&*visual, |panel, _| {
+        let (_, height) = panel.test_room_size();
+        assert!(height > 120.0);
+    });
+
+    // The floating player starts at 360 px and stays inside the player area.
+    visual.update(|window, app| {
+        voice.update(app, |panel, _| {
+            panel.test_open_player(publication(7, "alice", 1));
+        });
+        let _ = window;
+    });
+    draw(&mut visual);
+    let player = visual
+        .debug_bounds("voice-player")
+        .expect("the player is painted");
+    assert!((f32::from(player.size.width) - 360.0).abs() < 1.0);
+    assert!((f32::from(player.size.height) - (360.0 * 9.0 / 16.0 + 76.0)).abs() < 1.0);
+    let area = voice.read_with(&*visual, |panel, _| panel.test_player_area());
+    assert!(f32::from(player.origin.x) >= area.x + 8.0 - 0.5);
+    assert!(f32::from(player.origin.y) >= area.y + 8.0 - 0.5);
+}
+
+#[gpui::test]
+async fn unconfirmed_access_hides_the_active_room_and_blocks_join(cx: &mut TestAppContext) {
+    let (mut visual, view, voice) = fixture(cx);
+    visual.update(|_, app| {
+        voice.update(app, |panel, _| {
+            panel.test_set_streams(vec![publication(7, "alice", 1)]);
+        });
+    });
+    draw(&mut visual);
+    voice.read_with(&*visual, |panel, _| {
+        assert_eq!(panel.test_visible_roster_len(), 2);
+        assert_eq!(panel.test_visible_streams_len(), 1);
+        assert!(panel.test_audio_for("alice"));
+    });
+
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            v.voice_unconfirmed.insert(1);
+            v.sync_voice_panel(cx);
+        });
+        let _ = window;
+    });
+    draw(&mut visual);
+    voice.read_with(&*visual, |panel, _| {
+        assert_eq!(
+            panel.test_visible_roster_len(),
+            0,
+            "the active call roster must follow the ACL gate"
+        );
+        assert_eq!(panel.test_visible_streams_len(), 0);
+        assert!(!panel.test_audio_for("alice"));
+    });
+    visual.update(|_, app| {
+        voice.update(app, |panel, cx| {
+            panel.join(cx);
+            assert!(panel.error().contains("не подтверждены"));
+        });
+    });
+
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            v.apply_confirmed_channels(1, vec![channel(7, "Room A", "voice")], window, cx);
+        });
+    });
+    draw(&mut visual);
+    view.read_with(&*visual, |v, _| {
+        assert!(!v.voice_unconfirmed.contains(&1));
+    });
+    voice.read_with(&*visual, |panel, _| {
+        assert_eq!(panel.test_visible_roster_len(), 2);
+        assert_eq!(panel.test_visible_streams_len(), 1);
+        assert!(panel.test_audio_for("alice"));
+    });
+}
+
+#[gpui::test]
+async fn ended_in_fullscreen_restores_the_window_and_closes_the_player(cx: &mut TestAppContext) {
+    let (mut visual, _view, voice) = fixture(cx);
+    draw(&mut visual);
+    visual.update(|window, app| {
+        voice.update(app, |panel, cx| {
+            panel.test_open_player(publication(7, "alice", 1));
+            panel.player_toggle_fullscreen(window);
+            assert!(panel.player_fullscreen());
+            panel.test_apply_update(
+                voxhold_media::runtime::VoiceUpdate::Ended(Some(
+                    "Голосовое соединение завершено сервером".into(),
+                )),
+                window,
+                cx,
+            );
+        });
+    });
+    draw(&mut visual);
+    voice.read_with(&*visual, |panel, _| {
+        assert!(!panel.player_fullscreen(), "revoke must leave fullscreen");
+        assert!(!panel.player_open(), "the player is closed");
+        assert!(!panel.call_active(), "the call is released");
+    });
+}
+
+#[gpui::test]
+async fn voice_participants_are_listed_under_their_channel(cx: &mut TestAppContext) {
+    let (mut visual, view, _voice) = fixture(cx);
+    visual.update(|_, app| {
+        view.update(app, |v, cx| {
+            let mut bob = participant("bob", 2);
+            bob.self_mute = true;
+            v.voice_rooms
+                .insert((1, 7), vec![participant("alice", 1), bob]);
+            let mut dave = participant("dave", 4);
+            dave.reconnecting = true;
+            v.voice_rooms
+                .insert((1, 8), vec![participant("carol", 3), dave]);
+            cx.notify();
+        });
+    });
+    draw(&mut visual);
+    let channel7 = visual.debug_bounds("channel-7").expect("channel 7 row");
+    let channel8 = visual.debug_bounds("channel-8").expect("channel 8 row");
+    let alice = visual
+        .debug_bounds("voice-member-alice")
+        .expect("alice row");
+    let bob = visual.debug_bounds("voice-member-bob").expect("bob row");
+    let carol = visual
+        .debug_bounds("voice-member-carol")
+        .expect("carol row");
+    let dave = visual
+        .debug_bounds("voice-member-dave")
+        .expect("a reconnecting member still has a row");
+    // Rows belong to the channel above them, not just to the list.
+    assert!(channel7.origin.y < alice.origin.y);
+    assert!(alice.origin.y < bob.origin.y);
+    assert!(bob.origin.y < channel8.origin.y);
+    assert!(channel8.origin.y < carol.origin.y);
+    assert!(carol.origin.y < dave.origin.y);
+    // Muted and reconnecting members show the card's state icon; a healthy
+    // member shows only the dot.
+    assert!(visual.debug_bounds("voice-state-bob").is_some());
+    assert!(visual.debug_bounds("voice-state-dave").is_some());
+    assert!(visual.debug_bounds("voice-state-alice").is_none());
+    assert!(visual.debug_bounds("voice-state-carol").is_none());
+}
+
+#[gpui::test]
+async fn voice_actions_apply_one_snapshot_and_persist(cx: &mut TestAppContext) {
+    let (mut visual, view, voice) = fixture(cx);
+    draw(&mut visual);
+    visual.update(|_window, app| {
+        view.update(app, |v, cx| {
+            use personal_settings::Action;
+            // The fixture's panel is in a call, so device changes must not
+            // start a second WinMM preview while the transmission owns the
+            // microphone.
+            v.active_settings = Some(SettingsKind::Personal);
+            v.personal.as_mut().unwrap().dialog.active = 1;
+            v.voice_settings.path = None;
+            v.voice_settings.devices = vec![
+                crate::voice_settings::Device {
+                    id: "1:Mic".into(),
+                    name: "Mic".into(),
+                    input: true,
+                },
+                crate::voice_settings::Device {
+                    id: "2:Spk".into(),
+                    name: "Spk".into(),
+                    input: false,
+                },
+            ];
+            assert!(v.voice_settings_action(Action::SelectInput("1:Mic".into()), cx));
+            assert_eq!(v.voice_settings.prefs.input, "1:Mic");
+            assert_eq!(v.voice_settings.prefs.output, "", "output is untouched");
+            assert!(v.voice_settings.preview.is_none(), "no in-call preview");
+
+            assert!(v.voice_settings_action(Action::SelectOutput("2:Spk".into()), cx));
+            assert_eq!(v.voice_settings.prefs.output, "2:Spk");
+            assert_eq!(v.voice_settings.prefs.input, "1:Mic");
+
+            assert!(v.voice_settings_action(Action::SetBitrate(96), cx));
+            assert_eq!(v.voice_settings.prefs.bitrate, 96);
+            assert!(v.voice_settings_action(Action::SetBitrate(160), cx));
+            assert_eq!(v.voice_settings.prefs.bitrate, 96, "160 is not a preset");
+
+            assert!(v.voice_settings_action(Action::SetVolume("input", 150), cx));
+            assert!(v.voice_settings_action(Action::SetVolume("output", 0), cx));
+            assert!(v.voice_settings_action(Action::SetNoiseMode(1), cx));
+            assert_eq!(v.voice_settings.prefs.noise_mode, "threshold");
+            assert!(v.voice_settings_action(Action::SetVolume("noise", 40), cx));
+            if let Some(voice) = &v.voice {
+                let controls = voice.read(cx).test_controls();
+                assert_eq!(controls.noise_mode.as_str(), "threshold");
+                assert_eq!(controls.noise_gate_percent, 40);
+                assert!((controls.input_gain - 1.5).abs() < 1e-6);
+                assert_eq!(controls.output_gain, Some(0.0));
+            }
+            let auto_gain = v.voice_settings.prefs.auto_gain;
+            assert!(v.voice_settings_action(Action::ToggleAutoGain, cx));
+            assert_ne!(v.voice_settings.prefs.auto_gain, auto_gain);
+            if let Some(voice) = &v.voice {
+                assert_eq!(
+                    voice.read(cx).test_controls().auto_gain_control,
+                    v.voice_settings.prefs.auto_gain
+                );
+            }
+            assert!(v.voice_settings_action(Action::SetVolume("sound", 25), cx));
+            assert_eq!(v.voice_settings.prefs.sound_volume, 25);
+            let sounds = v.voice_settings.prefs.sounds;
+            assert!(v.voice_settings_action(Action::ToggleSounds, cx));
+            assert_ne!(v.voice_settings.prefs.sounds, sounds);
+
+            assert!(v.voice_settings_action(Action::SetInputMode(1), cx));
+            assert_eq!(v.voice_settings.prefs.input_mode, "push_to_talk");
+            assert!(v.voice_settings_action(Action::ResetVoice, cx));
+            assert!(v.voice_settings.prefs.input.is_empty());
+            assert!(v.voice_settings.prefs.output.is_empty());
+            assert_eq!(v.voice_settings.prefs.bitrate, 64);
+            assert_eq!(v.voice_settings.prefs.input_volume, 100);
+            assert_eq!(v.voice_settings.prefs.output_volume, 100);
+            assert!(!v.voice_settings_action(Action::ToggleTheme, cx));
+        });
+    });
+    voice.read_with(&*visual, |panel, _| {
+        let controls = panel.test_controls();
+        assert!(
+            controls.input.is_none() || controls.input.as_deref() == Some(""),
+            "reset selects the system input"
+        );
+        assert_eq!(controls.output.as_deref(), Some(""));
+        assert_eq!(controls.bitrate_kbps, Some(64));
+        assert_eq!(controls.output_gain, Some(1.0));
+        assert!((controls.input_gain - 1.0).abs() < 1e-6);
+        assert!(!panel.test_push_to_talk(), "reset keeps voice activity");
+    });
+}
+
+#[gpui::test]
+async fn closing_the_dialog_stops_the_voice_meter(cx: &mut TestAppContext) {
+    let (mut visual, view, _voice) = fixture(cx);
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            v.active_settings = Some(SettingsKind::Personal);
+            v.personal.as_mut().unwrap().dialog.active = 1;
+            v.start_voice_meter(cx);
+            let epoch = v.voice_settings.meter_epoch;
+            assert!(v.voice_settings.preview.is_none());
+            v.close_settings(false, window, cx);
+            assert!(v.active_settings.is_none());
+            assert!(
+                v.voice_settings.meter_epoch > epoch,
+                "closing bumps the epoch, so a late tick stops"
+            );
+        });
+    });
+}
+
+#[gpui::test]
+async fn the_room_keeps_the_current_palette(cx: &mut TestAppContext) {
+    let (visual, view, voice) = fixture(cx);
+    // A real theme switch reaches an already running panel.
+    visual.update(|_, app| {
+        view.update(app, |v, cx| {
+            v.theme_path = None;
+            v.apply_theme(crate::theme::ThemeMode::Light, cx);
+        });
+    });
+    assert!(view.read_with(&*visual, |v, _| v.palette.light));
+    voice.read_with(&*visual, |panel, _| assert!(panel.test_palette().light));
+
+    // A room opened later starts with the same palette.
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            v.voice = None;
+            v.open_voice_room(7, window, cx);
+        });
+    });
+    let panel = view
+        .read_with(&*visual, |v, _| v.voice.clone())
+        .expect("a new panel");
+    panel.read_with(&*visual, |panel, _| assert!(panel.test_palette().light));
+}
+
+#[gpui::test]
+async fn many_voice_members_keep_the_account_footer_visible(cx: &mut TestAppContext) {
+    let (mut visual, view, _voice) = fixture(cx);
+    let roster: Vec<_> = (0..80)
+        .map(|index| participant(&format!("member-{index}"), 100 + index))
+        .collect();
+    visual.update(|_, app| {
+        view.update(app, |v, cx| {
+            v.voice_rooms.insert((1, 7), roster);
+            cx.notify();
+        });
+    });
+    draw(&mut visual);
+    let list = visual.debug_bounds("channel-list").expect("channel list");
+    let footer = visual
+        .debug_bounds("account-footer")
+        .expect("account footer");
+    let (_, viewport_h) = visual.update(|window, _| {
+        let size = window.viewport_size();
+        (f32::from(size.width), f32::from(size.height))
+    });
+    let list_bottom: f32 = (list.origin.y + list.size.height).into();
+    let footer_bottom: f32 = (footer.origin.y + footer.size.height).into();
+    assert!(
+        list_bottom <= f32::from(footer.origin.y) + 0.5,
+        "the member rows scroll instead of covering the footer"
+    );
+    assert!(
+        footer_bottom <= viewport_h + 0.5,
+        "the footer stays inside the window"
+    );
+}
+
+#[gpui::test]
+async fn speaking_changes_wake_the_parent_once(cx: &mut TestAppContext) {
+    let (visual, _view, voice) = fixture(cx);
+    let calls = std::rc::Rc::new(std::cell::Cell::new(0_usize));
+    let counter = calls.clone();
+    visual.update(|window, app| {
+        voice.update(app, |panel, cx| {
+            panel.set_speaking_handler(Box::new(move |_cx| {
+                counter.set(counter.get() + 1);
+            }));
+            let mut speaking = std::collections::HashMap::new();
+            speaking.insert("alice".to_string(), true);
+            let first = panel.test_apply_update(
+                voxhold_media::runtime::VoiceUpdate::Speaking(speaking.clone()),
+                window,
+                cx,
+            );
+            // The runtime resends the same set while it is unchanged.
+            let again = panel.test_apply_update(
+                voxhold_media::runtime::VoiceUpdate::Speaking(speaking),
+                window,
+                cx,
+            );
+            assert!(first, "a real change repaints the panel");
+            assert!(!again, "an unchanged speech set must not repaint");
+        });
+    });
+    assert_eq!(
+        calls.get(),
+        1,
+        "only an actual speech change repaints the sidebar"
+    );
+}
+
+#[gpui::test]
+async fn an_app_opened_room_wakes_the_sidebar_on_speech(cx: &mut TestAppContext) {
+    let (mut visual, view, _voice) = fixture(cx);
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            v.voice = None;
+            v.open_voice_room(7, window, cx);
+        });
+    });
+    let panel = view
+        .read_with(&*visual, |v, _| v.voice.clone())
+        .expect("panel");
+    visual.update(|window, app| {
+        panel.update(app, |panel, cx| {
+            let mut speaking = std::collections::HashMap::new();
+            speaking.insert("alice".to_string(), true);
+            panel.test_apply_update(
+                voxhold_media::runtime::VoiceUpdate::Speaking(speaking),
+                window,
+                cx,
+            );
+        });
+    });
+    // The production handler defers a parent update; drawing must drain it
+    // without a re-entrant entity update.
+    draw(&mut visual);
+    panel.read_with(&*visual, |panel, _| assert!(panel.speaking("alice")));
+}
+
+#[gpui::test]
+async fn dsp_controls_accept_the_web_ranges(cx: &mut TestAppContext) {
+    let (mut visual, _view, voice) = fixture(cx);
+    draw(&mut visual);
+    voice.update(&mut *visual, |panel, _| {
+        panel.set_dsp("threshold", 250, 999, false, false);
+    });
+    voice.read_with(&*visual, |panel, _| {
+        let controls = panel.test_controls();
+        assert_eq!(
+            controls.noise_mode,
+            voxhold_media::dsp::NoiseMode::Threshold
+        );
+        assert_eq!(controls.noise_gate_percent, 100);
+        assert!((controls.input_gain - 2.0).abs() < f32::EPSILON);
+        assert!(!controls.echo_cancellation);
+        assert!(!controls.auto_gain_control);
+    });
+    voice.update(&mut *visual, |panel, _| {
+        panel.set_dsp("auto", 15, 0, true, true);
+    });
+    voice.update(&mut *visual, |panel, _| {
+        panel.select_input(Some("endpoint-x".into()));
+    });
+    voice.read_with(&*visual, |panel, _| {
+        let controls = panel.test_controls();
+        assert_eq!(controls.noise_mode, voxhold_media::dsp::NoiseMode::Auto);
+        assert_eq!(controls.noise_gate_percent, 15);
+        assert_eq!(controls.input_gain, 0.0);
+        assert_eq!(controls.input.as_deref(), Some("endpoint-x"));
+    });
+}
+
+#[gpui::test]
+async fn applied_audio_update_reaches_the_panel(cx: &mut TestAppContext) {
+    let (mut visual, _view, voice) = fixture(cx);
+    draw(&mut visual);
+    let applied = AppliedAudio {
+        capture: "platform",
+        noise_mode: "auto",
+        echo_cancellation: true,
+        auto_gain_control: true,
+        software_mixer: true,
+    };
+    let expected = applied.clone();
+    visual.update(|window, app| {
+        voice.update(app, |panel, cx| {
+            assert!(panel.apply_update(VoiceUpdate::AudioMode(applied), window, cx));
+        });
+    });
+    voice.read_with(&*visual, |panel, _| {
+        assert_eq!(panel.applied_audio(), Some(&expected));
+    });
+    draw(&mut visual);
+    assert!(
+        visual.debug_bounds("voice-audio-mode").is_some(),
+        "the applied processing mode must be visible in the active room"
+    );
+    // Leaving the call must clear the diagnostic so a later attempt cannot
+    // show the previous engine's mode.
+    voice.update(&mut *visual, |panel, cx| panel.leave_call(cx));
+    voice.read_with(&*visual, |panel, _| {
+        assert!(panel.applied_audio().is_none());
+    });
+}
+
+#[test]
+fn voice_room_colors_follow_the_theme() {
+    let dark_palette = crate::theme::dark_palette();
+    let light_palette = crate::theme::light_palette();
+    let dark = crate::voice_panel::VoiceColors::resolve(dark_palette);
+    let light = crate::voice_panel::VoiceColors::resolve(light_palette);
+    // The dark room keeps its fixed surfaces; the light room uses the light
+    // workspace surfaces and text instead of the black card.
+    assert_eq!(dark.surface, 0x1e1e1b);
+    assert_eq!(light.surface, 0xe8e8e0);
+    assert_eq!(dark.fg, 0xf3f4eb);
+    assert_eq!(light.fg, 0x20211d);
+    assert_ne!(dark.danger_bg, light.danger_bg);
+    assert_ne!(dark.avatar_bg, light.avatar_bg);
+    // The fill keeps its hue; the text accent reuses the theme ink so the
+    // ring stays readable on a light surface.
+    assert_eq!(dark.accent, light.accent);
+    assert_eq!(dark.accent_text, dark_palette.accent_ink);
+    assert_eq!(light.accent_text, light_palette.accent_ink);
+}
+
+#[gpui::test]
+async fn the_decoder_viewport_tracks_the_fullscreen_picture(cx: &mut TestAppContext) {
+    let (mut visual, _view, voice) = fixture(cx);
+    draw(&mut visual);
+    visual.update(|window, app| {
+        voice.update(app, |panel, _| {
+            panel.test_attach_detached_handle();
+            panel.set_scale(1.0);
+            panel.test_open_player(publication(7, "alice", 1));
+            panel.set_player_area_and_place(crate::voice_room::Rect::new(0., 0., 1920., 1080.));
+            assert_eq!(
+                panel.test_take_viewport(),
+                Some((358, 202)),
+                "the floating player keeps its own picture, not the whole window"
+            );
+            // The production fullscreen action must request the fullscreen
+            // picture on its own; the test adds no manual viewport sync.
+            panel.player_toggle_fullscreen(window);
+            assert!(panel.player_fullscreen());
+            assert_eq!(
+                panel.test_take_viewport(),
+                Some((1920, 1018)),
+                "fullscreen decodes to the full picture surface"
+            );
+            assert_eq!(
+                panel.test_take_viewport(),
+                None,
+                "the toggle must not request the same viewport twice"
+            );
+            panel.set_scale(2.0);
+            assert_eq!(
+                panel.test_take_viewport(),
+                Some((3840, 2036)),
+                "a DPI change requests physical pixels"
+            );
+        });
+    });
+    // Leaving fullscreen returns to the floating picture at the same scale.
+    visual.update(|window, app| {
+        voice.update(app, |panel, _| {
+            panel.exit_fullscreen(window);
+            assert!(!panel.player_fullscreen());
+            assert_eq!(panel.test_take_viewport(), Some((716, 405)));
+        });
+    });
+}
+
+#[gpui::test]
+async fn a_room_resize_requests_only_the_changed_picture_surface(cx: &mut TestAppContext) {
+    let (mut visual, _view, voice) = fixture(cx);
+    draw(&mut visual);
+    visual.update(|_window, app| {
+        voice.update(app, |panel, _| {
+            panel.test_attach_detached_handle();
+            panel.set_scale(1.0);
+            panel.test_open_player(publication(7, "alice", 1));
+            panel.set_player_area_and_place(crate::voice_room::Rect::new(0., 0., 1920., 1080.));
+            assert_eq!(panel.test_take_viewport(), Some((358, 202)));
+            // A narrower room clamps the floating box, so the picture surface
+            // really changes even though the player was already placed.
+            panel.set_player_area_and_place(crate::voice_room::Rect::new(0., 0., 300., 600.));
+            assert_eq!(
+                panel.test_take_viewport(),
+                Some((282, 159)),
+                "a resize between two non-empty rects requests the new surface"
+            );
+            // Repeating the same rect changes nothing and must not wake the
+            // worker with a duplicate size.
+            panel.set_player_area_and_place(crate::voice_room::Rect::new(0., 0., 300., 600.));
+            assert_eq!(
+                panel.test_take_viewport(),
+                None,
+                "an unchanged repeat is not requested"
+            );
+            // Widening the room restores the default floating width.
+            panel.set_player_area_and_place(crate::voice_room::Rect::new(0., 0., 1920., 1080.));
+            assert_eq!(panel.test_take_viewport(), Some((358, 202)));
+        });
+    });
+}

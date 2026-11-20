@@ -1,70 +1,338 @@
+//! Personal settings form state: profile, avatar crop, password, sessions,
+//! appearance, system notifications and privacy.
+//!
+//! Network work lives in `src/app/personal_ops.rs`; this module only holds the
+//! confirmed snapshots, editor values and per-request bookkeeping.
+
 use std::sync::Arc;
-use gpui::{div, prelude::*, px, rgb, Context, Entity, Window};
-use gpui_component::input::{InputState, TextInput};
-use voxhold_api::{AccountSession, Client, MessagePrivacy, Profile};
+
+use gpui::{AppContext, Context, Entity, RenderImage, Window};
+use gpui_component::input::InputState;
+use voxhold_api::{AccountSession, MessagePrivacy, Profile};
+
+use crate::settings::{self, Crop, Dialog, LoadState, Scope, Tab};
+use crate::theme::ThemeMode;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Action {
+    Retry,
+    RetrySessions,
+    SaveProfile,
+    CancelProfile,
+    OpenCountry,
+    CloseCountry,
+    ChooseCountry(usize),
+    PickAvatar,
+    SaveAvatar,
+    CancelAvatar,
+    RemoveAvatar,
+    ChangePassword,
+    RevokeSession(i64),
+    RevokeOthers,
+    SetPrivacy(usize),
+    Unblock(i64),
+    ToggleTheme,
+    ToggleNotifications,
+    DeleteAccount,
+    ConfirmDelete,
+    CancelDelete,
+    RefreshDevices,
+    /// Stable endpoint id captured when the row was drawn. An index would
+    /// select a different device after a refresh, so the id is the identity.
+    SelectInput(String),
+    SelectOutput(String),
+    SetVolume(&'static str, i64),
+    SetBitrate(i64),
+    ToggleSounds,
+    SetNoiseMode(usize),
+    SetInputMode(usize),
+    ToggleAutoGain,
+    /// Show or hide the collapsed «Подробнее» diagnostics of the voice tab.
+    ToggleVoiceDiagnostics,
+    ResetVoice,
+    TestMicrophone,
+    TestTone,
+    /// Start recording a shortcut for `0` mute, `1` deafen, `2` push-to-talk.
+    RecordShortcut(usize),
+    /// Per-user room volume by the stable user id (0–200 %).
+    SetVoiceUserVolume(i64, i64),
+    CropZoom(i32),
+    CropX(i32),
+    CropY(i32),
+}
+
+pub const TABS: [Tab; 3] = [
+    Tab::new("Профиль", "people"),
+    Tab::new("Голос и звук", "headphones"),
+    Tab::new("Приватность", "lock"),
+];
+
+/// One decoded avatar crop draft. `source` is already EXIF-oriented and
+/// downscaled to at most 640 px; `crop` uses the Go client's 0..100 space and
+/// is mapped back to original pixels for upload.
+pub struct CropDraft {
+    pub data: Arc<Vec<u8>>,
+    pub source: Arc<image::DynamicImage>,
+    /// File choice that produced these pixels. A preview task captures this
+    /// value together with the draft, so a newer selection cannot lend its ID
+    /// to an older image.
+    pub pick: u64,
+    pub width: u32,
+    pub height: u32,
+    pub crop: Crop,
+    pub preview: Option<Arc<RenderImage>>,
+    pub preview_token: u64,
+}
+
+impl CropDraft {
+    /// `crop_x`, `crop_y`, `crop_size` in the original oriented image.
+    pub fn upload_crop(&self) -> (i32, i32, i32) {
+        let (x, y) = self.crop.origin(self.width, self.height);
+        (
+            x as i32,
+            y as i32,
+            self.crop.size(self.width, self.height) as i32,
+        )
+    }
+}
 
 pub struct PersonalSettings {
-    client: Client, runtime: Arc<tokio::runtime::Runtime>,
-    about: Entity<InputState>, country: Entity<InputState>, current: Entity<InputState>, next: Entity<InputState>, confirm: Entity<InputState>, mode: Entity<InputState>, user_id: Entity<InputState>, delete_name: Entity<InputState>, delete_confirm: bool,
-    profile: Option<Profile>, privacy: Option<MessagePrivacy>, sessions: Vec<AccountSession>, error: String, notice: String, busy: bool, generation: u64,
-}
-impl PersonalSettings {
-    pub fn new(client: Client, runtime: Arc<tokio::runtime::Runtime>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        Self { client, runtime,
-            about:cx.new(|cx|InputState::new(window,cx).multi_line().placeholder("О себе")),
-            country:cx.new(|cx|InputState::new(window,cx).placeholder("Код страны")),
-            current:cx.new(|cx|InputState::new(window,cx).masked(true).placeholder("Текущий пароль")),
-            next:cx.new(|cx|InputState::new(window,cx).masked(true).placeholder("Новый пароль")),
-            confirm:cx.new(|cx|InputState::new(window,cx).masked(true).placeholder("Повторите новый пароль")),
-            mode:cx.new(|cx|InputState::new(window,cx).placeholder("Режим личных сообщений")),
-            user_id:cx.new(|cx|InputState::new(window,cx).placeholder("ID пользователя")),
-            delete_name:cx.new(|cx|InputState::new(window,cx).placeholder("Имя пользователя для удаления")), delete_confirm:false,
-            profile:None,privacy:None,sessions:vec![],error:String::new(),notice:String::new(),busy:false,generation:0 }
-    }
-    pub fn load(&mut self, cx: &mut Context<Self>) { self.perform(Action::Load,cx); }
-    fn perform(&mut self, action: Action, cx: &mut Context<Self>) {
-        if self.busy{return;} if matches!(action,Action::DeleteAccount) { let name=self.delete_name.read(cx).value().to_string(); if self.profile.as_ref().is_none_or(|p|p.username!=name) || self.current.read(cx).value().is_empty() {self.error="Введите имя аккаунта и текущий пароль.".into();cx.notify();return;} if !self.delete_confirm {self.delete_confirm=true;cx.notify();return;} self.delete_confirm=false; } let about=self.about.read(cx).value().to_string(); let country=self.country.read(cx).value().to_string(); let current=self.current.read(cx).value().to_string(); let next=self.next.read(cx).value().to_string(); let confirm=self.confirm.read(cx).value().to_string(); let mode=self.mode.read(cx).value().to_string(); let uid=self.user_id.read(cx).value().parse::<i64>().unwrap_or(0);
-        if matches!(action,Action::Block|Action::Unblock) && uid<=0 {self.error="Укажите ID пользователя.".into();cx.notify();return;}
-        self.busy=true;self.error.clear();self.notice.clear();self.generation+=1;let generation=self.generation;let client=self.client.clone();let runtime=self.runtime.clone();cx.notify();
-        let task=cx.background_spawn(async move {runtime.block_on(async move {
-            match action {
-                Action::Load => {let profile=client.profile().await.map_err(|e|e.to_string())?; let privacy=client.message_privacy().await.map_err(|e|e.to_string())?;let sessions=client.sessions().await.map_err(|e|e.to_string())?;Ok(Response::Loaded(profile,privacy,sessions))},
-                Action::Profile => client.update_profile(&about,&country).await.map(Response::Profile),
-                Action::Password => client.change_password(&current,&next,&confirm).await.map(|_|Response::Done),
-                Action::Privacy => client.set_message_privacy(&mode).await.map(Response::Privacy),
-                Action::Block => client.block_user(uid,true).await.map(|_|Response::Done),
-                Action::Unblock => client.block_user(uid,false).await.map(|_|Response::Done),
-                Action::Revoke(id) => client.revoke_session(id).await.map(|_|Response::Done),
-                Action::RevokeOthers => client.revoke_other_sessions().await.map(|_|Response::Done),
-                Action::RemoveAvatar => client.remove_avatar().await.map(|_|Response::Done),
-                Action::DeleteAccount => client.delete_account(&current).await.map(|_|Response::Done),
-            }.map_err(|e:voxhold_api::Error|e.to_string())
-        })});
-        cx.spawn(async move |this,cx| {let result=task.await;if let Some(this)=this.upgrade(){this.update(cx,|s,cx|{if s.generation!=generation{return;}s.busy=false;match result {Ok(Response::Loaded(p,privacy,sessions))=>{s.profile=Some(p);s.privacy=Some(privacy);s.sessions=sessions},Ok(Response::Profile(p))=>s.profile=Some(p),Ok(Response::Privacy(p))=>s.privacy=Some(p),Ok(Response::Done)=>s.notice="Сохранено".into(),Err(e)=>s.error=e};cx.notify();}).ok();}}).detach();
-    }
-}
-#[derive(Clone,Copy)] enum Action { Load,Profile,Password,Privacy,Block,Unblock,Revoke(i64),RevokeOthers,RemoveAvatar,DeleteAccount }
-enum Response { Loaded(Profile,MessagePrivacy,Vec<AccountSession>),Profile(Profile),Privacy(MessagePrivacy),Done }
-impl Render for PersonalSettings {
-    fn render(&mut self,_:&mut Window,cx:&mut Context<Self>)->impl IntoElement {
-        let mut root=div().id("personal-settings").w(px(480.)).h_full().overflow_y_scroll().p_4().flex().flex_col().gap_2().bg(rgb(0x202323)).text_color(rgb(0xf3f4eb)).child("Личные настройки");
-        if let Some(p)=&self.profile {root=root.child(format!("{} · {}",p.username,p.about));}
-        root=root.child(div().id("settings-refresh").cursor_pointer().on_click(cx.listener(|s,_,_,cx|s.load(cx))).child("Обновить"))
-          .child(TextInput::new(&self.about)).child(TextInput::new(&self.country))
-          .child(div().id("profile-save").cursor_pointer().on_click(cx.listener(|s,_,_,cx|s.perform(Action::Profile,cx))).child("Сохранить профиль"))
-          .child(div().id("avatar-remove").cursor_pointer().on_click(cx.listener(|s,_,_,cx|s.perform(Action::RemoveAvatar,cx))).child("Удалить аватар"))
-          .child("Пароль").child(TextInput::new(&self.current)).child(TextInput::new(&self.next)).child(TextInput::new(&self.confirm))
-          .child(div().id("password-save").cursor_pointer().on_click(cx.listener(|s,_,_,cx|s.perform(Action::Password,cx))).child("Изменить пароль"))
-          .child("Личные сообщения");
-        if let Some(p)=&self.privacy {root=root.child(format!("Режим: {} · заблокированы: {:?}",p.mode,p.blocked_user_ids));}
-        root=root.child(TextInput::new(&self.mode)).child(div().id("privacy-save").cursor_pointer().on_click(cx.listener(|s,_,_,cx|s.perform(Action::Privacy,cx))).child("Сохранить режим"))
-          .child(TextInput::new(&self.user_id)).child(div().id("block").cursor_pointer().on_click(cx.listener(|s,_,_,cx|s.perform(Action::Block,cx))).child("Заблокировать"))
-          .child(div().id("unblock").cursor_pointer().on_click(cx.listener(|s,_,_,cx|s.perform(Action::Unblock,cx))).child("Разблокировать"))
-          .child("Сеансы");
-        for session in &self.sessions {let id=session.id;root=root.child(div().flex().gap_2().child(format!("{} · {}{}",session.user_agent,session.client_ip,if session.current {" · текущий"}else{""})).child(div().id(("revoke",id as u64)).cursor_pointer().on_click(cx.listener(move |s,_,_,cx|s.perform(Action::Revoke(id),cx))).child("Завершить")));}
-        root.child(div().id("revoke-others").cursor_pointer().on_click(cx.listener(|s,_,_,cx|s.perform(Action::RevokeOthers,cx))).child("Завершить другие сеансы"))
-          .child(TextInput::new(&self.delete_name)).child(div().id("delete-account").cursor_pointer().on_click(cx.listener(|s,_,_,cx|s.perform(Action::DeleteAccount,cx))).child(if self.delete_confirm {"Подтвердить удаление аккаунта"} else {"Удалить аккаунт"}))
-          .child(if self.busy {"Загрузка…"}else{""}).child(self.notice.clone()).child(div().text_color(rgb(0xff7777)).child(self.error.clone()))
-    }
+    pub dialog: Dialog,
+    pub about: Entity<InputState>,
+    pub country_search: Entity<InputState>,
+    pub password_current: Entity<InputState>,
+    pub password_next: Entity<InputState>,
+    pub password_confirm: Entity<InputState>,
+    pub delete_name: Entity<InputState>,
+    pub delete_password: Entity<InputState>,
+    pub profile: Option<Profile>,
+    /// Confirmed profile value, the value sent with the last request and the
+    /// request token, kept apart from the live editor text.
+    pub about_form: settings::FormValue<String>,
+    pub country_form: settings::FormValue<Option<String>>,
+    pub profile_loading: bool,
+    /// Identifies the latest PATCH. The in-flight lock itself lives on the
+    /// session, so a reopened form cannot start a second write.
+    pub profile_request: u64,
+    /// Bumped by a successful PATCH. A profile GET that started before that
+    /// answer is older than the confirmed write and must not overwrite it.
+    pub profile_epoch: u64,
+    pub avatar: Option<Arc<RenderImage>>,
+    pub avatar_version: Option<String>,
+    pub avatar_loading: bool,
+    pub avatar_missing: bool,
+    /// Identifies the chosen file. A decode that finishes after a newer choice
+    /// is discarded instead of replacing the newer crop draft.
+    pub avatar_pick: u64,
+    pub crop: Option<CropDraft>,
+    pub sessions: Vec<AccountSession>,
+    pub sessions_loading: bool,
+    pub sessions_error: String,
+    pub privacy: Option<MessagePrivacy>,
+    pub country_open: bool,
+    pub country_index: usize,
+    pub validation: String,
+    pub notice: String,
+    pub local_error: String,
+    pub delete_confirm: bool,
+    pub theme: ThemeMode,
+    pub notifications_enabled: bool,
+    pub notifications_error: String,
+    pub countries: Vec<settings::Country>,
 }
 
+impl PersonalSettings {
+    pub fn new(window: &mut Window, cx: &mut Context<crate::app::Voxhold>) -> Self {
+        let input = |cx: &mut Context<crate::app::Voxhold>,
+                     window: &mut Window,
+                     placeholder: &'static str,
+                     masked: bool| {
+            cx.new(|cx| {
+                let state = InputState::new(window, cx).placeholder(placeholder);
+                if masked {
+                    state.masked(true)
+                } else {
+                    state
+                }
+            })
+        };
+        Self {
+            dialog: Dialog::new("Настройки", Scope::default(), TABS.to_vec()),
+            about: cx.new(|cx| {
+                InputState::new(window, cx)
+                    .multi_line()
+                    .placeholder("Пара слов о себе, интересах или текущем проекте…")
+            }),
+            country_search: input(cx, window, "Найти…", false),
+            password_current: input(cx, window, "Текущий пароль", true),
+            password_next: input(cx, window, "Новый пароль", true),
+            password_confirm: input(cx, window, "Повторите новый пароль", true),
+            delete_name: input(cx, window, "Имя пользователя", false),
+            delete_password: input(cx, window, "Пароль для подтверждения", true),
+            profile: None,
+            about_form: settings::FormValue::new(String::new()),
+            country_form: settings::FormValue::new(None),
+            profile_loading: false,
+            profile_request: 0,
+            profile_epoch: 0,
+            avatar: None,
+            avatar_version: None,
+            avatar_loading: false,
+            avatar_missing: false,
+            avatar_pick: 0,
+            crop: None,
+            sessions: Vec::new(),
+            sessions_loading: false,
+            sessions_error: String::new(),
+            privacy: None,
+            country_open: false,
+            country_index: 0,
+            validation: String::new(),
+            notice: String::new(),
+            local_error: String::new(),
+            delete_confirm: false,
+            theme: ThemeMode::System,
+            notifications_enabled: false,
+            notifications_error: String::new(),
+            countries: settings::countries(),
+        }
+    }
+
+    /// Fresh dialog instance, like Go `showSettings` creating a new one. The
+    /// editors keep their text until the profile snapshot arrives.
+    pub fn reopen(&mut self, theme: ThemeMode, notifications: bool) {
+        self.dialog = Dialog::new("Настройки", Scope::default(), TABS.to_vec());
+        self.profile_loading = false;
+        self.profile_request = self.profile_request.wrapping_add(1);
+        self.profile_epoch = self.profile_epoch.wrapping_add(1);
+        self.avatar_pick = self.avatar_pick.wrapping_add(1);
+        self.sessions_loading = false;
+        self.sessions_error.clear();
+        self.validation.clear();
+        self.notice.clear();
+        self.local_error.clear();
+        self.delete_confirm = false;
+        self.country_open = false;
+        self.theme = theme;
+        self.notifications_enabled = notifications;
+        self.notifications_error.clear();
+        self.avatar_loading = false;
+        self.avatar_missing = false;
+    }
+
+    pub fn tab(&self) -> usize {
+        self.dialog.active
+    }
+
+    /// The profile tab owns two independent requests. The tab counts as
+    /// loaded only after both have finished, so leaving while either one is in
+    /// flight cannot mark the tab as complete.
+    pub fn sync_profile_load(&mut self) {
+        if self.dialog.active != 0 {
+            return;
+        }
+        if self.profile_loading || self.sessions_loading {
+            if let Some(slot) = self.dialog.loads.get_mut(0) {
+                *slot = LoadState::Loading;
+            }
+        } else if let Some(slot) = self.dialog.loads.get_mut(0) {
+            *slot = if self.profile.is_some() {
+                LoadState::Loaded
+            } else {
+                LoadState::Error
+            };
+        }
+    }
+
+    /// Drop the request bookkeeping of a profile tab that is being left. The
+    /// dialog generation already rejects its late answers; clearing the flags
+    /// lets the return start a fresh GET instead of keeping "Загрузка…".
+    pub fn cancel_profile_loads(&mut self) {
+        self.profile_loading = false;
+        self.sessions_loading = false;
+    }
+
+    pub fn next_profile_request(&mut self) -> u64 {
+        self.profile_request = self.profile_request.wrapping_add(1);
+        self.profile_request
+    }
+
+    pub fn about_value(&self, cx: &gpui::App) -> String {
+        self.about.read(cx).value().to_string()
+    }
+
+    pub fn set_profile(
+        &mut self,
+        profile: Profile,
+        window: &mut Window,
+        cx: &mut Context<crate::app::Voxhold>,
+    ) {
+        self.about.update(cx, |input, cx| {
+            input.set_value(profile.about.clone(), window, cx)
+        });
+        self.country_index =
+            settings::country_index(&self.countries, profile.country_code.as_deref());
+        self.about_form.load(profile.about.clone());
+        self.country_form.load(profile.country_code.clone());
+        self.profile = Some(profile);
+    }
+
+    /// Merge a GET answer without discarding a local edit or the `dispatched`
+    /// value of a PATCH that is still in flight. `set_profile` remains the
+    /// force-reset used by "Отмена".
+    ///
+    /// While a PATCH is in flight the page on the wire may still describe the
+    /// state before that write. Only the confirmed snapshot follows the GET;
+    /// both editor fields keep their values. Otherwise a GET country could
+    /// replace an untouched editor value that the PATCH had just sent, and
+    /// `FormValue::settle` would then treat the page value as a newer local
+    /// edit instead of applying the confirmed answer.
+    pub fn apply_profile_snapshot(
+        &mut self,
+        profile: Profile,
+        keep_dispatched: bool,
+        window: &mut Window,
+        cx: &mut Context<crate::app::Voxhold>,
+    ) {
+        let current_about = self.about.read(cx).value().to_string();
+        let current_country = self.country_code();
+        let about_edited = current_about != self.about_form.snapshot;
+        let country_edited = current_country != self.country_form.snapshot;
+        self.about_form.snapshot = profile.about.clone();
+        self.country_form.snapshot = profile.country_code.clone();
+        if !keep_dispatched {
+            self.about_form.dispatched = None;
+            self.country_form.dispatched = None;
+            if !about_edited {
+                self.about.update(cx, |input, cx| {
+                    input.set_value(profile.about.clone(), window, cx)
+                });
+            }
+            if !country_edited {
+                self.country_index =
+                    settings::country_index(&self.countries, profile.country_code.as_deref());
+            }
+        }
+        self.profile = Some(profile);
+    }
+
+    pub fn country_code(&self) -> Option<String> {
+        if self.country_index == 0 {
+            return None;
+        }
+        self.countries
+            .get(self.country_index - 1)
+            .map(|country| country.code.clone())
+    }
+
+    /// Avatar version from the member snapshot; a missing version means there
+    /// is no image to request.
+    pub fn set_avatar_version(&mut self, version: Option<String>) {
+        self.avatar_version = version.filter(|value| !value.is_empty());
+    }
+
+    pub fn clear_avatar(&mut self) {
+        self.avatar = None;
+        self.avatar_version = None;
+    }
+}

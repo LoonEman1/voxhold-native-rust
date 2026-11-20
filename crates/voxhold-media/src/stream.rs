@@ -1,64 +1,526 @@
-//! Inbound stream signaling and video-frame access. Drive this alongside the
-//! authenticated voice socket; only accept offers from the selected publisher.
-use std::{time::Duration, sync::{Arc, atomic::{AtomicU64, Ordering}}};
-use serde_json::{json, Value};
-use crate::{Candidate, Command, Event, IceServer, Media, VideoFrame, controller::{Publication, Signal}};
+//! One WebRTC engine per viewing attempt. The deterministic decisions live in
+//! `viewer`; this file only drives the media engine and reports what it sees.
 
-pub enum ViewerUpdate { Signal(Signal), Frame, Status(&'static str), Error(String) }
-pub struct StreamViewer {
-    pub publication: Publication,
-    pub frame: VideoFrame,
-    media: Media,
-    sequence: Arc<AtomicU64>,
-    request_start: u64,
-    watch_request: String,
-    retries: u8,
-    muted: bool,
+use crate::{Candidate, Command, Event, IceServer, Media, VideoFrame};
+use std::time::Duration;
+
+/// An engine event that belongs to the current attempt. Signaling is returned
+/// without request ids; `viewer` stamps the attempt's ids.
+pub enum EngineUpdate {
+    /// A fresh RTP frame was decoded. Only this update confirms the
+    /// connection and ends recovery.
+    Frame,
+    /// The cached last frame was re-read at a new viewport size. It refreshes
+    /// the picture only: connection state, status text and the recovery
+    /// deadline must stay exactly as they were. It is never video progress.
+    Repaint,
+    /// Cumulative inbound video counters of this attempt. A resize repaint and
+    /// a missing report must not be confused with these values.
+    Stats {
+        attempt: u64,
+        bytes_received: u64,
+        frames_decoded: u32,
+    },
+    Answer(String),
+    Ice(Candidate),
+    State(&'static str),
+    Error(String),
+    /// Audio output switch result. It is not a stream failure: the peer and the
+    /// decoded picture stay alive after a successful rollback.
+    Output {
+        applied: Option<String>,
+        audible: bool,
+        working: bool,
+        error: Option<String>,
+    },
 }
+
+pub struct StreamViewer {
+    media: Media,
+    muted: bool,
+    /// The last output requested from the player versus the endpoint it has
+    /// actually confirmed. A failed switch leaves `applied` on the previous
+    /// device so the same request can be retried instead of being dropped.
+    requested_output: Option<String>,
+    applied_output: Option<String>,
+    output_working: bool,
+    /// Viewport applied to the last decoded read. A different size re-reads
+    /// the still-current frame so a static stream repaints at the new texture
+    /// size instead of waiting for another RTP frame.
+    viewport: (u32, u32),
+    /// Viewer attempt this engine was created for. Every statistics report is
+    /// stamped with it so the state machine can reject a late report of a
+    /// replaced engine.
+    attempt: u64,
+}
+
 impl StreamViewer {
-    pub fn start(publication: Publication, servers: Vec<IceServer>, policy: String, output: Option<String>, muted: bool, sequence: Arc<AtomicU64>) -> Result<(Self, Signal),String> {
-        if publication.mode != "p2p" && publication.mode != "server" { return Err("Неизвестный режим трансляции".into()); }
-        let media=Media::new().map_err(|e|format!("{e:?}"))?;
-        media.command(Command::ViewStart {ice_servers:servers, ice_transport_policy:policy, output}).map_err(|e|format!("{e:?}"))?;
-        if muted {media.command(Command::ViewAudio {muted:true}).map_err(|e|format!("{e:?}"))?;}
-        let mut viewer=Self {publication,frame:VideoFrame::default(),media,sequence,request_start:0,watch_request:String::new(),retries:0,muted};
-        let request=viewer.signal("stream.watch",json!({"server_id":viewer.publication.server_id,"channel_id":viewer.publication.channel_id,"publisher_connection_id":viewer.publication.publisher_connection_id,"supported_dynamic_ranges":["sdr"]}));
-        viewer.watch_request=request.request_id.clone().unwrap_or_default(); viewer.request_start=viewer.sequence.load(Ordering::Relaxed);
-        Ok((viewer,request))
-    }
-    fn signal(&mut self, kind: &'static str, data: Value) -> Signal {let n=self.sequence.fetch_add(1,Ordering::Relaxed)+1; Signal {kind,data,request_id:Some(format!("native-stream-{n}"))}}
-    pub fn set_muted(&mut self, muted: bool) -> Result<(),String> {self.media.command(Command::ViewAudio {muted}).map_err(|e|format!("{e:?}"))?;self.muted=muted;Ok(())}
-    pub fn muted(&self) -> bool {self.muted}
-    pub fn leave(&mut self) -> Signal {let _=self.media.command(Command::Stop);self.signal("stream.leave",json!({}))}
-    pub fn on_signal(&mut self, kind: &str, request_id: &str, data: &Value) -> Result<(),String> {
-        match kind {
-            "stream.watching" if request_id == self.watch_request => {
-                let publication: Publication=serde_json::from_value(data["stream"].clone()).map_err(|_|"Некорректный ответ сервера")?;
-                if publication.publisher_connection_id != self.publication.publisher_connection_id {return Err("Сервер выбрал другую трансляцию".into());} self.publication=publication;
-            },
-            "stream.webrtc_offer" | "stream.p2p_offer" => {
-                if !self.accept_sender(kind,data) {return Ok(());} if let Some(sdp)=data["sdp"].as_str().filter(|s|!s.is_empty()) {self.media.command(Command::Offer {sdp:sdp.into()}).map_err(|e|format!("{e:?}"))?;}
-            },
-            "stream.ice_candidate" | "stream.p2p_ice_candidate" => {
-                if !self.accept_sender(kind,data) {return Ok(());} let c=Candidate {candidate:data["candidate"].as_str().unwrap_or_default().into(),sdp_mid:data["sdp_mid"].as_str().map(str::to_owned),sdp_mline_index:data["sdp_mline_index"].as_u64().and_then(|n|u16::try_from(n).ok()),username_fragment:data["username_fragment"].as_str().map(str::to_owned)};
-                self.media.command(Command::Ice(c)).map_err(|e|format!("{e:?}"))?;
-            },
-            "stream.stopped" if data["channel_id"].as_i64()==Some(self.publication.channel_id) && (data["publisher_connection_id"].as_str().unwrap_or_default().is_empty() || data["publisher_connection_id"].as_str()==Some(self.publication.publisher_connection_id.as_str())) => return Err("Трансляция завершена".into()),
-            
-            "error" if request_id.strip_prefix("native-stream-").and_then(|n|n.parse::<u64>().ok()).is_some_and(|n|n>=self.request_start) => return Err("Сервер отклонил просмотр трансляции".into()),
-            _ => {},
-        } Ok(())
-    }
-    fn accept_sender(&self, kind: &str, data: &Value) -> bool {if kind.starts_with("stream.p2p_") {self.publication.mode=="p2p" && data["from_connection_id"].as_str()==Some(self.publication.publisher_connection_id.as_str())} else {self.publication.mode=="server"}}
-    pub fn poll(&mut self, width: u32, height: u32) -> Option<ViewerUpdate> {
-        let event=self.media.poll(Duration::ZERO)?;
-        match event {
-            Event::Frame => {if self.media.read_video(&mut self.frame,width,height) {Some(ViewerUpdate::Frame)} else {None}},
-            Event::Answer {sdp} => {let p2p=self.publication.mode=="p2p";let mut data=json!({"sdp":sdp}); if p2p {data["target_connection_id"]=json!(self.publication.publisher_connection_id);} Some(ViewerUpdate::Signal(self.signal(if p2p {"stream.p2p_answer"} else {"stream.webrtc_answer"},data)))},
-            Event::Ice(c) => {let p2p=self.publication.mode=="p2p";let mut data=json!({"candidate":c.candidate,"sdp_mid":c.sdp_mid,"sdp_mline_index":c.sdp_mline_index,"username_fragment":c.username_fragment}); if p2p {data["target_connection_id"]=json!(self.publication.publisher_connection_id);} Some(ViewerUpdate::Signal(self.signal(if p2p {"stream.p2p_ice_candidate"} else {"stream.ice_candidate"},data)))},
-            Event::State {state:"connected"} => Some(ViewerUpdate::Status("Подключено")),
-            Event::State {state:"failed"|"disconnected"} if self.retries<2 => {self.retries+=1;let p2p=self.publication.mode=="p2p"; let data=if p2p {json!({"target_connection_id":self.publication.publisher_connection_id})} else {json!({"server_id":self.publication.server_id,"channel_id":self.publication.channel_id,"action":"ice_restart"})};Some(ViewerUpdate::Signal(self.signal(if p2p {"stream.p2p_restart"} else {"stream.recovery_request"},data)))},
-            Event::Error {message} => Some(ViewerUpdate::Error(message.into())), _=>None,
+    /// `mode` was validated by the viewer; unknown modes never reach here.
+    pub fn start(
+        servers: Vec<IceServer>,
+        policy: String,
+        output: Option<String>,
+        muted: bool,
+        attempt: u64,
+    ) -> Result<Self, String> {
+        let media = Media::new().map_err(|error| format!("{error:?}"))?;
+        media
+            .command(Command::ViewStart {
+                ice_servers: servers,
+                ice_transport_policy: policy,
+                output: output.clone(),
+            })
+            .map_err(|error| format!("{error:?}"))?;
+        if muted {
+            media
+                .command(Command::ViewAudio { muted: true })
+                .map_err(|error| format!("{error:?}"))?;
         }
+        Ok(Self {
+            media,
+            muted,
+            requested_output: output.clone(),
+            applied_output: output,
+            output_working: true,
+            viewport: (0, 0),
+            attempt,
+        })
+    }
+
+    /// Headless engine for crate tests: no worker and no socket. It keeps the
+    /// real `Events` queue and `VideoStore`, so `poll` takes the production
+    /// path without decoding or a device.
+    #[cfg(test)]
+    pub(crate) fn detached_for_tests() -> (
+        Self,
+        tokio::sync::mpsc::Receiver<Command>,
+        std::sync::Arc<crate::Events>,
+        std::sync::Arc<crate::video::VideoStore>,
+    ) {
+        Self::detached_for_attempt(0)
+    }
+
+    /// Headless engine with an explicit attempt id, so a test can prove that
+    /// `poll` stamps statistics with the attempt the runtime installed.
+    #[cfg(test)]
+    pub(crate) fn detached_for_attempt(
+        attempt: u64,
+    ) -> (
+        Self,
+        tokio::sync::mpsc::Receiver<Command>,
+        std::sync::Arc<crate::Events>,
+        std::sync::Arc<crate::video::VideoStore>,
+    ) {
+        let (commands, receiver) = tokio::sync::mpsc::channel(8);
+        let events = std::sync::Arc::new(crate::Events::default());
+        let video = std::sync::Arc::new(crate::video::VideoStore::default());
+        let media = Media {
+            commands,
+            events: events.clone(),
+            capture: std::sync::Arc::new(crate::voice::CaptureGate::default()),
+            video: video.clone(),
+            stop: std::sync::Arc::new(tokio::sync::Notify::new()),
+            worker: None,
+        };
+        (
+            Self {
+                media,
+                muted: false,
+                requested_output: None,
+                applied_output: None,
+                output_working: true,
+                viewport: (0, 0),
+                attempt,
+            },
+            receiver,
+            events,
+            video,
+        )
+    }
+
+    /// Headless engine whose worker blocks until the gate opens. The runtime
+    /// tests use it to prove that closing a player never joins the peer on the
+    /// signaling thread.
+    #[cfg(test)]
+    pub(crate) fn blocked_for_tests(
+        gate: std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+        released: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        let (commands, _receiver) = tokio::sync::mpsc::channel(1);
+        let events = std::sync::Arc::new(crate::Events::default());
+        let video = std::sync::Arc::new(crate::video::VideoStore::default());
+        let worker = std::thread::Builder::new()
+            .name("voxhold-media-test".into())
+            .spawn(move || {
+                let (open, changed) = &*gate;
+                let mut open = open.lock().unwrap();
+                while !*open {
+                    let (next, timeout) = changed
+                        .wait_timeout(open, std::time::Duration::from_secs(2))
+                        .unwrap();
+                    open = next;
+                    if timeout.timed_out() {
+                        break;
+                    }
+                }
+                released.store(true, std::sync::atomic::Ordering::SeqCst);
+            })
+            .expect("the test media worker starts");
+        Self {
+            media: Media {
+                commands,
+                events,
+                capture: std::sync::Arc::new(crate::voice::CaptureGate::default()),
+                video,
+                stop: std::sync::Arc::new(tokio::sync::Notify::new()),
+                worker: Some(worker),
+            },
+            muted: false,
+            requested_output: None,
+            applied_output: None,
+            output_working: true,
+            viewport: (0, 0),
+            attempt: 0,
+        }
+    }
+
+    pub fn set_muted(&mut self, muted: bool) -> Result<(), String> {
+        self.media
+            .command(Command::ViewAudio { muted })
+            .map_err(|error| format!("{error:?}"))?;
+        self.muted = muted;
+        Ok(())
+    }
+
+    /// The output device setting is shared with the voice session, so a
+    /// running player must follow it too. A repeat of a request that rolled
+    /// back is sent again because `applied_output` still names the old device.
+    pub fn set_output(&mut self, output: Option<String>) -> Result<(), String> {
+        if self.requested_output == output && self.applied_output == output && self.output_working {
+            return Ok(());
+        }
+        self.command_output(output)
+    }
+
+    /// Explicit selection from settings. The engine's `OutputState` is the
+    /// authority: the viewer cache may still name A while an unplug fallback
+    /// event is queued but not polled yet.
+    pub fn select_output(&mut self, output: Option<String>) -> Result<(), String> {
+        self.command_output(output)
+    }
+
+    fn command_output(&mut self, output: Option<String>) -> Result<(), String> {
+        self.media
+            .command(Command::ViewOutput {
+                output: output.clone(),
+            })
+            .map_err(|error| format!("{error:?}"))?;
+        self.requested_output = output;
+        Ok(())
+    }
+
+    pub fn offer(&self, sdp: String) -> Result<(), String> {
+        self.media
+            .command(Command::Offer { sdp })
+            .map_err(|error| format!("{error:?}"))
+    }
+
+    pub fn ice(&self, candidate: Candidate) -> Result<(), String> {
+        self.media
+            .command(Command::Ice(candidate))
+            .map_err(|error| format!("{error:?}"))
+    }
+
+    pub fn muted(&self) -> bool {
+        self.muted
+    }
+
+    /// Non-blocking: one queued engine event per call, so a burst of frames
+    /// cannot starve signaling or the voice session on the same worker.
+    ///
+    /// A queued event always wins: a fresh RTP frame is reported as `Frame`.
+    /// Only when the queue is empty does a changed viewport re-read the frame
+    /// `VideoStore` already holds, and that is reported as `Repaint`, never as
+    /// a connection-confirming `Frame`. The read is size-aware, so an
+    /// unchanged size reports nothing and the caller settles instead of
+    /// polling in a loop.
+    pub fn poll(
+        &mut self,
+        frame: &mut VideoFrame,
+        width: u32,
+        height: u32,
+    ) -> Option<EngineUpdate> {
+        let Some(event) = self.media.poll(Duration::ZERO) else {
+            // No engine event: the only remaining reason to touch the
+            // decoder is a new picture surface for the cached frame.
+            if (width, height) != self.viewport && self.media.read_video(frame, width, height) {
+                // Only a completed read counts. A failed attempt leaves the
+                // viewport unchanged so the next poll retries it.
+                self.viewport = (width, height);
+                return Some(EngineUpdate::Repaint);
+            }
+            return None;
+        };
+        match event {
+            Event::Frame => {
+                if !self.media.read_video(frame, width, height) {
+                    return None;
+                }
+                // The fresh frame now owns the picture surface, so the idle
+                // path must use this size as its baseline. Without it a
+                // later smaller viewport looks unchanged and the stale
+                // larger texture survives a fullscreen exit.
+                self.viewport = (width, height);
+                Some(EngineUpdate::Frame)
+            }
+            Event::Answer { sdp } => Some(EngineUpdate::Answer(sdp)),
+            Event::Ice(candidate) => Some(EngineUpdate::Ice(candidate)),
+            Event::State { state } => Some(EngineUpdate::State(state)),
+            Event::VideoStats {
+                bytes_received,
+                frames_decoded,
+            } => Some(EngineUpdate::Stats {
+                attempt: self.attempt,
+                bytes_received,
+                frames_decoded,
+            }),
+            Event::Error { message } => Some(EngineUpdate::Error(message.into())),
+            Event::Output {
+                applied,
+                audible,
+                working,
+                error,
+            } => {
+                self.applied_output = applied.clone();
+                self.requested_output = applied.clone();
+                self.output_working = working;
+                Some(EngineUpdate::Output {
+                    applied,
+                    audible,
+                    working,
+                    error: error.map(str::to_owned),
+                })
+            }
+            Event::Track { .. }
+            | Event::Level { .. }
+            | Event::InputLevel { .. }
+            | Event::Audio { .. }
+            | Event::Playout(_)
+            | Event::InputApplied { .. }
+            | Event::DeviceError { .. } => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Event, Events, VideoFrame, video::VideoStore};
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+
+    fn headless(
+        output: Option<&str>,
+    ) -> (
+        StreamViewer,
+        mpsc::Receiver<Command>,
+        Arc<Events>,
+        Arc<VideoStore>,
+    ) {
+        let (mut viewer, receiver, events, video) = StreamViewer::detached_for_tests();
+        let output = output.map(str::to_owned);
+        viewer.requested_output = output.clone();
+        viewer.applied_output = output;
+        (viewer, receiver, events, video)
+    }
+
+    #[test]
+    fn a_rolled_back_output_can_be_requested_again() {
+        let (mut viewer, mut commands, events, _video) = headless(Some("usb"));
+        viewer.set_output(Some("hdmi".into())).unwrap();
+        assert!(matches!(
+            commands.try_recv(),
+            Ok(Command::ViewOutput { output: Some(output) }) if output == "hdmi"
+        ));
+        // The engine could not open HDMI and restored USB. The peer and the
+        // picture stay alive; only the applied endpoint changes.
+        events.push(Event::Output {
+            applied: Some("usb".into()),
+            audible: true,
+            working: true,
+            error: Some("Не удалось переключить устройство воспроизведения, прежнее работает."),
+        });
+        let mut frame = VideoFrame::default();
+        assert!(matches!(
+            viewer.poll(&mut frame, 1, 1),
+            Some(EngineUpdate::Output { applied: Some(applied), .. }) if applied == "usb"
+        ));
+        // Repeating the same preference must reach the engine again instead of
+        // being skipped because the requested slot still said HDMI.
+        viewer.set_output(Some("hdmi".into())).unwrap();
+        assert!(matches!(
+            commands.try_recv(),
+            Ok(Command::ViewOutput { output: Some(output) }) if output == "hdmi"
+        ));
+    }
+
+    #[test]
+    fn an_unplug_fallback_does_not_hide_a_reconnected_device() {
+        let (mut viewer, mut commands, events, _video) = headless(Some("usb-a"));
+        // The hot-plug check switched playback to the default endpoint.
+        events.push(Event::Output {
+            applied: None,
+            audible: true,
+            working: true,
+            error: Some("Устройство воспроизведения отключено, используется системное."),
+        });
+        let mut frame = VideoFrame::default();
+        assert!(matches!(
+            viewer.poll(&mut frame, 1, 1),
+            Some(EngineUpdate::Output {
+                applied: None,
+                working: true,
+                ..
+            })
+        ));
+        // Reconnecting A and selecting it must still reach the engine.
+        viewer.set_output(Some("usb-a".into())).unwrap();
+        assert!(matches!(
+            commands.try_recv(),
+            Ok(Command::ViewOutput { output: Some(output) }) if output == "usb-a"
+        ));
+    }
+
+    #[test]
+    fn a_viewport_change_re_reads_a_static_frame_without_a_new_rtp_frame() {
+        let (mut viewer, _commands, events, video) = headless(None);
+        assert!(video.publish_i420(libwebrtc::video_frame::I420Buffer::new_black(320, 180)));
+        events.push(Event::Frame);
+        let mut frame = VideoFrame::default();
+        // A queued fresh RTP frame wins over the viewport re-read.
+        assert!(matches!(
+            viewer.poll(&mut frame, 160, 90),
+            Some(EngineUpdate::Frame)
+        ));
+        assert_eq!((frame.width(), frame.height()), (160, 90));
+
+        // Fullscreen: no `Event::Frame` is queued, only the picture surface
+        // changed. The viewer must re-read the frame it already decodes, as a
+        // repaint rather than a connection-confirming fresh frame.
+        assert!(matches!(
+            viewer.poll(&mut frame, 320, 278),
+            Some(EngineUpdate::Repaint)
+        ));
+        assert_eq!((frame.width(), frame.height()), (320, 180));
+
+        // The same size reports nothing, so the worker settles after one
+        // repaint instead of forcing frames in a loop.
+        assert!(viewer.poll(&mut frame, 320, 278).is_none());
+    }
+
+    #[test]
+    fn a_cached_repaint_returns_to_the_window_after_a_fullscreen_frame() {
+        let (mut viewer, _commands, events, video) = headless(None);
+        assert!(video.publish_i420(libwebrtc::video_frame::I420Buffer::new_black(320, 180)));
+        events.push(Event::Frame);
+        let mut frame = VideoFrame::default();
+        // Floating window first.
+        assert!(matches!(
+            viewer.poll(&mut frame, 160, 90),
+            Some(EngineUpdate::Frame)
+        ));
+        assert_eq!((frame.width(), frame.height()), (160, 90));
+
+        // A fresh RTP frame arrives while fullscreen. The decode uses the
+        // fullscreen surface, so the cached baseline must move to 320x278.
+        events.push(Event::Frame);
+        assert!(matches!(
+            viewer.poll(&mut frame, 320, 278),
+            Some(EngineUpdate::Frame)
+        ));
+        assert_eq!((frame.width(), frame.height()), (320, 180));
+
+        // Leaving fullscreen queues no frame. The cached picture must be
+        // re-read at the window surface, not stay at the fullscreen size.
+        assert!(matches!(
+            viewer.poll(&mut frame, 160, 90),
+            Some(EngineUpdate::Repaint)
+        ));
+        assert_eq!((frame.width(), frame.height()), (160, 90));
+        assert!(viewer.poll(&mut frame, 160, 90).is_none());
+    }
+
+    #[test]
+    fn a_cached_repaint_shrinks_a_fullscreen_picture_back_to_the_window() {
+        let (mut viewer, _commands, events, video) = headless(None);
+        assert!(video.publish_i420(libwebrtc::video_frame::I420Buffer::new_black(320, 180)));
+        events.push(Event::Frame);
+        let mut frame = VideoFrame::default();
+        // The last decode happened at the fullscreen surface.
+        assert!(matches!(
+            viewer.poll(&mut frame, 320, 278),
+            Some(EngineUpdate::Frame)
+        ));
+        assert_eq!((frame.width(), frame.height()), (320, 180));
+
+        // Exiting fullscreen only changes the surface: the same picture is
+        // re-read smaller and reported as a repaint.
+        assert!(matches!(
+            viewer.poll(&mut frame, 160, 90),
+            Some(EngineUpdate::Repaint)
+        ));
+        assert_eq!((frame.width(), frame.height()), (160, 90));
+        assert!(viewer.poll(&mut frame, 160, 90).is_none());
+    }
+
+    #[test]
+    fn a_cached_repaint_retries_after_a_failed_read() {
+        let (mut viewer, _commands, events, video) = headless(None);
+        events.push(Event::Frame);
+        let mut frame = VideoFrame::default();
+        // Nothing was published, so the fresh frame cannot be decoded. The
+        // failed attempt must not record the viewport as applied.
+        assert!(viewer.poll(&mut frame, 160, 90).is_none());
+        assert!(matches!(viewer.viewport, (0, 0)));
+
+        // A later attempt at the same size must still read the picture
+        // instead of settling because the size looks unchanged.
+        assert!(video.publish_i420(libwebrtc::video_frame::I420Buffer::new_black(320, 180)));
+        assert!(matches!(
+            viewer.poll(&mut frame, 160, 90),
+            Some(EngineUpdate::Repaint)
+        ));
+        assert_eq!((frame.width(), frame.height()), (160, 90));
+    }
+
+    #[test]
+    fn a_video_stats_event_is_stamped_with_the_engine_attempt() {
+        let (mut viewer, _commands, events, _video) = headless(None);
+        events.push(Event::VideoStats {
+            bytes_received: 10,
+            frames_decoded: 2,
+        });
+        let mut frame = VideoFrame::default();
+        assert!(matches!(
+            viewer.poll(&mut frame, 1, 1),
+            Some(EngineUpdate::Stats {
+                attempt: 0,
+                bytes_received: 10,
+                frames_decoded: 2
+            })
+        ));
+    }
+
+    #[test]
+    fn an_explicit_selection_bypasses_the_stale_output_cache() {
+        let (mut viewer, mut commands, _events, _video) = headless(Some("usb-a"));
+        // The fallback notice is still queued: the viewer cache says A is
+        // applied and working. An explicit settings selection must still reach
+        // `Session::ViewOutput`, whose own state knows about the unplug.
+        viewer.select_output(Some("usb-a".into())).unwrap();
+        assert!(matches!(
+            commands.try_recv(),
+            Ok(Command::ViewOutput { output: Some(output) }) if output == "usb-a"
+        ));
     }
 }

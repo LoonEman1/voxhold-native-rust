@@ -1,0 +1,13 @@
+[package]
+name = "voxhold-release"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+description = "Release tooling for Voxhold update packages, deltas and signed manifests"
+
+[dependencies]
+semver = "1"
+voxhold-update = { path = "../voxhold-update" }
+
+[dev-dependencies]
+tempfile = "3"

@@ -1,7 +1,22 @@
+mod channel;
+mod client_extra;
+mod conversations;
+mod recordings;
+mod session;
+pub use conversations::{
+    valid_cursor, ConversationNotification, ConversationPage, ConversationSearchHit,
+    ConversationSearchPage, MAX_LIMIT, MAX_NAME_RUNES, MAX_QUERY_RUNES, MAX_USERS,
+};
 use futures_util::{SinkExt, StreamExt};
+pub use recordings::{
+    Recording, RecordingList, RECORDING_DELETED, RECORDING_FAILED, RECORDING_LOCAL_ONLY,
+    RECORDING_READY, RECORDING_STARTED, RECORDING_UPLOADING,
+};
 use reqwest::{Method, Url};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
+use session::AuthShared;
+pub use session::{LoginSession, SessionUpdate};
 use std::{fmt, net::IpAddr, time::Duration};
 
 #[derive(Debug)]
@@ -9,6 +24,8 @@ pub enum Error {
     InvalidOrigin,
     InvalidResponse(&'static str),
     Http(u16),
+    /// A local file or pipe problem with a ready user-facing text.
+    Local(String),
     Network,
     Json(serde_json::Error),
     WebSocket(String),
@@ -22,9 +39,20 @@ impl fmt::Display for Error {
             ),
             Self::InvalidResponse(s) => write!(f, "{s}"),
             Self::Http(s) => write!(f, "Сервер вернул ошибку {s}."),
+            Self::Local(s) => write!(f, "{s}"),
             Self::Network => write!(f, "Не удалось связаться с сервером."),
             Self::Json(_) => write!(f, "Некорректный ответ сервера."),
             Self::WebSocket(_) => write!(f, "Соединение с сервером прервано."),
+        }
+    }
+}
+impl Error {
+    /// HTTP status of a refused request, used by retry gates and `429`
+    /// backoff. Local and transport errors have no status.
+    pub fn status(&self) -> Option<u16> {
+        match self {
+            Self::Http(status) => Some(*status),
+            _ => None,
         }
     }
 }
@@ -40,7 +68,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub struct Client {
     base: Url,
     http: reqwest::Client,
-    token: std::sync::Arc<str>,
+    auth: std::sync::Arc<AuthShared>,
 }
 impl Client {
     pub fn new(raw: &str) -> Result<Self> {
@@ -72,14 +100,30 @@ impl Client {
         Ok(Self {
             base,
             http,
-            token: std::sync::Arc::from(""),
+            auth: std::sync::Arc::new(AuthShared::default()),
         })
     }
-    pub fn set_token(&mut self, token: String) {
-        self.token = token.into();
+    /// Attach the current token and return it so a refusal can name the exact
+    /// credential that the server rejected.
+    fn authorized(
+        &self,
+        request: reqwest::RequestBuilder,
+    ) -> (reqwest::RequestBuilder, std::sync::Arc<str>) {
+        let token = self.auth.token();
+        let request = if token.is_empty() {
+            request
+        } else {
+            request.bearer_auth(token.as_ref())
+        };
+        (request, token)
     }
-    pub fn token(&self) -> &str {
-        &self.token
+    /// Record a `401` against the token that was actually sent. The response
+    /// body is never read here, so no personal content reaches a log.
+    fn refused(&self, status: u16, token: &str) -> Error {
+        if status == 401 {
+            self.auth.note_unauthorized(token);
+        }
+        Error::Http(status)
     }
     fn url(&self, path: &str) -> Result<Url> {
         if !path.starts_with('/') || path.starts_with("//") {
@@ -98,17 +142,31 @@ impl Client {
         body: Option<Value>,
         max: usize,
     ) -> Result<Vec<u8>> {
-        let mut r = self.http.request(method, self.url(path)?);
-        if !self.token.is_empty() {
-            r = r.bearer_auth(self.token.as_ref());
-        }
+        self.bytes_with_etag(method, path, body, max)
+            .await
+            .map(|(body, _)| body)
+    }
+
+    async fn bytes_with_etag(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<Value>,
+        max: usize,
+    ) -> Result<(Vec<u8>, Option<String>)> {
+        let (mut r, token) = self.authorized(self.http.request(method, self.url(path)?));
         if let Some(b) = body {
             r = r.json(&b);
         }
         let mut response = r.send().await.map_err(|_| Error::Network)?;
         if !response.status().is_success() {
-            return Err(Error::Http(response.status().as_u16()));
+            return Err(self.refused(response.status().as_u16(), &token));
         }
+        let etag = response
+            .headers()
+            .get(reqwest::header::ETAG)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
         let mut out = Vec::new();
         while let Some(chunk) = response.chunk().await.map_err(|_| Error::Network)? {
             if out.len().saturating_add(chunk.len()) > max {
@@ -118,7 +176,7 @@ impl Client {
             }
             out.extend_from_slice(&chunk);
         }
-        Ok(out)
+        Ok((out, etag))
     }
     pub async fn request<T: DeserializeOwned>(
         &self,
@@ -132,21 +190,6 @@ impl Client {
     }
     pub async fn action(&self, method: Method, path: &str, body: Option<Value>) -> Result<()> {
         self.bytes(method, path, body, 4 << 20).await?;
-        Ok(())
-    }
-    pub async fn login(&mut self, username: &str, password: &str) -> Result<()> {
-        let v: Value = self
-            .request(
-                Method::POST,
-                "/api/v1/auth/login",
-                Some(json!({"username":username,"password":password})),
-            )
-            .await?;
-        let token = v["session"]["token"]
-            .as_str()
-            .filter(|s| !s.is_empty())
-            .ok_or(Error::InvalidResponse("Сервер не вернул сессию."))?;
-        self.token = std::sync::Arc::from(token);
         Ok(())
     }
     pub async fn servers(&self) -> Result<Vec<Server>> {
@@ -165,14 +208,19 @@ impl Client {
             .await
     }
     pub async fn channel_members(&self, sid: i64, cid: i64) -> Result<Vec<i64>> {
-        let v: Value = self
+        #[derive(Deserialize)]
+        struct Members {
+            #[serde(default, deserialize_with = "null_default")]
+            user_ids: Vec<i64>,
+        }
+        let members: Members = self
             .request(
                 Method::GET,
                 &format!("{}/members", channel_path(sid, cid)),
                 None,
             )
             .await?;
-        Ok(serde_json::from_value(v["user_ids"].clone())?)
+        Ok(members.user_ids)
     }
     async fn page(&self, path: &str, before: i64) -> Result<MessagePage> {
         let path = format!(
@@ -206,32 +254,26 @@ impl Client {
         root: i64,
         before: i64,
     ) -> Result<MessagePage> {
-        self.page(
-            &format!("{}/comments", message_path(sid, cid, root)),
-            before,
-        )
-        .await
+        let page = self
+            .page(
+                &format!("{}/comments", message_path(sid, cid, root)),
+                before,
+            )
+            .await?;
+        // Comments must belong to the requested root and channel; a responder
+        // that mixes the main timeline into a thread is rejected.
+        if page.messages.iter().any(|message| {
+            message.id <= 0 || message.channel_id != cid || message.thread_root_id != Some(root)
+        }) {
+            return Err(Error::InvalidResponse("Некорректный ответ обсуждения."));
+        }
+        Ok(page)
     }
     pub async fn send_message(&self, sid: i64, cid: i64, content: &str) -> Result<Message> {
         self.request(
             Method::POST,
             &format!("{}/messages", channel_path(sid, cid)),
             Some(json!({"content":content})),
-        )
-        .await
-    }
-    pub async fn send_thread_message(
-        &self,
-        sid: i64,
-        cid: i64,
-        root: i64,
-        content: &str,
-        key: &str,
-    ) -> Result<Message> {
-        self.request(
-            Method::POST,
-            &format!("{}/messages", channel_path(sid, cid)),
-            Some(json!({"content":content,"thread_root_id":root,"client_message_id":key})),
         )
         .await
     }
@@ -283,18 +325,23 @@ impl Client {
         )
         .await
     }
+    /// The popup/rail keeps the R04 single-page view; the paged personal index
+    /// uses `conversations_page` instead.
     pub async fn recent_conversations(&self) -> Result<Vec<Conversation>> {
-        let v: Value = self
-            .request(Method::GET, "/api/v1/me/conversations?limit=13", None)
-            .await?;
-        let rows: Vec<Conversation> = serde_json::from_value(v["conversations"].clone())?;
-        Ok(rows
+        let page = self.conversations_page(13, None).await?;
+        Ok(page
+            .conversations
             .into_iter()
             .filter(|c| c.id > 0 && !c.saved)
             .take(12)
             .collect())
     }
+    /// Personal history. The backend returns the newest 50 rows first; the
+    /// client keeps an ascending window so merge/anchor rules match channels.
     pub async fn conversation_messages(&self, id: i64, before: i64) -> Result<MessagePage> {
+        if id <= 0 || before < 0 {
+            return Err(Error::InvalidResponse("Некорректный диалог."));
+        }
         let v: Value = self
             .request(
                 Method::GET,
@@ -309,13 +356,23 @@ impl Client {
                 None,
             )
             .await?;
-        let messages: Vec<Message> = serde_json::from_value(v["messages"].clone())?;
-        let next_before_id = messages.iter().map(|m| m.id).min();
+        let mut messages: Vec<Message> = serde_json::from_value(v["messages"].clone())?;
+        if messages.iter().any(|message| {
+            message.id <= 0 || message.conversation_id != id || message.channel_id != 0
+        }) {
+            return Err(Error::InvalidResponse("Некорректный ответ истории."));
+        }
+        messages.sort_by_key(|message| message.id);
+        let next_before_id = messages.first().map(|message| message.id);
+        let has_more = v["has_more"].as_bool().unwrap_or(false);
+        if has_more && (next_before_id.is_none_or(|id| id <= 0) || messages.is_empty()) {
+            return Err(Error::InvalidResponse("Некорректный курсор истории."));
+        }
         Ok(MessagePage {
             messages,
             pagination: Pagination {
                 next_before_id,
-                has_more: v["has_more"].as_bool().unwrap_or(false),
+                has_more,
             },
         })
     }
@@ -342,6 +399,9 @@ impl Client {
         .await
     }
     pub async fn search_messages(&self, sid: i64, query: &str, before: i64) -> Result<SearchPage> {
+        if sid <= 0 || query.trim().is_empty() || query.chars().count() > 200 {
+            return Err(Error::InvalidResponse("Введите корректный запрос."));
+        }
         let mut u = self.url(&format!("/api/v1/servers/{sid}/messages/search"))?;
         {
             let mut q = u.query_pairs_mut();
@@ -350,12 +410,31 @@ impl Client {
                 q.append_pair("before_id", &before.to_string());
             }
         }
-        self.request(
-            Method::GET,
-            &format!("{}?{}", u.path(), u.query().unwrap_or("")),
-            None,
-        )
-        .await
+        let page: SearchPage = self
+            .request(
+                Method::GET,
+                &format!("{}?{}", u.path(), u.query().unwrap_or("")),
+                None,
+            )
+            .await?;
+        if page
+            .messages
+            .iter()
+            .any(|hit| hit.message.id <= 0 || hit.message.channel_id <= 0)
+        {
+            // Search answers are channel rows; a comment or a foreign row is
+            // not a valid jump target.
+            return Err(Error::InvalidResponse("Некорректный ответ поиска."));
+        }
+        if page.pagination.has_more
+            && page
+                .pagination
+                .next_before_id
+                .is_none_or(|id| id <= 0 || (before > 0 && id >= before))
+        {
+            return Err(Error::InvalidResponse("Некорректный курсор поиска."));
+        }
+        Ok(page)
     }
     pub async fn webrtc_config(&self) -> Result<WebRtcConfig> {
         let v: WebRtcConfig = self
@@ -403,17 +482,6 @@ dto!(Channel {
     can_publish: bool,
     unread_count: i64
 });
-impl Channel {
-    pub fn readable(&self) -> bool {
-        self.permissions & 1 != 0
-    }
-    pub fn has_history(&self) -> bool {
-        self.readable() && !self.e2ee_required && (self.kind == "text" || self.kind == "news")
-    }
-    pub fn writable(&self) -> bool {
-        self.has_history() && self.permissions & 2 != 0 && (self.kind != "news" || self.can_publish)
-    }
-}
 dto!(Author {
     user_id: i64,
     username: String
@@ -433,6 +501,7 @@ dto!(Attachment {
     id: String,
     filename: String,
     mime_type: String,
+    size_bytes: i64,
     width: i32,
     height: i32,
     deleted: bool
@@ -441,7 +510,7 @@ dto!(Message { id:i64, channel_id:i64, conversation_id:i64, content:String, auth
 dto!(Pagination { next_before_id:Option<i64>, has_more:bool });
 dto!(MessagePage { messages:Vec<Message>, pagination:Pagination });
 dto!(Member { avatar_version:Option<String>, country_code:Option<String>, user_id:i64, username:String, role:String, last_seen_at:Option<i64> });
-dto!(Conversation { id:i64, name:String, direct:bool, members:Vec<Author>, unread_count:i64, saved:bool });
+dto!(Conversation { id:i64, name:String, direct:bool, members:Vec<Author>, unread_count:i64, saved:bool, muted:bool, last_message_id:i64 });
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SearchResult {
     #[serde(flatten)]
@@ -456,6 +525,13 @@ dto!(PinnedMessage {
     pinned_at: i64
 });
 dto!(ReactionsUpdate { channel_id:i64, message_id:i64, revision:i64, reactions:Vec<Reaction> });
+dto!(DirectReactions { revision:i64, reactions:Vec<Reaction> });
+dto!(ForwardDestination {
+    kind: String,
+    id: i64,
+    name: String,
+    server_id: i64
+});
 dto!(MessageContext { messages:Vec<Message>, target_message_id:i64, target_index:usize });
 dto!(Profile { user_id:i64, username:String, about:String, country_code:Option<String>, created_at:i64 });
 dto!(AccountSession { id:i64, user_agent:String, client_ip:String, current:bool, created_at:i64, last_used_at:Option<i64> });
@@ -491,7 +567,8 @@ dto!(LinkPreview {
     title: String,
     description: String,
     site_name: String,
-    image_path: String
+    image_path: String,
+    unavailable: bool
 });
 dto!(ChannelRead {
     server_id: i64,
@@ -506,6 +583,41 @@ pub struct RealtimeEvent {
     pub kind: String,
     pub data: Value,
     pub request_id: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChannelSubscription {
+    pub server_id: i64,
+    pub channel_id: i64,
+    pub generation: u64,
+}
+
+/// Timing of the application-level heartbeat on the account socket. The
+/// browser sends one check every 25 seconds and abandons the socket when the
+/// matching `pong` does not arrive within 10 seconds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HeartbeatConfig {
+    pub interval: Duration,
+    pub timeout: Duration,
+}
+
+impl Default for HeartbeatConfig {
+    fn default() -> Self {
+        Self {
+            interval: Duration::from_secs(25),
+            timeout: Duration::from_secs(10),
+        }
+    }
+}
+
+impl ChannelSubscription {
+    fn payload(self) -> Value {
+        json!({"server_id":self.server_id,"channel_id":self.channel_id})
+    }
+
+    fn request_id(self) -> String {
+        format!("native-channel-{}", self.generation)
+    }
 }
 dto!(IceServer { urls:Vec<String>, username:String, credential:String });
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -522,6 +634,17 @@ pub struct VoiceSocket {
 }
 impl Client {
     pub async fn open_voice_socket(&self) -> Result<VoiceSocket> {
+        Ok(self.open_voice_socket_with_token().await?.0)
+    }
+
+    /// Open the voice socket and return the exact token the `auth` event sent.
+    ///
+    /// A rotation may replace the shared token between the connect and the
+    /// read of `Client::token()`. The caller must compare a later refused
+    /// close with the credential this socket really authorized with, not with
+    /// whatever the client holds now. The returned token is a credential: it
+    /// is never logged.
+    pub async fn open_voice_socket_with_token(&self) -> Result<(VoiceSocket, String)> {
         let mut u = self.url("/api/v1/ws")?;
         u.set_scheme(if u.scheme() == "https" { "wss" } else { "ws" })
             .map_err(|_| Error::InvalidOrigin)?;
@@ -534,14 +657,15 @@ impl Client {
             tokio_tungstenite::connect_async_with_config(u.as_str(), Some(config), false)
                 .await
                 .map_err(|e| Error::WebSocket(e.to_string()))?;
+        let token = self.auth.token();
         let mut s = VoiceSocket { socket };
         s.send(
             "auth",
-            json!({"token":self.token.as_ref(),"multi_streams":true}),
+            json!({"token":token.as_ref(),"multi_streams":true}),
             None,
         )
         .await?;
-        Ok(s)
+        Ok((s, token.to_string()))
     }
     pub async fn subscribe<F: FnMut(RealtimeEvent)>(
         &self,
@@ -557,115 +681,238 @@ impl Client {
                     .send(
                         "channel.subscribe",
                         json!({"server_id":sid,"channel_id":cid}),
-                        None,
+                        Some("native-channel-subscribe"),
                     )
                     .await?;
             }
             if event.kind == "error" {
+                if event.request_id == "native-channel-subscribe"
+                    && event.data["code"].as_str() == Some("forbidden")
+                {
+                    return Err(Error::Http(403));
+                }
                 return Ok(());
             }
             receive(event);
         }
     }
-    pub async fn upload_attachment(
+
+    /// Keep account events on the same socket when the selected channel changes.
+    pub async fn subscribe_channels(
         &self,
-        kind: &str,
-        destination: i64,
-        id: &str,
-        filename: &str,
-        data: Vec<u8>,
-    ) -> Result<Attachment> {
-        if !(kind == "channels" || kind == "conversations") || destination <= 0 || !valid_id(id, 32)
-        {
-            return Err(Error::InvalidResponse("invalid attachment destination"));
-        }
-        let mut u = self.url(&format!("/api/v1/{kind}/{destination}/attachments/{id}"))?;
-        u.query_pairs_mut().append_pair("filename", filename);
-        let bytes = self.binary(Method::PUT, u, data, 1 << 20).await?;
-        let result: Attachment = serde_json::from_slice(&bytes)?;
-        if result.id != id {
-            return Err(Error::InvalidResponse("invalid attachment response"));
-        }
-        Ok(result)
+        desired: tokio::sync::watch::Receiver<Option<ChannelSubscription>>,
+        receive: impl FnMut(RealtimeEvent),
+    ) -> Result<()> {
+        self.subscribe_channels_with(desired, receive, HeartbeatConfig::default())
+            .await
     }
-    pub async fn download_attachment(&self, id: &str) -> Result<Vec<u8>> {
-        if !valid_id(id, 32) {
-            return Err(Error::InvalidResponse("invalid attachment id"));
+
+    /// `subscribe_channels` with configurable heartbeat timing for tests.
+    ///
+    /// After `ready` one `ping` is sent per interval. The matching `pong` must
+    /// arrive within `timeout`; otherwise the socket is reported as a network
+    /// error so the caller can open a new one. At most one `pong` is awaited,
+    /// channel changes keep working while it is outstanding, and no `pong`
+    /// reaches `receive`. Intervals below 10 ms are clamped so a test cannot
+    /// turn the select into a busy loop; production keeps 25 s / 10 s.
+    pub async fn subscribe_channels_with(
+        &self,
+        mut desired: tokio::sync::watch::Receiver<Option<ChannelSubscription>>,
+        mut receive: impl FnMut(RealtimeEvent),
+        heartbeat: HeartbeatConfig,
+    ) -> Result<()> {
+        let minimum = Duration::from_millis(10);
+        let heartbeat = HeartbeatConfig {
+            interval: heartbeat.interval.max(minimum),
+            timeout: heartbeat.timeout.max(minimum),
+        };
+        let mut socket = self.open_voice_socket().await?;
+        let ready = tokio::time::timeout(Duration::from_secs(8), socket.read())
+            .await
+            .map_err(|_| Error::Network)??;
+        if ready.kind != "ready" {
+            return Err(Error::InvalidResponse(
+                "Сервер не подтвердил WebSocket-сессию.",
+            ));
         }
-        self.binary(
-            Method::GET,
-            self.url(&format!("/api/v1/attachments/{id}/content"))?,
-            vec![],
-            64 << 20,
-        )
-        .await
-    }
-    async fn binary(&self, method: Method, url: Url, data: Vec<u8>, max: usize) -> Result<Vec<u8>> {
-        let mut r = self
-            .http
-            .request(method.clone(), url)
-            .timeout(Duration::from_secs(180));
-        if !self.token.is_empty() {
-            r = r.bearer_auth(self.token.as_ref());
-        }
-        if method == Method::PUT {
-            r = r
-                .header("Content-Type", "application/octet-stream")
-                .body(data);
-        }
-        let mut res = r.send().await.map_err(|_| Error::Network)?;
-        if !res.status().is_success() {
-            return Err(Error::Http(res.status().as_u16()));
-        }
-        let mut out = Vec::new();
-        while let Some(chunk) = res.chunk().await.map_err(|_| Error::Network)? {
-            if out.len().saturating_add(chunk.len()) > max {
-                return Err(Error::InvalidResponse("response too large"));
+        receive(ready);
+
+        let mut subscribed: Option<ChannelSubscription> = None;
+        // The first check is sent only after a full interval, so a healthy
+        // `ready` is never immediately followed by a ping.
+        let mut next_ping_at = tokio::time::Instant::now() + heartbeat.interval;
+        let mut pending_pong: Option<(String, tokio::time::Instant)> = None;
+        let mut ping_seq: u64 = 0;
+        loop {
+            let next = *desired.borrow_and_update();
+            if next != subscribed {
+                if let Some(previous) = subscribed {
+                    socket
+                        .send("channel.unsubscribe", previous.payload(), None)
+                        .await?;
+                }
+                if let Some(next) = next {
+                    socket
+                        .send(
+                            "channel.subscribe",
+                            next.payload(),
+                            Some(&next.request_id()),
+                        )
+                        .await?;
+                }
+                subscribed = next;
             }
-            out.extend_from_slice(&chunk);
+
+            // The timer waits for the outstanding `pong` when one exists, and
+            // for the next `ping` otherwise. Recomputing the absolute deadline
+            // on every pass keeps an unrelated event from postponing it.
+            let deadline = pending_pong
+                .as_ref()
+                .map(|(_, deadline)| *deadline)
+                .unwrap_or(next_ping_at);
+
+            tokio::select! {
+                changed = desired.changed() => {
+                    if changed.is_err() {
+                        return Ok(());
+                    }
+                }
+                event = socket.read() => {
+                    let mut event = event?;
+                    // A heartbeat answer belongs to the network loop. A
+                    // matching id clears the one wait; a foreign one is still
+                    // swallowed and does not extend the deadline. An `error`
+                    // with the heartbeat id is also an answer: older backends
+                    // treat an unknown application event that way, and the
+                    // browser accepts both.
+                    let heartbeat_answer = (event.kind == "pong" || event.kind == "error")
+                        && pending_pong
+                            .as_ref()
+                            .is_some_and(|(id, _)| id.as_str() == event.request_id.as_str());
+                    if heartbeat_answer {
+                        pending_pong = None;
+                        next_ping_at = tokio::time::Instant::now() + heartbeat.interval;
+                        continue;
+                    }
+                    if event.kind == "pong" {
+                        continue;
+                    }
+                    if event.kind == "channel.subscribed" {
+                        let Some(channel) = subscribed.filter(|channel| event.request_id == channel.request_id()) else {
+                            continue;
+                        };
+                        if event.data["server_id"].as_i64() != Some(channel.server_id)
+                            || event.data["channel_id"].as_i64() != Some(channel.channel_id)
+                        {
+                            continue;
+                        }
+                        event.data["generation"] = json!(channel.generation);
+                    }
+                    if event.kind == "error" {
+                        if let Some(channel) = subscribed.filter(|channel| event.request_id == channel.request_id()) {
+                            if event.data["code"].as_str() == Some("forbidden") {
+                                event.kind = "native.subscription_forbidden".into();
+                                event.data = channel.payload();
+                                event.data["generation"] = json!(channel.generation);
+                            }
+                        }
+                    }
+                    receive(event);
+                }
+                _ = tokio::time::sleep_until(deadline) => {
+                    if pending_pong.is_some() {
+                        // The deadline is the unanswered ping, not the next
+                        // scheduled check. The outer loop opens a fresh socket.
+                        return Err(Error::Network);
+                    }
+                    let request_id = format!("native-heartbeat-{ping_seq}");
+                    ping_seq = ping_seq.wrapping_add(1);
+                    socket.send("ping", json!({}), Some(&request_id)).await?;
+                    let sent = tokio::time::Instant::now();
+                    pending_pong = Some((request_id, sent + heartbeat.timeout));
+                    next_ping_at = sent + heartbeat.interval;
+                }
+            }
         }
-        Ok(out)
     }
     pub async fn image(&self, path: &str, max_edge: u32) -> Result<image::DynamicImage> {
         let bytes = self.bytes(Method::GET, path, None, 4 << 20).await?;
-        let reader = image::ImageReader::new(std::io::Cursor::new(&bytes))
+        Self::decode_image(&bytes, max_edge, 4_000_000)
+    }
+
+    fn decode_image(bytes: &[u8], max_edge: u32, max_pixels: u64) -> Result<image::DynamicImage> {
+        let reader = image::ImageReader::new(std::io::Cursor::new(bytes))
             .with_guessed_format()
             .map_err(|_| Error::InvalidResponse("invalid image"))?;
         let format = reader.format();
         let (w, h) = reader
             .into_dimensions()
             .map_err(|_| Error::InvalidResponse("invalid image"))?;
-        if w == 0 || h == 0 || w > max_edge || h > max_edge || u64::from(w) * u64::from(h) > 4 << 20
+        if w == 0
+            || h == 0
+            || w > max_edge
+            || h > max_edge
+            || u64::from(w) * u64::from(h) > max_pixels
         {
             return Err(Error::InvalidResponse("invalid image dimensions"));
         }
         image::load_from_memory_with_format(
-            &bytes,
+            bytes,
             format.ok_or(Error::InvalidResponse("invalid image"))?,
         )
         .map_err(|_| Error::InvalidResponse("invalid image"))
     }
-    pub async fn avatar(&self, id: i64) -> Result<image::DynamicImage> {
-        if id <= 0 {
-            return Err(Error::InvalidResponse("invalid avatar id"));
+    pub async fn avatar(&self, id: i64, version: &str) -> Result<image::DynamicImage> {
+        if id <= 0 || !valid_id(version, 64) {
+            return Err(Error::InvalidResponse(
+                "Некорректный ID или версия аватара.",
+            ));
         }
-        self.image(&format!("/api/v1/users/{id}/avatar"), 256).await
+        let path = format!("/api/v1/users/{id}/avatar?v={version}");
+        let (bytes, etag) = self
+            .bytes_with_etag(Method::GET, &path, None, 4 << 20)
+            .await?;
+        if etag
+            .as_deref()
+            .and_then(|tag| tag.strip_prefix('"')?.strip_suffix('"'))
+            != Some(version)
+        {
+            return Err(Error::InvalidResponse("Версия аватара изменилась."));
+        }
+        Self::decode_image(&bytes, 256, 4_000_000)
     }
     pub async fn attachment_thumbnail(&self, id: &str) -> Result<image::DynamicImage> {
         if !valid_id(id, 32) {
             return Err(Error::InvalidResponse("invalid attachment id"));
         }
-        self.image(&format!("/api/v1/attachments/{id}/thumbnail"), 480)
+        self.image(&format!("/api/v1/attachments/{id}/thumbnail"), 512)
             .await
+    }
+    /// Original chat picture for the viewer. Go limits: 48 MiB compressed,
+    /// 8192 px per side and 40 megapixels decoded.
+    pub async fn attachment_content_image(&self, id: &str) -> Result<image::DynamicImage> {
+        if !valid_id(id, 32) {
+            return Err(Error::InvalidResponse("invalid attachment id"));
+        }
+        let bytes = self
+            .bytes(
+                Method::GET,
+                &format!("/api/v1/attachments/{id}/content"),
+                None,
+                48 << 20,
+            )
+            .await?;
+        Self::decode_image(&bytes, 8192, 40_000_000)
     }
     pub async fn link_preview_image(&self, path: &str) -> Result<image::DynamicImage> {
         let prefix = "/api/v1/link-preview/images/";
         if !path.strip_prefix(prefix).is_some_and(|s| valid_id(s, 64)) {
             return Err(Error::InvalidResponse("invalid preview image path"));
         }
-        self.image(path, 4096).await
+        self.image(path, 1024).await
     }
 }
+
 fn valid_id(s: &str, len: usize) -> bool {
     s.len() == len
         && s.bytes()
@@ -716,418 +963,79 @@ impl VoiceSocket {
     }
 }
 
-impl Client {
-    pub async fn edit_channel(&self, s: i64, c: i64, name: &str) -> Result<()> {
-        self.action(
-            Method::PATCH,
-            &channel_path(s, c),
-            Some(json!({"name":name})),
-        )
-        .await
-    }
-    pub async fn delete_channel(&self, s: i64, c: i64) -> Result<()> {
-        self.action(Method::DELETE, &channel_path(s, c), None).await
-    }
-    pub async fn channel_notifications(&self, s: i64, c: i64) -> Result<String> {
-        let v: Value = self
-            .request(
-                Method::GET,
-                &format!("{}/notifications", channel_path(s, c)),
-                None,
-            )
-            .await?;
-        Ok(v["mode"].as_str().unwrap_or_default().to_owned())
-    }
-    pub async fn set_channel_notifications(&self, s: i64, c: i64, mode: &str) -> Result<()> {
-        self.action(
-            Method::PUT,
-            &format!("{}/notifications", channel_path(s, c)),
-            Some(json!({"mode":mode})),
-        )
-        .await
-    }
-    pub async fn update_member_role(&self, s: i64, u: i64, role: &str) -> Result<Member> {
-        self.request(
-            Method::PATCH,
-            &format!("/api/v1/servers/{s}/members/{u}/role"),
-            Some(json!({"role":role})),
-        )
-        .await
-    }
-    pub async fn ban_member(&self, s: i64, u: i64) -> Result<()> {
-        self.action(Method::POST, &format!("/api/v1/servers/{s}/bans/{u}"), None)
-            .await
-    }
-    pub async fn set_reaction(
-        &self,
-        s: i64,
-        c: i64,
-        id: i64,
-        emoji: &str,
-        active: bool,
-    ) -> Result<ReactionsUpdate> {
-        let segment: String = url::form_urlencoded::byte_serialize(emoji.as_bytes()).collect();
-        self.request(
-            if active { Method::PUT } else { Method::DELETE },
-            &format!("{}/reactions/{segment}", message_path(s, c, id)),
-            None,
-        )
-        .await
-    }
-    pub async fn pinned_message_list(&self, s: i64, c: i64) -> Result<Vec<PinnedMessage>> {
-        self.request(Method::GET, &format!("{}/pins", channel_path(s, c)), None)
-            .await
-    }
-    pub async fn set_message_pin(&self, s: i64, c: i64, id: i64, pinned: bool) -> Result<()> {
-        self.action(
-            if pinned { Method::PUT } else { Method::DELETE },
-            &format!("{}/pin", message_path(s, c, id)),
-            None,
-        )
-        .await
-    }
-    pub async fn message_context(
-        &self,
-        s: i64,
-        c: i64,
-        id: i64,
-        before: i32,
-        after: i32,
-    ) -> Result<MessageContext> {
-        let v: MessageContext = self
-            .request(
-                Method::GET,
-                &format!(
-                    "{}/context?before={before}&after={after}",
-                    message_path(s, c, id)
-                ),
-                None,
-            )
-            .await?;
-        if v.target_message_id != id
-            || v.messages.get(v.target_index).is_none_or(|m| m.id != id)
-            || v.messages.iter().any(|m| m.channel_id != c)
-            || v.messages.windows(2).any(|w| w[0].id >= w[1].id)
-        {
-            return Err(Error::InvalidResponse("Некорректный ответ истории."));
-        }
-        Ok(v)
-    }
-    pub async fn send_attached_message(
-        &self,
-        s: i64,
-        c: i64,
-        content: &str,
-        key: &str,
-        ids: &[String],
-        reply: i64,
-    ) -> Result<Message> {
-        let mut v = json!({"content":content,"client_message_id":key,"attachment_ids":ids});
-        if reply > 0 {
-            v["reply_to_message_id"] = json!(reply);
-        }
-        self.request(
-            Method::POST,
-            &format!("{}/messages", channel_path(s, c)),
-            Some(v),
-        )
-        .await
-    }
-    pub async fn forward_message(
-        &self,
-        s: i64,
-        source: i64,
-        id: i64,
-        destination: i64,
-        key: &str,
-    ) -> Result<Message> {
-        self.request(Method::POST,&format!("{}/messages/forward",channel_path(s,destination)),Some(json!({"source_server_id":s,"source_channel_id":source,"source_message_id":id,"client_message_id":key}))).await
-    }
-    pub async fn save_favorite(&self, id: i64, key: &str) -> Result<()> {
-        let v: Value = self
-            .request(Method::GET, "/api/v1/me/favorites", None)
-            .await?;
-        self.action(Method::POST,"/api/v1/me/forward",Some(json!({"source":{"kind":"channel","id":id},"destination":{"kind":"conversation","id":v["id"]},"client_message_id":key}))).await
-    }
-    pub async fn link_preview(&self, href: &str) -> Result<LinkPreview> {
-        let q: String = url::form_urlencoded::byte_serialize(href.as_bytes()).collect();
-        self.request(Method::GET, &format!("/api/v1/link-preview?url={q}"), None)
-            .await
-    }
-    pub async fn profile(&self) -> Result<Profile> {
-        self.request(Method::GET, "/api/v1/me/profile", None).await
-    }
-    pub async fn update_profile(&self, about: &str, country: &str) -> Result<Profile> {
-        self.request(
-            Method::PATCH,
-            "/api/v1/me/profile",
-            Some(json!({"about":about,"country_code":country})),
-        )
-        .await
-    }
-    pub async fn remove_avatar(&self) -> Result<()> {
-        self.action(Method::DELETE, "/api/v1/me/avatar", None).await
-    }
-    pub async fn upload_avatar(
-        &self,
-        data: Vec<u8>,
-        crop: Option<(i32, i32, i32)>,
-    ) -> Result<String> {
-        let mut u = self.url("/api/v1/me/avatar")?;
-        if let Some((x, y, size)) = crop {
-            u.query_pairs_mut()
-                .append_pair("crop_x", &x.to_string())
-                .append_pair("crop_y", &y.to_string())
-                .append_pair("crop_size", &size.to_string());
-        }
-        let b = self.binary(Method::PUT, u, data, 1 << 20).await?;
-        let v: Value = serde_json::from_slice(&b)?;
-        Ok(v["etag"].as_str().unwrap_or_default().to_owned())
-    }
-    pub async fn change_password(&self, current: &str, next: &str, confirm: &str) -> Result<()> {
-        self.action(Method::PUT,"/api/v1/me/password",Some(json!({"current_password":current,"new_password":next,"new_password_confirm":confirm}))).await
-    }
-    pub async fn sessions(&self) -> Result<Vec<AccountSession>> {
-        let v: Value = self
-            .request(Method::GET, "/api/v1/me/sessions", None)
-            .await?;
-        Ok(serde_json::from_value(v["sessions"].clone())?)
-    }
-    pub async fn revoke_session(&self, id: i64) -> Result<()> {
-        self.action(Method::DELETE, &format!("/api/v1/me/sessions/{id}"), None)
-            .await
-    }
-    pub async fn revoke_other_sessions(&self) -> Result<()> {
-        self.action(Method::DELETE, "/api/v1/me/sessions", None)
-            .await
-    }
-    pub async fn delete_account(&self, password: &str) -> Result<()> {
-        self.action(
-            Method::DELETE,
-            "/api/v1/account",
-            Some(json!({"password":password})),
-        )
-        .await
-    }
-    pub async fn message_privacy(&self) -> Result<MessagePrivacy> {
-        self.request(Method::GET, "/api/v1/me/message-privacy", None)
-            .await
-    }
-    pub async fn set_message_privacy(&self, mode: &str) -> Result<MessagePrivacy> {
-        self.request(
-            Method::PUT,
-            "/api/v1/me/message-privacy",
-            Some(json!({"mode":mode})),
-        )
-        .await
-    }
-    pub async fn block_user(&self, id: i64, blocked: bool) -> Result<()> {
-        self.action(
-            if blocked { Method::PUT } else { Method::DELETE },
-            &format!("/api/v1/me/blocks/{id}"),
-            None,
-        )
-        .await
-    }
-    pub async fn rename_server(&self, id: i64, name: &str) -> Result<()> {
-        self.action(
-            Method::PATCH,
-            &format!("/api/v1/servers/{id}"),
-            Some(json!({"name":name})),
-        )
-        .await
-    }
-    pub async fn channel_access(&self, s: i64, c: i64) -> Result<ChannelAccess> {
-        self.request(Method::GET, &format!("{}/access", channel_path(s, c)), None)
-            .await
-    }
-    pub async fn set_channel_access(&self, s: i64, c: i64, v: &ChannelAccess) -> Result<()> {
-        self.action(
-            Method::PUT,
-            &format!("{}/access", channel_path(s, c)),
-            Some(json!(v)),
-        )
-        .await
-    }
-    pub async fn news_settings(&self, s: i64, c: i64) -> Result<NewsSettings> {
-        self.request(Method::GET, &format!("{}/news", channel_path(s, c)), None)
-            .await
-    }
-    pub async fn set_news_settings(&self, s: i64, c: i64, v: &NewsSettings) -> Result<()> {
-        self.action(
-            Method::PUT,
-            &format!("{}/news", channel_path(s, c)),
-            Some(json!(v)),
-        )
-        .await
-    }
-    pub async fn roles(&self, s: i64) -> Result<Vec<CustomRole>> {
-        self.request(Method::GET, &format!("/api/v1/servers/{s}/roles"), None)
-            .await
-    }
-    pub async fn save_role(&self, s: i64, r: &CustomRole) -> Result<()> {
-        let mut path = format!("/api/v1/servers/{s}/roles");
-        let method = if r.id != 0 {
-            path.push_str(&format!("/{}", r.id));
-            Method::PUT
-        } else {
-            Method::POST
-        };
-        self.action(
-            method,
-            &path,
-            Some(json!({"name":r.name,"color":r.color,"permissions":r.permissions})),
-        )
-        .await
-    }
-    pub async fn delete_role(&self, s: i64, id: i64) -> Result<()> {
-        self.action(
-            Method::DELETE,
-            &format!("/api/v1/servers/{s}/roles/{id}"),
-            None,
-        )
-        .await
-    }
-    pub async fn role_preview(&self, s: i64, id: i64) -> Result<Vec<RolePreview>> {
-        self.request(
-            Method::GET,
-            &format!("/api/v1/servers/{s}/roles/{id}/preview"),
-            None,
-        )
-        .await
-    }
-    pub async fn set_member_roles(&self, s: i64, u: i64, ids: &[i64]) -> Result<()> {
-        self.action(
-            Method::PUT,
-            &format!("/api/v1/servers/{s}/members/{u}/roles"),
-            Some(json!({"role_ids":ids})),
-        )
-        .await
-    }
-    pub async fn role_grants(&self, s: i64, c: i64) -> Result<Vec<i64>> {
-        let v: Value = self
-            .request(
-                Method::GET,
-                &format!("{}/role-grants", channel_path(s, c)),
-                None,
-            )
-            .await?;
-        Ok(serde_json::from_value(v["role_ids"].clone())?)
-    }
-    pub async fn set_role_grants(&self, s: i64, c: i64, ids: &[i64]) -> Result<()> {
-        self.action(
-            Method::PUT,
-            &format!("{}/role-grants", channel_path(s, c)),
-            Some(json!({"role_ids":ids})),
-        )
-        .await
-    }
-}
-impl Client {
-    pub async fn client_diagnostics(&self) -> Result<Value> {
-        Ok(serde_json::from_slice(
-            &self
-                .bytes(
-                    Method::GET,
-                    "/api/v1/diagnostics/client-events?limit=5000",
-                    None,
-                    32 << 20,
-                )
-                .await?,
-        )?)
-    }
-    pub async fn cors_origins(&self) -> Result<Vec<String>> {
-        let v: Value = self
-            .request(Method::GET, "/api/v1/instance/cors-origins", None)
-            .await?;
-        Ok(serde_json::from_value(v["origins"].clone())?)
-    }
-    pub async fn set_cors_origins(&self, origins: &[String]) -> Result<()> {
-        self.action(
-            Method::PUT,
-            "/api/v1/instance/cors-origins",
-            Some(json!({"origins":origins})),
-        )
-        .await
-    }
-    pub async fn slowmode(&self, s: i64, c: i64) -> Result<i64> {
-        let v: Value = self
-            .request(
-                Method::GET,
-                &format!("{}/slowmode", channel_path(s, c)),
-                None,
-            )
-            .await?;
-        v["seconds"]
-            .as_i64()
-            .ok_or(Error::InvalidResponse("invalid slowmode"))
-    }
-    pub async fn set_slowmode(&self, s: i64, c: i64, seconds: i64) -> Result<()> {
-        self.action(
-            Method::PUT,
-            &format!("{}/slowmode", channel_path(s, c)),
-            Some(json!({"seconds":seconds})),
-        )
-        .await
-    }
-    pub async fn voice_encryption(&self, s: i64, c: i64) -> Result<bool> {
-        let v: Value = self
-            .request(Method::GET, &format!("{}/e2ee", channel_path(s, c)), None)
-            .await?;
-        v["required"]
-            .as_bool()
-            .ok_or(Error::InvalidResponse("invalid encryption state"))
-    }
-    pub async fn set_voice_encryption(&self, s: i64, c: i64, required: bool) -> Result<()> {
-        self.action(
-            Method::PUT,
-            &format!("{}/e2ee", channel_path(s, c)),
-            Some(json!({"required":required})),
-        )
-        .await
-    }
-    pub async fn storage(&self) -> Result<StorageState> {
-        self.request(Method::GET, "/api/v1/instance/storage", None)
-            .await
-    }
-    pub async fn set_storage(&self, quotas: Value) -> Result<StorageState> {
-        self.request(Method::PUT, "/api/v1/instance/storage", Some(quotas))
-            .await
-    }
-    pub async fn preview_cleanup(&self, category: &str, before: i64) -> Result<CleanupPlan> {
-        self.request(
-            Method::POST,
-            "/api/v1/instance/storage/preview",
-            Some(json!({"category":category,"before":before})),
-        )
-        .await
-    }
-    pub async fn cleanup(&self, token: &str) -> Result<CleanupPlan> {
-        self.request(
-            Method::POST,
-            "/api/v1/instance/storage/cleanup",
-            Some(json!({"token":token})),
-        )
-        .await
-    }
-    pub async fn bans(&self, s: i64) -> Result<Vec<ServerBan>> {
-        let v: Value = self
-            .request(Method::GET, &format!("/api/v1/servers/{s}/bans"), None)
-            .await?;
-        Ok(serde_json::from_value(v["bans"].clone())?)
-    }
-    pub async fn unban(&self, s: i64, u: i64) -> Result<()> {
-        self.action(
-            Method::DELETE,
-            &format!("/api/v1/servers/{s}/bans/{u}"),
-            None,
-        )
-        .await
-    }
-}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn changing_channels_reuses_the_authenticated_socket() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    let mut client = Client::new(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+                    client.set_token("fixture".into());
+                    let first = ChannelSubscription { server_id: 1, channel_id: 10, generation: 1 };
+                    let second = ChannelSubscription { server_id: 1, channel_id: 11, generation: 2 };
+                    let (target, desired) = tokio::sync::watch::channel(Some(first));
+                    let (events, mut received) = tokio::sync::mpsc::unbounded_channel();
+                    let mut worker = tokio::spawn(async move {
+                        client.subscribe_channels(desired, |event| {
+                            let _ = events.send(event);
+                        }).await
+                    });
+                    let (connection, _) = tokio::select! {
+                        connection = listener.accept() => connection.unwrap(),
+                        result = &mut worker => panic!("WebSocket client stopped before connecting: {result:?}"),
+                    };
+                    let mut peer = tokio_tungstenite::accept_async(connection).await.unwrap();
+                    async fn next(
+                        peer: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+                    ) -> RealtimeEvent {
+                        let message = peer.next().await.unwrap().unwrap();
+                        serde_json::from_str(message.to_text().unwrap()).unwrap()
+                    }
+                    async fn send(
+                        peer: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+                        event: Value,
+                    ) {
+                        peer.send(tokio_tungstenite::tungstenite::Message::Text(event.to_string().into())).await.unwrap();
+                    }
+                    assert_eq!(next(&mut peer).await.kind, "auth");
+                    send(&mut peer, json!({"type":"ready"})).await;
+                    let subscribe = next(&mut peer).await;
+                    assert_eq!(subscribe.kind, "channel.subscribe");
+                    assert_eq!(subscribe.data, first.payload());
+
+                    target.send(Some(second)).unwrap();
+                    let unsubscribe = next(&mut peer).await;
+                    assert_eq!(unsubscribe.kind, "channel.unsubscribe");
+                    assert_eq!(unsubscribe.data, first.payload());
+                    let subscribe = next(&mut peer).await;
+                    assert_eq!(subscribe.kind, "channel.subscribe");
+                    assert_eq!(subscribe.data, second.payload());
+
+                    send(&mut peer, json!({"type":"error","request_id":first.request_id(),"data":{"code":"forbidden"}})).await;
+                    send(&mut peer, json!({"type":"error","request_id":second.request_id(),"data":{"code":"forbidden"}})).await;
+                    assert_eq!(received.recv().await.unwrap().kind, "ready");
+                    assert_eq!(received.recv().await.unwrap().kind, "error");
+                    let denied = received.recv().await.unwrap();
+                    assert_eq!(denied.kind, "native.subscription_forbidden");
+                    assert_eq!(denied.data["channel_id"], 11);
+                    assert_eq!(denied.data["generation"], 2);
+
+                    target.send(None).unwrap();
+                    assert_eq!(next(&mut peer).await.kind, "channel.unsubscribe");
+                    send(&mut peer, json!({"type":"presence.updated","data":{"user_id":4,"status":"online"}})).await;
+                    assert_eq!(received.recv().await.unwrap().kind, "presence.updated");
+                    drop(target);
+                    worker.await.unwrap().unwrap();
+                }).await.unwrap();
+            });
+    }
     #[test]
     fn origin_security() {
         for bad in [
@@ -1156,61 +1064,6 @@ mod tests {
         assert!(c.url("https://evil.test").is_err());
         assert_eq!(c.url("/api/v1/ws").unwrap().host_str(), Some("example.com"));
     }
-    #[test]
-    fn permissions() {
-        let mut c = Channel {
-            kind: "news".into(),
-            permissions: 3,
-            ..Default::default()
-        };
-        assert!(c.has_history());
-        assert!(!c.writable());
-        c.can_publish = true;
-        assert!(c.writable());
-        c.e2ee_required = true;
-        assert!(!c.has_history());
-    }
-}
-impl Client {
-    /// Subscribe to read snapshots and updates for one channel. Dropping the
-    /// future closes the socket, which allows callers to cancel on navigation.
-    pub async fn read_receipts<F: FnMut(Vec<ChannelRead>)>(
-        &self,
-        server_id: i64,
-        channel_id: i64,
-        mut receive: F,
-    ) -> Result<()> {
-        self.subscribe(server_id, channel_id, |event| {
-            if event.kind == "channel.read_snapshot" {
-                let data = &event.data;
-                if data["server_id"].as_i64() == Some(server_id)
-                    && data["channel_id"].as_i64() == Some(channel_id)
-                {
-                    if let Ok(reads) = serde_json::from_value(data["reads"].clone()) {
-                        receive(reads);
-                    }
-                }
-            } else if event.kind == "channel.read" {
-                if let Ok(read) = serde_json::from_value::<ChannelRead>(event.data) {
-                    if read.server_id == server_id && read.channel_id == channel_id {
-                        receive(vec![read]);
-                    }
-                }
-            }
-        })
-        .await
-    }
 }
 #[cfg(test)]
-mod compatibility_tests {
-    use super::*;
-    #[test]
-    fn null_arrays_match_go_zero_values() {
-        let message: Message =
-            serde_json::from_str(r#"{"id":1,"attachments":null,"reactions":null}"#).unwrap();
-        assert!(message.attachments.is_empty());
-        assert!(message.reactions.is_empty());
-        let channel: Channel = serde_json::from_str(r#"{"id":1,"name":null}"#).unwrap();
-        assert!(channel.name.is_empty());
-    }
-}
+mod compat_tests;

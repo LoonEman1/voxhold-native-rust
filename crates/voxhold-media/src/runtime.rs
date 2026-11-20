@@ -1,39 +1,93 @@
-//! Background voice connection. UI callers send controls and consume snapshots.
-use crate::{
-    Command, Controls, IceServer, Media,
-    controller::{Action, Participant, Publication, VoiceController},
-    stream::{StreamViewer, ViewerUpdate},
-};
-use std::{sync::{mpsc as std_mpsc, Arc, atomic::AtomicU64}, thread, time::{Duration, Instant}};
-use tokio::sync::mpsc;
+//! Background voice session. The UI never blocks on the socket or a media
+//! engine: it writes bounded last-value requests and reads coalesced updates.
+//!
+//! High-frequency values (controls, stream mute, viewport, frames, levels,
+//! rosters) keep only the latest value, so a burst of input cannot grow a
+//! queue. User actions are bounded too; `leave` outranks everything and a
+//! watch/close pair shares one last-value slot, so an old close can never
+//! overtake a newer selection.
 
-#[derive(Clone, Debug)]
-pub enum VoiceUpdate {
-    Connecting,
-    Connected,
-    Participants(Vec<Participant>),
-    Speaking(std::collections::HashMap<String, bool>),
-    Error(String),
-    Left,
-    Streams(Vec<Publication>),
-    StreamStatus(String),
+use crate::{
+    Command, Controls, Event, IceServer, Media, VideoFrame,
+    controller::{Action, Publication, Signal, VoiceController},
+    stream::StreamViewer,
+    viewer::{Outcome as ViewerOutcome, Viewer},
+    voice::CaptureGate,
+};
+use std::{
+    collections::VecDeque,
+    sync::{
+        Arc, Condvar, Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
+    thread,
+    time::{Duration, Instant},
+};
+use tokio::sync::Notify;
+
+const LOCAL_MUTE_CAPACITY: usize = 64;
+const FRAMES_PER_TICK: usize = 4;
+const DEFAULT_VIEWPORT: (u32, u32) = (960, 540);
+const RECONNECT_DELAY: Duration = Duration::from_secs(3);
+const MAX_RECONNECTS: u32 = 5;
+const LONG_SESSION: Duration = Duration::from_secs(30);
+/// A blocked socket send must not keep the media lease alive for the whole
+/// library-level eight-second timeout.
+const SEND_TIMEOUT: Duration = Duration::from_secs(2);
+/// The leave handshake is best effort; the capture is already latched.
+const LEAVE_SEND_TIMEOUT: Duration = Duration::from_millis(750);
+
+mod updates;
+use updates::Updates;
+pub use updates::VoiceUpdate;
+
+mod engine;
+mod player;
+use player::install_stream;
+mod preflight;
+mod prep;
+mod recovery;
+mod requests;
+mod screen;
+mod session;
+mod test_support;
+use engine::{EngineEffect, apply_engine_update};
+use recovery::{PublishRecovery, RecoveredAttempt, Rotation};
+use requests::{
+    InputRequest, Pending, Requests, ScreenAccess, StreamCommand, set_input_request,
+    set_stream_command,
+};
+use session::run;
+
+pub struct StreamFrame {
+    /// Selection that produced this frame. The panel ignores a frame from an
+    /// older selection even if it was already in the slot during a switch.
+    pub selection: u64,
+    pub width: u32,
+    pub height: u32,
+    /// BGRA pixels ready for `RenderImage`; the UI must not swap channels.
+    pub bgra: Vec<u8>,
 }
-#[derive(Debug)]
-enum Request {
-    Controls(Controls, bool),
-    LocalMute(String, bool),
-    Leave,
-    Watch(Publication),
-    LeaveStream,
-    StreamMute(bool),
-}
-pub struct StreamFrame { pub width: u32, pub height: u32, pub rgba: Vec<u8> }
+
 pub struct VoiceHandle {
-    requests: mpsc::UnboundedSender<Request>,
-    updates: std_mpsc::Receiver<VoiceUpdate>,
+    requests: Arc<Requests>,
+    updates: Arc<Updates>,
+    frame: Arc<Mutex<Option<StreamFrame>>>,
+    /// Capture permission is independent of the socket worker, so leave, a
+    /// released PTT key or logout silences the track immediately.
+    capture: Arc<CaptureGate>,
+    /// Last local preview of the screen publication. The publisher engine
+    /// writes it; the on-air card takes it.
+    screen_preview: Arc<crate::screen_capture::PreviewStore>,
+    /// Ids for the picker and its listings. `u64` so a stale answer can never
+    /// replace a newer one.
+    screen_picker: Arc<AtomicU64>,
+    source_generation: Arc<AtomicU64>,
+    attempt: u64,
     worker: Option<thread::JoinHandle<()>>,
-    frame: std::sync::Arc<std::sync::Mutex<Option<StreamFrame>>>,
+    finished: Arc<(Mutex<bool>, Condvar)>,
 }
+
 impl VoiceHandle {
     pub fn join(
         client: voxhold_api::Client,
@@ -42,267 +96,621 @@ impl VoiceHandle {
         controls: Controls,
         self_muted: bool,
     ) -> Result<Self, String> {
-        let (tx, rx) = mpsc::unbounded_channel();
-        let (updates, output) = std_mpsc::channel();
-        let frame=std::sync::Arc::new(std::sync::Mutex::new(None));
-        let worker_frame=frame.clone();
+        Self::join_with_rotation(client, server, channel, controls, self_muted, false)
+    }
+
+    /// Join while a token refresh is already in flight. The gate is installed
+    /// on the shared requests before the worker thread starts, so its first
+    /// authorization waits for the refresh answer (or the 30 s deadline)
+    /// instead of using the revoked token.
+    pub fn join_with_rotation(
+        client: voxhold_api::Client,
+        server: i64,
+        channel: i64,
+        controls: Controls,
+        self_muted: bool,
+        rotation_pending: bool,
+    ) -> Result<Self, String> {
+        static ATTEMPT: AtomicU64 = AtomicU64::new(1);
+        let attempt = ATTEMPT.fetch_add(1, Ordering::SeqCst);
+        let requests = Arc::new(Requests::default());
+        if rotation_pending {
+            requests.rotation_started(Instant::now());
+        }
+        let updates = Arc::new(Updates::new());
+        let frame = Arc::new(Mutex::new(None));
+        let capture = Arc::new(CaptureGate::default());
+        let finished = Arc::new((Mutex::new(false), Condvar::new()));
+        let screen_preview = Arc::new(crate::screen_capture::PreviewStore::default());
+        let screen_picker = Arc::new(AtomicU64::new(1));
+        let source_generation = Arc::new(AtomicU64::new(1));
+        let (worker_requests, worker_updates) = (requests.clone(), updates.clone());
+        let (worker_frame, worker_finished) = (frame.clone(), finished.clone());
+        let worker_capture = capture.clone();
+        let worker_preview = screen_preview.clone();
         let worker = thread::Builder::new()
             .name("voxhold-voice-session".into())
             .spawn(move || {
-                let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                else {
-                    let _ = updates.send(VoiceUpdate::Error(
-                        "Не удалось запустить голосовое соединение".into(),
-                    ));
-                    return;
-                };
-                runtime.block_on(run(
-                    client, server, channel, controls, self_muted, rx, updates, worker_frame,
-                ));
+                run(
+                    client,
+                    server,
+                    channel,
+                    controls,
+                    self_muted,
+                    worker_requests,
+                    worker_updates,
+                    worker_frame,
+                    worker_capture,
+                    worker_preview,
+                );
+                if let Ok(mut done) = worker_finished.0.lock() {
+                    *done = true;
+                    worker_finished.1.notify_all();
+                }
             })
-            .map_err(|e| e.to_string())?;
+            .map_err(|error| error.to_string())?;
         Ok(Self {
-            requests: tx,
-            updates: output,
-            worker: Some(worker),
+            requests,
+            updates,
             frame,
+            capture,
+            screen_preview,
+            screen_picker,
+            source_generation,
+            attempt,
+            worker: Some(worker),
+            finished,
         })
     }
+
+    /// Identity of this join attempt; stale updates of an older handle are
+    /// discarded by the panel.
+    pub fn attempt(&self) -> u64 {
+        self.attempt
+    }
+
     pub fn controls(&self, controls: Controls, self_muted: bool) {
-        let _ = self.requests.send(Request::Controls(controls, self_muted));
+        // The panel folds join, server mute, local mute and push-to-talk into
+        // `controls.muted`. Apply that decision to the live track before the
+        // worker is even scheduled; a blocked socket must not hold the mic.
+        self.capture
+            .set_local(!controls.muted && !controls.deafened);
+        if let Ok(mut slot) = self.requests.controls.lock() {
+            *slot = Some((controls, self_muted));
+        }
+        self.requests.wake();
     }
+
+    /// An explicit output choice from settings. Generic control updates may
+    /// skip an unchanged value, but this request is always forwarded to the
+    /// media engine, whose own output state decides whether it is a no-op.
+    pub fn select_output(&self, output: Option<String>) {
+        let output = output.filter(|id| !id.is_empty());
+        if let Ok(mut slot) = self.requests.output.lock() {
+            *slot = Some(output);
+        }
+        self.requests.wake();
+    }
+
+    /// The refresh request started. The worker must not re-authorize the old
+    /// socket with the revoked token while the answer is in flight.
+    pub fn token_rotation_started(&self) {
+        self.requests.rotation_started(Instant::now());
+        self.requests.wake();
+    }
+
+    /// The refresh result was applied to every clone of the shared client. A
+    /// waiting reconnect may now open its one new socket.
+    pub fn token_rotation_finished(&self) {
+        self.requests.rotation_finished();
+        self.requests.wake();
+    }
+
+    /// Explicit input selection. The request travels in its own slot with a
+    /// monotonically increasing generation, so a later PTT/DSP `controls`
+    /// update cannot displace it and a late result cannot outrank a newer
+    /// choice in the UI.
+    pub fn select_input(&self, input: Option<String>) -> u64 {
+        static GENERATION: AtomicU64 = AtomicU64::new(1);
+        let generation = GENERATION.fetch_add(1, Ordering::SeqCst);
+        let input = input.filter(|id| !id.is_empty());
+        if let Ok(mut slot) = self.requests.input.lock() {
+            set_input_request(&mut slot, InputRequest { input, generation });
+        }
+        self.requests.wake();
+        generation
+    }
+
     pub fn local_mute(&self, connection: String, muted: bool) {
-        let _ = self.requests.send(Request::LocalMute(connection, muted));
+        if let Ok(mut queue) = self.requests.local_mutes.lock() {
+            if queue.len() >= LOCAL_MUTE_CAPACITY {
+                queue.pop_front();
+            }
+            queue.push_back((connection, muted));
+        }
+        self.requests.wake();
     }
-    pub fn take_frame(&self) -> Option<StreamFrame> { self.frame.lock().ok()?.take() }
+
+    /// System power transition. The worker reopens or releases the playout
+    /// sink; a resume before the first session is a no-op for the engine.
+    pub fn power(&self, resumed: bool) {
+        if let Ok(mut slot) = self.requests.power.lock() {
+            *slot = Some(resumed);
+        }
+        self.requests.wake();
+    }
+
+    pub fn take_frame(&self) -> Option<StreamFrame> {
+        self.frame.lock().ok()?.take()
+    }
+
+    /// Physical pixels of the player picture; the decoder scales to this.
+    /// A repeat of the current size is ignored, but a real change wakes the
+    /// worker so it re-reads the latest frame without waiting for a socket
+    /// event or a new RTP frame.
+    pub fn set_viewport(&self, width: u32, height: u32) {
+        if width == 0 || height == 0 {
+            return;
+        }
+        let Ok(mut slot) = self.requests.viewport.lock() else {
+            return;
+        };
+        if *slot == Some((width, height)) {
+            return;
+        }
+        *slot = Some((width, height));
+        // Release the slot before waking: the worker reads it at the top of its
+        // loop and must not contend with a writer that would not change it.
+        drop(slot);
+        self.requests.wake();
+    }
+
     pub fn try_update(&self) -> Option<VoiceUpdate> {
-        self.updates.try_recv().ok()
+        self.updates.poll()
     }
-    pub fn watch_stream(&self, publication: Publication) { if let Ok(mut slot)=self.frame.lock(){slot.take();} let _=self.requests.send(Request::Watch(publication)); }
-    pub fn leave_stream(&self) { if let Ok(mut slot)=self.frame.lock(){slot.take();} let _=self.requests.send(Request::LeaveStream); }
-    pub fn stream_mute(&self, muted: bool) { let _=self.requests.send(Request::StreamMute(muted)); }
+
+    /// Selecting another publication is a last-value intent: if the worker has
+    /// not picked up B yet and the user chooses C, only C is applied. A close
+    /// is the same slot, so it cannot erase a newer watch from another thread.
+    pub fn watch_stream(&self, selection: u64, publication: Publication) {
+        set_stream_command(
+            &self.requests,
+            StreamCommand::Watch {
+                selection,
+                publication,
+            },
+        );
+        if let Ok(mut frame) = self.frame.lock() {
+            frame.take();
+        }
+        self.requests.wake();
+    }
+
+    pub fn leave_stream(&self, selection: u64) {
+        set_stream_command(&self.requests, StreamCommand::Close { selection });
+        if let Ok(mut frame) = self.frame.lock() {
+            frame.take();
+        }
+        self.requests.wake();
+    }
+
+    pub fn stream_mute(&self, selection: u64, muted: bool) {
+        if let Ok(mut slot) = self.requests.stream_mute.lock() {
+            *slot = Some((selection, muted));
+        }
+        self.requests.wake();
+    }
+
     pub fn leave(&self) {
-        let _ = self.requests.send(Request::Leave);
+        // Latch first: the flag stops the worker, but the track must be silent
+        // now, even while `socket.send` is still waiting.
+        self.capture.latch();
+        self.requests.cancel_publish_recovery();
+        self.requests.leave.store(true, Ordering::SeqCst);
+        if let Ok(mut stream) = self.requests.stream.lock() {
+            stream.clear();
+        }
+        self.requests.wake();
     }
 }
+
 impl Drop for VoiceHandle {
     fn drop(&mut self) {
         self.leave();
-        self.worker.take();
-    }
-}
-async fn execute(
-    actions: Vec<Action>,
-    media: &Media,
-    socket: &mut voxhold_api::VoiceSocket,
-) -> Result<bool, String> {
-    for action in actions {
-        match action {
-            Action::Media(command) => media
-                .command(command)
-                .map_err(|e| format!("Ошибка медиадвижка: {e:?}"))?,
-            Action::Send(s) => socket
-                .send(s.kind, s.data, s.request_id.as_deref())
-                .await
-                .map_err(|e| e.to_string())?,
-            Action::Reconnect => return Ok(false),
-            Action::Closed(e) => return Err(e.into()),
-        }
-    }
-    Ok(true)
-}
-#[derive(Clone)]
-struct StreamIntent { publication: Publication, muted: bool }
-async fn waiting<F: std::future::Future>(
-    future: F,
-    requests: &mut mpsc::UnboundedReceiver<Request>,
-    controller: &mut VoiceController,
-    intent: &mut Option<StreamIntent>,
-) -> Option<F::Output> {
-    tokio::pin!(future);
-    loop {
-        tokio::select! {
-            result = &mut future => return Some(result),
-            request = requests.recv() => match request {
-                Some(Request::Controls(c,m)) => { controller.update_controls(c,m); },
-                Some(Request::LocalMute(id,m)) => { controller.set_local_mute(&id,m); },
-                Some(Request::Watch(publication)) => { *intent=Some(StreamIntent {publication,muted:false}); },
-                Some(Request::LeaveStream) => { *intent=None; },
-                Some(Request::StreamMute(muted)) => { if let Some(intent)=intent {intent.muted=muted;} },
-            _ => return None,
-            }
-        }
-    }
-}
-async fn run(
-    client: voxhold_api::Client,
-    server: i64,
-    channel: i64,
-    controls: Controls,
-    self_muted: bool,
-    mut requests: mpsc::UnboundedReceiver<Request>,
-    updates: std_mpsc::Sender<VoiceUpdate>,
-    frame: std::sync::Arc<std::sync::Mutex<Option<StreamFrame>>>,
-) {
-    let mut controller = VoiceController::new(server, channel, controls, self_muted);
-    let mut streams: Vec<Publication> = Vec::new();
-    let mut intent: Option<StreamIntent> = None;
-    let sequence=Arc::new(AtomicU64::new(0));
-    'outer: loop {
-        let _ = updates.send(VoiceUpdate::Connecting);
-        let config = match waiting(client.webrtc_config(), &mut requests, &mut controller, &mut intent).await {
-            Some(Ok(v)) => v,
-            Some(Err(e)) => {
-                let _ = updates.send(VoiceUpdate::Error(e.to_string()));
-                break;
-            }
-            None => break,
+        let Some(worker) = self.worker.take() else {
+            return;
         };
-        let mut socket =
-            match waiting(client.open_voice_socket(), &mut requests, &mut controller, &mut intent).await {
-                Some(Ok(v)) => v,
-                Some(Err(e)) => {
-                    let _ = updates.send(VoiceUpdate::Error(e.to_string()));
-                    break;
+        // The UI thread must never wait for the socket. The worker latches the
+        // capture synchronously above; joining happens on a short-lived thread.
+        let finished = self.finished.clone();
+        let _ = thread::Builder::new()
+            .name("voxhold-voice-close".into())
+            .spawn(move || {
+                let done = finished
+                    .0
+                    .lock()
+                    .map(|done| {
+                        finished
+                            .1
+                            .wait_timeout_while(done, Duration::from_secs(3), |done| !*done)
+                            .map(|(done, _)| *done)
+                            .unwrap_or(false)
+                    })
+                    .unwrap_or(false);
+                if done {
+                    let _ = worker.join();
                 }
-                None => break,
-            };
-        let media = match Media::new() {
-            Ok(v) => v,
-            Err(e) => {
-                let _ = updates.send(VoiceUpdate::Error(format!("{e:?}")));
-                break;
-            }
-        };
-        let servers: Vec<IceServer> = config
-            .ice_servers
-            .into_iter()
-            .map(|s| IceServer {
-                urls: s.urls,
-                username: s.username,
-                credential: s.credential,
-            })
-            .collect();
-        if let Err(e) = media.command(Command::Start {
-            ice_servers: servers.clone(),
-            ice_transport_policy: config.ice_transport_policy.clone(),
-            controls: {
-                let mut c = controller.controls.clone();
-                c.muted |= controller.server_muted;
-                c
-            },
-        }) {
-            let _ = updates.send(VoiceUpdate::Error(format!("{e:?}")));
-            break;
-        }
-        let mut viewer: Option<StreamViewer> = None;
-        let mut pending_leave: Option<(String, Instant)> = None;
-        let mut viewer_deadline: Option<Instant> = None;
-        let mut viewer_retries: u8 = 0;
-        let mut tick = tokio::time::interval(Duration::from_millis(25));
-        let mut reconnect = false;
-        loop {
-            tokio::select! {
-                request=requests.recv()=>{
-                    let actions=match request {
-                        Some(Request::Controls(c,m))=>controller.update_controls(c,m),
-                        Some(Request::LocalMute(id,m))=>controller.set_local_mute(&id,m),
-                        Some(Request::Watch(publication))=>{
-                            if publication.server_id != server || publication.channel_id != channel { continue; }
-                            intent=Some(StreamIntent {publication,muted:false}); viewer_retries=0; viewer_deadline=None;
-                            if let Some(mut old)=viewer.take() {
-                                let signal=old.leave(); let id=signal.request_id.clone().unwrap_or_default();
-                                if socket.send(signal.kind,signal.data,Some(&id)).await.is_err(){reconnect=true;break;}
-                                pending_leave=Some((id,Instant::now()+Duration::from_secs(5)));
-                            }
-                            if let Ok(mut slot)=frame.lock(){slot.take();}
-                            let _=updates.send(VoiceUpdate::StreamStatus("Подключение…".into())); continue;
-                        },
-                        Some(Request::LeaveStream)=>{
-                            intent=None; viewer_deadline=None;
-                            if let Some(mut old)=viewer.take(){let signal=old.leave();let id=signal.request_id.clone().unwrap_or_default();if socket.send(signal.kind,signal.data,Some(&id)).await.is_err(){reconnect=true;break;}pending_leave=Some((id,Instant::now()+Duration::from_secs(5)));}
-                            if let Ok(mut slot)=frame.lock(){slot.take();}let _=updates.send(VoiceUpdate::StreamStatus(String::new()));continue;
-                        },
-                        Some(Request::StreamMute(muted))=>{if let Some(intent)=&mut intent {intent.muted=muted;} if let Some(viewer)=&mut viewer {let _=viewer.set_muted(muted);}continue;},
-                        _=>{if let Some(mut old)=viewer.take(){let signal=old.leave();let _=socket.send(signal.kind,signal.data,signal.request_id.as_deref()).await;}let _=socket.send("voice.leave",serde_json::json!({}),None).await; let _=socket.close().await; break 'outer}
-                    };
-                    match execute(actions,&media,&mut socket).await {Ok(true)=>{},Ok(false)=>{reconnect=true;break},Err(e)=>{let _=updates.send(VoiceUpdate::Error(e));break 'outer}}
-                },
-                event=socket.read()=>{
-                    let event=match event {Ok(e)=>e,Err(_)=>{reconnect=true;break}};
-                    match event.kind.as_str() {
-                        "stream.snapshot"=>{streams=serde_json::from_value::<Vec<Publication>>(event.data["streams"].clone()).unwrap_or_default().into_iter().filter(|p|p.server_id==server && p.channel_id==channel && !p.publisher_connection_id.is_empty()).collect();
-                            if !controller.joined {if let Some(selected)=&mut intent {let replacement=streams.iter().find(|p|p.publisher_connection_id==selected.publication.publisher_connection_id).or_else(||streams.iter().find(|p|p.publisher_user_id==selected.publication.publisher_user_id));if let Some(p)=replacement {selected.publication=p.clone();}}}
-                            let _=updates.send(VoiceUpdate::Streams(streams.clone()));},
-                        "stream.started"|"stream.updated"=>{if let Ok(p)=serde_json::from_value::<Publication>(event.data.clone()){if p.server_id==server && p.channel_id==channel && !p.publisher_connection_id.is_empty(){streams.retain(|old|old.publisher_connection_id!=p.publisher_connection_id);streams.push(p);let _=updates.send(VoiceUpdate::Streams(streams.clone()));}}},
-                        "stream.stopped"=>{let id=event.data["publisher_connection_id"].as_str().unwrap_or_default();streams.retain(|p|p.publisher_connection_id!=id);let _=updates.send(VoiceUpdate::Streams(streams.clone()));}, _=>{}
-                    }
-                    if event.kind.starts_with("stream.") || (event.kind=="error" && event.request_id.starts_with("native-stream-")) {
-                        if event.kind=="stream.left" && pending_leave.as_ref().is_some_and(|(id,_)|*id==event.request_id) {pending_leave=None;continue;}
-                        if event.kind=="stream.left" && event.request_id.is_empty() && viewer.is_some() {viewer=None;intent=None;viewer_deadline=None;let _=updates.send(VoiceUpdate::StreamStatus("Просмотр трансляции завершён сервером".into()));continue;}
-                        if event.kind=="stream.webrtc_closed" && viewer.is_some() {
-                            let reason=event.data["reason"].as_str().unwrap_or_default().to_lowercase();
-                            let final_close=["permission","access","stopped","replaced","e2ee"].iter().any(|s|reason.contains(s));
-                            if final_close || viewer_retries>=2 {viewer=None;intent=None;viewer_deadline=None;let _=updates.send(VoiceUpdate::StreamStatus("Трансляция завершена".into()));}
-                            else if let Some(mut old)=viewer.take() {viewer_retries+=1;viewer_deadline=None;let signal=old.leave();let id=signal.request_id.clone().unwrap_or_default();if socket.send(signal.kind,signal.data,Some(&id)).await.is_err(){reconnect=true;break;}pending_leave=Some((id,Instant::now()+Duration::from_secs(5)));}
-                            continue;
-                        }
-                        let failure=viewer.as_mut().and_then(|current|current.on_signal(&event.kind,&event.request_id,&event.data).err());
-                        if let Some(e)=failure {intent=None;viewer_deadline=None;if let Some(mut old)=viewer.take(){let signal=old.leave();let id=signal.request_id.clone().unwrap_or_default();if socket.send(signal.kind,signal.data,Some(&id)).await.is_err(){reconnect=true;break;}pending_leave=Some((id,Instant::now()+Duration::from_secs(5)));}let _=updates.send(VoiceUpdate::StreamStatus(e));} continue;
-                    }
-                    let actions=controller.on_signal(&event.kind,&event.data); let _=updates.send(VoiceUpdate::Participants(controller.participants.clone()));
-                    match execute(actions,&media,&mut socket).await {Ok(true)=>{},Ok(false)=>{reconnect=true;break},Err(e)=>{let _=updates.send(VoiceUpdate::Error(e));break 'outer}}
-                },
-                _=tick.tick()=>{
-                    while let Some(event)=media.poll(Duration::ZERO) {if matches!(event,crate::Event::State{state:"connected"}) {let _=updates.send(VoiceUpdate::Connected);} let actions=controller.media_event(event); let _=updates.send(VoiceUpdate::Speaking(controller.speaking.clone())); match execute(actions,&media,&mut socket).await {Ok(true)=>{},Ok(false)=>{reconnect=true;break},Err(e)=>{let _=updates.send(VoiceUpdate::Error(e));break 'outer}}}
-                    if let Some(current)=&mut viewer {match current.poll(960,540) {
-                        Some(ViewerUpdate::Frame)=>{viewer_deadline=None;if let Ok(mut slot)=frame.lock() {*slot=Some(StreamFrame {width:current.frame.width(),height:current.frame.height(),rgba:current.frame.rgba.clone()});}},
-                        Some(ViewerUpdate::Status(s))=>{let _=updates.send(VoiceUpdate::StreamStatus(s.into()));},
-                        Some(ViewerUpdate::Error(e))=>{let _=updates.send(VoiceUpdate::StreamStatus(e));intent=None;viewer_deadline=None;if let Some(mut old)=viewer.take(){let signal=old.leave();let id=signal.request_id.clone().unwrap_or_default();if socket.send(signal.kind,signal.data,Some(&id)).await.is_err(){reconnect=true;}else {pending_leave=Some((id,Instant::now()+Duration::from_secs(5)));}}},
-                        Some(ViewerUpdate::Signal(signal))=>{if signal.kind=="stream.p2p_restart" || signal.kind=="stream.recovery_request" {viewer_deadline=Some(Instant::now()+Duration::from_secs(15));} if socket.send(signal.kind,signal.data,signal.request_id.as_deref()).await.is_err(){reconnect=true;}},None=>{}
-                    }}
-                    if reconnect {break}
-                    if pending_leave.as_ref().is_some_and(|(_,deadline)|Instant::now()>=*deadline) {
-                        pending_leave=None; if intent.is_some(){intent=None;let _=updates.send(VoiceUpdate::StreamStatus("Не удалось завершить предыдущий просмотр".into()));}
-                    }
-                    if viewer_deadline.is_some_and(|deadline|Instant::now()>=deadline) {
-                        viewer_deadline=None;
-                        if viewer_retries>=2 {intent=None;if let Some(mut old)=viewer.take(){let signal=old.leave();let id=signal.request_id.clone().unwrap_or_default();if socket.send(signal.kind,signal.data,Some(&id)).await.is_err(){reconnect=true;break;}pending_leave=Some((id,Instant::now()+Duration::from_secs(5)));}let _=updates.send(VoiceUpdate::StreamStatus("Не удалось восстановить трансляцию".into()));}
-                        else if let Some(mut old)=viewer.take(){viewer_retries+=1;let signal=old.leave();let id=signal.request_id.clone().unwrap_or_default();if socket.send(signal.kind,signal.data,Some(&id)).await.is_err(){reconnect=true;break;}pending_leave=Some((id,Instant::now()+Duration::from_secs(5)));}
-                    }
-                    if controller.joined && viewer.is_none() && pending_leave.is_none() {
-                        if let Some(selected)=intent.clone() {
-                            match StreamViewer::start(selected.publication,servers.clone(),config.ice_transport_policy.clone(),controller.controls.output.clone(),selected.muted,sequence.clone()) {
-                                Ok((new,signal))=>{if socket.send(signal.kind,signal.data,signal.request_id.as_deref()).await.is_err(){reconnect=true;break;} viewer=Some(new);viewer_deadline=Some(Instant::now()+Duration::from_secs(15));let _=updates.send(VoiceUpdate::StreamStatus("Подключение…".into()));},
-                                Err(e)=>{intent=None;let _=updates.send(VoiceUpdate::StreamStatus(e));}
-                            }
-                        }
-                    }
-                },
-            }
-        }
-        controller.joined = false;
-        if let Ok(mut slot)=frame.lock(){slot.take();}
-        if intent.is_some(){let _=updates.send(VoiceUpdate::StreamStatus("Восстанавливаем трансляцию…".into()));}
-        let _ = media.command(Command::Stop);
-        drop(media);
-        if !reconnect {
-            break;
-        }
-        if waiting(
-            tokio::time::sleep(Duration::from_secs(3)),
-            &mut requests,
-            &mut controller,
-            &mut intent,
-        )
-        .await
-        .is_none()
-        {
-            break;
-        }
+            });
     }
-    let _ = updates.send(VoiceUpdate::Left);
 }
 
+#[derive(Debug)]
+enum SessionEnd {
+    Leave,
+    Recover,
+    Error(String),
+}
+
+struct Live {
+    socket: voxhold_api::VoiceSocket,
+    media: Media,
+    servers: Vec<IceServer>,
+    policy: String,
+    output: Option<String>,
+    output_working: bool,
+    stream: Option<StreamViewer>,
+    stream_selection: Option<u64>,
+    /// Screen-share state machine of this socket session. It survives viewer
+    /// switches and never survives a reconnect.
+    publisher: crate::publisher::Publisher,
+    /// The capture and peer of the current publishing attempt.
+    screen: Option<crate::publisher::engine::PublisherEngine>,
+    /// The newest live bitrate change that the worker has not accepted yet. A
+    /// full command queue defers it to the next tick instead of failing.
+    bitrate: screen::BitrateQueue,
+    /// The one preparation that may be opening a capture or a peer. The session
+    /// loop only observes and cancels it.
+    prep: Option<prep::ScreenPrep<crate::publisher::engine::PublisherEngine>>,
+    /// A preflight of a live quality change. The live engine above keeps
+    /// running until this confirms the new capture and the publisher commits
+    /// the existing stop+start.
+    restart: Option<preflight::PendingRestart>,
+    /// Room identity a preparation result must still match.
+    server: i64,
+    channel: i64,
+    connection: Option<String>,
+    joined: bool,
+    /// The fresh streams snapshot of this socket is authoritative.
+    snapshot_ready: bool,
+    /// The panel confirmed the screen gate for this socket session.
+    access_seen: bool,
+    /// Panel-confirmed gate of the current picker/attempt.
+    access: ScreenAccess,
+    /// Freshest gate written by `VoiceHandle::screen_access`.
+    screen_access: Arc<Mutex<Option<ScreenAccess>>>,
+    /// Confirmed broadcast captured before this session ends.
+    recovery: Arc<PublishRecovery>,
+    /// Cancellation epoch the current live attempt was confirmed under.
+    recovery_epoch: u64,
+    /// The intent this session took and has not confirmed yet.
+    recovered: RecoveredAttempt,
+    cancel_epoch: Arc<AtomicU64>,
+    /// Rotation owns the reconnect of this credential.
+    rotation: Arc<Mutex<Rotation>>,
+    /// Credential this socket was opened with; a different current token means
+    /// an old-generation close must not end the call.
+    session_token: String,
+    screen_preview: Arc<crate::screen_capture::PreviewStore>,
+    render: VideoFrame,
+    viewport: (u32, u32),
+    local_level: Option<f64>,
+    frame: Arc<Mutex<Option<StreamFrame>>>,
+    updates: Arc<Updates>,
+}
+
+impl Live {
+    async fn send(
+        &mut self,
+        kind: &str,
+        data: serde_json::Value,
+        id: Option<&str>,
+    ) -> Result<(), SessionEnd> {
+        let sent = tokio::time::timeout(SEND_TIMEOUT, self.socket.send(kind, data, id)).await;
+        match sent {
+            Ok(Ok(())) => Ok(()),
+            _ => Err(SessionEnd::Recover),
+        }
+    }
+
+    /// The leave handshake has its own short budget: the capture is already
+    /// closed, so a stalled socket must not delay the UI.
+    async fn send_leave(&mut self) {
+        let _ = tokio::time::timeout(
+            LEAVE_SEND_TIMEOUT,
+            self.socket.send("voice.leave", serde_json::json!({}), None),
+        )
+        .await;
+    }
+
+    fn clear_frame(&self) {
+        if let Ok(mut frame) = self.frame.lock() {
+            frame.take();
+        }
+    }
+
+    async fn drain_voice_media(
+        &mut self,
+        controller: &mut VoiceController,
+    ) -> Result<bool, SessionEnd> {
+        while let Some(event) = self.media.poll(Duration::ZERO) {
+            if matches!(event, Event::State { state: "connected" }) {
+                self.updates.push(VoiceUpdate::Connected);
+            }
+            if let Event::InputApplied {
+                generation,
+                input,
+                error,
+            } = &event
+            {
+                self.updates.push(VoiceUpdate::InputApplied {
+                    generation: *generation,
+                    input: input.clone(),
+                    error: error.map(str::to_owned),
+                });
+            }
+            let speaking = controller.speaking.clone();
+            let tracks = controller.connections_with_audio();
+            let applied = controller.applied_audio.clone();
+            let playout = controller.playout;
+            let actions = controller.media_event(event);
+            if !self.execute(actions).await? {
+                return Ok(false);
+            }
+            if controller.applied_audio != applied {
+                if let Some(applied) = controller.applied_audio.clone() {
+                    self.updates.push(VoiceUpdate::AudioMode(applied));
+                }
+            }
+            if controller.playout != playout {
+                if let Some(stats) = controller.playout {
+                    self.updates.push(VoiceUpdate::Playout(stats));
+                }
+            }
+            if controller.speaking != speaking {
+                self.updates
+                    .push(VoiceUpdate::Speaking(controller.speaking.clone()));
+            }
+            if controller.connections_with_audio() != tracks {
+                self.updates
+                    .push(VoiceUpdate::Tracks(controller.connections_with_audio()));
+            }
+            if let Some(last) = self.local_level {
+                if (last - controller.local_level).abs() > 0.005 {
+                    self.local_level = Some(controller.local_level);
+                    self.updates
+                        .push(VoiceUpdate::LocalLevel(controller.local_level));
+                }
+            } else {
+                self.local_level = Some(controller.local_level);
+            }
+        }
+        Ok(true)
+    }
+
+    async fn drain_viewer(&mut self, viewer: &mut Viewer) -> Result<bool, SessionEnd> {
+        let (width, height) = self.viewport;
+        for _ in 0..FRAMES_PER_TICK {
+            let update = {
+                let Self { stream, render, .. } = self;
+                let Some(engine) = stream.as_mut() else {
+                    return Ok(true);
+                };
+                engine.poll(render, width, height)
+            };
+            let Some(update) = update else {
+                return Ok(true);
+            };
+            let now = Instant::now();
+            let outcomes =
+                match apply_engine_update(&self.frame, &mut self.render, viewer, update, now) {
+                    EngineEffect::Outcomes(outcomes) => outcomes,
+                    EngineEffect::Output {
+                        applied,
+                        working,
+                        error,
+                    } => {
+                        // The applied endpoint may be the previous one after a
+                        // rollback. Updating both values lets a repeated request
+                        // retry instead of being skipped as unchanged.
+                        self.output = applied;
+                        self.output_working = working;
+                        if let Some(selection) =
+                            viewer.watching().map(|watching| watching.selection)
+                        {
+                            self.updates
+                                .push(VoiceUpdate::StreamAudio { selection, error });
+                        }
+                        Vec::new()
+                    }
+                };
+            if !self.apply(outcomes, viewer).await? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    async fn execute(&mut self, actions: Vec<Action>) -> Result<bool, SessionEnd> {
+        for action in actions {
+            match action {
+                Action::Media(command) => self.media.command(command).map_err(|error| {
+                    SessionEnd::Error(format!("РћС€РёР±РєР° РјРµРґРёР°РґРІРёР¶РєР°: {error:?}"))
+                })?,
+                Action::Send(signal) => self.send_signal(signal).await?,
+                Action::Notice(message) => {
+                    self.updates.push(VoiceUpdate::DeviceError(message.into()))
+                }
+                Action::Reconnect => return Ok(false),
+                Action::Closed(message) => return Err(SessionEnd::Error(message.into())),
+            }
+        }
+        Ok(true)
+    }
+
+    async fn send_signal(&mut self, signal: Signal) -> Result<(), SessionEnd> {
+        // The live stand test needs the exact signaling the session sent and
+        // the answer mid; the test-only probe is empty in every other build.
+        #[cfg(test)]
+        crate::live_probe::record_signal(signal.kind, &signal.data);
+        self.send(signal.kind, signal.data, signal.request_id.as_deref())
+            .await
+    }
+
+    /// Execute viewer decisions in order. A failed engine start is converted
+    /// back into state-machine outcomes, so the intent is cleared the same way
+    /// as any other failure.
+    async fn apply(
+        &mut self,
+        outcomes: Vec<ViewerOutcome>,
+        viewer: &mut Viewer,
+    ) -> Result<bool, SessionEnd> {
+        let mut work: VecDeque<ViewerOutcome> = outcomes.into();
+        while let Some(outcome) = work.pop_front() {
+            match outcome {
+                ViewerOutcome::Start {
+                    selection,
+                    attempt,
+                    publication,
+                    muted,
+                    request,
+                } => {
+                    // Defensive: the viewer starts only after the previous
+                    // attempt closed, but an engine must never be dropped on the
+                    // signaling thread if that ever changes.
+                    match StreamViewer::start(
+                        self.servers.clone(),
+                        self.policy.clone(),
+                        self.output.clone(),
+                        muted,
+                        attempt,
+                    ) {
+                        Ok(engine) => {
+                            // A replacement engine has its own frame sequence.
+                            // Keeping the old identity would hide its first
+                            // frame when the sequence and size happen to match.
+                            install_stream(
+                                &mut self.stream,
+                                &mut self.stream_selection,
+                                &self.frame,
+                                &mut self.render,
+                                engine,
+                                selection,
+                            );
+                            if let Err(end) = self.send_signal(request).await {
+                                self.close_stream();
+                                return Err(end);
+                            }
+                            let _ = publication;
+                        }
+                        Err(message) => {
+                            for outcome in viewer
+                                .on_start_failed(&message, Instant::now())
+                                .into_iter()
+                                .rev()
+                            {
+                                work.push_front(outcome);
+                            }
+                        }
+                    }
+                }
+                ViewerOutcome::Close => {
+                    self.close_stream();
+                }
+                ViewerOutcome::Send(signal) => self.send_signal(signal).await?,
+                ViewerOutcome::Offer(sdp) => {
+                    let failure = self
+                        .stream
+                        .as_ref()
+                        .and_then(|stream| stream.offer(sdp).err());
+                    if let Some(message) = failure {
+                        for outcome in viewer
+                            .on_engine_error(&message, Instant::now())
+                            .into_iter()
+                            .rev()
+                        {
+                            work.push_front(outcome);
+                        }
+                    }
+                }
+                ViewerOutcome::Ice(candidate) => {
+                    let failure = self
+                        .stream
+                        .as_ref()
+                        .and_then(|stream| stream.ice(candidate).err());
+                    if let Some(message) = failure {
+                        for outcome in viewer
+                            .on_engine_error(&message, Instant::now())
+                            .into_iter()
+                            .rev()
+                        {
+                            work.push_front(outcome);
+                        }
+                    }
+                }
+                ViewerOutcome::Mute { selection, muted } => {
+                    if self.stream_selection == Some(selection) {
+                        if let Some(stream) = &mut self.stream {
+                            if let Err(message) = stream.set_muted(muted) {
+                                self.updates.push(VoiceUpdate::StreamStatus {
+                                    selection,
+                                    status: message,
+                                });
+                            }
+                        }
+                    }
+                }
+                ViewerOutcome::Status { selection, text } => {
+                    self.updates.push(VoiceUpdate::StreamStatus {
+                        selection,
+                        status: text,
+                    });
+                }
+                ViewerOutcome::Connected {
+                    selection,
+                    connected,
+                } => {
+                    self.updates.push(VoiceUpdate::StreamConnected {
+                        selection,
+                        connected,
+                    });
+                }
+                ViewerOutcome::Clear { selection } => {
+                    if self.stream_selection == Some(selection) {
+                        self.close_stream();
+                    }
+                    self.updates.push(VoiceUpdate::StreamStatus {
+                        selection,
+                        status: String::new(),
+                    });
+                }
+                ViewerOutcome::Failed { selection, message } => {
+                    if self.stream_selection == Some(selection) {
+                        self.close_stream();
+                    }
+                    self.updates.push(VoiceUpdate::StreamError {
+                        selection,
+                        error: message,
+                    });
+                }
+                ViewerOutcome::Catalog => {
+                    self.updates
+                        .push(VoiceUpdate::Streams(viewer.catalog().list().to_vec()));
+                }
+            }
+        }
+        Ok(true)
+    }
+}
+
+#[cfg(test)]
+mod tests;

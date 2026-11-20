@@ -5,12 +5,19 @@
 //! through WASAPI loopback, feeding one `NativeAudioSource` in the screen-share
 //! peer. The two never share a track, a peer or `CaptureGate`.
 //!
-//! Loopback captures everything the endpoint renders, including Voxhold's own
-//! room and stream player. Windows has no per-process exclusion for loopback
-//! (the browser-only `restrictOwnAudio` is a Chromium feature), so the UI and
-//! this module state that limitation instead of promising echo-free system
-//! audio. The local «Ваш экран» preview stays a BGRA picture and never plays
-//! the captured audio.
+//! Windows offers two loopback scopes. The plain endpoint loopback captures
+//! everything the default render endpoint plays, including Voxhold's own room
+//! and stream player. Windows 10 build 20348+ and Windows 11 also expose process
+//! loopback (`ActivateAudioInterfaceAsync` with
+//! `PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE` /
+//! `EXCLUDE_TARGET_PROCESS_TREE`), which is the only way to keep the room voice
+//! out of a window share or Voxhold out of a whole-screen share. Microsoft
+//! documents this API from Windows 10 build 20348; an older host returns an
+//! explicit activation error, and the publication fails instead of silently
+//! capturing the whole endpoint. The UI and
+//! this module state the real scope instead of promising echo-free audio. The
+//! local «Ваш экран» preview stays a BGRA picture and never plays the captured
+//! audio.
 //!
 //! Layout:
 //! - [`AudioProducer`] is the block source the publisher engine pumps. The
@@ -21,7 +28,7 @@
 //!   even when nothing is playing.
 //! - `format` converts the device mix format (commonly 48 kHz float32 stereo)
 //!   into interleaved 48 kHz i16 stereo without a new dependency.
-//! - `wasapi` owns COM, the endpoint, the loopback client and the bounded
+//! - `wasapi` owns COM, the endpoint or process-loopback client and the bounded
 //!   reopen on a device change or removal.
 
 use std::{
@@ -34,6 +41,8 @@ use std::{
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
+
+use crate::screen_capture::{ScreenSource, SourceKind};
 
 /// The WebRTC audio pipeline and Opus use 48 kHz.
 pub const SAMPLE_RATE: u32 = 48_000;
@@ -59,6 +68,81 @@ pub struct AudioDeviceInfo {
     pub label: String,
     /// Human-readable mix format, for the manual loopback test.
     pub format: String,
+}
+
+/// What the user asked the system-audio track to cover. The engine resolves it
+/// to a concrete [`CaptureScope`] off the UI thread, right before the capture
+/// starts, so a stale picker never captures another process.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum AudioScope {
+    /// The whole default render endpoint. This is the explicit
+    /// "everything on the device" choice, never a silent fallback.
+    #[default]
+    Device,
+    /// The process tree of the selected window. Requires a window source.
+    WindowApplication,
+    /// The whole endpoint except this client's process tree.
+    EverythingExceptSelf,
+}
+
+impl AudioScope {
+    /// Resolve the user's choice against the source of the same attempt. A
+    /// window scope without a window source is an explicit error instead of a
+    /// whole-device capture.
+    pub fn resolve(self, source: &ScreenSource) -> Result<CaptureScope, String> {
+        self.resolve_with(source, platform::window_process_id)
+    }
+
+    /// The pure part of [`Self::resolve`]; tests inject the window lookup.
+    pub fn resolve_with(
+        self,
+        source: &ScreenSource,
+        window_process_id: impl FnOnce(u64) -> Result<u32, String>,
+    ) -> Result<CaptureScope, String> {
+        match self {
+            Self::Device => Ok(CaptureScope::Device),
+            Self::WindowApplication => {
+                if source.kind != SourceKind::Window {
+                    return Err("Звук приложения можно захватить только для окна.".into());
+                }
+                if source.id == 0 {
+                    return Err("Выбранное окно не сообщило идентификатор.".into());
+                }
+                Ok(CaptureScope::Process {
+                    pid: window_process_id(source.id)?,
+                })
+            }
+            Self::EverythingExceptSelf => Ok(CaptureScope::ExcludeProcess {
+                pid: std::process::id(),
+            }),
+        }
+    }
+}
+
+/// The scope with every process id resolved. Passed to the platform capture.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CaptureScope {
+    Device,
+    Process { pid: u32 },
+    ExcludeProcess { pid: u32 },
+}
+
+impl CaptureScope {
+    /// Human-readable scope of the capture that really runs. The process name
+    /// is read from Windows; an unavailable name falls back to the process id.
+    pub fn describe(self) -> String {
+        match self {
+            Self::Device => "Всё устройство вывода".into(),
+            Self::Process { pid } => match platform::process_name(pid) {
+                Some(name) => format!("Только звук {name} (PID {pid})"),
+                None => format!("Только процессы PID {pid}"),
+            },
+            Self::ExcludeProcess { pid } => match platform::process_name(pid) {
+                Some(name) => format!("Всё, кроме {name} (PID {pid})"),
+                None => format!("Всё, кроме процессов PID {pid}"),
+            },
+        }
+    }
 }
 
 /// The publisher engine pulls one 10 ms block at a time. `None` means "no
@@ -161,17 +245,17 @@ pub struct SystemAudio {
 }
 
 impl SystemAudio {
-    /// Open the default render endpoint in WASAPI shared loopback mode. The
-    /// call is bounded: a driver that never reports readiness is an error, not
-    /// a hang.
-    pub fn start() -> Result<Self, String> {
+    /// Open the requested scope. The call is bounded: a driver or the async
+    /// process-loopback activation that never reports readiness is an error,
+    /// not a hang, and never falls back to the whole endpoint.
+    pub fn start(scope: CaptureScope) -> Result<Self, String> {
         let shared = Arc::new(Shared::default());
         let (ready_tx, ready_rx) = mpsc::channel();
         let worker = shared.clone();
         let thread = thread::Builder::new()
             .name("voxhold-system-audio".into())
             .spawn(move || {
-                platform::run(&worker, &ready_tx);
+                platform::run(&worker, &ready_tx, scope);
                 if !worker.stopping() && worker.failure().is_none() {
                     worker.fail("Захват системного звука завершился.");
                 }
@@ -258,12 +342,27 @@ mod wasapi;
 mod platform {
     use super::*;
 
-    pub(super) fn run(shared: &Arc<Shared>, ready: &mpsc::Sender<Result<AudioDeviceInfo, String>>) {
-        wasapi::run(shared, ready);
+    pub(super) fn run(
+        shared: &Arc<Shared>,
+        ready: &mpsc::Sender<Result<AudioDeviceInfo, String>>,
+        scope: CaptureScope,
+    ) {
+        wasapi::run(shared, ready, scope);
     }
 
     pub(super) fn probe() -> Result<AudioDeviceInfo, String> {
         wasapi::probe()
+    }
+
+    /// `GetWindowThreadProcessId` for the HWND the capturer reports as a
+    /// window's source id.
+    pub(super) fn window_process_id(window: u64) -> Result<u32, String> {
+        wasapi::window_process_id(window)
+    }
+
+    /// File name of one process, for the honest scope label.
+    pub(super) fn process_name(pid: u32) -> Option<String> {
+        wasapi::process_name(pid)
     }
 }
 
@@ -274,12 +373,21 @@ mod platform {
     pub(super) fn run(
         _shared: &Arc<Shared>,
         ready: &mpsc::Sender<Result<AudioDeviceInfo, String>>,
+        _scope: CaptureScope,
     ) {
         let _ = ready.send(Err("Системный звук доступен только в Windows.".into()));
     }
 
     pub(super) fn probe() -> Result<AudioDeviceInfo, String> {
         Err("Системный звук доступен только в Windows.".into())
+    }
+
+    pub(super) fn window_process_id(_window: u64) -> Result<u32, String> {
+        Err("Окно можно сопоставить с процессом только в Windows.".into())
+    }
+
+    pub(super) fn process_name(_pid: u32) -> Option<String> {
+        None
     }
 }
 
@@ -318,6 +426,89 @@ mod tests {
         shared.fail("устройство исчезло");
         shared.fail("другая ошибка");
         assert_eq!(shared.failure().as_deref(), Some("устройство исчезло"));
+    }
+
+    fn window_source() -> ScreenSource {
+        ScreenSource {
+            id: 0x1234,
+            kind: SourceKind::Window,
+            title: "Демонстрация".into(),
+            display_id: -1,
+            width: 1280,
+            height: 720,
+            monitor: None,
+        }
+    }
+
+    fn monitor_source() -> ScreenSource {
+        ScreenSource {
+            id: 0,
+            kind: SourceKind::Monitor,
+            title: "Экран 1".into(),
+            display_id: -1,
+            width: 1920,
+            height: 1080,
+            monitor: None,
+        }
+    }
+
+    #[test]
+    fn a_window_scope_resolves_the_window_hwnd_to_its_process() {
+        let mut asked = None;
+        let scope = AudioScope::WindowApplication
+            .resolve_with(&window_source(), |window| {
+                asked = Some(window);
+                Ok(4_321)
+            })
+            .expect("a window has a process");
+        assert_eq!(asked, Some(0x1234), "the HWND of the selected window");
+        assert_eq!(scope, CaptureScope::Process { pid: 4_321 });
+    }
+
+    #[test]
+    fn a_window_scope_without_a_window_is_an_error_not_the_device() {
+        let error = AudioScope::WindowApplication
+            .resolve_with(&monitor_source(), |_| Ok(99))
+            .expect_err("a monitor has no window process");
+        assert!(error.contains("окна"), "{error}");
+    }
+
+    #[test]
+    fn the_exclude_scope_names_this_process_and_the_device_scope_is_explicit() {
+        assert_eq!(
+            AudioScope::EverythingExceptSelf
+                .resolve_with(&monitor_source(), |_| Ok(1))
+                .expect("the monitor scope needs no window"),
+            CaptureScope::ExcludeProcess {
+                pid: std::process::id()
+            }
+        );
+        assert_eq!(
+            AudioScope::Device
+                .resolve_with(&monitor_source(), |_| Ok(1))
+                .expect("the device scope is always valid"),
+            CaptureScope::Device
+        );
+    }
+
+    #[test]
+    fn the_scope_description_names_the_real_area() {
+        assert_eq!(CaptureScope::Device.describe(), "Всё устройство вывода");
+        assert!(
+            CaptureScope::Process { pid: 4_242 }
+                .describe()
+                .contains("4242")
+        );
+        assert!(
+            CaptureScope::ExcludeProcess { pid: 4_242 }
+                .describe()
+                .contains("кроме")
+        );
+        assert_ne!(
+            CaptureScope::Process { pid: 1 },
+            CaptureScope::ExcludeProcess { pid: 1 },
+            "include and exclude are different captures"
+        );
     }
 
     fn stereo_packet(frames: usize, left: i16, right: i16) -> Vec<u8> {
@@ -453,7 +644,7 @@ mod wasapi_manual {
             "wasapi: device={} format={} id={}",
             device.label, device.format, device.id
         );
-        let mut capture = SystemAudio::start().expect("loopback start");
+        let mut capture = SystemAudio::start(CaptureScope::Device).expect("loopback start");
         if let Some(opened) = capture.device() {
             println!("wasapi: opened {}", opened.format);
         }
@@ -483,5 +674,107 @@ mod wasapi_manual {
             peak > 500,
             "loopback delivered silence (peak {peak}); check the default output device"
         );
+    }
+
+    /// Manual proof of the window scope: process loopback INCLUDE of this test
+    /// process must carry the tone this process plays. Needs Windows 10 build
+    /// 20348+ or Windows 11. No other application has to be quiet for the
+    /// positive assertion; the negative one is checked by the next test.
+    #[test]
+    #[ignore = "manual: requires Windows process loopback and plays a short tone"]
+    fn process_loopback_of_this_process_captures_its_own_tone() {
+        let pid = std::process::id();
+        let mut capture = SystemAudio::start(CaptureScope::Process { pid })
+            .expect("process loopback INCLUDE this process");
+        if let Some(opened) = capture.device() {
+            println!(
+                "wasapi: opened process scope {} ({})",
+                opened.label, opened.format
+            );
+        }
+        let (baseline_blocks, baseline_peak) = collect(&mut capture, 400);
+        println!("wasapi: process baseline blocks={baseline_blocks} peak={baseline_peak}");
+
+        let wav = wav_tone(440.0, 1000);
+        let played = unsafe {
+            PlaySoundW(
+                PCWSTR(wav.as_ptr().cast()),
+                None,
+                SND_MEMORY | SND_ASYNC | SND_NODEFAULT,
+            )
+        };
+        let (blocks, peak) = collect(&mut capture, 1200);
+        println!(
+            "wasapi: process tone blocks={blocks} peak={peak} dropped={} failure={:?}",
+            capture.dropped(),
+            capture.failure()
+        );
+        drop(wav);
+        assert!(played.as_bool(), "winmm did not accept the in-memory WAV");
+        assert!(
+            blocks > 0,
+            "process loopback delivered no block during the tone"
+        );
+        assert!(
+            peak > 500,
+            "process loopback did not carry this process's own tone (peak {peak}); \
+             record the host Windows version and HRESULT instead of falling back"
+        );
+    }
+
+    /// The whole-screen scope must not carry Voxhold's own playback. Ignored:
+    /// it plays a tone from this process and needs process loopback EXCLUDE.
+    #[test]
+    #[ignore = "manual: requires Windows process loopback and plays a short tone"]
+    fn the_exclude_scope_does_not_capture_this_process() {
+        let pid = std::process::id();
+        let mut capture = SystemAudio::start(CaptureScope::ExcludeProcess { pid })
+            .expect("process loopback EXCLUDE this process");
+        let (baseline_blocks, baseline_peak) = collect(&mut capture, 400);
+        println!("wasapi: exclude baseline blocks={baseline_blocks} peak={baseline_peak}");
+
+        let wav = wav_tone(440.0, 1000);
+        let played = unsafe {
+            PlaySoundW(
+                PCWSTR(wav.as_ptr().cast()),
+                None,
+                SND_MEMORY | SND_ASYNC | SND_NODEFAULT,
+            )
+        };
+        let (blocks, peak) = collect(&mut capture, 1200);
+        println!(
+            "wasapi: exclude tone blocks={blocks} peak={peak} dropped={} failure={:?}",
+            capture.dropped(),
+            capture.failure()
+        );
+        drop(wav);
+        assert!(played.as_bool(), "winmm did not accept the in-memory WAV");
+        assert!(blocks > 0, "the exclude stream must still deliver silence");
+        assert!(
+            peak < 500,
+            "the exclude scope carried this process's own tone (peak {peak}); \
+             this is the defect the scope must prevent"
+        );
+    }
+
+    /// An unknown target process must be an explicit error, never a fallback to
+    /// the whole endpoint. PID 0 is the system idle process and is not a valid
+    /// process-loopback target.
+    #[test]
+    fn process_loopback_with_an_invalid_target_fails_instead_of_falling_back() {
+        let result = SystemAudio::start(CaptureScope::Process { pid: 0 });
+        match result {
+            Ok(capture) => {
+                drop(capture);
+                panic!("an invalid process target must not open a capture");
+            }
+            Err(error) => {
+                println!("wasapi: process loopback rejected PID 0: {error}");
+                assert!(
+                    !error.contains("Устройство вывода по умолчанию"),
+                    "the failure must not describe a whole-device capture: {error}"
+                );
+            }
+        }
     }
 }

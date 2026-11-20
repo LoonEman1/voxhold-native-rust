@@ -481,7 +481,7 @@ fn device_choices_and_voice_prefs_are_local() {
         input: true,
     }];
     let (_, _, current) = crate::voice_settings::device_choices(&prefs, &devices, true);
-    assert_eq!(current, "Устройство недоступно");
+    assert_eq!(current, crate::voice_settings::UNAVAILABLE_DEVICE);
 }
 
 #[gpui::test]

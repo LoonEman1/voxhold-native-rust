@@ -46,6 +46,7 @@ mod settings_slider_tests;
 #[cfg(test)]
 mod settings_tests;
 mod settings_view;
+mod settings_voice_shortcuts;
 mod settings_voice_view;
 mod shell_view;
 #[cfg(test)]
@@ -57,9 +58,27 @@ mod update_ops;
 #[cfg(test)]
 mod update_tests;
 mod update_view;
+#[cfg(all(feature = "voxhold-media", test))]
+mod voice_cue_tests;
+#[cfg(test)]
+mod voice_dock_tests;
 #[cfg(test)]
 mod voice_form_tests;
+#[cfg(test)]
+mod voice_gain_tests;
 mod voice_ops;
+#[cfg(test)]
+mod voice_screen_audio_tests;
+#[cfg(test)]
+mod voice_screen_confirmed_tests;
+#[cfg(test)]
+mod voice_screen_identity_tests;
+#[cfg(test)]
+mod voice_screen_operation_tests;
+#[cfg(test)]
+mod voice_screen_preview_tests;
+#[cfg(test)]
+mod voice_screen_restart_tests;
 #[cfg(test)]
 mod voice_screen_tests;
 mod voice_settings_ops;
@@ -194,6 +213,15 @@ struct ForwardState {
     sending: bool,
     error: String,
 }
+/// One cue the test sink captured instead of opening an audio device.
+#[cfg(all(feature = "voxhold-media", test))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CueCall {
+    pub(crate) cue: crate::ui_sounds::VoiceCue,
+    pub(crate) volume: i64,
+    pub(crate) output: String,
+}
+
 pub(crate) struct Voxhold {
     runtime: std::sync::Arc<tokio::runtime::Runtime>,
     instance: Entity<InputState>,
@@ -350,6 +378,12 @@ pub(crate) struct Voxhold {
     /// Channel of the active call, mirrored from the panel for the dock.
     #[cfg(feature = "voxhold-media")]
     voice_channel: i64,
+    /// Local interface-cue player. It owns one background WinMM thread and
+    /// never blocks the UI; the tests replace it with a capture sink.
+    #[cfg(all(feature = "voxhold-media", not(test)))]
+    voice_cue_player: voxhold_media::preview::CuePlayer,
+    #[cfg(all(feature = "voxhold-media", test))]
+    voice_cue_calls: Vec<CueCall>,
     /// Confirmed rosters keyed by `(server_id, channel_id)`, so browsing
     /// another server does not discard its cached room.
     #[cfg(feature = "voxhold-media")]
@@ -728,6 +762,10 @@ impl Voxhold {
             voice_chat_rooms: std::collections::HashSet::new(),
             #[cfg(feature = "voxhold-media")]
             voice_channel: 0,
+            #[cfg(all(feature = "voxhold-media", not(test)))]
+            voice_cue_player: voxhold_media::preview::CuePlayer::new(),
+            #[cfg(all(feature = "voxhold-media", test))]
+            voice_cue_calls: Vec::new(),
             #[cfg(feature = "voxhold-media")]
             voice_unconfirmed: std::collections::HashSet::new(),
             voice_rooms: std::collections::HashMap::new(),

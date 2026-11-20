@@ -11,6 +11,11 @@ use serde_json::{json, Value};
 /// Go `voiceBitrates`, in the frontend order. 160 is not offered.
 pub const BITRATES: [i64; 6] = [24, 32, 48, 64, 96, 128];
 
+/// Name `device_choices` reports for a saved endpoint that is no longer listed.
+/// The voice form compares against this shared constant for the danger styling,
+/// so the label and its tone cannot drift apart.
+pub const UNAVAILABLE_DEVICE: &str = "Устройство недоступно";
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VoicePrefs {
     pub input: String,
@@ -150,6 +155,22 @@ impl VoicePrefs {
         })
     }
 
+    /// The action that already owns `combo`, ignoring modifier spelling and
+    /// order. `except` is the action being rebound, so its own current value is
+    /// never reported as a conflict with itself. Actions are 0 mute, 1 deafen
+    /// and 2 push-to-talk, matching `recording_shortcut`.
+    pub fn shortcut_owner(&self, combo: &str, except: usize) -> Option<usize> {
+        let canonical = canonical_shortcut(combo);
+        if canonical.is_empty() {
+            return None;
+        }
+        [&self.mute, &self.deafen, &self.push_to_talk]
+            .into_iter()
+            .enumerate()
+            .find(|(index, value)| *index != except && canonical_shortcut(value) == canonical)
+            .map(|(index, _)| index)
+    }
+
     /// Duplicate shortcuts are rejected by the Go form. Comparison ignores
     /// modifier spelling and order, so `Ctrl+Shift+M` and `Shift+Control+M`
     /// are the same binding.
@@ -193,6 +214,17 @@ fn normalize_shortcut(value: &mut String, fallback: &str) {
     } else if trimmed.len() != value.len() {
         *value = trimmed.to_owned();
     }
+}
+
+/// Stable display names of the three voice shortcut actions, in the same order
+/// as `recording_shortcut` and the recorded fields.
+pub const SHORTCUT_ACTION_NAMES: [&str; 3] =
+    ["Микрофон вкл/выкл", "Звук вкл/выкл", "Нажми и говори"];
+
+/// Name of one voice shortcut action. The recorder and the conflict message
+/// both use this helper, so a renamed row cannot leave a stale sentence.
+pub fn shortcut_action_name(field: usize) -> Option<&'static str> {
+    SHORTCUT_ACTION_NAMES.get(field).copied()
 }
 
 /// One spelling for a shortcut: `ctrl+alt+shift+super+key`, modifiers sorted.
@@ -339,6 +371,12 @@ pub struct VoiceSettings {
     pub device_notice: String,
     /// Shortcut currently being recorded: 0 mute, 1 deafen, 2 push-to-talk.
     pub recording_shortcut: Option<usize>,
+    /// View-only rejection shown while the recorder stays open. It is never
+    /// persisted; the previous binding and `saved_error` stay untouched.
+    pub shortcut_conflict: String,
+    /// The voice tab's «Подробнее» block. Collapsed by default; it only hides
+    /// explanation rows, every control stays reachable outside it.
+    pub diagnostics_open: bool,
     pub tone_pending: bool,
     pub tone_error: String,
     /// Bumped whenever the meter task must stop or restart.
@@ -375,6 +413,8 @@ impl Default for VoiceSettings {
             preview_pending: false,
             device_notice: String::new(),
             recording_shortcut: None,
+            shortcut_conflict: String::new(),
+            diagnostics_open: false,
             tone_pending: false,
             tone_error: String::new(),
             meter_epoch: 0,
@@ -539,7 +579,7 @@ pub fn device_choices(
         names.push(device.name.clone());
     }
     if !selected.is_empty() && !ids.contains(selected) {
-        current = "Устройство недоступно".to_owned();
+        current = UNAVAILABLE_DEVICE.to_owned();
     }
     (names, ids, current)
 }
@@ -775,6 +815,29 @@ mod tests {
     }
 
     #[test]
+    fn shortcut_owner_reports_the_action_and_skips_the_one_being_rebound() {
+        let mut prefs = VoicePrefs::default();
+        prefs.deafen = "Control+Shift+D".into();
+        assert_eq!(prefs.shortcut_owner("Ctrl+Shift+D", 0), Some(1));
+        assert_eq!(
+            prefs.shortcut_owner("Shift+Ctrl+D", 2),
+            Some(1),
+            "modifier order and spelling do not matter"
+        );
+        assert_eq!(
+            prefs.shortcut_owner("Ctrl+Shift+D", 1),
+            None,
+            "the action being rebound does not conflict with its own value"
+        );
+        assert_eq!(prefs.shortcut_owner("Ctrl+Shift+K", 0), None);
+        assert_eq!(prefs.shortcut_owner("Ctrl+", 0), None);
+        assert_eq!(shortcut_action_name(0), Some("Микрофон вкл/выкл"));
+        assert_eq!(shortcut_action_name(1), Some("Звук вкл/выкл"));
+        assert_eq!(shortcut_action_name(2), Some("Нажми и говори"));
+        assert_eq!(shortcut_action_name(3), None);
+    }
+
+    #[test]
     fn user_volumes_are_keyed_by_user_id_and_bounded() {
         let mut prefs = VoicePrefs::default();
         prefs.user_volumes.insert(7, 150);
@@ -852,7 +915,9 @@ mod tests {
         let (names, ids, select) = device_choices(&prefs, &devices, true);
         assert_eq!(names, vec!["Системное по умолчанию", "Microphone"]);
         assert_eq!(ids, vec!["", "mic-1"]);
-        assert_eq!(select, "Устройство недоступно");
+        assert_eq!(select, UNAVAILABLE_DEVICE);
+        // The published contract stays the exact Go/frontend sentence.
+        assert_eq!(UNAVAILABLE_DEVICE, "Устройство недоступно");
         assert_eq!(device_choices(&prefs, &devices, false).0[1], "Speakers");
     }
 }

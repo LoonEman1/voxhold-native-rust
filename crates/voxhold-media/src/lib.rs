@@ -178,11 +178,22 @@ pub enum Event {
         level: f64,
     },
     /// Pre-gate software-capture meter. `dropped` counts whole 10 ms blocks
-    /// discarded by the bounded PCM queue or a stalled `NativeAudioSource`.
+    /// discarded by the bounded jitter queue, an epoch/mute flush, or a
+    /// `NativeAudioSource` send that failed or unexpectedly stayed pending.
+    /// The other fields are the aggregate capture counters reported with the
+    /// meter so a periodic click (missed slots) or a driver problem is
+    /// observable outside `MicCapture::stats()`: underruns, whole blocks lost
+    /// to the ceiling, skipped and short-late ticks, and source send errors.
+    /// Counters only; no PCM or personal content.
     InputLevel {
         level: f64,
         muted: bool,
         dropped: u64,
+        underruns: u64,
+        overflow_blocks: u64,
+        late_ticks: u64,
+        late_sends: u64,
+        source_errors: u64,
     },
     /// The applied capture path, reported once per session. `capture` is
     /// `software` for the WinMM 48 kHz path or `platform` for the ADM fallback;

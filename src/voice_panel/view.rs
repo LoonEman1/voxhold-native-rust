@@ -3,6 +3,18 @@
 
 use super::*;
 
+/// Tinted SVG for the room and dock actions. The shipped icons paint their
+/// strokes with `currentColor`, so the tint has to be set on the SVG element
+/// itself; `app::ui::icon` is private to the app module.
+pub(super) fn vector_icon(path: &'static str, size: f32, color: gpui::Rgba) -> gpui::AnyElement {
+    gpui::svg()
+        .path(path)
+        .w(px(size))
+        .h(px(size))
+        .text_color(color)
+        .into_any_element()
+}
+
 impl VoicePanel {
     fn room_phase(&self) -> CallPhase {
         if self.call_channel != 0 && self.call_channel == self.room {
@@ -24,45 +36,63 @@ impl VoicePanel {
     }
 
     fn action_active(&self, action: &VoiceAction) -> bool {
-        match action.id {
-            "voice-mic" => self.self_muted || self.server_muted,
-            "voice-deaf" => self.controls.deafened,
-            "voice-leave" => true,
-            _ => false,
-        }
+        self.action_active_flag(action.id)
     }
 
+    /// One vertical toolbar button, per web `CallControls`: a 46x45 cell with
+    /// the icon above a small label. The icon itself is tinted; leave is the
+    /// coral filled action.
     fn action_button(
         &self,
-        index: usize,
+        slot: usize,
+        action_index: usize,
         action: &VoiceAction,
-        labels: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let c = self.colors();
         let active = self.action_active(action);
-        let color = if active { c.danger } else { c.muted };
+        let style = voice_room::toolbar_action_style(
+            action.id,
+            active,
+            voice_room::ActionColors {
+                surface: c.surface,
+                line: c.line,
+                muted: c.muted,
+                danger: c.danger,
+                danger_bg: c.danger_bg,
+                on_danger: 0xffffff,
+            },
+        );
         let action_id = action.id;
         div()
-            .id(("voice-action", index))
-            .debug_selector(move || format!("voice-action-{index}").into())
-            .h_full()
-            .flex_1()
+            .id(("voice-action", slot))
+            .debug_selector(move || format!("voice-action-{slot}").into())
+            .w(px(voice_room::TOOLBAR_BUTTON_WIDTH))
+            .h(px(voice_room::TOOLBAR_BUTTON_HEIGHT))
+            .flex_shrink_0()
             .flex()
+            .flex_col()
             .items_center()
             .justify_center()
-            .gap_2()
-            .rounded(px(10.))
+            .gap(px(3.))
+            .rounded(px(9.))
             .cursor_pointer()
-            .bg(rgb(if active { c.danger_bg } else { c.surface }))
-            .border_1()
-            .border_color(rgb(if active { c.danger } else { c.line }))
-            .text_color(rgb(color))
-            .track_focus(&self.action_focus[index])
-            .child(img(self.action_icon(action)).w(px(16.)).h(px(16.)))
-            .when(labels, |button| {
-                button.child(div().text_size(px(11.)).child(action.label))
+            .when(style.margin_left > 0.0, |button| {
+                button.ml(px(style.margin_left))
             })
+            .bg(rgb(style.fill))
+            .border_1()
+            .border_color(rgb(style.border))
+            .text_color(rgb(style.text))
+            .track_focus(&self.action_focus[action_index])
+            .child(vector_icon(self.action_icon(action), 16., rgb(style.text)))
+            .child(
+                div()
+                    .text_size(px(9.))
+                    .line_height(px(10.))
+                    .truncate()
+                    .child(action.label),
+            )
             .on_click(cx.listener(move |panel, _, window, cx| match action_id {
                 "voice-mic" => panel.mute(cx),
                 "voice-deaf" => panel.deafen(cx),
@@ -627,12 +657,20 @@ impl VoicePanel {
                 .border_1()
                 .border_color(rgb(c.line))
                 .flex()
-                .gap(px(5.))
+                .items_center()
+                .justify_center()
+                .gap(px(voice_room::TOOLBAR_BUTTON_GAP))
                 .p(px(7.));
-            for (index, action) in VOICE_ACTIONS.iter().enumerate() {
-                bar = bar.child(self.action_button(index, action, true, cx));
+            // Web `CallControls` order; camera, start recording and chat have
+            // no implementation yet, so they are not painted at all.
+            for (slot, id) in TOOLBAR_ACTIONS.iter().enumerate() {
+                if *id == "voice-screen" {
+                    bar = bar.child(self.screen_share_button(cx));
+                } else if let Some(index) = VOICE_ACTIONS.iter().position(|action| action.id == *id)
+                {
+                    bar = bar.child(self.action_button(slot, index, &VOICE_ACTIONS[index], cx));
+                }
             }
-            bar = bar.child(self.screen_share_button(cx));
             body = body.child(bar);
             // The disabled button carries its reason in the room, not in a
             // hover-only tooltip: there is no dead element without an

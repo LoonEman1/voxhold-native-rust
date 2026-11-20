@@ -14,29 +14,49 @@ impl VoicePanel {
             update,
             VoiceUpdate::ScreenShare(_) | VoiceUpdate::ScreenSources { .. }
         ) {
-            return self.apply_screen_update(update);
+            let sources = matches!(update, VoiceUpdate::ScreenSources { .. });
+            let repaint = self.apply_screen_update(update);
+            if sources {
+                // A fresh answer can add, remove or rename rows; only the
+                // visible category is queued, and cached/pending ids skip.
+                self.request_screen_previews(cx);
+            }
+            return repaint;
         }
         let mut repaint = true;
         match update {
             VoiceUpdate::Connecting => {
-                self.phase = CallPhase::Connecting;
+                self.transition_phase(CallPhase::Connecting, cx);
                 self.status = "Подключение…".into();
                 self.applied_audio = None;
+                // The previous session's sink stopped; its report must not
+                // keep the room on the software path if this attempt opens
+                // without a mixer (ADM) or is still starting one.
+                self.playout = None;
                 self.controls.muted = true;
+                self.sync_output_gain();
                 self.release_push_to_talk();
             }
             VoiceUpdate::Connected => {
                 if self.phase != CallPhase::Connected {
-                    self.phase = CallPhase::Connected;
+                    self.transition_phase(CallPhase::Connected, cx);
                     self.status = "Подключено".into();
                     self.refresh_capture();
                 }
             }
             VoiceUpdate::Reconnecting => {
-                self.phase = CallPhase::Reconnecting;
+                self.transition_phase(CallPhase::Reconnecting, cx);
                 self.status = "Восстанавливаем соединение…".into();
                 self.applied_audio = None;
+                // A `Playout` report is session state: the old sink is gone,
+                // and keeping its `running, Stable` snapshot would make the
+                // next session look software even when its mixer never opened
+                // and the ADM plays the room.
+                self.playout = None;
                 self.controls.muted = true;
+                // The next session starts before its playback path is known:
+                // hand it the stored percentage again.
+                self.sync_output_gain();
                 self.release_push_to_talk();
                 // Go drops the confirmed roster until the fresh join; a
                 // stale list must not look like a live call during a
@@ -70,7 +90,12 @@ impl VoicePanel {
                 self.local_level = level;
             }
             VoiceUpdate::Tracks(tracks) => self.tracks = tracks,
-            VoiceUpdate::Streams(streams) => self.streams = streams,
+            VoiceUpdate::Streams(streams) => {
+                self.streams = streams;
+                // The slot count may have changed under an open picker or a
+                // pending capture preparation.
+                self.sync_screen_access();
+            }
             VoiceUpdate::StreamStatus { selection, status } => {
                 if self.watching_selection != Some(selection) {
                     return false;
@@ -136,14 +161,22 @@ impl VoicePanel {
             }
             VoiceUpdate::AudioMode(applied) => {
                 self.applied_audio = Some(applied);
+                // ADM has no numeric room gain: clear it while that path plays
+                // and put the stored percentage back when the software mixer
+                // returns, without waiting for the settings tab.
+                self.sync_output_gain();
             }
             VoiceUpdate::Playout(stats) => {
                 self.playout = Some(stats);
+                // A final `AdmFallback` report or a reopened mixer changes the
+                // playback path: keep the sent numeric gain in step.
+                self.sync_output_gain();
             }
             VoiceUpdate::Ended(error) => {
                 self.handle.take();
                 self.reset_screen();
                 self.applied_audio = None;
+                self.restore_output_gain();
                 self.server_muted = false;
                 self.self_connection = None;
                 self.playout = None;
@@ -152,18 +185,20 @@ impl VoicePanel {
                 self.ptt_combo = None;
                 self.close_player_in_window(window);
                 self.call_channel = 0;
-                self.phase = if error.is_some() {
-                    CallPhase::Failed
-                } else {
-                    CallPhase::Idle
-                };
+                self.transition_phase(
+                    if error.is_some() {
+                        CallPhase::Failed
+                    } else {
+                        CallPhase::Idle
+                    },
+                    cx,
+                );
                 self.error = error.unwrap_or_default();
                 self.status.clear();
                 self.participants.clear();
                 self.clear_speaking(cx);
                 self.tracks.clear();
                 self.streams.clear();
-                self.notify_call_changed(cx);
             }
             VoiceUpdate::ScreenShare(_) | VoiceUpdate::ScreenSources { .. } => {}
         }

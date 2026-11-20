@@ -268,6 +268,18 @@ impl Render for Voxhold {
         let thread_active = self.show_thread && self.thread.is_some();
         let voice_room = !personal_empty && self.voice_room_visible();
         let room_chat = voice_room && self.voice_chat_open();
+        // The focus ring is rebuilt from these flags on every Tab press, so
+        // they must describe this frame, not the previous one. The dock starts
+        // hidden and only `voice_dock()` raises it after it actually paints;
+        // the room flag is the same predicate that chooses `history` below.
+        #[cfg(feature = "voxhold-media")]
+        if let Some(voice) = &self.voice {
+            let room_painted = voice_room;
+            voice.update(cx, |panel, _| {
+                panel.set_room_painted(room_painted);
+                panel.set_dock_visible(false);
+            });
+        }
         let history = if personal_empty {
             self.personal_center(window, cx)
         } else if voice_room {

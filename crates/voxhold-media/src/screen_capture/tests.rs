@@ -237,8 +237,47 @@ fn an_empty_source_list_is_not_a_native_success() {
 fn a_real_desktop_capture_delivers_a_frame() {
     let sources = list_sources(SourceKind::Monitor).expect("monitor list");
     assert!(!sources.is_empty(), "no monitor sources on this host");
+    for candidate in &sources {
+        println!(
+            "monitor {} · identity {:?} · {}×{}",
+            candidate.id,
+            candidate
+                .monitor
+                .as_ref()
+                .map(|monitor| monitor.device.as_str()),
+            candidate.width,
+            candidate.height
+        );
+    }
+    // Every screen source has an empty title on the pinned capturer; the
+    // identity must therefore come from `EnumDisplayDevicesW`. Without a
+    // bound display the picker cannot offer a selectable monitor at all.
+    let source = sources
+        .iter()
+        .find(|source| source.monitor.is_some())
+        .expect("no monitor source is bound to a Windows display")
+        .clone();
+    let identity = source.monitor.as_ref().expect("checked above");
+    assert!(
+        !identity.device.trim().is_empty(),
+        "a bound monitor must name its Windows display"
+    );
+    assert!(identity.size().0 >= 2 && identity.size().1 >= 2);
+    // The same display must resolve uniquely in a fresh enumeration.
+    let other = sources
+        .iter()
+        .filter(|candidate| candidate.id != source.id)
+        .filter(|candidate| {
+            candidate
+                .monitor
+                .as_ref()
+                .is_some_and(|m| m.device.eq_ignore_ascii_case(&identity.device))
+        })
+        .count();
+    assert_eq!(other, 0, "one display cannot be offered under two ids");
+
     let latest = std::sync::Arc::new(LatestImage::default());
-    let mut capture = ScreenCapture::start(sources[0].clone(), (1280, 720), 30, latest.clone())
+    let mut capture = ScreenCapture::start(source.clone(), (1280, 720), 30, latest.clone())
         .expect("capture start");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     let image = loop {
@@ -252,13 +291,13 @@ fn a_real_desktop_capture_delivers_a_frame() {
         std::thread::sleep(std::time::Duration::from_millis(50));
     };
     println!(
-        "captured {}×{} from {:?}; first frame {}×{}",
-        image.width, image.height, sources[0], image.width, image.height
+        "captured {}×{} from {}; first frame {}×{}",
+        image.width, image.height, source.title, image.width, image.height
     );
     assert!(image.width >= 2 && image.height >= 2);
     assert!(image.i420.width() == image.width && image.i420.height() == image.height);
     capture.stop();
-    assert!(!sources[0].describe().is_empty());
+    assert!(!source.describe().is_empty());
 
     // The same picker must list windows with real titles. This process has no
     // visible top-level window, so the own-process filter is a no-op here; it
@@ -279,4 +318,139 @@ fn a_real_desktop_capture_delivers_a_frame() {
             .all(|window| window.kind == SourceKind::Window),
         "the window list must not mix monitor sources"
     );
+}
+
+#[test]
+fn a_bgra_thumbnail_is_downscaled_to_a_bounded_picture() {
+    // 16×8: red above, blue below. The preview is 8×4 and keeps the halves.
+    let mut source = solid(16, 8, 16 * 4, [0, 0, 255, 255]);
+    for y in 4..8 {
+        for x in 0..16 {
+            let at = y * 16 * 4 + x * 4;
+            source[at..at + 4].copy_from_slice(&[255, 0, 0, 255]);
+        }
+    }
+    let preview = preview_from_bgra(&source, 16, 8, 16 * 4, 8).expect("thumbnail");
+    assert_eq!((preview.width, preview.height), (8, 4));
+    assert_eq!(preview.bgra.len(), 8 * 4 * 4);
+    // Top row is red (B low, R high), bottom row is blue.
+    assert!(preview.bgra[0] < 30 && preview.bgra[2] > 200, "top");
+    let bottom = 3 * 8 * 4;
+    assert!(
+        preview.bgra[bottom] > 200 && preview.bgra[bottom + 2] < 30,
+        "bottom"
+    );
+    assert!(preview.bgra.iter().skip(3).step_by(4).all(|a| *a == 255));
+
+    // A caller cannot exceed the picker bound, and a small picture is never
+    // upscaled.
+    let wide = solid(400, 8, 400 * 4, [10, 20, 30, 255]);
+    let bounded = preview_from_bgra(&wide, 400, 8, 400 * 4, 10_000).expect("bounded");
+    assert_eq!(bounded.width, MAX_THUMBNAIL_WIDTH);
+    let small = preview_from_bgra(&source, 16, 8, 16 * 4, 16).expect("small");
+    assert_eq!((small.width, small.height), (16, 8));
+
+    // A short buffer, a too-small stride or a zero side is refused.
+    assert!(preview_from_bgra(&[], 16, 8, 16 * 4, 8).is_none());
+    assert!(preview_from_bgra(&source, 16, 8, 8, 8).is_none());
+    assert!(preview_from_bgra(&source, 0, 8, 16 * 4, 8).is_none());
+}
+
+/// Manual proof on a real desktop: one monitor or window delivers a thumbnail.
+/// Only dimensions are printed, never a source title. Run explicitly:
+/// `cargo test -p voxhold-media -- --ignored screen_capture`.
+#[cfg(windows)]
+#[test]
+#[ignore = "требует реальный рабочий стол; запускается вручную"]
+fn a_real_source_yields_a_bounded_thumbnail() {
+    let source = list_sources(SourceKind::Monitor)
+        .ok()
+        .and_then(|sources| sources.into_iter().next())
+        .or_else(|| {
+            list_sources(SourceKind::Window)
+                .ok()
+                .and_then(|sources| sources.into_iter().next())
+        })
+        .expect("no monitor or window source on this host");
+    let preview = capture_thumbnail(&source, MAX_THUMBNAIL_WIDTH).expect("thumbnail");
+    println!(
+        "thumbnail {}×{} ({:?} source kind)",
+        preview.width, preview.height, source.kind
+    );
+    assert!(preview.width >= 2 && preview.height >= 2);
+    assert!(preview.width <= MAX_THUMBNAIL_WIDTH);
+    assert_eq!(
+        preview.bgra.len(),
+        preview.width as usize * preview.height as usize * 4
+    );
+}
+
+/// Manual proof on a real desktop: the first window source yields a thumbnail
+/// of the same bounded shape. Only dimensions are printed, never a title. Run
+/// explicitly:
+/// `cargo test -p voxhold-media -- --ignored a_real_window_yields_a_bounded_thumbnail`.
+#[cfg(windows)]
+#[test]
+#[ignore = "требует реальный рабочий стол; запускается вручную"]
+fn a_real_window_yields_a_bounded_thumbnail() {
+    let source = list_sources(SourceKind::Window)
+        .expect("window list")
+        .into_iter()
+        .next()
+        .expect("no visible window source on this host");
+    assert_eq!(source.kind, SourceKind::Window);
+    let preview = capture_thumbnail(&source, MAX_THUMBNAIL_WIDTH).expect("window thumbnail");
+    println!("window thumbnail {}×{}", preview.width, preview.height);
+    assert!(preview.width >= 2 && preview.height >= 2);
+    assert!(preview.width <= MAX_THUMBNAIL_WIDTH);
+    assert_eq!(
+        preview.bgra.len(),
+        preview.width as usize * preview.height as usize * 4
+    );
+}
+
+fn descriptor(device: &str, width: u32, height: u32) -> MonitorDescriptor {
+    MonitorIdentity {
+        device: device.into(),
+        bounds: MonitorRect::new(0, 0, width, height),
+        work: MonitorRect::new(0, 0, width, height),
+        width,
+        height,
+    }
+}
+
+#[test]
+fn a_monitor_source_identity_ignores_its_mutable_label() {
+    let identity = descriptor(r"\\.\DISPLAY1", 1920, 1080);
+    let source = ScreenSource {
+        id: 7,
+        kind: SourceKind::Monitor,
+        title: "Экран 1".into(),
+        display_id: -1,
+        width: 1920,
+        height: 1080,
+        monitor: Some(identity.clone()),
+    };
+    let renamed = ScreenSource {
+        title: "Другое имя".into(),
+        width: 800,
+        height: 600,
+        ..source.clone()
+    };
+    assert_eq!(source.source_id(), renamed.source_id());
+    assert_eq!(source.identity(), renamed.identity());
+    assert_eq!(source.identity(), Some(SourceIdentity::Monitor(identity)));
+    assert_ne!(source.describe(), renamed.describe());
+
+    // The card/focus key follows the display, not the capturer number.
+    let moved = ScreenSource {
+        id: 9,
+        ..source.clone()
+    };
+    assert_eq!(source.focus_key(), moved.focus_key());
+    let other = ScreenSource {
+        monitor: Some(descriptor(r"\\.\DISPLAY2", 2560, 1440)),
+        ..source.clone()
+    };
+    assert_ne!(source.focus_key(), other.focus_key());
 }

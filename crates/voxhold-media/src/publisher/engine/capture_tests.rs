@@ -63,6 +63,7 @@ fn request() -> PublishRequest {
             display_id: -1,
             width: 64,
             height: 36,
+            monitor: None,
         },
         quality: Quality {
             resolution: Resolution::P720,
@@ -72,6 +73,7 @@ fn request() -> PublishRequest {
         },
         codec: Codec::Vp8,
         audio: false,
+        audio_scope: crate::system_audio::AudioScope::Device,
     }
 }
 
@@ -81,6 +83,7 @@ fn start(script: Script) -> PublisherEngine {
         Vec::new(),
         "all".into(),
         Box::new(ScriptedProducer { script, tick: 0 }),
+        None,
         None,
         Arc::new(PreviewStore::default()),
     )

@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::runtime::requests::ScreenCommand;
+use crate::stream::EngineUpdate;
 use std::collections::HashMap;
 
 fn publication(connection: &str) -> Publication {
@@ -32,10 +33,12 @@ fn screen_commands_keep_their_order_and_listings_keep_the_newest_generation() {
             display_id: -1,
             width: 1920,
             height: 1080,
+            monitor: None,
         },
         quality: Quality::default(),
         codec: Codec::Vp8,
         audio: false,
+        audio_scope: crate::system_audio::AudioScope::Device,
     };
     // Opening the picker must reach the worker before the chosen source.
     crate::runtime::requests::push_screen(&requests, ScreenCommand::OpenPicker { picker: 1 });
@@ -414,10 +417,12 @@ fn screen_request() -> crate::publisher::PublishRequest {
             display_id: -1,
             width: 1920,
             height: 1080,
+            monitor: None,
         },
         quality: Quality::default(),
         codec: Codec::Vp8,
         audio: false,
+        audio_scope: crate::system_audio::AudioScope::Device,
     }
 }
 
@@ -433,27 +438,206 @@ fn screen_publisher() -> crate::publisher::Publisher {
     publisher
 }
 
+/// A publisher whose attempt reached the air: both engine confirmations.
+fn live_screen_publisher(now: Instant) -> crate::publisher::Publisher {
+    use crate::publisher::EngineEvent;
+    let mut publisher = screen_publisher();
+    publisher.begin_picker(1);
+    publisher.publish(1, screen_request(), false, now);
+    publisher.engine_ready(now, false, None);
+    publisher.on_engine(
+        EngineEvent::State(crate::publisher::Connection::Connected),
+        now,
+    );
+    publisher.on_engine(
+        EngineEvent::State(crate::publisher::Connection::FirstFrame),
+        now,
+    );
+    assert_eq!(publisher.phase(), crate::publisher::Phase::Live);
+    publisher
+}
+
+#[test]
+fn a_stale_deferred_bitrate_never_reaches_a_freed_worker_queue() {
+    use crate::publisher::engine::BitrateSend;
+    use crate::publisher::{BITRATE_CONFIRM_TIMEOUT, Outcome as PublisherOutcome, Phase};
+
+    let now = Instant::now();
+    let mut publisher = live_screen_publisher(now);
+    let attempt = publisher.sharing().attempt;
+    let previous = publisher.request().cloned().expect("live request");
+    let previous_confirmed = publisher.sharing().confirmed.clone();
+    let mut next = screen_request();
+    next.quality.bitrate_kbps = 9000;
+    let outcomes = publisher.apply_quality(7, next.clone(), now);
+    let Some(PublisherOutcome::SetBitrate { quality, .. }) = outcomes.first() else {
+        panic!("a live bitrate change is one command: {outcomes:?}");
+    };
+    let quality = *quality;
+    let mut queue = super::screen::BitrateQueue::default();
+    queue.request(attempt, 7, quality);
+    // The bounded worker queue was full: the value stays deferred.
+    assert!(
+        super::screen::deliver_bitrate(&mut queue, &mut publisher, |_, _, _| BitrateSend::Full)
+            .is_empty()
+    );
+    assert!(queue.is_pending(), "the deferred value survives a tick");
+
+    // The confirmation deadline passes: the operation is refused and is no
+    // longer awaited, while the attempt keeps running.
+    let expired = publisher.tick(now + BITRATE_CONFIRM_TIMEOUT);
+    assert!(matches!(expired.as_slice(), [PublisherOutcome::State(_)]));
+    assert_eq!(publisher.phase(), Phase::Live);
+    assert!(
+        !publisher.awaits_bitrate(7),
+        "the timeout ends the operation"
+    );
+
+    // The queue frees up only after the timeout. The next tick must drop the
+    // deferred value instead of sending a bitrate the dialog gave up on.
+    let late = super::screen::deliver_bitrate(&mut queue, &mut publisher, |_, _, _| {
+        panic!("a stale bitrate must not reach the engine")
+    });
+    assert!(late.is_empty(), "a stale retry reports nothing: {late:?}");
+    assert!(!queue.is_pending(), "the stale value is dropped");
+
+    // The live attempt, the confirmed limits and the reported error stay.
+    assert_eq!(publisher.phase(), Phase::Live);
+    assert_eq!(publisher.request(), Some(&previous));
+    assert_eq!(publisher.sharing().confirmed, previous_confirmed);
+    assert!(
+        publisher.sharing().error.is_some(),
+        "the refused operation stays visible"
+    );
+
+    // A retry under a new operation is delivered as usual.
+    let retried = publisher.apply_quality(8, next, now + BITRATE_CONFIRM_TIMEOUT);
+    assert!(matches!(
+        retried.first(),
+        Some(PublisherOutcome::SetBitrate { op: 8, .. })
+    ));
+    queue.request(attempt, 8, quality);
+    let mut sent = None;
+    let delivered =
+        super::screen::deliver_bitrate(&mut queue, &mut publisher, |attempt, op, value| {
+            sent = Some((attempt, op, value));
+            BitrateSend::Sent
+        });
+    assert!(delivered.is_empty());
+    assert_eq!(
+        sent,
+        Some((attempt, 8, quality)),
+        "the retry reaches the engine under its own operation"
+    );
+}
+
+#[test]
+fn a_slow_engine_drop_does_not_block_the_release_path() {
+    use std::sync::{
+        Arc, Condvar, Mutex,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    /// A stand-in for `PublisherEngine` whose `Drop` takes as long as the gate
+    /// stays closed, like the bounded join of a capture/publisher worker. The
+    /// wait has its own timeout, so a release that ran on the caller's thread
+    /// fails the elapsed assertion instead of hanging the suite.
+    struct GatedEngine {
+        gate: Arc<(Mutex<bool>, Condvar)>,
+        released: Arc<AtomicBool>,
+    }
+
+    impl Drop for GatedEngine {
+        fn drop(&mut self) {
+            let (open, changed) = &*self.gate;
+            let mut open = open.lock().unwrap();
+            while !*open {
+                let (next, timeout) = changed.wait_timeout(open, Duration::from_secs(2)).unwrap();
+                open = next;
+                if timeout.timed_out() {
+                    break;
+                }
+            }
+            self.released.store(true, Ordering::SeqCst);
+        }
+    }
+
+    let gate = Arc::new((Mutex::new(false), Condvar::new()));
+    let released = Arc::new(AtomicBool::new(false));
+    let started = Instant::now();
+    // `screen::release_off_loop` is the same primitive plus the live probe; an
+    // engine that joins its worker for seconds must not hold the session loop.
+    super::screen::release_on_worker(
+        GatedEngine {
+            gate: gate.clone(),
+            released: released.clone(),
+        },
+        || {},
+    );
+    assert!(
+        started.elapsed() < Duration::from_millis(500),
+        "the session path waited for the engine drop: {:?}",
+        started.elapsed()
+    );
+    assert!(
+        !released.load(Ordering::SeqCst),
+        "the drop is still gated, so the caller must not have performed it"
+    );
+
+    // The engine is still released, just off the session path.
+    *gate.0.lock().unwrap() = true;
+    gate.1.notify_all();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !released.load(Ordering::SeqCst) {
+        assert!(
+            Instant::now() < deadline,
+            "the release thread never dropped the engine"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
 #[test]
 fn a_failed_engine_start_cancels_the_attempt_without_stream_start() {
     use crate::publisher::{Outcome as PublisherOutcome, Phase};
+    use crate::runtime::prep::{PrepBinding, PrepEvent, ScreenPrep, finish_prep};
     let now = Instant::now();
     let mut publisher = screen_publisher();
     publisher.begin_picker(1);
-    let mut outcomes = publisher.publish(1, screen_request(), false, now);
-    assert!(matches!(
-        outcomes.as_slice(),
-        [PublisherOutcome::StartEngine { .. }]
-    ));
-    let PublisherOutcome::StartEngine { request, .. } = outcomes.remove(0) else {
+    let outcomes = publisher.publish(1, screen_request(), false, now);
+    let PublisherOutcome::StartEngine { attempt, .. } = outcomes[0] else {
         unreachable!()
     };
-    // The substitutable engine starter fails: the attempt must be cancelled
-    // whole, with neither `stream.start` nor a compensating `stream.stop`.
-    let (engine, failure) = super::screen::start_engine::<()>(&mut publisher, request, now, |_| {
+    let binding = PrepBinding {
+        attempt,
+        server: 1,
+        channel: 10,
+        connection: Some("me".into()),
+        access: super::screen::screen_access(true, true, true),
+    };
+    // The off-loop preparation fails: the attempt must be cancelled whole,
+    // with neither `stream.start` nor a compensating `stream.stop`.
+    let mut prep = ScreenPrep::<()>::start(binding.clone(), now, Duration::from_secs(5), |_| {
         Err("движок не создан".to_string())
-    });
-    assert!(engine.is_none());
-    outcomes.extend(failure);
+    })
+    .expect("the preparation thread starts");
+    let event = loop {
+        if let Some(event) = prep.poll(Instant::now()) {
+            break event;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    };
+    assert!(matches!(event, PrepEvent::Failed(_)));
+    let finish = finish_prep(
+        &mut publisher,
+        &binding,
+        &binding,
+        super::screen::screen_access(true, true, true),
+        event,
+        now,
+    );
+    assert!(finish.engine.is_none());
+    let outcomes = finish.outcomes;
     assert!(
         !outcomes
             .iter()
@@ -473,6 +657,198 @@ fn a_failed_engine_start_cancels_the_attempt_without_stream_start() {
             .tick(now + crate::publisher::ANSWER_TIMEOUT)
             .is_empty(),
         "the failed start leaves no deadline"
+    );
+}
+
+#[test]
+fn the_newest_screen_gate_is_a_last_value_request() {
+    let requests = Requests::default();
+    requests
+        .screen_access
+        .lock()
+        .unwrap()
+        .replace(ScreenAccess {
+            stream_permission: false,
+            slot_available: true,
+        });
+    requests
+        .screen_access
+        .lock()
+        .unwrap()
+        .replace(ScreenAccess {
+            stream_permission: true,
+            slot_available: false,
+        });
+    match requests.take() {
+        Some(Pending::ScreenAccess(access)) => {
+            assert!(access.stream_permission, "the newest value wins");
+            assert!(!access.slot_available);
+        }
+        _ => panic!("the newest gate must reach the worker"),
+    }
+    assert!(requests.take().is_none());
+}
+
+#[test]
+fn a_cached_repaint_does_not_confirm_a_recovering_stream() {
+    let now = Instant::now();
+    let a = publication("a");
+    let mut viewer = Viewer::new(1, 10);
+    viewer.on_server_event(
+        "stream.snapshot",
+        "",
+        &serde_json::json!({"streams": [a.clone()]}),
+        now,
+    );
+    viewer.set_joined(true, now);
+    let started = viewer.select(&a, 1, now);
+    assert!(
+        started
+            .iter()
+            .any(|outcome| matches!(outcome, ViewerOutcome::Start { selection: 1, .. })),
+        "the viewer must be watching before recovery: {started:?}"
+    );
+    // A working picture first, then the engine reports a broken transport and
+    // arms the recovery deadline.
+    assert!(viewer.on_frame().iter().any(|outcome| matches!(
+        outcome,
+        ViewerOutcome::Connected {
+            selection: 1,
+            connected: true
+        }
+    )));
+    let recovering = viewer.on_engine_state("disconnected", now);
+    assert!(recovering.iter().any(|outcome| matches!(
+        outcome,
+        ViewerOutcome::Connected {
+            selection: 1,
+            connected: false
+        }
+    )));
+    assert!(viewer.watching().unwrap().recovering);
+
+    // The last decoded frame is still in the store. A viewport-only re-read
+    // must surface as a repaint, not as a fresh RTP frame.
+    let (mut stream, _commands, events, video) = StreamViewer::detached_for_tests();
+    assert!(video.publish_i420(libwebrtc::video_frame::I420Buffer::new_black(320, 180)));
+    events.push(crate::Event::Frame);
+    let mut render = crate::VideoFrame::default();
+    assert!(matches!(
+        stream.poll(&mut render, 160, 90),
+        Some(EngineUpdate::Frame)
+    ));
+    // Only the picture surface changes now; no RTP frame is queued.
+    assert!(matches!(
+        stream.poll(&mut render, 320, 278),
+        Some(EngineUpdate::Repaint)
+    ));
+
+    // Exactly what `drain_viewer` does for the cached update: publish the
+    // picture without any viewer transition.
+    let slot = Mutex::new(None);
+    let EngineEffect::Outcomes(outcomes) =
+        apply_engine_update(&slot, &mut render, &mut viewer, EngineUpdate::Repaint, now)
+    else {
+        panic!("a repaint is a picture update, not an audio-output result");
+    };
+    assert!(
+        outcomes.is_empty(),
+        "a repaint must not emit status or Connected: {outcomes:?}"
+    );
+    let frame = slot
+        .lock()
+        .unwrap()
+        .take()
+        .expect("the repaint must reach the picture slot");
+    assert_eq!((frame.selection, frame.width, frame.height), (1, 320, 180));
+
+    let watching = viewer
+        .watching()
+        .expect("the recovering stream stays selected");
+    assert!(watching.recovering, "a repaint must not clear recovery");
+    assert!(
+        !watching.connected,
+        "a repaint must not report the stream as connected"
+    );
+    // The deadline armed by `on_engine_state` is still live: the runtime tick
+    // still closes and restarts instead of leaving a frozen "connected" view.
+    let expired = viewer.tick(now + crate::viewer::START_TIMEOUT + Duration::from_millis(1));
+    assert!(!expired.is_empty(), "the recovery deadline must still fire");
+    assert!(
+        expired
+            .iter()
+            .any(|outcome| matches!(outcome, ViewerOutcome::Close)),
+        "the failed attempt is closed: {expired:?}"
+    );
+}
+
+#[test]
+fn a_full_bitrate_queue_defers_the_newest_value_and_a_closed_worker_is_terminal() {
+    use crate::publisher::Quality;
+    use crate::publisher::engine::BitrateSend;
+
+    let mut queue = super::screen::BitrateQueue::default();
+    let first = Quality {
+        bitrate_kbps: 1200,
+        ..Quality::default()
+    };
+    queue.request(4, 1, first);
+    assert_eq!(
+        queue.flush(4, |_, _, _| BitrateSend::Full),
+        super::screen::BitrateDelivery::Full,
+        "a full command queue is deferred, not failed"
+    );
+    assert!(
+        queue.is_pending(),
+        "the deferred value must survive for the next tick"
+    );
+
+    // The newest dialog value replaces the deferred one; only it is sent.
+    let newest = Quality {
+        bitrate_kbps: 900,
+        ..Quality::default()
+    };
+    queue.request(4, 2, newest);
+    let mut sent = None;
+    assert_eq!(
+        queue.flush(4, |attempt, op, quality| {
+            sent = Some((attempt, op, quality));
+            BitrateSend::Sent
+        }),
+        super::screen::BitrateDelivery::Sent
+    );
+    assert_eq!(
+        sent.map(|(attempt, op, quality)| (attempt, op, quality.bitrate_kbps)),
+        Some((4, 2, 900)),
+        "the retry carries the newest value and the same operation tag"
+    );
+    assert!(
+        !queue.is_pending(),
+        "an accepted value is no longer pending"
+    );
+
+    // A request that belongs to an older attempt never reaches a new sender.
+    queue.request(3, 3, newest);
+    assert_eq!(
+        queue.flush(4, |_, _, _| panic!("a stale attempt must not be sent")),
+        super::screen::BitrateDelivery::Idle
+    );
+    assert!(!queue.is_pending());
+
+    // A closed worker is terminal: the value is dropped, not retried, and the
+    // publisher ends the live attempt instead of claiming the new limit.
+    queue.request(4, 4, newest);
+    assert_eq!(
+        queue.flush(4, |_, _, _| BitrateSend::Closed),
+        super::screen::BitrateDelivery::Closed
+    );
+    assert!(
+        !queue.is_pending(),
+        "a dead worker must not be retried forever"
+    );
+    assert_eq!(
+        queue.flush(4, |_, _, _| panic!("nothing may be retried")),
+        super::screen::BitrateDelivery::Idle
     );
 }
 

@@ -53,6 +53,7 @@ fn a_screen_publication_never_touches_the_microphone_gate() {
                 display_id: -1,
                 width: 640,
                 height: 360,
+                monitor: None,
             },
             quality: crate::publisher::Quality {
                 resolution: crate::publisher::Resolution::P720,
@@ -62,6 +63,7 @@ fn a_screen_publication_never_touches_the_microphone_gate() {
             },
             codec: crate::publisher::Codec::Vp8,
             audio: true,
+            audio_scope: crate::system_audio::AudioScope::Device,
         },
         Vec::new(),
         "all".into(),

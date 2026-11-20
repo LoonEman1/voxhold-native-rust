@@ -177,6 +177,458 @@ async fn the_playout_report_is_kept_for_the_measured_mixer_line(cx: &mut TestApp
 }
 
 #[gpui::test]
+async fn the_output_gain_follows_the_active_playback_path(cx: &mut TestAppContext) {
+    let (visual, view, voice) = voice_call(cx);
+    visual.update(|window, app| {
+        // Before any path is reported the stored 150 % is already the value the
+        // next call will use.
+        view.update(app, |v, cx| {
+            use personal_settings::Action;
+            assert!(v.voice_settings_action(Action::SetVolume("output", 150), cx));
+        });
+        voice.update(app, |panel, _| {
+            assert_eq!(
+                panel.test_controls().output_gain,
+                Some(1.5),
+                "an unknown path keeps the stored percentage"
+            );
+            let snapshot = panel
+                .test_take_audio_snapshot()
+                .expect("the settings change is forwarded");
+            assert_eq!(snapshot.0.output_gain, Some(1.5));
+        });
+
+        let adm = || voxhold_media::controller::AppliedAudio {
+            capture: "platform",
+            noise_mode: "auto",
+            echo_cancellation: false,
+            auto_gain_control: true,
+            software_mixer: false,
+        };
+        voice.update(app, |panel, cx| {
+            assert!(panel.test_apply_update(VoiceUpdate::AudioMode(adm()), window, cx));
+            assert_eq!(
+                panel.test_controls().output_gain,
+                None,
+                "the ADM has no numeric room gain"
+            );
+            let snapshot = panel
+                .test_take_audio_snapshot()
+                .expect("the path change forwards the updated controls");
+            assert_eq!(snapshot.0.output_gain, None);
+            // Deafen is the real room mute on the ADM path: it still reaches
+            // the engine while the numeric gain stays absent.
+            panel.deafen(cx);
+            let snapshot = panel
+                .test_take_audio_snapshot()
+                .expect("deafen is forwarded");
+            assert!(snapshot.0.deafened);
+            assert_eq!(snapshot.0.output_gain, None);
+            panel.deafen(cx);
+            let _ = panel.test_take_audio_snapshot();
+        });
+
+        // The software mixer returns: the stored percentage is restored and
+        // sent without reopening the settings tab.
+        let software = voxhold_media::controller::AppliedAudio {
+            capture: "software",
+            noise_mode: "auto",
+            echo_cancellation: false,
+            auto_gain_control: true,
+            software_mixer: true,
+        };
+        voice.update(app, |panel, cx| {
+            assert!(panel.test_apply_update(VoiceUpdate::AudioMode(software), window, cx));
+            assert_eq!(panel.test_controls().output_gain, Some(1.5));
+            let snapshot = panel
+                .test_take_audio_snapshot()
+                .expect("the restored gain is forwarded");
+            assert_eq!(snapshot.0.output_gain, Some(1.5));
+        });
+
+        // Leaving the call restores the stored value for the next join after
+        // the ADM had cleared the numeric field.
+        voice.update(app, |panel, cx| {
+            panel.leave_call(cx);
+            assert_eq!(panel.test_controls().output_gain, Some(1.5));
+        });
+    });
+}
+
+#[gpui::test]
+async fn the_output_slider_keeps_its_value_but_is_disabled_on_the_adm(cx: &mut TestAppContext) {
+    let (mut visual, view, voice) = voice_call(cx);
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            use personal_settings::Action;
+            assert!(v.voice_settings_action(Action::SetVolume("output", 150), cx));
+        });
+        voice.update(app, |panel, cx| {
+            assert!(panel.test_apply_update(
+                VoiceUpdate::AudioMode(voxhold_media::controller::AppliedAudio {
+                    capture: "platform",
+                    noise_mode: "auto",
+                    echo_cancellation: false,
+                    auto_gain_control: true,
+                    software_mixer: false,
+                }),
+                window,
+                cx,
+            ));
+        });
+        let _ = window;
+    });
+    draw(&mut visual);
+    view.read_with(&*visual, |v, _| {
+        assert_eq!(
+            v.voice_settings.prefs.output_volume, 150,
+            "the stored percentage stays visible in the form"
+        );
+        assert!(
+            v.test_slider_focus("output-volume").is_none(),
+            "the ADM slider is not a Tab stop"
+        );
+    });
+    assert!(visual.debug_bounds("output-volume").is_some());
+    assert!(
+        visual.debug_bounds("output-volume-value").is_some(),
+        "the percentage is painted, not hidden"
+    );
+    assert!(
+        visual.debug_bounds("output-volume-adm-note").is_some(),
+        "the form states that only mute is applied"
+    );
+    // A click on the track must not change the stored value.
+    let track = view
+        .read_with(&*visual, |v, _| v.test_slider_track("output-volume"))
+        .expect("the disabled slider is still measured");
+    let row = visual
+        .debug_bounds("output-volume-track")
+        .expect("the disabled track is painted");
+    let y = f32::from(row.origin.y) + f32::from(row.size.height) / 2.;
+    let at = gpui::point(gpui::px(track.origin_x + track.width * 0.25), gpui::px(y));
+    visual.simulate_mouse_move(at, None, gpui::Modifiers::default());
+    visual.simulate_click(at, gpui::Modifiers::default());
+    draw(&mut visual);
+    view.read_with(&*visual, |v, _| {
+        assert_eq!(
+            v.voice_settings.prefs.output_volume, 150,
+            "a disabled ADM slider ignores the click"
+        );
+    });
+
+    // The software mixer returns: the same stored percentage becomes editable.
+    visual.update(|window, app| {
+        voice.update(app, |panel, cx| {
+            assert!(panel.test_apply_update(
+                VoiceUpdate::AudioMode(voxhold_media::controller::AppliedAudio {
+                    capture: "software",
+                    noise_mode: "auto",
+                    echo_cancellation: false,
+                    auto_gain_control: true,
+                    software_mixer: true,
+                }),
+                window,
+                cx,
+            ));
+        });
+    });
+    draw(&mut visual);
+    view.read_with(&*visual, |v, _| {
+        assert!(
+            v.test_slider_focus("output-volume").is_some(),
+            "the software mixer makes the slider a Tab stop again"
+        );
+        assert_eq!(v.voice_settings.prefs.output_volume, 150);
+    });
+
+    // Outside a call the stored value is editable for the next join.
+    visual.update(|_, app| {
+        voice.update(app, |panel, cx| panel.leave_call(cx));
+    });
+    draw(&mut visual);
+    view.read_with(&*visual, |v, _| {
+        assert!(v.test_slider_focus("output-volume").is_some());
+        assert_eq!(v.voice_settings.prefs.output_volume, 150);
+    });
+}
+
+#[test]
+fn the_output_slider_is_editable_outside_a_call_and_on_the_software_mixer() {
+    use super::settings_voice_view::output_gain_editable;
+    assert!(
+        output_gain_editable(false, false),
+        "outside a call it is stored for the next join"
+    );
+    assert!(output_gain_editable(false, true));
+    assert!(
+        output_gain_editable(true, true),
+        "the software mixer applies it"
+    );
+    assert!(
+        !output_gain_editable(true, false),
+        "the ADM keeps the value but cannot apply it"
+    );
+}
+
+/// Both cross cases: the output row follows the playback path, not the
+/// capture chain. A software microphone can be played by the ADM, and a
+/// platform microphone can coexist with the running software mixer.
+#[gpui::test]
+async fn the_output_row_follows_playback_not_the_capture_chain(cx: &mut TestAppContext) {
+    use crate::audio_capabilities::OutputGainPath;
+    use voxhold_media::mixer::{PlayoutPhase, PlayoutStats};
+    let (mut visual, view, voice) = voice_call(cx);
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            use personal_settings::Action;
+            assert!(v.voice_settings_action(Action::SetVolume("output", 150), cx));
+            v.voice_settings.diagnostics_open = true;
+            cx.notify();
+        });
+        voice.update(app, |panel, cx| {
+            // Cross case 1: the microphone opened in software, but the session
+            // has no software mixer, so the ADM plays the room.
+            assert!(panel.test_apply_update(
+                VoiceUpdate::AudioMode(voxhold_media::controller::AppliedAudio {
+                    capture: "software",
+                    noise_mode: "auto",
+                    echo_cancellation: false,
+                    auto_gain_control: true,
+                    software_mixer: false,
+                }),
+                window,
+                cx,
+            ));
+            assert_eq!(
+                panel.output_gain_path(),
+                OutputGainPath::Adm,
+                "a software microphone does not imply a software room"
+            );
+            assert_eq!(
+                panel.test_controls().output_gain,
+                None,
+                "the ADM receives no numeric gain"
+            );
+            let _ = window;
+        });
+    });
+    draw(&mut visual);
+    view.read_with(&*visual, |v, _| {
+        assert!(
+            v.test_slider_focus("output-volume").is_none(),
+            "no running mixer means the slider is disabled"
+        );
+    });
+    assert!(
+        visual.debug_bounds("cap-output-tag-недоступно").is_some(),
+        "«Подробнее» must not promise gain while the ADM plays"
+    );
+    assert!(
+        visual.debug_bounds("output-volume-adm-note").is_some(),
+        "the disabled slider explains that only mute applies"
+    );
+
+    // Cross case 2: the microphone fell back to the platform ADM, but the
+    // software mixer is running and applies the numeric gain.
+    visual.update(|window, app| {
+        voice.update(app, |panel, cx| {
+            assert!(panel.test_apply_update(
+                VoiceUpdate::AudioMode(voxhold_media::controller::AppliedAudio {
+                    capture: "platform",
+                    noise_mode: "auto",
+                    echo_cancellation: false,
+                    auto_gain_control: true,
+                    software_mixer: true,
+                }),
+                window,
+                cx,
+            ));
+            assert!(panel.test_apply_update(
+                VoiceUpdate::Playout(PlayoutStats {
+                    running: true,
+                    phase: PlayoutPhase::Stable,
+                    ..PlayoutStats::default()
+                }),
+                window,
+                cx,
+            ));
+            assert_eq!(
+                panel.output_gain_path(),
+                OutputGainPath::Software,
+                "the running mixer owns playback even after a platform microphone"
+            );
+            let snapshot = panel
+                .test_take_audio_snapshot()
+                .expect("the restored numeric gain is forwarded");
+            assert_eq!(snapshot.0.output_gain, Some(1.5));
+        });
+    });
+    draw(&mut visual);
+    view.read_with(&*visual, |v, _| {
+        assert!(
+            v.test_slider_focus("output-volume").is_some(),
+            "the running mixer keeps the slider editable"
+        );
+    });
+    assert!(
+        visual.debug_bounds("cap-output-tag-применяется").is_some(),
+        "the row follows the live playback path"
+    );
+}
+
+/// A mixer that is opening, retrying or suspended is not the ADM: the slider
+/// stays disabled, but the sentence and the row must not claim system playback.
+#[gpui::test]
+async fn a_retrying_or_suspended_mixer_is_not_reported_as_the_adm(cx: &mut TestAppContext) {
+    use crate::audio_capabilities::OutputGainPath;
+    use crate::voice_form_text::{
+        output_gain_note, output_volume_note, OUTPUT_VOLUME_ADM_NOTE, OUTPUT_VOLUME_TEMP_NOTE,
+    };
+    use voxhold_media::mixer::{PlayoutPhase, PlayoutStats};
+    let (mut visual, view, voice) = voice_call(cx);
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            use personal_settings::Action;
+            assert!(v.voice_settings_action(Action::SetVolume("output", 150), cx));
+            v.voice_settings.diagnostics_open = true;
+            cx.notify();
+        });
+        voice.update(app, |panel, cx| {
+            assert!(panel.test_apply_update(
+                VoiceUpdate::AudioMode(voxhold_media::controller::AppliedAudio {
+                    capture: "software",
+                    noise_mode: "auto",
+                    echo_cancellation: false,
+                    auto_gain_control: true,
+                    software_mixer: true,
+                }),
+                window,
+                cx,
+            ));
+            assert!(panel.test_apply_update(
+                VoiceUpdate::Playout(PlayoutStats {
+                    running: true,
+                    phase: PlayoutPhase::Stable,
+                    ..PlayoutStats::default()
+                }),
+                window,
+                cx,
+            ));
+            assert_eq!(panel.output_gain_path(), OutputGainPath::Software);
+            let _ = window;
+        });
+    });
+
+    // The sink died and the bounded retry owns it now. There is no ADM in this
+    // state, so the slider is disabled and the text must not name one.
+    visual.update(|window, app| {
+        voice.update(app, |panel, cx| {
+            assert!(panel.test_apply_update(
+                VoiceUpdate::Playout(PlayoutStats {
+                    running: false,
+                    phase: PlayoutPhase::Opening,
+                    ..PlayoutStats::default()
+                }),
+                window,
+                cx,
+            ));
+            assert_eq!(panel.output_gain_path(), OutputGainPath::Unavailable);
+            assert_eq!(
+                panel.test_controls().output_gain,
+                Some(1.5),
+                "the stored percentage is kept for the reopening mixer"
+            );
+            assert_eq!(
+                output_volume_note(panel.output_gain_path()),
+                OUTPUT_VOLUME_TEMP_NOTE,
+                "a retry is described as temporarily unavailable"
+            );
+            // The engine follows the final `running=false` report with an
+            // `Audio` snapshot whose live `software_mixer` flag is false. That
+            // is not proof of the ADM: the retry still owns the room.
+            assert!(panel.test_apply_update(
+                VoiceUpdate::AudioMode(voxhold_media::controller::AppliedAudio {
+                    capture: "software",
+                    noise_mode: "auto",
+                    echo_cancellation: false,
+                    auto_gain_control: true,
+                    software_mixer: false,
+                }),
+                window,
+                cx,
+            ));
+            assert_eq!(panel.output_gain_path(), OutputGainPath::Unavailable);
+            assert_eq!(panel.test_controls().output_gain, Some(1.5));
+
+            // A suspended system has no sink and no ADM either.
+            panel.power(false, cx);
+            assert_eq!(panel.output_gain_path(), OutputGainPath::Unavailable);
+            panel.power(true, cx);
+        });
+    });
+    draw(&mut visual);
+    view.read_with(&*visual, |v, _| {
+        assert!(
+            v.test_slider_focus("output-volume").is_none(),
+            "a mixer that is not running disables the slider"
+        );
+    });
+    assert!(
+        visual.debug_bounds("cap-output-tag-недоступно").is_some(),
+        "a transient outage is still unavailable, not applied"
+    );
+
+    // The budget is spent: now the ADM really owns the room.
+    visual.update(|window, app| {
+        voice.update(app, |panel, cx| {
+            assert!(panel.test_apply_update(
+                VoiceUpdate::Playout(PlayoutStats {
+                    running: false,
+                    phase: PlayoutPhase::AdmFallback,
+                    ..PlayoutStats::default()
+                }),
+                window,
+                cx,
+            ));
+            assert_eq!(panel.output_gain_path(), OutputGainPath::Adm);
+            assert_eq!(
+                panel.test_controls().output_gain,
+                None,
+                "the ADM must not receive the software percentage"
+            );
+            assert_eq!(
+                output_volume_note(panel.output_gain_path()),
+                OUTPUT_VOLUME_ADM_NOTE
+            );
+            assert_eq!(
+                output_gain_note(panel.output_gain_path()),
+                OUTPUT_VOLUME_ADM_NOTE,
+                "the capability row follows the ADM path"
+            );
+            let snapshot = panel
+                .test_take_audio_snapshot()
+                .expect("clearing the gain is forwarded");
+            assert_eq!(snapshot.0.output_gain, None);
+        });
+    });
+    draw(&mut visual);
+    view.read_with(&*visual, |v, _| {
+        assert!(v.test_slider_focus("output-volume").is_none());
+    });
+    // The ADM note selector was never painted before this draw (the earlier
+    // frames showed the transient path note), so it proves the Adm branch.
+    // The capability tag cannot: it was already `недоступно` for the
+    // transient outage, so a stale frame would satisfy it. The fresh-frame tag
+    // assertion lives in `the_first_adm_frame_paints...`; here the note
+    // mapping above is the direct check.
+    assert!(
+        visual.debug_bounds("output-volume-adm-note").is_some(),
+        "the spent budget paints the ADM sentence for the first time"
+    );
+}
+
+#[gpui::test]
 async fn closing_the_view_flushes_a_queued_voice_save(cx: &mut TestAppContext) {
     let (mut visual, view, _voice) = voice_call(cx);
     let directory = std::env::temp_dir().join(format!(

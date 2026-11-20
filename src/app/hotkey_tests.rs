@@ -55,7 +55,7 @@ fn voice_tab(cx: &mut TestAppContext) -> (&'static mut VisualTestContext, Entity
 }
 
 #[gpui::test]
-async fn the_next_key_becomes_the_binding_and_a_duplicate_is_flagged(cx: &mut TestAppContext) {
+async fn a_duplicate_combination_is_rejected_and_the_recorder_stays_open(cx: &mut TestAppContext) {
     let (_visual, view) = voice_tab(cx);
     let event = key("ctrl-shift-d");
     assert_eq!(
@@ -69,21 +69,134 @@ async fn the_next_key_becomes_the_binding_and_a_duplicate_is_flagged(cx: &mut Te
         event.keystroke.modifiers
     );
     view.update(cx, |v, cx| {
+        v.voice_settings.saved_error = "предыдущая ошибка".into();
         v.start_shortcut_recording(0, cx);
         assert!(v.record_shortcut_key(&key("ctrl-shift-d"), cx));
         assert_eq!(
-            v.voice_settings.prefs.mute, "Ctrl+Shift+D",
-            "the captured combination is stored as pressed"
+            v.voice_settings.prefs.mute, "Ctrl+Shift+M",
+            "the previous mute binding is kept"
         );
-        assert_eq!(v.voice_settings.recording_shortcut, None);
+        assert_eq!(
+            v.voice_settings.recording_shortcut,
+            Some(0),
+            "the recorder stays open for another combination"
+        );
+        assert_eq!(
+            v.voice_settings.shortcut_conflict,
+            "Сочетание уже занято: Звук вкл/выкл. Нажмите другое."
+        );
+        assert_eq!(
+            v.voice_settings.saved_error, "предыдущая ошибка",
+            "a rejected attempt is not a save error"
+        );
+        assert_eq!(v.voice_settings.writes, 0);
         assert!(
-            !v.voice_settings.prefs.shortcuts_valid(),
-            "the form reports the conflict with the deafen binding"
+            v.voice_settings
+                .store
+                .is_newest(v.voice_settings.saved_generation),
+            "a rejected attempt must not queue a save"
         );
-        v.start_shortcut_recording(0, cx);
+        // A unique combination after the rejection applies and clears the
+        // notice.
         assert!(v.record_shortcut_key(&key("ctrl-shift-k"), cx));
         assert_eq!(v.voice_settings.prefs.mute, "Ctrl+Shift+K");
+        assert_eq!(v.voice_settings.recording_shortcut, None);
+        assert!(v.voice_settings.shortcut_conflict.is_empty());
         assert!(v.voice_settings.prefs.shortcuts_valid());
+    });
+}
+
+#[gpui::test]
+async fn recording_deafen_rejects_the_push_to_talk_combination(cx: &mut TestAppContext) {
+    let (_visual, view) = voice_tab(cx);
+    view.update(cx, |v, cx| {
+        v.start_shortcut_recording(1, cx);
+        assert!(v.record_shortcut_key(&key("space"), cx));
+        assert_eq!(
+            v.voice_settings.prefs.deafen, "Ctrl+Shift+D",
+            "the previous deafen binding is kept"
+        );
+        assert_eq!(v.voice_settings.recording_shortcut, Some(1));
+        assert_eq!(
+            v.voice_settings.shortcut_conflict,
+            "Сочетание уже занято: Нажми и говори. Нажмите другое."
+        );
+        assert_eq!(v.voice_settings.writes, 0);
+        assert!(
+            v.voice_settings
+                .store
+                .is_newest(v.voice_settings.saved_generation),
+            "a rejected attempt must not queue a save"
+        );
+    });
+}
+
+#[gpui::test]
+async fn equivalent_modifier_spelling_and_order_are_detected(cx: &mut TestAppContext) {
+    let (_visual, view) = voice_tab(cx);
+    view.update(cx, |v, cx| {
+        v.voice_settings.prefs.deafen = "Shift+Control+D".into();
+        v.start_shortcut_recording(0, cx);
+        assert!(v.record_shortcut_key(&key("ctrl-shift-d"), cx));
+        assert_eq!(v.voice_settings.prefs.mute, "Ctrl+Shift+M");
+        assert_eq!(
+            v.voice_settings.shortcut_conflict,
+            "Сочетание уже занято: Звук вкл/выкл. Нажмите другое.",
+            "Ctrl+Shift+D and Shift+Control+D are the same binding"
+        );
+    });
+}
+
+#[gpui::test]
+async fn escape_clears_the_conflict_message_and_keeps_the_old_binding(cx: &mut TestAppContext) {
+    let (visual, view) = voice_tab(cx);
+    visual.update(|_, app| {
+        view.update(app, |v, cx| {
+            v.voice_settings.saved_error = "предыдущая ошибка".into();
+            v.start_shortcut_recording(0, cx);
+            assert!(v.record_shortcut_key(&key("ctrl-shift-d"), cx));
+            assert!(!v.voice_settings.shortcut_conflict.is_empty());
+        });
+    });
+    visual.simulate_event(key("escape"));
+    visual.update(|_, app| {
+        view.update(app, |v, _| {
+            assert_eq!(v.voice_settings.prefs.mute, "Ctrl+Shift+M");
+            assert_eq!(v.voice_settings.recording_shortcut, None);
+            assert!(v.voice_settings.shortcut_conflict.is_empty());
+            assert_eq!(v.voice_settings.saved_error, "предыдущая ошибка");
+        });
+    });
+}
+
+#[gpui::test]
+async fn re_pressing_the_own_combination_is_not_a_conflict(cx: &mut TestAppContext) {
+    let (_visual, view) = voice_tab(cx);
+    view.update(cx, |v, cx| {
+        v.start_shortcut_recording(0, cx);
+        assert!(v.record_shortcut_key(&key("ctrl-shift-m"), cx));
+        assert_eq!(v.voice_settings.prefs.mute, "Ctrl+Shift+M");
+        assert!(v.voice_settings.shortcut_conflict.is_empty());
+        assert_eq!(v.voice_settings.recording_shortcut, None);
+        assert_eq!(
+            v.voice_settings.writes, 0,
+            "keeping the same binding is a no-op, not a new write"
+        );
+    });
+}
+
+#[gpui::test]
+async fn closing_the_voice_tab_clears_the_conflict_message(cx: &mut TestAppContext) {
+    let (visual, view) = voice_tab(cx);
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            v.start_shortcut_recording(0, cx);
+            assert!(v.record_shortcut_key(&key("ctrl-shift-d"), cx));
+            assert!(!v.voice_settings.shortcut_conflict.is_empty());
+            v.close_settings(false, window, cx);
+            assert!(v.voice_settings.shortcut_conflict.is_empty());
+            assert_eq!(v.voice_settings.recording_shortcut, None);
+        });
     });
 }
 

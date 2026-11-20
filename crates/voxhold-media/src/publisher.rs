@@ -16,7 +16,9 @@
 
 use crate::controller::Signal;
 use crate::screen_capture::ScreenSource;
+use crate::system_audio::AudioScope;
 use crate::viewer::LEAVE_TIMEOUT;
+use live_change::PendingBitrate;
 use serde_json::{Value, json};
 use std::{
     collections::HashSet,
@@ -28,6 +30,9 @@ use std::{
 pub const ANSWER_TIMEOUT: Duration = Duration::from_secs(15);
 /// The stop handshake is bounded; a stalled socket never holds the capture.
 pub const STOP_TIMEOUT: Duration = Duration::from_secs(5);
+/// A live bitrate change that the worker does not confirm within this window is
+/// reported as a failure instead of leaving the dialog in `Applying` forever.
+pub const BITRATE_CONFIRM_TIMEOUT: Duration = Duration::from_secs(5);
 /// `MaxChannelPublishers` in `internal/streamcontract/limits.go`.
 pub const MAX_CHANNEL_PUBLISHERS: usize = 8;
 /// SDR is the only rendition of this stage; HDR is a later task.
@@ -65,39 +70,15 @@ impl Codec {
     }
 }
 
-/// Resolution choices of the SDR publisher, matching the web dialog.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Resolution {
-    #[default]
-    P720,
-    P1080,
-}
-
-impl Resolution {
-    pub fn size(self) -> (u32, u32) {
-        match self {
-            Self::P720 => (1280, 720),
-            Self::P1080 => (1920, 1080),
-        }
-    }
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::P720 => "1280 × 720",
-            Self::P1080 => "1920 × 1080",
-        }
-    }
-
-    pub fn wire(self) -> &'static str {
-        match self {
-            Self::P720 => "720p",
-            Self::P1080 => "1080p",
-        }
-    }
-}
-
+mod bitrate;
 mod quality;
-pub use quality::{AUDIO_BITRATES, Preset, Quality, normalize_audio_bitrate};
+pub use quality::{
+    AUDIO_BITRATES, Preset, Quality, QualityChange, QualityOp, QualityOutcome, QualityStatus,
+    Resolution, normalize_audio_bitrate,
+};
+
+mod sharing;
+pub use sharing::{Confirmed, Sharing};
 
 /// One capture attempt chosen in the picker.
 #[derive(Clone, Debug, PartialEq)]
@@ -109,42 +90,10 @@ pub struct PublishRequest {
     /// engine actually opened, so a missing loopback is an explicit failure
     /// instead of a silent video-only publication.
     pub audio: bool,
-}
-
-/// The UI-facing snapshot. The panel never guesses a phase itself.
-#[derive(Clone, Debug, PartialEq)]
-pub struct Sharing {
-    pub phase: Phase,
-    pub attempt: u64,
-    pub live: bool,
-    pub quality: Option<Quality>,
-    pub codec: Option<Codec>,
-    /// The engine really added the system-audio track (and `stream.start`
-    /// reported it), not merely that the user ticked the box.
-    pub has_audio: bool,
-    /// A confirmed stop+start is in flight. The UI must warn that the stream
-    /// will restart instead of claiming a live change.
-    pub restarting: bool,
-    pub status: String,
-    pub error: Option<String>,
-    pub stats: Option<engine::PublishStats>,
-}
-
-impl Default for Sharing {
-    fn default() -> Self {
-        Self {
-            phase: Phase::Idle,
-            attempt: 0,
-            live: false,
-            quality: None,
-            codec: None,
-            has_audio: false,
-            restarting: false,
-            status: String::new(),
-            error: None,
-            stats: None,
-        }
-    }
+    /// What the requested audio covers. Only used when `audio` is true; the
+    /// engine resolves it to a process id for this attempt. `stream.start` has
+    /// no scope field, so this stays a local engine parameter.
+    pub audio_scope: AudioScope,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -196,6 +145,13 @@ pub enum Outcome {
     /// Drop the viewer first and wait for `stream.left` (or five seconds).
     LeaveViewer,
     Send(Signal),
+    /// The engine must apply this video/audio bitrate limit to its live
+    /// sender. No renegotiation and no new `stream.start` follows.
+    SetBitrate {
+        attempt: u64,
+        op: QualityOp,
+        quality: Quality,
+    },
     /// The engine must apply this remote offer and produce an answer.
     Offer(String),
     Ice(crate::Candidate),
@@ -203,27 +159,9 @@ pub enum Outcome {
 }
 
 /// Engine events that need a state-machine decision.
-pub mod engine_events {
-    use crate::Candidate;
+mod engine_events;
 
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub enum Connection {
-        Connected,
-        FirstFrame,
-    }
-
-    #[derive(Clone, Debug, PartialEq)]
-    pub enum Event {
-        Answer(String),
-        Ice(Candidate),
-        State(Connection),
-        Stats(crate::publisher::engine::PublishStats),
-        Error(String),
-        Closed,
-    }
-}
-
-pub use engine_events::{Connection, Event as EngineEvent};
+pub use engine_events::{BitrateResult, Connection, Event as EngineEvent};
 
 pub struct Publisher {
     server: i64,
@@ -233,11 +171,35 @@ pub struct Publisher {
     phase: Phase,
     attempt: u64,
     request: Option<PublishRequest>,
+    /// What the attempt that is really on air accepted. It is only replaced
+    /// when an attempt turns `Live` or a live bitrate change is applied, so a
+    /// preflight, a restart or a rollback keeps the previous configuration.
+    confirmed: Option<Confirmed>,
     /// Quality change of a live attempt. The backend has no runtime
     /// reconfigure, so the new request waits for the current `stream.stop`
     /// acknowledgement (or its bounded timeout) and then starts a new attempt.
     pending_restart: Option<PublishRequest>,
+    /// The request of the attempt that was live when a restart began. A local
+    /// failure of the new attempt may restore it exactly once.
+    rollback: Option<PublishRequest>,
+    /// The one automatic restore was already used; a second local failure is
+    /// terminal instead of looping.
+    rollback_used: bool,
     restarting: bool,
+    /// A restart preflight is validating a new capture; the live stream was
+    /// not touched. The UI keeps the dialog open so closing it can cancel.
+    preflighting: bool,
+    /// The accepted quality-change operation and its last result. Results of
+    /// an older operation are ignored instead of overwriting a newer one.
+    quality_status: Option<QualityStatus>,
+    /// The requested live bitrate change that the engine has not confirmed
+    /// yet. `request` and `confirmed` keep the previous on-air values until
+    /// the worker reports an `Applied` result for this operation.
+    pending_bitrate: Option<PendingBitrate>,
+    /// The moment a live bitrate change must be confirmed by. If it passes
+    /// while the operation is still `Applying`, the operation fails without
+    /// stopping the publication; a late engine answer is then ignored.
+    bitrate_deadline: Option<Instant>,
     /// The backend broadcasts `stream.stopped` to the whole server and also
     /// answers `stream.stop` directly, so one stop produces two events. After
     /// a confirmed stop the second copy must not end the freshly restarted
@@ -245,6 +207,8 @@ pub struct Publisher {
     ignore_stop_echo: bool,
     /// Actual system-audio track of the engine; reported by `stream.start`.
     has_audio: bool,
+    /// Actual scope of that track, for the local on-air line.
+    audio_scope: Option<String>,
     /// Picker id of the current attempt. A publish for another id is stale.
     picker: Option<u64>,
     sequence: u64,
@@ -280,10 +244,18 @@ impl Publisher {
             phase: Phase::Idle,
             attempt: 0,
             request: None,
+            confirmed: None,
             pending_restart: None,
+            rollback: None,
+            rollback_used: false,
             restarting: false,
+            preflighting: false,
+            quality_status: None,
+            pending_bitrate: None,
+            bitrate_deadline: None,
             ignore_stop_echo: false,
             has_audio: false,
+            audio_scope: None,
             picker: None,
             sequence: 0,
             start_request: None,
@@ -312,8 +284,12 @@ impl Publisher {
             live: self.phase == Phase::Live,
             quality: self.request.as_ref().map(|request| request.quality),
             codec: self.request.as_ref().map(|request| request.codec),
+            confirmed: self.confirmed.clone(),
             has_audio: self.has_audio,
+            audio_scope: self.audio_scope.clone(),
             restarting: self.restarting,
+            preflighting: self.preflighting,
+            quality_status: self.quality_status.clone(),
             status: self.status.clone(),
             error: self.error.clone(),
             stats: self.stats,
@@ -411,12 +387,25 @@ impl Publisher {
     /// event, so this is a confirmed stop+start: one `stream.stop` now and one
     /// new `stream.start` after the acknowledgement (or its bounded timeout).
     /// Returns nothing outside `Live`, where the UI has no restart action.
-    pub fn restart(&mut self, request: PublishRequest, now: Instant) -> Vec<Outcome> {
-        if self.phase != Phase::Live {
+    pub fn restart(
+        &mut self,
+        op: QualityOp,
+        request: PublishRequest,
+        now: Instant,
+    ) -> Vec<Outcome> {
+        if self.phase != Phase::Live || !self.operation_current(op) {
             return Vec::new();
         }
         let mut request = request;
         request.quality = request.quality.clamped();
+        self.quality_status = Some(QualityStatus::new(op, QualityOutcome::Committed));
+        self.pending_bitrate = None;
+        self.bitrate_deadline = None;
+        // Keep the confirmed live request. If the new attempt fails locally
+        // after the old stream was stopped, it is restored once.
+        self.rollback = self.request.clone();
+        self.rollback_used = false;
+        self.preflighting = false;
         self.pending_restart = Some(request);
         self.restarting = true;
         self.status = "Перезапускаем трансляцию…".into();
@@ -466,6 +455,7 @@ impl Publisher {
                 self.stats = None;
                 self.viewer_wait = None;
                 self.deadline = None;
+                self.bitrate_deadline = None;
                 if self.start_sent {
                     self.stop_deadline = Some(now + STOP_TIMEOUT);
                     out.push(Outcome::State(self.sharing()));
@@ -497,9 +487,10 @@ impl Publisher {
         out
     }
 
-    /// The engine could not be created for this attempt.
+    /// The engine could not be created for this attempt, or the local media
+    /// path failed. A restart attempt may restore the previous request once.
     pub fn on_start_failed(&mut self, message: &str, now: Instant) -> Vec<Outcome> {
-        self.fail(message, now)
+        self.fail_local(message, now)
     }
 
     pub fn tick(&mut self, now: Instant) -> Vec<Outcome> {
@@ -508,6 +499,14 @@ impl Publisher {
         }
         if self.stop_deadline.is_some_and(|deadline| now >= deadline) {
             return self.finish();
+        }
+        if self.phase == Phase::Live
+            && self
+                .bitrate_deadline
+                .is_some_and(|deadline| now >= deadline)
+            && let Some(op) = self.pending_bitrate.as_ref().map(|pending| pending.op)
+        {
+            return self.bitrate_failed(op, "Медиадвижок не подтвердил новый битрейт.");
         }
         if self.phase == Phase::Publishing && self.deadline.is_some_and(|deadline| now >= deadline)
         {
@@ -551,7 +550,7 @@ impl Publisher {
                 if !self.active() || !self.tracked(request_id) {
                     return Vec::new();
                 }
-                self.fail(&server_error(data), now)
+                self.fail(&reason::server_error(data), now)
             }
             _ => Vec::new(),
         }
@@ -596,8 +595,13 @@ impl Publisher {
                 }
                 Vec::new()
             }
-            EngineEvent::Error(message) => self.fail(&message, now),
-            EngineEvent::Closed => self.fail("Соединение трансляции закрыто.", now),
+            EngineEvent::Bitrate {
+                attempt,
+                op,
+                result,
+            } => self.on_bitrate(attempt, op, result),
+            EngineEvent::Error(message) => self.fail_local(&message, now),
+            EngineEvent::Closed => self.fail_local("Соединение трансляции закрыто.", now),
         }
     }
 
@@ -693,7 +697,7 @@ impl Publisher {
                 let message = if reason.is_empty() || reason == "stream stopped by user" {
                     "Трансляция остановлена."
                 } else {
-                    reason_message(reason)
+                    reason::reason_message(reason)
                 };
                 self.fail(message, now)
             }
@@ -721,13 +725,13 @@ impl Publisher {
                 // the confirmed stop and belongs to the attempt that is
                 // already gone. A real failure of the new peer is reported by
                 // the local `EngineEvent::Closed`/error path.
-                if self.ignore_stop_echo && stale_media_close(reason) {
+                if self.ignore_stop_echo && reason::stale_media_close(reason) {
                     return Vec::new();
                 }
                 let message = if reason.is_empty() {
                     "Соединение трансляции закрыто сервером.".to_owned()
                 } else {
-                    reason_message(reason).to_owned()
+                    reason::reason_message(reason).to_owned()
                 };
                 self.fail(&message, now)
             }
@@ -789,7 +793,14 @@ impl Publisher {
     ///
     /// `has_audio` is what the engine really opened, not the user's request:
     /// the backend adds exactly one recvonly audio m-line from this flag.
-    pub fn engine_ready(&mut self, now: Instant, has_audio: bool) -> Vec<Outcome> {
+    /// `audio_scope` is local only: the pinned `stream.start` contract has no
+    /// scope field, so it is shown on the local card and never sent.
+    pub fn engine_ready(
+        &mut self,
+        now: Instant,
+        has_audio: bool,
+        audio_scope: Option<String>,
+    ) -> Vec<Outcome> {
         if self.phase != Phase::Publishing || self.start_sent {
             return Vec::new();
         }
@@ -797,6 +808,7 @@ impl Publisher {
             return self.fail("Источник трансляции не выбран.", now);
         };
         self.has_audio = has_audio;
+        self.audio_scope = if has_audio { audio_scope } else { None };
         let signal = self.signal(
             "stream.start",
             json!({
@@ -822,6 +834,20 @@ impl Publisher {
         self.phase = Phase::Live;
         self.deadline = None;
         self.status = "В эфире".into();
+        // Only an attempt that really reached the air becomes the confirmed
+        // configuration. A preflight or an in-flight restart never does. The
+        // audio flag is the track the engine actually opened, not merely the
+        // checkbox the picker sent.
+        self.confirmed = self.request.as_ref().map(|request| {
+            let mut confirmed = Confirmed::from_request(self.attempt, request);
+            confirmed.audio = self.has_audio;
+            confirmed
+        });
+        // A fresh confirmed attempt can serve as the rollback target of the
+        // next restart and may restore itself once.
+        self.rollback = None;
+        self.rollback_used = false;
+        self.preflighting = false;
         vec![Outcome::State(self.sharing())]
     }
 
@@ -847,9 +873,17 @@ impl Publisher {
         self.deadline = None;
         self.stop_deadline = None;
         self.pending_restart = None;
+        self.rollback = None;
+        self.rollback_used = false;
         self.restarting = false;
+        self.preflighting = false;
+        self.quality_status = None;
+        self.pending_bitrate = None;
+        self.bitrate_deadline = None;
         self.ignore_stop_echo = false;
         self.has_audio = false;
+        self.audio_scope = None;
+        self.confirmed = None;
         out.push(Outcome::State(self.sharing()));
         out
     }
@@ -889,7 +923,11 @@ impl Publisher {
         self.stats = None;
         self.error = None;
         self.restarting = false;
+        self.preflighting = false;
+        self.pending_bitrate = None;
+        self.bitrate_deadline = None;
         self.has_audio = false;
+        self.audio_scope = None;
         vec![
             Outcome::StartEngine {
                 attempt: self.attempt,
@@ -903,9 +941,17 @@ impl Publisher {
         self.phase = Phase::Idle;
         self.request = None;
         self.pending_restart = None;
+        self.rollback = None;
+        self.rollback_used = false;
         self.restarting = false;
+        self.preflighting = false;
+        self.quality_status = None;
+        self.pending_bitrate = None;
+        self.bitrate_deadline = None;
         self.ignore_stop_echo = false;
         self.has_audio = false;
+        self.audio_scope = None;
+        self.confirmed = None;
         self.picker = None;
         self.start_request = None;
         self.requests.clear();
@@ -938,50 +984,11 @@ impl Publisher {
     }
 }
 
-/// Media-session reasons the backend emits while tearing down a publication
-/// that the client already stopped. They are not a permission or voice loss.
-fn stale_media_close(reason: &str) -> bool {
-    matches!(
-        reason,
-        "stream WebRTC connection closed"
-            | "stream signaling connection was lost"
-            | "stream WebRTC recovery exhausted"
-    )
-}
-
-fn server_error(data: &Value) -> String {
-    let message = data["message"].as_str().unwrap_or_default();
-    match data["code"].as_str().unwrap_or_default() {
-        "forbidden" => "Нет права запускать трансляцию.".into(),
-        "invalid_payload" => "Сервер отклонил параметры трансляции.".into(),
-        "internal_error" => "Сервер не смог запустить трансляцию.".into(),
-        "invalid_state" if message.contains("limit reached") => {
-            "В канале уже 8 трансляций. Дождитесь завершения одной из них.".into()
-        }
-        "invalid_state" if message.contains("same voice channel") => {
-            "Сначала подключитесь к голосовому каналу.".into()
-        }
-        "invalid_state" if message.contains("already active") => "Трансляция уже запущена.".into(),
-        _ => "Сервер отклонил запуск трансляции.".into(),
-    }
-}
-
-fn reason_message(reason: &str) -> &'static str {
-    let reason = reason.to_lowercase();
-    if reason.contains("permission") || reason.contains("access") {
-        "Доступ к трансляции отозван."
-    } else if reason.contains("voice") {
-        "Голосовое соединение завершилось, трансляция остановлена."
-    } else if reason.contains("bitrate") {
-        "Превышен битрейт трансляции."
-    } else if reason.contains("rendition") {
-        "Сервер не принял параметры трансляции."
-    } else {
-        "Сервер остановил трансляцию."
-    }
-}
-
 pub mod engine;
+
+mod live_change;
+pub mod preflight;
+mod reason;
 
 #[cfg(test)]
 mod tests;

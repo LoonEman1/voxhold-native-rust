@@ -4,7 +4,7 @@
 //! lives here, free of UI types, and the view only renders what these functions
 //! return. Each one is asserted in the unit tests below.
 
-use crate::audio_capabilities::Support;
+use crate::audio_capabilities::{OutputGainPath, Support};
 
 fn on_off(value: bool) -> &'static str {
     if value {
@@ -73,14 +73,60 @@ pub const OUTPUT_GAIN_NOTE: &str =
 /// same sentence: an ADM path cannot apply the percentage.
 pub const OUTPUT_VOLUME_NOTE: &str = "Общая громкость применяется к дорожкам участников. Громкость каждого участника 0–200 % и лимитер применяет программный микшер комнаты; при недоступном микшере остаётся системный ADM, где действует только mute, а численное усиление участников не применяется.";
 
+/// Sentence under the output-volume slider while the platform ADM plays. The
+/// slider keeps painting the stored percentage, but that value only reaches
+/// the software mixer; on the ADM only the real mute is applied.
+pub const OUTPUT_VOLUME_ADM_NOTE: &str = "Сейчас комнату играет системный ADM: численная громкость вывода не применяется, действует только mute. Сохранённые 0–200 % остаются в настройках и вернутся, когда программный микшер снова заработает.";
+
+/// Sentence under the output-volume slider while the software mixer is
+/// opening, retrying or suspended. The ADM is not playing the room in those
+/// states, so the text must not name it: the numeric gain is only temporarily
+/// unavailable and the stored percentage is kept for the reopening mixer.
+pub const OUTPUT_VOLUME_TEMP_NOTE: &str = "Программный микшер комнаты сейчас не запущен: численная громкость вывода временно не применяется, действует только mute. Сохранённые 0–200 % остаются в настройках и применятся, когда микшер снова заработает.";
+
+/// Capability note for the room output volume, following the live playback
+/// path. Unlike the capture chain, this row must not promise a mixer that is
+/// not open and must not call a transient mixer outage "ADM".
+pub fn output_gain_note(path: OutputGainPath) -> &'static str {
+    match path {
+        OutputGainPath::Software => OUTPUT_GAIN_NOTE,
+        OutputGainPath::Adm => OUTPUT_VOLUME_ADM_NOTE,
+        OutputGainPath::Unavailable => OUTPUT_VOLUME_TEMP_NOTE,
+    }
+}
+
+/// Sentence under the output-volume slider for the same path. The normal
+/// software sentence explains the participant percentages; both fallback
+/// sentences say that only mute is real.
+pub fn output_volume_note(path: OutputGainPath) -> &'static str {
+    match path {
+        OutputGainPath::Software => OUTPUT_VOLUME_NOTE,
+        other => output_gain_note(other),
+    }
+}
+
 /// Description of the AGC switch. The ADM's own AGC cannot be toggled from
 /// here and was not measured.
 pub const AUTO_GAIN_DESCRIPTION: &str =
     "APM в software-пути выравнивает голос; platform ADM применяет своё усиление, которое здесь не измеряется";
 
+/// Sentence shown while the recorder stays open after a combination is
+/// rejected because another voice action already owns it.
+pub fn shortcut_conflict_message(action: &str) -> String {
+    format!("Сочетание уже занято: {action}. Нажмите другое.")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_rejected_hotkey_names_the_owning_action() {
+        assert_eq!(
+            shortcut_conflict_message("Звук вкл/выкл"),
+            "Сочетание уже занято: Звук вкл/выкл. Нажмите другое."
+        );
+    }
 
     #[test]
     fn the_platform_note_never_claims_echo_cancellation() {
@@ -130,5 +176,60 @@ mod tests {
             echo_cancellation_note(Support::Unavailable),
             echo_cancellation_note(Support::Automatic)
         );
+    }
+
+    #[test]
+    fn the_adm_output_note_says_only_mute_is_applied_and_the_value_is_kept() {
+        assert!(OUTPUT_VOLUME_ADM_NOTE.contains("только mute"));
+        assert!(
+            OUTPUT_VOLUME_ADM_NOTE.contains("Сохранённые 0–200 %"),
+            "the percentage stays visible for the next software path"
+        );
+        assert!(OUTPUT_VOLUME_ADM_NOTE.contains("программный микшер"));
+        assert!(!OUTPUT_VOLUME_ADM_NOTE.contains("применяется к дорожкам"));
+    }
+
+    #[test]
+    fn a_transient_mixer_outage_is_not_described_as_the_adm() {
+        let note = OUTPUT_VOLUME_TEMP_NOTE.to_lowercase();
+        assert!(note.contains("временно"));
+        assert!(note.contains("только mute"));
+        assert!(
+            OUTPUT_VOLUME_TEMP_NOTE.contains("Сохранённые 0–200 %"),
+            "the value is kept for the reopening mixer"
+        );
+        assert!(
+            !note.contains("adm") && !OUTPUT_VOLUME_TEMP_NOTE.contains("Сейчас комнату играет"),
+            "no ADM plays the room while the mixer retries or is suspended"
+        );
+        assert!(!OUTPUT_VOLUME_TEMP_NOTE.contains("применяется к дорожкам"));
+    }
+
+    #[test]
+    fn the_output_notes_follow_the_live_playback_path() {
+        assert_eq!(output_gain_note(OutputGainPath::Software), OUTPUT_GAIN_NOTE);
+        assert_eq!(
+            output_volume_note(OutputGainPath::Software),
+            OUTPUT_VOLUME_NOTE
+        );
+        assert_eq!(
+            output_gain_note(OutputGainPath::Adm),
+            OUTPUT_VOLUME_ADM_NOTE
+        );
+        assert_eq!(
+            output_volume_note(OutputGainPath::Adm),
+            OUTPUT_VOLUME_ADM_NOTE
+        );
+        assert_eq!(
+            output_gain_note(OutputGainPath::Unavailable),
+            OUTPUT_VOLUME_TEMP_NOTE
+        );
+        assert_eq!(
+            output_volume_note(OutputGainPath::Unavailable),
+            OUTPUT_VOLUME_TEMP_NOTE
+        );
+        assert!(OutputGainPath::Software.applies_numeric_gain());
+        assert!(!OutputGainPath::Adm.applies_numeric_gain());
+        assert!(!OutputGainPath::Unavailable.applies_numeric_gain());
     }
 }

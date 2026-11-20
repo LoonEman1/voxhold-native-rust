@@ -47,6 +47,8 @@ pub enum Action {
     SetNoiseMode(usize),
     SetInputMode(usize),
     ToggleAutoGain,
+    /// Show or hide the collapsed «Подробнее» diagnostics of the voice tab.
+    ToggleVoiceDiagnostics,
     ResetVoice,
     TestMicrophone,
     TestTone,

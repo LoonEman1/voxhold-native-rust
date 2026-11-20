@@ -10,7 +10,7 @@
 use crate::{
     Command, Controls, Event, IceServer, Media, VideoFrame,
     controller::{Action, Publication, Signal, VoiceController},
-    stream::{EngineUpdate, StreamViewer},
+    stream::StreamViewer,
     viewer::{Outcome as ViewerOutcome, Viewer},
     voice::CaptureGate,
 };
@@ -41,11 +41,16 @@ mod updates;
 use updates::Updates;
 pub use updates::VoiceUpdate;
 
+mod engine;
+mod preflight;
+mod prep;
 mod requests;
 mod screen;
 mod test_support;
+use engine::{EngineEffect, apply_engine_update};
 use requests::{
-    InputRequest, Pending, Requests, StreamCommand, set_input_request, set_stream_command,
+    InputRequest, Pending, Requests, ScreenAccess, StreamCommand, set_input_request,
+    set_stream_command,
 };
 
 pub struct StreamFrame {
@@ -202,10 +207,24 @@ impl VoiceHandle {
     }
 
     /// Physical pixels of the player picture; the decoder scales to this.
+    /// A repeat of the current size is ignored, but a real change wakes the
+    /// worker so it re-reads the latest frame without waiting for a socket
+    /// event or a new RTP frame.
     pub fn set_viewport(&self, width: u32, height: u32) {
-        if let Ok(mut slot) = self.requests.viewport.lock() {
-            *slot = Some((width, height));
+        if width == 0 || height == 0 {
+            return;
         }
+        let Ok(mut slot) = self.requests.viewport.lock() else {
+            return;
+        };
+        if *slot == Some((width, height)) {
+            return;
+        }
+        *slot = Some((width, height));
+        // Release the slot before waking: the worker reads it at the top of its
+        // loop and must not contend with a writer that would not change it.
+        drop(slot);
+        self.requests.wake();
     }
 
     pub fn try_update(&self) -> Option<VoiceUpdate> {
@@ -307,6 +326,25 @@ struct Live {
     publisher: crate::publisher::Publisher,
     /// The capture and peer of the current publishing attempt.
     screen: Option<crate::publisher::engine::PublisherEngine>,
+    /// The newest live bitrate change that the worker has not accepted yet. A
+    /// full command queue defers it to the next tick instead of failing.
+    bitrate: screen::BitrateQueue,
+    /// The one preparation that may be opening a capture or a peer. The session
+    /// loop only observes and cancels it.
+    prep: Option<prep::ScreenPrep<crate::publisher::engine::PublisherEngine>>,
+    /// A preflight of a live quality change. The live engine above keeps
+    /// running until this confirms the new capture and the publisher commits
+    /// the existing stop+start.
+    restart: Option<preflight::PendingRestart>,
+    /// Room identity a preparation result must still match.
+    server: i64,
+    channel: i64,
+    connection: Option<String>,
+    joined: bool,
+    /// Panel-confirmed gate of the current picker/attempt.
+    access: ScreenAccess,
+    /// Freshest gate written by `VoiceHandle::screen_access`.
+    screen_access: Arc<Mutex<Option<ScreenAccess>>>,
     screen_preview: Arc<crate::screen_capture::PreviewStore>,
     render: VideoFrame,
     viewport: (u32, u32),
@@ -342,35 +380,6 @@ impl Live {
     fn clear_frame(&self) {
         if let Ok(mut frame) = self.frame.lock() {
             frame.take();
-        }
-    }
-
-    /// Move the freshly decoded frame into the last-value slot, reclaiming the
-    /// buffer the UI has not taken yet so steady state does not allocate.
-    fn publish_frame(&mut self, selection: u64) {
-        let mut next = self
-            .frame
-            .lock()
-            .ok()
-            .and_then(|mut slot| {
-                // A frame from another selection is not a buffer to reclaim.
-                slot.take()
-                    .filter(|frame| frame.selection == selection)
-                    .map(|frame| frame.bgra)
-            })
-            .unwrap_or_default();
-        if next.len() < self.render.bgra.len() {
-            next.resize(self.render.bgra.len(), 0);
-        }
-        let (width, height) = (self.render.width(), self.render.height());
-        std::mem::swap(&mut next, &mut self.render.bgra);
-        if let Ok(mut slot) = self.frame.lock() {
-            *slot = Some(StreamFrame {
-                selection,
-                width,
-                height,
-                bgra: next,
-            });
         }
     }
 
@@ -447,35 +456,28 @@ impl Live {
                 return Ok(true);
             };
             let now = Instant::now();
-            let outcomes = match update {
-                EngineUpdate::Frame => {
-                    if let Some(selection) = viewer.watching().map(|watching| watching.selection) {
-                        self.publish_frame(selection);
+            let outcomes =
+                match apply_engine_update(&self.frame, &mut self.render, viewer, update, now) {
+                    EngineEffect::Outcomes(outcomes) => outcomes,
+                    EngineEffect::Output {
+                        applied,
+                        working,
+                        error,
+                    } => {
+                        // The applied endpoint may be the previous one after a
+                        // rollback. Updating both values lets a repeated request
+                        // retry instead of being skipped as unchanged.
+                        self.output = applied;
+                        self.output_working = working;
+                        if let Some(selection) =
+                            viewer.watching().map(|watching| watching.selection)
+                        {
+                            self.updates
+                                .push(VoiceUpdate::StreamAudio { selection, error });
+                        }
+                        Vec::new()
                     }
-                    viewer.on_frame()
-                }
-                EngineUpdate::Answer(sdp) => viewer.on_answer(sdp),
-                EngineUpdate::Ice(candidate) => viewer.on_ice(candidate),
-                EngineUpdate::State(state) => viewer.on_engine_state(state, now),
-                EngineUpdate::Error(message) => viewer.on_engine_error(&message, now),
-                EngineUpdate::Output {
-                    applied,
-                    audible: _,
-                    working,
-                    error,
-                } => {
-                    // The applied endpoint may be the previous one after a
-                    // rollback. Updating both values lets a repeated request
-                    // retry instead of being skipped as unchanged.
-                    self.output = applied;
-                    self.output_working = working;
-                    if let Some(selection) = viewer.watching().map(|watching| watching.selection) {
-                        self.updates
-                            .push(VoiceUpdate::StreamAudio { selection, error });
-                    }
-                    Vec::new()
-                }
-            };
+                };
             if !self.apply(outcomes, viewer).await? {
                 return Ok(false);
             }
@@ -712,6 +714,15 @@ async fn run_session(
         stream_selection: None,
         publisher: crate::publisher::Publisher::new(controller.server_id, controller.channel_id),
         screen: None,
+        bitrate: screen::BitrateQueue::default(),
+        prep: None,
+        restart: None,
+        server: controller.server_id,
+        channel: controller.channel_id,
+        connection: controller.resume_connection_id.clone(),
+        joined: controller.joined,
+        access: ScreenAccess::default(),
+        screen_access: requests.screen_access.clone(),
         screen_preview,
         render: VideoFrame::default(),
         viewport: requests.viewport(),
@@ -721,9 +732,22 @@ async fn run_session(
     };
     live.publisher
         .set_connection(controller.resume_connection_id.clone());
+    live.publisher.set_access(live.access_value());
     let mut tick = tokio::time::interval(Duration::from_millis(25));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
+        // A viewport change (fullscreen, resize, DPI) wakes the worker through
+        // `set_viewport`. Apply it before waiting for a socket event so the
+        // latest decoded frame is re-read without a new RTP frame.
+        let viewport = requests.viewport();
+        if viewport != live.viewport {
+            live.viewport = viewport;
+            match live.drain_viewer(viewer).await {
+                Ok(true) => {}
+                Ok(false) => return SessionEnd::Recover,
+                Err(end) => return end,
+            }
+        }
         let notified = requests.notify.notified();
         while let Some(pending) = requests.take() {
             match pending {
@@ -791,6 +815,15 @@ async fn run_session(
                     }
                 }
                 Pending::ScreenSources(request) => live.list_screen_sources(request),
+                Pending::ScreenAccess(access) => {
+                    // The panel's newest gate is applied before the pending
+                    // capture can complete; a revocation cancels it and fails
+                    // the attempt instead of letting a late engine start.
+                    let outcomes = live.apply_screen_access(access);
+                    if let Err(end) = live.apply_screen(outcomes, viewer).await {
+                        return end;
+                    }
+                }
                 Pending::Output(output) => {
                     live.output = output.clone();
                     if let Some(stream) = &mut live.stream {
@@ -926,8 +959,16 @@ async fn run_session(
                 live.media.set_joined(controller.joined);
                 live.media
                     .set_server_allowed(!controller.server_muted && !controller.controls.deafened);
-                live.publisher
-                    .set_connection(controller.resume_connection_id.clone());
+                // A changed connection id or a lost join invalidates a
+                // preparation that was bound to the old session.
+                let connection = live.set_connection(controller.resume_connection_id.clone());
+                if let Err(end) = live.apply_screen(connection, viewer).await {
+                    return end;
+                }
+                let joined = live.set_joined(controller.joined);
+                if let Err(end) = live.apply_screen(joined, viewer).await {
+                    return end;
+                }
                 // The viewer follows the confirmed voice state, not the socket:
                 // a fresh join re-watches the selected publication.
                 let outcomes = viewer.set_joined(controller.joined, Instant::now());
@@ -1103,7 +1144,7 @@ fn run(
                     Pending::StreamMute(selection, muted) => {
                         let _ = viewer.set_muted(selection, muted);
                     }
-                    Pending::Screen(_) | Pending::ScreenSources(_) => {
+                    Pending::Screen(_) | Pending::ScreenSources(_) | Pending::ScreenAccess(_) => {
                         // No session, no publisher and no capture: a picker
                         // action of the previous attempt is dropped. The UI
                         // cannot reach these states without a live call.

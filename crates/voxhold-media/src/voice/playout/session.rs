@@ -5,6 +5,19 @@
 
 use super::*;
 
+/// Whether one receiver is audible on the ADM fallback. The room percentage in
+/// `controls.output_gain` is deliberately not read: the ADM has no numeric bus
+/// gain, so only the real mute/deafen flags and a zeroed participant gain may
+/// close the track. The stored value belongs to the software mixer.
+pub(super) fn adm_track_enabled(controls: &Controls, source: Source) -> bool {
+    let gain = if controls.deafened {
+        0.0
+    } else {
+        source.gain.clamp(0.0, 2.0)
+    };
+    !source.muted && gain > 0.0
+}
+
 impl Session {
     fn adm_calls_allowed(&self) -> bool {
         #[cfg(test)]
@@ -408,17 +421,15 @@ impl Session {
             self.push_playout_state();
             return;
         }
-        let master = if self.controls.deafened { 0.0 } else { 1.0 };
         // Without the software mixer the pinned wrapper exposes no numeric
-        // gain, so only zero silences the track. The stored percentage is kept
-        // for the mixer path and for the UI.
-        let room_audible = self.controls.output_gain.unwrap_or(1.0) > 0.0;
+        // gain. The stored room percentage belongs to the mixer and the UI, so
+        // only the real mute/deafen flags (and a zeroed participant gain) may
+        // close a receiver. Sending `None`/0 % must not silence the ADM.
         for receiver in self.peer.receivers() {
             if let Some(MediaStreamTrack::Audio(track)) = receiver.track() {
                 let id = track.id();
                 let source = self.sources.get(&id).copied().unwrap_or_default();
-                let gain = (source.gain * master).clamp(0.0, 2.0);
-                track.set_enabled(room_audible && !source.muted && gain > 0.0);
+                track.set_enabled(adm_track_enabled(&self.controls, source));
             }
         }
     }
@@ -441,5 +452,59 @@ impl Session {
     /// check racing the retry ladder).
     pub(crate) fn software_playout_mode(&self) -> bool {
         self.playout_mode == PlayoutMode::Software && self.software_playout
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The output percentage is a software-mixer value. On the ADM path only
+    /// the real mute/deafen state may close a receiver, and a zero percentage
+    /// must not silence the room.
+    #[test]
+    fn the_adm_path_ignores_the_room_percentage_but_keeps_mute_real() {
+        let source = Source {
+            gain: 1.0,
+            muted: false,
+        };
+        for output_gain in [None, Some(0.0), Some(0.5), Some(1.5), Some(2.0)] {
+            let controls = Controls {
+                output_gain,
+                ..Controls::default()
+            };
+            assert!(
+                adm_track_enabled(&controls, source),
+                "output_gain {output_gain:?} is not applied by the ADM"
+            );
+        }
+        let deafened = Controls {
+            deafened: true,
+            ..Controls::default()
+        };
+        assert!(
+            !adm_track_enabled(&deafened, source),
+            "deafen still closes the ADM room"
+        );
+        assert!(
+            !adm_track_enabled(
+                &Controls::default(),
+                Source {
+                    muted: true,
+                    ..source
+                }
+            ),
+            "a local or server mute stays real on the ADM"
+        );
+        assert!(
+            !adm_track_enabled(
+                &Controls::default(),
+                Source {
+                    gain: 0.0,
+                    ..source
+                }
+            ),
+            "a participant at 0 % is silence in both paths"
+        );
     }
 }

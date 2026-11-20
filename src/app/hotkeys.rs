@@ -52,12 +52,15 @@ impl Voxhold {
             return;
         }
         self.voice_settings.recording_shortcut = Some(field);
+        self.voice_settings.shortcut_conflict.clear();
         cx.notify();
     }
 
     /// Feed a key-down to the recorder. Returns whether the event was consumed.
-    /// Escape cancels; a modifier-only press keeps the recorder open; any other
-    /// key becomes the new binding and is persisted with the voice snapshot.
+    /// Escape cancels; a modifier-only press keeps the recorder open; a key
+    /// that another action already owns is rejected without writing anything
+    /// and leaves the recorder open for the next attempt. Any other key
+    /// becomes the new binding and is persisted with the voice snapshot.
     pub(super) fn record_shortcut_key(
         &mut self,
         event: &gpui::KeyDownEvent,
@@ -68,17 +71,44 @@ impl Voxhold {
         };
         if !self.voice_tab_open() {
             self.voice_settings.recording_shortcut = None;
+            self.voice_settings.shortcut_conflict.clear();
             return false;
         }
         let key = event.keystroke.key.to_lowercase();
         if key == "escape" {
             self.voice_settings.recording_shortcut = None;
+            self.voice_settings.shortcut_conflict.clear();
             cx.notify();
             return true;
         }
         let Some(combo) = shortcut_from_key(&key, event.keystroke.modifiers) else {
             return true;
         };
+        let own = match field {
+            0 => &self.voice_settings.prefs.mute,
+            1 => &self.voice_settings.prefs.deafen,
+            _ => &self.voice_settings.prefs.push_to_talk,
+        };
+        let unchanged = crate::voice_settings::canonical_shortcut(&combo)
+            == crate::voice_settings::canonical_shortcut(own);
+        if unchanged {
+            // Re-pressing the action's own combination is accepted as a no-op:
+            // it must not read as a conflict with itself or trigger a write.
+            self.voice_settings.recording_shortcut = None;
+            self.voice_settings.shortcut_conflict.clear();
+            cx.notify();
+            return true;
+        }
+        if let Some(owner) = self.voice_settings.prefs.shortcut_owner(&combo, field) {
+            let name =
+                crate::voice_settings::shortcut_action_name(owner).unwrap_or("другое действие");
+            self.voice_settings.shortcut_conflict =
+                crate::voice_form_text::shortcut_conflict_message(name);
+            // The recorder stays open, the old binding and `saved_error` stay
+            // untouched, and nothing is persisted or applied.
+            cx.notify();
+            return true;
+        }
         let prefs = &mut self.voice_settings.prefs;
         match field {
             0 => prefs.mute = combo,
@@ -86,6 +116,7 @@ impl Voxhold {
             _ => prefs.push_to_talk = combo,
         }
         self.voice_settings.recording_shortcut = None;
+        self.voice_settings.shortcut_conflict.clear();
         self.persist_voice(cx);
         self.apply_voice_snapshot(cx);
         cx.notify();

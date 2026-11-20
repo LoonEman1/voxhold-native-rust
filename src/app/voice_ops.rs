@@ -13,7 +13,7 @@ use crate::voice_panel::RoomAccess;
 #[cfg(feature = "voxhold-media")]
 use crate::voice_room::{Hotkey, PlayerKey};
 #[cfg(feature = "voxhold-media")]
-use gpui::{img, prelude::*, px, rgb};
+use gpui::{prelude::*, px, rgb};
 #[cfg(feature = "voxhold-media")]
 use std::collections::HashMap;
 
@@ -217,17 +217,9 @@ impl Voxhold {
                         }
                     });
                 }));
-                let call_view = weak_view.clone();
-                panel.set_call_handler(Box::new(move |cx: &mut gpui::App| {
-                    let weak = call_view.clone();
-                    cx.defer(move |cx| {
-                        if let Some(view) = weak.upgrade() {
-                            view.update(cx, |view, cx| view.update_power_poll(cx));
-                        }
-                    });
-                }));
             });
             self.voice = Some(panel);
+            self.install_voice_call_handler(cx);
         }
         self.voice_room = channel;
         if let Some(panel) = &self.voice {
@@ -235,6 +227,29 @@ impl Voxhold {
             window.focus(&focus);
         }
         cx.notify();
+    }
+
+    /// Install the one deferred parent update a panel transition triggers. It
+    /// drains recorded cues (so an unmounted room still plays them) and keeps
+    /// the power poll in sync without borrowing the parent re-entrantly.
+    pub(super) fn install_voice_call_handler(&mut self, cx: &mut Context<Self>) {
+        let Some(panel) = self.voice.clone() else {
+            return;
+        };
+        let weak_view = cx.entity().downgrade();
+        panel.update(cx, |panel, _| {
+            panel.set_call_handler(Box::new(move |cx: &mut gpui::App| {
+                let weak = weak_view.clone();
+                cx.defer(move |cx| {
+                    if let Some(view) = weak.upgrade() {
+                        view.update(cx, |view, cx| {
+                            view.drain_voice_cues(cx);
+                            view.update_power_poll(cx);
+                        });
+                    }
+                });
+            }));
+        });
     }
 
     /// Push a roster and fresh room access into the panel. Called after
@@ -284,10 +299,71 @@ impl Voxhold {
         });
     }
 
+    /// Play the cues the panel recorded since the last drain. The panel owns
+    /// only the transition decision; the saved preferences and the single WinMM
+    /// player live here, so there is one persistence path and one audio path.
+    pub(super) fn drain_voice_cues(&mut self, cx: &mut Context<Self>) {
+        let Some(panel) = self.voice.clone() else {
+            return;
+        };
+        let cues = panel.update(cx, |panel, _| panel.take_cues());
+        if cues.is_empty() {
+            return;
+        }
+        let (sounds, volume, output) = {
+            let prefs = &self.voice_settings.prefs;
+            (prefs.sounds, prefs.sound_volume, prefs.output.clone())
+        };
+        // The checkbox and a zero slider silence the player before any device
+        // work; the drained list is dropped instead of accumulating.
+        if !sounds || volume <= 0 {
+            return;
+        }
+        for cue in cues {
+            self.play_voice_cue(cue, volume, &output);
+        }
+    }
+
+    /// Convert the pure frontend spec into the media cue description. The
+    /// device is resolved on the cue worker; an unavailable selection is silent.
+    /// Tests capture the same output id and volume inside this handoff, so they
+    /// exercise the saved preference path without opening a device.
+    fn play_voice_cue(&mut self, cue: crate::ui_sounds::VoiceCue, volume: i64, output: &str) {
+        #[cfg(test)]
+        self.voice_cue_calls.push(CueCall {
+            cue,
+            volume,
+            output: output.to_owned(),
+        });
+        #[cfg(not(test))]
+        {
+            let spec = cue.spec();
+            self.voice_cue_player.play(
+                voxhold_media::preview::CueSpec {
+                    gain: spec.gain,
+                    tones: spec
+                        .tones
+                        .iter()
+                        .map(|tone| voxhold_media::preview::CueTone {
+                            frequency: tone.frequency,
+                            at: tone.at,
+                            duration: tone.duration,
+                        })
+                        .collect(),
+                },
+                volume,
+                output,
+            );
+        }
+    }
+
     /// Mirror the call channel and drop calls whose access was revoked. A
     /// channel deleted, made unreadable or switched to E2EE ends the media
     /// session before the stale lease can keep audio or video.
     pub(super) fn refresh_voice_call(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Leave cues are recorded even when the call channel is already zero,
+        // so the drain must happen before the early return.
+        self.drain_voice_cues(cx);
         let Some(panel) = self.voice.clone() else {
             self.voice_channel = 0;
             return;
@@ -319,20 +395,21 @@ impl Voxhold {
         self.voice_room = 0;
     }
 
-    /// Sidebar dock while the call runs in another channel or conversation.
+    /// Sidebar dock for the whole call. It sits under the channel list even
+    /// while the active voice room is open; only the end of the call hides it.
+    /// On mobile/narrow layouts the channel panel is a closed overlay, so the
+    /// dock stays the overlay's surface: it is painted only while that panel
+    /// is open, and the central room controls remain the call surface. The
+    /// flag is reset by the shell each frame so a closed overlay cannot keep
+    /// dock handles in the Tab ring.
     pub(super) fn voice_dock_visible(&self, cx: &gpui::App) -> bool {
-        let Some(panel) = &self.voice else {
-            return false;
-        };
-        let panel = panel.read(cx);
-        panel.call_channel() != 0
-            && (self.conversation.is_some()
-                || self.voice_room != panel.call_channel()
-                || !self.voice_room_visible())
+        self.voice
+            .as_ref()
+            .is_some_and(|panel| panel.read(cx).call_channel() != 0)
     }
 
     /// Compact 98 px dock under the channel list: call status, room name and
-    /// the same four actions in the Go order.
+    /// the three web `VoiceDock` actions (microphone, sound, leave).
     pub(super) fn voice_dock(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let voice = self.voice.clone()?;
         if !self.voice_dock_visible(cx) {
@@ -343,17 +420,23 @@ impl Voxhold {
         }
         let panel = voice.read(cx);
         let (status, tone) = crate::voice_room::dock_status(panel.phase());
-        let active = panel.action_active_flags();
         let name = self
             .channels
             .iter()
             .find(|channel| channel.id == panel.call_channel())
             .map(|channel| channel.name.clone())
             .unwrap_or_default();
-        let focuses: Vec<_> = (0..4).map(|index| panel.dock_focus(index)).collect();
-        let icons: Vec<_> = crate::voice_room::VOICE_ACTIONS
+        let dock_actions = crate::voice_room::DOCK_ACTIONS;
+        let focuses: Vec<_> = (0..dock_actions.len())
+            .map(|index| panel.dock_focus(index))
+            .collect();
+        let icons: Vec<_> = dock_actions
             .iter()
-            .map(|action| panel.action_icon_for(action.id))
+            .map(|id| panel.action_icon_for(id))
+            .collect();
+        let active: Vec<_> = dock_actions
+            .iter()
+            .map(|id| panel.action_active_flag(id))
             .collect();
         voice.update(cx, |panel, _| panel.set_dock_visible(true));
         let colors = crate::voice_panel::VoiceColors::resolve(self.palette);
@@ -362,9 +445,16 @@ impl Voxhold {
             crate::voice_room::Tone::Danger => colors.danger,
             crate::voice_room::Tone::Muted => colors.muted,
         };
-        let mut actions = div().h(px(31.)).flex().gap(px(5.));
-        for (index, action) in crate::voice_room::VOICE_ACTIONS.iter().enumerate() {
-            let id = action.id;
+        let mut actions = div()
+            .h(px(crate::voice_room::DOCK_BUTTON_HEIGHT))
+            .flex()
+            .gap(px(crate::voice_room::DOCK_BUTTON_GAP));
+        for (index, id) in dock_actions.into_iter().enumerate() {
+            let icon_color = if active[index] {
+                colors.danger
+            } else {
+                colors.muted
+            };
             actions = actions.child(
                 div()
                     .id(("voice-dock-action", index))
@@ -374,7 +464,7 @@ impl Voxhold {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .rounded(px(9.))
+                    .rounded(px(8.))
                     .cursor_pointer()
                     .bg(rgb(if active[index] {
                         colors.danger_bg
@@ -388,7 +478,7 @@ impl Voxhold {
                         colors.line
                     }))
                     .track_focus(&focuses[index])
-                    .child(img(icons[index]).w(px(15.)).h(px(15.)))
+                    .child(super::ui::icon(icons[index], 16., rgb(icon_color)))
                     .on_click(cx.listener(move |view, _, window, cx| {
                         let Some(voice) = &view.voice else {
                             return;
@@ -396,7 +486,6 @@ impl Voxhold {
                         voice.update(cx, |panel, cx| match id {
                             "voice-mic" => panel.mute(cx),
                             "voice-deaf" => panel.deafen(cx),
-                            "voice-records" => panel.trigger_recordings(window, cx),
                             _ => panel.leave_in_window(window, cx),
                         });
                         view.refresh_voice_call(window, cx);
@@ -438,7 +527,7 @@ impl Voxhold {
                     .items_center()
                     .gap_2()
                     .h(px(20.))
-                    .child(img("icons/headphones.svg").w(px(12.)).h(px(12.)))
+                    .child(super::ui::icon("icons/volume.svg", 12., rgb(colors.muted)))
                     .child(
                         div()
                             .text_size(px(12.))
@@ -586,6 +675,7 @@ impl Voxhold {
             modifiers.platform,
         ) {
             panel.update(cx, |panel, cx| panel.mute(cx));
+            self.drain_voice_cues(cx);
             return true;
         }
         if Hotkey::parse(&prefs.deafen).matches(
@@ -596,6 +686,7 @@ impl Voxhold {
             modifiers.platform,
         ) {
             panel.update(cx, |panel, cx| panel.deafen(cx));
+            self.drain_voice_cues(cx);
             return true;
         }
         let fullscreen = panel.read(cx).player_fullscreen();

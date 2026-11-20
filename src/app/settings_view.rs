@@ -13,6 +13,42 @@ pub(super) enum ButtonKind {
     Icon,
 }
 
+/// Inner padding `settings_card` paints on every side. A row inside a card is
+/// narrower than the dialog body by this amount on each side.
+pub(super) const CARD_INSET: f32 = 16.0;
+
+/// Border `settings_card` paints with `border_1`, on each side.
+pub(super) const CARD_BORDER: f32 = 1.0;
+
+/// Logical box of the settings card. The voice tab reuses the same numbers to
+/// decide whether its form is wide enough for two columns, so the predicate
+/// follows the real painted dialog instead of a hard-coded window guess.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct CardMetrics {
+    pub width: f32,
+    pub height: f32,
+    pub pad: f32,
+}
+
+impl CardMetrics {
+    /// Usable width of one form row: the card minus both dialog insets, the
+    /// card's own inner padding and its 1 px border on each side. The 680 px
+    /// card leaves 598 px, the 620 px card 538 px.
+    pub(super) fn form_width(self) -> f32 {
+        self.width - 2.0 * self.pad - 2.0 * CARD_INSET - 2.0 * CARD_BORDER
+    }
+}
+
+/// The card box from the window viewport and the view scale. Physical margins
+/// stay constant across DPI steps: the logical inset grows with the scale.
+pub(super) fn settings_card_metrics(viewport: (f32, f32), scale: f32) -> CardMetrics {
+    let scale = scale.clamp(1.0, 3.0);
+    let width = 680_f32.min(viewport.0 - 16. * scale).max(260.);
+    let height = 780_f32.min(viewport.1 - 24. * scale).max(240.);
+    let pad = if width < 440. { 16. } else { 24. };
+    CardMetrics { width, height, pad }
+}
+
 impl Voxhold {
     /// The settings elements are looked up by their id in the layout tests; the
     /// debug selector is a no-op outside test builds.
@@ -332,6 +368,67 @@ impl Voxhold {
             .into_any_element()
     }
 
+    /// One bordered group inside the settings form, as in the web
+    /// `voice-settings__section`: a title, an optional description, an optional
+    /// trailing action and the body. The theme's `surface`/`line` tokens make
+    /// every card read as part of the same dialog.
+    pub(super) fn settings_card(
+        &self,
+        id: &'static str,
+        title: &str,
+        description: &str,
+        trailing: Option<AnyElement>,
+        body: AnyElement,
+    ) -> AnyElement {
+        let p = self.palette;
+        let mut header = div()
+            .w_full()
+            .flex()
+            .items_start()
+            .justify_between()
+            .gap_3()
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_size(px(14.))
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .child(title.to_owned()),
+                    )
+                    .when(!description.is_empty(), |text| {
+                        text.child(
+                            div()
+                                .text_size(px(12.))
+                                .text_color(ink(p.muted))
+                                .child(description.to_owned()),
+                        )
+                    }),
+            );
+        if let Some(trailing) = trailing {
+            header = header.child(trailing);
+        }
+        div()
+            .id(ElementId::Name(id.into()))
+            .debug_selector(move || id.to_string())
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap(px(12.))
+            .p(px(CARD_INSET))
+            .rounded(px(14.))
+            .border_1()
+            .border_color(ink(p.line))
+            .bg(ink(p.surface))
+            .child(header)
+            .child(body)
+            .into_any_element()
+    }
+
     /// Pin the logical scale the settings card lays out against. The production
     /// path samples `window.scale_factor()` on every paint; the layout tests
     /// pin it to emulate 125 %/150 % on a fixed test window.
@@ -411,12 +508,8 @@ impl Voxhold {
         };
         let p = self.palette;
         let (vw, vh) = self.viewport;
-        // Physical margins are constant across DPI steps: the logical inset
-        // grows with the scale, so a 150 % window keeps the same physical gap.
-        let scale = self.ui_scale.clamp(1.0, 3.0);
-        let width = 680_f32.min(vw - 16. * scale).max(260.);
-        let height = 780_f32.min(vh - 24. * scale).max(240.);
-        let pad = if width < 440. { 16. } else { 24. };
+        let metrics = settings_card_metrics((vw, vh), self.ui_scale);
+        let (width, height, pad) = (metrics.width, metrics.height, metrics.pad);
         let left = (vw - width) / 2.;
         let top = (vh - height) / 2.;
         self.settings_ring.clear();

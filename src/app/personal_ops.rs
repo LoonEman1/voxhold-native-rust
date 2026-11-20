@@ -31,6 +31,9 @@ impl Voxhold {
         // The WinMM preview and the meter belong to the open voice tab only.
         self.stop_voice_preview();
         self.stop_voice_meter();
+        // The shortcut recorder and its rejection notice are per-tab state.
+        self.voice_settings.recording_shortcut = None;
+        self.voice_settings.shortcut_conflict.clear();
         match kind {
             SettingsKind::Personal => {
                 if let Some(personal) = &mut self.personal {
@@ -232,6 +235,8 @@ impl Voxhold {
                 if previous == Some(1) && index != 1 {
                     self.stop_voice_preview();
                     self.stop_voice_meter();
+                    self.voice_settings.recording_shortcut = None;
+                    self.voice_settings.shortcut_conflict.clear();
                 }
                 if index == 1 {
                     // Go `open: refresh`: every entry to the tab re-reads the
@@ -663,6 +668,7 @@ impl Voxhold {
             | Action::SetNoiseMode(_)
             | Action::SetInputMode(_)
             | Action::ToggleAutoGain
+            | Action::ToggleVoiceDiagnostics
             | Action::ResetVoice
             | Action::TestMicrophone
             | Action::TestTone => {}

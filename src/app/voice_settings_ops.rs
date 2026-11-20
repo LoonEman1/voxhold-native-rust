@@ -82,10 +82,17 @@ impl Voxhold {
                 self.apply_voice_snapshot(cx);
                 cx.notify();
             }
+            Action::ToggleVoiceDiagnostics => {
+                // View-only state: the section must not touch the saved file.
+                self.voice_settings.diagnostics_open = !self.voice_settings.diagnostics_open;
+                cx.notify();
+            }
             Action::ResetVoice => {
                 // Go resets to `defaultVoicePreferences()` and therefore also
                 // clears both selected devices.
                 self.voice_settings.prefs = crate::voice_settings::VoicePrefs::default();
+                self.voice_settings.recording_shortcut = None;
+                self.voice_settings.shortcut_conflict.clear();
                 self.persist_voice(cx);
                 self.apply_voice_snapshot(cx);
                 #[cfg(feature = "voxhold-media")]
@@ -134,6 +141,7 @@ impl Voxhold {
                 #[cfg(feature = "voxhold-media")]
                 if self.voice_settings.recording_shortcut == Some(field) {
                     self.voice_settings.recording_shortcut = None;
+                    self.voice_settings.shortcut_conflict.clear();
                     cx.notify();
                 } else {
                     self.start_shortcut_recording(field, cx);

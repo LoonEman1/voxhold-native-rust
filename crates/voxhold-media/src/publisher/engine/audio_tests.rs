@@ -106,6 +106,7 @@ fn request(audio: bool) -> PublishRequest {
             display_id: -1,
             width: 1280,
             height: 720,
+            monitor: None,
         },
         quality: Quality {
             resolution: Resolution::P720,
@@ -115,6 +116,7 @@ fn request(audio: bool) -> PublishRequest {
         },
         codec: Codec::Vp8,
         audio,
+        audio_scope: crate::system_audio::AudioScope::Device,
     }
 }
 

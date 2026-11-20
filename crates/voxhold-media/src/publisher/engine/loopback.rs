@@ -29,7 +29,7 @@ use libwebrtc::{
 use tokio::time::sleep;
 use tokio_stream::StreamExt;
 
-use super::PublisherEngine;
+use super::{BitrateSend, PublisherEngine};
 use crate::publisher::{Codec, PublishRequest, Quality, Resolution};
 use crate::screen_capture::{ScreenSource, SourceKind};
 
@@ -93,6 +93,7 @@ fn request() -> PublishRequest {
             display_id: -1,
             width: 1280,
             height: 720,
+            monitor: None,
         },
         quality: Quality {
             resolution: Resolution::P720,
@@ -102,12 +103,27 @@ fn request() -> PublishRequest {
         },
         codec: Codec::Vp8,
         audio: false,
+        audio_scope: crate::system_audio::AudioScope::Device,
     }
 }
 
 #[test]
 fn the_publisher_answer_keeps_the_offered_mid_and_sends_frames() {
     loopback_with_frame_size((1280, 720));
+}
+
+/// A live bitrate change must reach the negotiated sender without a new offer
+/// or answer: the fake SFU keeps receiving frames from the same track. A later
+/// re-offer (the backend's `startRecovery` may send one to a live publisher)
+/// must keep the applied limit instead of reverting to the spawn-time request.
+#[test]
+fn a_live_bitrate_change_reaches_the_negotiated_sender_without_renegotiation() {
+    let change = Quality {
+        bitrate_kbps: 1200,
+        audio_bitrate_kbps: 64,
+        ..request().quality
+    };
+    loopback((1280, 720), Some(change));
 }
 
 /// A 21:9 monitor inside a 720p publication is encoded at 1280×540. The
@@ -119,6 +135,10 @@ fn a_smaller_21_by_9_frame_still_reaches_the_sfu() {
 }
 
 fn loopback_with_frame_size(frame_size: (u32, u32)) {
+    loopback(frame_size, None);
+}
+
+fn loopback(frame_size: (u32, u32), change: Option<Quality>) {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -183,19 +203,43 @@ fn loopback_with_frame_size(frame_size: (u32, u32)) {
         engine.offer(offer_sdp.clone()).expect("offer command");
 
         let mut answer: Option<String> = None;
-        let mut remote_answer_set = false;
+        let mut answers = 0_u32;
+        let mut applied_answers = 0_u32;
+        let mut expected_mid = offer_mid.clone();
         let mut reader = None;
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut change_applied = false;
+        let mut change_verified = false;
+        let mut frames_at_change = 0_u64;
+        let mut reoffered = false;
+        let mut frames_at_reoffer = 0_u64;
+        let budget = if change.is_some() { 30 } else { 20 };
+        let deadline = Instant::now() + Duration::from_secs(budget);
         while Instant::now() < deadline {
             while let Some(event) = engine.poll() {
                 match event {
-                    crate::publisher::EngineEvent::Answer(sdp) => answer = Some(sdp),
+                    crate::publisher::EngineEvent::Answer(sdp) => {
+                        answers += 1;
+                        answer = Some(sdp);
+                    }
                     crate::publisher::EngineEvent::Ice(candidate) => {
                         let mid = candidate.sdp_mid.clone().unwrap_or_default();
                         let index = candidate.sdp_mline_index.map(i32::from).unwrap_or(-1);
                         if let Ok(parsed) = IceCandidate::parse(&mid, index, &candidate.candidate) {
                             let _ = sfu.add_ice_candidate(parsed).await;
                         }
+                    }
+                    crate::publisher::EngineEvent::Bitrate {
+                        attempt,
+                        op,
+                        result,
+                    } => {
+                        assert_eq!((attempt, op), (1, 1), "the result keeps both tags");
+                        assert_eq!(
+                            result,
+                            crate::publisher::BitrateResult::Applied,
+                            "the live limit was not verified"
+                        );
+                        change_verified = true;
                     }
                     crate::publisher::EngineEvent::Error(message) => {
                         panic!("publisher engine error: {message}")
@@ -206,12 +250,14 @@ fn loopback_with_frame_size(frame_size: (u32, u32)) {
             }
             drain_to_sfu(&sfu_candidates, &sfu).await;
             drain_to_engine(&sfu_candidates, &engine);
-            if !remote_answer_set {
-                if let Some(sdp) = &answer {
+            // Each offer needs exactly one answer, applied once. A re-offer is
+            // answered on the same send track and must keep the offered mid.
+            if applied_answers < answers {
+                if let Some(sdp) = answer.as_deref() {
                     // The answer must keep the offered mid and be sendonly: a
                     // wrong transceiver binding produces recvonly/inactive or a
                     // different mid, and the SFU would never see a track.
-                    assert_eq!(first_mid(sdp).as_deref(), Some(offer_mid.as_str()));
+                    assert_eq!(first_mid(sdp).as_deref(), Some(expected_mid.as_str()));
                     let video = section(sdp, "m=video").expect("video section");
                     assert!(
                         video.contains("a=sendonly"),
@@ -223,10 +269,10 @@ fn loopback_with_frame_size(frame_size: (u32, u32)) {
                     sfu.set_remote_description(parsed)
                         .await
                         .expect("sfu remote answer");
-                    remote_answer_set = true;
+                    applied_answers += 1;
                 }
             }
-            if reader.is_none() && remote_answer_set {
+            if reader.is_none() && applied_answers > 0 {
                 if let Some(track) = track_slot.lock().unwrap().clone() {
                     let counter = frames.clone();
                     reader = Some(tokio::spawn(async move {
@@ -237,8 +283,64 @@ fn loopback_with_frame_size(frame_size: (u32, u32)) {
                     }));
                 }
             }
-            if remote_answer_set && frames.load(Ordering::SeqCst) > 0 {
-                break;
+            if applied_answers > 0 && frames.load(Ordering::SeqCst) > 0 {
+                match change {
+                    Some(next) if !change_applied => {
+                        // The negotiated sender is live; apply the new limit
+                        // exactly like `Outcome::SetBitrate` does.
+                        assert_eq!(
+                            engine.set_bitrate(1, 1, next),
+                            BitrateSend::Sent,
+                            "Sent only means the command reached the worker"
+                        );
+                        change_applied = true;
+                        frames_at_change = frames.load(Ordering::SeqCst);
+                    }
+                    Some(next) if !reoffered => {
+                        let expected = u64::from(next.bitrate_kbps) * 1000;
+                        // The verified event and the readback-derived limits
+                        // must agree before the SFU offers again.
+                        if change_verified
+                            && engine.applied_bitrate_limits().0 == expected
+                            && frames.load(Ordering::SeqCst) > frames_at_change
+                        {
+                            // The SFU offers again to the live publisher, as
+                            // `startRecovery` may. The answer is applied below
+                            // and must not revert the live limit.
+                            let second = sfu
+                                .create_offer(OfferOptions {
+                                    offer_to_receive_audio: None,
+                                    offer_to_receive_video: None,
+                                    ..OfferOptions::default()
+                                })
+                                .await
+                                .expect("second offer");
+                            let second_sdp = second.to_string();
+                            expected_mid =
+                                first_mid(&second_sdp).expect("the re-offer keeps a mid");
+                            sfu.set_local_description(second)
+                                .await
+                                .expect("sfu second local offer");
+                            engine.offer(second_sdp).expect("second offer command");
+                            reoffered = true;
+                            frames_at_reoffer = frames.load(Ordering::SeqCst);
+                        }
+                    }
+                    Some(next) if reoffered => {
+                        let expected = u64::from(next.bitrate_kbps) * 1000;
+                        if applied_answers >= 2 && frames.load(Ordering::SeqCst) > frames_at_reoffer
+                        {
+                            assert_eq!(
+                                engine.applied_bitrate_limits(),
+                                (expected, 0),
+                                "the re-offer reverted the live bitrate limit"
+                            );
+                            break;
+                        }
+                    }
+                    Some(_) => {}
+                    None => break,
+                }
             }
             sleep(Duration::from_millis(25)).await;
         }
@@ -251,8 +353,12 @@ fn loopback_with_frame_size(frame_size: (u32, u32)) {
         );
         assert!(answer.is_some(), "the publisher never produced an answer");
         assert!(
-            remote_answer_set,
+            applied_answers > 0,
             "the SFU never applied the publisher answer"
+        );
+        assert_eq!(
+            answers, applied_answers,
+            "every offer must be answered exactly once"
         );
         assert!(
             inbound > 0,
@@ -262,6 +368,27 @@ fn loopback_with_frame_size(frame_size: (u32, u32)) {
             decoded > 0,
             "on_track fired but no frame was decoded on the SFU"
         );
+        if let Some(next) = change {
+            assert!(
+                change_verified,
+                "the engine never sent a verified Bitrate/Applied result"
+            );
+            assert_eq!(
+                engine.applied_bitrate_limits(),
+                (u64::from(next.bitrate_kbps) * 1000, 0),
+                "the readback of the negotiated sender does not match the live limit"
+            );
+            assert_eq!(
+                answers, 2,
+                "a live change and its re-offer need exactly one answer each"
+            );
+            assert!(
+                reoffered,
+                "the re-offer after a live change was never produced"
+            );
+        } else {
+            assert_eq!(answers, 1, "one offer needs exactly one answer");
+        }
 
         if let Some(reader) = reader {
             reader.abort();

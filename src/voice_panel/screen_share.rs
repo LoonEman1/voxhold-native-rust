@@ -10,21 +10,31 @@
 
 use super::*;
 use voxhold_media::publisher::{
-    Codec, Phase, Preset, PublishRequest, Quality, Resolution, Sharing, AUDIO_BITRATES,
-    MAX_CHANNEL_PUBLISHERS,
+    Codec, Phase, Preset, PublishRequest, Quality, QualityChange, QualityOutcome, Resolution,
+    Sharing, AUDIO_BITRATES, MAX_CHANNEL_PUBLISHERS,
 };
-use voxhold_media::screen_capture::{self, ScreenSource, SourceKind};
-use voxhold_media::system_audio::{self, AudioDeviceInfo};
+use voxhold_media::screen_capture::{
+    self, PreviewFrame, ScreenSource, SourceId, SourceIdentity, SourceKind, ThumbnailError,
+};
+use voxhold_media::system_audio::{self, AudioDeviceInfo, AudioScope};
 
-/// Windows loopback sees every render session of the endpoint, including this
-/// application's own room and player. State it instead of promising otherwise.
-pub(crate) const SYSTEM_AUDIO_WARNING: &str =
-    "Системный звук записывается через loopback всего устройства вывода: в него попадут голос комнаты и плеер Voxhold. Windows не позволяет исключить звук отдельного приложения.";
 /// The backend has no runtime reconfigure; the dialog must warn honestly.
 pub(crate) const RESTART_WARNING: &str =
-    "Изменение качества перезапустит трансляцию: текущая сессия будет остановлена, зрители увидят новое подключение.";
+    "Изменение разрешения, частоты кадров или звука перезапустит трансляцию: текущая сессия будет остановлена, зрители увидят новое подключение.";
+/// A bitrate-only change reaches the running sender; the dialog says so
+/// instead of promising a restart.
+pub(crate) const LIVE_BITRATE_HINT: &str =
+    "Изменится только битрейт: он применится в эфире без перезапуска и без отключения зрителей.";
 /// A Start pressed before the endpoint probe answered; cleared by the answer.
 pub(crate) const AUDIO_PENDING_REASON: &str = "Дождитесь проверки системного звука.";
+/// The selected identity is gone from the current snapshot; the publish path
+/// repeats this check, so a stale dialog never sends a request.
+pub(crate) const SOURCE_GONE_REASON: &str =
+    "Выбранный источник больше недоступен. Обновите список и выберите источник снова.";
+/// The chosen monitor moved to another capturer number or its geometry
+/// changed: the numeric id still exists but no longer proves the same screen.
+pub(crate) const SOURCE_CHANGED_REASON: &str =
+    "Выбранный экран изменился. Обновите список и выберите экран снова.";
 /// A session rotation restarts the call lease, so the old publication cannot
 /// survive it. Say that plainly instead of letting the card disappear.
 pub(crate) const SCREEN_ROTATION_NOTICE: &str = "Трансляция остановлена после обновления сессии.";
@@ -34,11 +44,29 @@ pub(crate) const SCREEN_ROTATION_NOTICE: &str = "Трансляция остан
 /// It still does not allow publishing more than one stream in this stage.
 pub(crate) const MULTI_STREAMS_SUPPORTED: bool = true;
 
+/// Width requested from the media layer for one picker card. The media layer
+/// clamps it again, so a caller cannot grow the cache.
+pub(super) const SCREEN_THUMBNAIL_WIDTH: u32 = 320;
+/// Hard bound of the picker preview cache: at most 64 cards.
+pub(super) const MAX_SCREEN_PREVIEWS: usize = 64;
+/// Hard bound of all BGRA bytes kept for picker previews.
+pub(super) const MAX_SCREEN_PREVIEW_BYTES: usize = 16 * 1024 * 1024;
+/// A picture that does not fit the cache still gets an honest card note.
+pub(super) const PREVIEW_MEMORY_REASON: &str = "Предпросмотр недоступен: превышен лимит памяти.";
+
+/// One cached card picture. `bytes` is the BGRA source size, so the budget
+/// stays comparable across sessions.
+pub(super) struct PreviewThumb {
+    pub(super) image: Arc<RenderImage>,
+    pub(super) bytes: usize,
+}
+
 /// One focusable action inside the picker. `Enter`/`Space` on a focused
 /// element runs it, exactly like the settings modal.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ShareKey {
-    Source(usize),
+    /// A picker row, bound to the stable `kind + capturer id`, never a position.
+    Source(SourceId),
     Monitors,
     Windows,
     Refresh,
@@ -48,6 +76,8 @@ pub(super) enum ShareKey {
     BitrateUp,
     Preset(Preset),
     Audio,
+    /// One offered capture scope of the system-audio track.
+    AudioScope(AudioScope),
     AudioBitrateDown,
     AudioBitrateUp,
     Cancel,
@@ -66,22 +96,64 @@ pub(super) struct ScreenShareUi {
     pub(super) window_loading: bool,
     pub(super) monitor_error: String,
     pub(super) window_error: String,
-    pub(super) selected: Option<ScreenSource>,
+    /// Current enumeration key of the chosen row. It is re-resolved when a
+    /// snapshot moves the monitor to another id.
+    pub(super) selected: Option<SourceId>,
+    /// The surface the user really chose. A monitor is its Windows identity;
+    /// a window is its `HWND` in [`SourceId::id`].
+    pub(super) selected_identity: Option<SourceIdentity>,
     pub(super) resolution: Resolution,
     pub(super) fps: u32,
     pub(super) bitrate_kbps: u32,
     pub(super) audio_enabled: bool,
+    /// The scope the next request carries. Only meaningful when audio is on;
+    /// the provided source kind decides the default choice.
+    pub(super) audio_scope: AudioScope,
     pub(super) audio_bitrate_kbps: u32,
     pub(super) audio_availability: Option<Result<AudioDeviceInfo, String>>,
     /// The dialog was opened from the live card to change quality. Start then
     /// becomes a confirmed stop+start, never a live reconfigure.
     pub(super) restart: bool,
-    /// The request of the accepted attempt. A restart prefills from it.
-    pub(super) last_request: Option<PublishRequest>,
     pub(super) busy: bool,
+    /// A quality-change preflight of this dialog is pending. Start sets it, the
+    /// failure answer, a commit or closing the dialog clears it. It survives a
+    /// stale state that clears `busy`, so closing always cancels the preflight.
+    pub(super) preflight: bool,
+    /// Next tag of a quality-change operation. It survives closing the dialog,
+    /// so a delayed answer of an older operation can never match a newer one.
+    pub(super) quality_op: u64,
+    /// The operation whose result this dialog is waiting for. `busy` belongs
+    /// to it; a result of another operation never clears it.
+    pub(super) pending_quality_op: Option<u64>,
     pub(super) error: String,
     pub(super) sharing: Sharing,
     pub(super) preview: Option<Arc<RenderImage>>,
+    /// Picker thumbnails keyed by the stable surface identity, so a capturer
+    /// reorder keeps the picture of the same display. Bounded by
+    /// [`MAX_SCREEN_PREVIEWS`] and [`MAX_SCREEN_PREVIEW_BYTES`].
+    pub(super) previews: HashMap<SourceIdentity, PreviewThumb>,
+    /// Surfaces whose thumbnail attempt failed. The message is painted on the
+    /// card; the selection and the publish request never change because of it.
+    pub(super) preview_failures: HashMap<SourceIdentity, String>,
+    /// Identities whose thumbnail is being captured, so a refresh never
+    /// queues the same surface twice.
+    pub(super) preview_pending: HashSet<SourceIdentity>,
+    /// One preview batch is running for this picker. Only one batch may run at
+    /// a time; a request made while it is set returns, and the running batch
+    /// picks up newly visible rows at its next safe point and re-requests at
+    /// its end.
+    pub(super) preview_batching: bool,
+    /// Session epoch of the open picker. Closing it, a stop, a restart or a new
+    /// picker bumps this value; a late capture result is then ignored and no
+    /// further source is started.
+    pub(super) preview_epoch: u64,
+    /// BGRA bytes currently owned by `previews`.
+    pub(super) preview_bytes: usize,
+    /// Pictures dropped by the count or byte bound, kept for diagnostics/tests.
+    pub(super) preview_rejected: u32,
+    /// Cards painted by the last frame, so a layout test can prove one card per
+    /// source without relying on a single `debug_selector`.
+    pub(super) preview_cards: usize,
     pub(super) ring: Vec<(FocusHandle, ShareKey)>,
     /// Set once the dialog focused its first ring element. The flag is reset
     /// with the dialog, so a repaint never steals focus back from the user.
@@ -103,18 +175,30 @@ impl Default for ScreenShareUi {
             monitor_error: String::new(),
             window_error: String::new(),
             selected: None,
+            selected_identity: None,
             resolution: Resolution::P1080,
             fps: 30,
             bitrate_kbps: 6000,
-            audio_enabled: true,
+            audio_enabled: false,
+            audio_scope: AudioScope::EverythingExceptSelf,
             audio_bitrate_kbps: 128,
             audio_availability: None,
             restart: false,
-            last_request: None,
             busy: false,
+            preflight: false,
+            quality_op: 0,
+            pending_quality_op: None,
             error: String::new(),
             sharing: Sharing::default(),
             preview: None,
+            previews: HashMap::new(),
+            preview_failures: HashMap::new(),
+            preview_pending: HashSet::new(),
+            preview_batching: false,
+            preview_epoch: 0,
+            preview_bytes: 0,
+            preview_rejected: 0,
+            preview_cards: 0,
             ring: Vec::new(),
             focus_placed: false,
         }
@@ -123,10 +207,58 @@ impl Default for ScreenShareUi {
 
 impl ScreenShareUi {
     fn sources(&self) -> &[ScreenSource] {
-        match self.kind {
+        self.snapshot(self.kind)
+    }
+
+    fn snapshot(&self, kind: SourceKind) -> &[ScreenSource] {
+        match kind {
             SourceKind::Monitor => &self.monitors,
             SourceKind::Window => &self.windows,
         }
+    }
+
+    /// The confirmed live source of a restart dialog. It comes from the
+    /// configuration the media layer accepted on air; neither a request this
+    /// dialog sent nor an enumeration answer can define or inject it.
+    pub(super) fn restart_source(&self) -> Option<&ScreenSource> {
+        if !self.restart {
+            return None;
+        }
+        self.sharing
+            .confirmed
+            .as_ref()
+            .map(|confirmed| &confirmed.source)
+    }
+
+    /// Whether the restart still points at the identity the engine accepted.
+    /// The snapshot is irrelevant: the live source may be absent from it.
+    pub(super) fn restart_is_confirmed(&self) -> bool {
+        self.restart_source().is_some_and(|source| {
+            self.selected == Some(source.source_id()) && self.selected_identity == source.identity()
+        })
+    }
+
+    /// The request a restart dialog would send: the confirmed live source with
+    /// the quality and audio fields shown by the dialog. Only a scope the user
+    /// really picks in the dialog can widen a narrow live scope.
+    pub(super) fn restart_request(&self) -> Option<PublishRequest> {
+        let mut request = self.sharing.confirmed.as_ref()?.request();
+        request.quality = self.quality().clamped();
+        request.audio = self.audio_requested();
+        request.audio_scope = self.effective_audio_scope(request.source.kind);
+        Some(request)
+    }
+
+    /// What the dialog's current values would change relative to the confirmed
+    /// live configuration. `None` outside a restart dialog or before that
+    /// configuration is known.
+    pub(super) fn restart_change(&self) -> Option<QualityChange> {
+        if !self.restart {
+            return None;
+        }
+        let live = self.sharing.confirmed.as_ref()?.request();
+        let next = self.restart_request()?;
+        Some(live.change_to(&next))
     }
 
     fn loading(&self) -> bool {
@@ -152,12 +284,29 @@ impl ScreenShareUi {
         }
     }
 
-    /// The settings that a live attempt applies. Shown on the on-air card.
-    fn quality_label(&self) -> String {
+    /// The settings the live attempt really applies, shown on the on-air card.
+    /// The confirmed configuration wins over the in-flight restart request.
+    pub(super) fn quality_label(&self) -> String {
         self.sharing
-            .quality
+            .confirmed
+            .as_ref()
+            .map(|confirmed| confirmed.quality)
+            .or(self.sharing.quality)
             .unwrap_or_else(|| self.quality())
             .describe()
+    }
+
+    /// Return the dialog's numeric quality controls to the configuration the
+    /// media layer confirmed. A refused change must show the values that are
+    /// still on air, never the request that failed.
+    pub(super) fn restore_confirmed_quality(&mut self) {
+        let Some(confirmed) = self.sharing.confirmed.as_ref() else {
+            return;
+        };
+        self.resolution = confirmed.quality.resolution;
+        self.fps = confirmed.quality.fps;
+        self.bitrate_kbps = confirmed.quality.bitrate_kbps;
+        self.audio_bitrate_kbps = confirmed.quality.audio_bitrate_kbps;
     }
 
     pub(super) fn audio_available(&self) -> bool {
@@ -190,31 +339,91 @@ impl ScreenShareUi {
 
     /// The honest on-air sound line. The measured rate comes from the RTP
     /// stats; before the first sample only the configured maximum is shown.
+    /// The actual scope comes from the engine, not from the picker choice.
     pub(super) fn sound_label(&self) -> String {
         if !self.sharing.has_audio {
             return "Без звука".into();
         }
         let max = self
             .sharing
-            .quality
-            .map(|quality| quality.audio_bitrate_kbps)
+            .confirmed
+            .as_ref()
+            .map(|confirmed| confirmed.quality.audio_bitrate_kbps)
+            .or(self
+                .sharing
+                .quality
+                .map(|quality| quality.audio_bitrate_kbps))
             .unwrap_or(self.audio_bitrate_kbps);
-        match self.sharing.stats {
+        let rate = match self.sharing.stats {
             Some(stats) if stats.audio_kbps > 0.0 => {
                 format!("Звук ~{:.0} из до {} кбит/с", stats.audio_kbps, max)
             }
             _ => format!("Звук до {max} кбит/с"),
+        };
+        match self.sharing.audio_scope.as_deref() {
+            Some(scope) if !scope.is_empty() => format!("{rate} · {scope}"),
+            _ => rate,
         }
     }
 
+    /// The honest hint of the live quality dialog: a bitrate-only change is
+    /// applied in place, everything else restarts the publication.
     pub(super) fn restart_warning(&self) -> Option<&'static str> {
-        self.restart.then_some(RESTART_WARNING)
+        if !self.restart {
+            return None;
+        }
+        match self.restart_change() {
+            Some(QualityChange::LiveBitrate) => Some(LIVE_BITRATE_HINT),
+            _ => Some(RESTART_WARNING),
+        }
+    }
+}
+
+/// The exact line the on-air card paints under its title. `stats` carries the
+/// measured counters once the engine sampled them, `sound` is the fallback
+/// label (which already names the scope). The engine's real scope is appended
+/// exactly once, so the measured-stats card names the capture instead of hiding
+/// it behind the counters.
+pub(in crate::voice_panel) fn screen_on_air_line(
+    sharing: &Sharing,
+    quality: &str,
+    sound: &str,
+    stats: Option<&str>,
+) -> String {
+    let scope = sharing
+        .audio_scope
+        .as_deref()
+        .filter(|scope| sharing.has_audio && !scope.is_empty());
+    match (stats, scope) {
+        (Some(stats), Some(scope)) => format!("{quality} · {stats} · {scope}"),
+        (Some(stats), None) => format!("{quality} · {stats}"),
+        (None, Some(scope)) if !sound.contains(scope) => {
+            format!("{quality} · {sound} · {scope}")
+        }
+        (None, _) => format!("{quality} · {sound}"),
     }
 }
 
 impl VoicePanel {
     pub fn set_stream_permission(&mut self, allowed: bool) {
         self.can_stream = allowed;
+        // A revocation that arrives while the picker or a capture preparation
+        // is open must reach the worker, not wait for the next Start.
+        self.sync_screen_access();
+    }
+
+    /// Push the current gate to the worker while a picker or an attempt is
+    /// open. The session re-checks it before it accepts a prepared engine, so
+    /// a permission or slot loss during the capture start cannot be missed.
+    pub(super) fn sync_screen_access(&self) {
+        if !(self.screen.open || self.screen.busy || self.share_active()) {
+            return;
+        }
+        let Some(handle) = &self.handle else {
+            return;
+        };
+        let slot_available = self.active_publishers_in_room() < MAX_CHANNEL_PUBLISHERS;
+        handle.screen_access(self.can_stream, slot_available);
     }
 
     pub fn screen_share_open(&self) -> bool {
@@ -233,8 +442,7 @@ impl VoicePanel {
         self.screen.busy
     }
 
-    /// Whether this client currently owns a publication attempt. In this
-    /// phase the «Экран» action shows a status instead of a disabled reason.
+    /// Whether this client owns an attempt. The action shows a status then.
     pub(super) fn share_active(&self) -> bool {
         matches!(
             self.screen.sharing.phase,
@@ -242,9 +450,8 @@ impl VoicePanel {
         )
     }
 
-    /// Why the «Экран» action is disabled, shown next to the toolbar. During
-    /// an active share the reason would be the permanent "already running"
-    /// text, so the room shows the publication state instead.
+    /// Why the «Экран» action is disabled. During a share the permanent
+    /// "already running" text would hide the publication state instead.
     pub(super) fn screen_reason(&self) -> Option<&'static str> {
         if self.share_active() {
             return None;
@@ -313,22 +520,34 @@ impl VoicePanel {
         self.screen.open = true;
         self.screen.restart = false;
         self.screen.busy = false;
+        self.screen.preflight = false;
+        self.screen.pending_quality_op = None;
         self.screen.error.clear();
         self.screen.selected = None;
-        self.screen.last_request = None;
+        self.screen.selected_identity = None;
         self.screen.kind = SourceKind::Monitor;
-        // A fresh publication defaults to system audio; the background probe
-        // fills in availability and disables the toggle if the endpoint fails.
-        // The previous picker's answer must not leak into this one: Start
-        // stays locked until the new probe settles.
-        self.screen.audio_enabled = true;
+        // A new picker starts with no rows: no identity from the previous
+        // answer or a live source is selectable while the lists load.
+        self.screen.monitors.clear();
+        self.screen.windows.clear();
+        self.screen.monitor_error.clear();
+        self.screen.window_error.clear();
+        // A new epoch: a capture of the previous dialog is ignored.
+        self.screen.clear_previews();
+        // A fresh publication starts without system sound, and the previous
+        // picker's probe answer must not leak in: Start stays locked until
+        // the new probe settles and offers the safe default scope.
+        self.screen.audio_enabled = false;
+        self.screen.reset_audio_scope(SourceKind::Monitor);
         self.screen.audio_availability = None;
         self.begin_audio_probe(cx);
         self.screen.focus_placed = false;
         if let Some(handle) = &self.handle {
             self.screen.picker = handle.begin_screen_picker();
         }
+        self.sync_screen_access();
         self.request_screen_sources(cx);
+        self.request_screen_previews(cx);
         cx.notify();
     }
 
@@ -338,28 +557,39 @@ impl VoicePanel {
         if self.screen.sharing.phase != Phase::Live {
             return;
         }
+        // Without a configuration the media layer really accepted on air there
+        // is nothing safe to restart; a sent-but-unconfirmed request is not a
+        // substitute. The live card still owns the stop action.
+        let Some(confirmed) = self.screen.sharing.confirmed.clone() else {
+            return;
+        };
+        // The dialog really opens from here, so the push-to-talk key is free for
+        // its own use. A refused open leaves the voice state untouched.
         self.release_push_to_talk();
-        let sharing = self.screen.sharing.clone();
-        if let Some(quality) = sharing.quality {
-            self.screen.resolution = quality.resolution;
-            self.screen.fps = quality.fps;
-            self.screen.bitrate_kbps = quality.bitrate_kbps;
-            self.screen.audio_bitrate_kbps = quality.audio_bitrate_kbps;
-        }
-        self.screen.audio_enabled = sharing.has_audio;
+        self.screen.resolution = confirmed.quality.resolution;
+        self.screen.fps = confirmed.quality.fps;
+        self.screen.bitrate_kbps = confirmed.quality.bitrate_kbps;
+        self.screen.audio_bitrate_kbps = confirmed.quality.audio_bitrate_kbps;
+        self.screen.audio_enabled = confirmed.audio;
+        // The dialog starts from the scope the live attempt accepted; opening
+        // it never widens a narrow scope.
+        self.screen.audio_scope = confirmed.audio_scope;
         self.begin_audio_probe(cx);
-        if self.screen.selected.is_none() {
-            self.screen.selected = self
-                .screen
-                .last_request
-                .as_ref()
-                .map(|request| request.source.clone());
-        }
         self.screen.restart = true;
+        // The restart dialog is bound to the confirmed live source here, and
+        // only here: the identity stays in `confirmed`, never in the
+        // enumeration caches, so the current snapshot may be empty or stale.
+        self.screen.bind_confirmed_live_source();
+        // A restart has no picker: release every thumbnail and bump the epoch
+        // so an earlier picker capture cannot land in this dialog.
+        self.screen.clear_previews();
         self.screen.open = true;
         self.screen.busy = false;
+        self.screen.preflight = false;
+        self.screen.pending_quality_op = None;
         self.screen.error.clear();
         self.screen.focus_placed = false;
+        self.sync_screen_access();
         cx.notify();
     }
 
@@ -402,33 +632,69 @@ impl VoicePanel {
     }
 
     /// Close the picker. Before Start this only cancels the picker and leaves
-    /// the viewer alone. After Start (Escape, backdrop or a repeated close)
-    /// it is a stop intent: the attempt already committed, so the capture is
-    /// released and exactly one `stream.stop` is sent.
+    /// the viewer alone. After Start (Escape, backdrop or a repeated close) it
+    /// is a stop intent: the attempt already committed, so exactly one
+    /// `stream.stop` is sent and the capture is released.
     pub(super) fn close_screen_share(&mut self, cx: &mut Context<Self>) {
         if !self.screen.open {
             return;
         }
+        // A live bitrate change is still being applied by the senders. Closing
+        // would hide it while it can still change the on-air limit (and a
+        // stop/cancel does not belong to this operation), so Escape, the
+        // backdrop and Cancel wait for the engine's Applied/Failed answer.
+        let applying = self.screen.pending_quality_op.is_some_and(|op| {
+            self.screen
+                .sharing
+                .quality_status
+                .as_ref()
+                .is_some_and(|status| status.op == op && status.outcome == QualityOutcome::Applying)
+        });
+        if applying {
+            return;
+        }
         let restart_open = self.screen.restart;
-        // The live publication existed before this dialog; closing it without
-        // pressing Restart must leave the stream untouched.
+        // A preflight is pending as soon as this dialog asked for a restart,
+        // even before the worker's `preflighting` update lands or after a
+        // stale sample cleared `busy`. Closing cancels it and keeps Live.
+        let preflight_pending =
+            restart_open && (self.screen.preflight || self.screen.sharing.preflighting);
+        let restart_busy = restart_open && (self.screen.busy || preflight_pending);
+        // Closing without a committed change leaves the live stream untouched.
+        // A restart only commits once the publisher confirmed the stop; while
+        // its preflight runs, closing cancels it instead.
         let committed = if restart_open {
-            self.screen.busy
+            self.screen.sharing.restarting && self.screen.busy
         } else {
             self.screen.busy || self.share_active()
         };
+        let pending_op = self.screen.pending_quality_op;
         self.screen.open = false;
         self.screen.restart = false;
         self.screen.busy = false;
+        self.screen.preflight = false;
+        self.screen.pending_quality_op = None;
         self.screen.error.clear();
         self.screen.selected = None;
+        self.screen.selected_identity = None;
+        // No row of this dialog may survive into the next picker. The
+        // confirmed live identity lives in `sharing.confirmed`, not in these
+        // caches.
+        self.screen.monitors.clear();
+        self.screen.windows.clear();
+        // Closing cancels the preview batch: the epoch moves, so a late answer
+        // is ignored, and the pictures/titles are released immediately.
+        self.screen.clear_previews();
         self.screen.focus_placed = false;
         if let Some(handle) = &self.handle {
             if committed {
                 handle.stop_screen_share();
+            } else if restart_busy {
+                if let Some(op) = pending_op {
+                    handle.cancel_screen_restart(op);
+                }
             } else if !restart_open {
-                // A restart dialog never opened a picker, so there is nothing
-                // to cancel and the live publication stays untouched.
+                // A restart dialog never opened a picker: nothing to cancel.
                 handle.cancel_screen_picker(self.screen.picker);
             }
         }
@@ -445,7 +711,11 @@ impl VoicePanel {
         self.screen.window_generation = handle.screen_sources(SourceKind::Window);
     }
 
-    fn refresh_screen_sources(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn refresh_screen_sources(&mut self, cx: &mut Context<Self>) {
+        // A restart is source-locked: the enumeration cannot change it.
+        if self.screen.restart {
+            return;
+        }
         match self.screen.kind {
             SourceKind::Monitor => {
                 if let Some(handle) = &self.handle {
@@ -462,20 +732,84 @@ impl VoicePanel {
                 }
             }
         }
+        // A refresh retries a failed thumbnail of the visible category; cached
+        // pictures and running attempts are kept, and an absent source is
+        // still requested only after its new answer describes it.
+        let kind = self.screen.kind;
+        self.screen
+            .preview_failures
+            .retain(|id, _| selection::identity_kind(id) != kind);
+        self.request_screen_previews(cx);
         cx.notify();
     }
 
-    fn select_screen_source(&mut self, source: ScreenSource, cx: &mut Context<Self>) {
-        self.screen.selected = Some(source);
+    pub(super) fn select_screen_source(&mut self, id: SourceId, cx: &mut Context<Self>) {
+        // A restart is bound to the confirmed live source: no cached row,
+        // clicked or reached by Enter, may move it elsewhere.
+        if self.screen.restart {
+            return;
+        }
+        // A row may only select a source the current snapshot really offers,
+        // and a monitor must carry a confirmed display identity.
+        if id.kind != self.screen.kind {
+            return;
+        }
+        let Some(source) = self.screen.source_for(id) else {
+            return;
+        };
+        let Some(identity) = source.identity() else {
+            self.screen.error = SOURCE_CHANGED_REASON.into();
+            cx.notify();
+            return;
+        };
+        self.screen.selected = Some(id);
+        self.screen.selected_identity = Some(identity);
+        self.screen.error.clear();
         cx.notify();
     }
 
-    /// Start is possible only after the endpoint probe answered: committing
-    /// while the answer is pending would publish video without the requested
-    /// system audio.
+    /// Switch the picker category; a selection of the other one is dropped.
+    pub(super) fn change_share_kind(&mut self, kind: SourceKind, cx: &mut Context<Self>) {
+        // A restart is source-locked, so the category cannot change.
+        if self.screen.restart {
+            return;
+        }
+        if self.screen.kind == kind {
+            return;
+        }
+        self.screen.kind = kind;
+        if self.screen.selected.is_some_and(|id| id.kind != kind) {
+            self.screen.selected = None;
+            self.screen.selected_identity = None;
+        }
+        // The safe default follows the source kind; an explicit whole-device
+        // choice survives a tab switch.
+        if self.screen.audio_scope != AudioScope::Device {
+            self.screen.reset_audio_scope(kind);
+        }
+        // Only the visible category is captured. A batch for the hidden one
+        // stops at its next check; its pending ids are dropped so switching
+        // back requests them again instead of treating them as in flight.
+        self.screen
+            .preview_pending
+            .retain(|id| selection::identity_kind(id) == kind);
+        self.request_screen_previews(cx);
+        cx.notify();
+    }
+
+    /// Start waits for the endpoint probe: committing earlier would publish
+    /// video without the requested system audio. A normal Start needs its id
+    /// in the snapshot; a restart needs the confirmed live identity.
     pub(super) fn screen_can_start(&self) -> bool {
-        self.screen.selected.is_some()
+        let source_ready = if self.screen.restart {
+            self.screen.restart_is_confirmed()
+        } else {
+            self.screen.selection_is_current()
+        };
+        source_ready
             && !self.screen.busy
+            && !self.screen.preflight
+            && !self.screen.sharing.preflighting
             && !Codec::available().is_empty()
             && self.screen.audio_availability.is_some()
             && (!self.screen.restart || self.screen.sharing.phase == Phase::Live)
@@ -506,23 +840,66 @@ impl VoicePanel {
                 return;
             }
         }
-        let Some(source) = self.screen.selected.clone() else {
+        let Some(id) = self.screen.selected else {
             self.screen.error = "Выберите монитор или окно.".into();
             cx.notify();
             return;
         };
-        if self.screen.restart && self.screen.sharing.phase != Phase::Live {
-            self.screen.error = "Трансляция уже не идёт; откройте выбор экрана заново.".into();
-            self.screen.open = false;
-            self.screen.restart = false;
-            cx.notify();
-            return;
-        }
+        let source = if self.screen.restart {
+            // The restart is locked to the source the engine already accepted.
+            // The current snapshot may be empty, stale or describe a renamed
+            // row; none of that may move the restart to another source.
+            if self.screen.sharing.phase != Phase::Live {
+                self.screen.error = "Трансляция уже не идёт; откройте выбор экрана заново.".into();
+                self.screen.open = false;
+                self.screen.restart = false;
+                self.screen.focus_placed = false;
+                self.screen.clear_previews();
+                cx.notify();
+                return;
+            }
+            let Some(live) = self.screen.restart_source().cloned() else {
+                self.screen.error = SOURCE_GONE_REASON.into();
+                cx.notify();
+                return;
+            };
+            if live.source_id() != id || self.screen.selected_identity != live.identity() {
+                self.screen.error = SOURCE_GONE_REASON.into();
+                cx.notify();
+                return;
+            }
+            live
+        } else {
+            // The dialog may be stale: build the request from the row that
+            // exists now, and refuse an absent, duplicated or re-used id.
+            let source = self
+                .screen
+                .source_for(id)
+                .filter(|_| id.kind == self.screen.kind)
+                .cloned();
+            let Some(source) = source else {
+                self.screen.error = SOURCE_GONE_REASON.into();
+                cx.notify();
+                return;
+            };
+            if source.identity().is_none() || !self.screen.selection_matches(&source) {
+                self.screen.error = SOURCE_CHANGED_REASON.into();
+                cx.notify();
+                return;
+            }
+            source
+        };
         let request = PublishRequest {
             source,
             quality: self.screen.quality(),
             codec: Codec::Vp8,
             audio: self.screen.audio_requested(),
+            audio_scope: self.screen.effective_audio_scope(
+                self.screen
+                    .selected
+                    .map(|id| id.kind)
+                    .unwrap_or(self.screen.kind),
+            ),
         };
         let Some(handle) = &self.handle else {
             self.screen.error = "Голосовое соединение уже закрыто.".into();
@@ -530,8 +907,24 @@ impl VoicePanel {
             return;
         };
         let slot_available = self.active_publishers_in_room() < MAX_CHANNEL_PUBLISHERS;
-        if self.screen.restart {
-            handle.restart_screen_share(request.clone(), self.can_stream, slot_available);
+        let live_bitrate =
+            self.screen.restart && self.screen.restart_change() == Some(QualityChange::LiveBitrate);
+        // Every quality change gets its own tag, so a delayed answer of an
+        // older Apply cannot clear the busy state of this one.
+        let quality_op = if self.screen.restart {
+            self.screen.quality_op = self.screen.quality_op.wrapping_add(1);
+            Some(self.screen.quality_op)
+        } else {
+            None
+        };
+        if let Some(op) = quality_op {
+            // A bitrate-only change goes to the live sender; the worker
+            // repeats the classification before it applies anything.
+            if live_bitrate {
+                handle.apply_screen_quality(op, request.clone(), self.can_stream, slot_available);
+            } else {
+                handle.restart_screen_share(op, request.clone(), self.can_stream, slot_available);
+            }
         } else {
             handle.publish_screen(
                 self.screen.picker,
@@ -540,8 +933,17 @@ impl VoicePanel {
                 slot_available,
             );
         }
-        self.screen.last_request = Some(request);
+        // The request is only this attempt's draft. It becomes confirmed when
+        // the media layer reports the attempt Live.
         self.screen.busy = true;
+        // A restart without a live bitrate starts a preflight; closing the
+        // dialog while it runs must cancel it instead of stopping the stream.
+        // The pending operation tag is the only confirmation this dialog needs.
+        self.screen.preflight = self.screen.restart && !live_bitrate;
+        self.screen.pending_quality_op = quality_op;
+        // The previous attempt's error belongs to its own answer. A stale
+        // `Sharing` snapshot must not turn this Start into an instant failure.
+        self.screen.sharing.error = None;
         self.screen.error.clear();
         // A new publication replaces the old state, so the notice about the
         // broadcast a rotation stopped no longer describes this room.
@@ -553,10 +955,12 @@ impl VoicePanel {
         if let Some(handle) = &self.handle {
             handle.stop_screen_share();
         }
+        // A stop ends the picker session: no capture may start another card.
+        self.screen.clear_previews();
         cx.notify();
     }
 
-    fn change_bitrate(&mut self, delta: i64, cx: &mut Context<Self>) {
+    pub(super) fn change_bitrate(&mut self, delta: i64, cx: &mut Context<Self>) {
         let next = (self.screen.bitrate_kbps as i64 + delta).clamp(500, 16_000);
         self.screen.bitrate_kbps = ((next / 100) * 100) as u32;
         cx.notify();
@@ -592,111 +996,12 @@ impl VoicePanel {
             return;
         }
         self.screen.audio_enabled = !self.screen.audio_enabled;
-        cx.notify();
-    }
-
-    /// Apply one runtime update. Returns whether the panel must repaint.
-    pub(super) fn apply_screen_update(&mut self, update: VoiceUpdate) -> bool {
-        match update {
-            VoiceUpdate::ScreenShare(sharing) => {
-                let previous = self.screen.sharing.phase;
-                self.screen.sharing = sharing;
-                let phase = self.screen.sharing.phase;
-                if self.screen.sharing.restarting && self.screen.open {
-                    // The stop of the quality change is committed; the card
-                    // now shows the restart and the dialog must not allow a
-                    // second action.
-                    self.screen.open = false;
-                    self.screen.restart = false;
-                    self.screen.busy = false;
-                }
-                if phase == Phase::Idle || phase == Phase::Failed {
-                    self.screen.restart = false;
-                }
-                if matches!(phase, Phase::Publishing | Phase::Live) && self.screen.open {
-                    // The attempt is accepted by the worker; the card in the
-                    // room now owns the status and the stop action.
-                    self.screen.open = false;
-                    self.screen.busy = false;
-                    self.screen.focus_placed = false;
-                }
-                if phase == Phase::Failed {
-                    self.screen.busy = false;
-                    self.screen.focus_placed = false;
-                    self.screen.error = self.screen.sharing.error.clone().unwrap_or_default();
-                    // A failed attempt has no picker any more; reopening the
-                    // dialog calls `begin_picker` again.
-                    if self.screen.open {
-                        self.screen.open = false;
-                    }
-                }
-                if phase == Phase::Idle {
-                    if self.screen.open {
-                        // The session ended (or a new one replaced the worker)
-                        // while the dialog was open; its picker id is stale.
-                        self.screen.open = false;
-                        self.screen.busy = false;
-                        self.screen.focus_placed = false;
-                        if previous != Phase::Idle {
-                            self.screen.error =
-                                "Соединение было восстановлено, выберите экран снова.".into();
-                        }
-                    }
-                }
-                if phase == Phase::Idle && previous != Phase::Idle {
-                    self.screen.preview = None;
-                }
-                true
-            }
-            VoiceUpdate::ScreenSources {
-                generation,
-                kind,
-                sources,
-                error,
-            } => {
-                match kind {
-                    SourceKind::Monitor if generation >= self.screen.monitor_generation => {
-                        self.screen.monitor_generation = generation;
-                        self.screen.monitor_loading = false;
-                        self.screen.monitor_error = error.unwrap_or_default();
-                        if self
-                            .screen
-                            .selected
-                            .as_ref()
-                            .is_some_and(|selected| selected.kind == SourceKind::Monitor)
-                            && !sources
-                                .iter()
-                                .any(|item| Some(item) == self.screen.selected.as_ref())
-                        {
-                            self.screen.selected = None;
-                        }
-                        // The non-active kind still refreshes its cache; the
-                        // picker reads it when the user switches tabs.
-                        self.screen.monitors = sources;
-                    }
-                    SourceKind::Window if generation >= self.screen.window_generation => {
-                        self.screen.window_generation = generation;
-                        self.screen.window_loading = false;
-                        self.screen.window_error = error.unwrap_or_default();
-                        if self
-                            .screen
-                            .selected
-                            .as_ref()
-                            .is_some_and(|selected| selected.kind == SourceKind::Window)
-                            && !sources
-                                .iter()
-                                .any(|item| Some(item) == self.screen.selected.as_ref())
-                        {
-                            self.screen.selected = None;
-                        }
-                        self.screen.windows = sources;
-                    }
-                    _ => return false,
-                }
-                true
-            }
-            _ => false,
+        if self.screen.audio_enabled {
+            // Enabling always starts from a scope the kind really offers.
+            let scope = self.screen.effective_audio_scope(self.screen.kind);
+            self.screen.audio_scope = scope;
         }
+        cx.notify();
     }
 
     /// Take the newest local preview for the on-air card.
@@ -720,7 +1025,11 @@ impl VoicePanel {
     /// Forget every screen-share surface: leaving the call or a revoked
     /// session must not keep a card, a picker or a stale preview.
     pub(super) fn reset_screen(&mut self) {
+        // The epoch must not fall back to a value an in-flight capture of the
+        // discarded dialog already holds.
+        let epoch = self.screen.preview_epoch.wrapping_add(1);
         self.screen = ScreenShareUi::default();
+        self.screen.preview_epoch = epoch;
     }
 
     fn share_focus(&self, index: usize) -> FocusHandle {
@@ -728,11 +1037,22 @@ impl VoicePanel {
         // visible rows stay reachable and no index overlaps the toolbar.
         self.picker_focus[index.min(self.picker_focus.len() - 1)].clone()
     }
+
+    /// Element id of one source row, named by the stable surface identity so
+    /// a reorder keeps focus on the same display.
+    pub(super) fn source_element_id(source: &ScreenSource) -> gpui::ElementId {
+        let name = match source.kind {
+            SourceKind::Monitor => "share-source-monitor",
+            SourceKind::Window => "share-source-window",
+        };
+        gpui::ElementId::from((name, source.focus_key()))
+    }
 }
 
 impl VoicePanel {
     /// The «Экран» button inside the room toolbar. The reason of a disabled
-    /// state is rendered next to the toolbar by the room body.
+    /// state is rendered next to the toolbar by the room body. The button keeps
+    /// the web `CallControls` shape: a vertical icon above the label.
     pub(super) fn screen_share_button(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let c = self.colors();
         let enabled = self.share_gate().is_ok();
@@ -750,12 +1070,15 @@ impl VoicePanel {
         div()
             .id("voice-screen")
             .debug_selector(|| "voice-screen".into())
-            .h_full()
-            .w(px(44.))
+            .w(px(voice_room::TOOLBAR_BUTTON_WIDTH))
+            .h(px(voice_room::TOOLBAR_BUTTON_HEIGHT))
+            .flex_shrink_0()
             .flex()
+            .flex_col()
             .items_center()
             .justify_center()
-            .rounded(px(10.))
+            .gap(px(3.))
+            .rounded(px(9.))
             .bg(rgb(if active { c.danger_bg } else { c.surface }))
             .border_1()
             .border_color(rgb(if active { c.danger } else { c.line }))
@@ -767,187 +1090,25 @@ impl VoicePanel {
                     panel.open_screen_share(cx);
                 }
             }))
-            .child(img("icons/monitor.svg").w(px(16.)).h(px(16.)))
+            .child(super::view::vector_icon(
+                "icons/monitor.svg",
+                16.,
+                rgb(color),
+            ))
+            .child(
+                div()
+                    .text_size(px(9.))
+                    .line_height(px(10.))
+                    .truncate()
+                    .child("Экран"),
+            )
             .into_any_element()
-    }
-
-    /// Whether the local on-air card takes one room slot.
-    pub(super) fn screen_card_active(&self) -> bool {
-        matches!(
-            self.screen.sharing.phase,
-            Phase::Publishing | Phase::Live | Phase::Stopping | Phase::Failed
-        )
-    }
-
-    /// The card that replaces the local publication in the room grid while a
-    /// screen is on air. `None` when nothing is being published.
-    pub(super) fn screen_card(
-        &mut self,
-        rect: Rect,
-        cx: &mut Context<Self>,
-    ) -> Option<gpui::AnyElement> {
-        let sharing = self.screen.sharing.clone();
-        if !matches!(
-            sharing.phase,
-            Phase::Publishing | Phase::Live | Phase::Stopping | Phase::Failed
-        ) {
-            return None;
-        }
-        let c = self.colors();
-        let live = sharing.phase == Phase::Live;
-        let status = if live {
-            "В ЭФИРЕ".to_owned()
-        } else if sharing.phase == Phase::Failed {
-            "ОШИБКА".to_owned()
-        } else if sharing.phase == Phase::Stopping {
-            "ОСТАНОВКА…".to_owned()
-        } else {
-            sharing.status.clone()
-        };
-        let stats = sharing.stats.map(|stats| {
-            // FPS, drop, real resolution, limitation and source count come
-            // from OutboundRtpStats; this build has no GPU/CPU percentage.
-            stats.describe()
-        });
-        let quality = self.screen.quality_label();
-        let sound = self.screen.sound_label();
-        let mut card = div()
-            .id("screen-on-air")
-            .debug_selector(|| "screen-on-air".into())
-            .absolute()
-            .left(px(rect.x))
-            .top(px(rect.y))
-            .w(px(rect.w))
-            .h(px(rect.h))
-            .rounded(px(12.))
-            .bg(rgb(c.surface))
-            .border_1()
-            .border_color(rgb(if live { c.danger } else { c.line }))
-            .child(
-                div()
-                    .absolute()
-                    .left(px(12.))
-                    .top(px(12.))
-                    .px(px(8.))
-                    .py(px(2.))
-                    .rounded(px(5.))
-                    .bg(rgb(c.live_bg))
-                    .text_size(px(10.))
-                    .text_color(rgb(c.danger))
-                    .child(if live { "LIVE" } else { "ВАШ ЭКРАН" }),
-            )
-            .child(
-                div()
-                    .absolute()
-                    .right(px(12.))
-                    .top(px(12.))
-                    .text_size(px(10.))
-                    .text_color(rgb(c.muted))
-                    .truncate()
-                    .child(status),
-            )
-            .child(
-                div()
-                    .absolute()
-                    .left(px(10.))
-                    .top(px(34.))
-                    .w(px((rect.w - 20.).max(1.)))
-                    .h(px((rect.h - 108.).max(1.)))
-                    .rounded(px(8.))
-                    .overflow_hidden()
-                    .bg(rgb(0x080808))
-                    .when_some(self.screen.preview.clone(), |picture, image| {
-                        picture.child(
-                            img(image)
-                                .w_full()
-                                .h_full()
-                                .object_fit(gpui::ObjectFit::Contain),
-                        )
-                    }),
-            )
-            .child(
-                div()
-                    .absolute()
-                    .left(px(12.))
-                    .top(px(rect.h - 66.))
-                    .w(px((rect.w - 24.).max(0.)))
-                    .text_size(px(12.))
-                    .font_weight(gpui::FontWeight::BOLD)
-                    .truncate()
-                    .child("Ваш экран"),
-            )
-            .child(
-                div()
-                    .absolute()
-                    .left(px(12.))
-                    .top(px(rect.h - 50.))
-                    .w(px((rect.w - 24.).max(0.)))
-                    .text_size(px(10.))
-                    .text_color(rgb(c.muted))
-                    .truncate()
-                    .debug_selector(|| "screen-on-air-quality".into())
-                    .child(match stats {
-                        Some(stats) => format!("{quality} · {stats}"),
-                        None => format!("{quality} · {sound}"),
-                    }),
-            );
-        if sharing.phase != Phase::Stopping {
-            let mut actions = div()
-                .absolute()
-                .left(px(10.))
-                .top(px(rect.h - 36.))
-                .w(px((rect.w - 20.).max(0.)))
-                .h(px(28.))
-                .flex()
-                .gap_1();
-            // The dialog only applies changes while the stream is Live; in
-            // Publishing the action would be inert, so it is not shown.
-            if sharing.phase == Phase::Live {
-                let quality_focus = self.screen_focus[2].clone();
-                actions = actions.child(
-                    div()
-                        .id("screen-quality")
-                        .debug_selector(|| "screen-quality".into())
-                        .flex_1()
-                        .h_full()
-                        .rounded(px(8.))
-                        .border_1()
-                        .border_color(rgb(c.line))
-                        .text_color(rgb(c.fg))
-                        .text_size(px(11.))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .cursor_pointer()
-                        .track_focus(&quality_focus)
-                        .on_click(cx.listener(|panel, _, _, cx| panel.open_screen_settings(cx)))
-                        .child("Качество"),
-                );
-            }
-            let stop_focus = self.screen_focus[0].clone();
-            actions = actions.child(
-                div()
-                    .id("screen-stop")
-                    .debug_selector(|| "screen-stop".into())
-                    .flex_1()
-                    .h_full()
-                    .rounded(px(8.))
-                    .border_1()
-                    .border_color(rgb(c.danger))
-                    .text_color(rgb(c.danger))
-                    .text_size(px(11.))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .cursor_pointer()
-                    .track_focus(&stop_focus)
-                    .on_click(cx.listener(|panel, _, _, cx| panel.stop_screen_share(cx)))
-                    .child("Завершить"),
-            );
-            card = card.child(actions);
-        }
-        Some(card.into_any_element())
     }
 }
 
+mod audio_scope;
+mod card;
 mod dialog;
+mod preview;
+mod selection;
+mod update;

@@ -15,8 +15,8 @@
 use std::{
     collections::VecDeque,
     sync::{
-        Arc, Mutex, OnceLock,
-        atomic::{AtomicU32, AtomicU64, Ordering},
+        Arc, OnceLock,
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -25,7 +25,7 @@ use libwebrtc::{
     audio_source::{AudioSourceOptions, native::NativeAudioSource},
     ice_candidate::IceCandidate,
     media_stream_track::MediaStreamTrack,
-    peer_connection::{AnswerOptions, BitrateSettings, PeerConnection, PeerConnectionState},
+    peer_connection::{AnswerOptions, PeerConnection, PeerConnectionState},
     peer_connection_factory::{
         IceServer as RtcIceServer, IceTransportsType, PeerConnectionFactory, RtcConfiguration,
         native::PeerConnectionFactoryExt,
@@ -41,7 +41,12 @@ use tokio::sync::mpsc;
 
 use crate::{
     Candidate, IceServer,
-    publisher::{PublishRequest, Quality},
+    publisher::{
+        BitrateResult, PublishRequest, Quality, QualityOp,
+        bitrate::{
+            Limits, apply_sender_limits, confirmed_quality, failure_message, readback_limits,
+        },
+    },
     screen_capture::{
         CaptureFailure, CapturedImage, LatestImage, PreviewStore, ScreenCapture, preview_from_i420,
     },
@@ -66,6 +71,8 @@ const STATS_TIMEOUT: Duration = Duration::from_millis(500);
 /// A worker that does not finish after its channel closed is detached instead
 /// of hanging the runtime forever.
 const WORKER_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
+/// The session cancelled the preparation between two stages.
+const PREP_CANCELLED: &str = "Подготовка трансляции отменена.";
 
 /// The plan asks for a GPU/CPU share; this build has no GPU probe. The pinned
 /// `OutboundRtpStats` does report `quality_limitation_reason`, which is the
@@ -278,30 +285,8 @@ impl FrameProducer for SyntheticProducer {
 /// An event that belongs to the current publishing attempt.
 pub use crate::publisher::EngineEvent;
 
-#[derive(Default)]
-struct EventQueue {
-    items: Mutex<VecDeque<EngineEvent>>,
-}
-
-impl EventQueue {
-    fn push(&self, event: EngineEvent) {
-        let Ok(mut items) = self.items.lock() else {
-            return;
-        };
-        if matches!(event, EngineEvent::Stats(_)) {
-            // Only the latest counters matter.
-            items.retain(|item| !matches!(item, EngineEvent::Stats(_)));
-        }
-        if items.len() >= ENGINE_EVENT_CAPACITY {
-            items.pop_front();
-        }
-        items.push_back(event);
-    }
-
-    fn pop(&self) -> Option<EngineEvent> {
-        self.items.lock().ok()?.pop_front()
-    }
-}
+mod queue;
+use queue::EventQueue;
 
 /// Capture-side counters that the outbound stats poll merges into one
 /// `PublishStats`. The frame loop owns them; the command loop only reads.
@@ -313,13 +298,63 @@ struct FrameCounters {
     height: AtomicU32,
 }
 
+/// The limits the worker really confirmed on the negotiated senders. They are
+/// written only after `RtpSender::parameters()` read the values back, never
+/// from the requested quality, so a refused change cannot look applied here.
+/// The loopback test reads this value.
+#[derive(Default)]
+struct AppliedLimits {
+    video_bps: AtomicU64,
+    audio_bps: AtomicU64,
+}
+
+impl AppliedLimits {
+    fn store(&self, limits: &Limits) {
+        if let Some(video) = limits.video_bps {
+            self.video_bps.store(video, Ordering::Relaxed);
+        }
+        self.audio_bps
+            .store(limits.audio_bps.unwrap_or(0), Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn pair(&self) -> (u64, u64) {
+        (
+            self.video_bps.load(Ordering::Relaxed),
+            self.audio_bps.load(Ordering::Relaxed),
+        )
+    }
+}
+
 mod audio;
 use audio::{AudioCounters, AudioMeter, audio_loop};
 
 enum Command {
     Offer(String),
     Ice(Candidate),
+    /// A live bitrate change: no renegotiation, no new `stream.start`. Both
+    /// tags travel back with the result so a stale operation cannot be
+    /// mistaken for the current one.
+    Bitrate {
+        attempt: u64,
+        op: QualityOp,
+        quality: Quality,
+    },
     Stop,
+}
+
+/// Answer of one live bitrate command.
+///
+/// `Sent` only proves that the command reached the bounded worker queue, not
+/// that the senders accepted it; the verified result arrives later as
+/// [`crate::publisher::EngineEvent::Bitrate`]. `Full` is a burst of the queue,
+/// not a dead worker: the runtime keeps the newest quality and retries it on
+/// the next tick. Only `Closed` means the worker and its capture are gone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BitrateSend {
+    Sent,
+    Full,
+    Closed,
 }
 
 /// Non-blocking handle of one publishing engine. Dropping it releases the
@@ -331,17 +366,32 @@ pub struct PublisherEngine {
     events: Arc<EventQueue>,
     preview: Arc<PreviewStore>,
     ice_dropped: AtomicU64,
+    /// Read by the loopback test through `applied_bitrate_limits`; production
+    /// only writes it from the worker.
+    #[cfg_attr(not(test), allow(dead_code))]
+    limits: Arc<AppliedLimits>,
     has_audio: bool,
+    /// Actual scope of the opened system-audio capture.
+    audio_scope: Option<String>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl PublisherEngine {
+    /// Open the capture, the loopback and the peer of one attempt.
+    ///
+    /// `cancelled` is checked before and after every blocking stage. A stage
+    /// that is already running may finish, but its product is dropped here on
+    /// the preparing thread and never reaches `stream.start`.
     pub fn start(
         request: PublishRequest,
         servers: Vec<IceServer>,
         policy: String,
         preview: Arc<PreviewStore>,
+        cancelled: &AtomicBool,
     ) -> Result<Self, String> {
+        if cancelled.load(Ordering::SeqCst) {
+            return Err(PREP_CANCELLED.into());
+        }
         let latest = Arc::new(LatestImage::default());
         let target = request.quality.resolution.size();
         let capture = ScreenCapture::start(
@@ -351,12 +401,26 @@ impl PublisherEngine {
             latest.clone(),
         )
         .map_err(str::to_owned)?;
+        if cancelled.load(Ordering::SeqCst) {
+            return Err(PREP_CANCELLED.into());
+        }
         // The loopback is opened before the engine reports itself ready, so
         // `stream.start` can carry the real `has_audio`. A missing endpoint is
-        // an explicit capability error, never a silent video-only stream.
+        // an explicit capability error, never a silent video-only stream. The
+        // user's scope is resolved here, on the preparation thread: a window
+        // becomes its process id and the whole-screen choice becomes an
+        // exclude-self process loopback. No failure falls back to the device.
+        let mut audio_scope = None;
         let audio: Option<Box<dyn AudioProducer>> = if request.audio {
-            match SystemAudio::start() {
-                Ok(capture) => Some(Box::new(capture)),
+            let scope = request
+                .audio_scope
+                .resolve(&request.source)
+                .map_err(|error| format!("Системный звук недоступен: {error}"))?;
+            match SystemAudio::start(scope) {
+                Ok(capture) => {
+                    audio_scope = Some(scope.describe());
+                    Some(Box::new(capture))
+                }
                 Err(error) => {
                     return Err(format!("Системный звук недоступен: {error}"));
                 }
@@ -364,14 +428,23 @@ impl PublisherEngine {
         } else {
             None
         };
-        Self::spawn(
+        if cancelled.load(Ordering::SeqCst) {
+            return Err(PREP_CANCELLED.into());
+        }
+        let engine = Self::spawn(
             request,
             servers,
             policy,
             Box::new(DesktopProducer { capture, latest }),
             audio,
+            audio_scope,
             preview,
-        )
+        )?;
+        if cancelled.load(Ordering::SeqCst) {
+            drop(engine);
+            return Err(PREP_CANCELLED.into());
+        }
+        Ok(engine)
     }
 
     /// Test entry point: the same engine with a frame producer that does not
@@ -393,6 +466,7 @@ impl PublisherEngine {
             policy,
             Box::new(SyntheticProducer::new(frame_size.0, frame_size.1, preview)),
             audio,
+            None,
             Arc::new(PreviewStore::default()),
         )
     }
@@ -403,12 +477,19 @@ impl PublisherEngine {
         self.has_audio
     }
 
+    /// Actual scope of the opened capture, for the local on-air line. `None`
+    /// when the attempt has no system audio.
+    pub fn audio_scope(&self) -> Option<String> {
+        self.audio_scope.clone()
+    }
+
     fn spawn(
         request: PublishRequest,
         servers: Vec<IceServer>,
         policy: String,
         producer: Box<dyn FrameProducer>,
         audio: Option<Box<dyn AudioProducer>>,
+        audio_scope: Option<String>,
         preview: Arc<PreviewStore>,
     ) -> Result<Self, String> {
         let has_audio = audio.is_some();
@@ -416,11 +497,13 @@ impl PublisherEngine {
         let events = Arc::new(EventQueue::default());
         let counters = Arc::new(FrameCounters::default());
         let audio_counters = Arc::new(AudioCounters::default());
+        let limits = Arc::new(AppliedLimits::default());
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let worker_events = events.clone();
         let worker_preview = preview.clone();
         let worker_counters = counters.clone();
         let worker_audio_counters = audio_counters.clone();
+        let worker_limits = limits.clone();
         let thread = std::thread::Builder::new()
             .name("voxhold-screen-publisher".into())
             .spawn(move || {
@@ -437,6 +520,7 @@ impl PublisherEngine {
                     worker_preview,
                     worker_counters,
                     worker_audio_counters,
+                    worker_limits,
                     request,
                     servers,
                     policy,
@@ -452,7 +536,9 @@ impl PublisherEngine {
                 events,
                 preview,
                 ice_dropped: AtomicU64::new(0),
+                limits,
                 has_audio,
+                audio_scope: if has_audio { audio_scope } else { None },
                 thread: Some(thread),
             }),
             Ok(Err(message)) => {
@@ -475,6 +561,25 @@ impl PublisherEngine {
             .ok_or_else(|| "Медиадвижок трансляции уже закрыт.".to_string())?
             .try_send(Command::Offer(sdp))
             .map_err(|_| "Медиадвижок трансляции не принимает команды.".to_string())
+    }
+
+    /// Change the video and published-audio bitrate of the live sender.
+    ///
+    /// No offer, answer or `stream.start` is involved: the worker applies the
+    /// same `RtpSender::set_parameters` + `PeerConnection::set_bitrate` path
+    /// that the initial answer used. `attempt` and `op` are only tags: the
+    /// verified result comes back as an engine event with the same pair, and
+    /// the caller ignores it once a newer attempt or operation started. A
+    /// `Full` command queue is a burst, not a failed worker: the caller retries
+    /// the same operation instead of ending the attempt.
+    pub fn set_bitrate(&self, attempt: u64, op: QualityOp, quality: Quality) -> BitrateSend {
+        send_bitrate(self.commands.as_ref(), attempt, op, quality)
+    }
+
+    /// The limits the worker really handed to the negotiated senders.
+    #[cfg(test)]
+    pub(crate) fn applied_bitrate_limits(&self) -> (u64, u64) {
+        self.limits.pair()
     }
 
     /// Apply one server ICE candidate. A full queue drops the candidate; the
@@ -529,6 +634,29 @@ fn join_bounded(thread: std::thread::JoinHandle<()>, timeout: Duration) {
     let _ = thread.join();
 }
 
+/// Hand one live bitrate change to the bounded worker queue. Only a closed
+/// channel proves that the worker is gone; a full queue is a burst that must be
+/// retried with the newest quality.
+fn send_bitrate(
+    commands: Option<&mpsc::Sender<Command>>,
+    attempt: u64,
+    op: QualityOp,
+    quality: Quality,
+) -> BitrateSend {
+    let Some(commands) = commands else {
+        return BitrateSend::Closed;
+    };
+    match commands.try_send(Command::Bitrate {
+        attempt,
+        op,
+        quality,
+    }) {
+        Ok(()) => BitrateSend::Sent,
+        Err(mpsc::error::TrySendError::Full(_)) => BitrateSend::Full,
+        Err(mpsc::error::TrySendError::Closed(_)) => BitrateSend::Closed,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run(
     mut commands: mpsc::Receiver<Command>,
@@ -536,6 +664,7 @@ async fn run(
     preview: Arc<PreviewStore>,
     counters: Arc<FrameCounters>,
     audio_counters: Arc<AudioCounters>,
+    limits: Arc<AppliedLimits>,
     request: PublishRequest,
     servers: Vec<IceServer>,
     policy: String,
@@ -652,6 +781,16 @@ async fn run(
         counters.clone(),
         request.quality,
     ));
+    // The last quality really applied to the live senders. The backend's
+    // `startRecovery` may offer again to a live publisher, so a later answer
+    // must use this value instead of the spawn-time request: otherwise a live
+    // bitrate change is silently reverted by the re-offer. A refused change
+    // never moves it.
+    let mut quality = request.quality;
+    // The limits the senders really reported. Only a verified application or
+    // a successful answer updates them; they are the rollback target of the
+    // next live change.
+    let mut applied = Limits::default();
     let _ = ready.send(Ok(()));
 
     let mut remote_set = false;
@@ -698,8 +837,10 @@ async fn run(
                     &sender,
                     audio_sender.as_ref(),
                     &sdp,
-                    request.quality,
+                    quality,
                     &events,
+                    Some(&limits),
+                    &mut applied,
                 )
                 .await
                 {
@@ -709,6 +850,45 @@ async fn run(
                 while let Some(candidate) = pending.pop_front() {
                     add_ice(&peer, candidate).await;
                 }
+            }
+            Some(Command::Bitrate {
+                attempt,
+                op,
+                quality: next,
+            }) => {
+                let result =
+                    match apply_sender_limits(&peer, &sender, audio_sender.as_ref(), next, applied)
+                    {
+                        Ok(confirmed) => {
+                            applied = confirmed;
+                            limits.store(&confirmed);
+                            quality = confirmed_quality(quality, next, true);
+                            BitrateResult::Applied
+                        }
+                        Err(failure) => {
+                            // The readback after a failed restore is the honest
+                            // state of the senders. `AppliedLimits` reflects it so
+                            // a test or a later diagnostic never sees the refused
+                            // request as applied.
+                            let actual = readback_limits(&sender, audio_sender.as_ref());
+                            if let Some(video) = actual.video_bps {
+                                applied.video_bps = Some(video);
+                            }
+                            if let Some(audio) = actual.audio_bps {
+                                applied.audio_bps = Some(audio);
+                            }
+                            limits.store(&applied);
+                            quality = confirmed_quality(quality, next, false);
+                            let restored = failure.restored;
+                            let message = failure_message(failure, actual, audio_sender.is_some());
+                            BitrateResult::Failed { message, restored }
+                        }
+                    };
+                events.push(EngineEvent::Bitrate {
+                    attempt,
+                    op,
+                    result,
+                });
             }
             Some(Command::Ice(candidate)) => {
                 if remote_set {
@@ -731,6 +911,7 @@ async fn run(
     peer.close();
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn apply_offer(
     peer: &PeerConnection,
     sender: &RtpSender,
@@ -738,6 +919,8 @@ async fn apply_offer(
     sdp: &str,
     quality: Quality,
     events: &EventQueue,
+    limits: Option<&AppliedLimits>,
+    applied: &mut Limits,
 ) -> bool {
     let offer = match SessionDescription::parse(sdp, SdpType::Offer) {
         Ok(offer) => offer,
@@ -770,41 +953,28 @@ async fn apply_offer(
         ));
         return false;
     }
-    apply_bitrate(peer, sender, audio_sender, quality);
+    apply_confirmed_limits(peer, sender, audio_sender, quality, limits, applied);
     events.push(EngineEvent::Answer(text));
     true
 }
 
-/// The video limit comes from the dialog; the audio limit is the Opus maximum
-/// of the same settings and is clamped to the backend's 32–510 kbit/s range.
-/// `RtpEncodingParameters` has no degradation preference, so nothing here
-/// pretends to set one.
-fn apply_bitrate(
+/// The initial answer applies the same limits, but its result is not a live
+/// operation: a refused readback leaves the confirmed limits unknown instead
+/// of failing the publication.
+fn apply_confirmed_limits(
     peer: &PeerConnection,
     sender: &RtpSender,
     audio_sender: Option<&RtpSender>,
     quality: Quality,
+    limits: Option<&AppliedLimits>,
+    applied: &mut Limits,
 ) {
-    let video_max = Some(u64::from(quality.bitrate_kbps.clamp(500, 16_000)) * 1000);
-    let mut parameters = sender.parameters();
-    for encoding in &mut parameters.encodings {
-        encoding.max_bitrate = video_max;
-    }
-    let _ = sender.set_parameters(parameters);
-    let audio_max = audio_sender.map(|audio| {
-        let limit = Some(u64::from(quality.audio_bitrate_kbps.clamp(32, 510)) * 1000);
-        let mut parameters = audio.parameters();
-        for encoding in &mut parameters.encodings {
-            encoding.max_bitrate = limit;
+    if let Ok(confirmed) = apply_sender_limits(peer, sender, audio_sender, quality, *applied) {
+        *applied = confirmed;
+        if let Some(limits) = limits {
+            limits.store(&confirmed);
         }
-        let _ = audio.set_parameters(parameters);
-        limit
-    });
-    let total = video_max.unwrap_or(0) + audio_max.flatten().unwrap_or(0);
-    let _ = peer.set_bitrate(BitrateSettings {
-        max_bitrate_bps: Some(total),
-        ..BitrateSettings::default()
-    });
+    }
 }
 
 async fn add_ice(peer: &PeerConnection, candidate: Candidate) {
@@ -980,6 +1150,9 @@ fn ufrag(candidate: &str) -> Option<&str> {
 
 #[cfg(test)]
 mod loopback;
+
+#[cfg(test)]
+mod bitrate_tests;
 
 #[cfg(test)]
 mod audio_tests;

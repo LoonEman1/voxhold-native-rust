@@ -16,23 +16,47 @@
 //!   slower consumer drops frames instead of growing a queue.
 //! - [`PreviewStore`] keeps one small BGRA picture for the local on-air card.
 //!   It is bounded by [`MAX_PREVIEW_BYTES`] and never grows while idle.
+//! - [`capture_thumbnail`] grabs one bounded BGRA picture for the picker grid.
+//!   It creates its own capturer, resolves a monitor through its confirmed
+//!   Windows identity in the fresh list and gives up after
+//!   [`THUMBNAIL_TIMEOUT`]; it never queues more than one frame.
+//!
+//! The `libwebrtc 0.4.0` desktop capturer has no Windows system picker:
+//! `DesktopCapturerOptions::set_sck_system_picker` is compiled only for macOS.
+//! The picker therefore lists `get_source_list` itself and the local grid is
+//! the only chooser on Windows.
 
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
+use std::time::Duration;
 
 use libwebrtc::video_frame::{I420Buffer, VideoBuffer};
+
+mod topology;
+
+#[cfg_attr(not(windows), allow(unused_imports))]
+pub(crate) use topology::{
+    CapturerMonitor, ResolveError, confirm_prepared, confirmed_mapping, resolve_monitor,
+};
+pub use topology::{MonitorIdentity, MonitorRect};
 
 /// The largest side of the local preview. The on-air card is a room tile.
 pub const MAX_PREVIEW_WIDTH: u32 = 640;
 /// Upper bound of one stored preview picture. A bigger picture is rejected.
 pub const MAX_PREVIEW_BYTES: usize = 4 * 1024 * 1024;
+/// The picker thumbnail is never wider than this, so a grid of previews stays
+/// small even when the source is a 4K monitor.
+pub const MAX_THUMBNAIL_WIDTH: u32 = 320;
+/// One thumbnail attempt gives up after this long without a frame. The whole
+/// call is synchronous and meant for a background thread.
+pub const THUMBNAIL_TIMEOUT: Duration = Duration::from_millis(900);
 /// The same limits the viewer accepts; a captured frame is not bigger.
 const MAX_CAPTURE_SIDE: u32 = 4096;
 
 /// What kind of source is captured.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum SourceKind {
     Monitor,
     Window,
@@ -50,7 +74,9 @@ impl SourceKind {
 /// One entry of the picker.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScreenSource {
-    /// Source id of the desktop capturer. For a window this is its `HWND`.
+    /// Capturer id from the enumeration that produced this row. For a window
+    /// this is its `HWND`; for a monitor it is only the current lookup key and
+    /// may move to another display after a re-enumeration.
     pub id: u64,
     pub kind: SourceKind,
     pub title: String,
@@ -60,6 +86,10 @@ pub struct ScreenSource {
     /// Best known size; `0` when the platform did not report one.
     pub width: u32,
     pub height: u32,
+    /// Confirmed Windows display this monitor row names. `None` for a window
+    /// (its `id` is the `HWND`) and for a monitor whose row could not be
+    /// matched uniquely; such a monitor is never selectable.
+    pub monitor: Option<MonitorIdentity>,
 }
 
 impl ScreenSource {
@@ -71,7 +101,72 @@ impl ScreenSource {
             self.title.clone()
         }
     }
+
+    /// The identity the picker binds to: a monitor surface or a window
+    /// `HWND`. The numeric capturer id is never an identity by itself.
+    pub fn identity(&self) -> Option<SourceIdentity> {
+        match self.kind {
+            SourceKind::Monitor => self.monitor.clone().map(SourceIdentity::Monitor),
+            SourceKind::Window => Some(SourceIdentity::Window(self.id)),
+        }
+    }
+
+    /// Key of the painted card and its focus handle. A monitor keeps the key
+    /// across a capturer reorder; a window keys on its `HWND`.
+    pub fn focus_key(&self) -> u64 {
+        match (&self.monitor, self.kind) {
+            (Some(monitor), SourceKind::Monitor) => monitor.focus_key(),
+            _ => self.id,
+        }
+    }
+
+    /// The enumeration key of this row. Used for the current list lookup and
+    /// the keyboard action, not for the publication request.
+    pub fn source_id(&self) -> SourceId {
+        SourceId {
+            kind: self.kind,
+            id: self.id,
+        }
+    }
 }
+
+/// Stable identity of a capture source for the whole picker lifetime.
+///
+/// A window is its `HWND`. A monitor is the Windows display identity, so a
+/// capturer reorder still resolves to the same screen and a reused capturer
+/// number resolves to nothing.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum SourceIdentity {
+    Monitor(MonitorIdentity),
+    Window(u64),
+}
+
+/// Current enumeration key of one picker row.
+///
+/// A window id is its `HWND`, a durable identity. A monitor id is only the
+/// capturer's number in one list and may move to another display after a
+/// re-enumeration, so selection and the publish request bind to [`SourceId`]
+/// plus [`SourceIdentity`]. The id is used for the painted element and the
+/// current-list lookup.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct SourceId {
+    pub kind: SourceKind,
+    pub id: u64,
+}
+
+impl std::fmt::Debug for SourceId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let kind = match self.kind {
+            SourceKind::Monitor => "monitor",
+            SourceKind::Window => "window",
+        };
+        write!(f, "{kind}:{}", self.id)
+    }
+}
+
+/// One monitor as Windows enumerates it (the device name is the durable part).
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) type MonitorDescriptor = MonitorIdentity;
 
 /// Enumerate monitors or windows for the picker.
 ///
@@ -87,6 +182,56 @@ pub fn list_sources(kind: SourceKind) -> Result<Vec<ScreenSource>, &'static str>
     {
         let _ = kind;
         Err("Захват экрана поддерживается только в Windows.")
+    }
+}
+
+/// Capture one small BGRA thumbnail for the picker card of `source`.
+///
+/// A monitor row is resolved through its confirmed [`MonitorIdentity`], never
+/// its number: the fresh list is mapped against the current Windows monitors
+/// and only a unique match is captured. A missing display is
+/// [`ThumbnailError::Missing`]; a reused number or an ambiguous list is
+/// [`ThumbnailError::Changed`], never a neighbour. A window keeps its `HWND`.
+/// The call is bounded by [`THUMBNAIL_TIMEOUT`], includes no cursor and is
+/// safe to run on a background thread; it logs no title or picture content.
+pub fn capture_thumbnail(
+    source: &ScreenSource,
+    max_width: u32,
+) -> Result<PreviewFrame, ThumbnailError> {
+    let max_width = max_width.clamp(2, MAX_THUMBNAIL_WIDTH);
+    #[cfg(windows)]
+    {
+        windows::capture_thumbnail(source, max_width)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (source, max_width);
+        Err(ThumbnailError::Unavailable)
+    }
+}
+
+/// Confirm that the selected display still matches the one the picker recorded
+/// when the source was chosen.
+///
+/// The capturer is still addressed by a numeric id for the moment the capture
+/// starts. If Windows reorders or replaces displays between the selection and
+/// the first frame, that id can name another screen, so a prepared result is
+/// discarded instead of published. Only the chosen surface is checked: another
+/// monitor being plugged in or changing its work area does not invalidate the
+/// preparation. A source without a confirmed monitor (a window) has nothing to
+/// compare.
+pub(crate) fn confirm_source_topology(source: &ScreenSource) -> Result<(), ResolveError> {
+    let Some(selected) = source.monitor.as_ref() else {
+        return Ok(());
+    };
+    #[cfg(windows)]
+    {
+        confirm_prepared(Some(selected), &windows::monitor_descriptors())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = selected;
+        Ok(())
     }
 }
 
@@ -139,6 +284,42 @@ impl CaptureFailure {
             Self::Temporary => "temporary",
             Self::Permanent => "permanent",
             Self::Ended => "ended",
+        }
+    }
+}
+
+/// Why one picker thumbnail could not be produced. The picker shows
+/// [`Self::message`] on the card and never substitutes another source.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ThumbnailError {
+    /// No desktop capturer exists in this build or session.
+    Unavailable,
+    /// The exact `kind + id` is missing from the capturer's current list: the
+    /// window closed or the monitor was unplugged after the enumeration.
+    Missing,
+    /// The monitor identity cannot be confirmed in the fresh enumeration: the
+    /// capturer number now names another display or the match is ambiguous.
+    Changed,
+    /// The source delivered no frame within [`THUMBNAIL_TIMEOUT`].
+    Timeout,
+}
+
+impl ThumbnailError {
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::Unavailable => "Системный захват экрана недоступен.",
+            Self::Missing => "Выбранный источник захвата больше недоступен.",
+            Self::Changed => "Выбранный экран изменился. Обновите список и выберите экран снова.",
+            Self::Timeout => "Предпросмотр источника не получен.",
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unavailable => "unavailable",
+            Self::Missing => "missing",
+            Self::Changed => "changed",
+            Self::Timeout => "timeout",
         }
     }
 }
@@ -547,268 +728,73 @@ pub fn preview_from_i420(source: &I420Buffer, max_width: u32) -> Option<PreviewF
     })
 }
 
-#[cfg(windows)]
-mod windows {
-    use super::*;
-    use ::windows::Win32::Foundation::{HWND, LPARAM, RECT};
-    use ::windows::Win32::Graphics::Gdi::{
-        EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW,
-    };
-    use ::windows::Win32::UI::WindowsAndMessaging::{
-        EnumWindows, GetWindowRect, GetWindowThreadProcessId, IsWindowVisible,
-    };
-    use ::windows::core::BOOL;
-    use libwebrtc::desktop_capturer::{
-        CaptureError, DesktopCaptureSourceType, DesktopCapturer, DesktopCapturerOptions,
-    };
-    use std::sync::mpsc::Sender;
-    use std::time::{Duration, Instant};
-
-    /// Time between `capture_frame` calls. The capturer is pulled, so its call
-    /// rate is the capture frame rate; frames above the encoder rate are
-    /// dropped by [`LatestImage`].
-    const MAX_FPS: u32 = 60;
-
-    pub(super) fn capturer_available() -> bool {
-        let options = DesktopCapturerOptions::new(DesktopCaptureSourceType::Window);
-        DesktopCapturer::new(options).is_some()
+/// Downscale one BGRA desktop frame into a bounded preview, preserving the
+/// aspect ratio and never upscaling. The output is at most `max_width` wide
+/// (clamped to [`MAX_THUMBNAIL_WIDTH`]); each destination pixel averages its
+/// source box. The input may have row padding and the result has no padding.
+///
+/// The loop is bounded by the destination size and the source size is checked
+/// first, so a malformed frame returns `None` instead of indexing out of range.
+pub fn preview_from_bgra(
+    bgra: &[u8],
+    width: u32,
+    height: u32,
+    stride: u32,
+    max_width: u32,
+) -> Option<PreviewFrame> {
+    if width == 0 || height == 0 || stride < width.saturating_mul(4) {
+        return None;
     }
-
-    fn source_type(kind: SourceKind) -> DesktopCaptureSourceType {
-        match kind {
-            SourceKind::Monitor => DesktopCaptureSourceType::Screen,
-            SourceKind::Window => DesktopCaptureSourceType::Window,
-        }
+    if bgra.len() < stride as usize * height as usize {
+        return None;
     }
-
-    pub(super) fn list_sources(kind: SourceKind) -> Result<Vec<ScreenSource>, &'static str> {
-        let options = DesktopCapturerOptions::new(source_type(kind));
-        let Some(capturer) = DesktopCapturer::new(options) else {
-            return Err("Системный захват экрана недоступен.");
-        };
-        let sources = capturer.get_source_list();
-        let own = own_process_windows();
-        let monitors = match kind {
-            SourceKind::Monitor => monitor_names(),
-            SourceKind::Window => Vec::new(),
-        };
-        let mut result = Vec::with_capacity(sources.len());
-        for source in sources {
-            let id = source.id();
-            let title = source.title();
-            match kind {
-                SourceKind::Monitor => {
-                    // The pinned capturer reports `display_id = -1` on this
-                    // host, so the name/size are matched by the capturer's
-                    // source order. That is a known limitation: a reordered
-                    // source list can attach a neighbour's size to a monitor
-                    // until the capturer exposes a stable display id.
-                    let (name, width, height) = monitors
-                        .get(id as usize)
-                        .cloned()
-                        .unwrap_or_else(|| (format!("Экран {}", id + 1), 0, 0));
-                    result.push(ScreenSource {
-                        id,
-                        kind,
-                        title: name,
-                        display_id: source.display_id(),
-                        width,
-                        height,
-                    });
-                }
-                SourceKind::Window => {
-                    if own.contains(&id) {
-                        continue;
-                    }
-                    let title = title.trim().to_owned();
-                    if title.is_empty() {
-                        continue;
-                    }
-                    let (width, height) = window_size(id);
-                    result.push(ScreenSource {
-                        id,
-                        kind,
-                        title,
-                        display_id: source.display_id(),
-                        width,
-                        height,
-                    });
+    let max_width = max_width.clamp(2, MAX_THUMBNAIL_WIDTH);
+    let (out_w, out_h) = fit_even(width, height, max_width, MAX_CAPTURE_SIDE);
+    if out_w == 0 || out_h == 0 {
+        return None;
+    }
+    let mut preview = vec![0_u8; out_w as usize * out_h as usize * 4];
+    for out_y in 0..out_h {
+        let y0 = ((u64::from(out_y) * u64::from(height)) / u64::from(out_h)) as u32;
+        let y1 = (((u64::from(out_y) + 1) * u64::from(height) / u64::from(out_h)) as u32)
+            .max(y0 + 1)
+            .min(height);
+        for out_x in 0..out_w {
+            let x0 = ((u64::from(out_x) * u64::from(width)) / u64::from(out_w)) as u32;
+            let x1 = (((u64::from(out_x) + 1) * u64::from(width) / u64::from(out_w)) as u32)
+                .max(x0 + 1)
+                .min(width);
+            let mut blue = 0_u32;
+            let mut green = 0_u32;
+            let mut red = 0_u32;
+            let mut samples = 0_u32;
+            for y in y0..y1 {
+                let row = y as usize * stride as usize;
+                for x in x0..x1 {
+                    let at = row + x as usize * 4;
+                    blue += u32::from(bgra[at]);
+                    green += u32::from(bgra[at + 1]);
+                    red += u32::from(bgra[at + 2]);
+                    samples += 1;
                 }
             }
-        }
-        Ok(result)
-    }
-
-    /// `HWND` values of this process. Window sources are top-level windows, so
-    /// a match means the picker would mirror the client itself.
-    fn own_process_windows() -> std::collections::HashSet<u64> {
-        let process = std::process::id();
-        unsafe extern "system" fn collect(hwnd: HWND, lparam: LPARAM) -> BOOL {
-            let state = unsafe { &mut *(lparam.0 as *mut (u32, std::collections::HashSet<u64>)) };
-            let mut owner = 0_u32;
-            unsafe {
-                GetWindowThreadProcessId(hwnd, Some(&mut owner));
-            }
-            if owner == state.0 {
-                state.1.insert(hwnd.0 as u64);
-            }
-            BOOL(1)
-        }
-        let mut state = (process, std::collections::HashSet::<u64>::new());
-        unsafe {
-            let _ = EnumWindows(Some(collect), LPARAM(&mut state as *mut _ as isize));
-        }
-        state.1
-    }
-
-    unsafe extern "system" fn monitor_callback(
-        monitor: HMONITOR,
-        _dc: HDC,
-        _rect: *mut RECT,
-        lparam: LPARAM,
-    ) -> BOOL {
-        let list = unsafe { &mut *(lparam.0 as *mut Vec<(String, u32, u32)>) };
-        let mut info = MONITORINFOEXW {
-            monitorInfo: MONITORINFO {
-                cbSize: std::mem::size_of::<MONITORINFOEXW>() as u32,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let ok = unsafe {
-            GetMonitorInfoW(
-                monitor,
-                &mut info as *mut MONITORINFOEXW as *mut MONITORINFO,
-            )
-            .as_bool()
-        };
-        if ok {
-            let mut device = String::new();
-            for unit in info.szDevice {
-                if unit == 0 {
-                    break;
-                }
-                device.push(char::from_u32(u32::from(unit)).unwrap_or('?'));
-            }
-            let rect = info.monitorInfo.rcMonitor;
-            let name = if device.is_empty() {
-                format!("Экран {}", list.len() + 1)
-            } else {
-                format!("Экран {} ({device})", list.len() + 1)
-            };
-            list.push((
-                name,
-                (rect.right - rect.left).max(0) as u32,
-                (rect.bottom - rect.top).max(0) as u32,
-            ));
-        }
-        BOOL(1)
-    }
-
-    /// Display names and sizes in the same order the capturer lists monitors.
-    fn monitor_names() -> Vec<(String, u32, u32)> {
-        let mut list: Vec<(String, u32, u32)> = Vec::new();
-        unsafe {
-            let _ = EnumDisplayMonitors(
-                None,
-                None,
-                Some(monitor_callback),
-                LPARAM(&mut list as *mut _ as isize),
-            );
-        }
-        list
-    }
-
-    fn window_size(id: u64) -> (u32, u32) {
-        let mut rect = RECT::default();
-        let hwnd = HWND(id as *mut _);
-        let ok = unsafe { GetWindowRect(hwnd, &mut rect).is_ok() };
-        if !ok || !unsafe { IsWindowVisible(hwnd).as_bool() } {
-            return (0, 0);
-        }
-        (
-            (rect.right - rect.left).max(0) as u32,
-            (rect.bottom - rect.top).max(0) as u32,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn run(
-        source: ScreenSource,
-        target: (u32, u32),
-        fps: u32,
-        latest: Arc<LatestImage>,
-        stop: Arc<AtomicBool>,
-        failure: Arc<Mutex<Option<CaptureFailure>>>,
-        ready: Sender<Result<(), &'static str>>,
-    ) {
-        let mut options = DesktopCapturerOptions::new(source_type(source.kind));
-        options.set_include_cursor(true);
-        let Some(mut capturer) = DesktopCapturer::new(options) else {
-            let _ = ready.send(Err("Системный захват экрана недоступен."));
-            return;
-        };
-        let selected = capturer
-            .get_source_list()
-            .into_iter()
-            .find(|candidate| candidate.id() == source.id);
-        let Some(selected) = selected else {
-            let _ = ready.send(Err("Выбранный источник захвата больше недоступен."));
-            return;
-        };
-        if let Ok(mut slot) = failure.lock() {
-            *slot = None;
-        }
-        let converter_latest = latest.clone();
-        let converter_failure = failure.clone();
-        capturer.start_capture(Some(selected), move |result| match result {
-            Ok(frame) => {
-                let (width, height) = (frame.width().max(0) as u32, frame.height().max(0) as u32);
-                let output = fit_even(width, height, target.0, target.1);
-                if output == (0, 0) {
-                    return;
-                }
-                let mut buffer = I420Buffer::new(output.0, output.1);
-                if convert_bgra_to_i420(frame.data(), width, height, frame.stride(), &mut buffer) {
-                    let preview = preview_from_i420(&buffer, MAX_PREVIEW_WIDTH);
-                    converter_latest.publish(CapturedImage {
-                        width: output.0,
-                        height: output.1,
-                        i420: buffer,
-                        preview,
-                    });
-                } else if let Ok(mut slot) = converter_failure.lock() {
-                    *slot = Some(CaptureFailure::Permanent);
-                }
-            }
-            Err(CaptureError::Temporary) => {
-                if let Ok(mut slot) = converter_failure.lock() {
-                    *slot = Some(CaptureFailure::Temporary);
-                }
-            }
-            Err(CaptureError::Permanent) => {
-                if let Ok(mut slot) = converter_failure.lock() {
-                    *slot = Some(CaptureFailure::Permanent);
-                }
-            }
-        });
-        let _ = ready.send(Ok(()));
-        let paced = fps.clamp(1, MAX_FPS);
-        let interval = Duration::from_micros(1_000_000 / u64::from(paced));
-        while !stop.load(Ordering::SeqCst) {
-            if let Ok(slot) = failure.lock() {
-                if matches!(*slot, Some(CaptureFailure::Permanent)) {
-                    break;
-                }
-            }
-            let began = Instant::now();
-            capturer.capture_frame();
-            if let Some(delay) = interval.checked_sub(began.elapsed()) {
-                std::thread::sleep(delay);
-            }
+            let samples = samples.max(1);
+            let at = (out_y as usize * out_w as usize + out_x as usize) * 4;
+            preview[at] = (blue / samples) as u8;
+            preview[at + 1] = (green / samples) as u8;
+            preview[at + 2] = (red / samples) as u8;
+            preview[at + 3] = 255;
         }
     }
+    Some(PreviewFrame {
+        width: out_w,
+        height: out_h,
+        bgra: preview,
+    })
 }
+
+#[cfg(windows)]
+mod windows;
 
 #[cfg(test)]
 mod tests;

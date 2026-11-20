@@ -100,23 +100,90 @@ fn card_grid_matches_go_sizes_and_columns() {
 }
 
 #[test]
-fn the_toolbar_keeps_the_go_action_order_and_inset() {
+fn the_toolbar_keeps_the_web_action_order_and_button_size() {
     let toolbar = Rect::new(100.0, 700.0, 330.0, 61.0);
     let buttons = toolbar_buttons(toolbar, true);
-    assert_eq!(buttons.len(), 4);
-    let ids: Vec<_> = VOICE_ACTIONS.iter().map(|action| action.id).collect();
+    assert_eq!(buttons.len(), TOOLBAR_ACTIONS.len());
     assert_eq!(
-        ids,
-        vec!["voice-mic", "voice-deaf", "voice-records", "voice-leave"]
+        TOOLBAR_ACTIONS,
+        [
+            "voice-mic",
+            "voice-deaf",
+            "voice-screen",
+            "voice-records",
+            "voice-leave"
+        ],
+        "leave stays last; camera, record and chat are not implemented yet"
     );
-    assert_eq!(buttons[0].x, toolbar.x + 7.0);
-    assert_eq!(buttons[0].y, toolbar.y + 7.0);
-    assert!(buttons[0].right() < buttons[1].x);
-    assert!((buttons[3].right() - (toolbar.right() - 7.0)).abs() < 0.01);
-    // The dock has no labels and no inset.
+    assert_eq!(buttons[0].w, TOOLBAR_BUTTON_WIDTH);
+    assert_eq!(buttons[0].h, TOOLBAR_BUTTON_HEIGHT);
+    assert!(
+        buttons[0].x > toolbar.x,
+        "the row is inset like the web bar"
+    );
+    assert!(buttons[4].right() < toolbar.right());
+    assert!(
+        buttons.windows(2).all(|pair| pair[0].right() < pair[1].x),
+        "the painted order matches the ring order"
+    );
+    // The dock is a three-cell row with no labels.
     let dock = toolbar_buttons(Rect::new(0.0, 0.0, 200.0, 31.0), false);
+    assert_eq!(dock.len(), DOCK_ACTIONS.len());
+    assert_eq!(DOCK_ACTIONS, ["voice-mic", "voice-deaf", "voice-leave"]);
     assert_eq!(dock[0].x, 0.0);
     assert_eq!(dock[0].y, 0.0);
+    assert!((dock[2].right() - 200.0).abs() < 0.01);
+}
+
+#[test]
+fn the_dock_has_no_records_action() {
+    assert_eq!(DOCK_ACTIONS.len(), 3);
+    assert!(!DOCK_ACTIONS.contains(&"voice-records"));
+    assert_eq!(DOCK_ACTIONS[DOCK_ACTIONS.len() - 1], "voice-leave");
+    assert_eq!(
+        voice_action("voice-records").map(|action| action.label),
+        Some("Записи"),
+        "records stay available in the room toolbar"
+    );
+}
+
+#[test]
+fn toolbar_visuals_keep_leave_coral_and_toggles_tinted() {
+    let colors = ActionColors {
+        surface: 0x1e1e1b,
+        line: 0x363630,
+        muted: 0x9a9a90,
+        danger: 0xe06b5f,
+        danger_bg: 0x2a1c1a,
+        on_danger: 0xffffff,
+    };
+    // Leave is the coral filled action with light text and the web 5 px gap,
+    // and it stays the last toolbar entry.
+    let leave = toolbar_action_style("voice-leave", true, colors);
+    assert_eq!(leave.fill, colors.danger);
+    assert_eq!(leave.border, colors.danger);
+    assert_eq!(leave.text, colors.on_danger);
+    assert_eq!(leave.margin_left, 5.0);
+    assert!(leave.active);
+    assert_eq!(TOOLBAR_ACTIONS.last(), Some(&"voice-leave"));
+
+    // An inactive microphone or sound sits on the surface with muted text.
+    for id in ["voice-mic", "voice-deaf"] {
+        let idle = toolbar_action_style(id, false, colors);
+        assert_eq!(idle.fill, colors.surface, "{id} idle fill");
+        assert_eq!(idle.border, colors.line, "{id} idle border");
+        assert_eq!(idle.text, colors.muted, "{id} idle text");
+        assert_eq!(idle.margin_left, 0.0, "{id} has no extra gap");
+        assert!(!idle.active);
+
+        // When toggled on it uses danger text on the danger background.
+        let on = toolbar_action_style(id, true, colors);
+        assert_eq!(on.fill, colors.danger_bg, "{id} active fill");
+        assert_eq!(on.border, colors.danger, "{id} active border");
+        assert_eq!(on.text, colors.danger, "{id} active text");
+        assert_eq!(on.margin_left, 0.0);
+        assert!(on.active);
+    }
 }
 
 #[test]

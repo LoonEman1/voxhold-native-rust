@@ -29,7 +29,7 @@ fn channel(id: i64, name: &str, kind: &str) -> voxhold_api::Channel {
     }
 }
 
-fn participant(connection: &str, user: i64) -> Participant {
+pub(super) fn participant(connection: &str, user: i64) -> Participant {
     Participant {
         connection_id: connection.into(),
         user_id: user,
@@ -56,7 +56,7 @@ fn publication(channel_id: i64, publisher: &str, user: i64) -> Publication {
     }
 }
 
-fn draw(visual: &mut VisualTestContext) {
+pub(super) fn draw(visual: &mut VisualTestContext) {
     visual.update(|window, app| {
         window.refresh();
         window.draw(app).clear();
@@ -86,10 +86,30 @@ pub(super) fn fixture(
     Entity<Voxhold>,
     Entity<voice_panel::VoicePanel>,
 ) {
+    fixture_with(cx, None, true)
+}
+
+/// Same fixture with an optional initial window width and an optional idle
+/// call. A test that checks "not painted" can build the window at its final
+/// size or with an idle call before the first frame, so the dock selector was
+/// never mounted. GPUI's test frame keeps stale `debug_bounds` for a selector
+/// once it has been painted.
+pub(super) fn fixture_with(
+    cx: &mut TestAppContext,
+    width: Option<f32>,
+    active: bool,
+) -> (
+    &'static mut VisualTestContext,
+    Entity<Voxhold>,
+    Entity<voice_panel::VoicePanel>,
+) {
     cx.update(|cx| gpui_component::init(cx));
     let client = client();
     let (window, view) = super::settings_tests::make_app(cx, client.clone());
     let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
+    if let Some(width) = width {
+        visual.simulate_resize(gpui::size(gpui::px(width), gpui::px(760.)));
+    }
     let voice = visual.update(|window, cx| {
         let panel = cx.new(|cx| voice_panel::VoicePanel::new(client, 1, 7, false, window, cx));
         let mut rooms = std::collections::HashMap::new();
@@ -113,12 +133,16 @@ pub(super) fn fixture(
             panel.set_rooms(rooms);
             panel.set_self_user(1);
             panel.set_room_state(7, Vec::new(), Vec::new());
-            panel.test_set_call(
-                7,
-                CallPhase::Connected,
-                vec![participant("alice", 1), participant("bob", 2)],
-                vec!["alice".into()],
-            );
+            if active {
+                panel.test_set_call(
+                    7,
+                    CallPhase::Connected,
+                    vec![participant("alice", 1), participant("bob", 2)],
+                    vec!["alice".into()],
+                );
+            } else {
+                panel.test_set_call(0, CallPhase::Idle, Vec::new(), Vec::new());
+            }
         });
         view.update(cx, |v, cx| {
             cx.notify();
@@ -144,7 +168,7 @@ pub(super) fn fixture(
             v.server = 1;
             v.voice = Some(panel.clone());
             v.voice_room = 7;
-            v.voice_channel = 7;
+            v.voice_channel = if active { 7 } else { 0 };
             v.channel = 7;
             v.access_pending = false;
             cx.notify();
@@ -162,10 +186,33 @@ async fn a_call_survives_navigation_and_moves_to_the_dock(cx: &mut TestAppContex
     draw(&mut visual);
     view.read_with(&*visual, |v, app| {
         assert!(v.voice_room_visible(), "the call room is shown");
-        assert!(!v.voice_dock_visible(app), "no dock while the room is open");
+        assert!(
+            v.voice_dock_visible(app),
+            "the dock stays under the channel list for the whole call"
+        );
     });
+    assert!(
+        visual.debug_bounds("voice-dock").is_some(),
+        "the dock is painted even while the active room is open"
+    );
+    assert!(
+        visual.debug_bounds("voice-dock-action-voice-mic").is_some()
+            && visual
+                .debug_bounds("voice-dock-action-voice-deaf")
+                .is_some()
+            && visual
+                .debug_bounds("voice-dock-action-voice-leave")
+                .is_some(),
+        "the dock paints microphone, sound and leave"
+    );
+    assert!(
+        visual
+            .debug_bounds("voice-dock-action-voice-records")
+            .is_none(),
+        "«Записи» is a room action, not a dock action"
+    );
 
-    // Browse another voice room: the call stays in room 7 and gets a dock.
+    // Browse another voice room: the call stays in room 7 and the same dock.
     visual.update(|window, app| {
         view.update(app, |v, cx| {
             v.channel = 8;
@@ -200,7 +247,7 @@ async fn a_call_survives_navigation_and_moves_to_the_dock(cx: &mut TestAppContex
         assert!(v.voice_dock_visible(app));
     });
 
-    // Returning to the call room hides the dock and keeps the same attempt.
+    // Returning to the call room keeps the dock and the same attempt.
     visual.update(|window, app| {
         view.update(app, |v, cx| {
             v.channel = 7;
@@ -210,8 +257,9 @@ async fn a_call_survives_navigation_and_moves_to_the_dock(cx: &mut TestAppContex
     draw(&mut visual);
     view.read_with(&*visual, |v, app| {
         assert!(v.voice_room_visible());
-        assert!(!v.voice_dock_visible(app));
+        assert!(v.voice_dock_visible(app), "the dock does not disappear");
     });
+    assert!(visual.debug_bounds("voice-dock").is_some());
 }
 
 #[gpui::test]
@@ -231,15 +279,90 @@ async fn tab_and_shift_tab_walk_the_room_actions(cx: &mut TestAppContext) {
     visual.simulate_keystrokes("tab");
     assert_eq!(focused(&mut visual), Some("voice-deaf"));
     visual.simulate_keystrokes("tab");
+    assert_eq!(
+        focused(&mut visual),
+        Some("voice-screen"),
+        "screen follows sound in the web order"
+    );
+    visual.simulate_keystrokes("tab");
     assert_eq!(focused(&mut visual), Some("voice-records"));
+    visual.simulate_keystrokes("tab");
+    assert_eq!(focused(&mut visual), Some("voice-leave"), "leave is last");
+    visual.simulate_keystrokes("tab");
+    assert_eq!(
+        focused(&mut visual),
+        Some("voice-local"),
+        "then the audible participant card"
+    );
+    visual.simulate_keystrokes("tab");
+    assert_eq!(
+        focused(&mut visual),
+        Some("voice-dock-action-voice-mic"),
+        "the painted dock follows the room"
+    );
     visual.simulate_keystrokes("shift-tab");
     assert_eq!(
         focused(&mut visual),
-        Some("voice-deaf"),
+        Some("voice-local"),
         "Shift+Tab walks backwards"
     );
     visual.simulate_keystrokes("shift-tab");
+    assert_eq!(focused(&mut visual), Some("voice-leave"));
+    visual.simulate_keystrokes("shift-tab");
+    assert_eq!(focused(&mut visual), Some("voice-records"));
+    visual.simulate_keystrokes("shift-tab");
+    assert_eq!(focused(&mut visual), Some("voice-screen"));
+    visual.simulate_keystrokes("shift-tab");
+    assert_eq!(focused(&mut visual), Some("voice-deaf"));
+    visual.simulate_keystrokes("shift-tab");
     assert_eq!(focused(&mut visual), Some("voice-mic"));
+}
+
+#[gpui::test]
+async fn the_room_toolbar_paints_the_web_action_order(cx: &mut TestAppContext) {
+    fn button(visual: &mut VisualTestContext, id: &'static str) -> (f32, f32, f32, f32) {
+        let bounds = visual
+            .debug_bounds(id)
+            .unwrap_or_else(|| panic!("{id} is painted"));
+        (
+            f32::from(bounds.origin.x),
+            f32::from(bounds.origin.y),
+            f32::from(bounds.size.width),
+            f32::from(bounds.size.height),
+        )
+    }
+    let (mut visual, _view, _voice) = fixture(cx);
+    draw(&mut visual);
+    let mic = button(&mut visual, "voice-action-0");
+    let sound = button(&mut visual, "voice-action-1");
+    let screen = button(&mut visual, "voice-screen");
+    let records = button(&mut visual, "voice-action-3");
+    let leave = button(&mut visual, "voice-action-4");
+    assert!(
+        mic.0 < sound.0 && sound.0 < screen.0 && screen.0 < records.0 && records.0 < leave.0,
+        "mic, sound, screen, records, leave; leave is last"
+    );
+    assert!(
+        visual.debug_bounds("voice-action-2").is_none(),
+        "camera is not implemented and leaves no dead placeholder"
+    );
+    for (id, x, y, w, h) in [
+        ("mic", mic.0, mic.1, mic.2, mic.3),
+        ("sound", sound.0, sound.1, sound.2, sound.3),
+        ("screen", screen.0, screen.1, screen.2, screen.3),
+        ("records", records.0, records.1, records.2, records.3),
+        ("leave", leave.0, leave.1, leave.2, leave.3),
+    ] {
+        assert!(
+            (w - crate::voice_room::TOOLBAR_BUTTON_WIDTH).abs() < 1.0,
+            "{id} is 46 px wide, got {w}"
+        );
+        assert!(
+            (h - crate::voice_room::TOOLBAR_BUTTON_HEIGHT).abs() < 1.0,
+            "{id} is 45 px high, got {h}"
+        );
+        assert!(x.is_finite() && y.is_finite());
+    }
 }
 
 #[gpui::test]
@@ -470,7 +593,10 @@ async fn the_room_and_player_use_the_real_layout_coordinates(cx: &mut TestAppCon
     let toolbar = visual
         .debug_bounds("voice-action-0")
         .expect("toolbar buttons are painted");
-    assert!(f32::from(toolbar.size.width) > 60.0);
+    assert!(
+        (f32::from(toolbar.size.width) - 46.0).abs() < 1.0,
+        "the web action is 46 px wide: {toolbar:?}"
+    );
     voice.read_with(&*visual, |panel, _| {
         let (_, height) = panel.test_room_size();
         assert!(height > 120.0);
@@ -936,4 +1062,85 @@ fn voice_room_colors_follow_the_theme() {
     assert_eq!(dark.accent, light.accent);
     assert_eq!(dark.accent_text, dark_palette.accent_ink);
     assert_eq!(light.accent_text, light_palette.accent_ink);
+}
+
+#[gpui::test]
+async fn the_decoder_viewport_tracks_the_fullscreen_picture(cx: &mut TestAppContext) {
+    let (mut visual, _view, voice) = fixture(cx);
+    draw(&mut visual);
+    visual.update(|window, app| {
+        voice.update(app, |panel, _| {
+            panel.test_attach_detached_handle();
+            panel.set_scale(1.0);
+            panel.test_open_player(publication(7, "alice", 1));
+            panel.set_player_area_and_place(crate::voice_room::Rect::new(0., 0., 1920., 1080.));
+            assert_eq!(
+                panel.test_take_viewport(),
+                Some((358, 202)),
+                "the floating player keeps its own picture, not the whole window"
+            );
+            // The production fullscreen action must request the fullscreen
+            // picture on its own; the test adds no manual viewport sync.
+            panel.player_toggle_fullscreen(window);
+            assert!(panel.player_fullscreen());
+            assert_eq!(
+                panel.test_take_viewport(),
+                Some((1920, 1018)),
+                "fullscreen decodes to the full picture surface"
+            );
+            assert_eq!(
+                panel.test_take_viewport(),
+                None,
+                "the toggle must not request the same viewport twice"
+            );
+            panel.set_scale(2.0);
+            assert_eq!(
+                panel.test_take_viewport(),
+                Some((3840, 2036)),
+                "a DPI change requests physical pixels"
+            );
+        });
+    });
+    // Leaving fullscreen returns to the floating picture at the same scale.
+    visual.update(|window, app| {
+        voice.update(app, |panel, _| {
+            panel.exit_fullscreen(window);
+            assert!(!panel.player_fullscreen());
+            assert_eq!(panel.test_take_viewport(), Some((716, 405)));
+        });
+    });
+}
+
+#[gpui::test]
+async fn a_room_resize_requests_only_the_changed_picture_surface(cx: &mut TestAppContext) {
+    let (mut visual, _view, voice) = fixture(cx);
+    draw(&mut visual);
+    visual.update(|_window, app| {
+        voice.update(app, |panel, _| {
+            panel.test_attach_detached_handle();
+            panel.set_scale(1.0);
+            panel.test_open_player(publication(7, "alice", 1));
+            panel.set_player_area_and_place(crate::voice_room::Rect::new(0., 0., 1920., 1080.));
+            assert_eq!(panel.test_take_viewport(), Some((358, 202)));
+            // A narrower room clamps the floating box, so the picture surface
+            // really changes even though the player was already placed.
+            panel.set_player_area_and_place(crate::voice_room::Rect::new(0., 0., 300., 600.));
+            assert_eq!(
+                panel.test_take_viewport(),
+                Some((282, 159)),
+                "a resize between two non-empty rects requests the new surface"
+            );
+            // Repeating the same rect changes nothing and must not wake the
+            // worker with a duplicate size.
+            panel.set_player_area_and_place(crate::voice_room::Rect::new(0., 0., 300., 600.));
+            assert_eq!(
+                panel.test_take_viewport(),
+                None,
+                "an unchanged repeat is not requested"
+            );
+            // Widening the room restores the default floating width.
+            panel.set_player_area_and_place(crate::voice_room::Rect::new(0., 0., 1920., 1080.));
+            assert_eq!(panel.test_take_viewport(), Some((358, 202)));
+        });
+    });
 }

@@ -2,6 +2,8 @@
 //! selection ids and player state stay in `voice_panel.rs`.
 
 use super::*;
+use crate::audio_capabilities::OutputGainPath;
+use voxhold_media::mixer::PlayoutPhase;
 
 impl VoicePanel {
     /// The folded capture decision of the last `refresh_capture`: true means
@@ -80,7 +82,11 @@ impl VoicePanel {
         self.controls.input = input;
         self.controls.output = output;
         self.controls.bitrate_kbps = Some(bitrate);
-        self.controls.output_gain = Some(output_volume.clamp(0, 200) as f64 / 100.0);
+        // Keep the stored percentage even while the ADM plays: the engine gets
+        // `None` in that path, and the value is restored when the software
+        // mixer returns.
+        self.saved_output_gain = Some(output_volume.clamp(0, 200) as f64 / 100.0);
+        self.controls.output_gain = self.output_gain_for_path();
         self.controls.input_gain = input_volume.clamp(0, 200) as f32 / 100.0;
         self.controls.noise_mode = NoiseMode::parse(noise_mode);
         self.controls.noise_gate_percent = noise_gate.clamp(0, 100) as u8;
@@ -93,6 +99,86 @@ impl VoicePanel {
             .collect();
         self.controls.user_volumes = self.user_volumes.clone();
         self.refresh_capture();
+    }
+
+    /// Which path owns room playback right now, as far as the numeric gain is
+    /// concerned. The capture chain is not the answer: a software microphone
+    /// can be played by the ADM, and a platform microphone can coexist with
+    /// the running software mixer.
+    pub fn output_gain_path(&self) -> OutputGainPath {
+        let Some(audio) = self.applied_audio.as_ref() else {
+            // No path reported yet (outside a call or before the first
+            // `Audio` event): the software mixer is the default chain and the
+            // stored percentage is what the next join will use.
+            return OutputGainPath::Software;
+        };
+        if self.power_paused {
+            // Suspend released the sink; neither the mixer nor the ADM
+            // plays the room until the resume handler reopens it.
+            return OutputGainPath::Unavailable;
+        }
+        if let Some(stats) = &self.playout {
+            if stats.phase == PlayoutPhase::AdmFallback {
+                // The recovery budget was spent; the platform ADM owns the
+                // room and only the real mute/deafen applies.
+                return OutputGainPath::Adm;
+            }
+            if stats.running {
+                return OutputGainPath::Software;
+            }
+            // The mixer opened before and is now in its bounded
+            // Opening/Unstable retry. The `software_mixer` flag in the stale
+            // `Audio` report is false there, but the ADM does not play the
+            // room either: the numeric gain is only temporarily unavailable.
+            return OutputGainPath::Unavailable;
+        }
+        if audio.software_mixer {
+            // A live flag without a playout report yet: the mixer is starting.
+            OutputGainPath::Software
+        } else {
+            // The session never opened a software mixer; the ADM plays.
+            OutputGainPath::Adm
+        }
+    }
+
+    /// The room percentage that reaches the engine. The ADM has no numeric bus
+    /// gain, so it gets `None` and only the real mute/deafen flag applies. A
+    /// transiently unavailable mixer keeps the stored value, which the mixer
+    /// reads when it reopens.
+    fn output_gain_for_path(&self) -> Option<f64> {
+        match self.output_gain_path() {
+            OutputGainPath::Adm => None,
+            OutputGainPath::Software | OutputGainPath::Unavailable => self.saved_output_gain,
+        }
+    }
+
+    /// Whether the stored room percentage is applied by the active path. The
+    /// settings slider and its sentence use the same decision as the sent
+    /// controls, so they cannot promise an effect the path ignores.
+    pub fn output_gain_applied(&self) -> bool {
+        self.output_gain_path().applies_numeric_gain()
+    }
+
+    /// Re-evaluate the room gain after the engine reported another playback
+    /// path and forward the snapshot if it changed. This is what restores the
+    /// stored percentage when the software mixer returns without reopening
+    /// the settings tab.
+    pub(super) fn sync_output_gain(&mut self) -> bool {
+        let gain = self.output_gain_for_path();
+        if self.controls.output_gain == gain {
+            return false;
+        }
+        self.controls.output_gain = gain;
+        if let Some(handle) = &self.handle {
+            handle.controls(self.controls.clone(), self.self_muted);
+        }
+        true
+    }
+
+    /// The call ended or is being rebuilt: the saved percentage must be ready
+    /// for the next join instead of staying cleared from the ADM path.
+    pub(super) fn restore_output_gain(&mut self) {
+        self.controls.output_gain = self.saved_output_gain;
     }
 
     /// Per-user loudness chosen in the settings tab. The map is keyed by the

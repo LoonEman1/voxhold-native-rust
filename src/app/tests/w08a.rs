@@ -950,8 +950,8 @@ async fn personal_mode_keeps_the_voice_dock_and_account_controls(cx: &mut TestAp
     let (mut visual, view, voice) = super::super::voice_tests::fixture(cx);
     draw_window(&mut visual);
     assert!(
-        visual.debug_bounds("voice-dock").is_none(),
-        "the room owns the controls before the personal surface"
+        visual.debug_bounds("voice-dock").is_some(),
+        "an active call keeps its dock under the channel list"
     );
     let server = TestServer::spawn(vec![Reply::new(200, &empty_page())]);
     visual.update(|_, app| {
@@ -984,11 +984,11 @@ async fn personal_mode_keeps_the_voice_dock_and_account_controls(cx: &mut TestAp
     let mic = visual
         .debug_bounds("voice-dock-action-voice-mic")
         .expect("the dock microphone action");
-    let before = voice.read_with(&*visual, |panel, _| panel.action_active_flags()[0]);
+    let before = voice.read_with(&*visual, |panel, _| panel.action_active_flag("voice-mic"));
     visual.simulate_mouse_move(mic.center(), None, Modifiers::default());
     visual.simulate_click(mic.center(), Modifiers::default());
     draw_window(&mut visual);
-    let after = voice.read_with(&*visual, |panel, _| panel.action_active_flags()[0]);
+    let after = voice.read_with(&*visual, |panel, _| panel.action_active_flag("voice-mic"));
     assert!(after, "the dock action still mutes the confirmed call");
     assert_ne!(before, after);
 }

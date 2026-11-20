@@ -10,20 +10,63 @@ use std::{
     },
     time::{Duration, Instant},
 };
+use voxhold_media::screen_capture::{MonitorIdentity, MonitorRect, ScreenSource, SourceKind};
 use voxhold_media::system_audio::AudioDeviceInfo;
 
-fn source() -> voxhold_media::screen_capture::ScreenSource {
-    voxhold_media::screen_capture::ScreenSource {
-        id: 3,
-        kind: voxhold_media::screen_capture::SourceKind::Monitor,
-        title: "Экран 1".into(),
-        display_id: -1,
-        width: 1920,
-        height: 1080,
+pub(super) fn monitor_identity(display: u32) -> MonitorIdentity {
+    let left = display.saturating_sub(1) as i32 * 1920;
+    let bounds = MonitorRect::new(left, 0, 1920, 1080);
+    MonitorIdentity {
+        device: format!("\\\\.\\DISPLAY{display}"),
+        bounds,
+        work: bounds,
+        width: bounds.width,
+        height: bounds.height,
     }
 }
 
-fn draw(visual: &mut gpui::VisualTestContext) {
+/// A monitor row whose display is `display`, independent of the capturer id
+/// so a test can model the same number moving to another display.
+pub(super) fn monitor_on(
+    id: u64,
+    display: u32,
+    title: &str,
+    width: u32,
+    height: u32,
+) -> ScreenSource {
+    let identity = monitor_identity(display);
+    ScreenSource {
+        id,
+        kind: SourceKind::Monitor,
+        title: title.into(),
+        display_id: -1,
+        width,
+        height,
+        monitor: Some(identity),
+    }
+}
+
+pub(super) fn monitor(id: u64, title: &str, width: u32, height: u32) -> ScreenSource {
+    monitor_on(id, id as u32 + 1, title, width, height)
+}
+
+pub(super) fn window(id: u64, title: &str) -> ScreenSource {
+    ScreenSource {
+        id,
+        kind: SourceKind::Window,
+        title: title.into(),
+        display_id: -1,
+        width: 1280,
+        height: 720,
+        monitor: None,
+    }
+}
+
+fn source() -> ScreenSource {
+    monitor(3, "Экран 1", 1920, 1080)
+}
+
+pub(super) fn draw(visual: &mut gpui::VisualTestContext) {
     visual.update(|window, app| {
         window.refresh();
         window.draw(app).clear();
@@ -32,7 +75,7 @@ fn draw(visual: &mut gpui::VisualTestContext) {
 }
 
 /// Open the picker through the test seam and paint it once.
-fn open_picker(
+pub(super) fn open_picker(
     visual: &mut gpui::VisualTestContext,
     voice: &gpui::Entity<crate::voice_panel::VoicePanel>,
 ) {
@@ -48,7 +91,24 @@ fn open_picker(
     draw(visual);
 }
 
-fn focused(
+/// Open the picker with a controlled list and paint it once.
+pub(super) fn open_picker_with(
+    visual: &mut gpui::VisualTestContext,
+    voice: &gpui::Entity<crate::voice_panel::VoicePanel>,
+    kind: SourceKind,
+    sources: Vec<ScreenSource>,
+) {
+    visual.update(|_window, app| {
+        voice.update(app, |panel, _| {
+            panel.test_attach_detached_handle();
+            panel.test_open_screen_picker_with(kind, sources, None);
+        });
+    });
+    draw(visual);
+    draw(visual);
+}
+
+pub(super) fn focused(
     visual: &mut gpui::VisualTestContext,
     voice: &gpui::Entity<crate::voice_panel::VoicePanel>,
 ) -> Option<String> {
@@ -56,7 +116,7 @@ fn focused(
 }
 
 /// Bounded wait for a background result on the GPUI test loop.
-fn wait_for(
+pub(super) fn wait_for(
     visual: &mut gpui::VisualTestContext,
     voice: &gpui::Entity<crate::voice_panel::VoicePanel>,
     mut done: impl FnMut(&crate::voice_panel::VoicePanel) -> bool,
@@ -171,7 +231,10 @@ async fn the_picker_takes_focus_and_the_keyboard_selects_and_starts(cx: &mut Tes
     visual.simulate_keystrokes("tab");
     visual.simulate_keystrokes("tab");
     visual.simulate_keystrokes("tab");
-    assert_eq!(focused(&mut visual, &voice), Some("Source(0)".to_owned()));
+    assert_eq!(
+        focused(&mut visual, &voice),
+        Some("Source(monitor:3)".to_owned())
+    );
     visual.simulate_keystrokes("enter");
 
     // Walk to Start and run it.
@@ -262,7 +325,10 @@ async fn cancel_while_busy_never_enqueues_a_cancel_and_the_close_is_a_stop(
     for _ in 0..3 {
         visual.simulate_keystrokes("tab");
     }
-    assert_eq!(focused(&mut visual, &voice), Some("Source(0)".to_owned()));
+    assert_eq!(
+        focused(&mut visual, &voice),
+        Some("Source(monitor:3)".to_owned())
+    );
     visual.simulate_keystrokes("enter");
     for _ in 0..24 {
         if focused(&mut visual, &voice).as_deref() == Some("Start") {
@@ -368,11 +434,15 @@ async fn the_live_quality_dialog_warns_and_restarts_with_the_new_values(cx: &mut
     }
     assert_eq!(focused(&mut visual, &voice).as_deref(), Some("Start"));
     visual.simulate_keystrokes("enter");
-    let commands = visual
-        .update(|_window, app| voice.update(app, |panel, _| panel.test_take_screen_commands()));
+    let (commands, op) = visual.update(|_window, app| {
+        voice.update(app, |panel, _| {
+            let commands = panel.test_take_screen_commands();
+            (commands, panel.test_pending_quality_op())
+        })
+    });
     assert_eq!(
         commands,
-        vec![("restart", 0)],
+        vec![("restart", op.expect("the restart carries an operation id"))],
         "Start in the live dialog queues exactly one restart"
     );
     voice.read_with(&*visual, |panel, _| {
@@ -438,6 +508,24 @@ async fn the_on_air_sound_line_reports_measured_and_missing_audio(cx: &mut TestA
             assert!(
                 panel.test_sound_label().contains("96"),
                 "the card must show the measured audio rate"
+            );
+            panel.test_set_screen_sharing(Sharing {
+                phase: Phase::Live,
+                live: true,
+                quality: Some(quality),
+                has_audio: true,
+                audio_scope: Some("Только звук demo.exe (PID 42)".into()),
+                stats: Some(voxhold_media::publisher::engine::PublishStats {
+                    audio_active: true,
+                    audio_kbps: 96.0,
+                    ..Default::default()
+                }),
+                ..Sharing::default()
+            });
+            assert!(
+                panel.test_sound_label().contains("demo.exe"),
+                "the on-air line must name the actual scope: {}",
+                panel.test_sound_label()
             );
             panel.test_set_screen_sharing(Sharing {
                 phase: Phase::Live,
@@ -581,6 +669,9 @@ async fn a_pending_audio_probe_blocks_start_and_never_publishes_video_only(
 
     visual.update(|_window, app| {
         voice.update(app, |panel, cx| {
+            assert_eq!(panel.test_audio_toggle_label(), "Выключен");
+            // Audio is off by default now; enabling it is an explicit choice.
+            panel.test_toggle_system_audio(cx);
             assert_eq!(panel.test_audio_toggle_label(), "Включён");
             assert!(panel.test_can_start());
             panel.test_start_screen_share(cx);
@@ -747,5 +838,331 @@ async fn sharing_and_stopping_leave_the_microphone_gate_and_ptt_untouched(cx: &m
                 "stopping the share must not push new mic/gate controls"
             );
         });
+    });
+}
+
+#[gpui::test]
+async fn switching_tabs_drops_a_selection_from_the_hidden_category(cx: &mut TestAppContext) {
+    let (mut visual, _view, voice) = super::voice_tests::fixture(cx);
+    draw(&mut visual);
+    open_picker(&mut visual, &voice);
+    visual.update(|_window, app| {
+        voice.update(app, |panel, cx| {
+            assert_eq!(
+                panel.test_selected_source_id(),
+                Some(source().source_id()),
+                "the only monitor is selected"
+            );
+            assert!(panel.test_can_start());
+
+            // A monitor hidden by the «Окна» tab must not stay startable.
+            panel.test_switch_share_kind(SourceKind::Window, cx);
+            assert_eq!(
+                panel.test_selected_source_id(),
+                None,
+                "a hidden-category selection must be dropped"
+            );
+            assert!(!panel.test_can_start(), "Start is disabled without a row");
+            panel.test_start_screen_share(cx);
+            assert!(
+                panel.test_take_screen_commands().is_empty(),
+                "no publish command for an invisible selection"
+            );
+
+            // Switching back must not silently restore the old monitor.
+            panel.test_switch_share_kind(SourceKind::Monitor, cx);
+            assert_eq!(panel.test_selected_source_id(), None);
+            assert!(!panel.test_can_start());
+            panel.test_start_screen_share(cx);
+            assert!(
+                panel.test_take_screen_commands().is_empty(),
+                "the old selection must stay explicit"
+            );
+        });
+    });
+}
+
+#[gpui::test]
+async fn a_reordered_snapshot_keeps_the_id_and_uses_the_current_row(cx: &mut TestAppContext) {
+    let (mut visual, _view, voice) = super::voice_tests::fixture(cx);
+    draw(&mut visual);
+    let first = monitor(3, "Экран A", 1920, 1080);
+    let second = monitor(5, "Экран B", 2560, 1440);
+    let renamed = monitor(3, "Экран A · переименован", 1280, 720);
+    open_picker_with(
+        &mut visual,
+        &voice,
+        SourceKind::Monitor,
+        vec![first.clone(), second.clone()],
+    );
+    visual.update(|_window, app| {
+        voice.update(app, |panel, cx| {
+            panel.test_select_screen_source(first.clone(), cx);
+            // The capturer reorders and renames the entry; only the id binds.
+            panel.test_apply_screen_sources(
+                SourceKind::Monitor,
+                vec![second.clone(), renamed.clone()],
+            );
+            assert_eq!(
+                panel.test_selected_source_id(),
+                Some(first.source_id()),
+                "reordering must not move the selection to another source"
+            );
+            let selected = panel
+                .test_selected_source()
+                .expect("the selection is still present");
+            assert_eq!(
+                selected.describe(),
+                renamed.describe(),
+                "the label comes from the current snapshot"
+            );
+            assert_eq!((selected.width, selected.height), (1280, 720));
+
+            panel.test_apply_screen_sources(
+                SourceKind::Monitor,
+                vec![renamed.clone(), second.clone()],
+            );
+            assert!(panel.test_can_start());
+            panel.test_start_screen_share(cx);
+            let commands = panel.test_take_screen_commands();
+            assert_eq!(commands, vec![("publish", 7)]);
+            let request = panel.test_screen_request();
+            assert_eq!(
+                request.source, renamed,
+                "the request is built from the current row with that id"
+            );
+        });
+    });
+}
+
+#[gpui::test]
+async fn a_closed_window_or_unplugged_monitor_drops_the_selection_on_refresh(
+    cx: &mut TestAppContext,
+) {
+    let (mut visual, _view, voice) = super::voice_tests::fixture(cx);
+    draw(&mut visual);
+    open_picker(&mut visual, &voice);
+    visual.update(|_window, app| {
+        voice.update(app, |panel, cx| {
+            panel.test_apply_screen_sources(SourceKind::Monitor, Vec::new());
+            assert_eq!(panel.test_selected_source_id(), None, "the monitor is gone");
+            assert!(!panel.test_can_start());
+            assert!(
+                panel.test_screen_error().contains("больше недоступен"),
+                "the refresh explains the loss: {}",
+                panel.test_screen_error()
+            );
+            panel.test_start_screen_share(cx);
+            assert!(panel.test_take_screen_commands().is_empty());
+        });
+    });
+
+    let visible = window(11, "Документ");
+    open_picker_with(
+        &mut visual,
+        &voice,
+        SourceKind::Window,
+        vec![visible.clone()],
+    );
+    visual.update(|_window, app| {
+        voice.update(app, |panel, cx| {
+            panel.test_select_screen_source(visible.clone(), cx);
+            panel.test_apply_screen_sources(SourceKind::Window, Vec::new());
+            assert_eq!(panel.test_selected_source_id(), None, "the window closed");
+            assert!(!panel.test_can_start());
+            panel.test_start_screen_share(cx);
+            assert!(panel.test_take_screen_commands().is_empty());
+        });
+    });
+}
+
+#[gpui::test]
+async fn start_with_a_removed_source_is_refused_before_the_refresh(cx: &mut TestAppContext) {
+    let (mut visual, _view, voice) = super::voice_tests::fixture(cx);
+    draw(&mut visual);
+    let selected = monitor(3, "Экран A", 1920, 1080);
+    let replacement = monitor(5, "Экран B", 2560, 1440);
+    open_picker_with(
+        &mut visual,
+        &voice,
+        SourceKind::Monitor,
+        vec![selected.clone()],
+    );
+    visual.update(|_window, app| {
+        voice.update(app, |panel, cx| {
+            panel.test_select_screen_source(selected.clone(), cx);
+            // The list changed but the refresh answer is not applied yet.
+            panel.test_replace_screen_list_without_refresh(SourceKind::Monitor, vec![replacement]);
+            assert_eq!(panel.test_selected_source_id(), Some(selected.source_id()));
+            assert!(!panel.test_can_start(), "the id is not in the list");
+            panel.test_start_screen_share(cx);
+            assert!(
+                panel.test_take_screen_commands().is_empty(),
+                "a stale selection must never reach the worker"
+            );
+            assert!(
+                panel.test_screen_error().contains("больше недоступен"),
+                "the refusal is visible: {}",
+                panel.test_screen_error()
+            );
+        });
+    });
+}
+
+#[gpui::test]
+async fn the_accepted_publish_update_closes_the_committed_picker(cx: &mut TestAppContext) {
+    use voxhold_media::publisher::{Phase, Sharing};
+    let (mut visual, _view, voice) = super::voice_tests::fixture(cx);
+    draw(&mut visual);
+    open_picker(&mut visual, &voice);
+    visual.update(|_window, app| {
+        voice.update(app, |panel, cx| {
+            assert!(panel.test_can_start());
+            panel.test_start_screen_share(cx);
+            assert!(panel.screen_share_busy(), "the attempt is committed");
+            let commands = panel.test_take_screen_commands();
+            assert_eq!(commands, vec![("publish", 7)]);
+
+            assert!(panel.test_apply_screen_sharing(Sharing {
+                phase: Phase::Publishing,
+                live: false,
+                ..Sharing::default()
+            }));
+            assert!(
+                !panel.screen_share_open(),
+                "the accepted publish closes the committed picker"
+            );
+            assert!(!panel.screen_share_busy());
+        });
+    });
+}
+
+#[gpui::test]
+async fn a_duplicate_source_id_is_never_selected_or_published(cx: &mut TestAppContext) {
+    let (mut visual, _view, voice) = super::voice_tests::fixture(cx);
+    draw(&mut visual);
+    let first = monitor(3, "Экран A", 1920, 1080);
+    let duplicate = monitor(3, "Экран A · дубль", 1920, 1080);
+    let id = first.source_id();
+    visual.update(|_window, app| {
+        voice.update(app, |panel, cx| {
+            panel.test_attach_detached_handle();
+            // A normal worker answer may describe the same (kind,id) twice.
+            // The selection is still held by identity, as after a click on the
+            // row before the duplicated snapshot arrived.
+            panel.test_open_screen_picker_with(
+                SourceKind::Monitor,
+                vec![first.clone(), duplicate.clone()],
+                Some(id),
+            );
+            assert_eq!(panel.test_selected_source_id(), Some(id));
+            assert!(
+                !panel.test_can_start(),
+                "an ambiguous identity cannot be started"
+            );
+            panel.test_start_screen_share(cx);
+            assert!(
+                panel.test_take_screen_commands().is_empty(),
+                "a duplicated id must never reach the worker"
+            );
+            assert_eq!(
+                panel.test_screen_error(),
+                panel.test_source_gone_reason(),
+                "the duplicate refusal is visible"
+            );
+
+            // The worker repeats the same duplicated answer: the selection is
+            // invalidated through `retain_selection`, not silently repaired.
+            panel.test_apply_screen_sources(SourceKind::Monitor, vec![first, duplicate]);
+            assert_eq!(
+                panel.test_selected_source_id(),
+                None,
+                "a duplicated snapshot clears the ambiguous selection"
+            );
+            assert!(!panel.test_can_start());
+            assert_eq!(panel.test_screen_error(), panel.test_source_gone_reason());
+        });
+    });
+}
+
+#[gpui::test]
+async fn the_panel_pushes_gate_changes_while_the_picker_is_open(cx: &mut TestAppContext) {
+    let (visual, _view, voice) = super::voice_tests::fixture(cx);
+    visual.update(|window, app| {
+        voice.update(app, |panel, cx| {
+            panel.test_attach_detached_handle();
+            panel.test_set_share_gate(Ok(()));
+            panel.test_open_screen_share(cx);
+            assert_eq!(
+                panel.test_take_screen_access(),
+                Some((false, true)),
+                "opening the picker binds the worker to the current gate"
+            );
+            panel.set_stream_permission(true);
+            assert_eq!(
+                panel.test_take_screen_access(),
+                Some((true, true)),
+                "a granted permission reaches the worker while the picker is open"
+            );
+            // The channel fills while the picker stays open. The worker must
+            // see the slot loss before it accepts a prepared capture.
+            panel.test_apply_update(
+                voxhold_media::runtime::VoiceUpdate::Streams((0..8).map(publication).collect()),
+                window,
+                cx,
+            );
+            assert_eq!(
+                panel.test_take_screen_access(),
+                Some((true, false)),
+                "the slot loss reaches the worker without a new Start"
+            );
+            panel.set_stream_permission(false);
+            assert_eq!(panel.test_take_screen_access(), Some((false, false)));
+        });
+    });
+}
+
+#[gpui::test]
+async fn keyboard_focus_follows_the_source_id_across_a_reorder(cx: &mut TestAppContext) {
+    let (mut visual, _view, voice) = super::voice_tests::fixture(cx);
+    draw(&mut visual);
+    let first = monitor(3, "Экран A", 1920, 1080);
+    let second = monitor(5, "Экран B", 2560, 1440);
+    open_picker_with(
+        &mut visual,
+        &voice,
+        SourceKind::Monitor,
+        vec![first.clone(), second.clone()],
+    );
+    // Monitors -> Windows -> Refresh -> first source row.
+    for _ in 0..3 {
+        visual.simulate_keystrokes("tab");
+    }
+    assert_eq!(
+        focused(&mut visual, &voice),
+        Some("Source(monitor:3)".to_owned())
+    );
+
+    visual.update(|_window, app| {
+        voice.update(app, |panel, _| {
+            panel.test_apply_screen_sources(
+                SourceKind::Monitor,
+                vec![second.clone(), first.clone()],
+            );
+        });
+    });
+    draw(&mut visual);
+    // Focus must follow the source, not the row position.
+    assert_eq!(
+        focused(&mut visual, &voice),
+        Some("Source(monitor:3)".to_owned()),
+        "the same kind+id stays focused"
+    );
+
+    // Enter still selects the focused identity, not the new row position.
+    visual.simulate_keystrokes("enter");
+    voice.read_with(&*visual, |panel, _| {
+        assert_eq!(panel.test_selected_source_id(), Some(first.source_id()));
+        assert_eq!(panel.test_selected_source(), Some(first));
     });
 }

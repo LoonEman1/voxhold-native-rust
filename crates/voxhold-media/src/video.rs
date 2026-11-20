@@ -114,6 +114,18 @@ impl VideoStore {
     }
 }
 
+#[cfg(test)]
+impl VideoStore {
+    /// Test-only: publish a frame through the production path so a viewer test
+    /// can prove a viewport change re-reads an already decoded picture.
+    pub(crate) fn publish_i420(&self, buffer: I420Buffer) -> bool {
+        self.publish(libwebrtc::video_frame::VideoFrame::new(
+            libwebrtc::video_frame::VideoRotation::VideoRotation0,
+            Box::new(buffer) as Box<dyn VideoBuffer>,
+        ))
+    }
+}
+
 fn fit(w: u32, h: u32, max_w: u32, max_h: u32) -> (u32, u32) {
     if max_w == 0 || max_h == 0 {
         return (0, 0);
@@ -354,6 +366,35 @@ mod tests {
         let mut output = vec![0; 8 * 8 * 4];
         assert_eq!(store.read(&mut request, &mut output), 8 * 8 * 4);
         assert!(output[2] > 250 && output[0] < 4);
+        assert_eq!(store.read(&mut request, &mut output), 0);
+    }
+
+    #[test]
+    fn a_viewport_change_re_reads_the_static_frame_at_the_fitted_size() {
+        let store = VideoStore::default();
+        assert!(store.publish_i420(I420Buffer::new_black(320, 180)));
+        let mut request = VideoRead {
+            viewport_width: 160,
+            viewport_height: 90,
+            ..VideoRead::default()
+        };
+        let mut output = vec![0; 160 * 90 * 4];
+        assert_eq!(
+            store.read(&mut request, &mut output),
+            (160 * 90 * 4) as isize
+        );
+        // Fullscreen changes only the player surface: no new RTP frame is
+        // stored, yet the same picture must be scaled to the new size.
+        request.viewport_width = 320;
+        request.viewport_height = 278;
+        output.resize(320 * 180 * 4, 0);
+        assert_eq!(
+            store.read(&mut request, &mut output),
+            (320 * 180 * 4) as isize
+        );
+        assert_eq!((request.width, request.height), fit(320, 180, 320, 278));
+        // A second read at the same viewport and sequence is a no-op, so the
+        // UI settles after the repaint instead of forcing another frame.
         assert_eq!(store.read(&mut request, &mut output), 0);
     }
 }

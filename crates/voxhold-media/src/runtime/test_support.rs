@@ -24,6 +24,13 @@ impl VoiceHandle {
         }
     }
 
+    /// Push one update through the real coalescing queue, exactly as the
+    /// worker does. The panel tests use this to model a burst that is read as
+    /// one latest snapshot.
+    pub fn push_update_for_tests(&self, update: VoiceUpdate) {
+        self.updates.push(update);
+    }
+
     /// The newest control snapshot waiting for the media worker, if the UI
     /// queued one. The slot holds one value, so this is also the count of
     /// pending snapshots.
@@ -36,8 +43,27 @@ impl VoiceHandle {
         self.requests.power.lock().ok()?.take()
     }
 
-    /// Drain the queued screen actions as (kind, picker) pairs. The detached
-    /// handle has no worker, so this is exactly what the UI sent.
+    /// The newest viewport the UI requested. The slot is a last-value cell, so
+    /// `None` after a take proves that an unchanged size was not rewritten.
+    pub fn take_viewport_for_tests(&self) -> Option<(u32, u32)> {
+        self.requests.viewport.lock().ok()?.take()
+    }
+
+    /// The newest screen gate the UI pushed for the worker while a picker or
+    /// an attempt was open.
+    pub fn take_screen_access_for_tests(&self) -> Option<(bool, bool)> {
+        self.requests
+            .screen_access
+            .lock()
+            .ok()?
+            .take()
+            .map(|access| (access.stream_permission, access.slot_available))
+    }
+
+    /// Drain the queued screen actions as `(kind, target)` pairs. The detached
+    /// handle has no worker, so this is exactly what the UI sent. The target is
+    /// the picker id for picker actions and the real quality-operation id for
+    /// `restart`, `bitrate` and `cancel-restart`; `stop` has none.
     pub fn take_screen_commands_for_tests(&self) -> Vec<(&'static str, u64)> {
         let mut out = Vec::new();
         while let Some(pending) = self.requests.take() {
@@ -47,7 +73,9 @@ impl VoiceHandle {
             out.push(match command {
                 ScreenCommand::OpenPicker { picker } => ("open", picker),
                 ScreenCommand::Publish { picker, .. } => ("publish", picker),
-                ScreenCommand::Restart { .. } => ("restart", 0),
+                ScreenCommand::Restart { op, .. } => ("restart", op),
+                ScreenCommand::LiveQuality { op, .. } => ("bitrate", op),
+                ScreenCommand::CancelRestart { op } => ("cancel-restart", op),
                 ScreenCommand::CancelPicker { picker } => ("cancel", picker),
                 ScreenCommand::Stop => ("stop", 0),
             });

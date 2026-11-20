@@ -7,7 +7,8 @@
 
 use crate::theme::Palette;
 use crate::voice_room::{
-    self, CallPhase, Hotkey, Rect, Tone, VoiceAction, PLAYER_DEFAULT_WIDTH, VOICE_ACTIONS,
+    self, CallPhase, Hotkey, Rect, Tone, VoiceAction, DOCK_ACTIONS, PLAYER_DEFAULT_WIDTH,
+    TOOLBAR_ACTIONS, VOICE_ACTIONS,
 };
 use gpui::{
     div, img, prelude::*, px, rgb, Context, FocusHandle, MouseButton, RenderImage, Subscription,
@@ -72,9 +73,14 @@ pub struct VoicePanel {
     attempt: u64,
     call_channel: i64,
     phase: CallPhase,
+    /// Local cues from real transitions; the parent drains them onto the output.
+    cues: cues::CueQueue,
     status: String,
     error: String,
     controls: Controls,
+    /// Saved room output percentage. The ADM path sends `None`; the software
+    /// mixer and an unknown path keep the stored value.
+    saved_output_gain: Option<f64>,
     /// Applied capture chain reported by the engine. Rendered as a diagnostic
     /// label in the active room; not part of the Go room layout.
     applied_audio: Option<AppliedAudio>,
@@ -148,11 +154,18 @@ pub struct VoicePanel {
     player_placed: bool,
     player_fullscreen: bool,
     owns_fullscreen: bool,
+    /// Physical size last handed to the media worker. Repeated renders must not
+    /// rewrite the same slot, but a real change is never skipped.
+    requested_viewport: Option<(u32, u32)>,
     player_drag: Option<PlayerDrag>,
     join_focus: FocusHandle,
     action_focus: Vec<FocusHandle>,
     dock_focus: Vec<FocusHandle>,
     dock_visible: bool,
+    /// Whether the shell painted the room pane this frame. The room actions,
+    /// join button, participant cards and stream tiles are only mounted while
+    /// it is true, so they must not stay in the Tab ring otherwise.
+    room_painted: bool,
     stream_focus: Vec<FocusHandle>,
     /// Focus handles of the «Экран» toolbar action and the on-air actions.
     /// Index 0 is the on-air stop action, index 1 the toolbar button, index 2
@@ -187,6 +200,21 @@ pub struct VoicePanel {
     #[cfg(test)]
     test_audio_probe: Option<
         Arc<dyn Fn() -> Result<voxhold_media::system_audio::AudioDeviceInfo, String> + Send + Sync>,
+    >,
+    /// Test-only thumbnail provider. `None` in tests keeps real desktop capture
+    /// out of the suite entirely; an injected provider runs on the same
+    /// background task as the production capture.
+    #[cfg(test)]
+    test_preview_provider: Option<
+        Arc<
+            dyn Fn(
+                    &voxhold_media::screen_capture::ScreenSource,
+                ) -> Result<
+                    voxhold_media::screen_capture::PreviewFrame,
+                    voxhold_media::screen_capture::ThumbnailError,
+                > + Send
+                + Sync,
+        >,
     >,
 }
 
@@ -235,8 +263,10 @@ impl VoicePanel {
             attempt: 0,
             call_channel: 0,
             phase: CallPhase::Idle,
+            cues: cues::CueQueue::default(),
             status: String::new(),
             error: String::new(),
+            saved_output_gain: controls.output_gain,
             controls,
             applied_audio: None,
             self_muted: false,
@@ -280,15 +310,15 @@ impl VoicePanel {
             player_placed: false,
             player_fullscreen: false,
             owns_fullscreen: false,
+            requested_viewport: None,
             player_drag: None,
             join_focus: cx.focus_handle(),
             action_focus: (0..VOICE_ACTIONS.len())
                 .map(|_| cx.focus_handle())
                 .collect(),
-            dock_focus: (0..VOICE_ACTIONS.len())
-                .map(|_| cx.focus_handle())
-                .collect(),
+            dock_focus: (0..DOCK_ACTIONS.len()).map(|_| cx.focus_handle()).collect(),
             dock_visible: false,
+            room_painted: false,
             stream_focus: (0..8).map(|_| cx.focus_handle()).collect(),
             screen_focus: (0..3).map(|_| cx.focus_handle()).collect(),
             picker_focus: (0..32).map(|_| cx.focus_handle()).collect(),
@@ -307,6 +337,8 @@ impl VoicePanel {
             test_share_gate: None,
             #[cfg(test)]
             test_audio_probe: None,
+            #[cfg(test)]
+            test_preview_provider: None,
         }
     }
 
@@ -456,6 +488,9 @@ impl VoicePanel {
 
     pub fn set_scale(&mut self, scale: f32) {
         self.scale = scale.max(0.1);
+        // A DPI change moves the same window rectangle to different physical
+        // pixels, so the decoder must be told before the next frame arrives.
+        self.sync_viewport();
     }
 
     pub fn room(&self) -> i64 {
@@ -569,7 +604,7 @@ impl VoicePanel {
                 self.attempt = handle.attempt();
                 self.handle = Some(handle);
                 self.call_channel = self.room;
-                self.phase = CallPhase::Connecting;
+                self.begin_attempt();
                 self.status = "Подключение…".into();
                 self.error.clear();
                 self.participants.clear();
@@ -638,7 +673,7 @@ impl VoicePanel {
         self.reset_screen();
         self.screen_notice.clear();
         self.call_channel = 0;
-        self.phase = CallPhase::Idle;
+        self.transition_phase(CallPhase::Idle, cx);
         self.status.clear();
         self.error.clear();
         self.ptt_held = false;
@@ -647,6 +682,8 @@ impl VoicePanel {
         self.server_muted = false;
         self.self_connection = None;
         self.playout = None;
+        // The ADM cleared the numeric gain; the next join restores the saved value.
+        self.restore_output_gain();
         self.power_paused = false;
         // The next join starts with a closed microphone until the server
         // confirms `voice.joined`, even if the previous call was unmuted.
@@ -657,7 +694,6 @@ impl VoicePanel {
         self.local_mutes.clear();
         self.streams.clear();
         self.local_level = 0.0;
-        self.notify_call_changed(cx);
         cx.notify();
     }
 
@@ -779,13 +815,23 @@ impl VoicePanel {
     }
 
     pub fn mute(&mut self, cx: &mut Context<Self>) {
+        let cue = crate::ui_sounds::mute_toggle_cue(self.self_muted);
+        let server_muted = self.server_muted;
         self.self_muted = !self.self_muted;
+        if !server_muted {
+            // Server mute owns the effective state; a local toggle stays silent.
+            self.queue_cue(cue);
+            self.notify_call_changed(cx);
+        }
         self.refresh_capture();
         cx.notify();
     }
 
     pub fn deafen(&mut self, cx: &mut Context<Self>) {
+        let cue = crate::ui_sounds::deafen_toggle_cue(self.controls.deafened);
         self.controls.deafened = !self.controls.deafened;
+        self.queue_cue(cue);
+        self.notify_call_changed(cx);
         self.refresh_capture();
         cx.notify();
     }
@@ -864,6 +910,9 @@ impl VoicePanel {
         self.watching = None;
         self.watching_selection = None;
         self.player_open = false;
+        // The next player may be served by another handle; its first viewport
+        // must reach that worker even if the size matches the closed player.
+        self.requested_viewport = None;
         self.stream_status.clear();
         self.stream_error.clear();
         self.stream_audio_error.clear();
@@ -901,9 +950,18 @@ impl VoicePanel {
     }
 
     /// The sidebar dock renders outside the room pane, but its focus handles
-    /// belong to the same Tab ring.
+    /// belong to the same Tab ring. The shell resets this at the start of a
+    /// frame and `voice_dock()` raises it again only when it really paints, so
+    /// an unpainted dock can never leave entries in the ring.
     pub fn set_dock_visible(&mut self, visible: bool) {
         self.dock_visible = visible;
+    }
+
+    /// Mirrors the shell's room-pane predicate for the same frame. This is not
+    /// the same as an active call: a text channel or another voice room shows
+    /// the dock only, with no room toolbar or participant cards to focus.
+    pub fn set_room_painted(&mut self, painted: bool) {
+        self.room_painted = painted;
     }
 
     pub fn dock_focus(&self, index: usize) -> FocusHandle {
@@ -921,14 +979,14 @@ impl VoicePanel {
         }
     }
 
-    /// `(mic, deafen, records, leave)` active flags for the dock buttons.
-    pub fn action_active_flags(&self) -> [bool; 4] {
-        [
-            self.self_muted || self.server_muted,
-            self.controls.deafened,
-            false,
-            true,
-        ]
+    /// Active state of one action, shared by the room toolbar and the dock.
+    pub fn action_active_flag(&self, action_id: &str) -> bool {
+        match action_id {
+            "voice-mic" => self.self_muted || self.server_muted,
+            "voice-deaf" => self.controls.deafened,
+            "voice-leave" => true,
+            _ => false,
+        }
     }
 
     pub fn player_fullscreen(&self) -> bool {
@@ -941,15 +999,7 @@ impl VoicePanel {
     }
 
     fn poll(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(player) = self.player_box() {
-            let geometry = voice_room::player_geometry(self.player_area, player, self.has_audio());
-            let picture = geometry.picture;
-            let width = (picture.w * self.scale).max(1.0) as u32;
-            let height = (picture.h * self.scale).max(1.0) as u32;
-            if let Some(handle) = &self.handle {
-                handle.set_viewport(width, height);
-            }
-        }
+        self.sync_viewport();
         let preview_changed = self.take_screen_preview();
         let Some(handle) = &self.handle else {
             if preview_changed {
@@ -984,111 +1034,6 @@ impl VoicePanel {
         }
     }
 
-    // ---- focus ring -----------------------------------------------------
-
-    fn focus_ring(&self) -> Vec<(&'static str, FocusHandle)> {
-        let mut ring = Vec::new();
-        let active = self.call_channel != 0 && self.call_channel == self.room;
-        if active {
-            for (index, action) in VOICE_ACTIONS.iter().enumerate() {
-                ring.push((action.id, self.action_focus[index].clone()));
-            }
-            ring.push(("voice-screen", self.screen_focus[1].clone()));
-            if matches!(
-                self.screen.sharing.phase,
-                voxhold_media::publisher::Phase::Publishing
-                    | voxhold_media::publisher::Phase::Live
-                    | voxhold_media::publisher::Phase::Stopping
-                    | voxhold_media::publisher::Phase::Failed
-            ) {
-                ring.push(("screen-stop", self.screen_focus[0].clone()));
-            }
-        } else {
-            ring.push(("voice-join", self.join_focus.clone()));
-        }
-        for (index, publication) in self
-            .room_streams()
-            .iter()
-            .filter(|publication| publication.channel_id == self.room)
-            .take(self.stream_focus.len())
-            .enumerate()
-        {
-            if self.call_active() && self.call_channel == self.room {
-                ring.push((
-                    if self.watching.as_ref().is_some_and(|current| {
-                        current.publisher_connection_id == publication.publisher_connection_id
-                    }) {
-                        "stream-full"
-                    } else {
-                        "stream-watch"
-                    },
-                    self.stream_focus[index].clone(),
-                ));
-            }
-        }
-        let roster = self.visible_roster();
-        let mut card = 0;
-        for participant in roster {
-            if !self.audio_for(&participant.connection_id) {
-                continue;
-            }
-            let Some(handle) = self.member_focus.get(card) else {
-                break;
-            };
-            ring.push(("voice-local", handle.clone()));
-            card += 1;
-        }
-        if self.player_open {
-            if self.has_audio() {
-                ring.push(("stream-audio", self.player_actions[0].clone()));
-            }
-            ring.push(("stream-fullscreen", self.player_actions[1].clone()));
-            ring.push(("stream-close", self.player_actions[2].clone()));
-        }
-        if self.dock_visible && self.call_channel != 0 {
-            for (index, action) in VOICE_ACTIONS.iter().enumerate() {
-                ring.push((action.id, self.dock_focus[index].clone()));
-            }
-        }
-        ring
-    }
-
-    pub fn cycle_focus(
-        &mut self,
-        shift: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        let ring = self.focus_ring();
-        if ring.is_empty() {
-            return false;
-        }
-        let current = ring
-            .iter()
-            .position(|(_, handle)| handle.is_focused(window));
-        let next = match current {
-            None => 0,
-            Some(index) => {
-                if shift {
-                    (index + ring.len() - 1) % ring.len()
-                } else {
-                    (index + 1) % ring.len()
-                }
-            }
-        };
-        window.focus(&ring[next].1);
-        cx.notify();
-        true
-    }
-
-    #[cfg(test)]
-    pub fn focused_action(&self, window: &Window) -> Option<&'static str> {
-        self.focus_ring()
-            .into_iter()
-            .find(|(_, handle)| handle.is_focused(window))
-            .map(|(id, _)| id)
-    }
-
     /// Test hook: install a confirmed call without opening a socket, so the
     /// room, dock and keyboard can be tested deterministically.
     #[cfg(test)]
@@ -1115,11 +1060,6 @@ impl VoicePanel {
         self.player_open = true;
         self.stream_status = "Подключено".into();
         self.watching = Some(publication);
-    }
-
-    #[cfg(test)]
-    pub fn test_set_fullscreen(&mut self, fullscreen: bool) {
-        self.player_fullscreen = fullscreen;
     }
 
     #[cfg(test)]
@@ -1180,6 +1120,8 @@ impl VoicePanel {
 
 mod colors;
 mod controls;
+mod cues;
+mod focus;
 mod player;
 mod screen_share;
 use screen_share::{ScreenShareUi, SCREEN_ROTATION_NOTICE};

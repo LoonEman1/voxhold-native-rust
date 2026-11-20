@@ -36,9 +36,23 @@ pub(super) enum ScreenCommand {
     },
     /// New settings of a live attempt: one stop followed by one new start.
     Restart {
+        op: u64,
         request: PublishRequest,
         stream_permission: bool,
         slot_available: bool,
+    },
+    /// Only the bitrates changed: the live sender applies them without a stop
+    /// or a new start.
+    LiveQuality {
+        op: u64,
+        request: PublishRequest,
+        stream_permission: bool,
+        slot_available: bool,
+    },
+    /// The user closed the quality dialog while the restart preflight was
+    /// running. The live stream stays untouched.
+    CancelRestart {
+        op: u64,
     },
     Stop,
 }
@@ -48,6 +62,14 @@ pub(super) enum ScreenCommand {
 pub(super) struct SourceRequest {
     pub(super) kind: SourceKind,
     pub(super) generation: u64,
+}
+
+/// The panel's confirmed gate for screen sharing. It is a last-value cell: the
+/// worker applies the newest value before a preparation may complete.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct ScreenAccess {
+    pub(super) stream_permission: bool,
+    pub(super) slot_available: bool,
 }
 
 impl StreamCommand {
@@ -165,6 +187,9 @@ pub(super) struct Requests {
     pub(super) screen: Mutex<VecDeque<ScreenCommand>>,
     /// Picker listings. Only the newest request of each kind matters.
     pub(super) screen_sources: Mutex<Vec<SourceRequest>>,
+    /// Freshest screen gate from the panel. Shared with the session so the
+    /// completion check reads the value directly, not a queued command.
+    pub(super) screen_access: Arc<Mutex<Option<ScreenAccess>>>,
     /// Explicit output selection from settings. This is separate from generic
     /// control updates so it always reaches the media engine even when the
     /// runtime cache still describes the pre-unplug device.
@@ -181,6 +206,7 @@ pub(super) enum Pending {
     Stream(StreamCommand),
     Screen(ScreenCommand),
     ScreenSources(SourceRequest),
+    ScreenAccess(ScreenAccess),
     Output(Option<String>),
     Input(InputRequest),
     Controls(Controls, bool),
@@ -213,6 +239,11 @@ impl Requests {
         if let Ok(mut sources) = self.screen_sources.lock() {
             if !sources.is_empty() {
                 return Some(Pending::ScreenSources(sources.remove(0)));
+            }
+        }
+        if let Ok(mut access) = self.screen_access.lock() {
+            if let Some(access) = access.take() {
+                return Some(Pending::ScreenAccess(access));
             }
         }
         if let Ok(mut output) = self.output.lock() {

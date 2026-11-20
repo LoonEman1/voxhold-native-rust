@@ -438,6 +438,99 @@ fn screen_publisher() -> crate::publisher::Publisher {
     publisher
 }
 
+/// A publisher whose attempt reached the air: both engine confirmations.
+fn live_screen_publisher(now: Instant) -> crate::publisher::Publisher {
+    use crate::publisher::EngineEvent;
+    let mut publisher = screen_publisher();
+    publisher.begin_picker(1);
+    publisher.publish(1, screen_request(), false, now);
+    publisher.engine_ready(now, false, None);
+    publisher.on_engine(
+        EngineEvent::State(crate::publisher::Connection::Connected),
+        now,
+    );
+    publisher.on_engine(
+        EngineEvent::State(crate::publisher::Connection::FirstFrame),
+        now,
+    );
+    assert_eq!(publisher.phase(), crate::publisher::Phase::Live);
+    publisher
+}
+
+#[test]
+fn a_stale_deferred_bitrate_never_reaches_a_freed_worker_queue() {
+    use crate::publisher::engine::BitrateSend;
+    use crate::publisher::{BITRATE_CONFIRM_TIMEOUT, Outcome as PublisherOutcome, Phase};
+
+    let now = Instant::now();
+    let mut publisher = live_screen_publisher(now);
+    let attempt = publisher.sharing().attempt;
+    let previous = publisher.request().cloned().expect("live request");
+    let previous_confirmed = publisher.sharing().confirmed.clone();
+    let mut next = screen_request();
+    next.quality.bitrate_kbps = 9000;
+    let outcomes = publisher.apply_quality(7, next.clone(), now);
+    let Some(PublisherOutcome::SetBitrate { quality, .. }) = outcomes.first() else {
+        panic!("a live bitrate change is one command: {outcomes:?}");
+    };
+    let quality = *quality;
+    let mut queue = super::screen::BitrateQueue::default();
+    queue.request(attempt, 7, quality);
+    // The bounded worker queue was full: the value stays deferred.
+    assert!(
+        super::screen::deliver_bitrate(&mut queue, &mut publisher, |_, _, _| BitrateSend::Full)
+            .is_empty()
+    );
+    assert!(queue.is_pending(), "the deferred value survives a tick");
+
+    // The confirmation deadline passes: the operation is refused and is no
+    // longer awaited, while the attempt keeps running.
+    let expired = publisher.tick(now + BITRATE_CONFIRM_TIMEOUT);
+    assert!(matches!(expired.as_slice(), [PublisherOutcome::State(_)]));
+    assert_eq!(publisher.phase(), Phase::Live);
+    assert!(
+        !publisher.awaits_bitrate(7),
+        "the timeout ends the operation"
+    );
+
+    // The queue frees up only after the timeout. The next tick must drop the
+    // deferred value instead of sending a bitrate the dialog gave up on.
+    let late = super::screen::deliver_bitrate(&mut queue, &mut publisher, |_, _, _| {
+        panic!("a stale bitrate must not reach the engine")
+    });
+    assert!(late.is_empty(), "a stale retry reports nothing: {late:?}");
+    assert!(!queue.is_pending(), "the stale value is dropped");
+
+    // The live attempt, the confirmed limits and the reported error stay.
+    assert_eq!(publisher.phase(), Phase::Live);
+    assert_eq!(publisher.request(), Some(&previous));
+    assert_eq!(publisher.sharing().confirmed, previous_confirmed);
+    assert!(
+        publisher.sharing().error.is_some(),
+        "the refused operation stays visible"
+    );
+
+    // A retry under a new operation is delivered as usual.
+    let retried = publisher.apply_quality(8, next, now + BITRATE_CONFIRM_TIMEOUT);
+    assert!(matches!(
+        retried.first(),
+        Some(PublisherOutcome::SetBitrate { op: 8, .. })
+    ));
+    queue.request(attempt, 8, quality);
+    let mut sent = None;
+    let delivered =
+        super::screen::deliver_bitrate(&mut queue, &mut publisher, |attempt, op, value| {
+            sent = Some((attempt, op, value));
+            BitrateSend::Sent
+        });
+    assert!(delivered.is_empty());
+    assert_eq!(
+        sent,
+        Some((attempt, 8, quality)),
+        "the retry reaches the engine under its own operation"
+    );
+}
+
 #[test]
 fn a_slow_engine_drop_does_not_block_the_release_path() {
     use std::sync::{

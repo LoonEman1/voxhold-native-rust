@@ -97,6 +97,51 @@ impl BitrateQueue {
     }
 }
 
+/// Deliver the pending live bitrate to the engine of the live attempt.
+///
+/// A deferred command only survives while the publisher still awaits its
+/// operation. If the confirmation deadline passed, the request was replaced or
+/// the attempt left `Live`, the worker queue may free up later; applying the
+/// value then would change a limit that `request`/`confirmed` already report as
+/// refused. Such a stale value is dropped here, before anything is sent.
+///
+/// `Sent` only proves that the command reached the worker queue; the publisher
+/// already reports `Applying` and waits for the verified engine result. `Full`
+/// only shows a non-terminal status and keeps the previous limit; the next tick
+/// retries the same operation. `Closed` is the only answer that means the
+/// worker (and its capture) is gone.
+pub(super) fn deliver_bitrate(
+    bitrate: &mut BitrateQueue,
+    publisher: &mut Publisher,
+    send: impl FnOnce(u64, u64, Quality) -> BitrateSend,
+) -> Vec<PublisherOutcome> {
+    if publisher.phase() != crate::publisher::Phase::Live {
+        bitrate.clear();
+        return Vec::new();
+    }
+    let Some(op) = bitrate.pending_op() else {
+        return Vec::new();
+    };
+    if !publisher.awaits_bitrate(op) {
+        // A timeout, a cancel or a newer operation ended this one. A late
+        // retry must not apply a bitrate the dialog already gave up on.
+        bitrate.clear();
+        return Vec::new();
+    }
+    let attempt = publisher.sharing().attempt;
+    match bitrate.flush(attempt, send) {
+        // The engine answers with a `Bitrate` event once the senders and the
+        // peer confirmed the new limits.
+        BitrateDelivery::Sent => Vec::new(),
+        BitrateDelivery::Full => publisher.bitrate_queued(op),
+        BitrateDelivery::Closed => publisher.on_engine(
+            crate::publisher::EngineEvent::Error("Медиадвижок трансляции уже закрыт.".into()),
+            Instant::now(),
+        ),
+        BitrateDelivery::Idle => Vec::new(),
+    }
+}
+
 /// One preview picture for the local on-air card.
 pub struct ScreenFrame {
     pub width: u32,
@@ -353,39 +398,18 @@ impl Live {
         Ok(true)
     }
 
-    /// Deliver the newest pending live bitrate change to the engine.
-    ///
-    /// `Sent` only proves that the command reached the worker queue; the
-    /// publisher already reports `Applying` and waits for the verified engine
-    /// result. `Full` only shows a non-terminal status and keeps the previous
-    /// limit; the next tick retries the same operation. `Closed` is the only
-    /// answer that means the worker (and its capture) is gone.
+    /// Deliver the newest pending live bitrate change to the engine of this
+    /// attempt.
     fn flush_screen_bitrate(&mut self) -> Vec<PublisherOutcome> {
-        if self.publisher.phase() != crate::publisher::Phase::Live {
-            self.bitrate.clear();
-            return Vec::new();
-        }
-        let attempt = self.publisher.sharing().attempt;
-        let op = self.bitrate.pending_op();
-        let delivery =
-            self.bitrate
-                .flush(attempt, |attempt, op, quality| match self.screen.as_ref() {
-                    Some(screen) => screen.set_bitrate(attempt, op, quality),
-                    None => BitrateSend::Closed,
-                });
-        match delivery {
-            // The engine answers with a `Bitrate` event once the senders and
-            // the peer confirmed the new limits.
-            BitrateDelivery::Sent => Vec::new(),
-            BitrateDelivery::Full => op
-                .map(|op| self.publisher.bitrate_queued(op))
-                .unwrap_or_default(),
-            BitrateDelivery::Closed => self.publisher.on_engine(
-                crate::publisher::EngineEvent::Error("Медиадвижок трансляции уже закрыт.".into()),
-                Instant::now(),
-            ),
-            BitrateDelivery::Idle => Vec::new(),
-        }
+        let screen = self.screen.as_ref();
+        deliver_bitrate(
+            &mut self.bitrate,
+            &mut self.publisher,
+            |attempt, op, quality| match screen {
+                Some(screen) => screen.set_bitrate(attempt, op, quality),
+                None => BitrateSend::Closed,
+            },
+        )
     }
 
     /// Drain the engine of the current attempt, one bounded batch per tick.

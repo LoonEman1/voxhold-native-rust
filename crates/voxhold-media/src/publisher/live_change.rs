@@ -84,6 +84,21 @@ impl Publisher {
         ]
     }
 
+    /// Whether `op` is the live bitrate change this attempt still waits for.
+    ///
+    /// A deferred command may only reach the engine while its operation is
+    /// pending. After the confirmation deadline, a cancel or a newer request,
+    /// the worker queue can free up late; applying the value then would change
+    /// the limit that `request`/`confirmed` already report as refused. The
+    /// runtime therefore drops such a deferred value instead of retrying it.
+    pub fn awaits_bitrate(&self, op: QualityOp) -> bool {
+        self.phase == Phase::Live
+            && self
+                .pending_bitrate
+                .as_ref()
+                .is_some_and(|pending| pending.op == op && pending.attempt == self.attempt)
+    }
+
     /// The bounded command queue of the live worker was full, so the newest
     /// quality is still pending. This is not a failure: no `stream.stop`, no
     /// `Phase::Failed`, and the previous limit keeps applying until the retry.

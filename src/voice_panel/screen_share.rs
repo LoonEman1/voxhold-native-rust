@@ -35,10 +35,6 @@ pub(crate) const SOURCE_GONE_REASON: &str =
 /// changed: the numeric id still exists but no longer proves the same screen.
 pub(crate) const SOURCE_CHANGED_REASON: &str =
     "Выбранный экран изменился. Обновите список и выберите экран снова.";
-/// A session rotation restarts the call lease, so the old publication cannot
-/// survive it. Say that plainly instead of letting the card disappear.
-pub(crate) const SCREEN_ROTATION_NOTICE: &str = "Трансляция остановлена после обновления сессии.";
-
 /// The account socket always authenticates with `multi_streams: true`
 /// (`crates/voxhold-api/src/lib.rs:638`), so the client capability is known.
 /// It still does not allow publishing more than one stream in this stage.
@@ -428,12 +424,6 @@ impl VoicePanel {
 
     pub fn screen_share_open(&self) -> bool {
         self.screen.open
-    }
-
-    /// The room-level screen-share message, if any. Today it is the explicit
-    /// notice that a session rotation stopped the broadcast.
-    pub fn screen_share_notice(&self) -> Option<&str> {
-        (!self.screen_notice.is_empty()).then_some(self.screen_notice.as_str())
     }
 
     /// Whether a Start was pressed and the worker has not answered yet.
@@ -945,9 +935,6 @@ impl VoicePanel {
         // `Sharing` snapshot must not turn this Start into an instant failure.
         self.screen.sharing.error = None;
         self.screen.error.clear();
-        // A new publication replaces the old state, so the notice about the
-        // broadcast a rotation stopped no longer describes this room.
-        self.screen_notice.clear();
         cx.notify();
     }
 

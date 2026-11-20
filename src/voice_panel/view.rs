@@ -675,12 +675,8 @@ impl VoicePanel {
             // The disabled button carries its reason in the room, not in a
             // hover-only tooltip: there is no dead element without an
             // explanation. An active share shows its card status instead of
-            // the permanent "already running" text. A rotation that stopped
-            // the broadcast takes this line, so the loss is never silent.
-            let line = self
-                .screen_share_notice()
-                .map(str::to_owned)
-                .or_else(|| self.screen_reason().map(str::to_owned));
+            // the permanent "already running" text.
+            let line = self.screen_reason().map(str::to_owned);
             if let Some(line) = line {
                 body = body.child(
                     div()

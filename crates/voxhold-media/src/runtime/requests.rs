@@ -1,5 +1,6 @@
 //! Bounded last-value request slots shared by `VoiceHandle` and the worker.
 
+use super::recovery::{PublishRecovery, Rotation};
 use super::*;
 use crate::publisher::PublishRequest;
 use crate::screen_capture::SourceKind;
@@ -197,6 +198,15 @@ pub(super) struct Requests {
     pub(super) viewport: Mutex<Option<(u32, u32)>>,
     /// System resume/suspend. Last-value: only the newest transition matters.
     pub(super) power: Mutex<Option<bool>>,
+    /// The confirmed broadcast captured before transport loss.
+    pub(super) publish_recovery: Arc<PublishRecovery>,
+    /// Cancellation epoch of that intent. Stop/Leave/a newer publish bumps it
+    /// so a late store or a late join confirmation cannot resurrect the old
+    /// broadcast.
+    pub(super) publish_cancel_epoch: Arc<AtomicU64>,
+    /// Token rotation currently owns the reconnect. Shared with the handle so
+    /// the UI can announce it before the refresh answer arrives.
+    pub(super) rotation: Arc<Mutex<Rotation>>,
     pub(super) leave: AtomicBool,
     pub(super) notify: Notify,
 }
@@ -282,5 +292,58 @@ impl Requests {
             .and_then(|viewport| *viewport)
             .filter(|(width, height)| *width > 0 && *height > 0)
             .unwrap_or(DEFAULT_VIEWPORT)
+    }
+
+    pub(super) fn rotation_started(&self, now: Instant) -> u64 {
+        self.rotation
+            .lock()
+            .map(|mut rotation| rotation.start(now))
+            .unwrap_or_default()
+    }
+
+    pub(super) fn rotation_finished(&self) -> bool {
+        self.rotation
+            .lock()
+            .map(|mut rotation| rotation.finish())
+            .unwrap_or(false)
+    }
+
+    /// The first authorization of a handle must wait for a refresh that is in
+    /// flight (or its bounded deadline). A rotation that already finished or
+    /// never started authorizes immediately.
+    pub(super) fn rotation_authorizes(&self, now: Instant) -> bool {
+        self.rotation
+            .lock()
+            .map(|rotation| rotation.authorization_allowed(now))
+            .unwrap_or(true)
+    }
+
+    pub(super) fn rotation_socket_closed(&self) {
+        if let Ok(mut rotation) = self.rotation.lock() {
+            rotation.socket_closed();
+        }
+    }
+
+    pub(super) fn rotation_should_reconnect(&self, now: Instant, ordinary: Instant) -> bool {
+        self.rotation
+            .lock()
+            .map(|rotation| rotation.should_reconnect(now, ordinary))
+            .unwrap_or(true)
+    }
+
+    pub(super) fn rotation_reconnected(&self) {
+        if let Ok(mut rotation) = self.rotation.lock() {
+            rotation.reconnected();
+        }
+    }
+
+    /// Stop, Leave or a newer publish supersedes the captured broadcast.
+    pub(super) fn cancel_publish_recovery(&self) {
+        self.publish_cancel_epoch.fetch_add(1, Ordering::SeqCst);
+        self.publish_recovery.clear();
+    }
+
+    pub(super) fn cancellation_epoch(&self) -> u64 {
+        self.publish_cancel_epoch.load(Ordering::SeqCst)
     }
 }

@@ -545,6 +545,13 @@ impl Voxhold {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // The backend revokes the old token and closes the voice socket while
+        // the refresh is in flight. Tell the existing handle now, so its close
+        // waits for the answer instead of re-authorizing with the old token.
+        #[cfg(feature = "voxhold-media")]
+        if let Some(panel) = self.voice.clone() {
+            panel.update(cx, |panel, _| panel.begin_token_rotation());
+        }
         let epoch = self.session_epoch;
         let runtime = self.runtime.clone();
         let task = cx.background_spawn(async move {
@@ -682,16 +689,17 @@ impl Voxhold {
         }
         #[cfg(feature = "voxhold-media")]
         if let Some(panel) = self.voice.clone() {
-            let channel = panel.read(cx).call_channel();
-            if channel != 0 {
-                if let Some(client) = self.client.clone() {
-                    panel.update(cx, |panel, cx| {
-                        panel.set_client(client);
-                        panel.rejoin_call(channel, cx);
-                    });
+            let client = self.client.clone();
+            // Keep the one live `VoiceHandle`. Its worker shares this client,
+            // so it reads the new token on its own next authorization and
+            // recovers the call/publication without a second join from the UI.
+            panel.update(cx, |panel, _| {
+                if let Some(client) = client {
+                    panel.set_client(client);
                 }
-                self.refresh_voice_call(window, cx);
-            }
+                panel.token_rotated();
+            });
+            self.refresh_voice_call(window, cx);
         }
         cx.notify();
     }

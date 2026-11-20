@@ -616,6 +616,17 @@ pub struct VoiceSocket {
 }
 impl Client {
     pub async fn open_voice_socket(&self) -> Result<VoiceSocket> {
+        Ok(self.open_voice_socket_with_token().await?.0)
+    }
+
+    /// Open the voice socket and return the exact token the `auth` event sent.
+    ///
+    /// A rotation may replace the shared token between the connect and the
+    /// read of `Client::token()`. The caller must compare a later refused
+    /// close with the credential this socket really authorized with, not with
+    /// whatever the client holds now. The returned token is a credential: it
+    /// is never logged.
+    pub async fn open_voice_socket_with_token(&self) -> Result<(VoiceSocket, String)> {
         let mut u = self.url("/api/v1/ws")?;
         u.set_scheme(if u.scheme() == "https" { "wss" } else { "ws" })
             .map_err(|_| Error::InvalidOrigin)?;
@@ -636,7 +647,7 @@ impl Client {
             None,
         )
         .await?;
-        Ok(s)
+        Ok((s, token.to_string()))
     }
     pub async fn subscribe<F: FnMut(RealtimeEvent)>(
         &self,

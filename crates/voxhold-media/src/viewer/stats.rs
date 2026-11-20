@@ -225,7 +225,7 @@ impl Viewer {
                 connected: false,
             },
         ];
-        out.extend(self.close_active(now));
+        out.extend(self.restart(now));
         out
     }
 }

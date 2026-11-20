@@ -236,7 +236,7 @@ fn stats_of_another_attempt_are_ignored() {
 
 #[test]
 fn keyframe_attempts_are_bounded_and_then_the_same_publication_is_rewatched() {
-    let (mut viewer, attempt, start) = watching("server");
+    let (mut viewer, mut attempt, start) = watching("server");
     viewer.on_frame();
     let mut bytes = 1_000_u64;
     report(&mut viewer, attempt, bytes, 10, start);
@@ -273,6 +273,16 @@ fn keyframe_attempts_are_bounded_and_then_the_same_publication_is_rewatched() {
                                 Outcome::Start { selection: 1, .. }
                             )),
                             "the same publication starts again: {ack:?}"
+                        );
+                        // The replacement engine is a new viewing attempt:
+                        // reports stamped with the closed engine are ignored.
+                        let next = viewer.watching().expect("the re-watch is active").attempt;
+                        assert_ne!(next, attempt, "a reconnect gets a fresh attempt id");
+                        attempt = next;
+                        assert!(
+                            viewer
+                                .on_video_stats(attempt.wrapping_add(1), bytes, 10, at)
+                                .is_empty()
                         );
                         // The new engine confirms its first picture; this must
                         // not reset the reconnect budget by itself.

@@ -227,7 +227,11 @@ impl Viewer {
             self.retire(&active, now);
             out.push(Outcome::Close);
         }
-        if let Some(intent) = &self.intent {
+        if let Some(intent) = &mut self.intent {
+            // The rejoin is a new viewing attempt: its engine must not inherit
+            // statistics reports of the peer that was just closed.
+            self.attempt = self.attempt.wrapping_add(1);
+            intent.attempt = self.attempt;
             out.push(Outcome::Status {
                 selection: intent.selection,
                 text: "Восстанавливаем трансляцию…".into(),
@@ -667,7 +671,7 @@ impl Viewer {
                 connected: false,
             },
         ];
-        out.extend(self.close_active(now));
+        out.extend(self.restart(now));
         out
     }
 
@@ -823,7 +827,7 @@ impl Viewer {
                     out.extend(self.fail("Не удалось восстановить трансляцию", now));
                 } else {
                     self.retries += 1;
-                    out.extend(self.close_active(now));
+                    out.extend(self.restart(now));
                     if let Some(selection) = self.selection() {
                         out.push(Outcome::Status {
                             selection,
@@ -922,6 +926,18 @@ impl Viewer {
                 request,
             },
         ]
+    }
+
+    /// Close the active attempt for an automatic recovery and give the next
+    /// watch a fresh attempt id. Statistics of the engine that is being closed
+    /// must not be credited to its replacement, especially when a re-watch
+    /// keeps the same publication and selection.
+    fn restart(&mut self, now: Instant) -> Vec<Outcome> {
+        if let Some(intent) = &mut self.intent {
+            self.attempt = self.attempt.wrapping_add(1);
+            intent.attempt = self.attempt;
+        }
+        self.close_active(now)
     }
 
     fn close_active(&mut self, now: Instant) -> Vec<Outcome> {

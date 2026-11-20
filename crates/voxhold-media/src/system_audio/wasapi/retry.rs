@@ -123,6 +123,10 @@ fn run_with<D, O, C, P>(
 {
     let mut first = true;
     let mut reopens = 0_u8;
+    // The endpoint whose PCM queue is still valid. A transient failure on the
+    // same device must not insert a silent gap; only a real device change
+    // discards audio that belongs to the old endpoint.
+    let mut last_device: Option<String> = None;
     loop {
         if shared.stopping() {
             return;
@@ -145,12 +149,13 @@ fn run_with<D, O, C, P>(
             }
         };
         let info = device.info().clone();
-        if !first {
+        if !first && last_device.as_deref() != Some(info.id.as_str()) {
             // A reopen creates a fresh converter; audio queued by the previous
-            // client is stale and, on a device change, belongs to the old
-            // endpoint.
+            // client belongs to the old endpoint and must not leak into the
+            // new one. A same-device retry keeps its queue to avoid a gap.
             shared.clear_audio();
         }
+        last_device = Some(info.id.clone());
         shared.set_device(info.clone());
         if first {
             first = false;
@@ -425,6 +430,44 @@ mod tests {
             next_block(&shared).is_none(),
             "the queue of the old endpoint must be cleared"
         );
+    }
+
+    #[test]
+    fn a_same_device_reopen_keeps_the_queued_audio() {
+        let shared = Arc::new(Shared::default());
+        let (ready_tx, _ready_rx) = ready();
+        let sessions = Arc::new(AtomicUsize::new(0));
+        let sessions_in = sessions.clone();
+        run_with(
+            &shared,
+            &ready_tx,
+            CaptureScope::Device,
+            3,
+            Duration::ZERO,
+            |_scope| Ok(FakeDevice(info("endpoint-a"))),
+            move |shared, _device| {
+                if sessions_in.fetch_add(1, Ordering::SeqCst) == 0 {
+                    push_block(shared, vec![7_i16; BLOCK_SAMPLES]);
+                    SessionEnd::Reopen {
+                        stable: false,
+                        message: "Устройство вывода изменилось.".into(),
+                    }
+                } else {
+                    // A transient failure on the same endpoint must continue
+                    // from the queued audio instead of inserting a silence.
+                    assert!(
+                        next_block(shared).is_some(),
+                        "a same-device retry keeps the PCM queue"
+                    );
+                    shared.stop.store(true, Ordering::SeqCst);
+                    SessionEnd::Stopped
+                }
+            },
+            |_| {},
+        );
+
+        assert!(shared.failure().is_none());
+        assert_eq!(sessions.load(Ordering::SeqCst), 2);
     }
 
     #[test]

@@ -74,6 +74,7 @@ async fn forward_posts_the_source_message_id_for_channel_and_conversation(cx: &m
                 loading: false,
                 sending: false,
                 error: String::new(),
+                keys: Default::default(),
             });
             v.forward_to(0, window, cx);
         });
@@ -102,6 +103,7 @@ async fn forward_posts_the_source_message_id_for_channel_and_conversation(cx: &m
                 loading: false,
                 sending: false,
                 error: String::new(),
+                keys: Default::default(),
             });
             v.forward_to(0, window, cx);
         });

@@ -1,18 +1,20 @@
-//! Bounded replay set for rows that arrive while "К последним" loads.
+//! Bounded replay set for rows that arrive while a page replaces a gapped
+//! window.
 //!
 //! A loaded window that ends before the live tail has an unloaded range after
 //! its right edge. Message ids are not contiguous, so one fresh row cannot
 //! prove that the range is closed: it is kept out of the visible window. When a
-//! reset request owns the next window, the row is held here and replayed into
-//! the confirmed latest page instead of into the old fragment. The set is bound
-//! to one request id and one chat, so a late answer or an event of another chat
-//! can never import it. On overflow the rows are dropped and the normal
-//! refresh repeat re-reads the latest page.
+//! refresh owns the next window — "К последним" (reset) or the ordinary
+//! reconnect/resync refresh started while `history_has_newer` is set — the row
+//! is held here and replayed into the confirmed page instead of into the old
+//! fragment. The set is bound to one request id and one chat, so a late answer
+//! or an event of another chat can never import it. On overflow the rows are
+//! dropped and the normal refresh repeat re-reads the latest page.
 
 use super::*;
 use crate::history::merge_revision;
 
-/// Rows received after "К последним" took its request slot, before its answer.
+/// Rows received after a refresh took its request slot, before its answer.
 #[derive(Debug)]
 pub(super) struct LatestBuffer {
     request: u64,
@@ -30,11 +32,14 @@ impl LatestBuffer {
 }
 
 impl Voxhold {
-    /// Open the bounded replay set for a reset request that will replace the
-    /// window. Only rows of this exact request and chat are replayed, so a late
-    /// answer of another scope cannot import them.
+    /// Open the bounded replay set for a refresh that will replace the window.
+    /// Any refresh started while the window is separated from the tail binds
+    /// one, not only "К последним": an ordinary resync also replaces the
+    /// fragment with the latest page and must replay the rows it raced. Only
+    /// rows of this exact request and chat are replayed, so a late answer of
+    /// another scope cannot import them.
     pub(super) fn bind_latest_buffer(&mut self, request: u64) {
-        if !self.history_reset_pending {
+        if !self.history_reset_pending && !self.history_has_newer {
             return;
         }
         let chat = self.chat_key();
@@ -50,16 +55,14 @@ impl Voxhold {
         });
     }
 
-    /// Take the replay set that belongs to this answer. A buffer of another
-    /// request or chat is left untouched and never merged.
+    /// Take the replay set that belongs to this answer. A set of another
+    /// request or chat can no longer reach its own answer, so it is dropped
+    /// instead of keeping up to `MAX_ROWS` rows alive until the next cleanup.
     pub(super) fn take_latest_buffer(&mut self, request: u64) -> Vec<Message> {
         let chat = self.chat_key();
         match self.latest_buffer.take() {
             Some(buffer) if buffer.request == request && buffer.chat == chat => buffer.rows,
-            other => {
-                self.latest_buffer = other;
-                Vec::new()
-            }
+            _ => Vec::new(),
         }
     }
 
@@ -68,9 +71,9 @@ impl Voxhold {
     }
 
     /// Hold one created row that arrived behind the known gap of the window an
-    /// in-flight "К последним" request is about to replace. Any other request or
-    /// chat drops the row. A full buffer is cleared and the normal refresh
-    /// repeat re-reads the latest page.
+    /// in-flight refresh is about to replace. Any other request or chat drops
+    /// the row. A full buffer is cleared and the normal refresh repeat re-reads
+    /// the latest page.
     pub(super) fn buffer_behind_gap(&mut self, message: Message) {
         let chat = self.chat_key();
         let Some(request) = self.refresh_request else {
@@ -121,5 +124,40 @@ impl Voxhold {
             .into_values()
             .filter(|row| !self.deleted_ids.contains(&row.id))
             .collect()
+    }
+
+    /// Does the loaded conversation page end before the tail that the index
+    /// records in `last_message_id`? A page that already reaches it, an empty
+    /// page or a missing index row is not a gap: numeric id differences alone
+    /// prove nothing.
+    pub(super) fn conversation_has_newer_tail(&self, conversation: i64) -> bool {
+        let tail = self
+            .conversations
+            .iter()
+            .find(|row| row.id == conversation)
+            .or_else(|| {
+                self.conversation
+                    .as_ref()
+                    .filter(|row| row.id == conversation)
+            })
+            .map(|row| row.last_message_id)
+            .unwrap_or(0);
+        let last_loaded = self.messages.last().map(|row| row.id).unwrap_or(0);
+        last_loaded > 0 && tail > last_loaded
+    }
+
+    /// Repeat a "К последним" click that arrived while a conversation jump held
+    /// the request slot. The jump owns that answer, so the deferred reset can
+    /// only start after it; a dialogue closed by a 403/404 stays closed.
+    pub(super) fn retry_refresh_after_jump(
+        &mut self,
+        chat: draft::ChatKey,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let refresh_again = std::mem::take(&mut self.refresh_again);
+        if refresh_again && self.conversation.is_some() && self.chat_key() == chat {
+            self.refresh_history(window, cx);
+        }
     }
 }

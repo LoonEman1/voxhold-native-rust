@@ -2,7 +2,7 @@
 //! the gap with one fresh realtime row. `history_has_newer` means "there is an
 //! unloaded range between this window and the tail"; numeric id differences
 //! cannot prove continuity, so a created row behind the right edge is not
-//! inserted and the accumulated read receipt stays unsent. "К последним"
+//! inserted and the accumulated read receipt stays unsent. "Рљ РїРѕСЃР»РµРґРЅРёРј"
 //! replaces the window only after a successful latest page and replays the rows
 //! that arrived while that page loaded, without resurrecting tombstones.
 
@@ -17,6 +17,7 @@ use std::time::Duration;
 
 const SERVER: i64 = 1;
 const CHANNEL: i64 = 7;
+const DM: i64 = 7;
 
 fn dto(id: i64, revision: i64, content: &str) -> voxhold_api::Message {
     let mut value = message_json(id, revision, content);
@@ -26,6 +27,54 @@ fn dto(id: i64, revision: i64, content: &str) -> voxhold_api::Message {
 
 fn created(id: i64, content: &str) -> serde_json::Value {
     message_json(id, 1, content)
+}
+
+fn dm_row(id: i64, content: &str) -> serde_json::Value {
+    json!({
+        "id": id,
+        "channel_id": 0,
+        "conversation_id": DM,
+        "content": content,
+        "author": {"user_id": 1, "username": "neva"},
+        "created_at": 1,
+        "revision": 1,
+        "comment_count": 0,
+        "client_message_id": "",
+        "reactions": [],
+        "reactions_revision": 0,
+        "attachments": [],
+        "poll": null
+    })
+}
+
+/// A conversation page uses the top-level `has_more`; the client derives the
+/// cursor from the first row.
+fn dm_page(ids: &[i64], has_more: bool) -> String {
+    json!({
+        "messages": ids
+            .iter()
+            .map(|id| dm_row(*id, "dm row"))
+            .collect::<Vec<_>>(),
+        "has_more": has_more,
+    })
+    .to_string()
+}
+
+fn dm_conversation(last_message_id: i64) -> voxhold_api::Conversation {
+    serde_json::from_value(json!({
+        "id": DM,
+        "name": "neva",
+        "direct": true,
+        "members": [
+            {"user_id": 1, "username": "me"},
+            {"user_id": 2, "username": "neva"}
+        ],
+        "unread_count": 0,
+        "saved": false,
+        "muted": false,
+        "last_message_id": last_message_id
+    }))
+    .expect("conversation")
 }
 
 fn event(kind: &str, data: serde_json::Value) -> voxhold_api::RealtimeEvent {
@@ -172,7 +221,7 @@ async fn a_fresh_row_behind_the_gap_stays_out_and_blocks_reads(cx: &mut TestAppC
     );
 }
 
-/// (b) "К последним" loads the latest page while a fresh row arrives. After the
+/// (b) "Рљ РїРѕСЃР»РµРґРЅРёРј" loads the latest page while a fresh row arrives. After the
 /// answer the window is the fresh page plus that row, each exactly once, and the
 /// gap is closed.
 ///
@@ -378,4 +427,295 @@ async fn an_overflowed_latest_buffer_repeats_the_refresh(cx: &mut TestAppContext
         page_requests, 2,
         "the overflow uses the normal refresh repeat"
     );
+}
+
+/// An ordinary (not reset) refresh that replaces the fragment with the latest
+/// page must replay the rows it held for that page. Otherwise the gap reappears
+/// as a hole that later rows cannot fill.
+#[gpui::test]
+async fn ordinary_refresh_closes_the_gap_without_losing_raced_rows(cx: &mut TestAppContext) {
+    cx.update(|cx| gpui_component::init(cx));
+    let server = TestServer::spawn(vec![Reply::new(200, &latest_page(&[1000, 1001]))
+        .with_path("/api/v1/servers/1/channels/7/messages")
+        .with_delay(Duration::from_millis(40))]);
+    let (window, view) = make_app(cx, direct_client(&server));
+    let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
+    setup_old_window(&mut visual, &view);
+
+    // No "Рљ РїРѕСЃР»РµРґРЅРёРј": this is the reconnect/resync path.
+    visual.update(|window, app| {
+        view.update(app, |v, cx| v.refresh_history(window, cx));
+    });
+    deliver(
+        &mut visual,
+        &view,
+        vec![event("message.created", created(1002, "raced row"))],
+    );
+    view.read_with(&*visual, |v, _| {
+        assert_eq!(
+            v.messages.last().map(|row| row.id),
+            Some(10),
+            "the old fragment must not absorb the fresh row"
+        );
+        assert!(v.history_has_newer);
+        assert!(!v.history_reset_pending, "no reset owns this refresh");
+    });
+
+    wait_for(&mut visual, &view, |v| {
+        v.refresh_request.is_none() && !v.history_has_newer
+    });
+    view.read_with(&*visual, |v, _| {
+        let ids: Vec<i64> = v.messages.iter().map(|row| row.id).collect();
+        assert_eq!(
+            ids,
+            vec![1000, 1001, 1002],
+            "the ordinary refresh replays the row it held"
+        );
+    });
+
+    deliver(
+        &mut visual,
+        &view,
+        vec![event("message.created", created(1003, "next row"))],
+    );
+    view.read_with(&*visual, |v, _| {
+        let ids: Vec<i64> = v.messages.iter().map(|row| row.id).collect();
+        assert_eq!(
+            ids,
+            vec![1000, 1001, 1002, 1003],
+            "after the confirmed page the next row is appended, not lost"
+        );
+        assert!(!v.history_has_newer);
+    });
+}
+
+/// A buffered row deleted while "Рљ РїРѕСЃР»РµРґРЅРёРј" loads is a tombstone, not a page
+/// row: neither the replay set nor the page may bring it back.
+#[gpui::test]
+async fn a_buffered_row_deleted_during_the_latest_load_stays_deleted(cx: &mut TestAppContext) {
+    cx.update(|cx| gpui_component::init(cx));
+    let server = TestServer::spawn(vec![Reply::new(200, &latest_page(&[1000, 1001]))
+        .with_path("/api/v1/servers/1/channels/7/messages")
+        .with_delay(Duration::from_millis(40))]);
+    let (window, view) = make_app(cx, direct_client(&server));
+    let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
+    setup_old_window(&mut visual, &view);
+
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            v.reset_for_latest();
+            v.refresh_history(window, cx);
+        });
+    });
+    deliver(
+        &mut visual,
+        &view,
+        vec![
+            event("message.created", created(1002, "raced row")),
+            event("message.deleted", json!({"channel_id":7,"message_id":1002})),
+        ],
+    );
+    view.read_with(&*visual, |v, _| {
+        assert!(v.deleted_ids.contains(&1002));
+        assert_eq!(v.messages.last().map(|row| row.id), Some(10));
+    });
+
+    wait_for(&mut visual, &view, |v| {
+        v.refresh_request.is_none() && !v.history_has_newer
+    });
+    view.read_with(&*visual, |v, _| {
+        let ids: Vec<i64> = v.messages.iter().map(|row| row.id).collect();
+        assert_eq!(ids, vec![1000, 1001], "the tombstone wins over the buffer");
+        assert!(v.deleted_ids.contains(&1002));
+    });
+}
+
+/// The confirmed latest page clears the gap, so the accumulated read receipt is
+/// allowed again.
+#[gpui::test]
+async fn a_confirmed_latest_page_unblocks_the_read_receipt(cx: &mut TestAppContext) {
+    cx.update(|cx| gpui_component::init(cx));
+    let server = TestServer::spawn(vec![
+        Reply::new(200, &latest_page(&[1000, 1001]))
+            .with_path("/api/v1/servers/1/channels/7/messages"),
+        Reply::new(200, "{}"),
+    ]);
+    let (window, view) = make_app(cx, direct_client(&server));
+    let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
+    setup_old_window(&mut visual, &view);
+
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            v.reset_for_latest();
+            v.refresh_history(window, cx);
+        });
+    });
+    wait_for(&mut visual, &view, |v| {
+        v.refresh_request.is_none() && !v.history_has_newer
+    });
+
+    visual.update(|window, app| {
+        view.update(app, |v, cx| v.mark_visible_read(1001, window, cx));
+    });
+    settle(&mut visual);
+    let reads = read_requests(&server);
+    assert_eq!(
+        reads.len(),
+        1,
+        "the closed gap allows one read receipt: {reads:?}"
+    );
+    assert_eq!(reads[0], "PUT /api/v1/servers/1/channels/7/read");
+}
+
+/// A conversation page that already ends at `last_message_id` reaches the live
+/// edge; a numeric id difference alone is not a gap.
+#[gpui::test]
+async fn a_conversation_jump_at_the_tail_does_not_invent_a_gap(cx: &mut TestAppContext) {
+    cx.update(|cx| gpui_component::init(cx));
+    let server = TestServer::spawn(vec![
+        Reply::new(200, &dm_page(&[10, 15, 20], false))
+            .with_path("/api/v1/conversations/7/messages?before="),
+        Reply::new(200, &dm_page(&[], false)).with_path("/api/v1/conversations/7/messages"),
+        Reply::new(200, r#"{"conversation_id":7,"muted":false}"#)
+            .with_path("/api/v1/conversations/7/notifications"),
+    ]);
+    let (window, view) = make_app(cx, direct_client(&server));
+    let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
+    let row = dm_conversation(20);
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            v.personal_mode = true;
+            v.conversations = vec![row.clone()];
+            v.open_conversation_message(DM, 15, window, cx);
+        });
+    });
+    wait_for(&mut visual, &view, |v| {
+        v.refresh_request.is_none() && v.messages.iter().any(|row| row.id == 15)
+    });
+    view.read_with(&*visual, |v, _| {
+        let ids: Vec<i64> = v.messages.iter().map(|row| row.id).collect();
+        assert_eq!(ids, vec![10, 15, 20]);
+        assert!(
+            !v.history_has_newer,
+            "the page ends at last_message_id, so no gap is open"
+        );
+        assert_eq!(
+            v.highlighted_message.map(|(id, _)| id),
+            Some(15),
+            "the target is highlighted"
+        );
+        assert!(v.error.is_empty());
+    });
+}
+
+/// The same jump with a newer tail keeps `history_has_newer` set.
+#[gpui::test]
+async fn a_conversation_jump_before_the_tail_keeps_the_gap(cx: &mut TestAppContext) {
+    cx.update(|cx| gpui_component::init(cx));
+    let server = TestServer::spawn(vec![
+        Reply::new(200, &dm_page(&[10, 15, 20], false))
+            .with_path("/api/v1/conversations/7/messages?before="),
+        Reply::new(200, &dm_page(&[], false)).with_path("/api/v1/conversations/7/messages"),
+        Reply::new(200, r#"{"conversation_id":7,"muted":false}"#)
+            .with_path("/api/v1/conversations/7/notifications"),
+    ]);
+    let (window, view) = make_app(cx, direct_client(&server));
+    let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
+    let row = dm_conversation(99);
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            v.personal_mode = true;
+            v.conversations = vec![row.clone()];
+            v.open_conversation_message(DM, 15, window, cx);
+        });
+    });
+    wait_for(&mut visual, &view, |v| {
+        v.refresh_request.is_none() && v.messages.iter().any(|row| row.id == 15)
+    });
+    view.read_with(&*visual, |v, _| {
+        let ids: Vec<i64> = v.messages.iter().map(|row| row.id).collect();
+        assert_eq!(ids, vec![10, 15, 20]);
+        assert!(
+            v.history_has_newer,
+            "last_message_id is newer than the loaded tail"
+        );
+        assert_eq!(v.highlighted_message.map(|(id, _)| id), Some(15));
+    });
+}
+
+/// "Рљ РїРѕСЃР»РµРґРЅРёРј" clicked while a conversation jump holds the request slot is
+/// repeated after the jump, so the click is not lost.
+#[gpui::test]
+async fn latest_clicked_during_a_conversation_jump_is_not_lost(cx: &mut TestAppContext) {
+    cx.update(|cx| gpui_component::init(cx));
+    let server = TestServer::spawn(vec![
+        Reply::new(200, &dm_page(&[10, 15, 20], false))
+            .with_path("/api/v1/conversations/7/messages?before=")
+            .with_delay(Duration::from_millis(40)),
+        Reply::new(200, &dm_page(&[], false)).with_path("/api/v1/conversations/7/messages"),
+        Reply::new(200, &dm_page(&[90, 91], false)).with_path("/api/v1/conversations/7/messages"),
+        Reply::new(200, r#"{"conversation_id":7,"muted":false}"#)
+            .with_path("/api/v1/conversations/7/notifications"),
+    ]);
+    let (window, view) = make_app(cx, direct_client(&server));
+    let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
+    let row = dm_conversation(99);
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            v.personal_mode = true;
+            v.conversations = vec![row.clone()];
+            v.open_conversation_message(DM, 15, window, cx);
+            v.reset_for_latest();
+            v.refresh_history(window, cx);
+            assert!(
+                v.refresh_again,
+                "the running jump owns the slot and defers the reset"
+            );
+        });
+    });
+    wait_for(&mut visual, &view, |v| {
+        v.refresh_request.is_none()
+            && v.messages.first().map(|row| row.id) == Some(90)
+            && !v.history_has_newer
+    });
+    view.read_with(&*visual, |v, _| {
+        let ids: Vec<i64> = v.messages.iter().map(|row| row.id).collect();
+        assert_eq!(
+            ids,
+            vec![90, 91],
+            "the deferred reset replaced the jump window"
+        );
+    });
+}
+
+/// An ordinary refresh without a gap keeps the `refresh_new_ids` contract: rows
+/// inserted while the page was in flight survive when they are newer than it.
+#[gpui::test]
+async fn an_ordinary_refresh_without_a_gap_keeps_new_ids(cx: &mut TestAppContext) {
+    cx.update(|cx| gpui_component::init(cx));
+    let server = TestServer::spawn(Vec::new());
+    let (window, view) = make_app(cx, direct_client(&server));
+    let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
+    setup_old_window(&mut visual, &view);
+
+    visual.update(|_, app| {
+        view.update(app, |v, _| {
+            v.history_has_newer = false;
+            v.refresh_request = Some(1);
+            v.merge_message(true, dto(20, 1, "during the page"));
+            assert!(v.refresh_new_ids.contains(&20));
+            let new_ids = std::mem::take(&mut v.refresh_new_ids);
+            let page = voxhold_api::MessagePage {
+                messages: vec![dto(5, 1, "page"), dto(10, 1, "page")],
+                pagination: voxhold_api::Pagination {
+                    next_before_id: Some(5),
+                    has_more: true,
+                },
+            };
+            v.refresh_request = None;
+            v.apply_history_snapshot(page, new_ids);
+            let ids: Vec<i64> = v.messages.iter().map(|row| row.id).collect();
+            assert_eq!(ids, vec![5, 10, 20], "a newer in-flight row survives");
+        });
+    });
 }

@@ -216,12 +216,25 @@ impl Voxhold {
                         || self.message_menu.as_ref().is_some_and(|menu| {
                             menu.message_id == message.id && menu.confirm_delete
                         });
-                    let error = self
-                        .action_error
-                        .as_ref()
-                        .filter(|(id, _)| *id == message.id)
-                        .map(|(_, error)| error.clone())
-                        .unwrap_or_default();
+                    let error = {
+                        let edit_error = self
+                            .edit_error
+                            .as_ref()
+                            .filter(|(row, open, _)| {
+                                *row == message.id && *open == self.edit_open_seq && editing
+                            })
+                            .map(|(_, _, error)| error.clone())
+                            .unwrap_or_default();
+                        if edit_error.is_empty() {
+                            self.action_error
+                                .as_ref()
+                                .filter(|(id, _)| *id == message.id)
+                                .map(|(_, error)| error.clone())
+                                .unwrap_or_default()
+                        } else {
+                            edit_error
+                        }
+                    };
                     (
                         message.clone(),
                         permissions,

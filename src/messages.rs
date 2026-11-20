@@ -45,6 +45,20 @@ impl SearchState {
         self.truncated = false;
     }
 
+    /// A submitted query owns the next answer: drop the previous rows, the
+    /// cursor and the cap note before the request leaves.
+    pub fn begin(&mut self, request: u64, query: &str) {
+        self.request = request;
+        self.submitted = query.to_string();
+        self.results.clear();
+        self.has_more = false;
+        self.next_before = None;
+        self.loading = true;
+        self.loading_more = false;
+        self.error.clear();
+        self.truncated = false;
+    }
+
     pub fn apply_page(&mut self, page: ConversationSearchPage, append: bool) {
         let base = if append {
             std::mem::take(&mut self.results)
@@ -520,7 +534,13 @@ mod tests {
         assert!(state.truncated, "the cap is reported");
         assert!(!state.has_more, "no next page can add paintable rows");
         assert!(state.next_before.is_none());
+        state.begin(7, "fresh");
+        assert!(!state.truncated, "a new query resets the cap note");
+        assert!(state.loading);
+        assert!(state.results.is_empty());
+        assert_eq!(state.request, 7);
+        assert_eq!(state.submitted, "fresh");
         state.invalidate();
-        assert!(!state.truncated, "a new query resets the note");
+        assert!(!state.truncated, "a closed surface resets the note");
     }
 }

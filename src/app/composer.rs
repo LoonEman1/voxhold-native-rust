@@ -329,14 +329,17 @@ impl Voxhold {
                                 Some(404) => {
                                     // A missing conversation is authoritative for
                                     // its row even after a switch; only the live
-                                    // surface is cleared.
-                                    s.conversations.retain(|row| row.id != plan_key.channel);
+                                    // surface is cleared with a window, while a
+                                    // background row's draft scope goes too.
                                     if active {
+                                        s.conversations.retain(|row| row.id != plan_key.channel);
                                         s.clear_active_conversation(
                                             Some("Диалог недоступен."),
                                             window,
                                             cx,
                                         );
+                                    } else {
+                                        s.forget_conversation(plan_key.channel, None, cx);
                                     }
                                     s.refresh_recents(cx);
                                 }

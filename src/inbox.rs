@@ -65,7 +65,7 @@ mod tests {
 
         let group = conversation("", false, vec![(1, "me"), (2, "neva"), (3, "alex")]);
         assert_eq!(conversation_title(&group, 1), "neva, alex");
-        assert_eq!(conversation_peer(&group, 0), 0);
+        assert_eq!(conversation_peer(&group, 1), 0);
 
         let named = conversation("Проект", true, vec![(1, "me"), (2, "neva")]);
         assert_eq!(conversation_title(&named, 1), "Проект");

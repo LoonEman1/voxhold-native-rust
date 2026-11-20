@@ -97,8 +97,13 @@ impl Voxhold {
         if self.access_pending && self.access_reload_in_flight {
             // The ACL answer owns the fresh channel list. Remember which
             // channel to reopen; its callback selects it once access is
-            // confirmed, without cancelling the reload here. The callback also
-            // picks the first readable channel if this one was revoked.
+            // confirmed. `select_channel` is blocked while access is pending,
+            // so restore the saved draft here; otherwise the empty composer
+            // would overwrite it when the callback selects the channel.
+            let key = draft::ChatKey::channel(self.server, saved_channel);
+            let draft = self.drafts.borrow().text(key);
+            self.composer
+                .update(cx, |input, cx| input.set_value(draft, window, cx));
             self.channel = saved_channel;
             self.pending_return_channel = Some(saved_channel);
             cx.notify();
@@ -226,16 +231,33 @@ impl Voxhold {
         self.update_channel_subscription(false);
     }
 
-    /// A confirmed 403/404 for a conversation row that is not the current chat
-    /// still removes that row from the index. The open chat is only cleared
-    /// when it is the same conversation.
-    pub(super) fn note_conversation_unavailable(&mut self, id: i64, cx: &mut Context<Self>) {
+    /// A confirmed removal drops the index row together with the draft scope
+    /// and pending send of that conversation. The open chat is only cleared
+    /// when it is the removed row; another chat keeps its draft and composer.
+    pub(super) fn forget_conversation(
+        &mut self,
+        id: i64,
+        reason: Option<&str>,
+        cx: &mut Context<Self>,
+    ) {
         self.conversations.retain(|row| row.id != id);
         if self.conversation.as_ref().map(|row| row.id) == Some(id) {
             // No `Window` here; the next render finishes the window-owned
             // cleanup.
-            self.clear_active_conversation_state(Some("Диалог недоступен."), cx);
+            self.clear_active_conversation_state(reason, cx);
+            return;
         }
+        let key = draft::ChatKey::conversation(id);
+        if let Some(pending) = self.pending_sends.remove(&key) {
+            pending.abort.abort();
+        }
+        self.drafts.borrow_mut().clear(key);
+    }
+
+    /// A confirmed 403/404 for a conversation row that is not the current chat
+    /// still removes that row from the index.
+    pub(super) fn note_conversation_unavailable(&mut self, id: i64, cx: &mut Context<Self>) {
+        self.forget_conversation(id, Some("Диалог недоступен."), cx);
     }
 
     /// A leave, 403 or missing index row owns the next frame. Pending sends for
@@ -460,10 +482,11 @@ impl Voxhold {
                             s.conversation = Some(row);
                         }
                         Err(voxhold_api::Error::Http(403 | 404)) => {
-                            s.conversations.retain(|row| row.id != marker.conversation);
-                            // No `Window` in this answer; the next render
-                            // finishes the window-owned cleanup.
-                            s.clear_active_conversation_state(Some("Диалог недоступен."), cx);
+                            s.forget_conversation(
+                                marker.conversation,
+                                Some("Диалог недоступен."),
+                                cx,
+                            );
                         }
                         // A transient failure is not proof of deletion.
                         Err(_) => {}
@@ -526,10 +549,7 @@ impl Voxhold {
                             }
                         }
                         Err(voxhold_api::Error::Http(403 | 404)) => {
-                            s.conversations.retain(|row| row.id != id);
-                            if active {
-                                s.clear_active_conversation_state(Some("Диалог недоступен."), cx);
-                            }
+                            s.forget_conversation(id, Some("Диалог недоступен."), cx);
                         }
                         // A transient failure is not proof of revocation. The
                         // send error stays visible and the draft can be retried.
@@ -655,6 +675,7 @@ impl Voxhold {
         if query.is_empty() || query.chars().count() > 200 {
             self.messaging.search.request = self.messaging.search.request.wrapping_add(1);
             self.messaging.search.results.clear();
+            self.messaging.search.truncated = false;
             self.messaging.search.has_more = false;
             self.messaging.search.next_before = None;
             self.messaging.search.loading = false;
@@ -674,17 +695,7 @@ impl Voxhold {
         self.action_seq = self.action_seq.wrapping_add(1);
         let request = self.action_seq;
         let session = self.session_generation;
-        {
-            let search = &mut self.messaging.search;
-            search.request = request;
-            search.submitted = query.clone();
-            search.results.clear();
-            search.has_more = false;
-            search.next_before = None;
-            search.loading = true;
-            search.loading_more = false;
-            search.error.clear();
-        }
+        self.messaging.search.begin(request, &query);
         let runtime = self.runtime.clone();
         let task =
             cx.background_spawn(

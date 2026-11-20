@@ -1,6 +1,7 @@
-//! W08a P2 follow-up regressions: return fallback during a gated ACL reload,
-//! a replacement reload for a second `channels.changed`, the mobile personal
-//! entry, banner/F5 DM behaviour, stale older pages, post-switch 403 cleanup,
+//! W08a P2 follow-up regressions: return fallback during a gated ACL reload
+//! (including the preserved channel draft and a failed reload), a replacement
+//! reload for a second `channels.changed`, the mobile personal entry,
+//! banner/F5 DM behaviour, stale older pages, post-switch 403/404 cleanup,
 //! DM reaction verification, leave after a switch and members restore.
 
 use super::super::*;
@@ -109,6 +110,108 @@ async fn return_during_pending_acl_reload_uses_the_first_readable_channel(cx: &m
     );
 }
 
+/// "К каналам" during a gated ACL reload must not overwrite the saved channel
+/// draft: the pending branch restores the text before the callback selects the
+/// channel, so the empty composer from the personal surface never clobbers it.
+#[gpui::test]
+async fn return_during_pending_acl_reload_keeps_the_channel_draft(cx: &mut TestAppContext) {
+    cx.update(|cx| gpui_component::init(cx));
+    let gate = Gate::new();
+    let channels = serde_json::to_string(&vec![channel_row(9, "kept")]).unwrap();
+    let server = TestServer::spawn_concurrent(vec![
+        Reply::new(200, &channels)
+            .with_path("/api/v1/servers/1/channels")
+            .with_gate(gate.clone()),
+        Reply::new(200, "[]").with_path("/api/v1/servers/1/members"),
+        Reply::new(200, &empty_page()).with_path("/api/v1/me/conversations"),
+        Reply::new(200, &messages_page()).with_path("/api/v1/servers/1/channels/9/messages"),
+    ]);
+    let (window, view) = make_app(cx, direct_client(&server));
+    let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
+    visual.run_until_parked();
+    let key = draft::ChatKey::channel(1, 9);
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            v.channels = vec![channel_row(9, "kept")];
+            v.channel = 9;
+            v.composer
+                .update(cx, |input, cx| input.set_value("hello", window, cx));
+            v.drafts.borrow_mut().set_text(key, "hello");
+            gate.arm();
+            v.invalidate_access(window, cx);
+            assert!(v.access_pending && v.access_reload_in_flight);
+            v.enter_personal_mode(window, cx);
+            assert_eq!(v.drafts.borrow().text(key), "hello");
+            v.return_to_channels(window, cx);
+            assert!(!v.personal_mode);
+            assert_eq!(v.channel, 9);
+            assert_eq!(v.pending_return_channel, Some(9));
+            assert_eq!(
+                v.composer.read(cx).value(),
+                "hello",
+                "the pending return restores the saved channel text"
+            );
+        });
+    });
+    let waiter = release_on_arrival(gate.clone());
+    visual.run_until_parked();
+    assert!(waiter.join().unwrap(), "the reload reached the server");
+    wait_for(&mut visual, &view, |v| {
+        !v.access_pending && !v.access_reload_in_flight && v.channel == 9
+    });
+    view.read_with(&*visual, |v, cx| {
+        assert_eq!(v.pending_return_channel, None);
+        assert_eq!(
+            v.drafts.borrow().text(key),
+            "hello",
+            "the callback did not write the empty composer over the draft"
+        );
+        assert_eq!(v.composer.read(cx).value(), "hello");
+    });
+}
+
+/// A non-403 reload failure releases the pending return so a later unrelated
+/// success cannot auto-fallback into the channel.
+#[gpui::test]
+async fn failed_acl_reload_clears_the_pending_return(cx: &mut TestAppContext) {
+    cx.update(|cx| gpui_component::init(cx));
+    let gate = Gate::new();
+    let server = TestServer::spawn_concurrent(vec![
+        Reply::new(500, r#"{"error":"failed"}"#)
+            .with_path("/api/v1/servers/1/channels")
+            .with_gate(gate.clone()),
+        Reply::new(200, "[]").with_path("/api/v1/servers/1/members"),
+        Reply::new(200, &empty_page()).with_path("/api/v1/me/conversations"),
+    ]);
+    let (window, view) = make_app(cx, direct_client(&server));
+    let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
+    visual.run_until_parked();
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            v.channels = vec![channel_row(9, "kept")];
+            v.channel = 9;
+            gate.arm();
+            v.invalidate_access(window, cx);
+            v.enter_personal_mode(window, cx);
+            v.return_to_channels(window, cx);
+            assert_eq!(v.pending_return_channel, Some(9));
+        });
+    });
+    let waiter = release_on_arrival(gate.clone());
+    visual.run_until_parked();
+    assert!(waiter.join().unwrap(), "the reload reached the server");
+    wait_for(&mut visual, &view, |v| {
+        !v.access_reload_in_flight && !v.error.is_empty()
+    });
+    view.read_with(&*visual, |v, _| {
+        assert_eq!(
+            v.pending_return_channel, None,
+            "a failed reload releases the pending channel"
+        );
+        assert_eq!(v.channel, 9, "the saved channel stays the open target");
+    });
+}
+
 /// A second `channels.changed` while a reload and a DM are both open replaces
 /// the stale request instead of clearing the flag into a no-op.
 #[gpui::test]
@@ -133,8 +236,8 @@ async fn second_channels_changed_while_a_dm_is_open_restarts_the_reload(cx: &mut
     let (window, view) = make_app(cx, direct_client(&server));
     let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
     visual.run_until_parked();
-    visual.update(|window, app| {
-        view.update(app, |v, cx| {
+    visual.update(|_, app| {
+        view.update(app, |v, _| {
             v.channels = vec![channel_row(5, "old")];
             v.channel = 5;
             v.server = 1;
@@ -243,7 +346,7 @@ async fn acl_banner_is_hidden_in_an_open_dm(cx: &mut TestAppContext) {
     let server = TestServer::spawn(Vec::new());
     let (window, view) = make_app(cx, direct_client(&server));
     let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
-    visual.update(|window, app| {
+    visual.update(|_, app| {
         view.update(app, |v, _| {
             let row = conversation(7, "Нева", true, false);
             v.personal_mode = true;
@@ -259,7 +362,7 @@ async fn acl_banner_is_hidden_in_an_open_dm(cx: &mut TestAppContext) {
         visual.debug_bounds("channel-access-pending").is_none(),
         "no channel ACL block below personal history"
     );
-    visual.update(|window, app| {
+    visual.update(|_, app| {
         view.update(app, |v, _| {
             v.conversation = None;
             v.channel = 0;
@@ -270,7 +373,7 @@ async fn acl_banner_is_hidden_in_an_open_dm(cx: &mut TestAppContext) {
         visual.debug_bounds("channel-access-pending").is_none(),
         "the empty personal center is not a channel surface"
     );
-    visual.update(|window, app| {
+    visual.update(|_, app| {
         view.update(app, |v, _| {
             v.personal_mode = false;
         });
@@ -382,14 +485,88 @@ async fn send_403_after_a_switch_removes_the_revoked_row(cx: &mut TestAppContext
         assert_eq!(v.channel, 8);
         assert!(v.composer_error.is_empty());
         assert!(
-            v.drafts.borrow().text(draft::ChatKey::conversation(7)) == "hello",
-            "the revoked row keeps its own draft until the row is gone"
+            v.drafts
+                .borrow()
+                .text(draft::ChatKey::conversation(7))
+                .is_empty(),
+            "the confirmed removal drops the revoked row's own draft"
         );
     });
     assert!(server
         .requests()
         .iter()
         .any(|request| request.method == "GET" && request.path == "/api/v1/conversations/7"));
+}
+
+/// A send `404` for a row the user already left drops that row's draft scope;
+/// the open chat keeps its own draft and composer.
+#[gpui::test]
+async fn send_404_after_a_switch_drops_the_revoked_draft(cx: &mut TestAppContext) {
+    cx.update(|cx| gpui_component::init(cx));
+    let gate = Gate::new();
+    let server = TestServer::spawn_concurrent(vec![
+        Reply::new(404, r#"{"error":"missing"}"#)
+            .with_path("/api/v1/conversations/7/messages")
+            .with_gate(gate.clone()),
+        Reply::new(200, &messages_page()).with_path("/api/v1/conversations/8/messages"),
+        Reply::new(200, r#"{"conversation_id":8,"muted":false}"#)
+            .with_path("/api/v1/conversations/8/notifications"),
+        Reply::new(200, &page(vec![conversation(8, "Новый", true, false)]))
+            .with_path("/api/v1/me/conversations"),
+    ]);
+    let (window, view) = make_app(cx, direct_client(&server));
+    let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
+    visual.run_until_parked();
+    gate.arm();
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            let seven = conversation(7, "Старый", true, false);
+            v.personal_mode = true;
+            v.conversations = vec![seven.clone(), conversation(8, "Новый", true, false)];
+            v.conversation = Some(seven);
+            v.channel = 7;
+            v.composer
+                .update(cx, |input, cx| input.set_value("hello", window, cx));
+            v.send(window, cx);
+        });
+    });
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            v.select_conversation(conversation(8, "Новый", true, false), window, cx);
+        });
+    });
+    view.read_with(&*visual, |v, _| {
+        assert_eq!(
+            v.drafts.borrow().text(draft::ChatKey::conversation(7)),
+            "hello",
+            "the switch saves the old row's draft first"
+        );
+    });
+    let waiter = release_on_arrival(gate.clone());
+    visual.run_until_parked();
+    assert!(waiter.join().unwrap(), "the send reached the server");
+    wait_for(&mut visual, &view, |v| {
+        v.conversations.len() == 1 && v.conversations[0].id == 8 && !v.messaging.loading
+    });
+    view.read_with(&*visual, |v, cx| {
+        assert_eq!(v.conversation.as_ref().map(|row| row.id), Some(8));
+        assert_eq!(v.channel, 8);
+        assert!(
+            v.drafts
+                .borrow()
+                .text(draft::ChatKey::conversation(7))
+                .is_empty(),
+            "the removed non-active row keeps no stale draft"
+        );
+        assert!(
+            v.drafts
+                .borrow()
+                .text(draft::ChatKey::conversation(8))
+                .is_empty(),
+            "another chat's draft is untouched"
+        );
+        assert_eq!(v.composer.read(cx).value(), "");
+    });
 }
 
 /// A conversation reaction `403` is decided by the conversation GET, not the
@@ -404,7 +581,7 @@ async fn dm_reaction_403_verifies_and_clears_the_conversation(cx: &mut TestAppCo
     ]);
     let (window, view) = make_app(cx, direct_client(&server));
     let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
-    visual.update(|window, app| {
+    visual.update(|_, app| {
         view.update(app, |v, cx| {
             let row = conversation(7, "Нева", true, false);
             v.personal_mode = true;

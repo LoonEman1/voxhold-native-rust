@@ -605,7 +605,13 @@ impl Voxhold {
                     Err(voxhold_api::Error::Http(403 | 404)) => {
                         s.remove_current_server(window, cx);
                     }
-                    Err(error) => s.error = error.to_string(),
+                    Err(error) => {
+                        // A failed reload never restores the pending channel:
+                        // a later unrelated success must not auto-fallback
+                        // into it.
+                        s.pending_return_channel = None;
+                        s.error = error.to_string();
+                    }
                 }
                 cx.notify();
             });

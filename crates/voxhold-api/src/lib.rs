@@ -702,13 +702,19 @@ impl Client {
     /// arrive within `timeout`; otherwise the socket is reported as a network
     /// error so the caller can open a new one. At most one `pong` is awaited,
     /// channel changes keep working while it is outstanding, and no `pong`
-    /// reaches `receive`.
+    /// reaches `receive`. Intervals below 10 ms are clamped so a test cannot
+    /// turn the select into a busy loop; production keeps 25 s / 10 s.
     pub async fn subscribe_channels_with(
         &self,
         mut desired: tokio::sync::watch::Receiver<Option<ChannelSubscription>>,
         mut receive: impl FnMut(RealtimeEvent),
         heartbeat: HeartbeatConfig,
     ) -> Result<()> {
+        let minimum = Duration::from_millis(10);
+        let heartbeat = HeartbeatConfig {
+            interval: heartbeat.interval.max(minimum),
+            timeout: heartbeat.timeout.max(minimum),
+        };
         let mut socket = self.open_voice_socket().await?;
         let ready = tokio::time::timeout(Duration::from_secs(8), socket.read())
             .await

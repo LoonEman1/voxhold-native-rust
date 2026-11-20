@@ -51,7 +51,10 @@ impl Voxhold {
     pub(super) fn render_composer(&mut self, cx: &mut Context<Self>, compact: bool) -> AnyElement {
         let p = self.palette;
         let pad = if compact { 10. } else { 18. };
-        let mut body = div().flex().flex_col();
+        let mut body = div()
+            .flex()
+            .flex_col()
+            .debug_selector(|| "chat-composer".into());
         let text = self.composer.read(cx).value().to_string();
         let files = self.drafts.borrow().files(self.chat_key());
         let reading = self

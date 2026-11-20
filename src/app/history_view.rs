@@ -1013,7 +1013,13 @@ impl Voxhold {
                 });
             }
         }
-        let mut history = div().relative().flex_1().flex().flex_col().min_h(px(0.));
+        let mut history = div()
+            .relative()
+            .flex_1()
+            .flex()
+            .flex_col()
+            .min_h(px(0.))
+            .debug_selector(|| "chat-history".into());
         if self.has_more {
             let retry_in = self
                 .older_retry_at

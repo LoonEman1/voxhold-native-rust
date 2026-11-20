@@ -33,7 +33,7 @@ async fn send_frame(peer: &mut Peer, value: Value) {
         .expect("send frame");
 }
 
-async fn accept(listener: &TcpListener) -> Peer {
+async fn accept(listener: &TcpListener) -> (Peer, Instant) {
     let (stream, _) = timeout(Duration::from_secs(2), listener.accept())
         .await
         .expect("accept")
@@ -47,8 +47,9 @@ async fn accept(listener: &TcpListener) -> Peer {
     .expect("websocket");
     let auth = read_frame(&mut peer).await;
     assert_eq!(auth.kind, "auth");
+    let ready_sent = Instant::now();
     send_frame(&mut peer, json!({"type": "ready"})).await;
-    peer
+    (peer, ready_sent)
 }
 
 /// A socket that stops answering after `ready` must fail by the heartbeat
@@ -76,14 +77,21 @@ async fn a_silent_socket_fails_by_the_heartbeat_deadline() {
             .await
     });
 
-    let mut peer = accept(&listener).await;
+    let (mut peer, ready_sent) = accept(&listener).await;
+    let started = Instant::now();
+    let interval = Duration::from_millis(120);
+    let pong_timeout = Duration::from_millis(120);
     let ping = timeout(Duration::from_secs(2), read_frame(&mut peer))
         .await
         .expect("the first ping arrives after the interval");
     assert_eq!(ping.kind, "ping");
     assert!(!ping.request_id.is_empty(), "ping carries a request id");
+    assert!(
+        ready_sent.elapsed() >= interval.mul_f32(0.6),
+        "the first ping is not sent immediately after ready, took {:?}",
+        ready_sent.elapsed()
+    );
 
-    let started = Instant::now();
     let result = timeout(Duration::from_secs(2), worker)
         .await
         .expect("the subscription ends by the deadline")
@@ -93,8 +101,8 @@ async fn a_silent_socket_fails_by_the_heartbeat_deadline() {
         "a silent socket is a network error: {result:?}"
     );
     assert!(
-        started.elapsed() >= Duration::from_millis(120),
-        "the deadline is measured from the ping, took {:?}",
+        started.elapsed() >= pong_timeout.saturating_sub(Duration::from_millis(20)),
+        "the failure comes from the pong deadline, took {:?}",
         started.elapsed()
     );
     drop(target);
@@ -126,11 +134,16 @@ async fn a_matching_pong_clears_the_heartbeat_wait_and_schedules_the_next_ping()
             .await
     });
 
-    let mut peer = accept(&listener).await;
+    let (mut peer, ready_sent) = accept(&listener).await;
     let ping = timeout(Duration::from_secs(2), read_frame(&mut peer))
         .await
         .expect("first ping");
     assert_eq!(ping.kind, "ping");
+    assert!(
+        ready_sent.elapsed() >= interval.mul_f32(0.6),
+        "the first ping waits for the interval, took {:?}",
+        ready_sent.elapsed()
+    );
     let answered = Instant::now();
     send_frame(
         &mut peer,
@@ -183,17 +196,19 @@ async fn a_foreign_pong_and_chat_events_do_not_extend_the_heartbeat_deadline() {
                 },
                 HeartbeatConfig {
                     interval: Duration::from_millis(100),
-                    timeout: Duration::from_millis(150),
+                    timeout: Duration::from_millis(400),
                 },
             )
             .await
     });
 
-    let mut peer = accept(&listener).await;
+    let (mut peer, _ready_sent) = accept(&listener).await;
     let ping = timeout(Duration::from_secs(2), read_frame(&mut peer))
         .await
         .expect("first ping");
     assert_eq!(ping.kind, "ping");
+    let pong_timeout = Duration::from_millis(400);
+    let ping_at = Instant::now();
     send_frame(
         &mut peer,
         json!({"type": "pong", "request_id": "someone-else"}),
@@ -205,7 +220,14 @@ async fn a_foreign_pong_and_chat_events_do_not_extend_the_heartbeat_deadline() {
     )
     .await;
 
-    let started = Instant::now();
+    // No second ping may be sent while the first one is still unanswered.
+    assert!(
+        timeout(Duration::from_millis(300), read_frame(&mut peer))
+            .await
+            .is_err(),
+        "a foreign pong must not open a second heartbeat request"
+    );
+
     let result = timeout(Duration::from_secs(2), worker)
         .await
         .expect("a foreign pong does not cancel the deadline")
@@ -215,8 +237,9 @@ async fn a_foreign_pong_and_chat_events_do_not_extend_the_heartbeat_deadline() {
         "the request was never answered: {result:?}"
     );
     assert!(
-        started.elapsed() < Duration::from_secs(2),
-        "the failure comes from the ping deadline, not the test timeout"
+        ping_at.elapsed() >= pong_timeout.saturating_sub(Duration::from_millis(20)),
+        "a foreign pong does not shorten or extend the pong deadline, took {:?}",
+        ping_at.elapsed()
     );
 
     let ready = received.try_recv().expect("ready");
@@ -266,7 +289,7 @@ async fn a_channel_change_during_a_pending_heartbeat_pong_still_resubscribes() {
             .await
     });
 
-    let mut peer = accept(&listener).await;
+    let (mut peer, _ready_sent) = accept(&listener).await;
     let subscribe = timeout(Duration::from_secs(2), read_frame(&mut peer))
         .await
         .expect("initial subscribe");

@@ -186,6 +186,10 @@ pub struct Reply {
     /// Hold the response for a while before writing headers. Used by the
     /// long-recording test that must outlive the eight-second JSON timeout.
     pub delay: Option<Duration>,
+    /// Optional request-path prefix. A routed reply is served only to the
+    /// first request whose path starts with it, so concurrent requests can be
+    /// answered deterministically.
+    pub path: Option<String>,
 }
 
 impl Reply {
@@ -197,6 +201,7 @@ impl Reply {
             gate: None,
             body_gate: None,
             delay: None,
+            path: None,
         }
     }
 
@@ -209,6 +214,7 @@ impl Reply {
             gate: None,
             body_gate: None,
             delay: None,
+            path: None,
         }
     }
 
@@ -221,6 +227,7 @@ impl Reply {
             gate: None,
             body_gate: None,
             delay: None,
+            path: None,
         }
     }
 
@@ -236,6 +243,13 @@ impl Reply {
 
     pub fn with_delay(mut self, delay: Duration) -> Self {
         self.delay = Some(delay);
+        self
+    }
+
+    /// Route this answer to one request path. The answer is used once; later
+    /// requests fall back to the next unclaimed sequential reply.
+    pub fn with_path(mut self, path: impl Into<String>) -> Self {
+        self.path = Some(path.into());
         self
     }
 
@@ -273,6 +287,7 @@ impl TestServer {
         let recorded = requests.clone();
         let running = stop.clone();
         let replies = Arc::new(replies);
+        let used = Arc::new(Mutex::new(vec![false; replies.len()]));
         let handle = std::thread::spawn(move || {
             for stream in listener.incoming() {
                 if running.load(Ordering::Relaxed) {
@@ -282,15 +297,34 @@ impl TestServer {
                 let Some(record) = read_request(&mut stream) else {
                     continue;
                 };
-                let index = {
+                {
                     let mut records = recorded.lock().unwrap();
-                    records.push(record);
-                    records.len() - 1
+                    records.push(record.clone());
+                }
+                let reply = {
+                    let mut used = used.lock().unwrap();
+                    let routed = replies.iter().enumerate().position(|(index, reply)| {
+                        !used[index]
+                            && reply
+                                .path
+                                .as_deref()
+                                .is_some_and(|path| record.path.starts_with(path))
+                    });
+                    let fallback = replies
+                        .iter()
+                        .enumerate()
+                        .position(|(index, reply)| !used[index] && reply.path.is_none());
+                    let index = routed
+                        .or(fallback)
+                        .or_else(|| used.iter().position(|used| !*used));
+                    match index {
+                        Some(index) => {
+                            used[index] = true;
+                            replies[index].clone()
+                        }
+                        None => Reply::new(500, "{\"error\":\"unexpected request\"}"),
+                    }
                 };
-                let reply = replies
-                    .get(index)
-                    .cloned()
-                    .unwrap_or(Reply::new(500, "{\"error\":\"unexpected request\"}"));
                 if concurrent {
                     let running = running.clone();
                     std::thread::spawn(move || {

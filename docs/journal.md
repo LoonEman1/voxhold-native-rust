@@ -503,3 +503,27 @@ backend/браузер, TURN/ICE на втором ПК, DPI 125/150, запис
 - CI `release.yml`: одна Windows x64 сборка → portable ZIP + per-user Setup.exe (Inno), Authenticode при секретах, дельта от предыдущего `beta`, manifest+sign последним.
 - Ключ: публичный в `crates/voxhold-update/update-pubkey.txt`, приватный в GitHub secret `VOXHOLD_UPDATE_SIGNING_KEY` и вне репозитория; Authenticode-сертификата нет (`authenticode:false`).
 - Не проверено: реальный A→B из Setup и ZIP на чистой Windows, компиляция Inno/установка/удаление, Authenticode/SmartScreen, реальный GitHub-канал, живой GUI/DPI и настоящий helper-процесс.
+- Интеграция: PR #26 влит в `dev` коммитом `78a7cb3`; ревью и тесты пройдены на `2ceb420`. Реальный A→B, Inno и Authenticode остаются обязательными сценариями `W13`.
+
+### W05a — текстовый чат голосовой комнаты — PR #27
+
+Ветка `codex/w05a-room-chat` от `78a7cb3`, коммит `6345627`; эталоны backend `9b29fdd`, frontend `ed7cb00`. Проверки: fmt; `cargo test --workspace --locked` — 791 passed, 0 failed, 13 ignored (API 15, media 199/12 ignored, app 497/1 ignored, release 3, update 72, updater 5); release; лимиты файлов 277.
+
+- `src/app/room_chat.rs`: открытие/закрытие панели для выбранной комнаты, `ChatKey::channel(server, room)`, `chat_scope_epoch`, док/стек-панель, очистка при отзыве доступа; `Channel::chat_readable/chat_writable` в `crates/voxhold-api/src/channel.rs` с сохранением E2EE-политики.
+- `src/app/shell_view.rs` + `composer.rs`: переключатель «Чат», общий composer и history в доке; `history_view` учитывает 48 px заголовок панели.
+- `src/app/workspace.rs`, `history_ops.rs`, `history_actions.rs`, `session.rs`, `message_tools.rs`: подписка и read только для видимой разрешённой ленты, epoch для отложенного read, prune после подтверждённого списка каналов, права действий для комнаты.
+- `src/layout.rs`: `voice_chat_layout` — 300/34%/440 справа на широком окне, непалящее наложение на узком; `VoicePanel` получает фактический размер.
+- Ревью диапазона `78a7cb3..6345627` — PASS, P0/P1 нет. P2: единственный переключатель без подписи на широком окне; недоступные «Закрепы» комнаты; снапшот без снятия подписки при отзыве Read; неполное покрытие failure-path; cfg-стабы без `voxhold-media`.
+- Не проверено: живой backend/POST/WS, ручной GUI и DPI, сравнение кадров web ↔ native; P2 вынесены на последующие правки/`W13`.
+
+### W08a — полноценные «Сообщения» и новая беседа — PR #27
+
+Ветка `codex/w08a-messages` от `13fd803`, итог `d0a6f50`; база `dev` обновлена до `922d41b` (общий Cargo-кеш и CI из PR #28). Эталоны backend `9b29fdd`, frontend `ed7cb00`. Проверки: fmt; `cargo test --workspace --locked` — 829 passed, 0 failed, 13 ignored (API 15, media 199/12 ignored, app 535/1 ignored, release 3, update 72, updater 5); release; лимиты файлов 284, `messages_ops.rs` 1143 с документированным исключением 1200.
+
+- `crates/voxhold-api/src/conversations.rs`: типизированные paged list, conversation GET, create (direct dedup), message search с numeric cursor, notification GET/PUT, leave; проверки id/курсоров/лимитов.
+- `src/messages.rs`, `src/app/messages_ops.rs`, `messages_view.rs`, `messages_creator.rs`: личный режим, bounded первая/старая страницы, фильтр по имени и глобальный поиск, `+` с выбором участников, mute/leave, `conversation.changed`, точечная проверка отсутствующей строки через `GET`.
+- `src/app/shell_view.rs`, `navigation_view.rs`: rail «Сообщения», sidebar/center, «К каналам» с восстановлением разрешённого контекста, voice dock и account footer в личном режиме, ошибки/повтор первой страницы.
+- `src/app/realtime.rs`, `session.rs`, `workspace.rs`, `history_ops.rs`, `composer.rs`, `inbox_ops.rs`: события личного индекса независимы от channel ACL, сброс состояния при logout, сохранение DM-черновика при смене/удалении сервера, merge успешной отправки при висящей ACL-перезагрузке, сохранение черновика и вложений при «+», 403 block/privacy не закрывает диалог (проверка `GET`), 404/leave очищают ChatKey.
+- Ревью: три раунда. Первый — 3 P1 (частичная страница, logout, voice dock) + P2; второй — 2 P1 (классификация 403, потеря черновика при «+») + P2; третий — 1 P1 (отправка при ACL reload). Финальное ревью диапазона `96bdb6d..d0a6f50` — PASS.
+- Остаются P2: fallback при возврате отозванного канала, второй `channels.changed` во время reload, мобильный вход, мёртвый R04 inbox popup, cursor/retry старой страницы, favorites-поверхность W08b, API-тесты wire-контракта.
+- Не проверено: живой backend/WS/POST, два физических устройства, block/privacy на реальном сервере, ручной GUI/DPI/узкие окна и кадры web ↔ native; это остаётся для стенда и `W13`.

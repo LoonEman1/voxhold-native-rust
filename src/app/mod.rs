@@ -16,6 +16,9 @@ mod hotkeys;
 mod inbox_ops;
 mod media_ops;
 mod members_view;
+mod messages_creator;
+mod messages_ops;
+mod messages_view;
 mod navigation_view;
 mod overlays_view;
 mod personal_ops;
@@ -30,6 +33,9 @@ mod recordings_ops_tests;
 #[cfg(test)]
 mod recordings_tests;
 mod recordings_view;
+mod room_chat;
+#[cfg(all(feature = "voxhold-media", test))]
+mod room_chat_tests;
 mod server_ops;
 mod session;
 #[cfg(test)]
@@ -67,7 +73,7 @@ use gpui::{
     div, list, prelude::*, px, rgba, AnyElement, Context, Entity, FocusHandle, ListAlignment,
     ListState, MouseButton, Render, Window,
 };
-use gpui_component::input::{InputState, TextInput};
+use gpui_component::input::{InputEvent, InputState, TextInput};
 use layout::{SplitterDrag, SplitterSide};
 use voxhold_api::{Channel, ChannelSubscription, Client, Member, Message, Server};
 
@@ -75,8 +81,9 @@ use voxhold_api::{Channel, ChannelSubscription, Client, Member, Message, Server}
 use crate::voice_panel;
 use crate::{
     attachments, auth, auth_session, background, channel_settings, draft, inbox, instance_prefs,
-    layout, links, media, members, message_tools, personal_settings, reactions, recordings,
-    recordings_dialog, search, server_settings, session_store, theme, thread_panel, window_chrome,
+    layout, links, media, members, message_tools, messages, personal_settings, reactions,
+    recordings, recordings_dialog, search, server_settings, session_store, theme, thread_panel,
+    window_chrome,
 };
 use ui::{icon, ink};
 
@@ -249,6 +256,13 @@ pub(crate) struct Voxhold {
     conversations: Vec<voxhold_api::Conversation>,
     recents_request: Option<u64>,
     recents_again: bool,
+    /// A `conversation.changed` event asks the next index answer to reconcile
+    /// the active conversation: update it when present, clear it when gone.
+    /// Scoped to that conversation, selection, surface epoch and session.
+    conversations_reconcile: Option<messages::ConversationReconcile>,
+    /// Bumped on every conversation selection. An index page requested before
+    /// the selection cannot clear the newly opened conversation.
+    conversation_select_seq: u64,
     channel_snapshot_request: Option<u64>,
     attachments: Option<Entity<attachments::Attachments>>,
     personal: Option<personal_settings::PersonalSettings>,
@@ -302,6 +316,16 @@ pub(crate) struct Voxhold {
     window_active: bool,
     inbox: Option<Entity<inbox::Inbox>>,
     show_inbox: bool,
+    /// Personal "Сообщения" mode. The server/channel context is kept in
+    /// `personal_return` so "К каналам" can restore it when still permitted.
+    personal_mode: bool,
+    personal_return: Option<(i64, i64)>,
+    messaging: messages::Messages,
+    /// A background answer cleared the active chat; the next render closes the
+    /// window-owned viewer/thread/settings and clears the composer.
+    pending_personal_cleanup: bool,
+    _conversation_query_subscription: gpui::Subscription,
+    _creator_subscriptions: Vec<gpui::Subscription>,
     show_members: bool,
     show_channels: bool,
     show_servers: bool,
@@ -314,6 +338,11 @@ pub(crate) struct Voxhold {
     /// Channel shown in the room pane; independent from the call channel.
     #[cfg(feature = "voxhold-media")]
     voice_room: i64,
+    /// Rooms whose chat panel the user opened, keyed by `(server, channel)`.
+    /// Membership survives navigation and is pruned when the channel stops
+    /// being readable.
+    #[cfg(feature = "voxhold-media")]
+    voice_chat_rooms: std::collections::HashSet<(i64, i64)>,
     /// Channel of the active call, mirrored from the panel for the dock.
     #[cfg(feature = "voxhold-media")]
     voice_channel: i64,
@@ -336,6 +365,9 @@ pub(crate) struct Voxhold {
     messages: Vec<Message>,
     history_list: ListState,
     history_keys: Vec<HistoryKey>,
+    /// Bumped when the room chat opens or closes so a read scheduled for the
+    /// previous surface cannot mark anything visible.
+    chat_scope_epoch: u64,
     before: Option<i64>,
     has_more: bool,
     history_has_newer: bool,
@@ -549,6 +581,24 @@ impl Voxhold {
         let recent_reactions = reactions::SharedRecents::default();
         let reaction_picker =
             cx.new(|cx| reactions::ReactionPicker::new(recent_reactions.clone(), window, cx));
+        let messaging = messages::Messages::new(window, cx);
+        let conversation_query_subscription = cx.subscribe(
+            &messaging.query,
+            |this, _, event: &InputEvent, cx| match event {
+                InputEvent::Change => {
+                    if this.messaging.global {
+                        this.messaging.search.invalidate();
+                    }
+                    cx.notify();
+                }
+                InputEvent::PressEnter { .. } => {
+                    if this.messaging.global {
+                        this.submit_messages_search(cx);
+                    }
+                }
+                _ => {}
+            },
+        );
         let notification_path = shell_path
             .as_deref()
             .map(crate::notifications::path_from_layout);
@@ -616,6 +666,8 @@ impl Voxhold {
             conversations: Vec::new(),
             recents_request: None,
             recents_again: false,
+            conversations_reconcile: None,
+            conversation_select_seq: 0,
             channel_snapshot_request: None,
             attachments: None,
             personal: None,
@@ -653,6 +705,12 @@ impl Voxhold {
             window_active: true,
             inbox: None,
             show_inbox: false,
+            personal_mode: false,
+            personal_return: None,
+            messaging,
+            pending_personal_cleanup: false,
+            _conversation_query_subscription: conversation_query_subscription,
+            _creator_subscriptions: Vec::new(),
             show_members: false,
             show_channels: false,
             show_servers: false,
@@ -662,6 +720,8 @@ impl Voxhold {
             power_task: None,
             #[cfg(feature = "voxhold-media")]
             voice_room: 0,
+            #[cfg(feature = "voxhold-media")]
+            voice_chat_rooms: std::collections::HashSet::new(),
             #[cfg(feature = "voxhold-media")]
             voice_channel: 0,
             #[cfg(feature = "voxhold-media")]
@@ -676,6 +736,7 @@ impl Voxhold {
             messages: vec![],
             history_list,
             history_keys: Vec::new(),
+            chat_scope_epoch: 0,
             before: None,
             has_more: false,
             history_has_newer: false,

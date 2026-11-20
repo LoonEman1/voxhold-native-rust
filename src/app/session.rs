@@ -208,6 +208,10 @@ impl Voxhold {
         let first_server = self.servers.first().map(|server| server.id);
         if let Some(id) = first_server {
             self.select_server(id, window, cx);
+        } else {
+            // The web loads the personal index regardless of the selected
+            // server. An account without servers still has conversations.
+            self.refresh_recents(cx);
         }
         cx.notify();
     }
@@ -303,6 +307,7 @@ impl Voxhold {
             self.voice_rooms.clear();
             self.voice_streams.clear();
             self.voice_unconfirmed.clear();
+            self.voice_chat_rooms.clear();
         }
         self.close_recordings(false, window, cx);
         self.recording_access_epoch = self.recording_access_epoch.wrapping_add(1);
@@ -381,6 +386,16 @@ impl Voxhold {
         self.conversations.clear();
         self.recents_request = None;
         self.recents_again = false;
+        // The personal surface belongs to the signed-in account. Keep no
+        // selection, filter, search, creator, notification or cursor state for
+        // the next account; the new workspace always starts from a fresh index.
+        self.personal_mode = false;
+        self.personal_return = None;
+        self.conversations_reconcile = None;
+        self.conversation_select_seq = self.conversation_select_seq.wrapping_add(1);
+        self.messaging.reset(window, cx);
+        self._creator_subscriptions.clear();
+        self.pending_personal_cleanup = false;
         self.channel_snapshot_request = None;
         self.attachments = None;
         self.personal = None;
@@ -690,12 +705,7 @@ impl Voxhold {
         self.stop_realtime();
         if let Some(client) = self.client.clone() {
             self.start_realtime(client, window, cx);
-            let has_history = self.conversation.is_none()
-                && self
-                    .channels
-                    .iter()
-                    .any(|channel| channel.id == self.channel && channel.has_history());
-            self.update_channel_subscription(has_history);
+            self.refresh_chat_subscription();
         }
         #[cfg(feature = "voxhold-media")]
         if let Some(panel) = self.voice.clone() {

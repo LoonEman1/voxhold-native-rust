@@ -19,6 +19,7 @@ impl Voxhold {
         cx: &mut Context<Self>,
         chat: layout::Rect,
         mobile: bool,
+        docked: bool,
     ) -> AnyElement {
         let p = self.palette; // Chat column: fixed header, history, composer, panels.
         let channel_kind = if self.conversation.is_some() {
@@ -78,8 +79,7 @@ impl Voxhold {
         }
         let selected = self.channels.iter().find(|c| c.id == self.channel).cloned();
         let conversation = self.conversation.is_some();
-        let readable = conversation
-            || (!self.access_pending && selected.as_ref().is_some_and(|c| c.has_history()));
+        let readable = conversation || self.channel_chat_readable(self.channel);
         let role = self
             .servers
             .iter()
@@ -1086,7 +1086,14 @@ impl Voxhold {
             let progress = (scroll_offset / scroll_max).clamp(0., 1.);
             let thumb_top = (track_h - thumb_h) * progress;
             let track_top: f32 = self.history_list.viewport_bounds().origin.y.into();
-            let history_top = chat.y + if mobile { 58. } else { 67. };
+            let header_height = if docked {
+                48.
+            } else if mobile {
+                58.
+            } else {
+                67.
+            };
+            let history_top = chat.y + header_height;
             history = history.child(
                 div()
                     .id("history-scrollbar")

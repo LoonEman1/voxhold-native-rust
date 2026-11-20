@@ -377,6 +377,76 @@ fn a_bitrate_only_change_is_applied_to_the_live_sender_without_a_restart() {
 }
 
 #[test]
+fn a_full_command_queue_keeps_the_live_attempt_and_its_previous_limit() {
+    let now = Instant::now();
+    let mut publisher = publisher();
+    live(&mut publisher, now);
+    let attempt = publisher.attempt;
+    let applied_limit = publisher.request().expect("live request").quality;
+    let queued = bitrate_only();
+    publisher.apply_quality(queued.clone(), now);
+
+    // The worker queue was full; the newest value was not accepted yet.
+    let pending = publisher.bitrate_queued();
+    assert_eq!(
+        pending,
+        vec![Outcome::State(publisher.sharing())],
+        "a deferred limit only updates the status: {pending:?}"
+    );
+    assert_eq!(
+        publisher.phase(),
+        Phase::Live,
+        "a full queue must not fail the attempt"
+    );
+    assert_eq!(publisher.sharing().attempt, attempt, "no new attempt");
+    assert!(publisher.sharing().error.is_none());
+    assert!(
+        publisher.sharing().status.contains("Применяем"),
+        "the card says the limit is still being applied: {:?}",
+        publisher.sharing().status
+    );
+    assert!(
+        !pending.iter().any(|outcome| matches!(
+            outcome,
+            Outcome::Send(_) | Outcome::StartEngine { .. } | Outcome::StopEngine
+        )),
+        "a full queue must not stop or restart the publication: {pending:?}"
+    );
+
+    // The next tick accepted the value; the limit is the requested one and the
+    // request has already been recorded by `apply_quality`.
+    let applied = publisher.bitrate_applied();
+    assert!(matches!(applied.as_slice(), [Outcome::State(_)]));
+    assert_eq!(publisher.phase(), Phase::Live);
+    assert_eq!(publisher.sharing().quality, Some(queued.quality));
+    assert_eq!(
+        publisher.request().map(|request| request.quality),
+        Some(queued.quality)
+    );
+    assert_eq!(
+        publisher.bitrate_applied(),
+        Vec::new(),
+        "a repeated confirmation is not a new status"
+    );
+    assert_ne!(
+        applied_limit, queued.quality,
+        "the test really changed the limit"
+    );
+
+    // A closed worker is terminal: it fails the local attempt instead of
+    // pretending the limit reached the sender.
+    let failed = publisher.on_engine(
+        EngineEvent::Error("Медиадвижок трансляции уже закрыт.".into()),
+        now,
+    );
+    assert_eq!(publisher.phase(), Phase::Failed);
+    assert!(failed.contains(&Outcome::StopEngine));
+    assert!(publisher.sharing().error.is_some());
+    assert!(publisher.bitrate_queued().is_empty());
+    assert!(publisher.bitrate_applied().is_empty());
+}
+
+#[test]
 fn resolution_frame_rate_or_audio_scope_change_keeps_the_restart_path() {
     let now = Instant::now();
     let live_request = request();

@@ -326,6 +326,9 @@ struct Live {
     publisher: crate::publisher::Publisher,
     /// The capture and peer of the current publishing attempt.
     screen: Option<crate::publisher::engine::PublisherEngine>,
+    /// The newest live bitrate change that the worker has not accepted yet. A
+    /// full command queue defers it to the next tick instead of failing.
+    bitrate: screen::BitrateQueue,
     /// The one preparation that may be opening a capture or a peer. The session
     /// loop only observes and cancels it.
     prep: Option<prep::ScreenPrep<crate::publisher::engine::PublisherEngine>>,
@@ -711,6 +714,7 @@ async fn run_session(
         stream_selection: None,
         publisher: crate::publisher::Publisher::new(controller.server_id, controller.channel_id),
         screen: None,
+        bitrate: screen::BitrateQueue::default(),
         prep: None,
         restart: None,
         server: controller.server_id,

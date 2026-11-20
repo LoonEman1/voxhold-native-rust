@@ -29,7 +29,7 @@ use libwebrtc::{
 use tokio::time::sleep;
 use tokio_stream::StreamExt;
 
-use super::PublisherEngine;
+use super::{BitrateSend, PublisherEngine};
 use crate::publisher::{Codec, PublishRequest, Quality, Resolution};
 use crate::screen_capture::{ScreenSource, SourceKind};
 
@@ -112,7 +112,9 @@ fn the_publisher_answer_keeps_the_offered_mid_and_sends_frames() {
 }
 
 /// A live bitrate change must reach the negotiated sender without a new offer
-/// or answer: the fake SFU keeps receiving frames from the same track.
+/// or answer: the fake SFU keeps receiving frames from the same track. A later
+/// re-offer (the backend's `startRecovery` may send one to a live publisher)
+/// must keep the applied limit instead of reverting to the spawn-time request.
 #[test]
 fn a_live_bitrate_change_reaches_the_negotiated_sender_without_renegotiation() {
     let change = Quality {
@@ -201,11 +203,15 @@ fn loopback(frame_size: (u32, u32), change: Option<Quality>) {
 
         let mut answer: Option<String> = None;
         let mut answers = 0_u32;
-        let mut remote_answer_set = false;
+        let mut applied_answers = 0_u32;
+        let mut expected_mid = offer_mid.clone();
         let mut reader = None;
         let mut change_applied = false;
         let mut frames_at_change = 0_u64;
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut reoffered = false;
+        let mut frames_at_reoffer = 0_u64;
+        let budget = if change.is_some() { 30 } else { 20 };
+        let deadline = Instant::now() + Duration::from_secs(budget);
         while Instant::now() < deadline {
             while let Some(event) = engine.poll() {
                 match event {
@@ -229,12 +235,14 @@ fn loopback(frame_size: (u32, u32), change: Option<Quality>) {
             }
             drain_to_sfu(&sfu_candidates, &sfu).await;
             drain_to_engine(&sfu_candidates, &engine);
-            if !remote_answer_set {
-                if let Some(sdp) = &answer {
+            // Each offer needs exactly one answer, applied once. A re-offer is
+            // answered on the same send track and must keep the offered mid.
+            if applied_answers < answers {
+                if let Some(sdp) = answer.as_deref() {
                     // The answer must keep the offered mid and be sendonly: a
                     // wrong transceiver binding produces recvonly/inactive or a
                     // different mid, and the SFU would never see a track.
-                    assert_eq!(first_mid(sdp).as_deref(), Some(offer_mid.as_str()));
+                    assert_eq!(first_mid(sdp).as_deref(), Some(expected_mid.as_str()));
                     let video = section(sdp, "m=video").expect("video section");
                     assert!(
                         video.contains("a=sendonly"),
@@ -246,10 +254,10 @@ fn loopback(frame_size: (u32, u32), change: Option<Quality>) {
                     sfu.set_remote_description(parsed)
                         .await
                         .expect("sfu remote answer");
-                    remote_answer_set = true;
+                    applied_answers += 1;
                 }
             }
-            if reader.is_none() && remote_answer_set {
+            if reader.is_none() && applied_answers > 0 {
                 if let Some(track) = track_slot.lock().unwrap().clone() {
                     let counter = frames.clone();
                     reader = Some(tokio::spawn(async move {
@@ -260,22 +268,59 @@ fn loopback(frame_size: (u32, u32), change: Option<Quality>) {
                     }));
                 }
             }
-            if remote_answer_set && frames.load(Ordering::SeqCst) > 0 {
+            if applied_answers > 0 && frames.load(Ordering::SeqCst) > 0 {
                 match change {
                     Some(next) if !change_applied => {
                         // The negotiated sender is live; apply the new limit
                         // exactly like `Outcome::SetBitrate` does.
-                        engine.set_bitrate(next).expect("live bitrate command");
+                        assert_eq!(
+                            engine.set_bitrate(next),
+                            BitrateSend::Sent,
+                            "the live bitrate command must reach the worker"
+                        );
                         change_applied = true;
                         frames_at_change = frames.load(Ordering::SeqCst);
                     }
-                    Some(next) => {
-                        let applied = engine.applied_bitrate_limits().0;
+                    Some(next) if !reoffered => {
                         let expected = u64::from(next.bitrate_kbps) * 1000;
-                        if applied == expected && frames.load(Ordering::SeqCst) > frames_at_change {
+                        if engine.applied_bitrate_limits().0 == expected
+                            && frames.load(Ordering::SeqCst) > frames_at_change
+                        {
+                            // The SFU offers again to the live publisher, as
+                            // `startRecovery` may. The answer is applied below
+                            // and must not revert the live limit.
+                            let second = sfu
+                                .create_offer(OfferOptions {
+                                    offer_to_receive_audio: None,
+                                    offer_to_receive_video: None,
+                                    ..OfferOptions::default()
+                                })
+                                .await
+                                .expect("second offer");
+                            let second_sdp = second.to_string();
+                            expected_mid =
+                                first_mid(&second_sdp).expect("the re-offer keeps a mid");
+                            sfu.set_local_description(second)
+                                .await
+                                .expect("sfu second local offer");
+                            engine.offer(second_sdp).expect("second offer command");
+                            reoffered = true;
+                            frames_at_reoffer = frames.load(Ordering::SeqCst);
+                        }
+                    }
+                    Some(next) if reoffered => {
+                        let expected = u64::from(next.bitrate_kbps) * 1000;
+                        if applied_answers >= 2 && frames.load(Ordering::SeqCst) > frames_at_reoffer
+                        {
+                            assert_eq!(
+                                engine.applied_bitrate_limits(),
+                                (expected, 0),
+                                "the re-offer reverted the live bitrate limit"
+                            );
                             break;
                         }
                     }
+                    Some(_) => {}
                     None => break,
                 }
             }
@@ -290,8 +335,12 @@ fn loopback(frame_size: (u32, u32), change: Option<Quality>) {
         );
         assert!(answer.is_some(), "the publisher never produced an answer");
         assert!(
-            remote_answer_set,
+            applied_answers > 0,
             "the SFU never applied the publisher answer"
+        );
+        assert_eq!(
+            answers, applied_answers,
+            "every offer must be answered exactly once"
         );
         assert!(
             inbound > 0,
@@ -308,9 +357,15 @@ fn loopback(frame_size: (u32, u32), change: Option<Quality>) {
                 "the live video limit never reached the sender"
             );
             assert_eq!(
-                answers, 1,
-                "a live bitrate change must not renegotiate the publication"
+                answers, 2,
+                "a live change and its re-offer need exactly one answer each"
             );
+            assert!(
+                reoffered,
+                "the re-offer after a live change was never produced"
+            );
+        } else {
+            assert_eq!(answers, 1, "one offer needs exactly one answer");
         }
 
         if let Some(reader) = reader {

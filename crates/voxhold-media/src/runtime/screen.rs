@@ -8,8 +8,8 @@
 //! loop never joins a capture or a peer worker.
 
 use super::*;
-use crate::publisher::engine::PublisherEngine;
-use crate::publisher::{Access, Outcome as PublisherOutcome, Publisher, QualityChange};
+use crate::publisher::engine::{BitrateSend, PublisherEngine};
+use crate::publisher::{Access, Outcome as PublisherOutcome, Publisher, Quality, QualityChange};
 use crate::runtime::preflight::{PendingRestart, finish_preflight};
 use crate::runtime::prep::{
     PREP_BUDGET, PrepBinding, ScreenPrep, access_violation, cancel_prep, finish_prep,
@@ -18,6 +18,75 @@ use crate::runtime::requests::{
     ScreenAccess, ScreenCommand, SourceRequest, push_screen, set_source_request,
 };
 use crate::screen_capture::SourceKind;
+
+/// The newest live bitrate change that the engine worker has not accepted yet.
+///
+/// The worker command queue is bounded and an ICE burst can fill it for a tick,
+/// so a full queue defers the value instead of ending the attempt. A newer
+/// request replaces the pending one: only the latest quality is ever applied.
+#[derive(Default)]
+pub(super) struct BitrateQueue {
+    pending: Option<(u64, Quality)>,
+}
+
+/// What one delivery attempt of [`BitrateQueue`] did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum BitrateDelivery {
+    /// Nothing was pending, or it belonged to an older attempt.
+    Idle,
+    /// The worker accepted the newest quality.
+    Sent,
+    /// The bounded queue is full; the value stays pending for the next tick.
+    Full,
+    /// The worker channel is closed; the attempt cannot keep sending.
+    Closed,
+}
+
+impl BitrateQueue {
+    /// Keep the newest request of `attempt`; a newer request replaces an older
+    /// pending one.
+    pub(super) fn request(&mut self, attempt: u64, quality: Quality) {
+        self.pending = Some((attempt, quality));
+    }
+
+    /// Forget the pending value: the attempt it belonged to is gone.
+    pub(super) fn clear(&mut self) {
+        self.pending = None;
+    }
+
+    #[cfg(test)]
+    pub(super) fn is_pending(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    /// Hand the pending quality to the live engine. A request of an older
+    /// attempt is dropped without being sent. `Full` keeps the value for the
+    /// next tick; `Closed` drops it because only a dead worker answers so.
+    pub(super) fn flush(
+        &mut self,
+        current_attempt: u64,
+        send: impl FnOnce(Quality) -> BitrateSend,
+    ) -> BitrateDelivery {
+        let Some((attempt, quality)) = self.pending else {
+            return BitrateDelivery::Idle;
+        };
+        if attempt != current_attempt {
+            self.pending = None;
+            return BitrateDelivery::Idle;
+        }
+        match send(quality) {
+            BitrateSend::Sent => {
+                self.pending = None;
+                BitrateDelivery::Sent
+            }
+            BitrateSend::Full => BitrateDelivery::Full,
+            BitrateSend::Closed => {
+                self.pending = None;
+                BitrateDelivery::Closed
+            }
+        }
+    }
+}
 
 /// One preview picture for the local on-air card.
 pub struct ScreenFrame {
@@ -171,6 +240,7 @@ impl Live {
                     // overlaps the new device start) and a preparation still
                     // opening a device is replaced.
                     self.release_engine();
+                    self.bitrate.clear();
                     let _ = self.cancel_screen_prep(None);
                     self.drop_restart_prep();
                     // Bind the capture to the gate the panel has right now.
@@ -192,6 +262,7 @@ impl Live {
                 PublisherOutcome::StopEngine => {
                     // A stop also covers a capture that is still opening, so
                     // the device starts closing even when no engine exists yet.
+                    self.bitrate.clear();
                     let _ = self.cancel_screen_prep(None);
                     self.release_engine();
                     self.screen_preview.clear();
@@ -209,24 +280,12 @@ impl Live {
                     if attempt != self.publisher.sharing().attempt {
                         continue;
                     }
-                    let failure = match self.screen.as_ref() {
-                        Some(screen) => screen.set_bitrate(quality).err(),
-                        None => Some("Медиадвижок трансляции уже закрыт.".to_string()),
-                    };
-                    if let Some(message) = failure {
-                        // The worker is gone, so the attempt cannot keep
-                        // sending; this is a local failure of the live attempt.
-                        for outcome in self
-                            .publisher
-                            .on_engine(
-                                crate::publisher::EngineEvent::Error(message),
-                                Instant::now(),
-                            )
-                            .into_iter()
-                            .rev()
-                        {
-                            work.push_front(outcome);
-                        }
+                    // Keep the newest quality even when the bounded worker
+                    // queue is full: it is retried on the next tick, and only a
+                    // closed channel ends the attempt.
+                    self.bitrate.request(attempt, quality);
+                    for outcome in self.flush_screen_bitrate().into_iter().rev() {
+                        work.push_front(outcome);
                     }
                 }
                 PublisherOutcome::Offer(sdp) => {
@@ -269,6 +328,34 @@ impl Live {
             self.drop_restart_prep();
         }
         Ok(true)
+    }
+
+    /// Deliver the newest pending live bitrate change to the engine.
+    ///
+    /// `Full` only shows a non-terminal status and keeps the previous limit;
+    /// the next tick retries the newest value. `Closed` is the only answer that
+    /// means the worker (and its capture) is gone.
+    fn flush_screen_bitrate(&mut self) -> Vec<PublisherOutcome> {
+        if self.publisher.phase() != crate::publisher::Phase::Live {
+            self.bitrate.clear();
+            return Vec::new();
+        }
+        let attempt = self.publisher.sharing().attempt;
+        let delivery = self
+            .bitrate
+            .flush(attempt, |quality| match self.screen.as_ref() {
+                Some(screen) => screen.set_bitrate(quality),
+                None => BitrateSend::Closed,
+            });
+        match delivery {
+            BitrateDelivery::Sent => self.publisher.bitrate_applied(),
+            BitrateDelivery::Full => self.publisher.bitrate_queued(),
+            BitrateDelivery::Closed => self.publisher.on_engine(
+                crate::publisher::EngineEvent::Error("Медиадвижок трансляции уже закрыт.".into()),
+                Instant::now(),
+            ),
+            BitrateDelivery::Idle => Vec::new(),
+        }
     }
 
     /// Drain the engine of the current attempt, one bounded batch per tick.
@@ -799,6 +886,12 @@ impl Live {
         // A preflight of a live change is observed the same way: one bounded
         // probe per tick, never a wait for a device.
         self.poll_restart_prep(now, viewer).await?;
+        // A bitrate change that met a full command queue is retried here, so a
+        // burst of ICE/offers cannot lose the newest limit.
+        let pending = self.flush_screen_bitrate();
+        if !pending.is_empty() {
+            self.apply_screen(pending, viewer).await?;
+        }
         let outcomes = self.publisher.tick(now);
         self.apply_screen(outcomes, viewer).await?;
         if viewer_cleared(viewer) {

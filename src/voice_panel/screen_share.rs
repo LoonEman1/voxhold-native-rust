@@ -109,6 +109,11 @@ pub(super) struct ScreenShareUi {
     /// The request of the accepted attempt. A restart prefills from it.
     pub(super) last_request: Option<PublishRequest>,
     pub(super) busy: bool,
+    /// A quality-change preflight of this dialog is pending. Start sets it, the
+    /// worker's `preflighting` update repeats it, and the failure answer, a
+    /// commit or closing the dialog clears it. It survives a stale state that
+    /// clears `busy`, so closing the dialog always cancels the preflight.
+    pub(super) preflight: bool,
     pub(super) error: String,
     pub(super) sharing: Sharing,
     pub(super) preview: Option<Arc<RenderImage>>,
@@ -168,6 +173,7 @@ impl Default for ScreenShareUi {
             restart: false,
             last_request: None,
             busy: false,
+            preflight: false,
             error: String::new(),
             sharing: Sharing::default(),
             preview: None,
@@ -584,6 +590,7 @@ impl VoicePanel {
         self.screen.clear_previews();
         self.screen.open = true;
         self.screen.busy = false;
+        self.screen.preflight = false;
         self.screen.error.clear();
         self.screen.focus_placed = false;
         self.sync_screen_access();
@@ -637,7 +644,13 @@ impl VoicePanel {
             return;
         }
         let restart_open = self.screen.restart;
-        let restart_busy = restart_open && self.screen.busy;
+        // A preflight is pending as soon as this dialog asked for a restart,
+        // even when a stale state already cleared `busy` and the worker's
+        // `preflighting` update has not landed. Closing must cancel it: the
+        // live stream was never stopped and must stay up.
+        let preflight_pending =
+            restart_open && (self.screen.preflight || self.screen.sharing.preflighting);
+        let restart_busy = restart_open && (self.screen.busy || preflight_pending);
         // The live publication existed before this dialog; closing it without
         // a committed change must leave the stream untouched. A restart only
         // commits once the publisher confirmed the stop; while its preflight
@@ -650,6 +663,7 @@ impl VoicePanel {
         self.screen.open = false;
         self.screen.restart = false;
         self.screen.busy = false;
+        self.screen.preflight = false;
         self.screen.error.clear();
         self.screen.selected = None;
         // No row of this dialog may survive into the next picker. The
@@ -768,6 +782,8 @@ impl VoicePanel {
         };
         source_ready
             && !self.screen.busy
+            && !self.screen.preflight
+            && !self.screen.sharing.preflighting
             && !Codec::available().is_empty()
             && self.screen.audio_availability.is_some()
             && (!self.screen.restart || self.screen.sharing.phase == Phase::Live)
@@ -860,10 +876,12 @@ impl VoicePanel {
             return;
         };
         let slot_available = self.active_publishers_in_room() < MAX_CHANNEL_PUBLISHERS;
+        let live_bitrate =
+            self.screen.restart && self.screen.restart_change() == Some(QualityChange::LiveBitrate);
         if self.screen.restart {
             // A bitrate-only change goes to the live sender; the worker
             // repeats the classification before it applies anything.
-            if self.screen.restart_change() == Some(QualityChange::LiveBitrate) {
+            if live_bitrate {
                 handle.apply_screen_quality(request.clone(), self.can_stream, slot_available);
             } else {
                 handle.restart_screen_share(request.clone(), self.can_stream, slot_available);
@@ -878,6 +896,12 @@ impl VoicePanel {
         }
         self.screen.last_request = Some(request);
         self.screen.busy = true;
+        // A restart without a live bitrate starts a preflight; closing the
+        // dialog while it runs must cancel it instead of stopping the stream.
+        self.screen.preflight = self.screen.restart && !live_bitrate;
+        // The previous attempt's error belongs to its own answer. A stale
+        // `Sharing` snapshot must not turn this Start into an instant failure.
+        self.screen.sharing.error = None;
         self.screen.error.clear();
         // A new publication replaces the old state, so the notice about the
         // broadcast a rotation stopped no longer describes this room.
@@ -952,21 +976,34 @@ impl VoicePanel {
                     self.screen.open = false;
                     self.screen.restart = false;
                     self.screen.busy = false;
+                    self.screen.preflight = false;
                     self.screen.clear_previews();
+                }
+                if self.screen.sharing.preflighting {
+                    // The worker confirmed the preflight of this dialog. Keep
+                    // the dialog (and its cancel intent) alive even when a
+                    // stale state cleared `busy` in between.
+                    self.screen.preflight = true;
+                    self.screen.busy = true;
                 }
                 // A failed preflight keeps the dialog open with its reason:
                 // nothing was stopped and the user may correct the settings.
+                // Only a preflight this dialog really started may end `busy`; a
+                // stale stats sample with the previous error must not.
                 let preflight_failed = phase == Phase::Live
+                    && self.screen.preflight
                     && self.screen.busy
                     && !self.screen.sharing.restarting
                     && !self.screen.sharing.preflighting
                     && self.screen.sharing.error.is_some();
                 if preflight_failed {
                     self.screen.busy = false;
+                    self.screen.preflight = false;
                     self.screen.error = self.screen.sharing.error.clone().unwrap_or_default();
                 }
                 if phase == Phase::Idle || phase == Phase::Failed {
                     self.screen.restart = false;
+                    self.screen.preflight = false;
                 }
                 if matches!(phase, Phase::Publishing | Phase::Live)
                     && self.screen.open
@@ -982,6 +1019,7 @@ impl VoicePanel {
                     // preflight keeps the dialog open so closing it cancels.
                     self.screen.open = false;
                     self.screen.busy = false;
+                    self.screen.preflight = false;
                     self.screen.focus_placed = false;
                     self.screen.clear_previews();
                 }

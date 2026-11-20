@@ -11,6 +11,13 @@ use std::time::Instant;
 
 use super::{Outcome, Phase, PublishRequest, Publisher, QualityChange, STOP_TIMEOUT};
 
+/// The status of a live bitrate change that the sender really received.
+const BITRATE_APPLIED_STATUS: &str = "Битрейт обновлён в эфире.";
+/// The bounded command queue of the worker was momentarily full. The value is
+/// retried on the next tick; nothing failed and the previous limit still
+/// applies until then.
+const BITRATE_QUEUED_STATUS: &str = "Применяем новый битрейт…";
+
 impl Publisher {
     /// The request of the current attempt, as the live sender received it.
     pub fn request(&self) -> Option<&PublishRequest> {
@@ -40,7 +47,7 @@ impl Publisher {
         let quality = request.quality;
         self.request = Some(request);
         self.error = None;
-        self.status = "Битрейт обновлён в эфире.".into();
+        self.status = BITRATE_APPLIED_STATUS.into();
         vec![
             Outcome::SetBitrate {
                 attempt: self.attempt,
@@ -48,6 +55,28 @@ impl Publisher {
             },
             Outcome::State(self.sharing()),
         ]
+    }
+
+    /// The bounded command queue of the live worker was full, so the newest
+    /// quality is still pending. This is not a failure: no `stream.stop`, no
+    /// `Phase::Failed`, and the previous limit keeps applying until the retry.
+    pub fn bitrate_queued(&mut self) -> Vec<Outcome> {
+        if self.phase != Phase::Live || self.status == BITRATE_QUEUED_STATUS {
+            return Vec::new();
+        }
+        self.status = BITRATE_QUEUED_STATUS.into();
+        self.error = None;
+        vec![Outcome::State(self.sharing())]
+    }
+
+    /// The retried limit reached the worker of the live attempt.
+    pub fn bitrate_applied(&mut self) -> Vec<Outcome> {
+        if self.phase != Phase::Live || self.status == BITRATE_APPLIED_STATUS {
+            return Vec::new();
+        }
+        self.status = BITRATE_APPLIED_STATUS.into();
+        self.error = None;
+        vec![Outcome::State(self.sharing())]
     }
 
     /// A restart preflight started. The live stream keeps running and no

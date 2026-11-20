@@ -688,6 +688,76 @@ fn a_cached_repaint_does_not_confirm_a_recovering_stream() {
 }
 
 #[test]
+fn a_full_bitrate_queue_defers_the_newest_value_and_a_closed_worker_is_terminal() {
+    use crate::publisher::Quality;
+    use crate::publisher::engine::BitrateSend;
+
+    let mut queue = super::screen::BitrateQueue::default();
+    let first = Quality {
+        bitrate_kbps: 1200,
+        ..Quality::default()
+    };
+    queue.request(4, first);
+    assert_eq!(
+        queue.flush(4, |_| BitrateSend::Full),
+        super::screen::BitrateDelivery::Full,
+        "a full command queue is deferred, not failed"
+    );
+    assert!(
+        queue.is_pending(),
+        "the deferred value must survive for the next tick"
+    );
+
+    // The newest dialog value replaces the deferred one; only it is sent.
+    let newest = Quality {
+        bitrate_kbps: 900,
+        ..Quality::default()
+    };
+    queue.request(4, newest);
+    let mut sent = None;
+    assert_eq!(
+        queue.flush(4, |quality| {
+            sent = Some(quality);
+            BitrateSend::Sent
+        }),
+        super::screen::BitrateDelivery::Sent
+    );
+    assert_eq!(
+        sent.map(|quality| quality.bitrate_kbps),
+        Some(900),
+        "the retry carries the newest value, not the first one"
+    );
+    assert!(
+        !queue.is_pending(),
+        "an accepted value is no longer pending"
+    );
+
+    // A request that belongs to an older attempt never reaches a new sender.
+    queue.request(3, newest);
+    assert_eq!(
+        queue.flush(4, |_| panic!("a stale attempt must not be sent")),
+        super::screen::BitrateDelivery::Idle
+    );
+    assert!(!queue.is_pending());
+
+    // A closed worker is terminal: the value is dropped, not retried, and the
+    // publisher ends the live attempt instead of claiming the new limit.
+    queue.request(4, newest);
+    assert_eq!(
+        queue.flush(4, |_| BitrateSend::Closed),
+        super::screen::BitrateDelivery::Closed
+    );
+    assert!(
+        !queue.is_pending(),
+        "a dead worker must not be retried forever"
+    );
+    assert_eq!(
+        queue.flush(4, |_| panic!("nothing may be retried")),
+        super::screen::BitrateDelivery::Idle
+    );
+}
+
+#[test]
 fn a_pending_viewer_switch_is_left_before_the_screen_publication() {
     use crate::publisher::Outcome as PublisherOutcome;
     let now = Instant::now();

@@ -354,6 +354,19 @@ enum Command {
     Stop,
 }
 
+/// Answer of one live bitrate command.
+///
+/// `Full` is a burst of the bounded command queue, not a dead worker: the
+/// runtime keeps the newest quality and retries it on the next tick, and the
+/// sender keeps the previous limit until the retry succeeds. Only `Closed`
+/// means the worker and its capture are gone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BitrateSend {
+    Sent,
+    Full,
+    Closed,
+}
+
 /// Non-blocking handle of one publishing engine. Dropping it releases the
 /// capture and closes the peer.
 pub struct PublisherEngine {
@@ -564,14 +577,11 @@ impl PublisherEngine {
     ///
     /// No offer, answer or `stream.start` is involved: the worker applies the
     /// same `RtpSender::set_parameters` + `PeerConnection::set_bitrate` path
-    /// that the initial answer used. An error means the engine worker is gone,
-    /// which the caller must report instead of claiming a live change.
-    pub fn set_bitrate(&self, quality: Quality) -> Result<(), String> {
-        self.commands
-            .as_ref()
-            .ok_or_else(|| "Медиадвижок трансляции уже закрыт.".to_string())?
-            .try_send(Command::Bitrate(quality))
-            .map_err(|_| "Медиадвижок трансляции не принимает команды.".to_string())
+    /// that the initial answer used. A `Full` command queue is a burst, not a
+    /// failed worker: the caller retries the newest quality instead of ending
+    /// the attempt.
+    pub fn set_bitrate(&self, quality: Quality) -> BitrateSend {
+        send_bitrate(self.commands.as_ref(), quality)
     }
 
     /// The limits the worker really handed to the negotiated senders.
@@ -630,6 +640,20 @@ fn join_bounded(thread: std::thread::JoinHandle<()>, timeout: Duration) {
         std::thread::sleep(Duration::from_millis(5));
     }
     let _ = thread.join();
+}
+
+/// Hand one live bitrate change to the bounded worker queue. Only a closed
+/// channel proves that the worker is gone; a full queue is a burst that must be
+/// retried with the newest quality.
+fn send_bitrate(commands: Option<&mpsc::Sender<Command>>, quality: Quality) -> BitrateSend {
+    let Some(commands) = commands else {
+        return BitrateSend::Closed;
+    };
+    match commands.try_send(Command::Bitrate(quality)) {
+        Ok(()) => BitrateSend::Sent,
+        Err(mpsc::error::TrySendError::Full(_)) => BitrateSend::Full,
+        Err(mpsc::error::TrySendError::Closed(_)) => BitrateSend::Closed,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -756,6 +780,11 @@ async fn run(
         counters.clone(),
         request.quality,
     ));
+    // The last quality really applied to the live senders. The backend's
+    // `startRecovery` may offer again to a live publisher, so a later answer
+    // must use this value instead of the spawn-time request: otherwise a live
+    // bitrate change is silently reverted by the re-offer.
+    let mut quality = request.quality;
     let _ = ready.send(Ok(()));
 
     let mut remote_set = false;
@@ -802,7 +831,7 @@ async fn run(
                     &sender,
                     audio_sender.as_ref(),
                     &sdp,
-                    request.quality,
+                    quality,
                     &events,
                     Some(&limits),
                 )
@@ -815,14 +844,9 @@ async fn run(
                     add_ice(&peer, candidate).await;
                 }
             }
-            Some(Command::Bitrate(quality)) => {
-                apply_bitrate(
-                    &peer,
-                    &sender,
-                    audio_sender.as_ref(),
-                    quality,
-                    Some(&limits),
-                );
+            Some(Command::Bitrate(next)) => {
+                apply_bitrate(&peer, &sender, audio_sender.as_ref(), next, Some(&limits));
+                quality = next;
             }
             Some(Command::Ice(candidate)) => {
                 if remote_set {
@@ -1100,6 +1124,9 @@ fn ufrag(candidate: &str) -> Option<&str> {
 
 #[cfg(test)]
 mod loopback;
+
+#[cfg(test)]
+mod bitrate_tests;
 
 #[cfg(test)]
 mod audio_tests;

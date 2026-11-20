@@ -599,3 +599,84 @@ async fn a_failed_preflight_keeps_live_and_shows_the_error(cx: &mut TestAppConte
         });
     });
 }
+
+/// After an earlier preflight failure, the dialog's next Apply must keep its
+/// cancel intent. A stale stats sample of the previous answer can clear `busy`,
+/// and the worker's `preflighting` update may land only afterwards; closing the
+/// dialog must still cancel the preflight and leave the live stream untouched.
+#[gpui::test]
+async fn a_preflight_cancel_survives_a_stale_failure_state_and_keeps_live(cx: &mut TestAppContext) {
+    let (mut visual, _view, voice) = super::voice_tests::fixture(cx);
+    draw(&mut visual);
+    let live = window(11, "Документ");
+    visual.update(|_window, app| {
+        voice.update(app, |panel, cx| {
+            open_quality_dialog(panel, live.clone(), Quality::default(), false, cx);
+            panel.test_set_screen_resolution(voxhold_media::publisher::Resolution::P720, cx);
+
+            // The first Apply fails: the dialog stays open with the reason.
+            panel.test_start_screen_share(cx);
+            assert_eq!(panel.test_take_screen_commands(), vec![("restart", 0)]);
+            let failed = Sharing {
+                preflighting: false,
+                error: Some("Новая настройка не открылась.".into()),
+                status: "Новая настройка не открылась.".into(),
+                ..sharing_with(Quality::default(), false)
+            };
+            assert!(panel.test_apply_screen_sharing(failed.clone()));
+            assert!(!panel.screen_share_busy());
+            assert!(panel.screen_share_open());
+            assert!(panel.test_screen_error().contains("не открылась"));
+
+            // Apply again. Start must drop the previous attempt's reason.
+            panel.test_start_screen_share(cx);
+            assert_eq!(panel.test_take_screen_commands(), vec![("restart", 0)]);
+            assert!(panel.screen_share_busy());
+            assert!(
+                panel.test_screen_sharing().error.is_none(),
+                "Start clears the stale sharing error: {:?}",
+                panel.test_screen_sharing().error
+            );
+            assert!(!panel.test_screen_error().contains("не открылась"));
+
+            // A stale stats sample of the *previous* answer lands after the
+            // click. It may clear `busy`, but it is not the new answer and it
+            // must not stop or close anything.
+            assert!(panel.test_apply_screen_sharing(failed));
+            assert!(
+                panel.screen_share_open(),
+                "a stale state must not close the dialog"
+            );
+            assert_eq!(panel.test_screen_phase(), Phase::Live);
+            assert!(
+                panel.test_take_screen_commands().is_empty(),
+                "a stale state must not send stream.stop"
+            );
+
+            // The worker's preflight update lands afterwards. The dialog keeps
+            // its cancel intent, and Start is refused while it runs.
+            let preflighting = Sharing {
+                preflighting: true,
+                status: "Проверяем новую настройку…".into(),
+                ..sharing_with(Quality::default(), false)
+            };
+            assert!(panel.test_apply_screen_sharing(preflighting));
+            assert!(panel.screen_share_open());
+            assert!(panel.test_screen_sharing().preflighting);
+            assert!(
+                !panel.test_can_start(),
+                "Start cannot run a second preflight"
+            );
+
+            // Closing cancels the pending preflight; Live is untouched.
+            panel.test_close_screen_share(cx);
+            assert!(!panel.screen_share_open());
+            assert_eq!(
+                panel.test_take_screen_commands(),
+                vec![("cancel-restart", 0)],
+                "closing during a preflight must cancel it"
+            );
+            assert_eq!(panel.test_screen_phase(), Phase::Live);
+        });
+    });
+}

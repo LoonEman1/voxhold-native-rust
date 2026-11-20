@@ -251,6 +251,7 @@ impl Voxhold {
         if let Some(pending) = self.pending_sends.remove(&key) {
             pending.abort.abort();
         }
+        self.unconfirmed_sends.remove(&key);
         self.drafts.borrow_mut().clear(key);
     }
 
@@ -286,6 +287,7 @@ impl Voxhold {
         if let Some(pending) = self.pending_sends.remove(&key) {
             pending.abort.abort();
         }
+        self.unconfirmed_sends.remove(&key);
         self.drafts.borrow_mut().clear(key);
         self.conversations_reconcile = None;
         self.messaging.notifications = None;

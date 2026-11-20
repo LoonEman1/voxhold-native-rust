@@ -933,6 +933,7 @@ async fn paste_and_drop_add_only_metadata_to_the_draft(cx: &mut TestAppContext) 
 
 mod auth_session_tests;
 mod cf_01_heartbeat;
+mod cf_02_send_ack;
 mod fixes;
 mod followup;
 mod followup2;

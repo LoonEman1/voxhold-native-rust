@@ -112,10 +112,13 @@ use ui::{icon, ink};
 type HistoryKey = (i64, i64, i64, String, bool, bool, u64);
 
 /// One in-flight send for a chat. The attempt number distinguishes two sends
-/// of the same chat; the abort handle stops the runtime task on logout.
+/// of the same chat; the abort handle stops the runtime task on logout. The
+/// plan snapshot lets an own `message.created`/`conversation.message` echo
+/// complete the same attempt the HTTP answer would.
 struct PendingSend {
     attempt: u64,
     abort: tokio::task::AbortHandle,
+    plan: draft::SendPlan,
 }
 
 /// One runtime preview request. The generation is the dialog preview scope; an
@@ -481,6 +484,11 @@ pub(crate) struct Voxhold {
     /// One confirmed send in flight per chat. The runtime task is aborted on
     /// logout, so no POST starts after the session ended.
     pending_sends: std::collections::HashMap<draft::ChatKey, PendingSend>,
+    /// The last POST of a chat whose outcome is unknown (a network error or a
+    /// `504`). Its plan is kept because a later own WebSocket echo can still
+    /// confirm it and consume the draft. A new send of the same chat replaces
+    /// the entry, so the old attempt cannot clear the new composition's key.
+    unconfirmed_sends: std::collections::HashMap<draft::ChatKey, draft::SendPlan>,
     /// Monotonic id of the latest send, stored in `PendingSend::attempt`.
     send_attempt: u64,
     /// Changes on login and logout; a send result from another session is
@@ -534,6 +542,7 @@ impl Drop for Voxhold {
         for (_, pending) in self.pending_sends.drain() {
             pending.abort.abort();
         }
+        self.unconfirmed_sends.clear();
         self.stop_session_clock();
         self.stop_realtime();
     }
@@ -835,6 +844,7 @@ impl Voxhold {
             error: String::new(),
             composer_error: String::new(),
             pending_sends: Default::default(),
+            unconfirmed_sends: Default::default(),
             send_attempt: 0,
             session_generation: 0,
             active_profile_save: None,

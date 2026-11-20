@@ -119,8 +119,14 @@ impl Voxhold {
                 .await
         });
         let abort = task.abort_handle();
-        self.pending_sends
-            .insert(plan.key, PendingSend { attempt, abort });
+        self.pending_sends.insert(
+            plan.key,
+            PendingSend {
+                attempt,
+                abort,
+                plan: plan.clone(),
+            },
+        );
         cx.spawn_in(window, async move |this, window| {
             let result = match task.await {
                 Ok(result) => result,

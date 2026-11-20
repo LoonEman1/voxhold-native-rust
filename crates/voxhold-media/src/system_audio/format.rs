@@ -60,12 +60,18 @@ impl SourceFormat {
     }
 }
 
-/// Stateful because resampling must keep the fractional position and the last
-/// frame across WASAPI packets.
+/// Stateful streaming resampler. It keeps the fractional position and the last
+/// frame across WASAPI packets, so an output sample that interpolates across a
+/// packet boundary waits for the next packet instead of restarting the phase.
 pub(super) struct Converter {
     format: SourceFormat,
     step: f64,
-    position: f64,
+    /// Absolute position of the next output sample, in input frames. It only
+    /// grows by `step`, so splitting the same input into packets produces the
+    /// same sequence of positions as one conversion.
+    time: f64,
+    /// Absolute number of input frames already handed to the converter.
+    frames: u64,
     previous: Option<[f32; 2]>,
 }
 
@@ -79,7 +85,8 @@ impl Converter {
         Self {
             format,
             step,
-            position: 0.0,
+            time: 0.0,
+            frames: 0,
             previous: None,
         }
     }
@@ -96,129 +103,174 @@ impl Converter {
             return;
         }
         if silent {
-            let produced = self.advance(frames);
-            out.extend(std::iter::repeat_n(0, produced * 2));
-            self.previous = Some([0.0, 0.0]);
+            // The payload of a silent packet is undefined; the real frame count
+            // still advances the same time axis as a normal packet.
+            self.resample(frames, |_| [0.0, 0.0], out);
             return;
         }
-        let mut decoded = Vec::with_capacity(frames);
-        for frame in 0..frames {
-            let base = frame * frame_bytes;
-            decoded.push(self.decode(&bytes[base..base + frame_bytes]));
+        let format = self.format;
+        self.resample(
+            frames,
+            |frame| {
+                decode(
+                    &format,
+                    &bytes[frame * frame_bytes..(frame + 1) * frame_bytes],
+                )
+            },
+            out,
+        );
+    }
+
+    /// Advance through a silent packet that has no usable payload at all.
+    pub(super) fn convert_silence(&mut self, frames: usize, out: &mut Vec<i16>) {
+        if frames == 0 {
+            return;
         }
-        let mut position = self.position;
-        while position < frames as f64 {
-            let index = position.floor() as usize;
-            let fraction = (position - index as f64) as f32;
-            let first = if index == 0 {
-                self.previous.unwrap_or(decoded[0])
+        self.resample(frames, |_| [0.0, 0.0], out);
+    }
+
+    /// One packet of the streaming resampler. Output sample `k` sits at
+    /// `time` on the absolute input frame axis and interpolates between the two
+    /// surrounding frames. If the right frame is the first frame of the next
+    /// packet, the sample is left in `time` and finished there; that keeps the
+    /// phase continuous across packet boundaries. Frame −1 is the carried last
+    /// frame of the previous packet.
+    fn resample(
+        &mut self,
+        packet_frames: usize,
+        mut frame: impl FnMut(usize) -> [f32; 2],
+        out: &mut Vec<i16>,
+    ) {
+        let base = self.frames;
+        let end = base + packet_frames as u64;
+        let last_local = (packet_frames - 1) as i64;
+        let mut time = self.time;
+        while time < end as f64 {
+            let index = time.floor();
+            let local = index as i64 - base as i64;
+            let fraction = (time - index) as f32;
+            if fraction > 0.0 && local + 1 > last_local {
+                // The right endpoint belongs to the next packet.
+                break;
+            }
+            let first = if local < 0 {
+                // Frame −1 is the last frame of the previous packet.
+                self.previous.unwrap_or_else(|| frame(0))
             } else {
-                decoded[index]
+                frame((local as usize).min(packet_frames - 1))
             };
-            let second = decoded.get(index + 1).copied().unwrap_or(first);
+            let second = if fraction == 0.0 || local + 1 < 0 {
+                // An integral position only needs the left frame. This is the
+                // 48 kHz case, which stays a direct sample-for-sample copy.
+                first
+            } else {
+                frame((local + 1) as usize)
+            };
             out.push(sample(first[0] + (second[0] - first[0]) * fraction));
             out.push(sample(first[1] + (second[1] - first[1]) * fraction));
-            position += self.step;
+            time += self.step;
         }
-        self.position = position - frames as f64;
-        if self.position < 0.0 {
-            self.position = 0.0;
-        }
-        self.previous = decoded.last().copied();
+        self.time = time;
+        self.frames = end;
+        self.previous = Some(frame(packet_frames - 1));
     }
 
-    fn advance(&mut self, frames: usize) -> usize {
-        let mut position = self.position;
-        let mut produced = 0;
-        while position < frames as f64 {
-            produced += 1;
-            position += self.step;
-        }
-        self.position = (position - frames as f64).max(0.0);
-        produced
-    }
-
-    fn decode(&self, frame: &[u8]) -> [f32; 2] {
-        if self.format.channels == 1 {
-            let mono = self.component(frame, 0);
-            return [mono, mono];
-        }
-        let mut left = 0.0_f32;
-        let mut right = 0.0_f32;
-        for channel in 0..self.format.channels as usize {
-            let value = self.component(frame, channel);
-            let (to_left, to_right) = self.weight(channel);
-            left += value * to_left;
-            right += value * to_right;
-        }
-        // A full-scale center plus both fronts can exceed 1.0; clamp here so
-        // the later i16 conversion cannot wrap.
-        [left.clamp(-1.0, 1.0), right.clamp(-1.0, 1.0)]
-    }
-
-    /// Stereo contribution of one source channel. The −3 dB fold-down
-    /// (0.7071) keeps the summed power of a center or surround channel close
-    /// to the original instead of doubling it.
-    fn weight(&self, channel: usize) -> (f32, f32) {
-        let bit = if self.format.mask == 0 {
-            fallback_speaker(self.format.channels, channel)
-        } else {
-            speaker_bit(self.format.mask, channel)
+    /// Finish the stream. Only samples whose time is still inside the input are
+    /// emitted; for them a single whole-input conversion holds the final frame,
+    /// so the streamed result matches it exactly.
+    pub(super) fn flush(&mut self, out: &mut Vec<i16>) {
+        let Some(last) = self.previous else {
+            return;
         };
-        match bit {
-            SPEAKER_FRONT_LEFT | SPEAKER_FRONT_LEFT_OF_CENTER => (1.0, 0.0),
-            SPEAKER_FRONT_RIGHT | SPEAKER_FRONT_RIGHT_OF_CENTER => (0.0, 1.0),
-            SPEAKER_FRONT_CENTER => (0.707_106_77, 0.707_106_77),
-            // LFE is deliberately absent: it carries effects, not dialog,
-            // and mixing it into stereo mostly steals headroom.
-            SPEAKER_LOW_FREQUENCY => (0.0, 0.0),
-            SPEAKER_BACK_LEFT
-            | SPEAKER_SIDE_LEFT
-            | SPEAKER_TOP_FRONT_LEFT
-            | SPEAKER_TOP_BACK_LEFT => (0.707_106_77, 0.0),
-            SPEAKER_BACK_RIGHT
-            | SPEAKER_SIDE_RIGHT
-            | SPEAKER_TOP_FRONT_RIGHT
-            | SPEAKER_TOP_BACK_RIGHT => (0.0, 0.707_106_77),
-            SPEAKER_BACK_CENTER => (0.5, 0.5),
-            SPEAKER_TOP_CENTER => (0.5, 0.5),
-            SPEAKER_TOP_FRONT_CENTER | SPEAKER_TOP_BACK_CENTER => (0.353_553_38, 0.353_553_38),
-            // An unknown speaker or a channel beyond the mask contributes
-            // nothing; the alternative is guessing and misplacing audio.
-            _ => (0.0, 0.0),
+        while self.time < self.frames as f64 {
+            out.push(sample(last[0]));
+            out.push(sample(last[1]));
+            self.time += self.step;
         }
     }
+}
 
-    /// One channel of one frame, without a per-frame allocation.
-    fn component(&self, frame: &[u8], channel: usize) -> f32 {
-        let bytes = (self.format.bits as usize / 8).max(1);
-        let start = channel * bytes;
-        let Some(slice) = frame.get(start..start + bytes) else {
-            return 0.0;
-        };
-        match self.format.bits {
-            16 => f32::from(i16::from_le_bytes([slice[0], slice[1]])) / 32_768.0,
-            24 => {
-                // 24-bit PCM is packed in three little-endian bytes. Bit 23
-                // is the sign, so the raw value needs explicit sign extension.
-                let raw =
-                    i32::from(slice[0]) | (i32::from(slice[1]) << 8) | (i32::from(slice[2]) << 16);
-                let value = if raw & 0x80_0000 != 0 {
-                    raw - 0x100_0000
-                } else {
-                    raw
-                };
-                value as f32 / 8_388_608.0
-            }
-            32 if self.format.float => {
-                f32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]).clamp(-1.0, 1.0)
-            }
-            32 => {
-                let value = i32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]);
-                value as f32 / 2_147_483_648.0
-            }
-            _ => 0.0,
+/// Down-mix one source frame into stereo. Mono is duplicated; everything else
+/// is folded by [`weight`] and clamped so the i16 conversion cannot wrap.
+fn decode(format: &SourceFormat, frame: &[u8]) -> [f32; 2] {
+    if format.channels == 1 {
+        let mono = component(format, frame, 0);
+        return [mono, mono];
+    }
+    let mut left = 0.0_f32;
+    let mut right = 0.0_f32;
+    for channel in 0..format.channels as usize {
+        let value = component(format, frame, channel);
+        let (to_left, to_right) = weight(format, channel);
+        left += value * to_left;
+        right += value * to_right;
+    }
+    // A full-scale center plus both fronts can exceed 1.0; clamp here so
+    // the later i16 conversion cannot wrap.
+    [left.clamp(-1.0, 1.0), right.clamp(-1.0, 1.0)]
+}
+
+/// Stereo contribution of one source channel. The −3 dB fold-down
+/// (0.7071) keeps the summed power of a center or surround channel close
+/// to the original instead of doubling it.
+fn weight(format: &SourceFormat, channel: usize) -> (f32, f32) {
+    let bit = if format.mask == 0 {
+        fallback_speaker(format.channels, channel)
+    } else {
+        speaker_bit(format.mask, channel)
+    };
+    match bit {
+        SPEAKER_FRONT_LEFT | SPEAKER_FRONT_LEFT_OF_CENTER => (1.0, 0.0),
+        SPEAKER_FRONT_RIGHT | SPEAKER_FRONT_RIGHT_OF_CENTER => (0.0, 1.0),
+        SPEAKER_FRONT_CENTER => (0.707_106_77, 0.707_106_77),
+        // LFE is deliberately absent: it carries effects, not dialog,
+        // and mixing it into stereo mostly steals headroom.
+        SPEAKER_LOW_FREQUENCY => (0.0, 0.0),
+        SPEAKER_BACK_LEFT | SPEAKER_SIDE_LEFT | SPEAKER_TOP_FRONT_LEFT | SPEAKER_TOP_BACK_LEFT => {
+            (0.707_106_77, 0.0)
         }
+        SPEAKER_BACK_RIGHT
+        | SPEAKER_SIDE_RIGHT
+        | SPEAKER_TOP_FRONT_RIGHT
+        | SPEAKER_TOP_BACK_RIGHT => (0.0, 0.707_106_77),
+        SPEAKER_BACK_CENTER => (0.5, 0.5),
+        SPEAKER_TOP_CENTER => (0.5, 0.5),
+        SPEAKER_TOP_FRONT_CENTER | SPEAKER_TOP_BACK_CENTER => (0.353_553_38, 0.353_553_38),
+        // An unknown speaker or a channel beyond the mask contributes
+        // nothing; the alternative is guessing and misplacing audio.
+        _ => (0.0, 0.0),
+    }
+}
+
+/// One channel of one frame, without a per-frame allocation.
+fn component(format: &SourceFormat, frame: &[u8], channel: usize) -> f32 {
+    let bytes = (format.bits as usize / 8).max(1);
+    let start = channel * bytes;
+    let Some(slice) = frame.get(start..start + bytes) else {
+        return 0.0;
+    };
+    match format.bits {
+        16 => f32::from(i16::from_le_bytes([slice[0], slice[1]])) / 32_768.0,
+        24 => {
+            // 24-bit PCM is packed in three little-endian bytes. Bit 23
+            // is the sign, so the raw value needs explicit sign extension.
+            let raw =
+                i32::from(slice[0]) | (i32::from(slice[1]) << 8) | (i32::from(slice[2]) << 16);
+            let value = if raw & 0x80_0000 != 0 {
+                raw - 0x100_0000
+            } else {
+                raw
+            };
+            value as f32 / 8_388_608.0
+        }
+        32 if format.float => {
+            f32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]).clamp(-1.0, 1.0)
+        }
+        32 => {
+            let value = i32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]);
+            value as f32 / 2_147_483_648.0
+        }
+        _ => 0.0,
     }
 }
 
@@ -375,6 +427,7 @@ mod tests {
         }
         let mut out = Vec::new();
         converter.convert(&pcm16_mono(&left), false, &mut out);
+        converter.flush(&mut out);
         assert!(
             (480..=481).contains(&(out.len() / 2)),
             "one 10 ms output block at 48 kHz, got {}",
@@ -518,6 +571,151 @@ mod tests {
         let mut out = Vec::new();
         converter.convert(&bytes[..3], false, &mut out);
         assert!((out[0] as i32 - 16_384).abs() <= 1);
+    }
+
+    /// Convert mono input split into packets of the given sizes, flushing the
+    /// end of the stream like a real capture does on shutdown.
+    fn streamed(format: SourceFormat, input: &[i16], chunks: &[usize]) -> Vec<i16> {
+        let mut converter = Converter::new(format);
+        let mut out = Vec::new();
+        let mut offset = 0;
+        let mut chunk = 0;
+        while offset < input.len() {
+            let size = chunks[chunk % chunks.len()]
+                .max(1)
+                .min(input.len() - offset);
+            converter.convert(&pcm16_mono(&input[offset..offset + size]), false, &mut out);
+            offset += size;
+            chunk += 1;
+        }
+        converter.flush(&mut out);
+        out
+    }
+
+    fn whole(format: SourceFormat, input: &[i16]) -> Vec<i16> {
+        streamed(format, input, &[input.len().max(1)])
+    }
+
+    #[test]
+    fn packet_boundaries_match_one_whole_conversion() {
+        let input: Vec<i16> = (0..2_001)
+            .map(|index| ((index * 337) % 4_001) as i16 - 2_000)
+            .collect();
+        for rate in [SAMPLE_RATE, 44_100] {
+            let format = pcm16_format(rate, 1);
+            let reference = whole(format, &input);
+            for chunks in [
+                &[1_usize][..],
+                &[7, 64, 333, 5][..],
+                &[480, 17][..],
+                &[input.len()][..],
+            ] {
+                assert_eq!(
+                    streamed(format, &input, chunks),
+                    reference,
+                    "{rate} Hz differs when split into {chunks:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_impulse_on_a_packet_boundary_interpolates_across_packets() {
+        let rate = 44_100;
+        let boundary = 441; // 10 ms at 44.1 kHz
+        let mut input = vec![0_i16; boundary * 2];
+        input[boundary] = 16_000;
+        let format = pcm16_format(rate, 1);
+        let reference = whole(format, &input);
+        let split = streamed(format, &input, &[boundary, boundary]);
+        assert_eq!(split, reference, "a boundary impulse must not be smeared");
+
+        let step = f64::from(rate) / f64::from(SAMPLE_RATE);
+        let output_index = (f64::from(boundary as u32) / step).round() as usize;
+        let window = &split[(output_index - 2) * 2..(output_index + 3) * 2];
+        assert!(
+            window.iter().any(|sample| *sample != 0),
+            "the impulse on the packet boundary was lost"
+        );
+        assert!(
+            split.chunks(2).any(|pair| pair[0] > 0 && pair[0] < 16_000),
+            "no sample interpolates between the silent packet and the impulse"
+        );
+    }
+
+    #[test]
+    fn a_silent_packet_keeps_the_time_axis_for_the_next_signal() {
+        for rate in [SAMPLE_RATE, 44_100] {
+            let boundary = if rate == SAMPLE_RATE { 480 } else { 441 };
+            let format = pcm16_format(rate, 1);
+            let signal: Vec<i16> = (0..boundary)
+                .map(|index| ((index % 200) as i16 + 1) * 40)
+                .collect();
+            let mut input = vec![0_i16; boundary];
+            input.extend_from_slice(&signal);
+            let reference = whole(format, &input);
+
+            let mut converter = Converter::new(format);
+            let mut out = Vec::new();
+            converter.convert_silence(boundary, &mut out);
+            converter.convert(&pcm16_mono(&signal), false, &mut out);
+            converter.flush(&mut out);
+
+            assert_eq!(
+                out, reference,
+                "{rate} Hz silence → signal differs from one whole conversion"
+            );
+            assert!(
+                out.iter().any(|sample| *sample != 0),
+                "the signal after the silent packet must reach the output"
+            );
+            if rate != SAMPLE_RATE {
+                assert!(
+                    out.chunks(2).any(|pair| pair[0] > 0 && pair[0] < signal[0]),
+                    "the transition must interpolate out of silence"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn end_of_stream_flushes_only_samples_inside_the_input() {
+        let frames = 100_usize;
+        let format = pcm16_format(44_100, 1);
+        let input: Vec<i16> = (0..frames).map(|index| index as i16).collect();
+        let step = 44_100.0 / 48_000.0;
+        let expected = {
+            let mut count = 0;
+            while (count as f64) * step < frames as f64 {
+                count += 1;
+            }
+            count
+        };
+
+        let mut converter = Converter::new(format);
+        let mut out = Vec::new();
+        converter.convert(&pcm16_mono(&input), false, &mut out);
+        assert!(
+            out.len() / 2 < expected,
+            "the sample that needs the next packet must stay deferred"
+        );
+        converter.flush(&mut out);
+        assert_eq!(out.len() / 2, expected);
+        assert_eq!(
+            &out[out.len() - 2..],
+            &[frames as i16 - 1, frames as i16 - 1],
+            "the flush holds the final frame like a whole-input conversion"
+        );
+        let before = out.len();
+        converter.flush(&mut out);
+        assert_eq!(out.len(), before, "a second flush cannot invent samples");
+
+        // 48 kHz has no deferred sample: every input frame is already exact.
+        let mut exact = Converter::new(pcm16_format(SAMPLE_RATE, 1));
+        let mut out = Vec::new();
+        exact.convert(&pcm16_mono(&[1, 2, 3]), false, &mut out);
+        exact.flush(&mut out);
+        assert_eq!(out, vec![1, 1, 2, 2, 3, 3]);
     }
 
     fn goertzel(samples: &[i16], frequency: f32) -> f32 {

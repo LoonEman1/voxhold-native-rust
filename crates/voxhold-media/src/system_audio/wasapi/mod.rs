@@ -9,7 +9,10 @@
 //! that refuses it is an explicit error, never a whole-device capture.
 //!
 //! A device that disappears or becomes the non-default endpoint is reopened
-//! with a bounded retry count. Every wait and join here has a deadline.
+//! with a bounded retry budget. An open failure and a client that is
+//! invalidated right after opening both spend the same budget; it resets only
+//! after a session polled the client for a stable window, so a silent device
+//! counts as healthy. Every wait and join here has a deadline.
 
 use std::{
     ffi::c_void,
@@ -60,6 +63,19 @@ use super::{
     join_bounded, push_block,
 };
 
+mod retry;
+
+use retry::{Health, SessionEnd};
+
+/// Open and capture until the publication stops or the retry budget is spent.
+pub(super) fn run(
+    shared: &Arc<Shared>,
+    ready: &mpsc::Sender<Result<AudioDeviceInfo, String>>,
+    scope: CaptureScope,
+) {
+    retry::run(shared, ready, scope);
+}
+
 const WAVE_FORMAT_EXTENSIBLE: u16 = 0xFFFE;
 const WAVE_FORMAT_IEEE_FLOAT: u16 = 3;
 const KSDATAFORMAT_SUBTYPE_PCM: GUID = GUID::from_u128(0x0000_0001_0000_0010_8000_00aa_0038_9b71);
@@ -69,8 +85,6 @@ const KSDATAFORMAT_SUBTYPE_IEEE_FLOAT: GUID =
 /// latency and memory bounded.
 const BUFFER_DURATION: i64 = 2_000_000;
 const POLL: Duration = Duration::from_millis(5);
-const REOPEN_DELAY: Duration = Duration::from_millis(300);
-const MAX_REOPEN: u8 = 3;
 const DEVICE_CHECK: Duration = Duration::from_secs(2);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 /// Process-loopback activation runs on a COM worker; a host that never answers
@@ -589,22 +603,33 @@ fn map_capture_error(error: windows::core::Error) -> Failure {
     }
 }
 
-fn capture(shared: &Shared, opened: &Opened) -> Failure {
+/// One capture session. It reports how it ended; the retry policy in
+/// [`retry`] decides whether the session proved itself stable.
+fn capture(shared: &Shared, opened: &Opened) -> SessionEnd {
+    // A fresh converter for every client: a reopen starts a new time axis, and
+    // the old fractional position must not leak into a different device.
     let mut converter = Converter::new(opened.format);
     let mut scratch = Vec::with_capacity(BLOCK_SAMPLES * 4);
     let mut blocks = BlockBuffer::default();
     let mut next_device_check = Instant::now() + DEVICE_CHECK;
+    let mut health = Health::new(Instant::now());
     loop {
         if shared.stopping() {
-            return Failure::Reopen("остановлено".into());
+            // End of stream: finish the sample that was waiting for the next
+            // packet so the tail matches a whole-input conversion.
+            scratch.clear();
+            converter.flush(&mut scratch);
+            blocks.push(&scratch, |block| push_block(shared, block));
+            return SessionEnd::Stopped;
         }
         if Instant::now() >= next_device_check {
             next_device_check = Instant::now() + DEVICE_CHECK;
             if opened.check_default {
                 if let Ok(device) = default_device() {
                     if device_id(&device).is_some_and(|current| current != opened.info.id) {
-                        return Failure::Reopen(
-                            "Устройство вывода по умолчанию изменилось.".into(),
+                        return ended(
+                            Failure::Reopen("Устройство вывода по умолчанию изменилось.".into()),
+                            &mut health,
                         );
                     }
                 }
@@ -612,8 +637,11 @@ fn capture(shared: &Shared, opened: &Opened) -> Failure {
         }
         let packet = match unsafe { opened.capture.GetNextPacketSize() } {
             Ok(packet) => packet,
-            Err(error) => return map_capture_error(error),
+            Err(error) => return ended(map_capture_error(error), &mut health),
         };
+        // A silent endpoint answers this poll with zero packets. The answered
+        // call still proves the client works, so it extends the healthy streak.
+        health.record(Instant::now());
         if packet == 0 {
             thread::sleep(POLL);
             continue;
@@ -626,75 +654,42 @@ fn capture(shared: &Shared, opened: &Opened) -> Failure {
                 .capture
                 .GetBuffer(&mut data, &mut frames, &mut flags, None, None)
         } {
-            return map_capture_error(error);
+            return ended(map_capture_error(error), &mut health);
         }
-        if frames > 0 && !data.is_null() {
-            let bytes = frames as usize * opened.format.frame_bytes();
-            let silent = (flags as i32 & AUDCLNT_BUFFERFLAGS_SILENT.0) != 0;
-            let packet = unsafe { slice::from_raw_parts(data, bytes) };
+        health.record(Instant::now());
+        if frames > 0 {
+            let frames = frames as usize;
             scratch.clear();
-            // With the silent flag the payload is undefined; the converter
-            // advances the timeline and emits zeros without reading it.
-            converter.convert(packet, silent, &mut scratch);
+            let silent = (flags as i32 & AUDCLNT_BUFFERFLAGS_SILENT.0) != 0;
+            if silent {
+                // With the silent flag the payload is undefined; only the
+                // frame count matters, and it advances the same time axis.
+                converter.convert_silence(frames, &mut scratch);
+            } else if !data.is_null() {
+                let bytes = frames * opened.format.frame_bytes();
+                let packet = unsafe { slice::from_raw_parts(data, bytes) };
+                converter.convert(packet, false, &mut scratch);
+            }
             blocks.push(&scratch, |block| push_block(shared, block));
         }
         if let Err(error) = unsafe { opened.capture.ReleaseBuffer(frames) } {
-            return map_capture_error(error);
+            return ended(map_capture_error(error), &mut health);
         }
+        health.record(Instant::now());
     }
 }
 
-pub(super) fn run(
-    shared: &Arc<Shared>,
-    ready: &mpsc::Sender<Result<AudioDeviceInfo, String>>,
-    scope: CaptureScope,
-) {
-    let _com = match Com::init() {
-        Ok(com) => com,
-        Err(error) => {
-            let _ = ready.send(Err(error));
-            return;
-        }
-    };
-    let mut first = true;
-    let mut reopens = 0_u8;
-    loop {
-        if shared.stopping() {
-            return;
-        }
-        match open_scope(scope) {
-            Ok(opened) => {
-                reopens = 0;
-                shared.set_device(opened.info.clone());
-                if first {
-                    first = false;
-                    if ready.send(Ok(opened.info.clone())).is_err() {
-                        return;
-                    }
-                }
-                match capture(shared, &opened) {
-                    Failure::Fatal(message) => {
-                        shared.fail(message);
-                        return;
-                    }
-                    Failure::Reopen(_) if shared.stopping() => return,
-                    Failure::Reopen(_) => {}
-                }
-                thread::sleep(REOPEN_DELAY);
-            }
-            Err(Failure::Reopen(message) | Failure::Fatal(message)) => {
-                if first {
-                    let _ = ready.send(Err(message));
-                    return;
-                }
-                reopens = reopens.saturating_add(1);
-                if reopens > MAX_REOPEN {
-                    shared.fail(format!(
-                        "Системный звук остановлен: {message} Повторное открытие не удалось."
-                    ));
-                    return;
-                }
-                thread::sleep(REOPEN_DELAY);
+/// Attach the measured stability to a reopen decision. The failing call is
+/// recorded first, so time spent blocked without a poll cannot count as
+/// healthy. A fatal error never reopens, so it carries no stability.
+fn ended(failure: Failure, health: &mut Health) -> SessionEnd {
+    match failure {
+        Failure::Fatal(message) => SessionEnd::Fatal(message),
+        Failure::Reopen(message) => {
+            health.record(Instant::now());
+            SessionEnd::Reopen {
+                stable: health.stable(),
+                message,
             }
         }
     }
@@ -745,197 +740,4 @@ pub(super) fn probe() -> Result<AudioDeviceInfo, String> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn process_loopback_params_carry_the_target_and_the_include_mode() {
-        let params =
-            process_loopback_params(4_321, PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE);
-        assert_eq!(
-            params.ActivationType,
-            AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK
-        );
-        let inner = unsafe { params.Anonymous.ProcessLoopbackParams };
-        assert_eq!(inner.TargetProcessId, 4_321);
-        assert_eq!(
-            inner.ProcessLoopbackMode,
-            PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE
-        );
-
-        let excluded =
-            process_loopback_params(4_321, PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE);
-        let inner = unsafe { excluded.Anonymous.ProcessLoopbackParams };
-        assert_eq!(
-            inner.ProcessLoopbackMode,
-            PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE
-        );
-        assert_ne!(
-            PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE,
-            PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE
-        );
-    }
-
-    #[test]
-    fn the_activation_blob_describes_the_exact_parameter_size() {
-        let mut params =
-            process_loopback_params(7, PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE);
-        let variant = activation_blob(&mut params);
-        let inner = unsafe { &*variant.Anonymous.Anonymous };
-        assert_eq!(inner.vt, VT_BLOB);
-        let blob = unsafe { inner.Anonymous.blob };
-        assert_eq!(
-            blob.cbSize as usize,
-            size_of::<AUDIOCLIENT_ACTIVATION_PARAMS>()
-        );
-        assert_eq!(blob.pBlobData, ptr::from_mut(&mut params).cast());
-        let read_back = unsafe { *(blob.pBlobData.cast::<AUDIOCLIENT_ACTIVATION_PARAMS>()) };
-        let read_inner = unsafe { read_back.Anonymous.ProcessLoopbackParams };
-        assert_eq!(read_inner.TargetProcessId, 7);
-        // The `ManuallyDrop` wrapper is intentionally not unwrapped: the blob
-        // borrows this stack value and must not be freed by `PropVariantClear`.
-    }
-
-    #[test]
-    fn the_keepalive_blob_points_into_its_owned_params_after_moving() {
-        let keepalive =
-            ActivationKeepAlive::new(7, PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE);
-        let variant_before = keepalive.variant_ptr();
-        // Moving the keepalive must not move the boxed variant or params: the
-        // COM activation keeps both pointers past this function's stack frame.
-        let mut moved = Box::new(keepalive);
-        assert_eq!(
-            moved.variant_ptr(),
-            variant_before,
-            "the boxed variant keeps its address when the keepalive moves"
-        );
-        let inner = unsafe { &*moved.variant().Anonymous.Anonymous };
-        assert_eq!(inner.vt, VT_BLOB);
-        let blob = unsafe { inner.Anonymous.blob };
-        assert_eq!(
-            blob.cbSize as usize,
-            size_of::<AUDIOCLIENT_ACTIVATION_PARAMS>()
-        );
-        assert_eq!(
-            blob.pBlobData,
-            ptr::from_mut(&mut *moved._params).cast(),
-            "the blob points into the owned params allocation"
-        );
-        let read_back = unsafe { *(blob.pBlobData.cast::<AUDIOCLIENT_ACTIVATION_PARAMS>()) };
-        let read_inner = unsafe { read_back.Anonymous.ProcessLoopbackParams };
-        assert_eq!(read_inner.TargetProcessId, 7);
-    }
-
-    #[test]
-    fn a_timed_out_activation_does_not_release_the_pending_guard() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-
-        struct DropProbe(Arc<AtomicBool>);
-        impl Drop for DropProbe {
-            fn drop(&mut self) {
-                self.0.store(true, Ordering::SeqCst);
-            }
-        }
-        impl LeakOnTimeout for DropProbe {
-            fn leak(self) {
-                std::mem::forget(self);
-            }
-        }
-
-        let dropped = Arc::new(AtomicBool::new(false));
-        // Keep the sender alive: this is a real timeout, not a disconnect.
-        let (_sender, receiver) = mpsc::channel::<Result<(), String>>();
-        let error = await_activation(
-            &receiver,
-            Duration::from_millis(1),
-            DropProbe(dropped.clone()),
-        )
-        .expect_err("an activation that never answers is a timeout");
-        assert!(error.contains("не завершилась"), "{error}");
-        assert!(
-            !dropped.load(Ordering::SeqCst),
-            "the pending COM guard must stay alive after the timeout"
-        );
-    }
-
-    #[test]
-    fn an_activation_failure_is_returned_instead_of_opening_the_device() {
-        let mut asked = None;
-        let result = open_process_with(
-            4_242,
-            PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE,
-            |pid, mode| {
-                asked = Some((pid, mode));
-                Err("fake activation failure".into())
-            },
-        );
-        let error = match result {
-            Ok(_) => panic!("a failed activation must not open a capture"),
-            Err(error) => error,
-        };
-        assert_eq!(
-            asked,
-            Some((4_242, PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE)),
-            "the requested process and mode reach the activation call"
-        );
-        match error {
-            Failure::Fatal(message) => {
-                assert!(
-                    message.contains("fake activation failure"),
-                    "the activation error must propagate unchanged: {message}"
-                );
-                assert!(
-                    !message.contains("Устройство вывода по умолчанию"),
-                    "the failure must not describe a whole-device capture: {message}"
-                );
-            }
-            Failure::Reopen(message) => {
-                panic!("an activation failure is terminal, not a reopen: {message}")
-            }
-        }
-    }
-
-    #[test]
-    fn a_window_id_resolves_to_the_owning_process() {
-        use windows::{
-            Win32::UI::WindowsAndMessaging::{
-                CreateWindowExW, DestroyWindow, HWND_MESSAGE, WINDOW_EX_STYLE, WINDOW_STYLE,
-            },
-            core::w,
-        };
-        let window = unsafe {
-            CreateWindowExW(
-                WINDOW_EX_STYLE(0),
-                w!("STATIC"),
-                w!("voxhold-scope-test"),
-                WINDOW_STYLE(0),
-                0,
-                0,
-                0,
-                0,
-                Some(HWND_MESSAGE),
-                None,
-                None,
-                None,
-            )
-        };
-        let window = match window {
-            Ok(window) => window,
-            // A session without a window station cannot create even a
-            // message-only window; the pure resolution is still covered above.
-            Err(error) => {
-                println!("wasapi: no test window available: {error}");
-                return;
-            }
-        };
-        let pid = window_process_id(window.0 as u64).expect("the test window has a process");
-        assert_eq!(pid, std::process::id());
-        assert!(process_name(pid).is_some_and(|name| !name.is_empty()));
-        let _ = unsafe { DestroyWindow(window) };
-    }
-
-    #[test]
-    fn an_absent_window_is_an_explicit_error() {
-        assert!(window_process_id(0).is_err());
-    }
-}
+mod tests;

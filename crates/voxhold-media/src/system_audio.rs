@@ -199,6 +199,15 @@ impl Shared {
     fn device(&self) -> Option<AudioDeviceInfo> {
         self.device.lock().ok().and_then(|device| device.clone())
     }
+
+    /// Drop audio queued by a capture client that is being replaced. The
+    /// converter itself is per client and starts fresh, so this covers the
+    /// block queue.
+    fn clear_audio(&self) {
+        if let Ok(mut queue) = self.blocks.lock() {
+            queue.clear();
+        }
+    }
 }
 
 /// Keep only the newest blocks. A slow encoder loses old audio instead of

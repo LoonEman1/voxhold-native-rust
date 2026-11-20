@@ -10,9 +10,7 @@ use std::{
     },
     time::{Duration, Instant},
 };
-use voxhold_media::screen_capture::{
-    MonitorIdentity, MonitorRect, ScreenSource, SourceKind, TopologySnapshot,
-};
+use voxhold_media::screen_capture::{MonitorIdentity, MonitorRect, ScreenSource, SourceKind};
 use voxhold_media::system_audio::AudioDeviceInfo;
 
 pub(super) fn monitor_identity(display: u32) -> MonitorIdentity {
@@ -44,7 +42,6 @@ pub(super) fn monitor_on(
         display_id: -1,
         width,
         height,
-        topology: Some(TopologySnapshot::from_monitors(vec![identity.clone()])),
         monitor: Some(identity),
     }
 }
@@ -62,7 +59,6 @@ pub(super) fn window(id: u64, title: &str) -> ScreenSource {
         width: 1280,
         height: 720,
         monitor: None,
-        topology: None,
     }
 }
 

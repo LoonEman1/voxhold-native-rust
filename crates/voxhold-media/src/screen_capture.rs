@@ -40,7 +40,7 @@ mod topology;
 pub(crate) use topology::{
     CapturerMonitor, ResolveError, confirm_prepared, confirmed_mapping, resolve_monitor,
 };
-pub use topology::{MonitorIdentity, MonitorRect, TopologySnapshot};
+pub use topology::{MonitorIdentity, MonitorRect};
 
 /// The largest side of the local preview. The on-air card is a room tile.
 pub const MAX_PREVIEW_WIDTH: u32 = 640;
@@ -90,9 +90,6 @@ pub struct ScreenSource {
     /// (its `id` is the `HWND`) and for a monitor whose row could not be
     /// matched uniquely; such a monitor is never selectable.
     pub monitor: Option<MonitorIdentity>,
-    /// Monitor configuration at the moment this row was enumerated. The
-    /// preparation path re-checks it before the first frame is accepted.
-    pub topology: Option<TopologySnapshot>,
 }
 
 impl ScreenSource {
@@ -171,9 +168,6 @@ impl std::fmt::Debug for SourceId {
 #[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) type MonitorDescriptor = MonitorIdentity;
 
-#[cfg(test)]
-pub(crate) use topology::monitor_for_title as monitor_descriptor_for_title;
-
 /// Enumerate monitors or windows for the picker.
 ///
 /// The list is read on a worker thread, not on the UI thread. An empty list is
@@ -216,22 +210,23 @@ pub fn capture_thumbnail(
     }
 }
 
-/// Confirm that the monitor configuration still matches the one the picker
-/// recorded when the source was chosen.
+/// Confirm that the selected display still matches the one the picker recorded
+/// when the source was chosen.
 ///
 /// The capturer is still addressed by a numeric id for the moment the capture
 /// starts. If Windows reorders or replaces displays between the selection and
 /// the first frame, that id can name another screen, so a prepared result is
-/// discarded instead of published. A source without a recorded snapshot (a
-/// window, or a test fixture) has nothing to compare.
+/// discarded instead of published. Only the chosen surface is checked: another
+/// monitor being plugged in or changing its work area does not invalidate the
+/// preparation. A source without a confirmed monitor (a window) has nothing to
+/// compare.
 pub(crate) fn confirm_source_topology(source: &ScreenSource) -> Result<(), ResolveError> {
-    let Some(selected) = source.topology.as_ref() else {
+    let Some(selected) = source.monitor.as_ref() else {
         return Ok(());
     };
     #[cfg(windows)]
     {
-        let current = windows::topology_snapshot();
-        confirm_prepared(Some(selected), &current)
+        confirm_prepared(Some(selected), &windows::monitor_descriptors())
     }
     #[cfg(not(windows))]
     {

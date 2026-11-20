@@ -164,7 +164,6 @@ mod tests {
             width: 1920,
             height: 1080,
             monitor: None,
-            topology: None,
         }
     }
 
@@ -361,7 +360,7 @@ mod tests {
             &[other],
             &[CapturerMonitor {
                 id: 0,
-                title: "Screen 2".into(),
+                device: r"\\.\DISPLAY2".into(),
             }],
         )
         .expect_err("the confirmed display must not resolve");

@@ -5,14 +5,15 @@
 use super::*;
 use ::windows::Win32::Foundation::{HWND, LPARAM, RECT};
 use ::windows::Win32::Graphics::Gdi::{
-    EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW,
+    DISPLAY_DEVICEW, EnumDisplayDevicesW, EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR,
+    MONITORINFO, MONITORINFOEXW,
 };
 use ::windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetWindowRect, GetWindowThreadProcessId, IsWindowVisible,
 };
-use ::windows::core::BOOL;
+use ::windows::core::{BOOL, PCWSTR};
 use libwebrtc::desktop_capturer::{
-    CaptureError, DesktopCaptureSourceType, DesktopCapturer, DesktopCapturerOptions,
+    CaptureError, CaptureSource, DesktopCaptureSourceType, DesktopCapturer, DesktopCapturerOptions,
 };
 use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
@@ -45,40 +46,36 @@ pub(super) fn list_sources(kind: SourceKind) -> Result<Vec<ScreenSource>, &'stat
         SourceKind::Monitor => monitor_descriptors(),
         SourceKind::Window => Vec::new(),
     };
-    let capturer_monitors: Vec<CapturerMonitor> = sources
-        .iter()
-        .map(|source| CapturerMonitor {
-            id: source.id(),
-            title: source.title(),
-        })
-        .collect();
-    let mapping = match kind {
-        SourceKind::Monitor => confirmed_mapping(&monitors, &capturer_monitors),
+    let translated = match kind {
+        SourceKind::Monitor => capturer_monitors(&sources),
         SourceKind::Window => Vec::new(),
     };
-    let topology = TopologySnapshot::from_monitors(monitors.clone());
+    let mapping = match kind {
+        SourceKind::Monitor => confirmed_mapping(&monitors, &translated),
+        SourceKind::Window => Vec::new(),
+    };
     let mut result = Vec::with_capacity(sources.len());
     for source in sources {
         let id = source.id();
         let title = source.title();
         match kind {
             SourceKind::Monitor => {
-                // The pinned capturer reports `display_id = -1` on this
-                // host. Identity and metadata are matched by the capturer's
-                // own title against the Windows device list, never by list
-                // position. An unmatched or ambiguous title keeps the row
-                // identity-less, so it cannot be selected or captured.
+                // The pinned capturer reports `display_id = -1` and an empty
+                // title on this host. Identity and metadata come from the
+                // `EnumDisplayDevicesW` device at this id's index, never from
+                // the title or the list position. A row without a device (a
+                // synthetic DirectX source) stays identity-less, so it cannot
+                // be selected or captured.
                 let title = title.trim().to_owned();
                 let matched = mapping
                     .iter()
                     .find(|(source_id, _)| *source_id == id)
                     .map(|(_, monitor)| monitor);
                 let (width, height) = matched.map(|monitor| monitor.size()).unwrap_or((0, 0));
+                // The caption is never an identity; the empty Windows title
+                // becomes a stable human label derived from the adapter index.
                 let title = if title.is_empty() {
-                    matched
-                        .map(|monitor| monitor.device.trim().to_owned())
-                        .filter(|device| !device.is_empty())
-                        .unwrap_or_else(|| format!("Экран {}", id + 1))
+                    format!("Экран {}", id + 1)
                 } else {
                     title
                 };
@@ -90,7 +87,6 @@ pub(super) fn list_sources(kind: SourceKind) -> Result<Vec<ScreenSource>, &'stat
                     width,
                     height,
                     monitor: matched.cloned(),
-                    topology: Some(topology.clone()),
                 });
             }
             SourceKind::Window => {
@@ -110,7 +106,6 @@ pub(super) fn list_sources(kind: SourceKind) -> Result<Vec<ScreenSource>, &'stat
                     width,
                     height,
                     monitor: None,
-                    topology: None,
                 });
             }
         }
@@ -139,21 +134,11 @@ pub(super) fn capture_thumbnail(
                 return Err(ThumbnailError::Changed);
             };
             let monitors = monitor_descriptors();
-            let capturer_monitors: Vec<CapturerMonitor> = list
-                .iter()
-                .map(|candidate| CapturerMonitor {
-                    id: candidate.id(),
-                    title: candidate.title(),
-                })
-                .collect();
-            resolve_monitor(identity, &monitors, &capturer_monitors).map_err(
-                |error| match error {
-                    ResolveError::Missing => ThumbnailError::Missing,
-                    ResolveError::Ambiguous | ResolveError::TopologyChanged => {
-                        ThumbnailError::Changed
-                    }
-                },
-            )?
+            let sources = capturer_monitors(&list);
+            resolve_monitor(identity, &monitors, &sources).map_err(|error| match error {
+                ResolveError::Missing => ThumbnailError::Missing,
+                ResolveError::Ambiguous | ResolveError::TopologyChanged => ThumbnailError::Changed,
+            })?
         }
         // A window id is its `HWND`, a durable identity of its own.
         SourceKind::Window => source.id,
@@ -193,6 +178,58 @@ pub(super) fn capture_thumbnail(
         }
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+/// Device names in `EnumDisplayDevicesW(NULL, index, ...)` order.
+///
+/// The pinned capturer lists a Windows screen as `(index, "")`: the id is
+/// exactly the index of this enumeration and the title is always empty. The
+/// index is only valid for one enumeration, so it is translated to the durable
+/// `\\.\DISPLAYn` name before it becomes an identity.
+fn display_devices() -> Vec<String> {
+    let mut devices = Vec::new();
+    let mut index = 0_u32;
+    loop {
+        let mut device = DISPLAY_DEVICEW {
+            cb: std::mem::size_of::<DISPLAY_DEVICEW>() as u32,
+            ..Default::default()
+        };
+        let found = unsafe { EnumDisplayDevicesW(PCWSTR::null(), index, &mut device, 0) };
+        if !found.as_bool() {
+            return devices;
+        }
+        devices.push(wide_to_string(&device.DeviceName));
+        index += 1;
+    }
+}
+
+/// Translate the capturer's numeric screen ids to the Windows device names
+/// they name in this enumeration.
+///
+/// A row whose id is beyond the display-device list (a synthetic DirectX
+/// source) has no device name and stays identity-less.
+fn capturer_monitors(sources: &[CaptureSource]) -> Vec<CapturerMonitor> {
+    let devices = display_devices();
+    sources
+        .iter()
+        .map(|source| CapturerMonitor {
+            id: source.id(),
+            device: usize::try_from(source.id())
+                .ok()
+                .and_then(|index| devices.get(index))
+                .cloned()
+                .unwrap_or_default(),
+        })
+        .collect()
+}
+
+/// A NUL-terminated wide string from the Win32 fixed-size buffers.
+fn wide_to_string(units: &[u16]) -> String {
+    let len = units
+        .iter()
+        .position(|unit| *unit == 0)
+        .unwrap_or(units.len());
+    String::from_utf16_lossy(&units[..len])
 }
 
 /// `HWND` values of this process. Window sources are top-level windows, so
@@ -239,17 +276,10 @@ unsafe extern "system" fn monitor_callback(
         .as_bool()
     };
     if ok {
-        let mut device = String::new();
-        for unit in info.szDevice {
-            if unit == 0 {
-                break;
-            }
-            device.push(char::from_u32(u32::from(unit)).unwrap_or('?'));
-        }
         let rect = info.monitorInfo.rcMonitor;
         let work = info.monitorInfo.rcWork;
         list.push(MonitorIdentity {
-            device,
+            device: wide_to_string(&info.szDevice),
             bounds: MonitorRect::new(
                 rect.left,
                 rect.top,
@@ -270,9 +300,9 @@ unsafe extern "system" fn monitor_callback(
 }
 
 /// Monitor descriptors in enumeration order. The order is only a cache
-/// detail; the topology mapping matches a capturer source by its title and
-/// device name, never by this position.
-fn monitor_descriptors() -> Vec<MonitorDescriptor> {
+/// detail; a capturer source is matched by the device name Windows reports
+/// for its id, never by this position.
+pub(super) fn monitor_descriptors() -> Vec<MonitorDescriptor> {
     let mut list: Vec<MonitorDescriptor> = Vec::new();
     unsafe {
         let _ = EnumDisplayMonitors(
@@ -283,11 +313,6 @@ fn monitor_descriptors() -> Vec<MonitorDescriptor> {
         );
     }
     list
-}
-
-/// The current configuration, for the first-frame topology check.
-pub(super) fn topology_snapshot() -> TopologySnapshot {
-    TopologySnapshot::from_monitors(monitor_descriptors())
 }
 
 fn window_size(id: u64) -> (u32, u32) {
@@ -329,14 +354,8 @@ pub(super) fn run(
                 return;
             };
             let monitors = monitor_descriptors();
-            let capturer_monitors: Vec<CapturerMonitor> = list
-                .iter()
-                .map(|candidate| CapturerMonitor {
-                    id: candidate.id(),
-                    title: candidate.title(),
-                })
-                .collect();
-            match resolve_monitor(identity, &monitors, &capturer_monitors) {
+            let sources = capturer_monitors(&list);
+            match resolve_monitor(identity, &monitors, &sources) {
                 Ok(id) => id,
                 Err(error) => {
                     let _ = ready.send(Err(error.message()));

@@ -237,8 +237,47 @@ fn an_empty_source_list_is_not_a_native_success() {
 fn a_real_desktop_capture_delivers_a_frame() {
     let sources = list_sources(SourceKind::Monitor).expect("monitor list");
     assert!(!sources.is_empty(), "no monitor sources on this host");
+    for candidate in &sources {
+        println!(
+            "monitor {} · identity {:?} · {}×{}",
+            candidate.id,
+            candidate
+                .monitor
+                .as_ref()
+                .map(|monitor| monitor.device.as_str()),
+            candidate.width,
+            candidate.height
+        );
+    }
+    // Every screen source has an empty title on the pinned capturer; the
+    // identity must therefore come from `EnumDisplayDevicesW`. Without a
+    // bound display the picker cannot offer a selectable monitor at all.
+    let source = sources
+        .iter()
+        .find(|source| source.monitor.is_some())
+        .expect("no monitor source is bound to a Windows display")
+        .clone();
+    let identity = source.monitor.as_ref().expect("checked above");
+    assert!(
+        !identity.device.trim().is_empty(),
+        "a bound monitor must name its Windows display"
+    );
+    assert!(identity.size().0 >= 2 && identity.size().1 >= 2);
+    // The same display must resolve uniquely in a fresh enumeration.
+    let other = sources
+        .iter()
+        .filter(|candidate| candidate.id != source.id)
+        .filter(|candidate| {
+            candidate
+                .monitor
+                .as_ref()
+                .is_some_and(|m| m.device.eq_ignore_ascii_case(&identity.device))
+        })
+        .count();
+    assert_eq!(other, 0, "one display cannot be offered under two ids");
+
     let latest = std::sync::Arc::new(LatestImage::default());
-    let mut capture = ScreenCapture::start(sources[0].clone(), (1280, 720), 30, latest.clone())
+    let mut capture = ScreenCapture::start(source.clone(), (1280, 720), 30, latest.clone())
         .expect("capture start");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     let image = loop {
@@ -252,13 +291,13 @@ fn a_real_desktop_capture_delivers_a_frame() {
         std::thread::sleep(std::time::Duration::from_millis(50));
     };
     println!(
-        "captured {}×{} from {:?}; first frame {}×{}",
-        image.width, image.height, sources[0], image.width, image.height
+        "captured {}×{} from {}; first frame {}×{}",
+        image.width, image.height, source.title, image.width, image.height
     );
     assert!(image.width >= 2 && image.height >= 2);
     assert!(image.i420.width() == image.width && image.i420.height() == image.height);
     capture.stop();
-    assert!(!sources[0].describe().is_empty());
+    assert!(!source.describe().is_empty());
 
     // The same picker must list windows with real titles. This process has no
     // visible top-level window, so the own-process filter is a no-op here; it
@@ -381,50 +420,6 @@ fn descriptor(device: &str, width: u32, height: u32) -> MonitorDescriptor {
 }
 
 #[test]
-fn a_monitor_title_matches_its_own_device_name() {
-    let monitors = [
-        descriptor(r"\\.\DISPLAY1", 1920, 1080),
-        descriptor(r"\\.\DISPLAY2", 2560, 1440),
-    ];
-    let matched = monitor_descriptor_for_title(r"Экран (\\.\DISPLAY2)", &monitors)
-        .expect("the device name is in the title");
-    assert_eq!((matched.width, matched.height), (2560, 1440));
-}
-
-#[test]
-fn a_monitor_title_matches_the_display_number_not_the_list_order() {
-    // The list starts with DISPLAY2, so position-based metadata would attach
-    // the 2560×1440 size to the title that names DISPLAY1.
-    let monitors = [
-        descriptor(r"\\.\DISPLAY2", 2560, 1440),
-        descriptor(r"\\.\DISPLAY1", 1920, 1080),
-    ];
-    let matched = monitor_descriptor_for_title("Screen 1", &monitors).expect("display number");
-    assert_eq!((matched.width, matched.height), (1920, 1080));
-}
-
-#[test]
-fn an_unmatched_or_ambiguous_monitor_title_never_borrows_a_size() {
-    let monitors = [
-        descriptor(r"\\.\DISPLAY1", 1920, 1080),
-        descriptor(r"\\.\DISPLAY2", 2560, 1440),
-    ];
-    assert!(
-        monitor_descriptor_for_title("Документ", &monitors).is_none(),
-        "a title without a device name or number has no known size"
-    );
-    assert!(monitor_descriptor_for_title("   ", &monitors).is_none());
-
-    // Two devices end in the same number: guessing either one would attach a
-    // neighbour's size.
-    let ambiguous = [
-        descriptor(r"\\.\DISPLAY1", 1920, 1080),
-        descriptor(r"\\.\MONITOR1", 1280, 720),
-    ];
-    assert!(monitor_descriptor_for_title("Screen 1", &ambiguous).is_none());
-}
-
-#[test]
 fn a_monitor_source_identity_ignores_its_mutable_label() {
     let identity = descriptor(r"\\.\DISPLAY1", 1920, 1080);
     let source = ScreenSource {
@@ -435,7 +430,6 @@ fn a_monitor_source_identity_ignores_its_mutable_label() {
         width: 1920,
         height: 1080,
         monitor: Some(identity.clone()),
-        topology: Some(TopologySnapshot::from_monitors(vec![identity.clone()])),
     };
     let renamed = ScreenSource {
         title: "Другое имя".into(),

@@ -492,7 +492,6 @@ impl VoicePanel {
                     width: 0,
                     height: 0,
                     monitor: None,
-                    topology: None,
                 },
             );
             voxhold_media::publisher::PublishRequest {

@@ -1,11 +1,16 @@
 //! Stable monitor identity for screen capture.
 //!
-//! The desktop capturer numbers its monitor sources per enumeration. That
+//! The desktop capturer numbers its monitor sources per enumeration. On the
+//! pinned `libwebrtc 0.4.0` a Windows screen source is `(device_index, "")`:
+//! the capturer id is exactly the index of
+//! `EnumDisplayDevicesW(NULL, index, ...)` and the title is always empty. That
 //! number is only a lookup key for one list, never the display itself: after a
 //! reordering, unplug or resolution change the same number can name another
-//! monitor. Selection, preview, preparation and the real capture therefore
-//! bind to the Windows display identity (`\\.\DISPLAYn`) plus its geometry,
-//! and resolve the current capturer id through a confirmed, unique mapping.
+//! monitor.
+//!
+//! Selection, preview, preparation and the real capture therefore bind to the
+//! Windows display identity (`\\.\DISPLAYn`) plus its geometry, and resolve the
+//! current capturer id through the device name that the same index reports.
 //!
 //! Everything here is pure so the reordering rules are tested without a
 //! desktop. The Windows enumeration in [`super::windows`] is a thin wrapper.
@@ -89,30 +94,16 @@ impl MonitorIdentity {
     }
 }
 
-/// The monitor configuration at one moment, sorted so two enumerations with
-/// the same surfaces compare equal regardless of enumeration order.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
-pub struct TopologySnapshot {
-    monitors: Vec<MonitorIdentity>,
-}
-
-impl TopologySnapshot {
-    pub fn from_monitors(mut monitors: Vec<MonitorIdentity>) -> Self {
-        monitors.sort();
-        Self { monitors }
-    }
-
-    pub fn monitors(&self) -> &[MonitorIdentity] {
-        &self.monitors
-    }
-}
-
-/// One monitor source of the desktop capturer as the current enumeration
-/// exposes it.
+/// One monitor source of the desktop capturer, translated from its numeric id
+/// to the Windows device name that id names in this enumeration.
+///
+/// The device is empty when the id has no display device behind it (a
+/// synthetic DirectX row beyond `EnumDisplayDevicesW`); such a row stays
+/// identity-less and can neither be selected nor captured.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CapturerMonitor {
     pub id: u64,
-    pub title: String,
+    pub device: String,
 }
 
 /// Why the selected surface cannot be resolved in the current enumeration.
@@ -122,8 +113,8 @@ pub(crate) enum ResolveError {
     Missing,
     /// More than one row or monitor matches the confirmed identity.
     Ambiguous,
-    /// The device still exists but its geometry (or the whole configuration)
-    /// changed after the selection was confirmed.
+    /// The device still exists but its geometry changed after the selection
+    /// was confirmed.
     TopologyChanged,
 }
 
@@ -141,6 +132,41 @@ impl ResolveError {
     }
 }
 
+/// Whether two device names name the same Windows display.
+///
+/// Device names are ASCII (`\\.\DISPLAYn`) and the comparison is case
+/// insensitive; an absent or blank name never matches, so an identity-less
+/// capturer row cannot claim a display.
+fn same_device(left: &str, right: &str) -> bool {
+    let left = left.trim();
+    let right = right.trim();
+    !left.is_empty() && left.eq_ignore_ascii_case(right)
+}
+
+/// Whether two identities describe the same confirmed surface. The device is
+/// compared separately and case insensitively.
+fn same_geometry(left: &MonitorIdentity, right: &MonitorIdentity) -> bool {
+    left.bounds == right.bounds
+        && left.work == right.work
+        && left.width == right.width
+        && left.height == right.height
+}
+
+/// The single monitor whose device is `device`; `None` when absent or doubled.
+fn monitor_for_device<'a>(
+    device: &str,
+    monitors: &'a [MonitorIdentity],
+) -> Option<&'a MonitorIdentity> {
+    if device.trim().is_empty() {
+        return None;
+    }
+    let mut matched = monitors
+        .iter()
+        .filter(|monitor| same_device(&monitor.device, device));
+    let first = matched.next()?;
+    matched.next().is_none().then_some(first)
+}
+
 /// A confirmed capturer row: the current numeric id and the Windows display it
 /// names. Only unique matches are returned.
 pub(crate) fn confirmed_mapping(
@@ -149,7 +175,7 @@ pub(crate) fn confirmed_mapping(
 ) -> Vec<(u64, MonitorIdentity)> {
     let mut matched: Vec<(u64, MonitorIdentity)> = Vec::new();
     for source in sources {
-        let Some(monitor) = monitor_for_title(&source.title, monitors) else {
+        let Some(monitor) = monitor_for_device(&source.device, monitors) else {
             continue;
         };
         matched.push((source.id, monitor.clone()));
@@ -158,17 +184,12 @@ pub(crate) fn confirmed_mapping(
         .iter()
         .filter(|(_, monitor)| {
             // A display with two capturer rows is ambiguous in both
-            // directions: neither row may claim it. The same applies when the
-            // Windows list itself repeats a monitor.
+            // directions: neither row may claim it.
             let rows = matched
                 .iter()
-                .filter(|(_, candidate)| candidate == monitor)
+                .filter(|(_, candidate)| same_device(&candidate.device, &monitor.device))
                 .count();
-            let monitors = monitors
-                .iter()
-                .filter(|candidate| *candidate == monitor)
-                .count();
-            rows == 1 && monitors == 1
+            rows == 1
         })
         .cloned()
         .collect()
@@ -184,134 +205,60 @@ pub(crate) fn resolve_monitor(
     monitors: &[MonitorIdentity],
     sources: &[CapturerMonitor],
 ) -> Result<u64, ResolveError> {
+    if identity.device.trim().is_empty() {
+        return Err(ResolveError::Missing);
+    }
     let on_device: Vec<&MonitorIdentity> = monitors
         .iter()
-        .filter(|monitor| monitor.device.eq_ignore_ascii_case(&identity.device))
+        .filter(|monitor| same_device(&monitor.device, &identity.device))
         .collect();
-    if on_device.is_empty() {
-        return Err(ResolveError::Missing);
+    match on_device.len() {
+        0 => return Err(ResolveError::Missing),
+        1 => {}
+        _ => return Err(ResolveError::Ambiguous),
     }
-    if !on_device.iter().any(|monitor| *monitor == identity) {
+    if !same_geometry(on_device[0], identity) {
         return Err(ResolveError::TopologyChanged);
     }
-    if on_device.len() > 1 {
-        return Err(ResolveError::Ambiguous);
-    }
-    // Two rows naming the same display are ambiguous even though the mapping
-    // helper discards both; that is a different answer from "gone".
-    let ambiguous = sources
+    let mut rows = sources
         .iter()
-        .filter(|source| monitor_for_title(&source.title, monitors) == Some(identity))
-        .count();
-    if ambiguous > 1 {
-        return Err(ResolveError::Ambiguous);
-    }
-    let mut ids = confirmed_mapping(monitors, sources)
-        .into_iter()
-        .filter(|(_, monitor)| monitor == identity)
-        .map(|(id, _)| id);
-    let Some(id) = ids.next() else {
+        .filter(|source| same_device(&source.device, &identity.device));
+    let Some(row) = rows.next() else {
         return Err(ResolveError::Missing);
     };
-    if ids.next().is_some() {
+    if rows.next().is_some() {
         return Err(ResolveError::Ambiguous);
     }
-    Ok(id)
+    Ok(row.id)
 }
 
 /// Confirm that a capture prepared from `selected` still describes the same
-/// display configuration when its first frame arrives. A moved, resized or
-/// replaced monitor discards the preparation instead of publishing a picture
-/// of another display.
-pub(crate) fn confirm_prepared(
-    selected: Option<&TopologySnapshot>,
-    current: &TopologySnapshot,
-) -> Result<(), ResolveError> {
-    match selected {
-        Some(snapshot) if snapshot != current => Err(ResolveError::TopologyChanged),
-        _ => Ok(()),
-    }
-}
-
-/// Match a capturer source title to the monitor it names.
+/// display when its first frame arrives.
 ///
-/// An exact device substring wins; otherwise the display number at the end of
-/// the device name is matched against a number in the title. An absent or
-/// ambiguous match is `None`, so no metadata or identity is borrowed from a
-/// neighbour.
-pub(crate) fn monitor_for_title<'a>(
-    title: &str,
-    monitors: &'a [MonitorIdentity],
-) -> Option<&'a MonitorIdentity> {
-    let title = title.trim().to_lowercase();
-    if title.is_empty() {
-        return None;
+/// Only the selected surface is checked: its device must still exist exactly
+/// once and keep the same geometry. Another monitor being plugged in, a
+/// taskbar/work-area change on a different display or a DPI change elsewhere
+/// does not invalidate the prepared picture.
+pub(crate) fn confirm_prepared(
+    selected: Option<&MonitorIdentity>,
+    current: &[MonitorIdentity],
+) -> Result<(), ResolveError> {
+    let Some(identity) = selected else {
+        return Ok(());
+    };
+    if identity.device.trim().is_empty() {
+        return Err(ResolveError::Missing);
     }
-    let named: Vec<&MonitorIdentity> = monitors
+    let on_device: Vec<&MonitorIdentity> = current
         .iter()
-        .filter(|monitor| {
-            let device = monitor.device.trim().to_lowercase();
-            !device.is_empty() && title.contains(&device)
-        })
+        .filter(|monitor| same_device(&monitor.device, &identity.device))
         .collect();
-    if !named.is_empty() {
-        // Only a unique longest device name is trusted, so a device that is a
-        // prefix of another one cannot pick the wrong monitor.
-        let longest = named
-            .iter()
-            .max_by_key(|monitor| monitor.device.len())
-            .copied()?;
-        let tied = named
-            .iter()
-            .filter(|monitor| monitor.device.len() == longest.device.len())
-            .count();
-        return (tied == 1).then_some(longest);
+    match on_device.len() {
+        0 => Err(ResolveError::Missing),
+        1 if same_geometry(on_device[0], identity) => Ok(()),
+        1 => Err(ResolveError::TopologyChanged),
+        _ => Err(ResolveError::Ambiguous),
     }
-    // Fall back to the display number, e.g. `\\.\DISPLAY2` -> 2.
-    let numbers = title_numbers(&title);
-    let mut matched = monitors.iter().filter(|monitor| {
-        display_number(&monitor.device).is_some_and(|number| numbers.contains(&number))
-    });
-    let first = matched.next()?;
-    matched.next().is_none().then_some(first)
-}
-
-/// Trailing number of a device name such as `\\.\DISPLAY2`.
-fn display_number(device: &str) -> Option<u64> {
-    let digits: String = device
-        .chars()
-        .rev()
-        .take_while(|character| character.is_ascii_digit())
-        .collect::<String>()
-        .chars()
-        .rev()
-        .collect();
-    if digits.is_empty() {
-        return None;
-    }
-    digits.parse().ok()
-}
-
-/// Every number that appears in a title, in order.
-fn title_numbers(title: &str) -> Vec<u64> {
-    let mut numbers = Vec::new();
-    let mut current = String::new();
-    for character in title.chars() {
-        if character.is_ascii_digit() {
-            current.push(character);
-        } else if !current.is_empty() {
-            if let Ok(number) = current.parse::<u64>() {
-                numbers.push(number);
-            }
-            current.clear();
-        }
-    }
-    if !current.is_empty() {
-        if let Ok(number) = current.parse::<u64>() {
-            numbers.push(number);
-        }
-    }
-    numbers
 }
 
 #[cfg(test)]
@@ -332,62 +279,27 @@ mod tests {
         }
     }
 
-    fn source(id: u64, title: &str) -> CapturerMonitor {
+    fn capturer(id: u64, device: &str) -> CapturerMonitor {
         CapturerMonitor {
             id,
-            title: title.into(),
+            device: if device.is_empty() {
+                String::new()
+            } else {
+                format!("\\\\.\\{device}")
+            },
         }
     }
 
-    fn snapshot(monitors: &[MonitorIdentity]) -> TopologySnapshot {
-        TopologySnapshot::from_monitors(monitors.to_vec())
-    }
-
     #[test]
-    fn a_monitor_title_matches_its_own_device_name() {
-        let monitors = [
-            display("DISPLAY1", 0, 1920, 1080),
-            display("DISPLAY2", 1920, 2560, 1440),
-        ];
-        let matched = monitor_for_title(r"Экран (\\.\DISPLAY2)", &monitors)
-            .expect("the device name is in the title");
-        assert_eq!(matched.size(), (2560, 1440));
-    }
+    fn a_capturer_id_resolves_through_the_display_device_at_that_index() {
+        let a = display("DISPLAY1", 0, 1920, 1080);
+        let b = display("DISPLAY2", 1920, 2560, 1440);
+        let monitors = [a.clone(), b.clone()];
+        let sources = [capturer(0, "DISPLAY1"), capturer(1, "DISPLAY2")];
 
-    #[test]
-    fn a_monitor_title_matches_the_display_number_not_the_list_order() {
-        // The list starts with DISPLAY2, so position-based metadata would
-        // attach the 2560×1440 size to the title that names DISPLAY1.
-        let monitors = [
-            display("DISPLAY2", 1920, 2560, 1440),
-            display("DISPLAY1", 0, 1920, 1080),
-        ];
-        let matched = monitor_for_title("Screen 1", &monitors).expect("display number");
-        assert_eq!(matched.size(), (1920, 1080));
-    }
-
-    #[test]
-    fn an_unmatched_or_ambiguous_monitor_title_never_borrows_a_size() {
-        let monitors = [
-            display("DISPLAY1", 0, 1920, 1080),
-            display("DISPLAY2", 1920, 2560, 1440),
-        ];
-        assert!(monitor_for_title("Документ", &monitors).is_none());
-        assert!(monitor_for_title("   ", &monitors).is_none());
-
-        // Two devices end in the same number: guessing either one would attach
-        // a neighbour's size.
-        let ambiguous = [
-            MonitorIdentity {
-                device: "\\\\.\\DISPLAY1".into(),
-                ..display("X", 0, 1920, 1080)
-            },
-            MonitorIdentity {
-                device: "\\\\.\\MONITOR1".into(),
-                ..display("Y", 1920, 1280, 720)
-            },
-        ];
-        assert!(monitor_for_title("Screen 1", &ambiguous).is_none());
+        assert_eq!(resolve_monitor(&a, &monitors, &sources), Ok(0));
+        assert_eq!(resolve_monitor(&b, &monitors, &sources), Ok(1));
+        assert_eq!(confirmed_mapping(&monitors, &sources), vec![(0, a), (1, b)]);
     }
 
     #[test]
@@ -396,14 +308,25 @@ mod tests {
         let b = display("DISPLAY2", 1920, 2560, 1440);
         let monitors = [a.clone(), b.clone()];
 
-        // First enumeration: A is id 0, B is id 1.
-        let first = [source(0, "Screen 1"), source(1, "Screen 2")];
-        assert_eq!(resolve_monitor(&a, &monitors, &first), Ok(0));
-
-        // The capturer reorders the list; the displays did not move.
-        let reordered = [source(0, "Screen 2"), source(1, "Screen 1")];
+        // The capturer's numeric ids follow the adapter index, so a reorder
+        // means the index of a device changed.
+        let reordered = [capturer(0, "DISPLAY2"), capturer(1, "DISPLAY1")];
         assert_eq!(resolve_monitor(&a, &monitors, &reordered), Ok(1));
         assert_eq!(resolve_monitor(&b, &monitors, &reordered), Ok(0));
+    }
+
+    #[test]
+    fn a_synthetic_id_without_a_display_device_is_identity_less() {
+        let a = display("DISPLAY1", 0, 1920, 1080);
+        let monitors = [a.clone()];
+        // A DirectX-only row beyond the adapter list has no device name.
+        let sources = [capturer(0, ""), capturer(7, "")];
+        assert!(confirmed_mapping(&monitors, &sources).is_empty());
+        assert_eq!(
+            resolve_monitor(&a, &monitors, &sources),
+            Err(ResolveError::Missing),
+            "an id without a device must never borrow the only display"
+        );
     }
 
     #[test]
@@ -413,7 +336,7 @@ mod tests {
         // The user chose A when the capturer called it id 0. In the next
         // snapshot A is gone and id 0 belongs to B.
         let current = [b.clone()];
-        let sources = [source(0, "Screen 2")];
+        let sources = [capturer(0, "DISPLAY2")];
         assert_eq!(
             resolve_monitor(&a, &current, &sources),
             Err(ResolveError::Missing),
@@ -428,7 +351,7 @@ mod tests {
         let b = display("DISPLAY2", 1920, 2560, 1440);
         // Windows still lists both displays but the capturer lost A's row.
         let monitors = [a.clone(), b.clone()];
-        let sources = [source(0, "Screen 2")];
+        let sources = [capturer(0, "DISPLAY2")];
         assert_eq!(
             resolve_monitor(&a, &monitors, &sources),
             Err(ResolveError::Missing)
@@ -439,7 +362,7 @@ mod tests {
     fn an_ambiguous_capturer_list_is_rejected_not_guessed() {
         let a = display("DISPLAY1", 0, 1920, 1080);
         let monitors = [a.clone()];
-        let sources = [source(0, "Screen 1"), source(2, "Screen 1")];
+        let sources = [capturer(0, "DISPLAY1"), capturer(2, "DISPLAY1")];
         assert_eq!(
             resolve_monitor(&a, &monitors, &sources),
             Err(ResolveError::Ambiguous)
@@ -451,7 +374,7 @@ mod tests {
     fn a_changed_display_geometry_requires_a_new_selection() {
         let a = display("DISPLAY1", 0, 1920, 1080);
         let moved = display("DISPLAY1", 1920, 1920, 1080);
-        let sources = [source(0, "Screen 1")];
+        let sources = [capturer(0, "DISPLAY1")];
         assert_eq!(
             resolve_monitor(&a, &[moved], &sources),
             Err(ResolveError::TopologyChanged)
@@ -459,20 +382,52 @@ mod tests {
     }
 
     #[test]
-    fn a_topology_change_between_selection_and_the_first_frame_discards_the_preparation() {
+    fn a_device_case_change_alone_is_not_a_topology_change() {
+        let a = display("DISPLAY1", 0, 1920, 1080);
+        let upper = MonitorIdentity {
+            device: r"\\.\display1".into(),
+            ..a.clone()
+        };
+        let sources = [capturer(0, "DISPLAY1")];
+        assert_eq!(resolve_monitor(&a, &[upper.clone()], &sources), Ok(0));
+        assert_eq!(confirm_prepared(Some(&a), &[upper]), Ok(()));
+    }
+
+    #[test]
+    fn confirming_the_selected_display_ignores_the_rest_of_the_configuration() {
         let a = display("DISPLAY1", 0, 1920, 1080);
         let b = display("DISPLAY2", 1920, 2560, 1440);
-        let selected = snapshot(&[a.clone()]);
-        // The user plugged in a second monitor (or moved A) after the choice.
-        let changed = snapshot(&[a, b]);
+
+        // A second monitor appears: the selected surface did not change.
+        assert_eq!(confirm_prepared(Some(&a), &[a.clone(), b.clone()]), Ok(()));
+        // A third monitor appears and the other display's work area changes.
+        let mut moved_b = b.clone();
+        moved_b.work = rect(1920, 0, 2560, 1400);
+        let c = display("DISPLAY3", 4480, 1280, 720);
+        assert_eq!(confirm_prepared(Some(&a), &[a.clone(), moved_b, c]), Ok(()));
+
+        // The selected display itself moved.
         assert_eq!(
-            confirm_prepared(Some(&selected), &changed),
+            confirm_prepared(Some(&a), &[display("DISPLAY1", 1920, 1920, 1080)]),
             Err(ResolveError::TopologyChanged)
         );
-        // The unchanged configuration still confirms.
-        assert_eq!(confirm_prepared(Some(&selected), &selected), Ok(()));
-        // A source without a recorded snapshot has nothing to compare.
-        assert_eq!(confirm_prepared(None, &changed), Ok(()));
+        // Its work area changed (taskbar moved).
+        let mut work_moved = a.clone();
+        work_moved.work = rect(0, 0, 1920, 1040);
+        assert_eq!(
+            confirm_prepared(Some(&a), &[work_moved]),
+            Err(ResolveError::TopologyChanged)
+        );
+        // It vanished, duplicated, or was never recorded.
+        assert_eq!(
+            confirm_prepared(Some(&a), &[b.clone()]),
+            Err(ResolveError::Missing)
+        );
+        assert_eq!(
+            confirm_prepared(Some(&a), &[a.clone(), a.clone()]),
+            Err(ResolveError::Ambiguous)
+        );
+        assert_eq!(confirm_prepared(None, &[b]), Ok(()));
     }
 
     #[test]
@@ -481,8 +436,12 @@ mod tests {
         let b = display("DISPLAY2", 1920, 2560, 1440);
         let mapping = confirmed_mapping(
             &[a.clone(), b.clone()],
-            &[source(1, "Screen 1"), source(0, "Screen 2")],
+            &[capturer(1, "DISPLAY1"), capturer(0, "DISPLAY2")],
         );
-        assert_eq!(mapping, vec![(1, a), (0, b)]);
+        assert_eq!(mapping, vec![(1, a.clone()), (0, b)]);
+
+        // Two Windows monitors with the same device name claim nothing.
+        let duplicated = confirmed_mapping(&[a.clone(), a.clone()], &[capturer(0, "DISPLAY1")]);
+        assert!(duplicated.is_empty());
     }
 }

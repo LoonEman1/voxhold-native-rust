@@ -989,8 +989,8 @@ impl Publisher {
     }
 }
 
-pub mod engine;
 mod answer;
+pub mod engine;
 mod live_change;
 pub mod preflight;
 mod reason;

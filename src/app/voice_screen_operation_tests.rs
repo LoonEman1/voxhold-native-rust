@@ -8,7 +8,10 @@ use super::voice_screen_restart_tests::{
 };
 use super::voice_screen_tests::{draw, window};
 use gpui::TestAppContext;
-use voxhold_media::publisher::{Phase, Quality, QualityOutcome, QualityStatus, Sharing};
+use voxhold_media::publisher::{
+    Codec, Confirmed, Phase, Quality, QualityOutcome, QualityStatus, Sharing,
+};
+use voxhold_media::system_audio::AudioScope;
 
 /// The worker can report `preflighting` and the failure before the panel reads
 /// its coalesced queue; only the failure snapshot is then visible. It still
@@ -284,6 +287,193 @@ async fn a_cancelled_preflight_with_a_reason_is_shown_in_the_dialog(cx: &mut Tes
                 panel.test_screen_error()
             );
             assert_eq!(panel.test_screen_phase(), Phase::Live);
+        });
+    });
+}
+
+/// One live-bitrate snapshot with a fully described confirmed attempt.
+fn bitrate_sharing(
+    live: Quality,
+    op: u64,
+    outcome: QualityOutcome,
+    error: Option<&str>,
+) -> Sharing {
+    let source = window(11, "Документ");
+    Sharing {
+        phase: Phase::Live,
+        live: true,
+        attempt: 1,
+        quality: Some(live),
+        confirmed: Some(Confirmed {
+            attempt: 1,
+            source,
+            quality: live,
+            codec: Codec::Vp8,
+            audio: false,
+            audio_scope: AudioScope::Device,
+        }),
+        has_audio: false,
+        quality_status: Some(QualityStatus::new(op, outcome)),
+        status: error.unwrap_or("В эфире").into(),
+        error: error.map(str::to_owned),
+        ..Sharing::default()
+    }
+}
+
+/// `Applying` is not success: the dialog stays open and busy, no stop is sent,
+/// and the previous confirmed value remains the on-air one.
+#[gpui::test]
+async fn a_live_bitrate_stays_applying_until_the_engine_confirms_it(cx: &mut TestAppContext) {
+    let (mut visual, _view, voice) = super::voice_tests::fixture(cx);
+    draw(&mut visual);
+    let live = window(11, "Документ");
+    visual.update(|_window, app| {
+        voice.update(app, |panel, cx| {
+            open_quality_dialog(panel, live.clone(), Quality::default(), false, cx);
+            panel.test_change_screen_bitrate(200, cx);
+            panel.test_start_screen_share(cx);
+            let op = panel
+                .test_pending_quality_op()
+                .expect("the bitrate change carries an operation id");
+            assert_eq!(panel.test_take_screen_commands(), vec![("bitrate", op)]);
+
+            let applying = bitrate_sharing(Quality::default(), op, QualityOutcome::Applying, None);
+            assert!(panel.test_apply_screen_sharing(applying));
+            assert!(
+                panel.screen_share_open(),
+                "the dialog must stay open while the limit is applied"
+            );
+            assert!(panel.screen_share_busy(), "the Apply stays in flight");
+            assert_eq!(panel.test_pending_quality_op(), Some(op));
+            assert!(
+                panel.test_screen_error().is_empty(),
+                "applying is not an error: {}",
+                panel.test_screen_error()
+            );
+            assert_eq!(panel.test_screen_phase(), Phase::Live);
+            assert!(
+                panel
+                    .test_screen_sharing()
+                    .confirmed
+                    .is_some_and(|confirmed| confirmed.quality.bitrate_kbps == 6000),
+                "the confirmed 6000 kbit/s limit is still on air"
+            );
+            assert!(
+                panel.test_take_screen_commands().is_empty(),
+                "applying must not stop the live stream"
+            );
+        });
+    });
+}
+
+/// A verified `Applied` closes the dialog and stops the busy state.
+#[gpui::test]
+async fn an_applied_live_bitrate_closes_the_dialog(cx: &mut TestAppContext) {
+    let (mut visual, _view, voice) = super::voice_tests::fixture(cx);
+    draw(&mut visual);
+    let live = window(11, "Документ");
+    visual.update(|_window, app| {
+        voice.update(app, |panel, cx| {
+            open_quality_dialog(panel, live.clone(), Quality::default(), false, cx);
+            panel.test_change_screen_bitrate(200, cx);
+            panel.test_start_screen_share(cx);
+            let op = panel
+                .test_pending_quality_op()
+                .expect("the bitrate change carries an operation id");
+            assert_eq!(panel.test_take_screen_commands(), vec![("bitrate", op)]);
+
+            let changed = Quality {
+                bitrate_kbps: 6200,
+                ..Quality::default()
+            };
+            let applied = bitrate_sharing(changed, op, QualityOutcome::Applied, None);
+            assert!(panel.test_apply_screen_sharing(applied));
+            assert!(
+                !panel.screen_share_open(),
+                "a verified change closes the dialog"
+            );
+            assert!(!panel.screen_share_busy());
+            assert_eq!(panel.test_pending_quality_op(), None);
+            assert_eq!(panel.test_screen_phase(), Phase::Live);
+            assert!(
+                panel
+                    .test_screen_sharing()
+                    .confirmed
+                    .is_some_and(|confirmed| confirmed.quality.bitrate_kbps == 6200),
+                "the confirmed configuration follows the verified limit"
+            );
+            assert!(
+                panel.test_take_screen_commands().is_empty(),
+                "a live change never stops the stream"
+            );
+        });
+    });
+}
+
+/// A refused change shows the error, returns the dialog to the confirmed
+/// limit, keeps the stream live and allows a retry.
+#[gpui::test]
+async fn a_refused_live_bitrate_shows_the_error_and_the_confirmed_value(cx: &mut TestAppContext) {
+    let (mut visual, _view, voice) = super::voice_tests::fixture(cx);
+    draw(&mut visual);
+    let live = window(11, "Документ");
+    visual.update(|_window, app| {
+        voice.update(app, |panel, cx| {
+            open_quality_dialog(panel, live.clone(), Quality::default(), false, cx);
+            panel.test_change_screen_bitrate(200, cx);
+            panel.test_start_screen_share(cx);
+            let op = panel
+                .test_pending_quality_op()
+                .expect("the bitrate change carries an operation id");
+            assert_eq!(panel.test_take_screen_commands(), vec![("bitrate", op)]);
+
+            let message = "Не удалось применить новый битрейт (видео): отказ. Прежние параметры восстановлены.";
+            let failed = bitrate_sharing(
+                Quality::default(),
+                op,
+                QualityOutcome::Failed(message.into()),
+                Some(message),
+            );
+            assert!(panel.test_apply_screen_sharing(failed));
+            assert!(
+                panel.screen_share_open(),
+                "the failed dialog stays open for a retry"
+            );
+            assert!(!panel.screen_share_busy());
+            assert_eq!(panel.test_pending_quality_op(), None);
+            assert!(
+                panel.test_screen_error().contains("видео"),
+                "the refusal is visible: {}",
+                panel.test_screen_error()
+            );
+            assert_eq!(
+                panel.test_screen_request().quality.bitrate_kbps,
+                6000,
+                "the dialog returns to the confirmed limit"
+            );
+            assert!(panel.test_can_start(), "the user may retry");
+            assert_eq!(
+                panel.test_screen_sharing().confirmed.map(|confirmed| confirmed.quality),
+                Some(Quality::default())
+            );
+            assert!(
+                panel.test_take_screen_commands().is_empty(),
+                "a refused bitrate must not stop the live stream"
+            );
+
+            // The dialog shows the confirmed limit again; the user dials the
+            // refused value once more and the retry is a new operation.
+            panel.test_change_screen_bitrate(200, cx);
+            panel.test_start_screen_share(cx);
+            let retry = panel
+                .test_pending_quality_op()
+                .expect("the retry carries an operation id");
+            assert_ne!(retry, op, "a retry is a new operation");
+            assert_eq!(
+                panel.test_take_screen_commands(),
+                vec![("bitrate", retry)],
+                "the retry goes to the live sender again"
+            );
         });
     });
 }

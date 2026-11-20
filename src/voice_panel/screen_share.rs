@@ -296,6 +296,19 @@ impl ScreenShareUi {
             .describe()
     }
 
+    /// Return the dialog's numeric quality controls to the configuration the
+    /// media layer confirmed. A refused change must show the values that are
+    /// still on air, never the request that failed.
+    pub(super) fn restore_confirmed_quality(&mut self) {
+        let Some(confirmed) = self.sharing.confirmed.as_ref() else {
+            return;
+        };
+        self.resolution = confirmed.quality.resolution;
+        self.fps = confirmed.quality.fps;
+        self.bitrate_kbps = confirmed.quality.bitrate_kbps;
+        self.audio_bitrate_kbps = confirmed.quality.audio_bitrate_kbps;
+    }
+
     pub(super) fn audio_available(&self) -> bool {
         matches!(self.audio_availability, Some(Ok(_)))
     }

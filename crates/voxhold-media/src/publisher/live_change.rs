@@ -10,16 +10,25 @@ use serde_json::json;
 use std::time::Instant;
 
 use super::{
-    Confirmed, Outcome, Phase, PublishRequest, Publisher, QualityChange, QualityOp, QualityOutcome,
-    QualityStatus, STOP_TIMEOUT,
+    BitrateResult, Confirmed, Outcome, Phase, PublishRequest, Publisher, QualityChange, QualityOp,
+    QualityOutcome, QualityStatus, STOP_TIMEOUT,
 };
 
 /// The status of a live bitrate change that the sender really received.
 const BITRATE_APPLIED_STATUS: &str = "Битрейт обновлён в эфире.";
-/// The bounded command queue of the worker was momentarily full. The value is
-/// retried on the next tick; nothing failed and the previous limit still
-/// applies until then.
-const BITRATE_QUEUED_STATUS: &str = "Применяем новый битрейт…";
+/// The command reached the worker queue (or a full queue deferred it), but the
+/// senders have not confirmed the limit yet. The previous configuration
+/// remains the on-air one and the value is retried until the engine answers.
+const BITRATE_APPLYING_STATUS: &str = "Применяем новый битрейт…";
+
+/// The live bitrate change the engine has not confirmed yet. The previous
+/// `request` and `confirmed` stay untouched until this operation reports a
+/// verified `Applied`.
+pub(super) struct PendingBitrate {
+    pub(super) op: QualityOp,
+    pub(super) attempt: u64,
+    pub(super) request: PublishRequest,
+}
 
 impl Publisher {
     /// The request of the current attempt, as the live sender received it.
@@ -53,16 +62,17 @@ impl Publisher {
         let mut request = request;
         request.quality = request.quality.clamped();
         let quality = request.quality;
-        // A live bitrate change keeps the same attempt and is really applied,
-        // so the confirmed configuration follows it. Nothing else about the
-        // attempt moves here; the audio flag stays the track really opened.
-        let mut confirmed = Confirmed::from_request(self.attempt, &request);
-        confirmed.audio = self.has_audio;
-        self.confirmed = Some(confirmed);
-        self.request = Some(request);
+        // The command only reaches the worker queue here. `request` and
+        // `confirmed` keep describing what is really on air until the engine
+        // verified the new limits and reported `Applied`.
+        self.pending_bitrate = Some(PendingBitrate {
+            op,
+            attempt: self.attempt,
+            request,
+        });
         self.error = None;
-        self.status = BITRATE_APPLIED_STATUS.into();
-        self.quality_status = Some(QualityStatus::new(op, QualityOutcome::Applied));
+        self.status = BITRATE_APPLYING_STATUS.into();
+        self.quality_status = Some(QualityStatus::new(op, QualityOutcome::Applying));
         vec![
             Outcome::SetBitrate {
                 attempt: self.attempt,
@@ -76,31 +86,83 @@ impl Publisher {
     /// The bounded command queue of the live worker was full, so the newest
     /// quality is still pending. This is not a failure: no `stream.stop`, no
     /// `Phase::Failed`, and the previous limit keeps applying until the retry.
+    /// The operation stays `Applying`; it must never look applied before the
+    /// worker verified the limit.
     pub fn bitrate_queued(&mut self, op: QualityOp) -> Vec<Outcome> {
         if self.phase != Phase::Live
             || !self.operation_current(op)
-            || self.status == BITRATE_QUEUED_STATUS
+            || self.status == BITRATE_APPLYING_STATUS
         {
             return Vec::new();
         }
-        self.status = BITRATE_QUEUED_STATUS.into();
+        self.status = BITRATE_APPLYING_STATUS.into();
         self.error = None;
+        self.quality_status = Some(QualityStatus::new(op, QualityOutcome::Applying));
+        vec![Outcome::State(self.sharing())]
+    }
+
+    /// The engine verified the requested limit on every active sender and the
+    /// peer. Only now does the confirmed configuration follow the request.
+    pub fn bitrate_applied(&mut self, op: QualityOp) -> Vec<Outcome> {
+        if self.phase != Phase::Live || !self.operation_current(op) {
+            return Vec::new();
+        }
+        let Some(pending) = self.pending_bitrate.take() else {
+            return Vec::new();
+        };
+        if pending.op != op || pending.attempt != self.attempt {
+            return Vec::new();
+        }
+        // A live bitrate change keeps the same attempt, so the confirmed
+        // configuration follows the request the senders really accepted. The
+        // audio flag stays the track the engine opened.
+        let mut confirmed = Confirmed::from_request(self.attempt, &pending.request);
+        confirmed.audio = self.has_audio;
+        self.confirmed = Some(confirmed);
+        self.request = Some(pending.request);
+        self.error = None;
+        self.status = BITRATE_APPLIED_STATUS.into();
         self.quality_status = Some(QualityStatus::new(op, QualityOutcome::Applied));
         vec![Outcome::State(self.sharing())]
     }
 
-    /// The retried limit reached the worker of the live attempt.
-    pub fn bitrate_applied(&mut self, op: QualityOp) -> Vec<Outcome> {
-        if self.phase != Phase::Live
-            || !self.operation_current(op)
-            || self.status == BITRATE_APPLIED_STATUS
-        {
+    /// The engine refused the change or failed to verify its readback. The
+    /// live publication, its attempt and its previous limits stay untouched:
+    /// no `stream.stop`, no `StopEngine`, no viewer teardown.
+    pub fn bitrate_failed(&mut self, op: QualityOp, message: &str) -> Vec<Outcome> {
+        if self.phase != Phase::Live || !self.operation_current(op) {
             return Vec::new();
         }
-        self.status = BITRATE_APPLIED_STATUS.into();
-        self.error = None;
-        self.quality_status = Some(QualityStatus::new(op, QualityOutcome::Applied));
+        self.pending_bitrate = None;
+        self.status = message.to_owned();
+        self.error = Some(message.to_owned());
+        self.quality_status = Some(QualityStatus::new(
+            op,
+            QualityOutcome::Failed(message.into()),
+        ));
         vec![Outcome::State(self.sharing())]
+    }
+
+    /// One result of the current live-bitrate operation. A result of another
+    /// attempt or an older operation is ignored, so two sequential applies
+    /// cannot overwrite each other.
+    pub(super) fn on_bitrate(
+        &mut self,
+        attempt: u64,
+        op: QualityOp,
+        result: BitrateResult,
+    ) -> Vec<Outcome> {
+        if self.phase != Phase::Live || attempt != self.attempt || !self.operation_current(op) {
+            return Vec::new();
+        }
+        match result {
+            BitrateResult::Applied => self.bitrate_applied(op),
+            BitrateResult::Failed {
+                message,
+                restored: _,
+                partial: _,
+            } => self.bitrate_failed(op, &message),
+        }
     }
 
     /// A restart preflight started. The live stream keeps running and no
@@ -111,6 +173,9 @@ impl Publisher {
         }
         self.preflighting = true;
         self.restarting = false;
+        // A different operation replaced the live-bitrate request; its late
+        // engine result must not update the confirmed configuration.
+        self.pending_bitrate = None;
         self.error = None;
         self.status = "Проверяем новую настройку…".into();
         self.quality_status = Some(QualityStatus::new(op, QualityOutcome::Preflighting));

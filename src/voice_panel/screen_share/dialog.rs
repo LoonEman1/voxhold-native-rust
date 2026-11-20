@@ -620,7 +620,15 @@ impl VoicePanel {
         let start_focus = row(self, &mut ring, ShareKey::Start);
         let can_start = self.screen_can_start();
         let live_bitrate = self.screen.restart_change() == Some(QualityChange::LiveBitrate);
-        let start_label = if self.screen.sharing.preflighting {
+        let applying = self
+            .screen
+            .sharing
+            .quality_status
+            .as_ref()
+            .is_some_and(|status| status.outcome == QualityOutcome::Applying);
+        let start_label = if applying {
+            "Применяем…"
+        } else if self.screen.sharing.preflighting {
             "Проверяем…"
         } else if self.screen.restart {
             if live_bitrate {

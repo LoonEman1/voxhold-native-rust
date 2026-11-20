@@ -25,7 +25,7 @@ use libwebrtc::{
     audio_source::{AudioSourceOptions, native::NativeAudioSource},
     ice_candidate::IceCandidate,
     media_stream_track::MediaStreamTrack,
-    peer_connection::{AnswerOptions, BitrateSettings, PeerConnection, PeerConnectionState},
+    peer_connection::{AnswerOptions, PeerConnection, PeerConnectionState},
     peer_connection_factory::{
         IceServer as RtcIceServer, IceTransportsType, PeerConnectionFactory, RtcConfiguration,
         native::PeerConnectionFactoryExt,
@@ -41,7 +41,10 @@ use tokio::sync::mpsc;
 
 use crate::{
     Candidate, IceServer,
-    publisher::{PublishRequest, Quality},
+    publisher::{
+        BitrateResult, PublishRequest, Quality, QualityOp,
+        bitrate::{Limits, apply_sender_limits, confirmed_quality, readback_limits},
+    },
     screen_capture::{
         CaptureFailure, CapturedImage, LatestImage, PreviewStore, ScreenCapture, preview_from_i420,
     },
@@ -315,9 +318,10 @@ struct FrameCounters {
     height: AtomicU32,
 }
 
-/// The limits the worker really handed to the negotiated senders. A live
-/// quality change is applied here; the state machine can report `SetBitrate`
-/// only after this value moved, and the loopback test reads it.
+/// The limits the worker really confirmed on the negotiated senders. They are
+/// written only after `RtpSender::parameters()` read the values back, never
+/// from the requested quality, so a refused change cannot look applied here.
+/// The loopback test reads this value.
 #[derive(Default)]
 struct AppliedLimits {
     video_bps: AtomicU64,
@@ -325,13 +329,12 @@ struct AppliedLimits {
 }
 
 impl AppliedLimits {
-    fn store(&self, video: Option<u64>, audio: Option<u64>) {
-        if let Some(video) = video {
+    fn store(&self, limits: &Limits) {
+        if let Some(video) = limits.video_bps {
             self.video_bps.store(video, Ordering::Relaxed);
         }
-        if let Some(audio) = audio {
-            self.audio_bps.store(audio, Ordering::Relaxed);
-        }
+        self.audio_bps
+            .store(limits.audio_bps.unwrap_or(0), Ordering::Relaxed);
     }
 
     #[cfg(test)]
@@ -349,17 +352,24 @@ use audio::{AudioCounters, AudioMeter, audio_loop};
 enum Command {
     Offer(String),
     Ice(Candidate),
-    /// A live bitrate change: no renegotiation, no new `stream.start`.
-    Bitrate(Quality),
+    /// A live bitrate change: no renegotiation, no new `stream.start`. Both
+    /// tags travel back with the result so a stale operation cannot be
+    /// mistaken for the current one.
+    Bitrate {
+        attempt: u64,
+        op: QualityOp,
+        quality: Quality,
+    },
     Stop,
 }
 
 /// Answer of one live bitrate command.
 ///
-/// `Full` is a burst of the bounded command queue, not a dead worker: the
-/// runtime keeps the newest quality and retries it on the next tick, and the
-/// sender keeps the previous limit until the retry succeeds. Only `Closed`
-/// means the worker and its capture are gone.
+/// `Sent` only proves that the command reached the bounded worker queue, not
+/// that the senders accepted it; the verified result arrives later as
+/// [`crate::publisher::EngineEvent::Bitrate`]. `Full` is a burst of the queue,
+/// not a dead worker: the runtime keeps the newest quality and retries it on
+/// the next tick. Only `Closed` means the worker and its capture are gone.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BitrateSend {
     Sent,
@@ -577,11 +587,13 @@ impl PublisherEngine {
     ///
     /// No offer, answer or `stream.start` is involved: the worker applies the
     /// same `RtpSender::set_parameters` + `PeerConnection::set_bitrate` path
-    /// that the initial answer used. A `Full` command queue is a burst, not a
-    /// failed worker: the caller retries the newest quality instead of ending
-    /// the attempt.
-    pub fn set_bitrate(&self, quality: Quality) -> BitrateSend {
-        send_bitrate(self.commands.as_ref(), quality)
+    /// that the initial answer used. `attempt` and `op` are only tags: the
+    /// verified result comes back as an engine event with the same pair, and
+    /// the caller ignores it once a newer attempt or operation started. A
+    /// `Full` command queue is a burst, not a failed worker: the caller retries
+    /// the same operation instead of ending the attempt.
+    pub fn set_bitrate(&self, attempt: u64, op: QualityOp, quality: Quality) -> BitrateSend {
+        send_bitrate(self.commands.as_ref(), attempt, op, quality)
     }
 
     /// The limits the worker really handed to the negotiated senders.
@@ -645,11 +657,20 @@ fn join_bounded(thread: std::thread::JoinHandle<()>, timeout: Duration) {
 /// Hand one live bitrate change to the bounded worker queue. Only a closed
 /// channel proves that the worker is gone; a full queue is a burst that must be
 /// retried with the newest quality.
-fn send_bitrate(commands: Option<&mpsc::Sender<Command>>, quality: Quality) -> BitrateSend {
+fn send_bitrate(
+    commands: Option<&mpsc::Sender<Command>>,
+    attempt: u64,
+    op: QualityOp,
+    quality: Quality,
+) -> BitrateSend {
     let Some(commands) = commands else {
         return BitrateSend::Closed;
     };
-    match commands.try_send(Command::Bitrate(quality)) {
+    match commands.try_send(Command::Bitrate {
+        attempt,
+        op,
+        quality,
+    }) {
         Ok(()) => BitrateSend::Sent,
         Err(mpsc::error::TrySendError::Full(_)) => BitrateSend::Full,
         Err(mpsc::error::TrySendError::Closed(_)) => BitrateSend::Closed,
@@ -783,8 +804,13 @@ async fn run(
     // The last quality really applied to the live senders. The backend's
     // `startRecovery` may offer again to a live publisher, so a later answer
     // must use this value instead of the spawn-time request: otherwise a live
-    // bitrate change is silently reverted by the re-offer.
+    // bitrate change is silently reverted by the re-offer. A refused change
+    // never moves it.
     let mut quality = request.quality;
+    // The limits the senders really reported. Only a verified application or
+    // a successful answer updates them; they are the rollback target of the
+    // next live change.
+    let mut applied = Limits::default();
     let _ = ready.send(Ok(()));
 
     let mut remote_set = false;
@@ -834,6 +860,7 @@ async fn run(
                     quality,
                     &events,
                     Some(&limits),
+                    &mut applied,
                 )
                 .await
                 {
@@ -844,9 +871,46 @@ async fn run(
                     add_ice(&peer, candidate).await;
                 }
             }
-            Some(Command::Bitrate(next)) => {
-                apply_bitrate(&peer, &sender, audio_sender.as_ref(), next, Some(&limits));
-                quality = next;
+            Some(Command::Bitrate {
+                attempt,
+                op,
+                quality: next,
+            }) => {
+                let result =
+                    match apply_sender_limits(&peer, &sender, audio_sender.as_ref(), next, applied)
+                    {
+                        Ok(confirmed) => {
+                            applied = confirmed;
+                            limits.store(&confirmed);
+                            quality = confirmed_quality(quality, next, true);
+                            BitrateResult::Applied
+                        }
+                        Err(failure) => {
+                            // The readback after a failed restore is the honest
+                            // state of the senders. `AppliedLimits` reflects it so
+                            // a test or a later diagnostic never sees the refused
+                            // request as applied.
+                            let actual = readback_limits(&sender, audio_sender.as_ref());
+                            if let Some(video) = actual.video_bps {
+                                applied.video_bps = Some(video);
+                            }
+                            if let Some(audio) = actual.audio_bps {
+                                applied.audio_bps = Some(audio);
+                            }
+                            limits.store(&applied);
+                            quality = confirmed_quality(quality, next, false);
+                            BitrateResult::Failed {
+                                message: failure.message,
+                                restored: failure.restored,
+                                partial: failure.partial,
+                            }
+                        }
+                    };
+                events.push(EngineEvent::Bitrate {
+                    attempt,
+                    op,
+                    result,
+                });
             }
             Some(Command::Ice(candidate)) => {
                 if remote_set {
@@ -869,6 +933,7 @@ async fn run(
     peer.close();
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn apply_offer(
     peer: &PeerConnection,
     sender: &RtpSender,
@@ -877,6 +942,7 @@ async fn apply_offer(
     quality: Quality,
     events: &EventQueue,
     limits: Option<&AppliedLimits>,
+    applied: &mut Limits,
 ) -> bool {
     let offer = match SessionDescription::parse(sdp, SdpType::Offer) {
         Ok(offer) => offer,
@@ -909,45 +975,27 @@ async fn apply_offer(
         ));
         return false;
     }
-    apply_bitrate(peer, sender, audio_sender, quality, limits);
+    apply_confirmed_limits(peer, sender, audio_sender, quality, limits, applied);
     events.push(EngineEvent::Answer(text));
     true
 }
 
-/// The video limit comes from the dialog; the audio limit is the Opus maximum
-/// of the same settings and is clamped to the backend's 32–510 kbit/s range.
-/// `RtpEncodingParameters` has no degradation preference, so nothing here
-/// pretends to set one. The same function serves the initial answer and a live
-/// change; no renegotiation happens on this path.
-fn apply_bitrate(
+/// The initial answer applies the same limits, but its result is not a live
+/// operation: a refused readback leaves the confirmed limits unknown instead
+/// of failing the publication.
+fn apply_confirmed_limits(
     peer: &PeerConnection,
     sender: &RtpSender,
     audio_sender: Option<&RtpSender>,
     quality: Quality,
     limits: Option<&AppliedLimits>,
+    applied: &mut Limits,
 ) {
-    let video_max = Some(u64::from(quality.bitrate_kbps.clamp(500, 16_000)) * 1000);
-    let mut parameters = sender.parameters();
-    for encoding in &mut parameters.encodings {
-        encoding.max_bitrate = video_max;
-    }
-    let _ = sender.set_parameters(parameters);
-    let audio_max = audio_sender.map(|audio| {
-        let limit = Some(u64::from(quality.audio_bitrate_kbps.clamp(32, 510)) * 1000);
-        let mut parameters = audio.parameters();
-        for encoding in &mut parameters.encodings {
-            encoding.max_bitrate = limit;
+    if let Ok(confirmed) = apply_sender_limits(peer, sender, audio_sender, quality, *applied) {
+        *applied = confirmed;
+        if let Some(limits) = limits {
+            limits.store(&confirmed);
         }
-        let _ = audio.set_parameters(parameters);
-        limit
-    });
-    let total = video_max.unwrap_or(0) + audio_max.flatten().unwrap_or(0);
-    let _ = peer.set_bitrate(BitrateSettings {
-        max_bitrate_bps: Some(total),
-        ..BitrateSettings::default()
-    });
-    if let Some(limits) = limits {
-        limits.store(video_max, audio_max.flatten());
     }
 }
 

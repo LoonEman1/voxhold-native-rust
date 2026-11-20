@@ -541,6 +541,7 @@ fn ice_from_the_server_reaches_the_engine_only_while_publishing() {
     );
 }
 
+mod bitrate;
 mod quality;
 
 #[test]

@@ -213,8 +213,12 @@ pub enum QualityOutcome {
     /// The confirmed stop of a restart was sent. The new attempt starts after
     /// its acknowledgement.
     Committed,
-    /// A live-bitrate command was handed to the sender queue. This stage does
-    /// not prove the measured rate; that remains a later task.
+    /// A live-bitrate command reached the engine worker and its senders are
+    /// being updated. The previous confirmed configuration still describes
+    /// what is on air; the dialog stays busy and open.
+    Applying,
+    /// The engine verified the new limits on every active sender and the
+    /// peer, so the confirmed configuration follows the change.
     Applied,
 }
 

@@ -61,8 +61,9 @@ pub struct Sharing {
     pub phase: Phase,
     pub attempt: u64,
     pub live: bool,
-    /// The request of the current attempt. It can be newer than `confirmed`
-    /// while a restart runs; only `confirmed` describes what is on air.
+    /// The request of the current attempt. It stays at the confirmed values
+    /// while a restart or a live bitrate change is only being applied; only
+    /// `confirmed` describes what is on air.
     pub quality: Option<Quality>,
     pub codec: Option<Codec>,
     /// The accepted configuration of the live attempt. It stays at the last

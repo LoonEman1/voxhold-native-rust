@@ -28,12 +28,24 @@ impl VoicePanel {
                             self.screen.preflight = self.screen.restart;
                             self.screen.busy = true;
                         }
+                        QualityOutcome::Applying => {
+                            // The command reached the engine, but the senders
+                            // have not confirmed it. Keep the dialog open and
+                            // busy; the confirmed values still describe the
+                            // stream that is on air.
+                            self.screen.busy = true;
+                            self.screen.preflight = false;
+                        }
                         QualityOutcome::Failed(message) => {
                             failed_current = true;
                             self.screen.busy = false;
                             self.screen.pending_quality_op = None;
                             self.screen.preflight = false;
                             self.screen.error = message;
+                            // The refused change never replaced the on-air
+                            // configuration, so the dialog returns to the
+                            // confirmed values and the user may retry.
+                            self.screen.restore_confirmed_quality();
                         }
                         QualityOutcome::Cancelled => {
                             self.screen.busy = false;

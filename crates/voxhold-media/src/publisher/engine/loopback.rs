@@ -208,6 +208,7 @@ fn loopback(frame_size: (u32, u32), change: Option<Quality>) {
         let mut expected_mid = offer_mid.clone();
         let mut reader = None;
         let mut change_applied = false;
+        let mut change_verified = false;
         let mut frames_at_change = 0_u64;
         let mut reoffered = false;
         let mut frames_at_reoffer = 0_u64;
@@ -226,6 +227,19 @@ fn loopback(frame_size: (u32, u32), change: Option<Quality>) {
                         if let Ok(parsed) = IceCandidate::parse(&mid, index, &candidate.candidate) {
                             let _ = sfu.add_ice_candidate(parsed).await;
                         }
+                    }
+                    crate::publisher::EngineEvent::Bitrate {
+                        attempt,
+                        op,
+                        result,
+                    } => {
+                        assert_eq!((attempt, op), (1, 1), "the result keeps both tags");
+                        assert_eq!(
+                            result,
+                            crate::publisher::BitrateResult::Applied,
+                            "the live limit was not verified"
+                        );
+                        change_verified = true;
                     }
                     crate::publisher::EngineEvent::Error(message) => {
                         panic!("publisher engine error: {message}")
@@ -275,16 +289,19 @@ fn loopback(frame_size: (u32, u32), change: Option<Quality>) {
                         // The negotiated sender is live; apply the new limit
                         // exactly like `Outcome::SetBitrate` does.
                         assert_eq!(
-                            engine.set_bitrate(next),
+                            engine.set_bitrate(1, 1, next),
                             BitrateSend::Sent,
-                            "the live bitrate command must reach the worker"
+                            "Sent only means the command reached the worker"
                         );
                         change_applied = true;
                         frames_at_change = frames.load(Ordering::SeqCst);
                     }
                     Some(next) if !reoffered => {
                         let expected = u64::from(next.bitrate_kbps) * 1000;
-                        if engine.applied_bitrate_limits().0 == expected
+                        // The verified event and the readback-derived limits
+                        // must agree before the SFU offers again.
+                        if change_verified
+                            && engine.applied_bitrate_limits().0 == expected
                             && frames.load(Ordering::SeqCst) > frames_at_change
                         {
                             // The SFU offers again to the live publisher, as
@@ -352,10 +369,14 @@ fn loopback(frame_size: (u32, u32), change: Option<Quality>) {
             "on_track fired but no frame was decoded on the SFU"
         );
         if let Some(next) = change {
+            assert!(
+                change_verified,
+                "the engine never sent a verified Bitrate/Applied result"
+            );
             assert_eq!(
                 engine.applied_bitrate_limits(),
                 (u64::from(next.bitrate_kbps) * 1000, 0),
-                "the live video limit never reached the sender"
+                "the readback of the negotiated sender does not match the live limit"
             );
             assert_eq!(
                 answers, 2,

@@ -68,21 +68,22 @@ impl BitrateQueue {
     }
 
     /// Hand the pending quality to the live engine. A request of an older
-    /// attempt is dropped without being sent. `Full` keeps the value for the
-    /// next tick; `Closed` drops it because only a dead worker answers so.
+    /// attempt is dropped without being sent. `Full` keeps the value and its
+    /// operation tag for the next tick; `Closed` drops it because only a dead
+    /// worker answers so.
     pub(super) fn flush(
         &mut self,
         current_attempt: u64,
-        send: impl FnOnce(Quality) -> BitrateSend,
+        send: impl FnOnce(u64, u64, Quality) -> BitrateSend,
     ) -> BitrateDelivery {
-        let Some((attempt, _, quality)) = self.pending else {
+        let Some((attempt, op, quality)) = self.pending else {
             return BitrateDelivery::Idle;
         };
         if attempt != current_attempt {
             self.pending = None;
             return BitrateDelivery::Idle;
         }
-        match send(quality) {
+        match send(attempt, op, quality) {
             BitrateSend::Sent => {
                 self.pending = None;
                 BitrateDelivery::Sent
@@ -354,9 +355,11 @@ impl Live {
 
     /// Deliver the newest pending live bitrate change to the engine.
     ///
-    /// `Full` only shows a non-terminal status and keeps the previous limit;
-    /// the next tick retries the newest value. `Closed` is the only answer that
-    /// means the worker (and its capture) is gone.
+    /// `Sent` only proves that the command reached the worker queue; the
+    /// publisher already reports `Applying` and waits for the verified engine
+    /// result. `Full` only shows a non-terminal status and keeps the previous
+    /// limit; the next tick retries the same operation. `Closed` is the only
+    /// answer that means the worker (and its capture) is gone.
     fn flush_screen_bitrate(&mut self) -> Vec<PublisherOutcome> {
         if self.publisher.phase() != crate::publisher::Phase::Live {
             self.bitrate.clear();
@@ -364,16 +367,16 @@ impl Live {
         }
         let attempt = self.publisher.sharing().attempt;
         let op = self.bitrate.pending_op();
-        let delivery = self
-            .bitrate
-            .flush(attempt, |quality| match self.screen.as_ref() {
-                Some(screen) => screen.set_bitrate(quality),
-                None => BitrateSend::Closed,
-            });
+        let delivery =
+            self.bitrate
+                .flush(attempt, |attempt, op, quality| match self.screen.as_ref() {
+                    Some(screen) => screen.set_bitrate(attempt, op, quality),
+                    None => BitrateSend::Closed,
+                });
         match delivery {
-            BitrateDelivery::Sent => op
-                .map(|op| self.publisher.bitrate_applied(op))
-                .unwrap_or_default(),
+            // The engine answers with a `Bitrate` event once the senders and
+            // the peer confirmed the new limits.
+            BitrateDelivery::Sent => Vec::new(),
             BitrateDelivery::Full => op
                 .map(|op| self.publisher.bitrate_queued(op))
                 .unwrap_or_default(),

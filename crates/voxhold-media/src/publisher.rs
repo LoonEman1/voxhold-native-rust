@@ -18,6 +18,7 @@ use crate::controller::Signal;
 use crate::screen_capture::ScreenSource;
 use crate::system_audio::AudioScope;
 use crate::viewer::LEAVE_TIMEOUT;
+use live_change::PendingBitrate;
 use serde_json::{Value, json};
 use std::{
     collections::HashSet,
@@ -66,6 +67,7 @@ impl Codec {
     }
 }
 
+mod bitrate;
 mod quality;
 pub use quality::{
     AUDIO_BITRATES, Preset, Quality, QualityChange, QualityOp, QualityOutcome, QualityStatus,
@@ -154,27 +156,9 @@ pub enum Outcome {
 }
 
 /// Engine events that need a state-machine decision.
-pub mod engine_events {
-    use crate::Candidate;
+mod engine_events;
 
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub enum Connection {
-        Connected,
-        FirstFrame,
-    }
-
-    #[derive(Clone, Debug, PartialEq)]
-    pub enum Event {
-        Answer(String),
-        Ice(Candidate),
-        State(Connection),
-        Stats(crate::publisher::engine::PublishStats),
-        Error(String),
-        Closed,
-    }
-}
-
-pub use engine_events::{Connection, Event as EngineEvent};
+pub use engine_events::{BitrateResult, Connection, Event as EngineEvent};
 
 pub struct Publisher {
     server: i64,
@@ -205,6 +189,10 @@ pub struct Publisher {
     /// The accepted quality-change operation and its last result. Results of
     /// an older operation are ignored instead of overwriting a newer one.
     quality_status: Option<QualityStatus>,
+    /// The requested live bitrate change that the engine has not confirmed
+    /// yet. `request` and `confirmed` keep the previous on-air values until
+    /// the worker reports an `Applied` result for this operation.
+    pending_bitrate: Option<PendingBitrate>,
     /// The backend broadcasts `stream.stopped` to the whole server and also
     /// answers `stream.stop` directly, so one stop produces two events. After
     /// a confirmed stop the second copy must not end the freshly restarted
@@ -256,6 +244,7 @@ impl Publisher {
             restarting: false,
             preflighting: false,
             quality_status: None,
+            pending_bitrate: None,
             ignore_stop_echo: false,
             has_audio: false,
             audio_scope: None,
@@ -402,6 +391,7 @@ impl Publisher {
         let mut request = request;
         request.quality = request.quality.clamped();
         self.quality_status = Some(QualityStatus::new(op, QualityOutcome::Committed));
+        self.pending_bitrate = None;
         // Keep the confirmed live request. If the new attempt fails locally
         // after the old stream was stopped, it is restored once.
         self.rollback = self.request.clone();
@@ -587,6 +577,11 @@ impl Publisher {
                 }
                 Vec::new()
             }
+            EngineEvent::Bitrate {
+                attempt,
+                op,
+                result,
+            } => self.on_bitrate(attempt, op, result),
             EngineEvent::Error(message) => self.fail_local(&message, now),
             EngineEvent::Closed => self.fail_local("Соединение трансляции закрыто.", now),
         }
@@ -865,6 +860,7 @@ impl Publisher {
         self.restarting = false;
         self.preflighting = false;
         self.quality_status = None;
+        self.pending_bitrate = None;
         self.ignore_stop_echo = false;
         self.has_audio = false;
         self.audio_scope = None;
@@ -909,6 +905,7 @@ impl Publisher {
         self.error = None;
         self.restarting = false;
         self.preflighting = false;
+        self.pending_bitrate = None;
         self.has_audio = false;
         self.audio_scope = None;
         vec![
@@ -929,6 +926,7 @@ impl Publisher {
         self.restarting = false;
         self.preflighting = false;
         self.quality_status = None;
+        self.pending_bitrate = None;
         self.ignore_stop_echo = false;
         self.has_audio = false;
         self.audio_scope = None;

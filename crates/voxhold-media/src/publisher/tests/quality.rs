@@ -754,6 +754,111 @@ fn a_server_failure_does_not_restore_the_previous_request() {
 }
 
 #[test]
+fn the_confirmed_configuration_is_the_live_attempt_not_a_pending_change() {
+    let now = Instant::now();
+    let mut publisher = publisher();
+    live(&mut publisher, now);
+    let live_confirmed = publisher
+        .sharing()
+        .confirmed
+        .expect("a live attempt has a confirmed configuration");
+    let attempt = publisher.attempt;
+    assert_eq!(live_confirmed.attempt, attempt);
+    assert_eq!(live_confirmed.quality, Quality::default());
+    assert_eq!(live_confirmed.codec, Codec::Vp8);
+    assert_eq!(live_confirmed.audio, request().audio);
+    assert_eq!(
+        live_confirmed.audio_scope,
+        crate::system_audio::AudioScope::Device,
+        "the confirmed scope is typed, not a display string"
+    );
+    assert_eq!(live_confirmed.request(), request());
+
+    // A preflight for another audio scope is refused before any stop. The
+    // confirmed configuration and the live request stay exactly as they were.
+    let changed = PublishRequest {
+        audio: true,
+        audio_scope: crate::system_audio::AudioScope::WindowApplication,
+        ..request()
+    };
+    publisher.preflight_started(1);
+    assert!(
+        publisher.sharing().preflighting,
+        "the preflight keeps the live attempt running"
+    );
+    assert_eq!(
+        publisher.sharing().confirmed.as_ref(),
+        Some(&live_confirmed),
+        "a running preflight must not replace the confirmed configuration"
+    );
+    publisher.preflight_failed(1, "Новая настройка не открылась.");
+    assert_eq!(publisher.phase(), Phase::Live);
+    assert_eq!(
+        publisher.sharing().confirmed.as_ref(),
+        Some(&live_confirmed),
+        "a refused preflight must not replace the confirmed configuration"
+    );
+
+    // A committed restart starts the new request but the confirmed
+    // configuration still describes the stream that is on air until the new
+    // attempt really turns Live.
+    publisher.preflight_started(2);
+    publisher.restart(2, changed.clone(), now);
+    assert_eq!(
+        publisher.sharing().confirmed.as_ref(),
+        Some(&live_confirmed),
+        "a committed restart must not claim the new configuration yet"
+    );
+    let ack = publisher.on_server_event("stream.stopped", "", &json!({}), now);
+    assert!(
+        ack.iter().any(|outcome| matches!(
+            outcome,
+            Outcome::StartEngine { request, .. } if request == &changed
+        )),
+        "the new attempt starts after the stop acknowledgement: {ack:?}"
+    );
+    assert_eq!(
+        publisher.sharing().confirmed.as_ref(),
+        Some(&live_confirmed),
+        "an in-flight new attempt is not confirmed"
+    );
+
+    // The new capture fails locally and the media layer restores the previous
+    // request. The confirmed configuration describes that restored request.
+    let restored = publisher.on_start_failed("Захват не открылся.", now);
+    assert!(
+        restored.iter().any(|outcome| matches!(
+            outcome,
+            Outcome::StartEngine { request, .. } if request == &live_confirmed.request()
+        )),
+        "the previous request starts again: {restored:?}"
+    );
+    assert_eq!(
+        publisher.sharing().confirmed.as_ref(),
+        Some(&live_confirmed),
+        "the rollback keeps the previous confirmed configuration"
+    );
+    publisher.engine_ready(now, false, None);
+    publisher.on_engine(
+        EngineEvent::State(crate::publisher::Connection::Connected),
+        now,
+    );
+    publisher.on_engine(
+        EngineEvent::State(crate::publisher::Connection::FirstFrame),
+        now,
+    );
+    let restored_confirmed = publisher
+        .sharing()
+        .confirmed
+        .expect("the restored attempt is live");
+    assert_eq!(restored_confirmed.request(), request());
+    assert_eq!(
+        restored_confirmed.attempt, publisher.attempt,
+        "the confirmed attempt follows the restored live attempt"
+    );
+}
+
+#[test]
 fn a_viewer_sees_one_stop_and_one_start_in_order() {
     let now = Instant::now();
     let mut publisher = publisher();

@@ -413,7 +413,7 @@ async fn a_session_end_clears_the_preview_cache_and_moves_the_epoch(cx: &mut Tes
                 live: true,
                 ..Sharing::default()
             });
-            panel.test_set_screen_last_request(source.clone());
+            panel.test_set_screen_confirmed_source(source.clone());
             panel.test_open_live_screen_settings(cx);
             assert!(panel.test_screen_restart(), "the restart dialog opened");
             assert_ne!(

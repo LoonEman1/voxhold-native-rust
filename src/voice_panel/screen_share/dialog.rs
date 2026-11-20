@@ -14,15 +14,17 @@ impl ScreenShareUi {
     /// The capture engine accepted this identity, so it is known available
     /// until the engine itself reports a failure: this is the one exception
     /// to the "must be in the current snapshot" rule that guards a normal
-    /// Start. The identity lives only in `last_request`; it is never inserted
-    /// into the enumeration caches, so a later normal picker cannot select it.
+    /// Start. The identity lives only in `sharing.confirmed`; it is never
+    /// inserted into the enumeration caches, so a later normal picker cannot
+    /// select it.
     pub(super) fn bind_confirmed_live_source(&mut self) {
         self.selected = None;
         self.selected_identity = None;
         let Some(live) = self
-            .last_request
+            .sharing
+            .confirmed
             .as_ref()
-            .map(|request| request.source.clone())
+            .map(|confirmed| confirmed.source.clone())
         else {
             return;
         };

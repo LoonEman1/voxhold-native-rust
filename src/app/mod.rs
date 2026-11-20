@@ -64,6 +64,8 @@ mod voice_ops;
 #[cfg(test)]
 mod voice_screen_audio_tests;
 #[cfg(test)]
+mod voice_screen_confirmed_tests;
+#[cfg(test)]
 mod voice_screen_identity_tests;
 #[cfg(test)]
 mod voice_screen_operation_tests;

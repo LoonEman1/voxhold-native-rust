@@ -1,7 +1,52 @@
 //! The UI-facing publication snapshot. Kept in its own module so the state
 //! machine stays inside the repository file-size budget.
 
-use super::{Codec, Phase, Quality, QualityStatus, engine};
+use super::{Codec, Phase, PublishRequest, Quality, QualityStatus, engine};
+use crate::screen_capture::ScreenSource;
+use crate::system_audio::AudioScope;
+
+/// The configuration of the attempt the media layer really accepted and put on
+/// air. It is filled from the publisher's own request when that attempt turns
+/// `Live`, never from a request the picker only sent. A refused or cancelled
+/// quality change therefore cannot replace the live settings.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Confirmed {
+    /// The attempt that owns this configuration.
+    pub attempt: u64,
+    /// The accepted source; the restart dialog stays bound to its identity.
+    pub source: ScreenSource,
+    pub quality: Quality,
+    pub codec: Codec,
+    /// The accepted system-audio flag of the attempt.
+    pub audio: bool,
+    /// The typed capture scope the attempt requested. It is local to the
+    /// engine; the wire contract has no scope field.
+    pub audio_scope: AudioScope,
+}
+
+impl Confirmed {
+    pub(super) fn from_request(attempt: u64, request: &PublishRequest) -> Self {
+        Self {
+            attempt,
+            source: request.source.clone(),
+            quality: request.quality,
+            codec: request.codec,
+            audio: request.audio,
+            audio_scope: request.audio_scope,
+        }
+    }
+
+    /// The request a restart of this confirmed attempt would carry.
+    pub fn request(&self) -> PublishRequest {
+        PublishRequest {
+            source: self.source.clone(),
+            quality: self.quality,
+            codec: self.codec,
+            audio: self.audio,
+            audio_scope: self.audio_scope,
+        }
+    }
+}
 
 /// The UI-facing snapshot. The panel never guesses a phase itself.
 #[derive(Clone, Debug, PartialEq)]
@@ -9,8 +54,13 @@ pub struct Sharing {
     pub phase: Phase,
     pub attempt: u64,
     pub live: bool,
+    /// The request of the current attempt. It can be newer than `confirmed`
+    /// while a restart runs; only `confirmed` describes what is on air.
     pub quality: Option<Quality>,
     pub codec: Option<Codec>,
+    /// The accepted configuration of the live attempt. It stays at the last
+    /// confirmed values during a preflight, a restart or a rollback.
+    pub confirmed: Option<Confirmed>,
     /// The engine really added the system-audio track (and `stream.start`
     /// reported it), not merely that the user ticked the box.
     pub has_audio: bool,
@@ -40,6 +90,7 @@ impl Default for Sharing {
             live: false,
             quality: None,
             codec: None,
+            confirmed: None,
             has_audio: false,
             audio_scope: None,
             restarting: false,

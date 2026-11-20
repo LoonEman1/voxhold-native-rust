@@ -1,7 +1,7 @@
 //! Restart-dialog regressions: the live quality dialog is bound to the source
 //! the capture engine already accepted, while a normal Start still needs a row
-//! in the current list. The confirmed identity lives in `last_request` only;
-//! the enumeration caches never contain or inject it.
+//! in the current list. The confirmed identity lives in `sharing.confirmed`
+//! only; the enumeration caches never contain or inject it.
 
 use super::voice_screen_tests::{draw, focused, monitor, wait_for, window};
 use gpui::TestAppContext;
@@ -27,8 +27,25 @@ fn live_sharing() -> Sharing {
         phase: Phase::Live,
         live: true,
         quality: Some(Quality::default()),
+        confirmed: Some(confirmed(window(11, "Документ"), Quality::default(), true)),
         has_audio: true,
         ..Sharing::default()
+    }
+}
+
+/// The configuration the media layer confirms when the attempt turns Live.
+fn confirmed(
+    source: voxhold_media::screen_capture::ScreenSource,
+    quality: Quality,
+    audio: bool,
+) -> voxhold_media::publisher::Confirmed {
+    voxhold_media::publisher::Confirmed {
+        attempt: 1,
+        source,
+        quality,
+        codec: Codec::Vp8,
+        audio,
+        audio_scope: AudioScope::Device,
     }
 }
 
@@ -42,7 +59,7 @@ fn open_restart(
     panel.test_attach_detached_handle();
     panel.test_open_screen_picker_with(SourceKind::Window, snapshot, None);
     panel.test_set_screen_sharing(live_sharing());
-    panel.test_set_screen_last_request(live);
+    panel.test_set_screen_confirmed_source(live);
     panel.test_open_live_screen_settings(cx);
 }
 
@@ -63,7 +80,7 @@ async fn a_live_window_restart_binds_to_the_confirmed_source_with_an_empty_list(
                 Ok(device())
             }));
             panel.test_set_screen_sharing(live_sharing());
-            panel.test_set_screen_last_request(live.clone());
+            panel.test_set_screen_confirmed_source(live.clone());
             panel.test_open_live_screen_settings(cx);
 
             assert!(panel.screen_share_open(), "the restart dialog opened");
@@ -342,7 +359,7 @@ async fn a_same_phase_live_stats_update_keeps_an_uncommitted_restart_dialog_open
                     audio_kbps: 96.0,
                     ..Default::default()
                 }),
-                ..Sharing::default()
+                ..live_sharing()
             };
             assert!(panel.test_apply_screen_sharing(sampled));
             assert!(
@@ -376,7 +393,7 @@ async fn a_same_phase_live_stats_update_keeps_an_uncommitted_restart_dialog_open
                 quality_status: Some(QualityStatus::new(op, QualityOutcome::Committed)),
                 quality: Some(Quality::default()),
                 has_audio: true,
-                ..Sharing::default()
+                ..live_sharing()
             };
             panel.test_apply_screen_sharing(accepted);
             assert!(
@@ -435,6 +452,7 @@ fn sharing_with(quality: Quality, has_audio: bool) -> Sharing {
         phase: Phase::Live,
         live: true,
         quality: Some(quality),
+        confirmed: Some(confirmed(window(11, "Документ"), quality, has_audio)),
         has_audio,
         status: "В эфире".into(),
         ..Sharing::default()
@@ -492,7 +510,7 @@ pub(super) fn open_quality_dialog(
     panel.test_set_audio_probe(Arc::new(|| Ok(device())));
     panel.test_open_screen_picker_with(live_source.kind, Vec::new(), None);
     panel.test_set_screen_sharing(sharing_with(quality, audio));
-    panel.test_set_screen_live_request(PublishRequest {
+    panel.test_set_screen_confirmed_request(PublishRequest {
         source: live_source,
         quality,
         codec: Codec::Vp8,

@@ -73,7 +73,7 @@ pub use quality::{
 };
 
 mod sharing;
-pub use sharing::Sharing;
+pub use sharing::{Confirmed, Sharing};
 
 /// One capture attempt chosen in the picker.
 #[derive(Clone, Debug, PartialEq)]
@@ -184,6 +184,10 @@ pub struct Publisher {
     phase: Phase,
     attempt: u64,
     request: Option<PublishRequest>,
+    /// What the attempt that is really on air accepted. It is only replaced
+    /// when an attempt turns `Live` or a live bitrate change is applied, so a
+    /// preflight, a restart or a rollback keeps the previous configuration.
+    confirmed: Option<Confirmed>,
     /// Quality change of a live attempt. The backend has no runtime
     /// reconfigure, so the new request waits for the current `stream.stop`
     /// acknowledgement (or its bounded timeout) and then starts a new attempt.
@@ -245,6 +249,7 @@ impl Publisher {
             phase: Phase::Idle,
             attempt: 0,
             request: None,
+            confirmed: None,
             pending_restart: None,
             rollback: None,
             rollback_used: false,
@@ -282,6 +287,7 @@ impl Publisher {
             live: self.phase == Phase::Live,
             quality: self.request.as_ref().map(|request| request.quality),
             codec: self.request.as_ref().map(|request| request.codec),
+            confirmed: self.confirmed.clone(),
             has_audio: self.has_audio,
             audio_scope: self.audio_scope.clone(),
             restarting: self.restarting,
@@ -815,6 +821,15 @@ impl Publisher {
         self.phase = Phase::Live;
         self.deadline = None;
         self.status = "В эфире".into();
+        // Only an attempt that really reached the air becomes the confirmed
+        // configuration. A preflight or an in-flight restart never does. The
+        // audio flag is the track the engine actually opened, not merely the
+        // checkbox the picker sent.
+        self.confirmed = self.request.as_ref().map(|request| {
+            let mut confirmed = Confirmed::from_request(self.attempt, request);
+            confirmed.audio = self.has_audio;
+            confirmed
+        });
         // A fresh confirmed attempt can serve as the rollback target of the
         // next restart and may restore itself once.
         self.rollback = None;
@@ -853,6 +868,7 @@ impl Publisher {
         self.ignore_stop_echo = false;
         self.has_audio = false;
         self.audio_scope = None;
+        self.confirmed = None;
         out.push(Outcome::State(self.sharing()));
         out
     }
@@ -916,6 +932,7 @@ impl Publisher {
         self.ignore_stop_echo = false;
         self.has_audio = false;
         self.audio_scope = None;
+        self.confirmed = None;
         self.picker = None;
         self.start_request = None;
         self.requests.clear();

@@ -10,7 +10,7 @@ use serde_json::json;
 use std::time::Instant;
 
 use super::{
-    Outcome, Phase, PublishRequest, Publisher, QualityChange, QualityOp, QualityOutcome,
+    Confirmed, Outcome, Phase, PublishRequest, Publisher, QualityChange, QualityOp, QualityOutcome,
     QualityStatus, STOP_TIMEOUT,
 };
 
@@ -53,6 +53,12 @@ impl Publisher {
         let mut request = request;
         request.quality = request.quality.clamped();
         let quality = request.quality;
+        // A live bitrate change keeps the same attempt and is really applied,
+        // so the confirmed configuration follows it. Nothing else about the
+        // attempt moves here; the audio flag stays the track really opened.
+        let mut confirmed = Confirmed::from_request(self.attempt, &request);
+        confirmed.audio = self.has_audio;
+        self.confirmed = Some(confirmed);
         self.request = Some(request);
         self.error = None;
         self.status = BITRATE_APPLIED_STATUS.into();

@@ -114,8 +114,6 @@ pub(super) struct ScreenShareUi {
     /// The dialog was opened from the live card to change quality. Start then
     /// becomes a confirmed stop+start, never a live reconfigure.
     pub(super) restart: bool,
-    /// The request of the accepted attempt. A restart prefills from it.
-    pub(super) last_request: Option<PublishRequest>,
     pub(super) busy: bool,
     /// A quality-change preflight of this dialog is pending. Start sets it, the
     /// failure answer, a commit or closing the dialog clears it. It survives a
@@ -186,7 +184,6 @@ impl Default for ScreenShareUi {
             audio_bitrate_kbps: 128,
             audio_availability: None,
             restart: false,
-            last_request: None,
             busy: false,
             preflight: false,
             quality_op: 0,
@@ -221,12 +218,16 @@ impl ScreenShareUi {
     }
 
     /// The confirmed live source of a restart dialog. It comes from the
-    /// accepted request only; enumeration answers never define or inject it.
+    /// configuration the media layer accepted on air; neither a request this
+    /// dialog sent nor an enumeration answer can define or inject it.
     pub(super) fn restart_source(&self) -> Option<&ScreenSource> {
         if !self.restart {
             return None;
         }
-        self.last_request.as_ref().map(|request| &request.source)
+        self.sharing
+            .confirmed
+            .as_ref()
+            .map(|confirmed| &confirmed.source)
     }
 
     /// Whether the restart still points at the identity the engine accepted.
@@ -238,23 +239,24 @@ impl ScreenShareUi {
     }
 
     /// The request a restart dialog would send: the confirmed live source with
-    /// the quality and audio fields shown by the dialog.
+    /// the quality and audio fields shown by the dialog. Only a scope the user
+    /// really picks in the dialog can widen a narrow live scope.
     pub(super) fn restart_request(&self) -> Option<PublishRequest> {
-        let live = self.last_request.as_ref()?;
-        let mut request = live.clone();
+        let mut request = self.sharing.confirmed.as_ref()?.request();
         request.quality = self.quality().clamped();
         request.audio = self.audio_requested();
-        request.audio_scope = self.effective_audio_scope(live.source.kind);
+        request.audio_scope = self.effective_audio_scope(request.source.kind);
         Some(request)
     }
 
-    /// What the dialog's current values would change. `None` outside a restart
-    /// dialog or before the confirmed live request is known.
+    /// What the dialog's current values would change relative to the confirmed
+    /// live configuration. `None` outside a restart dialog or before that
+    /// configuration is known.
     pub(super) fn restart_change(&self) -> Option<QualityChange> {
         if !self.restart {
             return None;
         }
-        let live = self.last_request.as_ref()?;
+        let live = self.sharing.confirmed.as_ref()?.request();
         let next = self.restart_request()?;
         Some(live.change_to(&next))
     }
@@ -282,10 +284,14 @@ impl ScreenShareUi {
         }
     }
 
-    /// The settings that a live attempt applies. Shown on the on-air card.
+    /// The settings the live attempt really applies, shown on the on-air card.
+    /// The confirmed configuration wins over the in-flight restart request.
     pub(super) fn quality_label(&self) -> String {
         self.sharing
-            .quality
+            .confirmed
+            .as_ref()
+            .map(|confirmed| confirmed.quality)
+            .or(self.sharing.quality)
             .unwrap_or_else(|| self.quality())
             .describe()
     }
@@ -327,8 +333,13 @@ impl ScreenShareUi {
         }
         let max = self
             .sharing
-            .quality
-            .map(|quality| quality.audio_bitrate_kbps)
+            .confirmed
+            .as_ref()
+            .map(|confirmed| confirmed.quality.audio_bitrate_kbps)
+            .or(self
+                .sharing
+                .quality
+                .map(|quality| quality.audio_bitrate_kbps))
             .unwrap_or(self.audio_bitrate_kbps);
         let rate = match self.sharing.stats {
             Some(stats) if stats.audio_kbps > 0.0 => {
@@ -501,7 +512,6 @@ impl VoicePanel {
         self.screen.error.clear();
         self.screen.selected = None;
         self.screen.selected_identity = None;
-        self.screen.last_request = None;
         self.screen.kind = SourceKind::Monitor;
         // A new picker starts with no rows: no identity from the previous
         // answer or a live source is selectable while the lists load.
@@ -535,32 +545,24 @@ impl VoicePanel {
             return;
         }
         self.release_push_to_talk();
-        let sharing = self.screen.sharing.clone();
-        if let Some(quality) = sharing.quality {
-            self.screen.resolution = quality.resolution;
-            self.screen.fps = quality.fps;
-            self.screen.bitrate_kbps = quality.bitrate_kbps;
-            self.screen.audio_bitrate_kbps = quality.audio_bitrate_kbps;
-        }
-        self.screen.audio_enabled = sharing.has_audio;
-        // The restart carries the scope the live attempt accepted; if the
-        // previous request is unavailable, use the safe default of its kind.
-        let kind = self
-            .screen
-            .last_request
-            .as_ref()
-            .map(|request| request.source.kind)
-            .unwrap_or(self.screen.kind);
-        self.screen.audio_scope = self
-            .screen
-            .last_request
-            .as_ref()
-            .map(|request| request.audio_scope)
-            .unwrap_or_else(|| audio_scope::default_audio_scope(kind));
+        // Without a configuration the media layer really accepted on air there
+        // is nothing safe to restart; a sent-but-unconfirmed request is not a
+        // substitute. The live card still owns the stop action.
+        let Some(confirmed) = self.screen.sharing.confirmed.clone() else {
+            return;
+        };
+        self.screen.resolution = confirmed.quality.resolution;
+        self.screen.fps = confirmed.quality.fps;
+        self.screen.bitrate_kbps = confirmed.quality.bitrate_kbps;
+        self.screen.audio_bitrate_kbps = confirmed.quality.audio_bitrate_kbps;
+        self.screen.audio_enabled = confirmed.audio;
+        // The dialog starts from the scope the live attempt accepted; opening
+        // it never widens a narrow scope.
+        self.screen.audio_scope = confirmed.audio_scope;
         self.begin_audio_probe(cx);
         self.screen.restart = true;
         // The restart dialog is bound to the confirmed live source here, and
-        // only here: the identity stays in `last_request`, never in the
+        // only here: the identity stays in `confirmed`, never in the
         // enumeration caches, so the current snapshot may be empty or stale.
         self.screen.bind_confirmed_live_source();
         // A restart has no picker: release every thumbnail and bump the epoch
@@ -647,7 +649,8 @@ impl VoicePanel {
         self.screen.selected = None;
         self.screen.selected_identity = None;
         // No row of this dialog may survive into the next picker. The
-        // confirmed live identity lives in `last_request`, not in these caches.
+        // confirmed live identity lives in `sharing.confirmed`, not in these
+        // caches.
         self.screen.monitors.clear();
         self.screen.windows.clear();
         // Closing cancels the preview batch: the epoch moves, so a late answer
@@ -901,7 +904,8 @@ impl VoicePanel {
                 slot_available,
             );
         }
-        self.screen.last_request = Some(request);
+        // The request is only this attempt's draft. It becomes confirmed when
+        // the media layer reports the attempt Live.
         self.screen.busy = true;
         // A restart without a live bitrate starts a preflight; closing the
         // dialog while it runs must cancel it instead of stopping the stream.

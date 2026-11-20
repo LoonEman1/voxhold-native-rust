@@ -2,7 +2,7 @@
 //! production file stays small and the seam is obviously not part of the UI.
 
 use super::*;
-use voxhold_media::publisher::Sharing;
+use voxhold_media::publisher::{Confirmed, Sharing};
 use voxhold_media::screen_capture::{
     PreviewFrame, ScreenSource, SourceId, SourceKind, ThumbnailError,
 };
@@ -58,13 +58,6 @@ impl VoicePanel {
         let kind = source.kind;
         let id = source.source_id();
         self.test_open_screen_picker_with(kind, vec![source.clone()], Some(id));
-        self.screen.last_request = Some(voxhold_media::publisher::PublishRequest {
-            source,
-            quality: self.screen.quality(),
-            codec: voxhold_media::publisher::Codec::Vp8,
-            audio: false,
-            audio_scope: voxhold_media::system_audio::AudioScope::Device,
-        });
     }
 
     /// Open the picker with a controlled list and an optional selection, so
@@ -404,7 +397,20 @@ impl VoicePanel {
         sharing: Sharing,
         cx: &mut Context<Self>,
     ) {
-        self.test_open_screen_picker(source);
+        self.test_open_screen_picker(source.clone());
+        let mut sharing = sharing;
+        // The media layer fills `confirmed` when the attempt goes Live. Tests
+        // that only describe the live snapshot get the same seam here.
+        if sharing.confirmed.is_none() {
+            sharing.confirmed = Some(Confirmed {
+                attempt: sharing.attempt,
+                quality: sharing.quality.unwrap_or_default(),
+                codec: voxhold_media::publisher::Codec::Vp8,
+                audio: sharing.has_audio,
+                audio_scope: voxhold_media::system_audio::AudioScope::Device,
+                source,
+            });
+        }
         self.screen.sharing = sharing;
         // Production reaches this dialog while the publication is Live, so the
         // normal gate answers "already live". The restart path must pass that
@@ -422,10 +428,11 @@ impl VoicePanel {
         self.open_screen_settings(cx);
     }
 
-    /// Record the accepted attempt exactly as the publish handler does. This
-    /// is the request a restart dialog must bind to.
-    pub fn test_set_screen_last_request(&mut self, source: ScreenSource) {
-        self.screen.last_request = Some(voxhold_media::publisher::PublishRequest {
+    /// Record the accepted attempt exactly as the media layer does when it
+    /// turns Live. This is the configuration a restart dialog must bind to.
+    pub fn test_set_screen_confirmed_source(&mut self, source: ScreenSource) {
+        self.screen.sharing.confirmed = Some(Confirmed {
+            attempt: self.screen.sharing.attempt,
             source,
             quality: self.screen.quality(),
             codec: voxhold_media::publisher::Codec::Vp8,
@@ -436,11 +443,18 @@ impl VoicePanel {
 
     /// Record a fully described accepted attempt, for a test that needs the
     /// live audio flag or scope to match the dialog.
-    pub fn test_set_screen_live_request(
+    pub fn test_set_screen_confirmed_request(
         &mut self,
         request: voxhold_media::publisher::PublishRequest,
     ) {
-        self.screen.last_request = Some(request);
+        self.screen.sharing.confirmed = Some(Confirmed {
+            attempt: self.screen.sharing.attempt,
+            source: request.source,
+            quality: request.quality,
+            codec: request.codec,
+            audio: request.audio,
+            audio_scope: request.audio_scope,
+        });
     }
 
     /// Step the dialog's video bitrate exactly like the picker button does.
@@ -482,26 +496,32 @@ impl VoicePanel {
 
     /// The quality/audio fields the picker will send.
     pub fn test_screen_request(&self) -> voxhold_media::publisher::PublishRequest {
-        let mut request = self.screen.last_request.clone().unwrap_or_else(|| {
-            let source = self.screen.selected_source().cloned().unwrap_or(
-                voxhold_media::screen_capture::ScreenSource {
-                    id: 0,
-                    kind: voxhold_media::screen_capture::SourceKind::Monitor,
-                    title: String::new(),
-                    display_id: -1,
-                    width: 0,
-                    height: 0,
-                    monitor: None,
-                },
-            );
-            voxhold_media::publisher::PublishRequest {
-                source,
-                quality: self.screen.quality(),
-                codec: voxhold_media::publisher::Codec::Vp8,
-                audio: self.screen.audio_requested(),
-                audio_scope: self.screen.audio_scope,
-            }
-        });
+        let mut request = self
+            .screen
+            .sharing
+            .confirmed
+            .as_ref()
+            .map(Confirmed::request)
+            .unwrap_or_else(|| {
+                let source = self.screen.selected_source().cloned().unwrap_or(
+                    voxhold_media::screen_capture::ScreenSource {
+                        id: 0,
+                        kind: voxhold_media::screen_capture::SourceKind::Monitor,
+                        title: String::new(),
+                        display_id: -1,
+                        width: 0,
+                        height: 0,
+                        monitor: None,
+                    },
+                );
+                voxhold_media::publisher::PublishRequest {
+                    source,
+                    quality: self.screen.quality(),
+                    codec: voxhold_media::publisher::Codec::Vp8,
+                    audio: self.screen.audio_requested(),
+                    audio_scope: self.screen.audio_scope,
+                }
+            });
         request.quality = self.screen.quality();
         request.audio = self.screen.audio_requested();
         // Mirror the production `commit_screen_share`: the selected identity

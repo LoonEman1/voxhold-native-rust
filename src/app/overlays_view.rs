@@ -10,6 +10,9 @@ impl Voxhold {
         self.show_inbox = false;
         self.editing = None;
         self.confirm_delete = None;
+        if self.update.panel_open {
+            self.close_update_panel(cx);
+        }
         cx.notify();
     }
 
@@ -357,23 +360,43 @@ impl Voxhold {
     }
 
     pub(super) fn notice_overlay(&self) -> Option<AnyElement> {
-        if self.action_notice.is_empty() {
+        if self.action_notice.is_empty() && self.remember_error.is_empty() {
             return None;
         }
         let p = self.palette;
-        Some(
-            div()
-                .absolute()
-                .right(px(20.))
-                .bottom(px(90.))
-                .px(px(10.))
-                .py(px(6.))
-                .rounded(px(7.))
-                .bg(ink(p.selection))
-                .text_size(px(12.))
-                .text_color(ink(p.fg))
-                .child(self.action_notice.clone())
-                .into_any_element(),
-        )
+        let mut column = div()
+            .absolute()
+            .right(px(20.))
+            .bottom(px(90.))
+            .flex()
+            .flex_col()
+            .items_end()
+            .gap(px(6.));
+        if !self.remember_error.is_empty() {
+            column = column.child(
+                div()
+                    .debug_selector(|| "remember-error".into())
+                    .px(px(10.))
+                    .py(px(6.))
+                    .rounded(px(7.))
+                    .bg(ink(p.selection))
+                    .text_size(px(12.))
+                    .text_color(ink(p.fg))
+                    .child(self.remember_error.clone()),
+            );
+        }
+        if !self.action_notice.is_empty() {
+            column = column.child(
+                div()
+                    .px(px(10.))
+                    .py(px(6.))
+                    .rounded(px(7.))
+                    .bg(ink(p.selection))
+                    .text_size(px(12.))
+                    .text_color(ink(p.fg))
+                    .child(self.action_notice.clone()),
+            );
+        }
+        Some(column.into_any_element())
     }
 }

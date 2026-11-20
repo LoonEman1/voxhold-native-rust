@@ -1,0 +1,294 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version (semver, for example 0.2.0)"
+        required: true
+        type: string
+      channel:
+        description: "Update channel"
+        required: true
+        default: beta
+        type: choice
+        options:
+          - beta
+      publish:
+        description: "Upload assets and latest.json to the GitHub release"
+        required: true
+        default: false
+        type: boolean
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.event.inputs.channel || 'beta' }}
+  cancel-in-progress: false
+
+jobs:
+  windows-release:
+    runs-on: windows-latest
+    env:
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CHANNEL: ${{ github.event.inputs.channel || 'beta' }}
+      WINDOWS_CERT_PFX_BASE64: ${{ secrets.WINDOWS_CERT_PFX_BASE64 }}
+      WINDOWS_CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
+      VOXHOLD_UPDATE_SIGNING_KEY: ${{ secrets.VOXHOLD_UPDATE_SIGNING_KEY }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check repository file limits
+        shell: pwsh
+        run: pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/check-file-sizes.ps1 -All
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          cache-bin: "false"
+
+      - name: Test update layer
+        run: cargo test -p voxhold-update -p voxhold-release -p voxhold-updater --locked
+
+      - name: Resolve version
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = if ($env:GITHUB_REF_TYPE -eq 'tag') {
+            $env:GITHUB_REF_NAME -replace '^v', ''
+          } else {
+            '${{ github.event.inputs.version }}'
+          }
+          if ($version -notmatch '^\d+\.\d+\.\d+([-.+][0-9A-Za-z.-]+)?$') {
+            throw "Invalid version '$version'"
+          }
+          $publish = if ($env:GITHUB_REF_TYPE -eq 'tag') { 'true' } else { '${{ github.event.inputs.publish }}' }
+          "VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "PUBLISH=$publish" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "version=$version channel=$env:CHANNEL publish=$publish"
+
+      - name: Build client and tools
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $env:VOXHOLD_BUILD_VERSION = $env:VERSION
+          $webrtcBuild = cargo build --release --locked -p voxhold-native-rust --message-format=json-render-diagnostics |
+            ForEach-Object { ConvertFrom-Json -InputObject $_ } |
+            Where-Object { $_.reason -eq 'build-script-executed' -and $_.package_id -match '#webrtc-sys@' }
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $webrtcLicenses = @($webrtcBuild.linked_paths |
+            Where-Object { $_ -like 'native=*' } |
+            ForEach-Object { Join-Path (Split-Path -Parent ($_ -replace '^native=')) 'LICENSE.md' } |
+            Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } |
+            Select-Object -Unique)
+          if ($webrtcLicenses.Count -ne 1) { throw 'Expected one license file for the linked WebRTC build' }
+          "WEBRTC_LICENSE=$($webrtcLicenses[0])" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+          cargo build --release --locked -p voxhold-updater -p voxhold-release
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Stage payload
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $stage = Join-Path $env:RUNNER_TEMP 'voxhold-stage'
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item target/release/voxhold-native-rust.exe (Join-Path $stage 'Voxhold.exe')
+          Copy-Item target/release/voxhold-updater.exe $stage
+          Copy-Item -Recurse assets $stage
+          Copy-Item -LiteralPath LICENSE, THIRD_PARTY_NOTICES.md, README.md -Destination $stage
+          Copy-Item -LiteralPath $env:WEBRTC_LICENSE -Destination (Join-Path $stage 'assets/licenses/WebRTC-LICENSE.md')
+          foreach ($file in 'voxhold.ico', 'icons/brand.svg', 'icons/hash.svg', 'icons/news.svg', 'icons/volume.svg', 'icons/lock.svg', 'licenses/Inter-OFL.txt') {
+            if (!(Test-Path -LiteralPath (Join-Path $stage "assets/$file") -PathType Leaf)) {
+              throw "Missing asset $file"
+            }
+          }
+          "STAGE_DIR=$stage" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Authenticode sign staged executables
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ([string]::IsNullOrWhiteSpace($env:WINDOWS_CERT_PFX_BASE64)) {
+            "AUTHENTICODE=false" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+            Write-Warning 'WINDOWS_CERT_PFX_BASE64 is not configured; the release is unsigned (authenticode=false).'
+            exit 0
+          }
+          $pfx = Join-Path $env:RUNNER_TEMP 'voxhold-signing.pfx'
+          [System.IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_CERT_PFX_BASE64))
+          $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" |
+            Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $signtool) { throw 'signtool.exe was not found' }
+          foreach ($file in 'Voxhold.exe', 'voxhold-updater.exe') {
+            & $signtool.FullName sign /fd SHA256 /f $pfx /p $env:WINDOWS_CERT_PASSWORD `
+              /tr http://timestamp.digicert.com /td SHA256 (Join-Path $env:STAGE_DIR $file)
+            if ($LASTEXITCODE -ne 0) { throw "Signing failed for $file" }
+          }
+          Remove-Item -LiteralPath $pfx -Force
+          "AUTHENTICODE=true" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Pack portable ZIP
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          & target/release/voxhold-release.exe pack --dir $env:STAGE_DIR --version $env:VERSION --out dist/VoxHold-portable.zip
+          if ($LASTEXITCODE -ne 0) { throw 'pack failed' }
+
+      - name: Add package index for the installer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # The portable ZIP carries package.json; the installer payload must
+          # carry the same index so deltas work after a Setup install too.
+          $indexDir = Join-Path $env:RUNNER_TEMP 'portable-index'
+          & target/release/voxhold-release.exe unpack --zip dist/VoxHold-portable.zip --out $indexDir
+          if ($LASTEXITCODE -ne 0) { throw 'cannot read the portable package index' }
+          Copy-Item -LiteralPath (Join-Path $indexDir 'package.json') -Destination (Join-Path $env:STAGE_DIR 'package.json') -Force
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup --no-progress -y
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $iscc = @(
+            (Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'),
+            (Join-Path $env:ProgramFiles 'Inno Setup 6\ISCC.exe')
+          ) | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+          if (-not $iscc) { throw 'ISCC.exe was not found' }
+          & $iscc "/DMyAppVersion=$env:VERSION" "/DStageDir=$env:STAGE_DIR" "/DOutputDir=$(Resolve-Path dist)" installer/voxhold.iss
+          if ($LASTEXITCODE -ne 0) { throw 'installer build failed' }
+          if (!(Test-Path -LiteralPath 'dist/VoxHold-Setup.exe')) { throw 'VoxHold-Setup.exe is missing' }
+
+      - name: Authenticode sign installer
+        if: env.AUTHENTICODE == 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $pfx = Join-Path $env:RUNNER_TEMP 'voxhold-signing.pfx'
+          [System.IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_CERT_PFX_BASE64))
+          $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" |
+            Sort-Object FullName -Descending | Select-Object -First 1
+          & $signtool.FullName sign /fd SHA256 /f $pfx /p $env:WINDOWS_CERT_PASSWORD `
+            /tr http://timestamp.digicert.com /td SHA256 dist/VoxHold-Setup.exe
+          if ($LASTEXITCODE -ne 0) { throw 'Signing failed for VoxHold-Setup.exe' }
+          Remove-Item -LiteralPath $pfx -Force
+
+      - name: Build delta from previous channel release
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $previous = Join-Path $env:RUNNER_TEMP 'previous'
+          New-Item -ItemType Directory -Force -Path $previous | Out-Null
+          gh release view $env:CHANNEL --json tagName 2>$null | Out-Null
+          if ($LASTEXITCODE -ne 0) {
+            Write-Warning "Release $env:CHANNEL does not exist yet; skipping the delta."
+            exit 0
+          }
+          gh release download $env:CHANNEL --pattern VoxHold-portable.zip --dir $previous --clobber
+          if ($LASTEXITCODE -ne 0 -or !(Test-Path (Join-Path $previous 'VoxHold-portable.zip'))) {
+            Write-Warning 'Previous portable ZIP is unavailable; skipping the delta.'
+            exit 0
+          }
+          & target/release/voxhold-release.exe unpack --zip (Join-Path $previous 'VoxHold-portable.zip') --out (Join-Path $previous 'unpacked')
+          if ($LASTEXITCODE -ne 0) {
+            Write-Warning 'Previous portable ZIP has no package index; skipping the delta.'
+            exit 0
+          }
+          $previousVersion = (Get-Content (Join-Path $previous 'unpacked/package.json') -Raw | ConvertFrom-Json).version
+          if ($previousVersion -eq $env:VERSION) {
+            Write-Warning 'The previous asset already has this version; skipping the delta.'
+            exit 0
+          }
+          & target/release/voxhold-release.exe delta --base (Join-Path $previous 'VoxHold-portable.zip') --target dist/VoxHold-portable.zip --out "dist/VoxHold-delta-$previousVersion.zip"
+          if ($LASTEXITCODE -ne 0) {
+            Write-Warning 'Delta is not smaller than the full package; publishing the full package only.'
+            Remove-Item -LiteralPath "dist/VoxHold-delta-$previousVersion.zip" -ErrorAction SilentlyContinue
+            exit 0
+          }
+          "DELTA_FILE=dist/VoxHold-delta-$previousVersion.zip" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Write manifest and signature
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ([string]::IsNullOrWhiteSpace($env:VOXHOLD_UPDATE_SIGNING_KEY)) {
+            throw 'VOXHOLD_UPDATE_SIGNING_KEY is required to sign latest.json'
+          }
+          $notes = "docs/release-notes/$env:VERSION.md"
+          if (!(Test-Path -LiteralPath $notes)) {
+            $notes = Join-Path $env:RUNNER_TEMP 'release-notes.md'
+            $subject = git log -1 --pretty=%s
+            $commit = git rev-parse HEAD
+            @("VoxHold $env:VERSION", '', $subject, '', "Commit: $commit") |
+              Set-Content -LiteralPath $notes -Encoding utf8
+          }
+          $manifestArgs = @(
+            'manifest',
+            '--full', 'dist/VoxHold-portable.zip',
+            '--setup', 'dist/VoxHold-Setup.exe',
+            '--version', $env:VERSION,
+            '--channel', $env:CHANNEL,
+            '--notes-file', $notes,
+            '--out', 'dist'
+          )
+          if ($env:AUTHENTICODE -eq 'true') { $manifestArgs += '--authenticode' }
+          if ($env:DELTA_FILE) { $manifestArgs += @('--delta', $env:DELTA_FILE) }
+          & target/release/voxhold-release.exe @manifestArgs
+          if ($LASTEXITCODE -ne 0) { throw 'manifest generation failed' }
+
+      - name: Verify published artifacts
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $verifyArgs = @(
+            'verify',
+            '--manifest', 'dist/latest.json',
+            '--sig', 'dist/latest.json.sig',
+            '--full', 'dist/VoxHold-portable.zip',
+            '--setup', 'dist/VoxHold-Setup.exe'
+          )
+          if ($env:DELTA_FILE) { $verifyArgs += @('--delta', $env:DELTA_FILE) }
+          & target/release/voxhold-release.exe @verifyArgs
+          if ($LASTEXITCODE -ne 0) { throw 'manifest verification failed' }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: voxhold-release-${{ env.VERSION }}
+          path: dist/**
+          if-no-files-found: error
+
+      - name: Publish release assets
+        if: env.PUBLISH == 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          gh release view $env:CHANNEL *> $null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $env:CHANNEL --title "VoxHold $env:CHANNEL" --prerelease --notes "VoxHold beta channel"
+            if ($LASTEXITCODE -ne 0) { throw 'cannot create release' }
+          }
+          $assets = @('dist/VoxHold-portable.zip', 'dist/VoxHold-Setup.exe')
+          if ($env:DELTA_FILE) { $assets += $env:DELTA_FILE }
+          gh release upload $env:CHANNEL @assets --clobber
+          if ($LASTEXITCODE -ne 0) { throw 'asset upload failed' }
+          gh release upload $env:CHANNEL dist/latest.json.sig --clobber
+          if ($LASTEXITCODE -ne 0) { throw 'signature upload failed' }
+          # The manifest is uploaded last so clients never see a version whose
+          # artifacts are still missing.
+          gh release upload $env:CHANNEL dist/latest.json --clobber
+          if ($LASTEXITCODE -ne 0) { throw 'manifest upload failed' }

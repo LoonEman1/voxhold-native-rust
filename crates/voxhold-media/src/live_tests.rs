@@ -95,7 +95,7 @@ fn login(stand: &Stand, username: &str, password: &str) -> Client {
         .expect("live: tokio runtime for login");
     runtime.block_on(async {
         match tokio::time::timeout(LOGIN_BUDGET, client.login(username, password)).await {
-            Ok(Ok(())) => {}
+            Ok(Ok(_)) => {}
             Ok(Err(error)) => panic!("live: login failed: {error}"),
             Err(_) => panic!("live: login did not answer within {LOGIN_BUDGET:?}"),
         }

@@ -64,6 +64,11 @@ impl Render for Voxhold {
                             cx.stop_propagation();
                             return;
                         }
+                        if s.update.panel_open {
+                            s.close_update_panel(cx);
+                            cx.stop_propagation();
+                            return;
+                        }
                         s.show_search = false;
                         s.message_menu = None;
                         s.forward = None;
@@ -348,6 +353,7 @@ impl Render for Voxhold {
                     .gap_3()
                     .text_size(px(13.))
                     .text_color(ink(p.muted))
+                    .child(self.update_icon(cx))
                     .child(
                         div()
                             .id("toggle-search")
@@ -799,6 +805,7 @@ impl Render for Voxhold {
         self.ensure_viewer_scale(window, cx);
         let popup_open = self.show_search
             || self.show_inbox
+            || self.update.panel_open
             || self.message_menu.is_some()
             || self.member_menu.is_some()
             || self.forward.is_some();
@@ -806,10 +813,16 @@ impl Render for Voxhold {
             root = root.child(
                 div()
                     .id("overlay-backdrop")
+                    .debug_selector(|| "overlay-backdrop".into())
                     .absolute()
                     .size_full()
                     .on_click(cx.listener(|s, _, _, cx| s.dismiss_overlays(cx))),
             );
+        }
+        // The popup sits above the backdrop so a click inside it is not a
+        // dismiss, and below the modal layers that follow.
+        if self.update.panel_open {
+            root = root.child(self.update_panel(l.chat, mobile, cx));
         }
         if let Some(overlay) = self.inbox_overlay(window, cx) {
             root = root.child(overlay);

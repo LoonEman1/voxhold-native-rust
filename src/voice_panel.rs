@@ -675,6 +675,9 @@ impl VoicePanel {
         self.close_player();
         self.reset_screen();
         self.call_channel = 0;
+        // A failed refresh or an explicit leave ends the flight without a
+        // `token_rotated`; the next call must not inherit a stale gate.
+        self.rotation_in_flight = false;
         self.transition_phase(CallPhase::Idle, cx);
         self.status.clear();
         self.error.clear();

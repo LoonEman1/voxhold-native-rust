@@ -755,10 +755,9 @@ impl Voxhold {
                     s.search_permissions_ready = true;
                     s.sync_search_permissions(cx);
                     s.refresh_pins(cx);
-                    let readable = s
-                        .channels
-                        .iter()
-                        .any(|channel| channel.id == s.channel && channel.has_history());
+                    #[cfg(feature = "voxhold-media")]
+                    s.prune_voice_chat();
+                    let readable = s.channel_chat_readable(s.channel);
                     if !readable {
                         s.invalidate_access(window, cx);
                         return;
@@ -895,7 +894,6 @@ impl Voxhold {
             });
         }
         self.show_search = true;
-        self.show_inbox = false;
         self.message_menu = None;
         self.forward = None;
         cx.notify();

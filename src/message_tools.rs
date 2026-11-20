@@ -192,8 +192,8 @@ pub fn permissions_for(
     let Some(channel) = channel else {
         return MessagePermissions::default();
     };
-    let readable = channel.has_history();
-    let writable = channel.writable();
+    let readable = channel.chat_readable();
+    let writable = channel.chat_writable();
     let news = channel.kind == "news";
     let moderate = role == "owner" || role == "admin" || channel.permissions & 16 != 0;
     MessagePermissions {

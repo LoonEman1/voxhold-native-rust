@@ -2,6 +2,7 @@ use super::*;
 
 impl Render for Voxhold {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.finish_personal_cleanup(window, cx);
         let viewport = window.viewport_size();
         self.viewport = (viewport.width.into(), viewport.height.into());
         if !self.ui_scale_pinned {
@@ -74,14 +75,17 @@ impl Render for Voxhold {
                         s.forward = None;
                         s.editing = None;
                         s.confirm_delete = None;
-                        s.show_inbox = false;
                         s.show_channels = false;
                         s.show_servers = false;
                         cx.notify();
                         cx.stop_propagation();
                     }
                     "f5" if s.client.is_some() => {
-                        if s.access_pending {
+                        if s.in_conversation() {
+                            // A DM has no channel ACL; F5 refreshes its own
+                            // history even while a channel reload is pending.
+                            s.refresh_history(window, cx);
+                        } else if s.access_pending {
                             s.invalidate_access(window, cx);
                         } else {
                             s.refresh_history(window, cx);
@@ -240,7 +244,8 @@ impl Render for Voxhold {
             None
         };
         let channels_open = !mobile || self.show_channels;
-        let l = layout::compute_layout(vw, vh, self.shell, channels_open, self.show_members);
+        let members_open = self.show_members && !self.personal_mode;
+        let l = layout::compute_layout(vw, vh, self.shell, channels_open, members_open);
         #[cfg(feature = "voxhold-media")]
         self.sync_push_to_talk_block(cx);
         #[cfg(feature = "voxhold-media")]
@@ -256,13 +261,13 @@ impl Render for Voxhold {
                     .child(self.rail(cx)),
             );
         }
+        let personal_empty = self.personal_mode && self.conversation.is_none();
         let selected = self.channels.iter().find(|c| c.id == self.channel).cloned();
-        let readable = self.conversation.is_some()
-            || (!self.access_pending && selected.as_ref().is_some_and(|c| c.has_history()));
-        let writable = self.conversation.is_some()
-            || (!self.access_pending && selected.as_ref().is_some_and(|c| c.writable()));
+        let readable = self.conversation.is_some() || self.channel_chat_readable(self.channel);
+        let writable = self.conversation.is_some() || self.channel_chat_writable(self.channel);
         let thread_active = self.show_thread && self.thread.is_some();
-        let voice_room = self.voice_room_visible();
+        let voice_room = !personal_empty && self.voice_room_visible();
+        let room_chat = voice_room && self.voice_chat_open();
         // The focus ring is rebuilt from these flags on every Tab press, so
         // they must describe this frame, not the previous one. The dock starts
         // hidden and only `voice_dock()` raises it after it actually paints;
@@ -275,7 +280,9 @@ impl Render for Voxhold {
                 panel.set_dock_visible(false);
             });
         }
-        let history = if voice_room {
+        let history = if personal_empty {
+            self.personal_center(window, cx)
+        } else if voice_room {
             div().into_any_element()
         } else if thread_active {
             div()
@@ -284,9 +291,15 @@ impl Render for Voxhold {
                 .child(self.thread.clone().expect("thread"))
                 .into_any_element()
         } else {
-            self.render_history(window, cx, l.chat, mobile)
+            self.render_history(window, cx, l.chat, mobile, false)
         };
-        let title = if let Some(conversation) = &self.conversation {
+        let title = if personal_empty {
+            if self.messaging.creator.is_some() {
+                "Новый разговор".into()
+            } else {
+                "Сообщения".into()
+            }
+        } else if let Some(conversation) = &self.conversation {
             inbox::conversation_title(conversation, self.self_user_id)
         } else {
             selected
@@ -312,113 +325,336 @@ impl Render for Voxhold {
         };
         let mut chat = div().relative().size_full().flex().flex_col().bg(ink(p.bg));
         let show_labels = l.chat.w > 860.0 && !mobile;
-        let header = div()
-            .h(px(if mobile { 58. } else { 67. }))
-            .px(px(16.))
-            .items_center()
-            .bg(ink(p.surface))
-            .border_b_1()
-            .border_color(ink(p.line))
-            .flex()
-            .justify_between()
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_3()
-                    .when(mobile, |row| {
-                        row.child(
+        let header: AnyElement = if personal_empty {
+            div()
+                .h(px(if mobile { 58. } else { 67. }))
+                .px(px(16.))
+                .items_center()
+                .bg(ink(p.surface))
+                .border_b_1()
+                .border_color(ink(p.line))
+                .flex()
+                .justify_between()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_3()
+                        .when(mobile, |row| {
+                            row.child(
+                                div()
+                                    .id("messages-toggle")
+                                    .cursor_pointer()
+                                    .text_color(ink(p.muted))
+                                    .on_click(cx.listener(|s, _, _, cx| {
+                                        s.show_channels = !s.show_channels;
+                                        cx.notify();
+                                    }))
+                                    .child(icon("icons/menu.svg", 18., ink(p.muted))),
+                            )
+                        })
+                        .child(
                             div()
-                                .id("channels-toggle")
-                                .cursor_pointer()
-                                .text_color(ink(p.muted))
-                                .on_click(cx.listener(|s, _, _, cx| {
-                                    s.show_channels = !s.show_channels;
-                                    cx.notify();
-                                }))
-                                .child(icon("icons/menu.svg", 18., ink(p.muted))),
-                        )
-                    })
-                    .child(
-                        div()
-                            .text_size(px(15.))
-                            .font_weight(gpui::FontWeight::BOLD)
-                            .child(title),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_3()
-                    .text_size(px(13.))
-                    .text_color(ink(p.muted))
-                    .child(self.update_icon(cx))
-                    .child(
-                        div()
-                            .id("toggle-search")
-                            .debug_selector(|| "toggle-search".into())
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .cursor_pointer()
-                            .on_click(cx.listener(|s, _, window, cx| {
-                                s.open_search_popup(false, window, cx)
-                            }))
-                            .child(icon("icons/search.svg", 16., ink(p.muted)))
-                            .when(show_labels, |button| button.child("Поиск")),
-                    )
-                    .when(self.server != 0 && self.conversation.is_none(), |row| {
-                        row.child(
+                                .text_size(px(15.))
+                                .font_weight(gpui::FontWeight::BOLD)
+                                .child(title),
+                        ),
+                )
+                .child(
+                    div()
+                        .id("messages-return")
+                        .debug_selector(|| "messages-return".into())
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .cursor_pointer()
+                        .text_size(px(13.))
+                        .text_color(ink(p.muted))
+                        .on_click(cx.listener(|s, _, window, cx| s.return_to_channels(window, cx)))
+                        .child(icon("icons/hash.svg", 16., ink(p.muted)))
+                        .child("К каналам"),
+                )
+                .into_any_element()
+        } else {
+            div()
+                .h(px(if mobile { 58. } else { 67. }))
+                .px(px(16.))
+                .items_center()
+                .bg(ink(p.surface))
+                .border_b_1()
+                .border_color(ink(p.line))
+                .flex()
+                .justify_between()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_3()
+                        .when(mobile, |row| {
+                            row.child(
+                                div()
+                                    .id("channels-toggle")
+                                    .cursor_pointer()
+                                    .text_color(ink(p.muted))
+                                    .on_click(cx.listener(|s, _, _, cx| {
+                                        s.show_channels = !s.show_channels;
+                                        cx.notify();
+                                    }))
+                                    .child(icon("icons/menu.svg", 18., ink(p.muted))),
+                            )
+                        })
+                        .child(
                             div()
-                                .id("toggle-recordings")
-                                .flex()
-                                .items_center()
-                                .gap_2()
-                                .cursor_pointer()
-                                .track_focus(&self.recordings_entry_focus)
-                                .tab_index(0)
-                                .on_click(cx.listener(|s, _, window, cx| {
-                                    s.toggle_recordings("header", window, cx)
-                                }))
-                                .child(icon("icons/inbox.svg", 16., ink(p.muted)))
-                                .when(show_labels, |button| button.child("Записи")),
+                                .text_size(px(15.))
+                                .font_weight(gpui::FontWeight::BOLD)
+                                .child(title),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_3()
+                        .text_size(px(13.))
+                        .text_color(ink(p.muted))
+                        .child(self.update_icon(cx))
+                        .when(self.personal_mode, |row| {
+                            row.child(
+                                div()
+                                    .id("messages-return")
+                                    .debug_selector(|| "messages-return".into())
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .cursor_pointer()
+                                    .on_click(cx.listener(|s, _, window, cx| {
+                                        s.return_to_channels(window, cx)
+                                    }))
+                                    .child(icon("icons/hash.svg", 16., ink(p.muted)))
+                                    .when(show_labels, |button| button.child("К каналам")),
+                            )
+                        })
+                        .when(
+                            voice_room
+                                && !self.access_pending
+                                && self.voice_chat_available(self.channel),
+                            |row| {
+                                let color = if room_chat { p.fg } else { p.muted };
+                                row.child(
+                                    div()
+                                        .id("toggle-room-chat")
+                                        .debug_selector(|| "toggle-room-chat".into())
+                                        .px(px(7.))
+                                        .py(px(4.))
+                                        .rounded(px(7.))
+                                        .flex()
+                                        .items_center()
+                                        .gap_2()
+                                        .cursor_pointer()
+                                        .bg(ink(if room_chat { p.selection } else { p.surface }))
+                                        .text_color(ink(color))
+                                        .on_click(cx.listener(|s, _, window, cx| {
+                                            s.toggle_voice_chat(window, cx)
+                                        }))
+                                        .child(icon("icons/chat.svg", 16., ink(color)))
+                                        .when(show_labels, |button| button.child("Чат")),
+                                )
+                            },
                         )
-                    })
-                    .when(!self.conversation.is_some(), |row| {
-                        row.child(
-                            div()
-                                .id("toggle-pins")
-                                .flex()
-                                .items_center()
-                                .gap_2()
-                                .cursor_pointer()
-                                .on_click(cx.listener(|s, _, window, cx| {
-                                    s.open_search_popup(true, window, cx)
-                                }))
-                                .child(icon("icons/pin.svg", 16., ink(p.muted)))
-                                .when(show_labels, |button| button.child("Закрепы")),
+                        .when(!self.personal_mode, |row| {
+                            row.child(
+                                div()
+                                    .id("toggle-search")
+                                    .debug_selector(|| "toggle-search".into())
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .cursor_pointer()
+                                    .on_click(cx.listener(|s, _, window, cx| {
+                                        s.open_search_popup(false, window, cx)
+                                    }))
+                                    .child(icon("icons/search.svg", 16., ink(p.muted)))
+                                    .when(show_labels, |button| button.child("Поиск")),
+                            )
+                        })
+                        .when(
+                            self.server != 0 && !self.personal_mode && self.conversation.is_none(),
+                            |row| {
+                                row.child(
+                                    div()
+                                        .id("toggle-recordings")
+                                        .flex()
+                                        .items_center()
+                                        .gap_2()
+                                        .cursor_pointer()
+                                        .track_focus(&self.recordings_entry_focus)
+                                        .tab_index(0)
+                                        .on_click(cx.listener(|s, _, window, cx| {
+                                            s.toggle_recordings("header", window, cx)
+                                        }))
+                                        .child(icon("icons/inbox.svg", 16., ink(p.muted)))
+                                        .when(show_labels, |button| button.child("Записи")),
+                                )
+                            },
                         )
-                    })
-                    .child(
-                        div()
-                            .id("members-toggle")
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .cursor_pointer()
-                            .on_click(cx.listener(|s, _, _, cx| {
-                                let open = !s.show_members;
-                                s.set_members_open(open, cx);
-                            }))
-                            .child(icon("icons/people.svg", 16., ink(p.muted)))
-                            .when(show_labels, |button| button.child("Участники")),
-                    ),
-            );
+                        .when(!self.personal_mode && !self.conversation.is_some(), |row| {
+                            row.child(
+                                div()
+                                    .id("toggle-pins")
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .cursor_pointer()
+                                    .on_click(cx.listener(|s, _, window, cx| {
+                                        s.open_search_popup(true, window, cx)
+                                    }))
+                                    .child(icon("icons/pin.svg", 16., ink(p.muted)))
+                                    .when(show_labels, |button| button.child("Закрепы")),
+                            )
+                        })
+                        .when(!self.personal_mode, |row| {
+                            row.child(
+                                div()
+                                    .id("members-toggle")
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .cursor_pointer()
+                                    .on_click(cx.listener(|s, _, _, cx| {
+                                        let open = !s.show_members;
+                                        s.set_members_open(open, cx);
+                                    }))
+                                    .child(icon("icons/people.svg", 16., ink(p.muted)))
+                                    .when(show_labels, |button| button.child("Участники")),
+                            )
+                        })
+                        .when(self.in_conversation(), |row| {
+                            let note = self
+                                .messaging
+                                .notifications
+                                .as_ref()
+                                .filter(|note| note.id == self.channel);
+                            let pending = note.is_some_and(|note| note.pending);
+                            let error = note.map(|note| note.error.clone()).unwrap_or_default();
+                            let muted = note
+                                .map(|note| note.muted)
+                                .or_else(|| self.conversation.as_ref().map(|row| row.muted))
+                                .unwrap_or(false);
+                            let label = if pending {
+                                "…"
+                            } else if muted {
+                                "Без звука"
+                            } else {
+                                "Уведомления"
+                            };
+                            row.child(
+                                div()
+                                    .id("conversation-mute")
+                                    .debug_selector(|| "conversation-mute".into())
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .cursor_pointer()
+                                    .when(pending, |button| button.opacity(0.55))
+                                    .on_click(
+                                        cx.listener(|s, _, _, cx| s.activate_conversation_mute(cx)),
+                                    )
+                                    .child(icon("icons/bell.svg", 16., ink(p.muted)))
+                                    .when(show_labels, |button| button.child(label))
+                                    .when(!error.is_empty(), |button| {
+                                        button.child(
+                                            div()
+                                                .id("conversation-mute-error")
+                                                .debug_selector(|| "conversation-mute-error".into())
+                                                .max_w(px(180.))
+                                                .truncate()
+                                                .text_size(px(10.))
+                                                .text_color(ink(p.danger))
+                                                .child(error.clone()),
+                                        )
+                                    }),
+                            )
+                            .when(
+                                // W08a scope: only a group offers "leave"; the
+                                // direct-chat action stays outside this stage.
+                                self.conversation.as_ref().is_some_and(|chat| !chat.direct),
+                                |row| {
+                                    row.child(
+                                        div()
+                                            .id("conversation-leave")
+                                            .debug_selector(|| "conversation-leave".into())
+                                            .flex()
+                                            .items_center()
+                                            .gap_2()
+                                            .cursor_pointer()
+                                            .text_color(ink(p.danger))
+                                            .on_click(cx.listener(|s, _, _, cx| {
+                                                s.request_leave_conversation(cx)
+                                            }))
+                                            .child("Покинуть беседу"),
+                                    )
+                                },
+                            )
+                        }),
+                )
+                .into_any_element()
+        };
         chat = chat.child(header);
+        if self.in_conversation()
+            && (self.messaging.leave_confirm || !self.messaging.leave_error.is_empty())
+        {
+            let mut bar = div()
+                .px(px(16.))
+                .py(px(6.))
+                .flex()
+                .items_center()
+                .gap_3()
+                .text_size(px(12.))
+                .border_b_1()
+                .border_color(ink(p.line))
+                .child("Покинуть беседу?");
+            if !self.messaging.leave_error.is_empty() {
+                bar = bar.child(
+                    div()
+                        .text_color(ink(p.danger))
+                        .child(self.messaging.leave_error.clone()),
+                );
+            }
+            bar = bar
+                .child(
+                    div()
+                        .id("conversation-leave-yes")
+                        .debug_selector(|| "conversation-leave-yes".into())
+                        .cursor_pointer()
+                        .text_color(ink(p.danger))
+                        .on_click(
+                            cx.listener(|s, _, window, cx| {
+                                s.confirm_leave_conversation(window, cx)
+                            }),
+                        )
+                        .child("Да"),
+                )
+                .child(
+                    div()
+                        .id("conversation-leave-no")
+                        .debug_selector(|| "conversation-leave-no".into())
+                        .cursor_pointer()
+                        .text_color(ink(p.muted))
+                        .on_click(cx.listener(|s, _, _, cx| s.cancel_leave_conversation(cx)))
+                        .child("Нет"),
+                );
+            chat = chat.child(bar);
+        }
         chat = chat.child(history);
-        if self.access_pending {
-            let status = div().p_2().text_color(ink(p.muted));
+        // The channel ACL banner belongs to the channel surface. Personal mode
+        // (an open DM, the empty personal center or the creator) keeps its own
+        // content while the reload runs and must not paint this block.
+        if self.access_pending && !self.personal_mode {
+            let status = div()
+                .id("channel-access-pending")
+                .debug_selector(|| "channel-access-pending".into())
+                .p_2()
+                .text_color(ink(p.muted));
             chat = chat.child(if self.access_reload_in_flight {
                 status.child("Проверяем доступ…")
             } else {
@@ -451,200 +687,55 @@ impl Render for Voxhold {
                     .child(self.error.clone()),
             );
         }
-        if readable && !thread_active {
+        if readable && !thread_active && !voice_room {
             if let Some(attachments) = &self.attachments {
                 chat = chat.child(attachments.clone());
             }
         }
-        if writable && !thread_active {
-            let text = self.composer.read(cx).value().to_string();
-            let files = self.drafts.borrow().files(self.chat_key());
-            let reading = self
-                .attachments
-                .as_ref()
-                .is_some_and(|attachments| attachments.read(cx).is_reading());
-            let attachments_ready = self.attachments.is_some() && !self.is_sending() && !reading;
-            let valid = draft::validate_send(&text, &files).is_ok();
-            let can_send = valid && !self.is_sending() && !reading && !self.access_pending;
-            let reply_id = self.drafts.borrow().reply(self.chat_key());
-            if reply_id > 0 {
-                let (author, excerpt) = self
-                    .messages
-                    .iter()
-                    .find(|message| message.id == reply_id)
-                    .map(|message| {
-                        (
-                            message.author.username.clone(),
-                            message.content.replace('\n', " "),
-                        )
-                    })
-                    .unwrap_or_else(|| ("Сообщение".into(), format!("#{reply_id}")));
-                chat = chat.child(
-                    div()
-                        .mx(px(18.))
-                        .mb(px(4.))
-                        .px(px(10.))
-                        .py(px(5.))
-                        .rounded(px(7.))
-                        .bg(ink(p.surface))
-                        .border_l_2()
-                        .border_color(ink(p.lime))
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w(px(0.))
-                                .truncate()
-                                .text_size(px(11.))
-                                .text_color(ink(p.muted))
-                                .child(format!("Ответ: {author} · {excerpt}")),
-                        )
-                        .child(
-                            div()
-                                .id("clear-reply")
-                                .cursor_pointer()
-                                .text_size(px(11.))
-                                .text_color(ink(p.muted))
-                                .on_click(cx.listener(|s, _, _, cx| s.clear_reply(cx)))
-                                .child("Убрать"),
-                        ),
-                );
-            }
-            if let Some(counter) = draft::counter(&text) {
-                chat = chat.child(
-                    div()
-                        .px(px(18.))
-                        .pb(px(2.))
-                        .text_size(px(12.))
-                        .text_color(ink(p.muted))
-                        .child(counter),
-                );
-            }
-            if !self.composer_error.is_empty() {
-                chat = chat.child(
-                    div()
-                        .px(px(18.))
-                        .pb(px(2.))
-                        .text_size(px(12.))
-                        .text_color(ink(p.danger))
-                        .child(self.composer_error.clone()),
-                );
-            }
-            let send_button = div()
-                .id("send")
-                .w(px(112.))
-                .h(px(40.))
-                .rounded(px(11.))
-                .bg(ink(if can_send { p.lime } else { p.surface }))
-                .text_color(ink(if can_send { 0x10100f } else { p.muted }))
-                .font_weight(gpui::FontWeight::BOLD)
-                .text_size(px(14.))
-                .flex()
-                .items_center()
-                .justify_center()
-                .gap_2()
-                .when(can_send, |button| {
-                    button
-                        .cursor_pointer()
-                        .on_click(cx.listener(|s, _, w, cx| s.send(w, cx)))
-                })
-                .child(if self.is_sending() {
-                    "Отправка…".into_any_element()
-                } else {
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .child(icon(
-                            "icons/send.svg",
-                            16.,
-                            ink(if can_send { 0x10100f } else { p.muted }),
-                        ))
-                        .child("Отправить")
-                        .into_any_element()
-                });
-            chat = chat.child(
-                div()
-                    .px(px(18.))
-                    .py(px(12.))
-                    .flex()
-                    .items_end()
-                    .gap_2()
-                    .when(attachments_ready, |row| {
-                        row.child(
-                            div()
-                                .id("attach-files")
-                                .w(px(37.))
-                                .h(px(37.))
-                                .rounded(px(10.))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .cursor_pointer()
-                                .on_click(cx.listener(|s, _, _, cx| {
-                                    if let Some(attachments) = &s.attachments {
-                                        attachments.update(cx, |panel, cx| panel.pick(cx));
-                                    }
-                                }))
-                                .child(icon("icons/paperclip.svg", 17., ink(p.muted))),
-                        )
-                    })
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_h(px(47.))
-                            .key_context("Composer")
-                            .on_action(cx.listener(|s, _: &composer::ComposerSend, window, cx| {
-                                // While the viewer is open it owns the
-                                // keyboard, like Go `imageViewerEvent`.
-                                if s.media.viewer.is_some() {
-                                    return;
-                                }
-                                s.send(window, cx);
-                            }))
-                            .on_action(cx.listener(
-                                |s, _: &composer::ComposerPasteFiles, _window, cx| {
-                                    if s.media.viewer.is_some() {
-                                        return;
-                                    }
-                                    if !s.paste_attachments(cx) {
-                                        // The clipboard has no files: let the
-                                        // input widget paste ordinary text.
-                                        cx.dispatch_action(&gpui_component::input::Paste);
-                                    }
-                                },
-                            ))
-                            .child(
-                                TextInput::new(&self.composer)
-                                    .font_family("Inter")
-                                    .text_size(px(14.))
-                                    .h_full(),
-                            ),
-                    )
-                    .child(send_button),
-            );
+        if writable && !thread_active && !voice_room {
+            chat = chat.child(self.render_composer(cx, false));
         }
         #[cfg(feature = "voxhold-media")]
         if voice_room {
-            if let Some(voice) = &self.voice {
+            if let Some(voice) = self.voice.clone() {
                 let header_height = if mobile { 58. } else { 67. };
-                let room_width = l.chat.w;
                 let room_height = (l.chat.h - header_height).max(120.);
+                let area = layout::Rect::new(0., 0., l.chat.w, room_height);
+                let split = layout::voice_chat_layout(area, room_chat);
                 voice.update(cx, |panel, cx| {
-                    panel.set_room_size(room_width, room_height);
+                    panel.set_room_size(split.room.w, split.room.h);
                     cx.notify();
                 });
                 chat = chat.child(
                     div()
+                        .id("voice-room-pane")
+                        .debug_selector(|| "voice-room-pane".into())
                         .absolute()
-                        .left(px(0.))
-                        .top(px(header_height))
-                        .w(px(room_width))
-                        .h(px(room_height))
-                        .child(voice.clone()),
+                        .left(px(split.room.x))
+                        .top(px(header_height + split.room.y))
+                        .w(px(split.room.w.max(1.)))
+                        .h(px(split.room.h.max(1.)))
+                        .overflow_hidden()
+                        .child(voice),
                 );
+                if let Some(panel) = split.chat {
+                    let absolute = layout::Rect::new(
+                        l.chat.x + panel.x,
+                        l.chat.y + header_height + panel.y,
+                        panel.w,
+                        panel.h,
+                    );
+                    let local =
+                        layout::Rect::new(panel.x, header_height + panel.y, panel.w, panel.h);
+                    chat = chat.child(self.voice_chat_panel(
+                        absolute,
+                        local,
+                        panel.y > 0.0,
+                        mobile,
+                        window,
+                        cx,
+                    ));
+                }
             }
         }
         root = root.child(
@@ -670,34 +761,65 @@ impl Render for Voxhold {
                     .flex()
                     .text_size(px(12.))
                     .text_color(ink(p.muted))
+                    .when(!self.personal_mode, |row| {
+                        row.child(
+                            div()
+                                .id("bottom-channels")
+                                .flex_1()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .cursor_pointer()
+                                .on_click(cx.listener(|s, _, _, cx| {
+                                    s.show_channels = !s.show_channels;
+                                    cx.notify();
+                                }))
+                                .child("Каналы"),
+                        )
+                    })
                     .child(
                         div()
-                            .id("bottom-channels")
+                            .id("bottom-messages")
+                            .debug_selector(|| "bottom-messages".into())
                             .flex_1()
                             .flex()
                             .items_center()
                             .justify_center()
                             .cursor_pointer()
-                            .on_click(cx.listener(|s, _, _, cx| {
-                                s.show_channels = !s.show_channels;
-                                cx.notify();
+                            .on_click(cx.listener(|s, _, window, cx| {
+                                if s.personal_mode {
+                                    s.return_to_channels(window, cx);
+                                } else {
+                                    // The rail, including its personal entry, is
+                                    // hidden at this width; this bar is the only
+                                    // way into "Сообщения".
+                                    s.enter_personal_mode(window, cx);
+                                    s.show_channels = true;
+                                    cx.notify();
+                                }
                             }))
-                            .child("Каналы"),
+                            .child(if self.personal_mode {
+                                "К каналам"
+                            } else {
+                                "Сообщения"
+                            }),
                     )
-                    .child(
-                        div()
-                            .id("bottom-members")
-                            .flex_1()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .cursor_pointer()
-                            .on_click(cx.listener(|s, _, _, cx| {
-                                let open = !s.show_members;
-                                s.set_members_open(open, cx);
-                            }))
-                            .child("Участники"),
-                    )
+                    .when(!self.personal_mode, |row| {
+                        row.child(
+                            div()
+                                .id("bottom-members")
+                                .flex_1()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .cursor_pointer()
+                                .on_click(cx.listener(|s, _, _, cx| {
+                                    let open = !s.show_members;
+                                    s.set_members_open(open, cx);
+                                }))
+                                .child("Участники"),
+                        )
+                    })
                     .child(
                         div()
                             .id("bottom-settings")
@@ -728,6 +850,11 @@ impl Render for Voxhold {
             );
         }
         if l.is_channels_open() {
+            let panel = if self.personal_mode {
+                self.messages_panel(window, cx)
+            } else {
+                self.channels_panel(window, cx)
+            };
             root = root.child(
                 div()
                     .absolute()
@@ -736,7 +863,7 @@ impl Render for Voxhold {
                     .w(px(l.channels.w))
                     .h(px(l.channels.h))
                     .shadow_lg()
-                    .child(self.channels_panel(window, cx)),
+                    .child(panel),
             );
         }
         if l.is_members_open() {
@@ -804,7 +931,6 @@ impl Render for Voxhold {
         }
         self.ensure_viewer_scale(window, cx);
         let popup_open = self.show_search
-            || self.show_inbox
             || self.update.panel_open
             || self.message_menu.is_some()
             || self.member_menu.is_some()
@@ -823,9 +949,6 @@ impl Render for Voxhold {
         // dismiss, and below the modal layers that follow.
         if self.update.panel_open {
             root = root.child(self.update_panel(l.chat, mobile, cx));
-        }
-        if let Some(overlay) = self.inbox_overlay(window, cx) {
-            root = root.child(overlay);
         }
         if let Some(overlay) = self.search_overlay(cx) {
             root = root.child(overlay);

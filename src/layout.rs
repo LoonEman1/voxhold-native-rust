@@ -320,6 +320,58 @@ pub fn compute_layout(
     layout
 }
 
+pub const VOICE_CHAT_MIN_DOCK: f32 = 300.0;
+pub const VOICE_CHAT_MAX_DOCK: f32 = 440.0;
+pub const VOICE_CHAT_MIN_ROOM: f32 = 300.0;
+pub const VOICE_CHAT_MIN_HEIGHT: f32 = 200.0;
+
+/// The room area and the optional docked chat panel inside it. The two
+/// rectangles never overlap: a wide area docks the chat on the right, a narrow
+/// one stacks it under the room. The room is resized to the remainder before
+/// its tiles are laid out.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct VoiceChatLayout {
+    pub room: Rect,
+    pub chat: Option<Rect>,
+}
+
+impl VoiceChatLayout {
+    pub fn closed(area: Rect) -> Self {
+        Self {
+            room: area,
+            chat: None,
+        }
+    }
+}
+
+pub fn voice_chat_layout(area: Rect, open: bool) -> VoiceChatLayout {
+    if !open || area.is_empty() {
+        return VoiceChatLayout::closed(area);
+    }
+    if !area.w.is_finite() || !area.h.is_finite() || area.w <= 0.0 {
+        return VoiceChatLayout::closed(area);
+    }
+    let dock = (area.w * 0.34)
+        .clamp(VOICE_CHAT_MIN_DOCK, VOICE_CHAT_MAX_DOCK)
+        .min(area.w);
+    if area.w - dock >= VOICE_CHAT_MIN_ROOM {
+        return VoiceChatLayout {
+            room: Rect::new(area.x, area.y, area.w - dock, area.h),
+            chat: Some(Rect::new(area.x + area.w - dock, area.y, dock, area.h)),
+        };
+    }
+    // Not enough width for both columns: use a non-overlapping stacked panel
+    // instead of covering the room cards with an overlay.
+    let chat_h = (area.h * 0.45)
+        .clamp(VOICE_CHAT_MIN_HEIGHT, 420.0)
+        .min((area.h - VOICE_CHAT_MIN_HEIGHT).max(0.0));
+    let room_h = (area.h - chat_h).max(0.0);
+    VoiceChatLayout {
+        room: Rect::new(area.x, area.y, area.w, room_h),
+        chat: Some(Rect::new(area.x, area.y + room_h, area.w, chat_h)),
+    }
+}
+
 /// Drag state for the two shell splitters. The offset from the original edge is
 /// applied to the pointer position, then both Go bounds are enforced by
 /// [`compute_layout`].
@@ -513,5 +565,50 @@ mod tests {
     fn splitter_drag_maps_pointer_to_width() {
         assert_eq!(proposed_width(SplitterSide::Channels, 400.0, 6.0), 318.0);
         assert_eq!(members_width_from_pointer(1280.0, 1048.0, 6.0), 238.0);
+    }
+
+    #[test]
+    fn voice_chat_docks_right_and_resizes_the_room() {
+        let area = Rect::new(328.0, 67.0, 714.0, 833.0);
+        let layout = voice_chat_layout(area, true);
+        let chat = layout.chat.expect("docked chat");
+        assert_eq!(chat.w, 300.0, "clamp lower bound");
+        assert_eq!(chat.x + chat.w, area.right());
+        assert_eq!(layout.room.w, area.w - chat.w);
+        assert_eq!(layout.room.right(), chat.x, "no overlap");
+        assert_eq!(layout.room.h, area.h);
+    }
+
+    #[test]
+    fn voice_chat_width_follows_the_web_clamp() {
+        let area = Rect::new(0.0, 0.0, 1200.0, 700.0);
+        let chat = voice_chat_layout(area, true).chat.expect("docked chat");
+        assert_eq!(chat.w, 408.0, "34% of the area");
+        assert!(chat.w <= VOICE_CHAT_MAX_DOCK);
+        let wide = voice_chat_layout(Rect::new(0.0, 0.0, 2000.0, 700.0), true)
+            .chat
+            .expect("docked chat");
+        assert_eq!(wide.w, VOICE_CHAT_MAX_DOCK);
+    }
+
+    #[test]
+    fn voice_chat_stacks_without_overlap_on_a_narrow_area() {
+        let area = Rect::new(328.0, 67.0, 572.0, 653.0);
+        let layout = voice_chat_layout(area, true);
+        let chat = layout.chat.expect("stacked chat");
+        assert_eq!(layout.room.bottom(), chat.y, "no overlap");
+        assert_eq!(chat.w, area.w, "the panel keeps the full width");
+        assert!(layout.room.h > 0.0 && chat.h > 0.0);
+    }
+
+    #[test]
+    fn clipped_voice_chat_changes_nothing() {
+        let area = Rect::new(10.0, 20.0, 0.0, 100.0);
+        assert_eq!(voice_chat_layout(area, true), VoiceChatLayout::closed(area));
+        let area = Rect::new(10.0, 20.0, 500.0, 600.0);
+        assert_eq!(
+            voice_chat_layout(area, false),
+            VoiceChatLayout::closed(area)
+        );
     }
 }

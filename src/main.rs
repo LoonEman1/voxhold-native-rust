@@ -19,6 +19,7 @@ mod links;
 mod media;
 mod members;
 mod message_tools;
+mod messages;
 mod notifications;
 mod open_url;
 mod personal_settings;

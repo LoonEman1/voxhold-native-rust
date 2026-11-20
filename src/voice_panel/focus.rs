@@ -129,8 +129,8 @@ impl VoicePanel {
 /// the dock entries are named separately even when both are painted.
 fn dock_focus_id(action_id: &str) -> &'static str {
     match action_id {
-        "voice-mic" => "dock-voice-mic",
-        "voice-deaf" => "dock-voice-deaf",
-        _ => "dock-voice-leave",
+        "voice-mic" => "voice-dock-action-voice-mic",
+        "voice-deaf" => "voice-dock-action-voice-deaf",
+        _ => "voice-dock-action-voice-leave",
     }
 }

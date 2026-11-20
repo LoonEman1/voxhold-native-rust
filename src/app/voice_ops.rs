@@ -458,7 +458,7 @@ impl Voxhold {
             actions = actions.child(
                 div()
                     .id(("voice-dock-action", index))
-                    .debug_selector(move || format!("dock-{id}").into())
+                    .debug_selector(move || format!("voice-dock-action-{id}").into())
                     .h_full()
                     .flex_1()
                     .flex()

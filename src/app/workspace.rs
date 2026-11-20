@@ -20,6 +20,7 @@ impl Voxhold {
         #[cfg(feature = "voxhold-media")]
         {
             self.voice_unconfirmed.remove(&server);
+            self.prune_voice_chat();
             self.sync_voice_panel(cx);
             self.refresh_voice_call(window, cx);
         }
@@ -28,6 +29,26 @@ impl Voxhold {
 
     pub(super) fn select_server(&mut self, id: i64, window: &mut Window, cx: &mut Context<Self>) {
         let Some(c) = self.client.clone() else { return };
+        if self.personal_mode {
+            // The draft belongs to the still-open conversation key. Save it
+            // before both ids are cleared so no later `chat_key()` derives a
+            // channel key from the conversation id.
+            self.save_composer_draft(cx);
+            self.personal_mode = false;
+            self.personal_return = None;
+            self.pending_return_channel = None;
+            self.show_members = self.personal_members;
+            self.personal_members = false;
+            self.messaging.epoch = self.messaging.epoch.wrapping_add(1);
+            self.messaging.clear_search();
+            self.messaging.creator = None;
+            self._creator_subscriptions.clear();
+            self.messaging.notifications = None;
+            self.messaging.older_request = None;
+            self.messaging.open_request = None;
+            self.conversation = None;
+            self.channel = 0;
+        }
         let previous = self.chat_key();
         if previous.channel != 0 {
             let text = self.composer.read(cx).value().to_string();
@@ -35,7 +56,6 @@ impl Voxhold {
         }
         self.conversation = None;
         self.close_thread(window, cx);
-        self.show_inbox = false;
         self.message_menu = None;
         self.member_menu = None;
         self.forward = None;
@@ -100,33 +120,6 @@ impl Voxhold {
             }));
         });
         self.search = Some(search);
-        if self.inbox.is_none() {
-            let inbox = cx.new(|_| inbox::Inbox::new());
-            let weak_inbox = cx.entity().downgrade();
-            let weak_refresh = weak_inbox.clone();
-            inbox.update(cx, |inbox, _| {
-                inbox.set_select_handler(Box::new(move |id, window, cx| {
-                    if let Some(view) = weak_inbox.upgrade() {
-                        view.update(cx, |view, cx| {
-                            if let Some(conversation) = view
-                                .conversations
-                                .iter()
-                                .find(|conversation| conversation.id == id)
-                                .cloned()
-                            {
-                                view.select_conversation(conversation, window, cx);
-                            }
-                        });
-                    }
-                }));
-                inbox.set_refresh_handler(Box::new(move |_window, cx| {
-                    if let Some(view) = weak_refresh.upgrade() {
-                        view.update(cx, |view, cx| view.refresh_recents(cx));
-                    }
-                }));
-            });
-            self.inbox = Some(inbox);
-        }
         if self.personal.is_none() {
             self.personal = Some(personal_settings::PersonalSettings::new(window, cx));
         }
@@ -159,6 +152,7 @@ impl Voxhold {
         self.access_pending = false;
         self.access_reload_in_flight = false;
         self.access_refresh_again = false;
+        self.pending_return_channel = None;
         self.refresh_request = None;
         self.refresh_again = false;
         self.channel_snapshot_request = None;
@@ -252,7 +246,7 @@ impl Voxhold {
         self.close_viewer(window);
         self.preview_wakeup = None;
         self.preview_wake_at = None;
-        let writable = self.channels.iter().any(|ch| ch.id == id && ch.writable());
+        let writable = self.channel_chat_writable(id);
         if let Some(attachments) = &self.attachments {
             attachments.update(cx, |a, cx| {
                 a.set_scope(Some(draft::ChatKey::channel(self.server, id)), writable, cx)
@@ -283,6 +277,7 @@ impl Voxhold {
         self.access_pending = false;
         self.access_reload_in_flight = false;
         self.access_refresh_again = false;
+        self.pending_return_channel = None;
         self.refresh_request = None;
         self.refresh_again = false;
         self.pending_edits.clear();
@@ -346,21 +341,20 @@ impl Voxhold {
         self.loading_older = false;
         self.generation += 1;
         self.error.clear();
-        let has_history = self
-            .channels
-            .iter()
-            .any(|ch| ch.id == id && ch.has_history());
-        self.update_channel_subscription(has_history);
+        let has_chat = self.channel_chat_readable(id);
+        self.refresh_chat_subscription();
         self.load_channel_members(cx);
-        if has_history {
+        if has_chat {
             self.refresh_history(window, cx);
-            if self.search_permissions_ready {
-                self.refresh_pins(cx);
-            } else if self.search.is_some() {
-                // Returning from a personal conversation lost the confirmed
-                // snapshot. Read it now; its callback installs the panel
-                // permissions and then refreshes the pins.
-                self.refresh_search_permissions(window, cx);
+            if kind != "voice" {
+                if self.search_permissions_ready {
+                    self.refresh_pins(cx);
+                } else if self.search.is_some() {
+                    // Returning from a personal conversation lost the confirmed
+                    // snapshot. Read it now; its callback installs the panel
+                    // permissions and then refreshes the pins.
+                    self.refresh_search_permissions(window, cx);
+                }
             }
         }
         cx.notify();
@@ -390,6 +384,9 @@ impl Voxhold {
         self.access_reload_in_flight = false;
         self.access_refresh_again = false;
         self.error.clear();
+        // The confirmed timeline is hidden until the fresh ACL list arrives;
+        // stop channel events for it as well.
+        self.refresh_chat_subscription();
         self.access_generation = self.access_generation.wrapping_add(1);
         self.refresh_request = None;
         self.refresh_again = false;
@@ -469,6 +466,9 @@ impl Voxhold {
     }
 
     pub(super) fn remove_current_server(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Save the open DM under its conversation key before `channel` is
+        // cleared; `clear_server` below only removes channel-keyed drafts.
+        self.save_composer_draft(cx);
         self.servers.retain(|server| server.id != self.server);
         self.drafts.borrow_mut().clear_server(self.server);
         let next = self.servers.first().map_or(0, |server| server.id);
@@ -481,7 +481,8 @@ impl Voxhold {
             return;
         };
         self.access_reload_in_flight = true;
-        let (server, generation, access) = (self.server, self.generation, self.access_generation);
+        let (server, access, session) =
+            (self.server, self.access_generation, self.session_generation);
         let runtime = self.runtime.clone();
         let task = cx.background_spawn(async move {
             runtime.block_on(async {
@@ -493,13 +494,26 @@ impl Voxhold {
         cx.spawn_in(window, async move |this, window| {
             let result = task.await;
             let _ = this.update_in(window, |s, window, cx| {
-                if s.generation != generation || s.server != server || s.access_generation != access
+                // The reload belongs to the server ACL scope, not to the
+                // history generation: opening a personal conversation bumps
+                // `generation` but must still receive this answer.
+                if s.server != server
+                    || s.access_generation != access
+                    || s.session_generation != session
                 {
                     return;
                 }
                 s.access_reload_in_flight = false;
                 if std::mem::take(&mut s.access_refresh_again) {
-                    s.invalidate_access(window, cx);
+                    // This answer predates the last `channels.changed`. While a
+                    // personal chat is open `invalidate_access` is a no-op, so
+                    // the replacement reload must start directly; otherwise
+                    // `access_pending` would stay set without a request.
+                    if s.in_conversation() {
+                        s.reload_channels(window, cx);
+                    } else {
+                        s.invalidate_access(window, cx);
+                    }
                     return;
                 }
                 match result {
@@ -524,6 +538,9 @@ impl Voxhold {
                             s.close_settings(false, window, cx);
                         }
                         if s.in_conversation() {
+                            // A DM opened after "К каналам" owns the surface;
+                            // the saved channel must not be selected later.
+                            s.pending_return_channel = None;
                             s.access_pending = false;
                             s.error.clear();
                             s.refresh_recents(cx);
@@ -553,6 +570,19 @@ impl Voxhold {
                             .iter()
                             .find(|c| c.id == s.channel && c.readable() && !c.e2ee_required)
                             .map(|c| c.id);
+                        // "К каналам" during the reload restored a channel that
+                        // this fresh list may no longer contain. Use the same
+                        // first-readable fallback as the non-pending return.
+                        let returning = s.pending_return_channel.take().is_some();
+                        let fallback = if returning {
+                            s.channels
+                                .iter()
+                                .find(|c| c.readable() && !c.e2ee_required)
+                                .map(|c| c.id)
+                        } else {
+                            None
+                        };
+                        let channel = channel.or(fallback);
                         s.access_pending = false;
                         s.error.clear();
                         let channel = channel.unwrap_or_default();
@@ -575,7 +605,13 @@ impl Voxhold {
                     Err(voxhold_api::Error::Http(403 | 404)) => {
                         s.remove_current_server(window, cx);
                     }
-                    Err(error) => s.error = error.to_string(),
+                    Err(error) => {
+                        // A failed reload never restores the pending channel:
+                        // a later unrelated success must not auto-fallback
+                        // into it.
+                        s.pending_return_channel = None;
+                        s.error = error.to_string();
+                    }
                 }
                 cx.notify();
             });

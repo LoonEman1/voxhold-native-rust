@@ -231,10 +231,9 @@ fn manifest(options: &Options) -> Result<(), String> {
         let bytes = std::fs::read(path).map_err(|error| format!("{path}: {error}"))?;
         let delta =
             voxhold_update::delta::read_manifest(&bytes).map_err(|error| error.to_string())?;
-        if delta.to_version != version {
+        if delta.to_version != version || delta.target_package_sha256 != full_sha {
             return Err(format!(
-                "delta {path} targets {} instead of {version}",
-                delta.to_version
+                "delta {path} does not reproduce the portable package for {version}"
             ));
         }
         deltas.push(DeltaEntry {

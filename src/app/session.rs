@@ -161,33 +161,6 @@ impl Voxhold {
         self.server_settings = Some(server_settings::ServerSettings::new(window, cx));
         self.channel_settings = Some(channel_settings::ChannelSettings::new(window, cx));
         self.channel_notifications = Some(channel_settings::ChannelNotifications::new());
-        self.inbox = Some(cx.new(|_| inbox::Inbox::new()));
-        let inbox = self.inbox.clone().expect("inbox");
-        let weak = cx.entity().downgrade();
-        inbox.update(cx, |inbox, _| {
-            inbox.set_select_handler(Box::new(move |id, window, cx| {
-                if let Some(view) = weak.upgrade() {
-                    view.update(cx, |view, cx| {
-                        if let Some(conversation) = view
-                            .conversations
-                            .iter()
-                            .find(|conversation| conversation.id == id)
-                            .cloned()
-                        {
-                            view.select_conversation(conversation, window, cx);
-                        }
-                    });
-                }
-            }));
-        });
-        let weak = cx.entity().downgrade();
-        inbox.update(cx, |inbox, _| {
-            inbox.set_refresh_handler(Box::new(move |_window, cx| {
-                if let Some(view) = weak.upgrade() {
-                    view.update(cx, |view, cx| view.refresh_recents(cx));
-                }
-            }));
-        });
         self.self_user_id = login_session.user_id();
         self.auth.username = login_session.username().to_owned();
         self.active_profile_save = None;
@@ -208,6 +181,10 @@ impl Voxhold {
         let first_server = self.servers.first().map(|server| server.id);
         if let Some(id) = first_server {
             self.select_server(id, window, cx);
+        } else {
+            // The web loads the personal index regardless of the selected
+            // server. An account without servers still has conversations.
+            self.refresh_recents(cx);
         }
         cx.notify();
     }
@@ -303,6 +280,7 @@ impl Voxhold {
             self.voice_rooms.clear();
             self.voice_streams.clear();
             self.voice_unconfirmed.clear();
+            self.voice_chat_rooms.clear();
         }
         self.close_recordings(false, window, cx);
         self.recording_access_epoch = self.recording_access_epoch.wrapping_add(1);
@@ -381,6 +359,16 @@ impl Voxhold {
         self.conversations.clear();
         self.recents_request = None;
         self.recents_again = false;
+        // The personal surface belongs to the signed-in account. Keep no
+        // selection, filter, search, creator, notification or cursor state for
+        // the next account; the new workspace always starts from a fresh index.
+        self.personal_mode = false;
+        self.personal_return = None;
+        self.conversations_reconcile = None;
+        self.conversation_select_seq = self.conversation_select_seq.wrapping_add(1);
+        self.messaging.reset(window, cx);
+        self._creator_subscriptions.clear();
+        self.pending_personal_cleanup = false;
         self.channel_snapshot_request = None;
         self.attachments = None;
         self.personal = None;
@@ -390,11 +378,11 @@ impl Voxhold {
         self.active_settings = None;
         self.settings_return_focus = None;
         self.settings_ring.clear();
-        self.inbox = None;
         self.search = None;
-        self.show_inbox = false;
         self.show_search = false;
         self.show_servers = false;
+        self.pending_return_channel = None;
+        self.personal_members = false;
         self.auth = auth::AuthState::with_prefill(&origin);
         self.auth.screen = auth::AuthScreen::Login;
         self.auth.status = reason;
@@ -690,12 +678,7 @@ impl Voxhold {
         self.stop_realtime();
         if let Some(client) = self.client.clone() {
             self.start_realtime(client, window, cx);
-            let has_history = self.conversation.is_none()
-                && self
-                    .channels
-                    .iter()
-                    .any(|channel| channel.id == self.channel && channel.has_history());
-            self.update_channel_subscription(has_history);
+            self.refresh_chat_subscription();
         }
         #[cfg(feature = "voxhold-media")]
         if let Some(panel) = self.voice.clone() {

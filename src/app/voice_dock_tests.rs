@@ -18,7 +18,7 @@ async fn the_dock_ring_follows_the_painted_sidebar(cx: &mut TestAppContext) {
             let mut ids: Vec<_> = panel
                 .test_focus_ring_ids()
                 .into_iter()
-                .filter(|id| id.starts_with("dock-"))
+                .filter(|id| id.starts_with("voice-dock-action-"))
                 .collect();
             ids.sort_unstable();
             ids
@@ -44,7 +44,11 @@ async fn the_dock_ring_follows_the_painted_sidebar(cx: &mut TestAppContext) {
     assert!(visual.debug_bounds("voice-dock").is_some());
     assert_eq!(
         dock_ids(&mut visual),
-        ["dock-voice-deaf", "dock-voice-leave", "dock-voice-mic"],
+        [
+            "voice-dock-action-voice-deaf",
+            "voice-dock-action-voice-leave",
+            "voice-dock-action-voice-mic"
+        ],
         "the painted dock contributes microphone, sound and leave"
     );
 
@@ -72,7 +76,11 @@ async fn the_dock_ring_follows_the_painted_sidebar(cx: &mut TestAppContext) {
     });
     assert_eq!(
         dock_ids(&mut visual),
-        ["dock-voice-deaf", "dock-voice-leave", "dock-voice-mic"]
+        [
+            "voice-dock-action-voice-deaf",
+            "voice-dock-action-voice-leave",
+            "voice-dock-action-voice-mic"
+        ]
     );
 }
 
@@ -94,12 +102,16 @@ async fn tab_skips_room_handles_when_the_room_pane_is_hidden(cx: &mut TestAppCon
     assert!(visual.debug_bounds("voice-dock").is_some());
     assert_eq!(
         voice.read_with(&*visual, |panel, _| panel.test_focus_ring_ids()),
-        ["dock-voice-mic", "dock-voice-deaf", "dock-voice-leave"],
+        [
+            "voice-dock-action-voice-mic",
+            "voice-dock-action-voice-deaf",
+            "voice-dock-action-voice-leave"
+        ],
         "only the painted dock is in the ring"
     );
     for id in voice.read_with(&*visual, |panel, _| panel.test_focus_ring_ids()) {
         assert!(
-            id.starts_with("dock-") || id.starts_with("stream-"),
+            id.starts_with("voice-dock-action-") || id.starts_with("stream-"),
             "the hidden room contributed {id}"
         );
         assert!(
@@ -121,8 +133,12 @@ async fn tab_skips_room_handles_when_the_room_pane_is_hidden(cx: &mut TestAppCon
     let focused = |visual: &mut VisualTestContext| {
         visual.update(|window, app| voice.read(app).focused_action(window))
     };
-    assert_eq!(focused(&mut visual), Some("dock-voice-mic"));
-    for expected in ["dock-voice-deaf", "dock-voice-leave", "dock-voice-mic"] {
+    assert_eq!(focused(&mut visual), Some("voice-dock-action-voice-mic"));
+    for expected in [
+        "voice-dock-action-voice-deaf",
+        "voice-dock-action-voice-leave",
+        "voice-dock-action-voice-mic",
+    ] {
         visual.simulate_keystrokes("tab");
         assert_eq!(
             focused(&mut visual),
@@ -133,14 +149,14 @@ async fn tab_skips_room_handles_when_the_room_pane_is_hidden(cx: &mut TestAppCon
     visual.simulate_keystrokes("shift-tab");
     assert_eq!(
         focused(&mut visual),
-        Some("dock-voice-leave"),
+        Some("voice-dock-action-voice-leave"),
         "backward Tab wraps inside the dock too"
     );
     for _ in 0..3 {
         visual.simulate_keystrokes("shift-tab");
         let id = focused(&mut visual).expect("the dock keeps focus");
         assert!(
-            id.starts_with("dock-"),
+            id.starts_with("voice-dock-action-"),
             "the hidden room's {id} must not receive focus"
         );
         assert!(!matches!(id, "voice-local" | "voice-mic"));
@@ -180,7 +196,7 @@ async fn the_dock_disappears_when_the_call_ends(cx: &mut TestAppContext) {
         voice
             .read_with(&*visual, |panel, _| panel.test_focus_ring_ids())
             .iter()
-            .all(|id| !id.starts_with("dock-")),
+            .all(|id| !id.starts_with("voice-dock-action-")),
         "an idle call leaves no dock handles behind"
     );
 
@@ -214,7 +230,7 @@ async fn the_dock_disappears_when_the_call_ends(cx: &mut TestAppContext) {
         voice
             .read_with(&*visual, |panel, _| panel.test_focus_ring_ids())
             .iter()
-            .all(|id| !id.starts_with("dock-")),
+            .all(|id| !id.starts_with("voice-dock-action-")),
         "the ended call leaves no dock handles behind"
     );
 }

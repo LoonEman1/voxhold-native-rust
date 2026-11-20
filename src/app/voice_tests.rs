@@ -196,13 +196,19 @@ async fn a_call_survives_navigation_and_moves_to_the_dock(cx: &mut TestAppContex
         "the dock is painted even while the active room is open"
     );
     assert!(
-        visual.debug_bounds("dock-voice-mic").is_some()
-            && visual.debug_bounds("dock-voice-deaf").is_some()
-            && visual.debug_bounds("dock-voice-leave").is_some(),
+        visual.debug_bounds("voice-dock-action-voice-mic").is_some()
+            && visual
+                .debug_bounds("voice-dock-action-voice-deaf")
+                .is_some()
+            && visual
+                .debug_bounds("voice-dock-action-voice-leave")
+                .is_some(),
         "the dock paints microphone, sound and leave"
     );
     assert!(
-        visual.debug_bounds("dock-voice-records").is_none(),
+        visual
+            .debug_bounds("voice-dock-action-voice-records")
+            .is_none(),
         "«Записи» is a room action, not a dock action"
     );
 
@@ -291,7 +297,7 @@ async fn tab_and_shift_tab_walk_the_room_actions(cx: &mut TestAppContext) {
     visual.simulate_keystrokes("tab");
     assert_eq!(
         focused(&mut visual),
-        Some("dock-voice-mic"),
+        Some("voice-dock-action-voice-mic"),
         "the painted dock follows the room"
     );
     visual.simulate_keystrokes("shift-tab");

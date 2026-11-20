@@ -174,11 +174,15 @@ impl Voxhold {
                     // the server ACL still has to be refreshed: leaving
                     // `voice_unconfirmed` set would hide every room until an
                     // unrelated forced reload.
-                    #[cfg(feature = "voxhold-media")]
-                    if self.voice_unconfirmed.contains(&self.server) {
-                        if self.access_reload_in_flight {
-                            self.access_refresh_again = true;
-                        } else {
+                    // The in-flight answer predates this event, so it cannot
+                    // confirm the new ACL. Replace it once it returns; in a
+                    // personal chat `invalidate_access` is a no-op, so the
+                    // replacement must be started by the callback itself.
+                    if self.access_reload_in_flight {
+                        self.access_refresh_again = true;
+                    } else {
+                        #[cfg(feature = "voxhold-media")]
+                        if self.voice_unconfirmed.contains(&self.server) {
                             self.reload_channels(window, cx);
                         }
                     }
@@ -657,12 +661,18 @@ impl Voxhold {
                     }
                 }
             }
-            "conversation.message" if !self.access_pending => {
+            // Personal conversations are independent of the channel ACL
+            // reload; their index and events must keep flowing while a
+            // channel access attempt is pending.
+            "conversation.message" => {
                 if let Ok(message) = serde_json::from_value::<Message>(data.clone()) {
                     if self.in_conversation() && message.conversation_id == self.channel {
-                        self.merge_message(true, message);
+                        self.merge_message(true, message.clone());
                         self.trim_history(false);
                     }
+                    // The rail/sidebar index follows another device even when
+                    // the active window is a different conversation.
+                    self.note_conversation_message(&message);
                 }
                 effect.recents = true;
             }
@@ -685,10 +695,18 @@ impl Voxhold {
                     && data["conversation_id"].as_i64() == Some(self.channel);
                 if matches {
                     effect.resync = true;
+                    // Scope the marker to this exact event and selection: a
+                    // later page or another conversation cannot replay it.
+                    self.conversations_reconcile = Some(messages::ConversationReconcile {
+                        conversation: self.channel,
+                        select_seq: self.conversation_select_seq,
+                        epoch: self.messaging.epoch,
+                        session: self.session_generation,
+                    });
                 }
                 effect.recents = true;
             }
-            "conversation.reactions" if !self.access_pending => {
+            "conversation.reactions" => {
                 if self.in_conversation() && data["conversation_id"].as_i64() == Some(self.channel)
                 {
                     if let Some(message_id) = data["message_id"].as_i64().filter(|id| *id > 0) {
@@ -700,8 +718,21 @@ impl Voxhold {
                     }
                 }
             }
-            "conversation.notification" | "conversation.read" => {
+            "conversation.notification" => {
                 effect.recents = true;
+            }
+            "conversation.read" => {
+                if let Some(id) = data["conversation_id"].as_i64() {
+                    self.note_conversation_read(id);
+                }
+                effect.recents = true;
+            }
+            "conversation.settings" => {
+                if let (Some(id), Some(muted)) =
+                    (data["conversation_id"].as_i64(), data["muted"].as_bool())
+                {
+                    self.apply_conversation_settings(id, muted);
+                }
             }
             "attachments.changed" if !self.access_pending => {
                 if data["channel_id"].as_i64() == Some(self.channel) {

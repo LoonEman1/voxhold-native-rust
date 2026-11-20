@@ -1,6 +1,12 @@
+mod channel;
 mod client_extra;
+mod conversations;
 mod recordings;
 mod session;
+pub use conversations::{
+    valid_cursor, ConversationNotification, ConversationPage, ConversationSearchHit,
+    ConversationSearchPage, MAX_LIMIT, MAX_NAME_RUNES, MAX_QUERY_RUNES, MAX_USERS,
+};
 use futures_util::{SinkExt, StreamExt};
 pub use recordings::{
     Recording, RecordingList, RECORDING_DELETED, RECORDING_FAILED, RECORDING_LOCAL_ONLY,
@@ -319,12 +325,12 @@ impl Client {
         )
         .await
     }
+    /// The popup/rail keeps the R04 single-page view; the paged personal index
+    /// uses `conversations_page` instead.
     pub async fn recent_conversations(&self) -> Result<Vec<Conversation>> {
-        let v: Value = self
-            .request(Method::GET, "/api/v1/me/conversations?limit=13", None)
-            .await?;
-        let rows: Vec<Conversation> = serde_json::from_value(v["conversations"].clone())?;
-        Ok(rows
+        let page = self.conversations_page(13, None).await?;
+        Ok(page
+            .conversations
             .into_iter()
             .filter(|c| c.id > 0 && !c.saved)
             .take(12)
@@ -476,17 +482,6 @@ dto!(Channel {
     can_publish: bool,
     unread_count: i64
 });
-impl Channel {
-    pub fn readable(&self) -> bool {
-        self.permissions & 1 != 0
-    }
-    pub fn has_history(&self) -> bool {
-        self.readable() && !self.e2ee_required && (self.kind == "text" || self.kind == "news")
-    }
-    pub fn writable(&self) -> bool {
-        self.has_history() && self.permissions & 2 != 0 && (self.kind != "news" || self.can_publish)
-    }
-}
 dto!(Author {
     user_id: i64,
     username: String
@@ -972,20 +967,6 @@ mod tests {
         assert!(c.url("//evil.test/x").is_err());
         assert!(c.url("https://evil.test").is_err());
         assert_eq!(c.url("/api/v1/ws").unwrap().host_str(), Some("example.com"));
-    }
-    #[test]
-    fn permissions() {
-        let mut c = Channel {
-            kind: "news".into(),
-            permissions: 3,
-            ..Default::default()
-        };
-        assert!(c.has_history());
-        assert!(!c.writable());
-        c.can_publish = true;
-        assert!(c.writable());
-        c.e2ee_required = true;
-        assert!(!c.has_history());
     }
 }
 #[cfg(test)]

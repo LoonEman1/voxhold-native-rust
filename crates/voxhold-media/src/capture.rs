@@ -536,6 +536,11 @@ fn report_level(
         level,
         muted,
         dropped: jitter.dropped_blocks() + counters.source_errors + counters.source_pending,
+        underruns: jitter.underruns(),
+        overflow_blocks: jitter.overflow_blocks(),
+        late_ticks: jitter.late_ticks(),
+        late_sends: jitter.late_sends(),
+        source_errors: counters.source_errors,
     });
 }
 

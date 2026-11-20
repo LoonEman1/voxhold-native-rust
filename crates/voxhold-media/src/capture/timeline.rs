@@ -26,6 +26,10 @@ pub const RESERVE_SAMPLES: usize = BLOCK * 3;
 pub const CEILING_SAMPLES: usize = BLOCK * 8;
 /// One output block per 10 ms at 48 kHz mono.
 pub const TICK: Duration = Duration::from_millis(10);
+/// Upper bound on whole periods folded into one deadline step. More than
+/// 100 s of lateness (a system suspend) restarts the grid instead of letting
+/// it stay behind forever; the skipped slots are still counted in full.
+const MAX_MISSED_PER_WAKE: u64 = 10_000;
 /// Longest wait for a driver event. The deadline (not this timeout) is the
 /// output clock; the bound only lets mute/PTT epochs be noticed promptly.
 pub const MAX_WAIT: Duration = TICK;
@@ -55,12 +59,13 @@ pub struct CaptureStats {
     /// Whole blocks discarded without being sent: overflow, an underrun
     /// remainder, or an epoch/mute flush.
     pub dropped_blocks: u64,
-    /// Whole 10 ms periods skipped because the consumer woke at least one tick
-    /// late. This is the count of missed slots, not of late wakes.
+    /// Whole 10 ms slots skipped because the consumer woke after them or a
+    /// skipped slot left less than half a period before the next one. This is
+    /// the count of missed slots, not of late wakes.
     pub late_ticks: u64,
-    /// Ticks that woke after the deadline but by less than one 10 ms period.
-    /// The deadline is still re-anchored to `now`, so repeated small jitter
-    /// never accumulates latency; this counter shows it instead of hiding it.
+    /// Ticks that woke after the deadline but by less than one 10 ms period,
+    /// yet still left at least half a period for the next slot. The absolute
+    /// grid is kept, so this shows jitter without accumulating latency.
     pub late_sends: u64,
     /// Driver waits that returned `WAIT_TIMEOUT` (normal when the next tick is
     /// earlier than the next 20 ms driver buffer).
@@ -188,17 +193,36 @@ impl PcmJitter {
         if now < deadline {
             return Tick::None;
         }
-        // Any lateness re-anchors the next deadline to the actual wake. Adding
-        // whole periods to the old deadline would let the next block leave
-        // almost immediately after a 1..9 ms late send (0/19/20 ms pattern).
+        // Keep the absolute 10 ms grid. The next deadline is derived from the
+        // grid, never from the actual wake, so a small lateness (a Win32 wait
+        // usually returns 0.3..0.45 ms late) shortens exactly one interval to
+        // ~9.7 ms instead of slowing the stream down on every block.
         let late = now.duration_since(deadline);
-        self.next_tick = Some(now + TICK);
-        if late >= TICK {
-            // Whole periods were missed: count slots, not wakes.
-            self.late_ticks += (late.as_nanos() / TICK.as_nanos()) as u64;
-        } else if late > Duration::ZERO {
-            // Sub-period lateness: still a late send, counted separately so
-            // repeated small jitter is visible without inflating `late_ticks`.
+        // `as_nanos` is u128; the cast is saturating for an impossible wake
+        // that is older than `u64::MAX` periods.
+        let missed = u64::try_from(late.as_nanos() / TICK.as_nanos()).unwrap_or(u64::MAX);
+        self.late_ticks = self.late_ticks.saturating_add(missed);
+        let mut skipped_slot = false;
+        let mut next = if missed > MAX_MISSED_PER_WAKE {
+            // A suspend/resume-sized gap: the old grid can never be reached
+            // again without a busy catch-up. Start a fresh grid at this wake;
+            // the lateness is already counted above.
+            now + TICK
+        } else {
+            deadline + TICK * (missed as u32 + 1)
+        };
+        // The next slot is due in less than half a period after this block
+        // was processed: it cannot be met, so skip it instead of sending a
+        // second block almost immediately.
+        if next.saturating_duration_since(now) < TICK / 2 && missed <= MAX_MISSED_PER_WAKE {
+            next += TICK;
+            self.late_ticks = self.late_ticks.saturating_add(1);
+            skipped_slot = true;
+        }
+        self.next_tick = Some(next);
+        if late > Duration::ZERO && missed == 0 && !skipped_slot {
+            // A short lateness that still kept the grid; a skipped slot is
+            // counted in `late_ticks` only, never twice.
             self.late_sends += 1;
         }
         if self.pop_into(out) {
@@ -523,10 +547,12 @@ mod tests {
         );
     }
 
-    /// Regression for review item P2: at 0/19/20 ms the 9 ms late send used to
-    /// keep the old deadline (20 ms), so the next block left 1 ms later.
+    /// Regression for review item P1/P2: after an on-time send at 0 ms, a wake
+    /// at 19 ms delivers the slot due at 10 ms. The 20 ms slot is only 1 ms
+    /// away and cannot be met, so it is skipped, counted once in `late_ticks`,
+    /// and the absolute grid puts the next block at 30 ms, never at 29 ms.
     #[test]
-    fn a_sub_period_late_send_reanchors_the_deadline_and_does_not_burst() {
+    fn a_nine_ms_late_send_keeps_the_grid_and_skips_the_unreachable_slot() {
         let base = Instant::now();
         let mut jitter = PcmJitter::new();
         let mut out = [0_i16; BLOCK];
@@ -537,25 +563,31 @@ mod tests {
         assert_eq!(jitter.stats().late_sends, 0);
         assert_eq!(jitter.tick(at(base, 19), &mut out), Tick::Send);
         assert_eq!(
-            jitter.stats().late_sends,
+            jitter.stats().late_ticks,
             1,
-            "9 ms lateness is a short late send"
+            "the unreachable 20 ms slot is skipped"
         );
-        assert_eq!(jitter.stats().late_ticks, 0, "no whole period was missed");
+        assert_eq!(
+            jitter.stats().late_sends,
+            0,
+            "a skipped slot is not also counted as a short late send"
+        );
         assert_eq!(
             jitter.tick(at(base, 20), &mut out),
             Tick::None,
             "the next block is not taken 1 ms after a late send"
         );
-        // The deadline is anchored at the actual send (29 ms), not at 20 ms.
-        assert_eq!(jitter.tick(at(base, 28), &mut out), Tick::None);
-        assert_eq!(jitter.tick(at(base, 29), &mut out), Tick::Send);
-        assert_eq!(jitter.stats().late_sends, 1, "an on-time send is not late");
+        assert_eq!(jitter.tick(at(base, 29), &mut out), Tick::None);
+        assert_eq!(jitter.tick(at(base, 30), &mut out), Tick::Send);
+        assert_eq!(out[0], (BLOCK * 2) as i16, "speech order is preserved");
+        assert_eq!(jitter.stats().late_ticks, 1);
+        assert_eq!(jitter.stats().late_sends, 0);
     }
 
-    /// A constant 2 ms lateness per wake must not accumulate: every gap stays
-    /// one period plus the fixed offset (never a 1 ms catch-up), `late_sends`
-    /// counts each short late send, `late_ticks` stays zero.
+    /// A constant 2 ms lateness per wake must not accumulate: the absolute grid
+    /// keeps every interval at 10 ms, so 1000 wakes deliver 1000 blocks in the
+    /// 10 s they span instead of slowing the stream down. `late_sends` counts
+    /// each short late send and no slot is skipped.
     #[test]
     fn repeated_small_lateness_never_accumulates_latency() {
         let base = Instant::now();
@@ -563,21 +595,23 @@ mod tests {
         let mut out = [0_i16; BLOCK];
         jitter.push(&chunk(0), 0);
         jitter.push(&chunk((BLOCK * 2) as i16), 0);
+        // Anchor the grid at 0 ms with an on-time send, like the prefill that
+        // `capture_loop` starts with.
+        assert_eq!(jitter.tick(base, &mut out), Tick::Send);
         let mut pushed = 2_i16;
         let mut last_send = None;
         let mut sends = 0_u64;
         let mut minimum_gap = Duration::MAX;
         let mut maximum_gap = Duration::ZERO;
 
-        for cycle in 0..1_000_u64 {
+        for cycle in 1..=1_000_u64 {
             if jitter.len() < RESERVE_SAMPLES {
                 jitter.push(&chunk(pushed.wrapping_mul((BLOCK * 2) as i16)), 0);
                 pushed += 1;
             }
-            // Every wake is exactly 2 ms after its deadline. Re-anchoring at
-            // `now` makes the next wake 12 ms later, so the offset stays 2 ms
-            // instead of compounding into the deadline.
-            let now = at(base, cycle * 12 + 2);
+            // Every wake is exactly 2 ms after its 10 ms deadline. The grid is
+            // absolute, so the interval stays 10 ms instead of 12 ms.
+            let now = at(base, cycle * 10 + 2);
             if jitter.tick(now, &mut out) == Tick::Send {
                 if let Some(last) = last_send {
                     minimum_gap = minimum_gap.min(now - last);
@@ -588,19 +622,16 @@ mod tests {
             }
         }
 
-        assert_eq!(sends, 1_000, "one block per wake, never a burst");
-        assert!(
-            minimum_gap >= TICK,
-            "sends are never closer than one period: {minimum_gap:?}"
+        assert_eq!(sends, 1_000, "1000 wakes deliver 10 s of audio");
+        assert_eq!(minimum_gap, TICK, "the grid keeps the interval at 10 ms");
+        assert_eq!(
+            maximum_gap, TICK,
+            "lateness never accumulates: {maximum_gap:?}"
         );
-        assert!(
-            maximum_gap <= TICK + Duration::from_millis(2),
-            "the constant 2 ms offset does not grow: {maximum_gap:?}"
-        );
-        assert!(
-            jitter.stats().late_sends >= 999,
-            "999 short late sends are visible: {}",
-            jitter.stats().late_sends
+        assert_eq!(
+            jitter.stats().late_sends,
+            1_000,
+            "every short late send is visible"
         );
         assert_eq!(
             jitter.stats().late_ticks,
@@ -608,10 +639,71 @@ mod tests {
             "short lateness must not inflate late_ticks"
         );
         assert_eq!(jitter.stats().underruns, 0);
+        assert_eq!(jitter.stats().overflow_blocks, 0);
     }
 
-    /// A 55 ms stall misses whole periods, sends exactly one block and anchors
-    /// the next deadline at now + 10 ms instead of replaying the backlog.
+    /// The measured Win32 behaviour: a 10 ms wait returns 0.3..0.45 ms late.
+    /// A 60 s run at that lateness must still deliver 100 blocks per second,
+    /// never overflow the bounded queue and never report an underrun. The old
+    /// `now + TICK` re-anchor added the lateness to every period (~97 blocks/s
+    /// and a growing queue); the absolute grid shortens the next wait instead.
+    #[test]
+    fn sub_millisecond_wake_lateness_keeps_hundred_blocks_per_second() {
+        let base = Instant::now();
+        let mut jitter = PcmJitter::new();
+        let mut out = [0_i16; BLOCK];
+        // 40 ms already captured: the 10 ms grid is anchored at t = 0.
+        jitter.push(&chunk(0), 0);
+        jitter.push(&chunk((BLOCK * 2) as i16), 0);
+        assert_eq!(jitter.tick(base, &mut out), Tick::Send);
+        let mut pushed = 2_i16;
+        let mut driver_chunks = 2_u64;
+        let mut now = base;
+        let mut sends = 0_u64;
+        let mut last_send = base;
+        let mut minimum_gap = Duration::MAX;
+        let mut maximum_gap = Duration::ZERO;
+
+        // Model `capture_loop`: wait for the scheduler deadline, then wake up
+        // 0.3 ms after it. The next wait is measured from the grid, not from
+        // the late wake, so the error does not compound.
+        for _ in 0..6_000_u64 {
+            let wait = jitter.wait_duration(now);
+            now += wait + Duration::from_micros(300);
+            let millis = (now - base).as_millis() as u64;
+            while driver_chunks * 20 <= millis {
+                jitter.push(&chunk(pushed.wrapping_mul((BLOCK * 2) as i16)), 0);
+                pushed += 1;
+                driver_chunks += 1;
+            }
+            if jitter.tick(now, &mut out) == Tick::Send {
+                if sends > 0 {
+                    minimum_gap = minimum_gap.min(now - last_send);
+                    maximum_gap = maximum_gap.max(now - last_send);
+                }
+                last_send = now;
+                sends += 1;
+            }
+        }
+
+        assert_eq!(sends, 6_000, "60 s must deliver 100 blocks per second");
+        assert_eq!(minimum_gap, TICK);
+        assert_eq!(maximum_gap, TICK, "the grid must not drift");
+        assert!(
+            last_send - base <= Duration::from_millis(60_100),
+            "6000 blocks took {:?}; re-anchoring stretched this out",
+            last_send - base
+        );
+        assert_eq!(jitter.stats().late_sends, 6_000);
+        assert_eq!(jitter.stats().late_ticks, 0);
+        assert_eq!(jitter.stats().underruns, 0);
+        assert_eq!(jitter.stats().overflow_blocks, 0);
+        assert!(jitter.len() <= CEILING_SAMPLES);
+    }
+
+    /// A 55 ms stall is five whole periods late. Exactly one block leaves and
+    /// the grid stays absolute: 70 ms is just half a period away, so it is kept
+    /// (the half-period guard only skips slots closer than that), then 80 ms.
     #[test]
     fn a_long_stall_counts_missed_periods_and_sends_one_block() {
         let base = Instant::now();
@@ -628,39 +720,59 @@ mod tests {
         assert_eq!(jitter.stats().late_ticks, 5, "55 ms is 5 missed periods");
         assert_eq!(jitter.stats().late_sends, 0);
         assert_eq!(out[0], BLOCK as i16, "speech order is preserved");
-        // Exactly one block for the wake, and the deadline moved to 75 ms.
+        // Exactly one block for the wake: no backlog burst.
         assert_eq!(jitter.tick(at(base, 66), &mut out), Tick::None);
-        assert_eq!(jitter.tick(at(base, 74), &mut out), Tick::None);
-        assert_eq!(jitter.tick(at(base, 75), &mut out), Tick::Send);
+        assert_eq!(jitter.tick(at(base, 69), &mut out), Tick::None);
+        assert_eq!(jitter.tick(at(base, 70), &mut out), Tick::Send);
+        assert_eq!(jitter.tick(at(base, 79), &mut out), Tick::None);
+        assert_eq!(jitter.tick(at(base, 80), &mut out), Tick::Send);
+        assert_eq!(jitter.stats().late_ticks, 5);
         assert_eq!(jitter.stats().overflow_blocks, 0);
     }
 
-    /// Ten simulated minutes of a 20 ms driver with jitter: the bounded queue
-    /// never leaves [RESERVE, CEILING] and neither latency nor overflow grows.
+    /// Ten simulated minutes of a 20 ms driver while every wait returns
+    /// 0.1..0.45 ms late, exactly as measured for `WaitForSingleObject`: the
+    /// bounded queue never leaves [RESERVE, CEILING], no slot is skipped and
+    /// the ten minutes do not stretch out.
     #[test]
-    fn ten_minutes_of_jittered_driver_keeps_the_queue_bounded() {
+    fn ten_minutes_of_late_wakes_keeps_the_queue_bounded() {
         let base = Instant::now();
         let mut jitter = PcmJitter::new();
         let mut out = [0_i16; BLOCK];
-        let mut pushed = 0_i16;
-        let mut chunk_index = 0_u64;
-        let mut next_driver = 0_u64;
-        let driver_jitter = [0_u64, 2, 4, 1, 3, 0, 2, 1];
+        jitter.push(&chunk(0), 0);
+        jitter.push(&chunk((BLOCK * 2) as i16), 0);
+        assert_eq!(jitter.tick(base, &mut out), Tick::Send);
+        let mut pushed = 2_i16;
+        let mut driver_chunks = 2_u64;
+        // The driver completes buffers a few ms early, never late; the wake
+        // lateness below is the real one.
+        let driver_early = [0_u64, 2, 4, 1, 3, 0, 2, 1];
+        let wake_late_us = [300_u32, 450, 120, 350, 410, 280, 390, 330];
+        let mut now = base;
+        let mut sends = 0_u64;
+        let mut last_send = base;
+        let mut maximum_gap = Duration::ZERO;
         let mut maximum_len = 0_usize;
-        let mut last_refill_len = 0_usize;
 
-        for millis in 0..600_000_u64 {
-            let mut refilled = false;
-            if millis == next_driver {
-                jitter.push(&chunk(pushed), 0);
-                pushed = pushed.wrapping_add((BLOCK * 2) as i16);
-                chunk_index += 1;
-                let offset = driver_jitter[chunk_index as usize % driver_jitter.len()];
-                next_driver = chunk_index * 20 + offset;
-                refilled = true;
+        for cycle in 1..=60_000_u64 {
+            let wait = jitter.wait_duration(now);
+            let late = wake_late_us[cycle as usize % wake_late_us.len()];
+            now += wait + Duration::from_micros(u64::from(late));
+            let millis = (now - base).as_millis() as u64;
+            while driver_chunks * 20 - driver_early[driver_chunks as usize % driver_early.len()]
+                <= millis
+            {
+                jitter.push(&chunk(pushed.wrapping_mul((BLOCK * 2) as i16)), 0);
+                pushed = pushed.wrapping_add(1);
+                driver_chunks += 1;
             }
-            match jitter.tick(at(base, millis), &mut out) {
-                Tick::Send | Tick::None => {}
+            match jitter.tick(now, &mut out) {
+                Tick::Send => {
+                    maximum_gap = maximum_gap.max(now - last_send);
+                    last_send = now;
+                    sends += 1;
+                }
+                Tick::None => {}
                 Tick::Fade => panic!("underrun at {millis} ms"),
             }
             maximum_len = maximum_len.max(jitter.len());
@@ -668,25 +780,23 @@ mod tests {
                 jitter.len() <= CEILING_SAMPLES,
                 "queue exceeded the ceiling at {millis} ms"
             );
-            if refilled && millis >= 100 {
-                // At a driver refill boundary the queue has rebuilt at least
-                // the reserve and never passes the ceiling.
-                assert!(
-                    (RESERVE_SAMPLES..=CEILING_SAMPLES).contains(&jitter.len()),
-                    "refill left {} samples at {millis} ms",
-                    jitter.len()
-                );
-                last_refill_len = jitter.len();
-            }
         }
+
+        assert_eq!(sends, 60_000, "ten minutes deliver 600 000 blocks");
+        assert!(
+            maximum_gap <= TICK + Duration::from_millis(1),
+            "the grid must not drift: {maximum_gap:?}"
+        );
+        assert!(
+            last_send - base <= Duration::from_secs(601),
+            "ten minutes must stay ten minutes, not stretch out: {:?}",
+            last_send - base
+        );
         assert_eq!(jitter.stats().underruns, 0);
         assert_eq!(jitter.stats().overflow_blocks, 0);
         assert_eq!(jitter.stats().late_ticks, 0);
+        assert_eq!(jitter.stats().late_sends, 60_000);
         assert!(maximum_len <= CEILING_SAMPLES);
-        assert!(
-            last_refill_len >= RESERVE_SAMPLES,
-            "the queue did not stay above the reserve: {last_refill_len}"
-        );
     }
 
     #[test]

@@ -74,9 +74,9 @@ fn short_late_sends_are_published_in_shared_stats() {
     jitter.push(&vec![222_i16; BLOCK * 2], 0);
     assert_eq!(jitter.tick(base, &mut block), Tick::Send);
     assert_eq!(
-        jitter.tick(base + Duration::from_millis(19), &mut block),
+        jitter.tick(base + Duration::from_millis(12), &mut block),
         Tick::Send,
-        "a 9 ms late wake still sends the due block"
+        "a 2 ms late wake still sends the due block"
     );
     let shared = SharedStats::default();
     publish_stats(&shared, &CaptureStats::default(), &jitter);
@@ -85,6 +85,54 @@ fn short_late_sends_are_published_in_shared_stats() {
     assert_eq!(snapshot.late_ticks, 0);
     assert_eq!(snapshot.underruns, 0);
     assert_eq!(snapshot.overflow_blocks, 0);
+}
+
+#[test]
+fn input_level_event_carries_the_capture_aggregates() {
+    let base = Instant::now();
+    let mut jitter = PcmJitter::new();
+    let mut block = [0_i16; BLOCK];
+    // Ten 20 ms chunks exceed the 80 ms ceiling, so overflow is non-zero.
+    for index in 0..10_i16 {
+        jitter.push(&vec![index; BLOCK * 2], 0);
+    }
+    assert_eq!(
+        jitter.tick(base, &mut block),
+        Tick::Send,
+        "the ceiling still leaves blocks to send"
+    );
+    // 2 ms late: a short late send that keeps the grid.
+    assert_eq!(
+        jitter.tick(base + Duration::from_millis(12), &mut block),
+        Tick::Send
+    );
+    // 13 ms late against the 20 ms deadline: one whole period is skipped.
+    assert_eq!(
+        jitter.tick(base + Duration::from_millis(33), &mut block),
+        Tick::Send
+    );
+    let mut counters = CaptureStats::default();
+    counters.source_errors = 3;
+    let events = Events::default();
+    let mut ticks = LEVEL_INTERVAL - 1;
+    report_level(&events, &mut ticks, 0.5, false, &counters, &jitter);
+    let Some(Event::InputLevel {
+        underruns,
+        overflow_blocks,
+        late_ticks,
+        late_sends,
+        source_errors,
+        ..
+    }) = events.poll(Duration::ZERO)
+    else {
+        panic!("the level interval did not publish an input level");
+    };
+    assert_eq!(underruns, jitter.underruns());
+    assert_eq!(overflow_blocks, jitter.overflow_blocks());
+    assert!(overflow_blocks > 0, "the queue ceiling was exceeded");
+    assert_eq!(late_ticks, 1, "one slot was skipped");
+    assert_eq!(late_sends, 1, "one short late send was counted");
+    assert_eq!(source_errors, 3);
 }
 
 #[test]

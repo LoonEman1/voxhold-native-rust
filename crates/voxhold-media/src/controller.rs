@@ -78,6 +78,14 @@ pub struct VoiceController {
     input_level_seen: bool,
     /// Whole 10 ms blocks discarded by the bounded PCM queue or the source.
     pub input_dropped: u64,
+    /// Aggregate software-capture counters carried by the same `InputLevel`
+    /// event: playback gaps, blocks lost to the queue ceiling, skipped slots,
+    /// short-late ticks and source send errors. Counters only, no PCM.
+    pub input_underruns: u64,
+    pub input_overflow_blocks: u64,
+    pub input_late_ticks: u64,
+    pub input_late_sends: u64,
+    pub input_source_errors: u64,
     pub input_muted: bool,
     /// Last applied capture chain reported by the media engine.
     pub applied_audio: Option<AppliedAudio>,
@@ -106,6 +114,11 @@ impl VoiceController {
             local_level: 0.0,
             input_level_seen: false,
             input_dropped: 0,
+            input_underruns: 0,
+            input_overflow_blocks: 0,
+            input_late_ticks: 0,
+            input_late_sends: 0,
+            input_source_errors: 0,
             input_muted: true,
             applied_audio: None,
             playout: None,
@@ -253,6 +266,11 @@ impl VoiceController {
                 level,
                 muted,
                 dropped,
+                underruns,
+                overflow_blocks,
+                late_ticks,
+                late_sends,
+                source_errors,
             } => {
                 // Pre-gate software meter: it must show a quiet background
                 // while the gate transmits nothing.
@@ -260,6 +278,11 @@ impl VoiceController {
                 self.input_level_seen = true;
                 self.input_muted = muted;
                 self.input_dropped = dropped;
+                self.input_underruns = underruns;
+                self.input_overflow_blocks = overflow_blocks;
+                self.input_late_ticks = late_ticks;
+                self.input_late_sends = late_sends;
+                self.input_source_errors = source_errors;
                 vec![]
             }
             Event::Audio {
@@ -551,16 +574,28 @@ mod tests {
     }
 
     #[test]
-    fn input_level_reports_the_pre_gate_meter_and_dropped_blocks() {
+    fn input_level_reports_the_pre_gate_meter_and_capture_aggregates() {
         let mut controller = VoiceController::new(1, 2, Controls::default(), false);
         controller.media_event(Event::InputLevel {
             level: 0.42,
             muted: false,
             dropped: 7,
+            underruns: 2,
+            overflow_blocks: 3,
+            late_ticks: 11,
+            late_sends: 4,
+            source_errors: 5,
         });
         assert!((controller.local_level - 0.42).abs() < f64::EPSILON);
         assert!(!controller.input_muted);
         assert_eq!(controller.input_dropped, 7);
+        // The aggregates must be observable in controller state, not only in
+        // `MicCapture::stats()`.
+        assert_eq!(controller.input_underruns, 2);
+        assert_eq!(controller.input_overflow_blocks, 3);
+        assert_eq!(controller.input_late_ticks, 11);
+        assert_eq!(controller.input_late_sends, 4);
+        assert_eq!(controller.input_source_errors, 5);
     }
 
     #[test]
@@ -570,6 +605,11 @@ mod tests {
             level: 0.2,
             muted: false,
             dropped: 0,
+            underruns: 0,
+            overflow_blocks: 0,
+            late_ticks: 0,
+            late_sends: 0,
+            source_errors: 0,
         });
         controller.media_event(Event::Level {
             track_id: None,
@@ -596,6 +636,11 @@ mod tests {
             level: 0.2,
             muted: false,
             dropped: 0,
+            underruns: 0,
+            overflow_blocks: 0,
+            late_ticks: 0,
+            late_sends: 0,
+            source_errors: 0,
         });
         controller.media_event(Event::Audio {
             capture: "platform",

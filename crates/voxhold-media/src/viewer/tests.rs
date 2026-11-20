@@ -3,6 +3,8 @@
 
 use super::*;
 
+mod stall;
+
 fn publication(connection: &str, user: i64) -> Publication {
     Publication {
         server_id: 1,

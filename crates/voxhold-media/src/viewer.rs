@@ -29,6 +29,9 @@ const STALE_CLOSE_GRACE: Duration = Duration::from_secs(5);
 const RETIRED_UFRAG_TTL: Duration = Duration::from_secs(600);
 const RETIRED_UFRAG_CAPACITY: usize = 64;
 
+mod stats;
+use stats::StatsWatch;
+
 #[derive(Clone, Debug)]
 struct Intent {
     selection: u64,
@@ -50,6 +53,9 @@ struct Active {
     recovering: bool,
     received_signal: bool,
     remote_ufrags: Vec<String>,
+    /// Inbound RTP/video counters of this engine. A stale report from an older
+    /// engine of the same selection is rejected by `attempt`.
+    stats: StatsWatch,
 }
 
 /// One decision produced by the state machine. The runtime executes them in
@@ -59,6 +65,9 @@ pub enum Outcome {
     /// Create an engine with this attempt's watch request.
     Start {
         selection: u64,
+        /// Viewer attempt the engine belongs to. Statistics of an engine of an
+        /// older attempt are ignored even when the selection id is unchanged.
+        attempt: u64,
         publication: Publication,
         muted: bool,
         request: Signal,
@@ -707,6 +716,12 @@ impl Viewer {
         let Some(active) = &mut self.active else {
             return Vec::new();
         };
+        // A real decoded frame is the only proof that the picture is moving. A
+        // cached repaint never reaches this method. A decoded frame clears the
+        // idle/keyframe counters, but only a full healthy stats window clears
+        // the reconnect budget: one frame after a reconnect must not hide a
+        // stream that freezes again immediately.
+        active.stats.on_decoded();
         if active.connected && !active.recovering {
             return Vec::new();
         }
@@ -822,6 +837,9 @@ impl Viewer {
                 }
             }
         }
+        // Frozen-picture detection runs on the browser's two-second video-stats
+        // cadence, not on this 25 ms session tick.
+        out.extend(self.poll_stats(now));
         out
     }
 
@@ -880,6 +898,7 @@ impl Viewer {
             recovering: false,
             received_signal: false,
             remote_ufrags: Vec::new(),
+            stats: StatsWatch::new(now),
         });
         self.intent = Some(Intent {
             publication: publication.clone(),
@@ -897,6 +916,7 @@ impl Viewer {
             },
             Outcome::Start {
                 selection,
+                attempt: intent.attempt,
                 publication,
                 muted,
                 request,

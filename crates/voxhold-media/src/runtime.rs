@@ -42,6 +42,7 @@ use updates::Updates;
 pub use updates::VoiceUpdate;
 
 mod engine;
+mod player;
 mod preflight;
 mod prep;
 mod requests;
@@ -377,12 +378,6 @@ impl Live {
         .await;
     }
 
-    fn clear_frame(&self) {
-        if let Ok(mut frame) = self.frame.lock() {
-            frame.take();
-        }
-    }
-
     async fn drain_voice_media(
         &mut self,
         controller: &mut VoiceController,
@@ -525,22 +520,31 @@ impl Live {
             match outcome {
                 ViewerOutcome::Start {
                     selection,
+                    attempt,
                     publication,
                     muted,
                     request,
                 } => {
+                    // Defensive: the viewer starts only after the previous
+                    // attempt closed, but an engine must never be dropped on the
+                    // signaling thread if that ever changes.
+                    self.close_stream();
                     match StreamViewer::start(
                         self.servers.clone(),
                         self.policy.clone(),
                         self.output.clone(),
                         muted,
+                        attempt,
                     ) {
                         Ok(engine) => {
+                            // A replacement engine has its own frame sequence.
+                            // Keeping the old identity would hide its first
+                            // frame when the sequence and size happen to match.
+                            self.render.reset_for_new_engine();
                             self.stream = Some(engine);
                             self.stream_selection = Some(selection);
                             if let Err(end) = self.send_signal(request).await {
-                                self.stream = None;
-                                self.stream_selection = None;
+                                self.close_stream();
                                 return Err(end);
                             }
                             let _ = publication;
@@ -557,9 +561,7 @@ impl Live {
                     }
                 }
                 ViewerOutcome::Close => {
-                    self.stream = None;
-                    self.stream_selection = None;
-                    self.clear_frame();
+                    self.close_stream();
                 }
                 ViewerOutcome::Send(signal) => self.send_signal(signal).await?,
                 ViewerOutcome::Offer(sdp) => {
@@ -621,9 +623,7 @@ impl Live {
                 }
                 ViewerOutcome::Clear { selection } => {
                     if self.stream_selection == Some(selection) {
-                        self.stream = None;
-                        self.stream_selection = None;
-                        self.clear_frame();
+                        self.close_stream();
                     }
                     self.updates.push(VoiceUpdate::StreamStatus {
                         selection,
@@ -632,9 +632,7 @@ impl Live {
                 }
                 ViewerOutcome::Failed { selection, message } => {
                     if self.stream_selection == Some(selection) {
-                        self.stream = None;
-                        self.stream_selection = None;
-                        self.clear_frame();
+                        self.close_stream();
                     }
                     self.updates.push(VoiceUpdate::StreamError {
                         selection,
@@ -777,9 +775,7 @@ async fn run_session(
                             _ => break,
                         }
                     }
-                    live.stream = None;
-                    live.stream_selection = None;
-                    live.clear_frame();
+                    live.close_stream();
                     return SessionEnd::Leave;
                 }
                 Pending::Stream(StreamCommand::Close { selection }) => {
@@ -789,9 +785,7 @@ async fn run_session(
                     // displaced before the worker read it.
                     let outcomes = viewer.leave_selection(selection, Instant::now());
                     if live.stream_selection == Some(selection) {
-                        live.stream = None;
-                        live.stream_selection = None;
-                        live.clear_frame();
+                        live.close_stream();
                     }
                     if let Err(end) = live.apply(outcomes, viewer).await {
                         return end;

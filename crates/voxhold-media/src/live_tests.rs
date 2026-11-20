@@ -214,7 +214,7 @@ fn restart_quality(
         source,
         quality: Quality {
             resolution: Resolution::P720,
-            fps: 30,
+            fps: 60,
             bitrate_kbps: 2500,
             audio_bitrate_kbps: 128,
         },
@@ -460,14 +460,12 @@ fn live_stand_publishes_a_monitor_and_a_viewer_decodes_frames() {
     let _guard = ProbeGuard;
 
     let owner = login(&stand, &stand.username, &stand.password);
-    let publisher = VoiceHandle::join(
-        owner,
-        stand.server,
-        stand.channel,
-        Controls::default(),
-        false,
-    )
-    .expect("live: voice join");
+    let muted = Controls {
+        muted: true,
+        ..Controls::default()
+    };
+    let publisher = VoiceHandle::join(owner, stand.server, stand.channel, muted.clone(), true)
+        .expect("live: voice join");
     let (joined, _catalog) = wait_joined(&publisher, "publisher");
     println!("live: publisher joined in {joined:?}");
 
@@ -522,8 +520,8 @@ fn live_stand_publishes_a_monitor_and_a_viewer_decodes_frames() {
         "the public stats must report the real encoded size"
     );
 
-    // A quality change during the broadcast: the backend has no runtime
-    // reconfigure, so this must be a confirmed stop+start with a new attempt.
+    // Changing the frame rate needs a new capture. A bitrate-only change
+    // would keep the current attempt running.
     let attempt = sharing.attempt;
     let (restart_after, restarted) =
         restart_quality(&publisher, source, attempt, sharing.has_audio);
@@ -548,14 +546,8 @@ fn live_stand_publishes_a_monitor_and_a_viewer_decodes_frames() {
     // proof above is still complete.
     if let Some((user, pass)) = &stand.viewer {
         let viewer_client = login(&stand, user, pass);
-        let viewer = VoiceHandle::join(
-            viewer_client,
-            stand.server,
-            stand.channel,
-            Controls::default(),
-            false,
-        )
-        .expect("live: viewer voice join");
+        let viewer = VoiceHandle::join(viewer_client, stand.server, stand.channel, muted, true)
+            .expect("live: viewer voice join");
         let (viewer_joined, catalog) = wait_joined(&viewer, "viewer");
         let publication = wait_publication(&viewer, catalog);
         println!(

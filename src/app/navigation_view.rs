@@ -698,10 +698,7 @@ impl Voxhold {
             || local_muted;
         // A muted or reconnecting member keeps the badge instead of a stale
         // speaking ring.
-        let speaking = reports_speaking
-            && !participant.reconnecting
-            && !participant.self_mute
-            && !participant.server_mute;
+        let speaking = active_room && reports_speaking && !participant.reconnecting && !muted;
         let state = crate::voice_room::voice_state_icon(
             participant.reconnecting,
             participant.self_deaf,

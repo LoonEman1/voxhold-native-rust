@@ -123,6 +123,7 @@ pub struct VoicePanel {
     tracks: HashSet<String>,
     local_mutes: HashSet<String>,
     local_level: f64,
+    local_speaking: bool,
     device_error: String,
     /// Newest explicit input request. A typed result for an older generation
     /// must not overwrite a newer choice; zero marks an engine-initiated
@@ -297,6 +298,7 @@ impl VoicePanel {
             tracks: HashSet::new(),
             local_mutes: HashSet::new(),
             local_level: 0.0,
+            local_speaking: false,
             device_error: String::new(),
             input_generation: 0,
             streams: Vec::new(),
@@ -393,14 +395,16 @@ impl VoicePanel {
             return false;
         }
         self.speaking = speaking;
-        if let Some(handler) = &self.speaking_handler {
-            handler(cx);
-        }
+        self.notify_speaking_changed(cx);
         true
     }
 
     fn clear_speaking(&mut self, cx: &mut gpui::App) {
-        self.set_speaking(HashMap::new(), cx);
+        let was_speaking = std::mem::take(&mut self.local_speaking);
+        self.local_level = 0.0;
+        if !self.set_speaking(HashMap::new(), cx) && was_speaking {
+            self.notify_speaking_changed(cx);
+        }
     }
 
     /// Server mute is read from the roster row of *this* connection. A second
@@ -523,7 +527,11 @@ impl VoicePanel {
     /// Only the room of the active call is analysed, so other rooms answer
     /// false; the sidebar uses this for the same ring as the room cards.
     pub fn speaking(&self, connection_id: &str) -> bool {
-        self.speaking.get(connection_id).copied().unwrap_or(false)
+        if self.self_connection.as_deref() == Some(connection_id) {
+            self.local_speaking && self.phase == CallPhase::Connected && !self.controls.muted
+        } else {
+            self.speaking.get(connection_id).copied().unwrap_or(false)
+        }
     }
 
     #[cfg(test)]
@@ -712,7 +720,6 @@ impl VoicePanel {
         self.tracks.clear();
         self.local_mutes.clear();
         self.streams.clear();
-        self.local_level = 0.0;
         cx.notify();
     }
 

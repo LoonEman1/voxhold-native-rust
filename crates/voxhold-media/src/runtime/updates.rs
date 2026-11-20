@@ -24,7 +24,10 @@ pub enum VoiceUpdate {
     Reconnecting,
     Participants(Vec<Participant>),
     Speaking(HashMap<String, bool>),
-    LocalLevel(f64),
+    LocalLevel {
+        level: f64,
+        speaking: bool,
+    },
     Tracks(std::collections::HashSet<String>),
     Streams(Vec<Publication>),
     StreamStatus {
@@ -95,7 +98,7 @@ impl VoiceUpdate {
                     | (Self::Reconnecting, Self::Reconnecting)
                     | (Self::Participants(_), Self::Participants(_))
                     | (Self::Speaking(_), Self::Speaking(_))
-                    | (Self::LocalLevel(_), Self::LocalLevel(_))
+                    | (Self::LocalLevel { .. }, Self::LocalLevel { .. })
                     | (Self::Tracks(_), Self::Tracks(_))
                     | (Self::Streams(_), Self::Streams(_))
                     | (Self::InputApplied { .. }, Self::InputApplied { .. })

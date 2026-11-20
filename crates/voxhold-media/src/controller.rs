@@ -127,6 +127,16 @@ impl VoiceController {
             tracks: HashMap::new(),
         }
     }
+    /// Speech for the current connection, separate from the pre-gate mic meter.
+    pub(crate) fn local_speaking(&self) -> bool {
+        self.joined
+            && !self.controls.muted
+            && !self.controls.deafened
+            && !self.server_muted
+            && (!self.input_level_seen || !self.input_muted)
+            && self.local_level >= crate::voice::SPEAKING_THRESHOLD
+    }
+
     fn signal(kind: &'static str, data: Value) -> Action {
         Action::Send(Signal {
             kind,
@@ -486,6 +496,9 @@ pub fn track_owners(sdp: &str) -> HashMap<String, String> {
     }
     owners
 }
+#[cfg(test)]
+mod speech_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;

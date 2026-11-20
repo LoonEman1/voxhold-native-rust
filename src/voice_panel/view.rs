@@ -251,11 +251,8 @@ impl VoicePanel {
             && !participant.reconnecting
             && !participant.self_mute
             && !participant.server_mute
-            && self
-                .speaking
-                .get(&participant.connection_id)
-                .copied()
-                .unwrap_or(false);
+            && !participant.self_deaf
+            && self.speaking(&participant.connection_id);
         let muted = participant.self_mute
             || participant.server_mute
             || self.local_mutes.contains(&participant.connection_id);

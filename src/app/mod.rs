@@ -87,6 +87,8 @@ mod voice_screen_tests;
 mod voice_settings_ops;
 #[cfg(test)]
 mod voice_settings_tests;
+#[cfg(all(feature = "voxhold-media", test))]
+mod voice_speech_tests;
 #[cfg(test)]
 mod voice_tests;
 mod workspace;

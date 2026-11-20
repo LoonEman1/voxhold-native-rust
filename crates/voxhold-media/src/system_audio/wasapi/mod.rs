@@ -25,14 +25,16 @@ use std::{
 
 use windows::{
     Win32::{
-        Foundation::{HWND, RPC_E_CHANGED_MODE},
+        Foundation::{CloseHandle, HANDLE, HWND, RPC_E_CHANGED_MODE, WAIT_FAILED},
         Media::Audio::{
-            AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_E_DEVICE_INVALIDATED, AUDCLNT_SHAREMODE_SHARED,
-            AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM, AUDCLNT_STREAMFLAGS_LOOPBACK,
-            AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY, AUDIOCLIENT_ACTIVATION_PARAMS,
-            AUDIOCLIENT_ACTIVATION_PARAMS_0, AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK,
-            AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS, ActivateAudioInterfaceAsync,
-            IActivateAudioInterfaceAsyncOperation, IActivateAudioInterfaceCompletionHandler,
+            AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY, AUDCLNT_BUFFERFLAGS_SILENT,
+            AUDCLNT_E_DEVICE_INVALIDATED, AUDCLNT_SHAREMODE_SHARED,
+            AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM, AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+            AUDCLNT_STREAMFLAGS_LOOPBACK, AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
+            AUDIOCLIENT_ACTIVATION_PARAMS, AUDIOCLIENT_ACTIVATION_PARAMS_0,
+            AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK, AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS,
+            ActivateAudioInterfaceAsync, IActivateAudioInterfaceAsyncOperation,
+            IActivateAudioInterfaceCompletionHandler,
             IActivateAudioInterfaceCompletionHandler_Impl, IAudioCaptureClient, IAudioClient,
             IMMDevice, IMMDeviceEnumerator, MMDeviceEnumerator, PROCESS_LOOPBACK_MODE,
             PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE,
@@ -47,8 +49,8 @@ use windows::{
                 CoTaskMemFree, CoUninitialize,
             },
             Threading::{
-                OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
-                QueryFullProcessImageNameW,
+                CreateEventW, OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+                QueryFullProcessImageNameW, WaitForSingleObject,
             },
             Variant::VT_BLOB,
         },
@@ -81,10 +83,9 @@ const WAVE_FORMAT_IEEE_FLOAT: u16 = 3;
 const KSDATAFORMAT_SUBTYPE_PCM: GUID = GUID::from_u128(0x0000_0001_0000_0010_8000_00aa_0038_9b71);
 const KSDATAFORMAT_SUBTYPE_IEEE_FLOAT: GUID =
     GUID::from_u128(0x0000_0003_0000_0010_8000_00aa_0038_9b71);
-/// 200 ms shared buffer: enough for a scheduling hiccup, short enough to keep
-/// latency and memory bounded.
-const BUFFER_DURATION: i64 = 2_000_000;
-const POLL: Duration = Duration::from_millis(5);
+// Even a silent or event-less endpoint is checked periodically, so stop and
+// device-change handling do not depend on another audio packet.
+const POLL_TIMEOUT_MS: u32 = 20;
 const DEVICE_CHECK: Duration = Duration::from_secs(2);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 /// Process-loopback activation runs on a COM worker; a host that never answers
@@ -138,6 +139,37 @@ impl Drop for MixFormat {
     }
 }
 
+struct PacketEvent(HANDLE);
+
+impl PacketEvent {
+    fn open() -> Result<Self, Failure> {
+        unsafe { CreateEventW(None, false, false, None) }
+            .map(Self)
+            .map_err(|error| Failure::Fatal(format!("Не удалось создать событие WASAPI: {error}")))
+    }
+
+    fn bind(&self, client: &IAudioClient) -> Result<(), Failure> {
+        unsafe { client.SetEventHandle(self.0) }.map_err(|error| {
+            Failure::Fatal(format!("Не удалось подписаться на данные WASAPI: {error}"))
+        })
+    }
+
+    fn wait(&self) -> Result<(), Failure> {
+        if unsafe { WaitForSingleObject(self.0, POLL_TIMEOUT_MS) } == WAIT_FAILED {
+            return Err(Failure::Reopen(
+                "Ожидание данных WASAPI завершилось ошибкой.".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Drop for PacketEvent {
+    fn drop(&mut self) {
+        let _ = unsafe { CloseHandle(self.0) };
+    }
+}
+
 struct Opened {
     info: AudioDeviceInfo,
     client: IAudioClient,
@@ -146,6 +178,7 @@ struct Opened {
     /// Only the endpoint scope has a "default device" that can move; a process
     /// loopback keeps capturing the same process tree.
     check_default: bool,
+    packet_event: PacketEvent,
 }
 
 impl Drop for Opened {
@@ -249,12 +282,13 @@ fn open_endpoint() -> Result<Opened, Failure> {
         ))
     })?);
     let format = parse_mix(mix.0)?;
+    let packet_event = PacketEvent::open()?;
     unsafe {
         client
             .Initialize(
                 AUDCLNT_SHAREMODE_SHARED,
-                AUDCLNT_STREAMFLAGS_LOOPBACK,
-                BUFFER_DURATION,
+                AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+                0,
                 0,
                 mix.0,
                 None,
@@ -266,6 +300,7 @@ fn open_endpoint() -> Result<Opened, Failure> {
             })?;
     }
     drop(mix);
+    packet_event.bind(&client)?;
     let capture: IAudioCaptureClient = unsafe { client.GetService() }
         .map_err(|error| Failure::Fatal(format!("Не удалось открыть захват loopback: {error}")))?;
     let _buffer_frames = unsafe { client.GetBufferSize() }.unwrap_or(0);
@@ -281,6 +316,7 @@ fn open_endpoint() -> Result<Opened, Failure> {
         capture,
         format,
         check_default: true,
+        packet_event,
     })
 }
 
@@ -497,6 +533,7 @@ fn open_process_with(
         ));
     }
     let client = activate(pid, mode).map_err(Failure::Fatal)?;
+    let packet_event = PacketEvent::open()?;
     // Process loopback rejects `GetMixFormat` and `IsFormatSupported` with
     // E_NOTIMPL (the client is AudioSes!CMixerClient, not an endpoint). The
     // documented path is to initialise it with an explicit format and let the
@@ -524,6 +561,7 @@ fn open_process_with(
             .Initialize(
                 AUDCLNT_SHAREMODE_SHARED,
                 AUDCLNT_STREAMFLAGS_LOOPBACK
+                    | AUDCLNT_STREAMFLAGS_EVENTCALLBACK
                     | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM
                     | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
                 0,
@@ -537,6 +575,7 @@ fn open_process_with(
                 ))
             })?;
     }
+    packet_event.bind(&client)?;
     let capture: IAudioCaptureClient = unsafe { client.GetService() }.map_err(|error| {
         Failure::Fatal(format!(
             "Не удалось открыть захват process loopback: {error}"
@@ -561,6 +600,7 @@ fn open_process_with(
         capture,
         format,
         check_default: false,
+        packet_event,
     })
 }
 
@@ -619,6 +659,7 @@ fn capture(shared: &Shared, opened: &Opened) -> SessionEnd {
     let mut converter = Converter::new(opened.format);
     let mut scratch = Vec::with_capacity(BLOCK_SAMPLES * 4);
     let mut blocks = BlockBuffer::default();
+    let mut received_audio = false;
     // One `now` for both clocks: a switch within the first check window must be
     // classified against the same origin the health streak started from.
     let now = Instant::now();
@@ -656,7 +697,9 @@ fn capture(shared: &Shared, opened: &Opened) -> SessionEnd {
         // call still proves the client works, so it extends the healthy streak.
         health.record(Instant::now());
         if packet == 0 {
-            thread::sleep(POLL);
+            if let Err(error) = opened.packet_event.wait() {
+                return ended(error, &mut health);
+            }
             continue;
         }
         let mut data: *mut u8 = ptr::null_mut();
@@ -671,6 +714,14 @@ fn capture(shared: &Shared, opened: &Opened) -> SessionEnd {
         }
         health.record(Instant::now());
         if frames > 0 {
+            if received_audio && flags as i32 & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY.0 != 0 {
+                // Do not join partial frames from opposite sides of a driver
+                // gap. The publisher fades once and rebuilds its reserve.
+                shared.clear_audio();
+                converter = Converter::new(opened.format);
+                blocks = BlockBuffer::default();
+            }
+            received_audio = true;
             let frames = frames as usize;
             scratch.clear();
             let silent = (flags as i32 & AUDCLNT_BUFFERFLAGS_SILENT.0) != 0;

@@ -48,7 +48,7 @@ impl Voxhold {
             loop {
                 let sender = tx.clone();
                 let overflow = overflow.clone();
-                let _ = client
+                let result = client
                     .subscribe_channels(desired.clone(), |mut event| {
                         if event.kind == "ready" && std::mem::replace(&mut connected, true) {
                             event.kind = "native.reconnected".into();
@@ -58,6 +58,23 @@ impl Voxhold {
                         }
                     })
                     .await;
+                if result.is_err() {
+                    // The socket ended (a failed handshake, a closed connection
+                    // or the missed heartbeat). Keep the already loaded history
+                    // on screen and mark the retry until a fresh `ready`
+                    // confirms the new socket. This queue and its task belong
+                    // to the current realtime generation: `stop_realtime`
+                    // aborts the task and replaces the receiver, so a stale
+                    // task cannot repaint the status in another session.
+                    let notice = voxhold_api::RealtimeEvent {
+                        kind: "native.reconnecting".into(),
+                        data: serde_json::json!({}),
+                        request_id: String::new(),
+                    };
+                    if sender.try_send(notice).is_err() {
+                        overflow.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
                 tokio::time::sleep(std::time::Duration::from_secs(3)).await;
             }
         }));
@@ -344,9 +361,16 @@ impl Voxhold {
             "ready" => {
                 // A reconnect can miss a permission change; unconfirm the
                 // recordings snapshot before the next list request.
+                self.realtime_reconnecting = false;
                 effect.recording_access = true;
             }
+            "native.reconnecting" => {
+                // The account socket ended and the outer loop waits for its
+                // next attempt. History and the composer stay untouched.
+                self.realtime_reconnecting = true;
+            }
             "native.reconnected" => {
+                self.realtime_reconnecting = false;
                 effect.recording_access = true;
                 if self.in_conversation() {
                     // An open direct chat missed whatever arrived while the

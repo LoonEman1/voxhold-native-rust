@@ -592,6 +592,24 @@ pub struct ChannelSubscription {
     pub generation: u64,
 }
 
+/// Timing of the application-level heartbeat on the account socket. The
+/// browser sends one check every 25 seconds and abandons the socket when the
+/// matching `pong` does not arrive within 10 seconds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HeartbeatConfig {
+    pub interval: Duration,
+    pub timeout: Duration,
+}
+
+impl Default for HeartbeatConfig {
+    fn default() -> Self {
+        Self {
+            interval: Duration::from_secs(25),
+            timeout: Duration::from_secs(10),
+        }
+    }
+}
+
 impl ChannelSubscription {
     fn payload(self) -> Value {
         json!({"server_id":self.server_id,"channel_id":self.channel_id})
@@ -671,8 +689,25 @@ impl Client {
     /// Keep account events on the same socket when the selected channel changes.
     pub async fn subscribe_channels(
         &self,
+        desired: tokio::sync::watch::Receiver<Option<ChannelSubscription>>,
+        receive: impl FnMut(RealtimeEvent),
+    ) -> Result<()> {
+        self.subscribe_channels_with(desired, receive, HeartbeatConfig::default())
+            .await
+    }
+
+    /// `subscribe_channels` with configurable heartbeat timing for tests.
+    ///
+    /// After `ready` one `ping` is sent per interval. The matching `pong` must
+    /// arrive within `timeout`; otherwise the socket is reported as a network
+    /// error so the caller can open a new one. At most one `pong` is awaited,
+    /// channel changes keep working while it is outstanding, and no `pong`
+    /// reaches `receive`.
+    pub async fn subscribe_channels_with(
+        &self,
         mut desired: tokio::sync::watch::Receiver<Option<ChannelSubscription>>,
         mut receive: impl FnMut(RealtimeEvent),
+        heartbeat: HeartbeatConfig,
     ) -> Result<()> {
         let mut socket = self.open_voice_socket().await?;
         let ready = tokio::time::timeout(Duration::from_secs(8), socket.read())
@@ -686,6 +721,11 @@ impl Client {
         receive(ready);
 
         let mut subscribed: Option<ChannelSubscription> = None;
+        // The first check is sent only after a full interval, so a healthy
+        // `ready` is never immediately followed by a ping.
+        let mut next_ping_at = tokio::time::Instant::now() + heartbeat.interval;
+        let mut pending_pong: Option<(String, tokio::time::Instant)> = None;
+        let mut ping_seq: u64 = 0;
         loop {
             let next = *desired.borrow_and_update();
             if next != subscribed {
@@ -706,6 +746,14 @@ impl Client {
                 subscribed = next;
             }
 
+            // The timer waits for the outstanding `pong` when one exists, and
+            // for the next `ping` otherwise. Recomputing the absolute deadline
+            // on every pass keeps an unrelated event from postponing it.
+            let deadline = pending_pong
+                .as_ref()
+                .map(|(_, deadline)| *deadline)
+                .unwrap_or(next_ping_at);
+
             tokio::select! {
                 changed = desired.changed() => {
                     if changed.is_err() {
@@ -714,6 +762,19 @@ impl Client {
                 }
                 event = socket.read() => {
                     let mut event = event?;
+                    // A heartbeat answer belongs to the network loop. A
+                    // matching id clears the one wait; a foreign one is still
+                    // swallowed and does not extend the deadline.
+                    if event.kind == "pong" {
+                        if pending_pong
+                            .as_ref()
+                            .is_some_and(|(id, _)| id.as_str() == event.request_id.as_str())
+                        {
+                            pending_pong = None;
+                            next_ping_at = tokio::time::Instant::now() + heartbeat.interval;
+                        }
+                        continue;
+                    }
                     if event.kind == "channel.subscribed" {
                         let Some(channel) = subscribed.filter(|channel| event.request_id == channel.request_id()) else {
                             continue;
@@ -735,6 +796,19 @@ impl Client {
                         }
                     }
                     receive(event);
+                }
+                _ = tokio::time::sleep_until(deadline) => {
+                    if pending_pong.is_some() {
+                        // The deadline is the unanswered ping, not the next
+                        // scheduled check. The outer loop opens a fresh socket.
+                        return Err(Error::Network);
+                    }
+                    let request_id = format!("native-heartbeat-{ping_seq}");
+                    ping_seq = ping_seq.wrapping_add(1);
+                    socket.send("ping", json!({}), Some(&request_id)).await?;
+                    let sent = tokio::time::Instant::now();
+                    pending_pong = Some((request_id, sent + heartbeat.timeout));
+                    next_ping_at = sent + heartbeat.interval;
                 }
             }
         }

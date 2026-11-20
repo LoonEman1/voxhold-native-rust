@@ -461,6 +461,9 @@ pub(crate) struct Voxhold {
     preview_wake_at: Option<std::time::Instant>,
     event_task: Option<tokio::task::JoinHandle<()>>,
     realtime_generation: u64,
+    /// The account socket ended and the outer loop is waiting for the next
+    /// attempt. The loaded history stays visible; only the status line changes.
+    realtime_reconnecting: bool,
     event_subscription: Option<tokio::sync::watch::Sender<Option<ChannelSubscription>>>,
     online_by_server: std::collections::HashMap<i64, std::collections::HashSet<i64>>,
     events: Option<
@@ -544,6 +547,9 @@ impl Voxhold {
         self.events = None;
         self.event_subscription = None;
         self.realtime_generation = self.realtime_generation.wrapping_add(1);
+        // The retry status belongs to the socket that just ended. A new
+        // session starts healthy and never inherits the previous banner.
+        self.realtime_reconnecting = false;
         self.online_by_server.clear();
     }
 
@@ -816,6 +822,7 @@ impl Voxhold {
             preview_wake_at: None,
             event_task: None,
             realtime_generation: 0,
+            realtime_reconnecting: false,
             event_subscription: None,
             online_by_server: Default::default(),
             events: None,

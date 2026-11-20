@@ -30,6 +30,12 @@ pub(super) struct RealtimeEffect {
     pub(super) voice_rooms: bool,
 }
 
+/// Text of the reconnect line in the existing chat status area. Kept apart
+/// from rendering so the `None`/`Some` contract is testable without a window.
+pub(super) fn reconnect_status_line(reconnecting: bool) -> Option<&'static str> {
+    reconnecting.then_some("Переподключаемся…")
+}
+
 impl Voxhold {
     pub(super) fn start_realtime(
         &mut self,
@@ -43,21 +49,37 @@ impl Voxhold {
         let overflow = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         self.events_overflow = overflow.clone();
         self.events = Some(std::sync::Arc::new(std::sync::Mutex::new(rx)));
+        let link = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.realtime_link = Some(link.clone());
+        self.realtime_reconnecting = false;
         self.event_task = Some(self.runtime.spawn(async move {
             let mut connected = false;
             loop {
                 let sender = tx.clone();
                 let overflow = overflow.clone();
-                let _ = client
+                let result = client
                     .subscribe_channels(desired.clone(), |mut event| {
-                        if event.kind == "ready" && std::mem::replace(&mut connected, true) {
-                            event.kind = "native.reconnected".into();
+                        if event.kind == "ready" {
+                            // The connection is confirmed. This runs before the
+                            // event is queued, so a full queue cannot leave the
+                            // status stuck on the retry line.
+                            link.store(false, std::sync::atomic::Ordering::Relaxed);
+                            if std::mem::replace(&mut connected, true) {
+                                event.kind = "native.reconnected".into();
+                            }
                         }
                         if sender.try_send(event).is_err() {
                             overflow.store(true, std::sync::atomic::Ordering::Relaxed);
                         }
                     })
                     .await;
+                if result.is_err() {
+                    // The socket ended (a failed handshake, a closed connection
+                    // or the missed heartbeat). The status is not an event:
+                    // the UI reads this shared flag on its next tick, so
+                    // dropping a queued `ready` cannot lose the transition.
+                    link.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
                 tokio::time::sleep(std::time::Duration::from_secs(3)).await;
             }
         }));
@@ -91,6 +113,14 @@ impl Voxhold {
     /// into the batch so a dropped `channels.changed` or credential event still
     /// unconfirms the recordings snapshot even when no event remains.
     pub(super) fn process_realtime_batch(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // The connection state is a shared flag, not an event: queue pressure
+        // cannot lose it. The tick that notices a change repaints the banner.
+        let link_reconnecting = self
+            .realtime_link
+            .as_ref()
+            .is_some_and(|link| link.load(std::sync::atomic::Ordering::Relaxed));
+        let status_changed = self.realtime_reconnecting != link_reconnecting;
+        self.realtime_reconnecting = link_reconnecting;
         let events: Vec<_> = self
             .events
             .as_ref()
@@ -105,7 +135,10 @@ impl Voxhold {
             .events_overflow
             .swap(false, std::sync::atomic::Ordering::Relaxed);
         let mut resync = overflow;
-        let mut access = overflow && self.channel != 0;
+        // A real dropped event still needs the ACL recheck, but during a retry
+        // the loaded history must stay visible: the fresh connection performs
+        // its own access/resync once `ready` and `native.reconnected` arrive.
+        let mut access = overflow && self.channel != 0 && !link_reconnecting;
         let mut server_removed = false;
         let mut removed_attachments = Vec::new();
         let mut restart_history = false;
@@ -118,6 +151,9 @@ impl Voxhold {
         for event in &events {
             self.forward_thread_event(event, window, cx);
             self.deliver_notification(event, window);
+            // An own echo is also a confirmation of the in-flight send; the
+            // event then continues through the normal history/recents path.
+            self.confirm_send_from_event(event, window, cx);
             let effect = self.apply_realtime_event(&event.kind, &event.data);
             resync |= effect.resync;
             access |= effect.access;
@@ -219,7 +255,7 @@ impl Voxhold {
                 self.close_viewer(window);
             }
         }
-        if changed || resync || access || recording_event {
+        if changed || resync || access || recording_event || status_changed {
             cx.notify();
         }
     }
@@ -247,6 +283,102 @@ impl Voxhold {
         } else {
             message.channel_id == self.channel && message.thread_root_id.is_none()
         }
+    }
+
+    /// The send plan whose own message this event confirms. Only the signed-in
+    /// author, a non-empty `client_message_id` equal to the plan's idempotency
+    /// key and the exact chat qualify; the content is never compared. `None`
+    /// means the event is only a history row.
+    fn own_send_plan(
+        &self,
+        kind: &str,
+        message: &Message,
+    ) -> Option<(Option<u64>, draft::SendPlan)> {
+        let key = message.client_message_id.as_str();
+        if key.is_empty()
+            || self.self_user_id <= 0
+            || message.author.user_id != self.self_user_id
+            || message.thread_root_id.is_some()
+        {
+            return None;
+        }
+        let matches = |plan: &draft::SendPlan| {
+            if plan.send_key != key || plan.key.root != 0 {
+                return false;
+            }
+            match kind {
+                // The event carries no server id. The account socket holds one
+                // channel subscription at a time (`update_channel_subscription`),
+                // so a `message.created` can only describe the selected server;
+                // requiring the plan's server rejects a stale plan of another
+                // server that happens to use the same channel id.
+                "message.created" => {
+                    !plan.key.is_conversation()
+                        && plan.key.server == self.server
+                        && plan.key.channel == message.channel_id
+                }
+                "conversation.message" => {
+                    plan.key.is_conversation() && plan.key.channel == message.conversation_id
+                }
+                _ => false,
+            }
+        };
+        if let Some(pending) = self
+            .pending_sends
+            .values()
+            .find(|pending| matches(&pending.plan))
+        {
+            return Some((Some(pending.attempt), pending.plan.clone()));
+        }
+        self.unconfirmed_sends
+            .values()
+            .find(|plan| matches(plan))
+            .cloned()
+            .map(|plan| (None, plan))
+    }
+
+    /// Complete an in-flight send from the server's own echo. It runs through
+    /// the same `apply_send_success` as the HTTP answer, so the first
+    /// confirmation consumes the draft and a later answer is ignored. The HTTP
+    /// task is never aborted: its own attempt/session check settles it.
+    fn confirm_send_from_event(
+        &mut self,
+        event: &voxhold_api::RealtimeEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if event.kind != "message.created" && event.kind != "conversation.message" {
+            return false;
+        }
+        let Ok(message) = serde_json::from_value::<Message>(event.data.clone()) else {
+            return false;
+        };
+        let Some((attempt, plan)) = self.own_send_plan(&event.kind, &message) else {
+            return false;
+        };
+        if let Some(attempt) = attempt {
+            let owns = self
+                .pending_sends
+                .get(&plan.key)
+                .is_some_and(|pending| pending.attempt == attempt);
+            if !owns {
+                return false;
+            }
+            self.pending_sends.remove(&plan.key);
+        }
+        self.confirm_unconfirmed(&plan);
+        let active = self.chat_key() == plan.key;
+        let composer_now = self.composer.read(cx).value().to_string();
+        if self.apply_send_success(plan, message, &composer_now, cx) {
+            self.composer
+                .update(cx, |input, cx| input.set_value("", window, cx));
+        }
+        if active {
+            // The 504/network error belonged to this attempt and this chat;
+            // the confirmed row replaces it.
+            self.composer_error.clear();
+        }
+        true
     }
 
     /// Thread rows live in their own timeline; only the root and its comments
@@ -293,6 +425,15 @@ impl Voxhold {
         match position {
             Ok(index) => merge_revision(&mut self.messages[index], message),
             Err(index) if created => {
+                // A window that ends before the live tail is separated from it
+                // by an unloaded range. Message ids are not contiguous, so a
+                // higher id alone cannot prove that this row is adjacent: keep
+                // it out of the visible window and, while "К последним" owns a
+                // reset request, hold it for that request's confirmed page.
+                if self.history_has_newer && self.messages.last().is_some_and(|row| row.id < id) {
+                    self.buffer_behind_gap(message);
+                    return;
+                }
                 if self.refresh_request.is_some() {
                     self.refresh_new_ids.insert(id);
                 }
@@ -343,7 +484,9 @@ impl Voxhold {
             }
             "ready" => {
                 // A reconnect can miss a permission change; unconfirm the
-                // recordings snapshot before the next list request.
+                // recordings snapshot before the next list request. The
+                // reconnect status itself is driven by `realtime_link`, not by
+                // this event, so a dropped `ready` cannot leave it stuck.
                 effect.recording_access = true;
             }
             "native.reconnected" => {

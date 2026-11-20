@@ -51,7 +51,10 @@ impl Voxhold {
     pub(super) fn render_composer(&mut self, cx: &mut Context<Self>, compact: bool) -> AnyElement {
         let p = self.palette;
         let pad = if compact { 10. } else { 18. };
-        let mut body = div().flex().flex_col();
+        let mut body = div()
+            .flex()
+            .flex_col()
+            .debug_selector(|| "chat-composer".into());
         let text = self.composer.read(cx).value().to_string();
         let files = self.drafts.borrow().files(self.chat_key());
         let reading = self
@@ -260,43 +263,56 @@ impl Voxhold {
         let attempt = self.send_attempt;
         let session = self.session_generation;
         let runtime = self.runtime.clone();
+        // A new composition of this chat replaces any uncertain attempt: its
+        // late echo may still update the history, but it must not consume the
+        // new draft or clear its idempotency key.
+        self.unconfirmed_sends.remove(&key);
         // The whole upload + POST chain runs as one runtime task so `abort()`
         // really stops it; a GPUI task wrapping `block_on` would keep going.
         // Keep the HTTP status so a conversation 404 can clear the ChatKey and
-        // a 403 can be disambiguated with one explicit conversation GET.
+        // a 403 can be disambiguated with one explicit conversation GET, and
+        // keep whether the POST itself started so a network error/504 is not
+        // confused with a local upload refusal.
+        let task_plan = plan.clone();
         let task = runtime.spawn(async move {
-            let ids = attachments::upload_draft(&client, &plan)
+            let ids = attachments::upload_draft(&client, &task_plan)
                 .await
-                .map_err(|text| (None, text))?;
-            let message = if plan.key.is_conversation() {
+                .map_err(|text| (None, text, false))?;
+            let message = if task_plan.key.is_conversation() {
                 client
                     .create_conversation_message(
-                        plan.key.channel,
-                        &plan.content,
-                        &plan.send_key,
+                        task_plan.key.channel,
+                        &task_plan.content,
+                        &task_plan.send_key,
                         &ids,
                     )
                     .await
             } else {
                 client
                     .send_channel_message(
-                        plan.key.server,
-                        plan.key.channel,
-                        &plan.content,
-                        &plan.send_key,
+                        task_plan.key.server,
+                        task_plan.key.channel,
+                        &task_plan.content,
+                        &task_plan.send_key,
                         &ids,
-                        plan.reply,
-                        plan.key.root,
+                        task_plan.reply,
+                        task_plan.key.root,
                     )
                     .await
             };
             message
-                .map(|message| (plan, message))
-                .map_err(|error| (error.status(), draft::describe_error(&error)))
+                .map(|message| (task_plan, message))
+                .map_err(|error| (error.status(), draft::describe_error(&error), true))
         });
         let abort = task.abort_handle();
-        self.pending_sends
-            .insert(key, PendingSend { attempt, abort });
+        self.pending_sends.insert(
+            key,
+            PendingSend {
+                attempt,
+                abort,
+                plan: plan.clone(),
+            },
+        );
         self.composer_error.clear();
         cx.notify();
         cx.spawn_in(window, async move |this, window| {
@@ -322,9 +338,17 @@ impl Voxhold {
                 };
                 let (plan, message) = match result {
                     Ok(value) => value,
-                    Err((status, text)) => {
+                    Err((status, text, post_started)) => {
+                        // An upload refusal happens before the POST, so its
+                        // outcome is certain. A network error or a `504` of the
+                        // POST leaves the outcome unknown: keep the plan so an
+                        // own WebSocket echo can still confirm it.
+                        let uncertain = post_started && (status.is_none() || status == Some(504));
                         let active = s.chat_key() == plan_key;
-                        if plan_key.is_conversation() {
+                        if uncertain {
+                            s.unconfirmed_sends.insert(plan_key, plan);
+                        }
+                        if plan_key.is_conversation() && !uncertain {
                             match status {
                                 Some(404) => {
                                     // A missing conversation is authoritative for
@@ -368,6 +392,10 @@ impl Voxhold {
                 };
                 let composer_now = s.composer.read(cx).value().to_string();
                 let active = s.chat_key() == plan.key;
+                s.confirm_unconfirmed(&plan);
+                if active {
+                    s.composer_error.clear();
+                }
                 if s.apply_send_success(plan, message, &composer_now, cx) {
                     s.composer
                         .update(cx, |input, cx| input.set_value("", window, cx));
@@ -379,6 +407,19 @@ impl Voxhold {
             });
         })
         .detach();
+    }
+
+    /// Forget the uncertain plan of `plan`'s own attempt once a confirmation
+    /// arrives. A stored plan with another send key belongs to a newer
+    /// composition and must stay.
+    pub(super) fn confirm_unconfirmed(&mut self, plan: &draft::SendPlan) {
+        if self
+            .unconfirmed_sends
+            .get(&plan.key)
+            .is_some_and(|stored| stored.send_key == plan.send_key)
+        {
+            self.unconfirmed_sends.remove(&plan.key);
+        }
     }
 
     /// Apply one confirmed send. Returns true when the composer must be

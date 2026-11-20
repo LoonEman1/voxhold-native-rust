@@ -668,6 +668,21 @@ impl Render for Voxhold {
                 )
             });
         }
+        // The account socket ended and the outer loop is between attempts. The
+        // loaded history and composer stay mounted; this is only a status line
+        // in the existing chat area until a fresh `ready` confirms the socket.
+        if let Some(line) = super::realtime::reconnect_status_line(self.realtime_reconnecting) {
+            chat = chat.child(
+                div()
+                    .id("chat-reconnecting")
+                    .debug_selector(|| "chat-reconnecting".into())
+                    .px(px(16.))
+                    .pb(px(6.))
+                    .text_size(px(12.))
+                    .text_color(ink(p.muted))
+                    .child(line),
+            );
+        }
         if !explanation.is_empty() {
             chat = chat.child(
                 div()

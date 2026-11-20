@@ -5,6 +5,7 @@ mod auto_login;
 mod avatar_ops;
 mod channel_ops;
 mod channel_view;
+mod chat_gap;
 mod composer;
 mod history_actions;
 mod history_ops;
@@ -112,10 +113,13 @@ use ui::{icon, ink};
 type HistoryKey = (i64, i64, i64, String, bool, bool, u64);
 
 /// One in-flight send for a chat. The attempt number distinguishes two sends
-/// of the same chat; the abort handle stops the runtime task on logout.
+/// of the same chat; the abort handle stops the runtime task on logout. The
+/// plan snapshot lets an own `message.created`/`conversation.message` echo
+/// complete the same attempt the HTTP answer would.
 struct PendingSend {
     attempt: u64,
     abort: tokio::task::AbortHandle,
+    plan: draft::SendPlan,
 }
 
 /// The unsent drafts of the account whose session expired in this process.
@@ -470,6 +474,9 @@ pub(crate) struct Voxhold {
     /// The next successful refresh replaces the window instead of merging it.
     /// Used by "К последним" after a quote opened a bounded context page.
     history_reset_pending: bool,
+    /// Realtime rows that arrived behind the gap of a window being replaced by
+    /// an in-flight "К последним" request. Bound to that request and chat.
+    latest_buffer: Option<chat_gap::LatestBuffer>,
     hovered_message: i64,
     /// Bumped when `attachments.changed` confirms a deletion, so the row
     /// re-measures without touching the server revision.
@@ -481,6 +488,13 @@ pub(crate) struct Voxhold {
     preview_wake_at: Option<std::time::Instant>,
     event_task: Option<tokio::task::JoinHandle<()>>,
     realtime_generation: u64,
+    /// The account socket ended and the outer loop is waiting for the next
+    /// attempt. The loaded history stays visible; only the status line changes.
+    realtime_reconnecting: bool,
+    /// Live connection state written by the socket task. It is not an event:
+    /// a full event queue cannot lose it, and `stop_realtime` replaces it so a
+    /// stale task cannot touch a newer session.
+    realtime_link: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     event_subscription: Option<tokio::sync::watch::Sender<Option<ChannelSubscription>>>,
     online_by_server: std::collections::HashMap<i64, std::collections::HashSet<i64>>,
     events: Option<
@@ -498,6 +512,11 @@ pub(crate) struct Voxhold {
     /// One confirmed send in flight per chat. The runtime task is aborted on
     /// logout, so no POST starts after the session ended.
     pending_sends: std::collections::HashMap<draft::ChatKey, PendingSend>,
+    /// The last POST of a chat whose outcome is unknown (a network error or a
+    /// `504`). Its plan is kept because a later own WebSocket echo can still
+    /// confirm it and consume the draft. A new send of the same chat replaces
+    /// the entry, so the old attempt cannot clear the new composition's key.
+    unconfirmed_sends: std::collections::HashMap<draft::ChatKey, draft::SendPlan>,
     /// Monotonic id of the latest send, stored in `PendingSend::attempt`.
     send_attempt: u64,
     /// Changes on login and logout; a send result from another session is
@@ -553,6 +572,7 @@ impl Drop for Voxhold {
         for (_, pending) in self.pending_sends.drain() {
             pending.abort.abort();
         }
+        self.unconfirmed_sends.clear();
         self.stop_session_clock();
         self.stop_realtime();
     }
@@ -566,6 +586,11 @@ impl Voxhold {
         self.events = None;
         self.event_subscription = None;
         self.realtime_generation = self.realtime_generation.wrapping_add(1);
+        // The retry status belongs to the socket that just ended. Replacing the
+        // shared link drops the old task's handle: its later writes cannot
+        // repaint the banner in a new session.
+        self.realtime_link = None;
+        self.realtime_reconnecting = false;
         self.online_by_server.clear();
     }
 
@@ -836,6 +861,7 @@ impl Voxhold {
             context_request: None,
             pending_jump: None,
             history_reset_pending: false,
+            latest_buffer: None,
             hovered_message: 0,
             attachment_epoch: 0,
             media: media::Media::default(),
@@ -843,6 +869,8 @@ impl Voxhold {
             preview_wake_at: None,
             event_task: None,
             realtime_generation: 0,
+            realtime_reconnecting: false,
+            realtime_link: None,
             event_subscription: None,
             online_by_server: Default::default(),
             events: None,
@@ -855,6 +883,7 @@ impl Voxhold {
             error: String::new(),
             composer_error: String::new(),
             pending_sends: Default::default(),
+            unconfirmed_sends: Default::default(),
             send_attempt: 0,
             session_generation: 0,
             active_profile_save: None,

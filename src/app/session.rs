@@ -318,6 +318,7 @@ impl Voxhold {
         for (_, pending) in self.pending_sends.drain() {
             pending.abort.abort();
         }
+        self.unconfirmed_sends.clear();
         // The pending voice save would be aborted by the generation bump; write
         // it before the session it belongs to goes away.
         self.voice_settings.flush();
@@ -369,6 +370,7 @@ impl Voxhold {
         self.refresh_request = None;
         self.refresh_again = false;
         self.refresh_new_ids.clear();
+        self.clear_latest_buffer();
         self.pending_edits.clear();
         self.pending_reactions.clear();
         self.older_request = 0;

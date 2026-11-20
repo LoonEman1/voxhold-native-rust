@@ -26,6 +26,7 @@ use std::{
 use libwebrtc::{
     audio_stream::native::{NativeAudioStream, NativeAudioStreamOptions},
     audio_track::RtcAudioTrack,
+    media_stream_track::RtcTrackState,
 };
 use tokio_stream::StreamExt;
 
@@ -51,6 +52,10 @@ pub(crate) const STABLE_BLOCKS: u64 = 50;
 /// Slow retry of the ADM path when it could not be started.
 const ADM_RETRY: Duration = Duration::from_secs(5);
 const REPORT_INTERVAL: Duration = Duration::from_secs(1);
+/// How often an attachment task checks whether its remote track ended. The
+/// native audio sink has no end callback, so an ended track would otherwise
+/// park the task and its mixer source until the session drops.
+const TRACK_STATE_POLL: Duration = Duration::from_secs(1);
 
 /// Which playout path owns the room right now.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -76,10 +81,80 @@ pub(crate) struct MixState {
 }
 
 enum Msg {
-    Remove(String),
-    Frame(String, Vec<i16>),
+    Remove(String, u64),
+    Frame(String, u64, Vec<i16>),
     Sink(Box<dyn Sink>),
 }
+
+/// Current attachment generation per track id. A re-offered track gets a new
+/// generation; frames and the end marker of the older task are then dropped, so
+/// the two receivers can never overlap in the mixer even before the aborted
+/// task has stopped.
+#[derive(Default)]
+struct Epochs {
+    current: std::collections::HashMap<String, u64>,
+}
+
+enum Epoch {
+    /// The task was replaced; its frame or end marker is stale.
+    Stale,
+    /// The current task keeps pushing.
+    Current,
+    /// A newer attachment takes the id; the old queued PCM must be discarded.
+    New,
+}
+
+impl Epochs {
+    fn frame(&mut self, id: &str, epoch: u64) -> Epoch {
+        match self.current.get(id) {
+            Some(&current) if epoch < current => Epoch::Stale,
+            Some(&current) if epoch == current => Epoch::Current,
+            _ => {
+                self.current.insert(id.to_owned(), epoch);
+                Epoch::New
+            }
+        }
+    }
+
+    /// An end marker only clears the source of the attachment that owns it.
+    fn ended(&mut self, id: &str, epoch: u64) -> bool {
+        if self.current.get(id) == Some(&epoch) {
+            self.current.remove(id);
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// Apply one decoded frame for its attachment generation. A new generation may
+/// discard the previous task's queued PCM, but never the participant's mixer
+/// source: gain and mute belong to the participant, not to the decoded stream.
+/// Returns whether the frame reached the source queue.
+fn apply_frame(
+    epochs: &mut Epochs,
+    pool: &mut SourcePool,
+    id: &str,
+    epoch: u64,
+    frame: Vec<i16>,
+) -> bool {
+    match epochs.frame(id, epoch) {
+        Epoch::Stale => false,
+        Epoch::Current => {
+            pool.push(id, frame);
+            true
+        }
+        Epoch::New => {
+            pool.remove(id);
+            pool.push(id, frame);
+            true
+        }
+    }
+}
+
+/// One attachment generation for the whole process. The mixer worker compares
+/// it per track id, so a late frame from a closed task is ignored.
+static ATTACH_SERIAL: AtomicU64 = AtomicU64::new(0);
 
 /// Bounded, coalesced state slot. A busy frame channel must never lose a gain
 /// snapshot: the newest snapshot waits here until the mixer thread takes it.
@@ -101,6 +176,12 @@ impl StateSlot {
 mod tap;
 use tap::Tap;
 pub(crate) use tap::TapReceiver;
+mod tracks;
+pub(crate) use tracks::TrackSet;
+
+/// Identifies one mixer generation. A task recorded against an older serial
+/// belongs to a replaced playout and must not be trusted again.
+static MIXER_SERIAL: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Default)]
 struct Metrics {
@@ -330,6 +411,9 @@ pub(crate) struct Playout {
     state: StateSlot,
     tap: Tap,
     open: Arc<OpenSink>,
+    /// Generation of this mixer, used to tell a current attachment task from
+    /// one bound to a replaced playout.
+    serial: u64,
     /// Non-blocking shutdown signal; `Drop` sets it instead of sending on a
     /// possibly full channel.
     stop: Arc<AtomicBool>,
@@ -367,12 +451,16 @@ impl PlayoutClip {
 
     /// Queue one decoded 10 ms frame. A full channel drops this frame and keeps
     /// the source alive; only a closed playout ends the task.
-    pub(crate) fn push_frame(&self, track_id: &str, block: Vec<i16>) -> bool {
-        self.send(Msg::Frame(track_id.to_owned(), block))
+    pub(crate) fn push_frame(&self, track_id: &str, epoch: u64, block: Vec<i16>) -> bool {
+        self.send(Msg::Frame(track_id.to_owned(), epoch, block))
     }
 
-    pub(crate) fn remove_source(&self, track_id: &str) {
-        let _ = self.send(Msg::Remove(track_id.to_owned()));
+    pub(crate) fn remove_source(&self, track_id: &str, epoch: u64) {
+        // The task is ending, so the marker must not be treated as another
+        // dropped frame: a full channel would otherwise keep the mixer source
+        // (and the finished attachment) forever. A closed playout has nothing
+        // to remove.
+        let _ = self.sender.send(Msg::Remove(track_id.to_owned(), epoch));
     }
 
     /// Attach a decoded remote track. The task drains the engine sink into the
@@ -384,7 +472,11 @@ impl PlayoutClip {
         runtime: tokio::runtime::Handle,
     ) -> tokio::task::JoinHandle<()> {
         let clip = self.clone();
+        let epoch = ATTACH_SERIAL.fetch_add(1, Ordering::Relaxed) + 1;
         runtime.spawn(async move {
+            // The sink produces no end callback; a clone of the track lets the
+            // task notice `Ended` instead of waiting for a closed queue forever.
+            let state = track.clone();
             let mut stream = NativeAudioStream::with_options(
                 track,
                 PLAYOUT_RATE as i32,
@@ -393,13 +485,29 @@ impl PlayoutClip {
                     queue_size_frames: Some(SOURCE_CHANNEL),
                 },
             );
-            while let Some(frame) = stream.next().await {
-                if !clip.push_frame(&track_id, frame.data.to_vec()) {
-                    break;
+            let mut poll = tokio::time::interval(TRACK_STATE_POLL);
+            poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    // `next` only polls the frame queue, so dropping its future
+                    // on the state tick loses no frame.
+                    frame = stream.next() => match frame {
+                        Some(frame) => {
+                            if !clip.push_frame(&track_id, epoch, frame.data.to_vec()) {
+                                break;
+                            }
+                        }
+                        None => break,
+                    },
+                    _ = poll.tick() => {
+                        if state.state() == RtcTrackState::Ended {
+                            break;
+                        }
+                    }
                 }
             }
             stream.close();
-            clip.remove_source(&track_id);
+            clip.remove_source(&track_id, epoch);
         })
     }
 }
@@ -450,6 +558,7 @@ impl Playout {
             state,
             tap,
             open,
+            serial: MIXER_SERIAL.fetch_add(1, Ordering::Relaxed) + 1,
             stop,
             thread: Some(thread),
             stability: Arc::new(Mutex::new(Stability {
@@ -491,6 +600,10 @@ impl Playout {
 
     pub(crate) fn clip(&self) -> PlayoutClip {
         self.clip.clone()
+    }
+
+    pub(crate) fn serial(&self) -> u64 {
+        self.serial
     }
 
     /// Post-mix subscription for the W07 recorder. No consumer is wired in this
@@ -564,6 +677,7 @@ fn run(
 ) {
     let mut mixer = Mixer::default();
     let mut pool = SourcePool::default();
+    let mut epochs = Epochs::default();
     let mut block = vec![0_i16; BLOCK_SAMPLES];
     let mut last_publish = Instant::now();
     'outer: loop {
@@ -573,11 +687,15 @@ fn run(
         let mut stopped = false;
         for _ in 0..64 {
             match receiver.recv_timeout(Duration::ZERO) {
-                Ok(Msg::Remove(id)) => {
-                    pool.remove(&id);
-                    mixer.remove_source(&id);
+                Ok(Msg::Remove(id, epoch)) => {
+                    if epochs.ended(&id, epoch) {
+                        pool.remove(&id);
+                        mixer.remove_source(&id);
+                    }
                 }
-                Ok(Msg::Frame(id, frame)) => pool.push(&id, frame),
+                Ok(Msg::Frame(id, epoch, frame)) => {
+                    apply_frame(&mut epochs, &mut pool, &id, epoch, frame);
+                }
                 Ok(Msg::Sink(next)) => {
                     let mut old = std::mem::replace(&mut sink, next);
                     old.close();
@@ -647,10 +765,6 @@ fn run(
     }
     metrics.publish(&mixer, &pool, 0, false);
     sink.close();
-}
-
-fn prune_finished(tasks: &mut Vec<tokio::task::JoinHandle<()>>) {
-    tasks.retain(|task| !task.is_finished());
 }
 
 mod session;

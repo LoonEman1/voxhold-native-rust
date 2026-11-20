@@ -749,6 +749,10 @@ impl Drop for Live {
     /// the voice worker for up to `WORKER_JOIN_TIMEOUT` after the leave
     /// handshake; hand it to the same release thread as every other stop.
     fn drop(&mut self) {
+        // The player peer is released on the same short-lived thread as a
+        // publication engine: closing it must not hold the voice worker after
+        // `stream.leave` was already sent.
+        self.close_stream();
         if let Some(engine) = self.screen.take() {
             release_off_loop(engine, true);
         }

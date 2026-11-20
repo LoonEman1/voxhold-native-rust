@@ -211,6 +211,13 @@ pub enum Event {
     /// Post-mix meter and playout counters from the software mixer.
     Playout(crate::mixer::PlayoutStats),
     Frame,
+    /// Cumulative inbound RTP counters of the viewer's video track. A missing
+    /// report is not sent at all, which is distinct from repeating the same
+    /// values. No pixels, codecs or track ids are included.
+    VideoStats {
+        bytes_received: u64,
+        frames_decoded: u32,
+    },
     Error {
         message: &'static str,
     },
@@ -303,6 +310,9 @@ pub struct Media {
     events: Arc<Events>,
     capture: Arc<CaptureGate>,
     video: Arc<VideoStore>,
+    /// Separate from the command queue: closing the player must not wait behind
+    /// offers or ICE candidates that were already accepted.
+    stop: Arc<tokio::sync::Notify>,
     worker: Option<JoinHandle<()>>,
 }
 
@@ -329,12 +339,20 @@ impl Media {
         let (commands, rx) = mpsc::channel(COMMAND_CAPACITY);
         let events = Arc::new(Events::default());
         let video = Arc::new(VideoStore::default());
+        let stop = Arc::new(tokio::sync::Notify::new());
         let (worker_events, worker_capture, worker_video) =
             (events.clone(), capture.clone(), video.clone());
+        let worker_stop = stop.clone();
         let worker = thread::Builder::new()
             .name("voxhold-media".into())
             .spawn(move || {
-                runtime.block_on(voice::run(rx, worker_events, worker_capture, worker_video))
+                runtime.block_on(voice::run(
+                    rx,
+                    worker_events,
+                    worker_capture,
+                    worker_video,
+                    worker_stop,
+                ))
             })
             .map_err(|_| MediaError::Worker)?;
         Ok(Self {
@@ -342,6 +360,7 @@ impl Media {
             events,
             capture,
             video,
+            stop,
             worker: Some(worker),
         })
     }
@@ -376,6 +395,13 @@ impl Media {
         self.capture.set_server_allowed(allowed);
     }
 
+    /// Stop the media worker ahead of the command queue. The worker drops the
+    /// peer connection and its video store; the caller still joins it away from
+    /// the UI/signaling thread.
+    pub fn stop(&self) {
+        self.stop.notify_one();
+    }
+
     pub fn poll(&self, wait: Duration) -> Option<Event> {
         self.events.poll(wait)
     }
@@ -399,6 +425,9 @@ impl Drop for Media {
         // reusable for the next media session on reconnect; only
         // `VoiceHandle::leave`/`Drop` sets the irreversible latch.
         self.capture.end_transport();
+        // The stop signal is ready before a queued offer/ICE burst can be
+        // drained; the worker then closes the peer and exits.
+        self.stop();
         // Close the channel before joining the worker.
         let (replacement, _) = mpsc::channel(1);
         drop(std::mem::replace(&mut self.commands, replacement));
@@ -420,6 +449,13 @@ impl VideoFrame {
     }
     pub fn height(&self) -> u32 {
         self.request.height
+    }
+    /// A replacement engine has its own frame sequence and dimensions. Keep the
+    /// BGRA allocation, but forget the previous engine's frame identity so its
+    /// first frame is read even when both stores start at sequence 1 and the
+    /// same fitted size.
+    pub(crate) fn reset_for_new_engine(&mut self) {
+        self.request.forget_frame();
     }
 }
 
@@ -444,6 +480,7 @@ mod tests {
                 events: Arc::new(Events::default()),
                 capture: capture.clone(),
                 video: Arc::new(VideoStore::default()),
+                stop: Arc::new(tokio::sync::Notify::new()),
                 worker: None,
             },
             capture,

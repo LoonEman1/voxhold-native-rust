@@ -76,10 +76,55 @@ pub(crate) struct MixState {
 }
 
 enum Msg {
-    Remove(String),
-    Frame(String, Vec<i16>),
+    Remove(String, u64),
+    Frame(String, u64, Vec<i16>),
     Sink(Box<dyn Sink>),
 }
+
+/// Current attachment generation per track id. A re-offered track gets a new
+/// generation; frames and the end marker of the older task are then dropped, so
+/// the two receivers can never overlap in the mixer even before the aborted
+/// task has stopped.
+#[derive(Default)]
+struct Epochs {
+    current: std::collections::HashMap<String, u64>,
+}
+
+enum Epoch {
+    /// The task was replaced; its frame or end marker is stale.
+    Stale,
+    /// The current task keeps pushing.
+    Current,
+    /// A newer attachment takes the id; the old queued PCM must be discarded.
+    New,
+}
+
+impl Epochs {
+    fn frame(&mut self, id: &str, epoch: u64) -> Epoch {
+        match self.current.get(id) {
+            Some(&current) if epoch < current => Epoch::Stale,
+            Some(&current) if epoch == current => Epoch::Current,
+            _ => {
+                self.current.insert(id.to_owned(), epoch);
+                Epoch::New
+            }
+        }
+    }
+
+    /// An end marker only clears the source of the attachment that owns it.
+    fn ended(&mut self, id: &str, epoch: u64) -> bool {
+        if self.current.get(id) == Some(&epoch) {
+            self.current.remove(id);
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// One attachment generation for the whole process. The mixer worker compares
+/// it per track id, so a late frame from a closed task is ignored.
+static ATTACH_SERIAL: AtomicU64 = AtomicU64::new(0);
 
 /// Bounded, coalesced state slot. A busy frame channel must never lose a gain
 /// snapshot: the newest snapshot waits here until the mixer thread takes it.
@@ -376,12 +421,12 @@ impl PlayoutClip {
 
     /// Queue one decoded 10 ms frame. A full channel drops this frame and keeps
     /// the source alive; only a closed playout ends the task.
-    pub(crate) fn push_frame(&self, track_id: &str, block: Vec<i16>) -> bool {
-        self.send(Msg::Frame(track_id.to_owned(), block))
+    pub(crate) fn push_frame(&self, track_id: &str, epoch: u64, block: Vec<i16>) -> bool {
+        self.send(Msg::Frame(track_id.to_owned(), epoch, block))
     }
 
-    pub(crate) fn remove_source(&self, track_id: &str) {
-        let _ = self.send(Msg::Remove(track_id.to_owned()));
+    pub(crate) fn remove_source(&self, track_id: &str, epoch: u64) {
+        let _ = self.send(Msg::Remove(track_id.to_owned(), epoch));
     }
 
     /// Attach a decoded remote track. The task drains the engine sink into the
@@ -393,6 +438,7 @@ impl PlayoutClip {
         runtime: tokio::runtime::Handle,
     ) -> tokio::task::JoinHandle<()> {
         let clip = self.clone();
+        let epoch = ATTACH_SERIAL.fetch_add(1, Ordering::Relaxed) + 1;
         runtime.spawn(async move {
             let mut stream = NativeAudioStream::with_options(
                 track,
@@ -403,12 +449,12 @@ impl PlayoutClip {
                 },
             );
             while let Some(frame) = stream.next().await {
-                if !clip.push_frame(&track_id, frame.data.to_vec()) {
+                if !clip.push_frame(&track_id, epoch, frame.data.to_vec()) {
                     break;
                 }
             }
             stream.close();
-            clip.remove_source(&track_id);
+            clip.remove_source(&track_id, epoch);
         })
     }
 }
@@ -578,6 +624,7 @@ fn run(
 ) {
     let mut mixer = Mixer::default();
     let mut pool = SourcePool::default();
+    let mut epochs = Epochs::default();
     let mut block = vec![0_i16; BLOCK_SAMPLES];
     let mut last_publish = Instant::now();
     'outer: loop {
@@ -587,11 +634,23 @@ fn run(
         let mut stopped = false;
         for _ in 0..64 {
             match receiver.recv_timeout(Duration::ZERO) {
-                Ok(Msg::Remove(id)) => {
-                    pool.remove(&id);
-                    mixer.remove_source(&id);
+                Ok(Msg::Remove(id, epoch)) => {
+                    if epochs.ended(&id, epoch) {
+                        pool.remove(&id);
+                        mixer.remove_source(&id);
+                    }
                 }
-                Ok(Msg::Frame(id, frame)) => pool.push(&id, frame),
+                Ok(Msg::Frame(id, epoch, frame)) => match epochs.frame(&id, epoch) {
+                    Epoch::Stale => {}
+                    Epoch::Current => pool.push(&id, frame),
+                    Epoch::New => {
+                        // A newer attachment owns the id now: drop the old
+                        // queued PCM before the first frame of the new task.
+                        pool.remove(&id);
+                        mixer.remove_source(&id);
+                        pool.push(&id, frame);
+                    }
+                },
                 Ok(Msg::Sink(next)) => {
                     let mut old = std::mem::replace(&mut sink, next);
                     old.close();

@@ -178,7 +178,7 @@ fn a_failed_open_is_retried_after_the_backoff_and_then_restores_audio() {
     // The recovered mixer really reaches the sink with the attached frame.
     playout
         .clip()
-        .push_frame("track", vec![2_000_i16; BLOCK_SAMPLES]);
+        .push_frame("track", 1, vec![2_000_i16; BLOCK_SAMPLES]);
     let deadline = Instant::now() + Duration::from_millis(400);
     while writes.lock().map(|w| w.is_empty()).unwrap_or(false) && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(5));
@@ -283,18 +283,41 @@ fn the_fifth_failure_requests_the_adm_fallback_instead_of_retrying() {
 }
 
 #[test]
+fn a_replaced_attachment_generation_cannot_mix_or_remove_the_new_source() {
+    let mut epochs = Epochs::default();
+    assert!(matches!(epochs.frame("track", 1), Epoch::New));
+    assert!(matches!(epochs.frame("track", 1), Epoch::Current));
+    // A re-offered id starts a new generation.
+    assert!(matches!(epochs.frame("track", 2), Epoch::New));
+    assert!(
+        matches!(epochs.frame("track", 1), Epoch::Stale),
+        "a late frame of the closed task is dropped"
+    );
+    assert!(
+        !epochs.ended("track", 1),
+        "the closed task must not remove the new source"
+    );
+    assert!(matches!(epochs.frame("track", 2), Epoch::Current));
+    assert!(epochs.ended("track", 2), "the current task ends its source");
+    assert!(
+        matches!(epochs.frame("track", 2), Epoch::New),
+        "a new attachment after the end starts a fresh generation"
+    );
+}
+
+#[test]
 fn a_full_source_channel_drops_the_frame_but_keeps_the_source() {
     let (clip, receiver, metrics) = test_clip(1);
-    assert!(clip.push_frame("track", vec![1_i16; BLOCK_SAMPLES]));
+    assert!(clip.push_frame("track", 1, vec![1_i16; BLOCK_SAMPLES]));
     assert!(
-        clip.push_frame("track", vec![2_i16; BLOCK_SAMPLES]),
+        clip.push_frame("track", 1, vec![2_i16; BLOCK_SAMPLES]),
         "a full channel is a dropped frame, not a dead source"
     );
     assert_eq!(metrics.queue_dropped.load(Ordering::Relaxed), 1);
     assert!(receiver.try_recv().is_ok());
     // Only a closed playout ends the task.
     drop(receiver);
-    assert!(!clip.push_frame("track", vec![3_i16; BLOCK_SAMPLES]));
+    assert!(!clip.push_frame("track", 1, vec![3_i16; BLOCK_SAMPLES]));
 }
 
 #[test]

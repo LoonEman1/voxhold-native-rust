@@ -12,6 +12,7 @@
 //! the new one.
 
 use super::*;
+use libwebrtc::media_stream_track::RtcTrackState;
 use tokio::task::JoinHandle;
 
 /// Same bound as the per-participant source table; a misbehaving peer cannot
@@ -44,6 +45,11 @@ pub(crate) struct TrackSet {
 impl TrackSet {
     /// Queue a receiver announced by `on_track`.
     pub(crate) fn offer(&mut self, track_id: String, track: RtcAudioTrack) {
+        if track.state() == RtcTrackState::Ended {
+            // A track can end while the mixer is absent; reattaching it later
+            // would only create a stream that immediately finishes.
+            return;
+        }
         if self.pending.len() >= MAX_TRACKS {
             self.pending.pop_front();
         }
@@ -86,6 +92,11 @@ impl TrackSet {
         while let Some((id, track)) = self.pending.pop_front() {
             self.known.insert(id, track);
         }
+        // A track may have ended while the mixer was absent (ADM fallback,
+        // suspend). Its task is gone, so drop it instead of reviving an idle
+        // stream. The `on_track` callback is not repeated for it.
+        self.known
+            .retain(|_, track| track.state() == RtcTrackState::Live);
         let active: Vec<(String, RtcAudioTrack)> = self
             .known
             .iter()
@@ -114,6 +125,10 @@ impl TrackSet {
         runtime: &tokio::runtime::Handle,
     ) {
         self.close(&id);
+        if track.state() == RtcTrackState::Ended {
+            self.known.remove(&id);
+            return;
+        }
         self.known.insert(id.clone(), track.clone());
         let task = playout.clip().attach(id.clone(), track, runtime.clone());
         self.tasks.insert(

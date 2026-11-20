@@ -110,10 +110,12 @@ pub(super) struct ScreenShareUi {
     pub(super) last_request: Option<PublishRequest>,
     pub(super) busy: bool,
     /// A quality-change preflight of this dialog is pending. Start sets it, the
-    /// worker's `preflighting` update repeats it, and the failure answer, a
-    /// commit or closing the dialog clears it. It survives a stale state that
-    /// clears `busy`, so closing the dialog always cancels the preflight.
+    /// failure answer, a commit or closing the dialog clears it. It survives a
+    /// stale state that clears `busy`, so closing always cancels the preflight.
     pub(super) preflight: bool,
+    /// The worker really confirmed this preflight (`preflighting: true`). Until
+    /// then a stale failure sample of the previous preflight cannot end it.
+    pub(super) preflight_confirmed: bool,
     pub(super) error: String,
     pub(super) sharing: Sharing,
     pub(super) preview: Option<Arc<RenderImage>>,
@@ -174,6 +176,7 @@ impl Default for ScreenShareUi {
             last_request: None,
             busy: false,
             preflight: false,
+            preflight_confirmed: false,
             error: String::new(),
             sharing: Sharing::default(),
             preview: None,
@@ -436,8 +439,7 @@ impl VoicePanel {
         self.screen.busy
     }
 
-    /// Whether this client currently owns a publication attempt. In this
-    /// phase the «Экран» action shows a status instead of a disabled reason.
+    /// Whether this client owns an attempt. The action shows a status then.
     pub(super) fn share_active(&self) -> bool {
         matches!(
             self.screen.sharing.phase,
@@ -445,9 +447,8 @@ impl VoicePanel {
         )
     }
 
-    /// Why the «Экран» action is disabled, shown next to the toolbar. During
-    /// an active share the reason would be the permanent "already running"
-    /// text, so the room shows the publication state instead.
+    /// Why the «Экран» action is disabled. During a share the permanent
+    /// "already running" text would hide the publication state instead.
     pub(super) fn screen_reason(&self) -> Option<&'static str> {
         if self.share_active() {
             return None;
@@ -516,26 +517,23 @@ impl VoicePanel {
         self.screen.open = true;
         self.screen.restart = false;
         self.screen.busy = false;
+        self.screen.preflight = false;
+        self.screen.preflight_confirmed = false;
         self.screen.error.clear();
         self.screen.selected = None;
         self.screen.last_request = None;
         self.screen.kind = SourceKind::Monitor;
-        // A new picker starts with no rows: an identity from the previous
-        // answer (or a confirmed live source) must not be selectable while
-        // the fresh lists load.
+        // A new picker starts with no rows: no identity from the previous
+        // answer or a live source is selectable while the lists load.
         self.screen.monitors.clear();
         self.screen.windows.clear();
         self.screen.monitor_error.clear();
         self.screen.window_error.clear();
-        // A new picker starts with no previews and a new epoch: a capture of
-        // the previous dialog can finish, but its result is ignored.
+        // A new epoch: a capture of the previous dialog is ignored.
         self.screen.clear_previews();
-        // A fresh publication starts without system sound: the whole endpoint
-        // is never published silently. Enabling it offers the safe default
-        // scope for the source kind. The background probe fills in
-        // availability and disables the toggle if the endpoint fails. The
-        // previous picker's answer must not leak into this one: Start stays
-        // locked until the new probe settles.
+        // A fresh publication starts without system sound, and the previous
+        // picker's probe answer must not leak in: Start stays locked until
+        // the new probe settles and offers the safe default scope.
         self.screen.audio_enabled = false;
         self.screen.reset_audio_scope(SourceKind::Monitor);
         self.screen.audio_availability = None;
@@ -591,6 +589,7 @@ impl VoicePanel {
         self.screen.open = true;
         self.screen.busy = false;
         self.screen.preflight = false;
+        self.screen.preflight_confirmed = false;
         self.screen.error.clear();
         self.screen.focus_placed = false;
         self.sync_screen_access();
@@ -636,25 +635,23 @@ impl VoicePanel {
     }
 
     /// Close the picker. Before Start this only cancels the picker and leaves
-    /// the viewer alone. After Start (Escape, backdrop or a repeated close)
-    /// it is a stop intent: the attempt already committed, so the capture is
-    /// released and exactly one `stream.stop` is sent.
+    /// the viewer alone. After Start (Escape, backdrop or a repeated close) it
+    /// is a stop intent: the attempt already committed, so exactly one
+    /// `stream.stop` is sent and the capture is released.
     pub(super) fn close_screen_share(&mut self, cx: &mut Context<Self>) {
         if !self.screen.open {
             return;
         }
         let restart_open = self.screen.restart;
         // A preflight is pending as soon as this dialog asked for a restart,
-        // even when a stale state already cleared `busy` and the worker's
-        // `preflighting` update has not landed. Closing must cancel it: the
-        // live stream was never stopped and must stay up.
+        // even before the worker's `preflighting` update lands or after a
+        // stale sample cleared `busy`. Closing cancels it and keeps Live.
         let preflight_pending =
             restart_open && (self.screen.preflight || self.screen.sharing.preflighting);
         let restart_busy = restart_open && (self.screen.busy || preflight_pending);
-        // The live publication existed before this dialog; closing it without
-        // a committed change must leave the stream untouched. A restart only
-        // commits once the publisher confirmed the stop; while its preflight
-        // runs, closing cancels the preflight instead.
+        // Closing without a committed change leaves the live stream untouched.
+        // A restart only commits once the publisher confirmed the stop; while
+        // its preflight runs, closing cancels it instead.
         let committed = if restart_open {
             self.screen.sharing.restarting && self.screen.busy
         } else {
@@ -664,11 +661,11 @@ impl VoicePanel {
         self.screen.restart = false;
         self.screen.busy = false;
         self.screen.preflight = false;
+        self.screen.preflight_confirmed = false;
         self.screen.error.clear();
         self.screen.selected = None;
         // No row of this dialog may survive into the next picker. The
-        // confirmed live identity stays in `last_request` for the quality
-        // dialog, not in the enumeration caches.
+        // confirmed live identity lives in `last_request`, not in these caches.
         self.screen.monitors.clear();
         self.screen.windows.clear();
         // Closing cancels the preview batch: the epoch moves, so a late answer
@@ -681,8 +678,7 @@ impl VoicePanel {
             } else if restart_busy {
                 handle.cancel_screen_restart();
             } else if !restart_open {
-                // A restart dialog never opened a picker, so there is nothing
-                // to cancel and the live publication stays untouched.
+                // A restart dialog never opened a picker: nothing to cancel.
                 handle.cancel_screen_picker(self.screen.picker);
             }
         }
@@ -770,10 +766,9 @@ impl VoicePanel {
         cx.notify();
     }
 
-    /// Start is possible only after the endpoint probe answered: committing
-    /// while the answer is pending would publish video without the requested
-    /// system audio. A normal Start needs its id in the visible snapshot; a
-    /// restart needs only the confirmed identity of the live attempt.
+    /// Start waits for the endpoint probe: committing earlier would publish
+    /// video without the requested system audio. A normal Start needs its id
+    /// in the snapshot; a restart needs the confirmed live identity.
     pub(super) fn screen_can_start(&self) -> bool {
         let source_ready = if self.screen.restart {
             self.screen.restart_is_confirmed()
@@ -898,7 +893,9 @@ impl VoicePanel {
         self.screen.busy = true;
         // A restart without a live bitrate starts a preflight; closing the
         // dialog while it runs must cancel it instead of stopping the stream.
+        // Only a `preflighting` sample of this attempt confirms it.
         self.screen.preflight = self.screen.restart && !live_bitrate;
+        self.screen.preflight_confirmed = false;
         // The previous attempt's error belongs to its own answer. A stale
         // `Sharing` snapshot must not turn this Start into an instant failure.
         self.screen.sharing.error = None;
@@ -977,6 +974,7 @@ impl VoicePanel {
                     self.screen.restart = false;
                     self.screen.busy = false;
                     self.screen.preflight = false;
+                    self.screen.preflight_confirmed = false;
                     self.screen.clear_previews();
                 }
                 if self.screen.sharing.preflighting {
@@ -984,42 +982,44 @@ impl VoicePanel {
                     // the dialog (and its cancel intent) alive even when a
                     // stale state cleared `busy` in between.
                     self.screen.preflight = true;
+                    self.screen.preflight_confirmed = true;
                     self.screen.busy = true;
                 }
-                // A failed preflight keeps the dialog open with its reason:
-                // nothing was stopped and the user may correct the settings.
-                // Only a preflight this dialog really started may end `busy`; a
-                // stale stats sample with the previous error must not.
-                let preflight_failed = phase == Phase::Live
+                // A failed preflight keeps the dialog open with its reason.
+                // Only an answer to the confirmed preflight of this attempt may
+                // end `busy`: a stale sample with the previous error is not it.
+                let preflight_failure = phase == Phase::Live
                     && self.screen.preflight
                     && self.screen.busy
                     && !self.screen.sharing.restarting
                     && !self.screen.sharing.preflighting
                     && self.screen.sharing.error.is_some();
-                if preflight_failed {
+                if preflight_failure && self.screen.preflight_confirmed {
                     self.screen.busy = false;
                     self.screen.preflight = false;
+                    self.screen.preflight_confirmed = false;
                     self.screen.error = self.screen.sharing.error.clone().unwrap_or_default();
                 }
                 if phase == Phase::Idle || phase == Phase::Failed {
                     self.screen.restart = false;
                     self.screen.preflight = false;
+                    self.screen.preflight_confirmed = false;
                 }
                 if matches!(phase, Phase::Publishing | Phase::Live)
                     && self.screen.open
                     && !self.screen.sharing.preflighting
-                    && !preflight_failed
+                    && !preflight_failure
                     && (self.screen.busy || previous != phase)
                 {
                     // Either this dialog committed the attempt (busy) or the
                     // phase really changed: the card in the room now owns the
-                    // status and the stop action. A periodic stats update in
-                    // the same phase must not close an uncommitted restart
-                    // dialog, or its Start could never be reached. A running
-                    // preflight keeps the dialog open so closing it cancels.
+                    // status and the stop action. A same-phase stats update
+                    // must not close an uncommitted restart dialog, and a
+                    // pending preflight stays open so closing cancels it.
                     self.screen.open = false;
                     self.screen.busy = false;
                     self.screen.preflight = false;
+                    self.screen.preflight_confirmed = false;
                     self.screen.focus_placed = false;
                     self.screen.clear_previews();
                 }

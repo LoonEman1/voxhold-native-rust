@@ -289,6 +289,11 @@ impl Live {
                     }
                 }
                 PublisherOutcome::Offer(sdp) => {
+                    // Unlike ICE and the live bitrate, an offer is not
+                    // retried: a burst that fills the bounded worker queue
+                    // here still ends the attempt. This keeps the pre-existing
+                    // terminal `Full` path; the offer burst it needs is rare
+                    // and has no deterministic reproduction yet.
                     let failure = self
                         .screen
                         .as_ref()

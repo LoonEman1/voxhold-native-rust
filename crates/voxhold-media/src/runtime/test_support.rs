@@ -24,6 +24,17 @@ impl VoiceHandle {
         }
     }
 
+    /// A detached handle whose first authorization is deferred exactly like
+    /// `join_with_rotation(..., true)`. No socket exists; only the shared
+    /// rotation gate is observable.
+    pub fn detached_for_tests_with_rotation(rotation_pending: bool) -> Self {
+        let handle = Self::detached_for_tests();
+        if rotation_pending {
+            handle.requests.rotation_started(Instant::now());
+        }
+        handle
+    }
+
     /// Push one update through the real coalescing queue, exactly as the
     /// worker does. The panel tests use this to model a burst that is read as
     /// one latest snapshot.
@@ -38,6 +49,15 @@ impl VoiceHandle {
             .lock()
             .map(|rotation| rotation.active())
             .unwrap_or(false)
+    }
+
+    /// Whether the worker may open its first socket now.
+    pub fn test_rotation_authorizes(&self) -> bool {
+        self.requests
+            .rotation
+            .lock()
+            .map(|rotation| rotation.authorization_allowed(Instant::now()))
+            .unwrap_or(true)
     }
 
     /// The newest control snapshot waiting for the media worker, if the UI

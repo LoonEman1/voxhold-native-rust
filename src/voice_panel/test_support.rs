@@ -24,6 +24,15 @@ impl VoicePanel {
         self.requested_viewport = None;
     }
 
+    /// Join with the real adoption path and the panel's rotation latch, but
+    /// with a detached worker so no socket is opened. This is exactly what
+    /// `VoicePanel::join` hands to the worker when a refresh is in flight.
+    pub fn test_join_detached(&mut self, cx: &mut Context<Self>) {
+        let handle = VoiceHandle::detached_for_tests_with_rotation(self.rotation_in_flight);
+        self.call_channel = self.room;
+        self.install_handle(handle, cx);
+    }
+
     /// The identity of the installed worker, so a test can prove a session
     /// rotation kept the same handle instead of rebuilding it.
     pub fn test_handle_attempt(&self) -> Option<u64> {
@@ -35,6 +44,14 @@ impl VoicePanel {
         self.handle
             .as_ref()
             .is_some_and(VoiceHandle::test_rotation_active)
+    }
+
+    /// Whether the installed handle may open its first socket now.
+    pub fn test_rotation_authorizes(&self) -> bool {
+        self.handle
+            .as_ref()
+            .map(VoiceHandle::test_rotation_authorizes)
+            .unwrap_or(true)
     }
 
     /// Take the viewport the UI queued for the detached media worker.

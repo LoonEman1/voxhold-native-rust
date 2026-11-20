@@ -308,6 +308,16 @@ impl Requests {
             .unwrap_or(false)
     }
 
+    /// The first authorization of a handle must wait for a refresh that is in
+    /// flight (or its bounded deadline). A rotation that already finished or
+    /// never started authorizes immediately.
+    pub(super) fn rotation_authorizes(&self, now: Instant) -> bool {
+        self.rotation
+            .lock()
+            .map(|rotation| rotation.authorization_allowed(now))
+            .unwrap_or(true)
+    }
+
     pub(super) fn rotation_socket_closed(&self) {
         if let Ok(mut rotation) = self.rotation.lock() {
             rotation.socket_closed();

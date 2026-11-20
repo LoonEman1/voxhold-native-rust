@@ -148,6 +148,13 @@ impl Viewer {
         &self.catalog
     }
 
+    /// A `stream.snapshot` was parsed and accepted for this connection. A
+    /// malformed snapshot leaves the previous value untouched, so callers that
+    /// gate recovery on a fresh list must ask this before acting.
+    pub fn snapshot_accepted(&self) -> bool {
+        self.snapshot_ready
+    }
+
     /// The publication the user selected, even while it is waiting for the
     /// previous attempt to leave.
     pub fn intent(&self) -> Option<&Publication> {

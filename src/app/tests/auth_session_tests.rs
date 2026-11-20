@@ -693,3 +693,58 @@ async fn a_rotated_token_keeps_the_voice_handle_and_does_not_rejoin(cx: &mut Tes
         );
     });
 }
+
+#[cfg(feature = "voxhold-media")]
+#[gpui::test]
+async fn a_call_joined_during_a_refresh_defers_its_first_authorization(cx: &mut TestAppContext) {
+    let (visual, _view, voice) = super::super::voice_tests::fixture(cx);
+    visual.update(|_window, app| {
+        voice.update(app, |panel, cx| {
+            // The refresh starts while the user is not in a call, so no handle
+            // carried the gate.
+            panel.leave_call(cx);
+            panel.begin_token_rotation();
+            // The user joins before the answer arrives. The new handle must
+            // inherit the panel-level latch.
+            panel.test_join_detached(cx);
+            assert_eq!(panel.call_channel(), 7);
+            assert!(panel.test_handle_attempt().is_some());
+            assert!(
+                panel.test_rotation_active(),
+                "the new handle inherits the panel-level latch"
+            );
+            assert!(
+                !panel.test_rotation_authorizes(),
+                "the first authorization waits for the refresh answer"
+            );
+        });
+    });
+
+    visual.update(|_window, app| {
+        voice.update(app, |panel, _| panel.token_rotated());
+    });
+    voice.read_with(&*visual, |panel, _| {
+        assert!(
+            panel.test_rotation_authorizes(),
+            "the answered refresh releases the deferred authorization"
+        );
+    });
+
+    // A call joined after the answer has no reason to wait.
+    visual.update(|_window, app| {
+        voice.update(app, |panel, cx| {
+            panel.leave_call(cx);
+            panel.test_join_detached(cx);
+        });
+    });
+    voice.read_with(&*visual, |panel, _| {
+        assert!(
+            panel.test_rotation_authorizes(),
+            "a later join authorizes immediately"
+        );
+        assert!(
+            !panel.test_rotation_active(),
+            "the completed rotation does not own the new join"
+        );
+    });
+}

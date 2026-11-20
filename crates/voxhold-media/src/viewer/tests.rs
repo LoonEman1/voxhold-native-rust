@@ -21,6 +21,30 @@ fn snapshot(viewer: &mut Viewer, streams: &[Publication], now: Instant) -> Vec<O
     viewer.on_server_event("stream.snapshot", "", &json!({"streams": streams}), now)
 }
 
+#[test]
+fn a_malformed_snapshot_is_not_authoritative_for_recovery() {
+    let now = Instant::now();
+    let mut viewer = Viewer::new(1, 10);
+    assert!(!viewer.snapshot_accepted());
+    let outcomes = viewer.on_server_event(
+        "stream.snapshot",
+        "",
+        &json!({"streams": "not-a-list"}),
+        now,
+    );
+    assert!(outcomes.is_empty());
+    assert!(
+        !viewer.snapshot_accepted(),
+        "a rejected snapshot must not satisfy the recovery gate"
+    );
+
+    snapshot(&mut viewer, &[publication("a", 1)], now);
+    assert!(
+        viewer.snapshot_accepted(),
+        "only a parsed snapshot is authoritative"
+    );
+}
+
 /// Pull the one `Start` out of the outcome list.
 fn start_of(outcomes: &[Outcome]) -> (String, Publication) {
     let starts: Vec<_> = outcomes

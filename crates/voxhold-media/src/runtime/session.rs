@@ -45,8 +45,11 @@ async fn run_session(
     }) {
         return SessionEnd::Error(format!("{error:?}"));
     }
-    let socket = match client.open_voice_socket().await {
-        Ok(socket) => socket,
+    // Take the token from the same `auth` event that authorized the socket. A
+    // refresh applied after the connect must not make a refusal of the token
+    // this socket really sent look like a refusal of the current one.
+    let (socket, session_token) = match client.open_voice_socket_with_token().await {
+        Ok(pair) => pair,
         Err(error) => {
             return if controller.resume_connection_id.is_some() {
                 SessionEnd::Recover
@@ -55,9 +58,6 @@ async fn run_session(
             };
         }
     };
-    // The token this socket was authorized with. A rotation replaces it while
-    // the old socket may still deliver one close; that close is stale.
-    let session_token = client.token();
     let cancel_epoch = requests.cancellation_epoch();
     let mut live = Live {
         socket,
@@ -79,6 +79,7 @@ async fn run_session(
         joined: controller.joined,
         snapshot_ready: false,
         access_seen: false,
+        recovered: RecoveredAttempt::default(),
         access: ScreenAccess::default(),
         screen_access: requests.screen_access.clone(),
         recovery: requests.publish_recovery.clone(),
@@ -313,9 +314,10 @@ async fn run_session(
                         return end;
                     }
                     if event.kind == "stream.snapshot" {
-                        // The fresh list is authoritative for this socket and
-                        // must arrive before a recovered publication starts.
-                        live.note_snapshot();
+                        // Only a snapshot the viewer really parsed is
+                        // authoritative for this socket; a malformed one must
+                        // not satisfy the recovery gate.
+                        live.note_snapshot(viewer.snapshot_accepted());
                     }
                     // `stream.watching` refreshes the publication in the list.
                     live.updates
@@ -330,7 +332,7 @@ async fn run_session(
                 if matches!(
                     event.kind.as_str(),
                     "voice.webrtc_closed" | "voice.left" | "error"
-                ) && live.stale_session(client)
+                ) && live.stale_session(client, &event.kind, &event.data)
                 {
                     return SessionEnd::Recover;
                 }
@@ -423,6 +425,20 @@ pub(super) fn run(
     let mut retries = 0;
     loop {
         if requests.leave.swap(false, Ordering::SeqCst) {
+            break;
+        }
+        // A handle created while a refresh is in flight must not authorize
+        // with the revoked old token. Wait for the answer or the bounded
+        // rotation deadline before opening the first socket.
+        let mut left = false;
+        while !requests.rotation_authorizes(Instant::now()) {
+            if requests.leave.swap(false, Ordering::SeqCst) {
+                left = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        if left {
             break;
         }
         updates.push(VoiceUpdate::Connecting);

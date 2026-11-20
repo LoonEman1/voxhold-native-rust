@@ -50,7 +50,7 @@ mod screen;
 mod session;
 mod test_support;
 use engine::{EngineEffect, apply_engine_update};
-use recovery::{PublishRecovery, Rotation};
+use recovery::{PublishRecovery, RecoveredAttempt, Rotation};
 use requests::{
     InputRequest, Pending, Requests, ScreenAccess, StreamCommand, set_input_request,
     set_stream_command,
@@ -94,9 +94,27 @@ impl VoiceHandle {
         controls: Controls,
         self_muted: bool,
     ) -> Result<Self, String> {
+        Self::join_with_rotation(client, server, channel, controls, self_muted, false)
+    }
+
+    /// Join while a token refresh is already in flight. The gate is installed
+    /// on the shared requests before the worker thread starts, so its first
+    /// authorization waits for the refresh answer (or the 30 s deadline)
+    /// instead of using the revoked token.
+    pub fn join_with_rotation(
+        client: voxhold_api::Client,
+        server: i64,
+        channel: i64,
+        controls: Controls,
+        self_muted: bool,
+        rotation_pending: bool,
+    ) -> Result<Self, String> {
         static ATTEMPT: AtomicU64 = AtomicU64::new(1);
         let attempt = ATTEMPT.fetch_add(1, Ordering::SeqCst);
         let requests = Arc::new(Requests::default());
+        if rotation_pending {
+            requests.rotation_started(Instant::now());
+        }
         let updates = Arc::new(Updates::new());
         let frame = Arc::new(Mutex::new(None));
         let capture = Arc::new(CaptureGate::default());
@@ -372,6 +390,8 @@ struct Live {
     recovery: Arc<PublishRecovery>,
     /// Cancellation epoch the current live attempt was confirmed under.
     recovery_epoch: u64,
+    /// The intent this session took and has not confirmed yet.
+    recovered: RecoveredAttempt,
     cancel_epoch: Arc<AtomicU64>,
     /// Rotation owns the reconnect of this credential.
     rotation: Arc<Mutex<Rotation>>,

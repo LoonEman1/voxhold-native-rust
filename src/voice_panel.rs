@@ -73,6 +73,10 @@ pub struct VoicePanel {
     attempt: u64,
     call_channel: i64,
     phase: CallPhase,
+    /// A token refresh is in flight. It is latched on the panel, not only on a
+    /// handle, so a call joined while no handle existed still defers its first
+    /// authorization until the refresh answer (or the 30 s worker deadline).
+    rotation_in_flight: bool,
     /// Local cues from real transitions; the parent drains them onto the output.
     cues: cues::CueQueue,
     status: String,
@@ -260,6 +264,7 @@ impl VoicePanel {
             attempt: 0,
             call_channel: 0,
             phase: CallPhase::Idle,
+            rotation_in_flight: false,
             cues: cues::CueQueue::default(),
             status: String::new(),
             error: String::new(),
@@ -589,31 +594,39 @@ impl VoicePanel {
         if self.handle.is_some() {
             return;
         }
-        match VoiceHandle::join(
+        match VoiceHandle::join_with_rotation(
             self.client.clone(),
             self.server,
             self.room,
             self.controls.clone(),
             self.self_muted,
+            self.rotation_in_flight,
         ) {
             Ok(handle) => {
-                self.attempt = handle.attempt();
-                self.handle = Some(handle);
                 self.call_channel = self.room;
-                self.begin_attempt();
-                self.status = "Подключение…".into();
-                self.error.clear();
-                self.participants.clear();
-                self.clear_speaking(cx);
-                self.tracks.clear();
-                self.local_mutes.clear();
-                self.close_player();
-                self.refresh_capture();
-                self.notify_call_changed(cx);
+                self.install_handle(handle, cx);
             }
             Err(error) => self.error = error,
         }
         cx.notify();
+    }
+
+    /// Adopt the one worker of this call. The rotation gate is already armed by
+    /// `VoiceHandle::join_with_rotation` before its thread starts, so a call
+    /// joined during a refresh never authorizes with the revoked token.
+    fn install_handle(&mut self, handle: VoiceHandle, cx: &mut Context<Self>) {
+        self.attempt = handle.attempt();
+        self.handle = Some(handle);
+        self.begin_attempt();
+        self.status = "Подключение…".into();
+        self.error.clear();
+        self.participants.clear();
+        self.clear_speaking(cx);
+        self.tracks.clear();
+        self.local_mutes.clear();
+        self.close_player();
+        self.refresh_capture();
+        self.notify_call_changed(cx);
     }
 
     pub fn leave_in_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -632,6 +645,9 @@ impl VoicePanel {
     /// until the answer arrives (or its bounded deadline), so an old socket
     /// close cannot reconnect with the revoked token.
     pub fn begin_token_rotation(&mut self) {
+        // Latch on the panel: a handle created later in this flight inherits
+        // the gate from `join_with_rotation`.
+        self.rotation_in_flight = true;
         if let Some(handle) = &self.handle {
             handle.token_rotation_started();
         }
@@ -640,6 +656,7 @@ impl VoicePanel {
     /// The refresh result was applied to the shared client. A waiting voice
     /// worker may now open its one new socket and restore the call.
     pub fn token_rotated(&mut self) {
+        self.rotation_in_flight = false;
         if let Some(handle) = &self.handle {
             handle.token_rotation_finished();
         }

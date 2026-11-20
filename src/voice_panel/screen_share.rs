@@ -50,8 +50,8 @@ pub(super) const MAX_SCREEN_PREVIEW_BYTES: usize = 16 * 1024 * 1024;
 /// A picture that does not fit the cache still gets an honest card note.
 pub(super) const PREVIEW_MEMORY_REASON: &str = "Предпросмотр недоступен: превышен лимит памяти.";
 
-/// One cached card picture. `bytes` is the BGRA source size before the UI
-/// converted it to RGBA, so the budget stays comparable across sessions.
+/// One cached card picture. `bytes` is the BGRA source size, so the budget
+/// stays comparable across sessions.
 pub(super) struct PreviewThumb {
     pub(super) image: Arc<RenderImage>,
     pub(super) bytes: usize,

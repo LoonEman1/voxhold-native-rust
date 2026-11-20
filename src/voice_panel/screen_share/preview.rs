@@ -160,15 +160,12 @@ impl ScreenShareUi {
     }
 }
 
-/// Convert a media BGRA picture into the RGBA surface GPUI paints. The swap is
-/// done once, when the result enters the cache, never during a frame.
+/// Wrap a media BGRA picture for GPUI. `RenderImage` keeps BGRA (the Windows
+/// atlas uploads it as `B8G8R8A8` verbatim), so the bytes are passed through:
+/// a channel swap here would paint every picker card in inverted colours.
 fn preview_render_image(frame: PreviewFrame) -> Option<Arc<RenderImage>> {
     let (width, height) = (frame.width, frame.height);
-    let mut rgba = frame.bgra;
-    for pixel in rgba.chunks_exact_mut(4) {
-        pixel.swap(0, 2);
-    }
-    let buffer = image::RgbaImage::from_raw(width, height, rgba)?;
+    let buffer = image::RgbaImage::from_raw(width, height, frame.bgra)?;
     Some(Arc::new(RenderImage::new(smallvec::smallvec![
         image::Frame::new(buffer)
     ])))
@@ -279,5 +276,50 @@ impl VoicePanel {
             });
         })
         .detach();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The bytes GPUI actually receives for one cached card. `RenderImage`
+    /// exposes its frame buffer as-is, so this is the atlas input.
+    fn cached_bytes(color: [u8; 4]) -> Vec<u8> {
+        let mut screen = ScreenShareUi::default();
+        let id = SourceId {
+            kind: SourceKind::Monitor,
+            id: 7,
+        };
+        let frame = PreviewFrame {
+            width: 2,
+            height: 1,
+            bgra: [color, color].concat(),
+        };
+        assert!(
+            screen.insert_preview(id, frame),
+            "the picture fits the cache"
+        );
+        let thumb = screen.previews.get(&id).expect("the picture is cached");
+        thumb.image.as_bytes(0).expect("one frame").to_vec()
+    }
+
+    /// A red plate must stay red and a blue plate blue. The media layer hands
+    /// over BGRA and GPUI uploads it verbatim, so any channel swap in between
+    /// is visible here as an inverted pair.
+    #[test]
+    fn picker_previews_keep_the_bgra_channel_order() {
+        let red = [0x00, 0x00, 0xff, 0xff];
+        let blue = [0xff, 0x00, 0x00, 0xff];
+        assert_eq!(
+            cached_bytes(red),
+            [red, red].concat(),
+            "pure red must not reach the card as blue"
+        );
+        assert_eq!(
+            cached_bytes(blue),
+            [blue, blue].concat(),
+            "pure blue must not reach the card as red"
+        );
     }
 }

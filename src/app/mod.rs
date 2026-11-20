@@ -284,6 +284,12 @@ pub(crate) struct Voxhold {
     action_error: Option<(i64, String)>,
     action_notice: String,
     editing: Option<i64>,
+    /// Changes on every open and close of the inline editor. A PATCH answer may
+    /// only close the editor whose generation it captured.
+    edit_open_seq: u64,
+    /// Failure of an in-flight PATCH, bound to its editor generation so a stale
+    /// attempt cannot paint over a reopened editor.
+    edit_error: Option<(i64, u64, String)>,
     edit_input: Entity<InputState>,
     reaction_picker: Entity<reactions::ReactionPicker>,
     confirm_delete: Option<i64>,
@@ -702,6 +708,8 @@ impl Voxhold {
             action_error: None,
             action_notice: String::new(),
             editing: None,
+            edit_open_seq: 0,
+            edit_error: None,
             edit_input: cx.new(|cx| {
                 InputState::new(window, cx)
                     .multi_line()

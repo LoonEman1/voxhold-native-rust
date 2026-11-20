@@ -10,7 +10,7 @@ impl Voxhold {
             self.forward = None;
         }
         self.show_search = false;
-        self.editing = None;
+        self.close_edit();
         self.confirm_delete = None;
         if self.update.panel_open {
             self.close_update_panel(cx);

@@ -35,7 +35,7 @@ impl Voxhold {
         self._creator_subscriptions.clear();
         self.message_menu = None;
         self.forward = None;
-        self.editing = None;
+        self.close_edit();
         self.confirm_delete = None;
         self.action_error = None;
         self.action_notice.clear();

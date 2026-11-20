@@ -419,3 +419,49 @@ async fn a_narrow_monitor_scope_is_not_widened_by_opening_or_a_preset(cx: &mut T
         });
     });
 }
+
+#[gpui::test]
+async fn an_ordinary_picker_never_sends_a_stale_confirmed_source(cx: &mut TestAppContext) {
+    let (mut visual, _view, voice) = super::voice_tests::fixture(cx);
+    draw(&mut visual);
+    let live_source = window(11, "Документ");
+    let picked = monitor(3, "Экран A", 1920, 1080);
+    let quality = Quality::default();
+    visual.update(|_window, app| {
+        voice.update(app, |panel, cx| {
+            // A previous publication left its confirmed configuration behind
+            // while a new picker is open. The picker sends the row it selects,
+            // never that leftover live source.
+            panel.test_open_screen_picker(picked.clone());
+            panel.test_set_screen_confirmed_source(live_source.clone());
+            panel.test_select_screen_source(picked.clone(), cx);
+            assert_eq!(
+                panel.test_screen_request().source,
+                picked,
+                "an ordinary picker must not publish the stale confirmed source"
+            );
+            panel.test_close_screen_share(cx);
+
+            // The restart dialog is the one place bound to that configuration.
+            let base = live(
+                &live_source,
+                quality,
+                false,
+                confirmed(
+                    1,
+                    &live_source,
+                    quality,
+                    false,
+                    AudioScope::WindowApplication,
+                ),
+            );
+            panel.test_set_screen_sharing(base);
+            panel.test_open_live_screen_settings(cx);
+            assert_eq!(
+                panel.test_screen_request().source,
+                live_source,
+                "the restart dialog keeps the confirmed live source"
+            );
+        });
+    });
+}

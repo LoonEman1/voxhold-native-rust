@@ -544,13 +544,15 @@ impl VoicePanel {
         if self.screen.sharing.phase != Phase::Live {
             return;
         }
-        self.release_push_to_talk();
         // Without a configuration the media layer really accepted on air there
         // is nothing safe to restart; a sent-but-unconfirmed request is not a
         // substitute. The live card still owns the stop action.
         let Some(confirmed) = self.screen.sharing.confirmed.clone() else {
             return;
         };
+        // The dialog really opens from here, so the push-to-talk key is free for
+        // its own use. A refused open leaves the voice state untouched.
+        self.release_push_to_talk();
         self.screen.resolution = confirmed.quality.resolution;
         self.screen.fps = confirmed.quality.fps;
         self.screen.bitrate_kbps = confirmed.quality.bitrate_kbps;

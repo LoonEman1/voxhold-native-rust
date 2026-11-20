@@ -7,8 +7,12 @@ use crate::system_audio::AudioScope;
 
 /// The configuration of the attempt the media layer really accepted and put on
 /// air. It is filled from the publisher's own request when that attempt turns
-/// `Live`, never from a request the picker only sent. A refused or cancelled
-/// quality change therefore cannot replace the live settings.
+/// `Live`, and a live bitrate change re-fills it from the request the sender
+/// really received. A request the picker only sent never becomes confirmed: a
+/// preflight, an in-flight restart and the rollback step itself leave this
+/// configuration alone, and only the next attempt's `Live` transition replaces
+/// it. A refused or cancelled quality change therefore cannot replace the live
+/// settings.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Confirmed {
     /// The attempt that owns this configuration.
@@ -19,8 +23,11 @@ pub struct Confirmed {
     pub codec: Codec,
     /// The accepted system-audio flag of the attempt.
     pub audio: bool,
-    /// The typed capture scope the attempt requested. It is local to the
-    /// engine; the wire contract has no scope field.
+    /// The typed capture scope carried by the request this configuration was
+    /// built from. It is local to the engine; the wire contract has no scope
+    /// field. The `Live` transition fills it, and a live bitrate change that
+    /// the sender really applied re-fills it from that request; a preflight, an
+    /// in-flight restart and the rollback step do not rewrite it.
     pub audio_scope: AudioScope,
 }
 
@@ -59,7 +66,9 @@ pub struct Sharing {
     pub quality: Option<Quality>,
     pub codec: Option<Codec>,
     /// The accepted configuration of the live attempt. It stays at the last
-    /// confirmed values during a preflight, a restart or a rollback.
+    /// confirmed values during a preflight, a restart or a rollback; only a
+    /// live bitrate change applied in the air or the next `Live` attempt
+    /// replaces it.
     pub confirmed: Option<Confirmed>,
     /// The engine really added the system-audio track (and `stream.start`
     /// reported it), not merely that the user ticked the box.

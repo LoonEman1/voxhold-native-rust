@@ -496,34 +496,31 @@ impl VoicePanel {
 
     /// The quality/audio fields the picker will send.
     pub fn test_screen_request(&self) -> voxhold_media::publisher::PublishRequest {
-        let mut request = self
-            .screen
-            .sharing
-            .confirmed
-            .as_ref()
-            .map(Confirmed::request)
-            .unwrap_or_else(|| {
-                let source = self.screen.selected_source().cloned().unwrap_or(
-                    voxhold_media::screen_capture::ScreenSource {
-                        id: 0,
-                        kind: voxhold_media::screen_capture::SourceKind::Monitor,
-                        title: String::new(),
-                        display_id: -1,
-                        width: 0,
-                        height: 0,
-                        monitor: None,
-                    },
-                );
-                voxhold_media::publisher::PublishRequest {
-                    source,
-                    quality: self.screen.quality(),
-                    codec: voxhold_media::publisher::Codec::Vp8,
-                    audio: self.screen.audio_requested(),
-                    audio_scope: self.screen.audio_scope,
-                }
-            });
-        request.quality = self.screen.quality();
-        request.audio = self.screen.audio_requested();
+        // Mirror production: only a restart dialog is locked to the confirmed
+        // live source. An ordinary picker sends the row it selected in the
+        // current snapshot, so a `confirmed` left over from the previous
+        // publication can never answer for it.
+        let source = if self.screen.restart {
+            self.screen.restart_source().cloned()
+        } else {
+            self.screen.selected_source().cloned()
+        }
+        .unwrap_or(voxhold_media::screen_capture::ScreenSource {
+            id: 0,
+            kind: voxhold_media::screen_capture::SourceKind::Monitor,
+            title: String::new(),
+            display_id: -1,
+            width: 0,
+            height: 0,
+            monitor: None,
+        });
+        let mut request = voxhold_media::publisher::PublishRequest {
+            source,
+            quality: self.screen.quality(),
+            codec: voxhold_media::publisher::Codec::Vp8,
+            audio: self.screen.audio_requested(),
+            audio_scope: self.screen.audio_scope,
+        };
         // Mirror the production `commit_screen_share`: the selected identity
         // decides the kind, so a stale window-only choice for a monitor (or the
         // reverse) cannot slip through the test seam. The fallback request uses

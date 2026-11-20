@@ -158,6 +158,7 @@ impl Voxhold {
             loading: true,
             sending: false,
             error: String::new(),
+            keys: Default::default(),
         });
         let runtime = self.runtime.clone();
         let session = self.session_generation;
@@ -231,7 +232,21 @@ impl Voxhold {
         let destination_id = destination.id;
         let destination_kind = destination.kind.clone();
         let destination_server = destination.server_id;
-        let key = format!("{:032x}", uuid::Uuid::new_v4().as_u128());
+        // A retry of this recipient repeats the saved key; the first click on
+        // it creates one. The insert mutates `self.forward`, not the clone, so
+        // the next attempt reads the key back even after an error.
+        let destination_key = (destination_kind.clone(), destination_id);
+        let key = state
+            .keys
+            .get(&destination_key)
+            .cloned()
+            .unwrap_or_else(|| format!("{:032x}", uuid::Uuid::new_v4().as_u128()));
+        if let Some(current) = self.forward.as_mut() {
+            current
+                .keys
+                .entry(destination_key)
+                .or_insert_with(|| key.clone());
+        }
         let runtime = self.runtime.clone();
         let session = self.session_generation;
         let task = cx.background_spawn(async move {

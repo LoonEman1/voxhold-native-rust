@@ -212,6 +212,11 @@ struct ForwardState {
     loading: bool,
     sending: bool,
     error: String,
+    /// One `client_message_id` per `(destination kind, destination id)` while
+    /// this dialog is open. A retry of a failed recipient repeats its key,
+    /// while another recipient gets its own. The keys are dropped with the
+    /// dialog on success or close, so a new dialog is a new operation.
+    keys: std::collections::HashMap<(String, i64), String>,
 }
 /// One cue the test sink captured instead of opening an audio device.
 #[cfg(all(feature = "voxhold-media", test))]

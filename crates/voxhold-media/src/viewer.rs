@@ -28,6 +28,10 @@ const STALE_CLOSE_GRACE: Duration = Duration::from_secs(5);
 /// but the set stays bounded across a long viewing session.
 const RETIRED_UFRAG_TTL: Duration = Duration::from_secs(600);
 const RETIRED_UFRAG_CAPACITY: usize = 64;
+/// Keyframe request ids of the current attempt remembered for error routing.
+/// The decoder budget permits two per stall cycle and a long session may run
+/// several cycles, so the set is bounded instead of growing forever.
+const KEYFRAME_REQUEST_CAPACITY: usize = 8;
 
 mod stats;
 use stats::StatsWatch;
@@ -48,6 +52,9 @@ struct Active {
     /// Request ids whose error belongs to this attempt. Numbering is not
     /// enough: a request from a previous attempt may have the same number.
     requests: HashSet<String>,
+    /// Keyframe requests of this attempt. Their error reply rejects only that
+    /// bounded recovery and must not end the view.
+    keyframes: VecDeque<String>,
     publication: Publication,
     connected: bool,
     recovering: bool,
@@ -229,9 +236,13 @@ impl Viewer {
         }
         if let Some(intent) = &mut self.intent {
             // The rejoin is a new viewing attempt: its engine must not inherit
-            // statistics reports of the peer that was just closed.
+            // statistics reports of the peer that was just closed, and the
+            // automatic-reconnect budget belongs to the previous socket
+            // session. Without the reset the first stall of the fresh session
+            // would fail with no re-watch at all.
             self.attempt = self.attempt.wrapping_add(1);
             intent.attempt = self.attempt;
+            self.retries = 0;
             out.push(Outcome::Status {
                 selection: intent.selection,
                 text: "Восстанавливаем трансляцию…".into(),
@@ -423,7 +434,17 @@ impl Viewer {
                 let Some(active) = &self.active else {
                     return Vec::new();
                 };
-                if request_id.is_empty() || !active.requests.contains(request_id) {
+                if request_id.is_empty() {
+                    return Vec::new();
+                }
+                if active.keyframes.iter().any(|id| id == request_id) {
+                    // The server rejected the keyframe request, not the view.
+                    // The bounded keyframe/ICE/rewatch cascade owns this
+                    // failure; ending the viewer here would turn a repairable
+                    // decoder stall into a terminal error.
+                    return Vec::new();
+                }
+                if !active.requests.contains(request_id) {
                     return Vec::new();
                 }
                 self.fail("Сервер отклонил просмотр трансляции", now)
@@ -749,9 +770,20 @@ impl Viewer {
     }
 
     /// The engine reports `failed`/`disconnected`: ask the server for one
-    /// bounded recovery and keep the picture until the deadline.
+    /// bounded recovery and keep the picture until the deadline. This is the
+    /// only transport-loss path: RTP silence on a connected peer is a static
+    /// screen (see `stats`), not a disconnect. One ICE failure often surfaces
+    /// as `disconnected` followed by `failed`; while its recovery deadline is
+    /// armed the duplicate state must not spend a second retry.
     pub fn on_engine_state(&mut self, state: &str, now: Instant) -> Vec<Outcome> {
         if state != "failed" && state != "disconnected" {
+            return Vec::new();
+        }
+        let already_recovering = self
+            .active
+            .as_ref()
+            .is_some_and(|active| active.recovering && self.deadline.is_some());
+        if already_recovering {
             return Vec::new();
         }
         let Some(active) = &self.active else {
@@ -897,6 +929,7 @@ impl Viewer {
             attempt: intent.attempt,
             watch_request: watch_request.clone(),
             requests: HashSet::from([watch_request]),
+            keyframes: VecDeque::new(),
             publication: publication.clone(),
             connected: false,
             recovering: false,
@@ -1022,6 +1055,17 @@ impl Viewer {
     fn track_request(&mut self, request_id: Option<&str>) {
         if let (Some(active), Some(id)) = (&mut self.active, request_id) {
             active.requests.insert(id.to_owned());
+        }
+    }
+
+    /// Remember a keyframe request so an `error` tagged with it is routed to
+    /// the bounded picture recovery instead of ending the viewer.
+    fn track_keyframe(&mut self, request_id: Option<&str>) {
+        if let (Some(active), Some(id)) = (&mut self.active, request_id) {
+            active.keyframes.push_back(id.to_owned());
+            while active.keyframes.len() > KEYFRAME_REQUEST_CAPACITY {
+                active.keyframes.pop_front();
+            }
         }
     }
 }

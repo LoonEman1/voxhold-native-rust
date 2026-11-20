@@ -2,7 +2,7 @@
 //! frame, and closing a view must not join the peer on the signaling loop.
 
 use super::*;
-use crate::runtime::player::close_player;
+use crate::runtime::player::{close_player, install_stream};
 use crate::stream::StreamViewer;
 use libwebrtc::video_frame::I420Buffer;
 use std::sync::{
@@ -255,28 +255,24 @@ fn a_cached_repaint_is_not_video_progress() {
         "a repaint must not confirm or restart anything: {outcomes:?}"
     );
 
-    // Two windows without RTP do not become healthy because of that draw.
-    let at = now + window;
-    viewer.on_video_stats(attempt, 1_000, 10, at);
-    let outcomes = viewer.tick(at);
-    assert!(
-        !outcomes
-            .iter()
-            .any(|outcome| matches!(outcome, ViewerOutcome::Send(signal) if signal.kind == "stream.recovery_request")),
-        "the first idle window is tolerant: {outcomes:?}"
-    );
-    let at = now + window * 2;
-    viewer.on_video_stats(attempt, 1_000, 10, at);
-    let outcomes = viewer.tick(at);
-    assert!(
-        outcomes.iter().any(|outcome| matches!(
-            outcome,
-            ViewerOutcome::Send(signal)
-                if signal.kind == "stream.recovery_request"
-                    && signal.data["action"] == "ice_restart"
-        )),
-        "a cached repaint is not progress: {outcomes:?}"
-    );
+    // Identical counters on a connected transport are a static screen, not a
+    // broken one. The draw has not made the picture move, but the transport is
+    // still healthy, so the view must survive without keyframe/ICE/re-watch.
+    for step in 1..=4 {
+        let at = now + window * step;
+        viewer.on_video_stats(attempt, 1_000, 10, at);
+        let outcomes = viewer.tick(at);
+        assert!(
+            !outcomes.iter().any(|outcome| matches!(
+                outcome,
+                ViewerOutcome::Send(signal)
+                    if signal.kind == "stream.recovery_request" || signal.kind == "stream.leave"
+            )),
+            "a static connected picture must be preserved: {outcomes:?}"
+        );
+    }
+    let watching = viewer.watching().expect("the picture stays selected");
+    assert!(watching.connected && !watching.recovering);
 }
 
 #[test]
@@ -324,4 +320,60 @@ fn leave_is_sent_and_the_next_event_runs_before_the_old_engine_is_released() {
     // A late frame notification of the closed stream has no engine to poll.
     assert!(stream.is_none());
     assert!(frame.lock().unwrap().is_none());
+}
+
+#[test]
+fn installing_a_replacement_engine_resets_the_cached_frame_identity() {
+    let (first, _commands_a, events_a, store_a) = StreamViewer::detached_for_tests();
+    let (second, _commands_b, events_b, store_b) = StreamViewer::detached_for_tests();
+    let mut stream = None;
+    let mut selection = None;
+    let slot = Mutex::new(None);
+    let mut render = VideoFrame::default();
+
+    // Engine A's first frame owns the picture surface: sequence 1 at 320x180.
+    assert!(store_a.publish_i420(I420Buffer::new_black(640, 360)));
+    events_a.push(Event::Frame);
+    install_stream(&mut stream, &mut selection, &slot, &mut render, first, 1);
+    assert!(matches!(
+        stream.as_mut().unwrap().poll(&mut render, 320, 180),
+        Some(EngineUpdate::Frame)
+    ));
+
+    // Engine B is a different store that also starts at sequence 1 with the
+    // same fitted size. The production install path must forget A's identity,
+    // otherwise B's first frame is hidden and the attempt never confirms.
+    assert!(store_b.publish_i420(I420Buffer::new_black(640, 360)));
+    events_b.push(Event::Frame);
+    install_stream(&mut stream, &mut selection, &slot, &mut render, second, 1);
+    assert!(matches!(
+        stream.as_mut().unwrap().poll(&mut render, 320, 180),
+        Some(EngineUpdate::Frame)
+    ));
+    assert_eq!(selection, Some(1), "the install owns the selection too");
+}
+
+#[test]
+fn statistics_are_stamped_with_the_attempt_the_runtime_installed() {
+    let now = Instant::now();
+    let (viewer, _stream) = watching(now);
+    let attempt = viewer.watching().expect("watching").attempt;
+    // The runtime passes `Outcome::Start.attempt` to `StreamViewer::start`;
+    // `poll` must report the same id or the state machine rejects a live
+    // engine's statistics as stale.
+    let (mut engine, _commands, events, _video) = StreamViewer::detached_for_attempt(attempt);
+    events.push(Event::VideoStats {
+        bytes_received: 42,
+        frames_decoded: 7,
+    });
+    let mut render = VideoFrame::default();
+    let update = engine.poll(&mut render, 1, 1).expect("a stats event");
+    assert!(matches!(
+        update,
+        EngineUpdate::Stats {
+            attempt: stamped,
+            bytes_received: 42,
+            frames_decoded: 7,
+        } if stamped == attempt
+    ));
 }

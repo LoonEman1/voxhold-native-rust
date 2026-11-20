@@ -43,6 +43,7 @@ pub use updates::VoiceUpdate;
 
 mod engine;
 mod player;
+use player::install_stream;
 mod preflight;
 mod prep;
 mod requests;
@@ -528,7 +529,6 @@ impl Live {
                     // Defensive: the viewer starts only after the previous
                     // attempt closed, but an engine must never be dropped on the
                     // signaling thread if that ever changes.
-                    self.close_stream();
                     match StreamViewer::start(
                         self.servers.clone(),
                         self.policy.clone(),
@@ -540,9 +540,14 @@ impl Live {
                             // A replacement engine has its own frame sequence.
                             // Keeping the old identity would hide its first
                             // frame when the sequence and size happen to match.
-                            self.render.reset_for_new_engine();
-                            self.stream = Some(engine);
-                            self.stream_selection = Some(selection);
+                            install_stream(
+                                &mut self.stream,
+                                &mut self.stream_selection,
+                                &self.frame,
+                                &mut self.render,
+                                engine,
+                                selection,
+                            );
                             if let Err(end) = self.send_signal(request).await {
                                 self.close_stream();
                                 return Err(end);

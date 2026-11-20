@@ -18,6 +18,25 @@ impl Live {
     }
 }
 
+/// Install the engine of a freshly started attempt at the one point that owns
+/// the player lifetime. The previous engine is released through the normal
+/// close path, and the cached frame identity is dropped because it belongs to
+/// that previous engine: its first frame may reuse sequence 1 at the same
+/// fitted size.
+pub(super) fn install_stream(
+    stream: &mut Option<StreamViewer>,
+    selection: &mut Option<u64>,
+    frame: &Mutex<Option<StreamFrame>>,
+    render: &mut VideoFrame,
+    engine: StreamViewer,
+    selection_id: u64,
+) {
+    close_player(stream, selection, frame);
+    render.reset_for_new_engine();
+    *stream = Some(engine);
+    *selection = Some(selection_id);
+}
+
 /// Remove the engine and its selection from the session and clear the picture
 /// immediately. The peer is released outside the signaling loop: its `Drop`
 /// signals the worker stop, asks the voice peer to close and joins the media

@@ -1,17 +1,29 @@
 //! Frozen-picture detection for one viewing attempt.
 //!
-//! WebRTC can stay `connected` while the picture stops moving. The browser
-//! samples inbound RTP every two seconds; the viewer follows that cadence and
-//! compares cumulative counters instead of pixels:
+//! The browser reference (`mediaRecovery.ts`, `DecodeWatchdog`) samples inbound
+//! RTP every two seconds and compares cumulative counters instead of pixels.
+//! The viewer follows the same rules:
 //!
-//! - decoded frames advanced: the picture is moving, reset recovery counters;
+//! - decoded frames advanced: the picture is moving, the window is healthy and
+//!   only such a confirmed window restores the reconnect budget;
 //! - RTP advanced but no frame was decoded: the decoder waits for a keyframe,
 //!   so ask the server/SFU for one and leave ICE alone;
-//! - no RTP at all while the transport is connected: use the existing ICE
-//!   recovery path.
+//! - neither counter advanced while the transport is connected and a frame was
+//!   already decoded: the screen is static. Keep the last picture, reset the
+//!   idle counters and do nothing else. Screen capture legitimately stops
+//!   producing RTP on an unchanged picture, so RTP silence while the peer
+//!   reports `connected` is not evidence of a transport failure and must never
+//!   restart ICE or re-watch a valid view.
+//!
+//! A real transport loss is detected by the PeerConnection state through
+//! `on_engine_state("disconnected"/"failed")`, which owns the ICE/P2P recovery
+//! path. Statistics only distinguish a moving picture, a stuck decoder and a
+//! static screen.
 //!
 //! A missing report is counted separately. It says nothing about the encoder
-//! and must never be mistaken for a series of identical reports.
+//! and must never be mistaken for a series of identical reports; after a
+//! bounded number of consecutive missing windows it does request the existing
+//! ICE recovery, because the stats source itself stopped answering.
 
 use super::*;
 
@@ -19,8 +31,9 @@ use super::*;
 /// uses the same cadence so one slow decode does not start recovery.
 ///
 /// These thresholds still need validation on real sources: a mostly static
-/// screen may legitimately skip frames for several seconds, and an encoder may
-/// stop sending RTP entirely while nothing changes.
+/// screen may legitimately skip frames for several seconds, an encoder may
+/// stop sending RTP entirely while nothing changes, and a busy machine may
+/// miss a stats sample or two.
 pub const STALL_WINDOW: Duration = Duration::from_secs(2);
 /// Consecutive sampled windows without a decoded frame before the picture is
 /// treated as frozen. Two windows (four seconds) tolerate ordinary static
@@ -29,6 +42,10 @@ pub const STALL_WINDOWS: u8 = 2;
 /// Server/SFU keyframe requests before the same publication is watched again.
 /// A lost keyframe is cheap to repair; re-watching resets the whole peer.
 pub const MAX_KEYFRAME_REQUESTS: u8 = 2;
+/// Consecutive sampled windows without any report before the stats source is
+/// treated as dead. The browser uses `bytesStallSamples + 2` = 6 samples
+/// (twelve seconds at the two-second cadence).
+pub const MISSING_WINDOWS: u8 = 6;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct Sample {
@@ -81,12 +98,12 @@ impl StatsWatch {
     }
 }
 
-/// What one evaluated stats window showed, if anything.
-enum Slow {
-    /// RTP advanced, decoded frames did not.
-    Decoder,
-    /// Neither RTP nor decoded frames advanced.
-    Transport,
+/// Which existing recovery a bounded stats window asks for.
+enum Recover {
+    /// RTP advanced, decoded frames did not: a stuck decoder.
+    Picture,
+    /// The stats source produced no report for a bounded number of windows.
+    Missing,
 }
 
 impl Viewer {
@@ -115,7 +132,7 @@ impl Viewer {
     /// Evaluate one two-second window. Called from `tick`, so the state machine
     /// never reads the clock itself.
     pub(super) fn poll_stats(&mut self, now: Instant) -> Vec<Outcome> {
-        let slow = {
+        let recover = {
             let Some(active) = &mut self.active else {
                 return Vec::new();
             };
@@ -128,46 +145,61 @@ impl Viewer {
                 return Vec::new();
             }
             watch.next = Some(now + STALL_WINDOW);
+            // During a start or an existing recovery its deadline owns the
+            // attempt; statistics must neither confirm nor restart it.
+            let connected = active.connected && !active.recovering && self.deadline.is_none();
             if watch.reports == 0 {
                 watch.missing_windows = watch.missing_windows.saturating_add(1);
-                return Vec::new();
-            }
-            watch.reports = 0;
-            watch.missing_windows = 0;
-            let Some(sample) = watch.latest else {
-                return Vec::new();
-            };
-            let Some(baseline) = watch.baseline.replace(sample) else {
-                return Vec::new();
-            };
-            if sample.frames > baseline.frames {
-                // A whole window of decoded frames is the healthy signal. Only
-                // this restores the reconnect budget, so one frame after a
-                // reconnect cannot hide a picture that freezes again.
-                watch.idle_windows = 0;
-                watch.keyframes = 0;
-                self.retries = 0;
-                return Vec::new();
-            }
-            if !active.connected || active.recovering || self.deadline.is_some() {
-                // Before the first picture or during an existing recovery the
-                // start/recovery deadline owns the attempt.
-                return Vec::new();
-            }
-            watch.idle_windows = watch.idle_windows.saturating_add(1);
-            if watch.idle_windows < STALL_WINDOWS {
-                return Vec::new();
-            }
-            watch.idle_windows = 0;
-            Some(if sample.bytes > baseline.bytes {
-                Slow::Decoder
+                if connected && watch.missing_windows >= MISSING_WINDOWS {
+                    watch.missing_windows = 0;
+                    Some(Recover::Missing)
+                } else {
+                    None
+                }
             } else {
-                Slow::Transport
-            })
+                watch.reports = 0;
+                // The next evaluation always starts from the newest report;
+                // a missing window reset this counter instead.
+                watch.missing_windows = 0;
+                let Some(sample) = watch.latest else {
+                    return Vec::new();
+                };
+                let Some(baseline) = watch.baseline.replace(sample) else {
+                    return Vec::new();
+                };
+                if sample.frames > baseline.frames {
+                    // A whole window of decoded frames is the healthy signal.
+                    // Only this restores the reconnect budget, so advancing
+                    // counters that never present a frame cannot hide a stuck
+                    // decoder forever.
+                    watch.idle_windows = 0;
+                    watch.keyframes = 0;
+                    if connected {
+                        self.retries = 0;
+                    }
+                    None
+                } else if !connected {
+                    None
+                } else if baseline.frames > 0 && sample.bytes == baseline.bytes {
+                    // Static connected picture: an unchanged screen legally
+                    // stops producing RTP. Reset the window counters, keep the
+                    // last picture and leave keyframe/ICE/re-watch alone.
+                    watch.idle_windows = 0;
+                    None
+                } else {
+                    watch.idle_windows = watch.idle_windows.saturating_add(1);
+                    if watch.idle_windows < STALL_WINDOWS {
+                        None
+                    } else {
+                        watch.idle_windows = 0;
+                        Some(Recover::Picture)
+                    }
+                }
+            }
         };
-        match slow {
-            Some(Slow::Decoder) => self.recover_picture(now),
-            Some(Slow::Transport) => self.on_engine_state("disconnected", now),
+        match recover {
+            Some(Recover::Picture) => self.recover_picture(now),
+            Some(Recover::Missing) => self.on_engine_state("disconnected", now),
             None => Vec::new(),
         }
     }
@@ -176,6 +208,10 @@ impl Viewer {
     /// in server mode. After the bounded keyframe budget the same publication is
     /// watched again. P2P has no keyframe gate, so its existing restart signal
     /// is the recovery.
+    ///
+    /// The keyframe request id is tracked separately: a server that answers
+    /// that request with an `error` rejects the keyframe, not the whole view,
+    /// so the bounded recovery continues instead of ending the viewer.
     fn recover_picture(&mut self, now: Instant) -> Vec<Outcome> {
         let Some(active) = &self.active else {
             return Vec::new();
@@ -200,6 +236,7 @@ impl Viewer {
                     "action": "keyframe",
                 }),
             );
+            self.track_keyframe(signal.request_id.as_deref());
             return vec![
                 Outcome::Status {
                     selection,

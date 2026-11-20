@@ -97,6 +97,20 @@ impl StreamViewer {
         std::sync::Arc<crate::Events>,
         std::sync::Arc<crate::video::VideoStore>,
     ) {
+        Self::detached_for_attempt(0)
+    }
+
+    /// Headless engine with an explicit attempt id, so a test can prove that
+    /// `poll` stamps statistics with the attempt the runtime installed.
+    #[cfg(test)]
+    pub(crate) fn detached_for_attempt(
+        attempt: u64,
+    ) -> (
+        Self,
+        tokio::sync::mpsc::Receiver<Command>,
+        std::sync::Arc<crate::Events>,
+        std::sync::Arc<crate::video::VideoStore>,
+    ) {
         let (commands, receiver) = tokio::sync::mpsc::channel(8);
         let events = std::sync::Arc::new(crate::Events::default());
         let video = std::sync::Arc::new(crate::video::VideoStore::default());
@@ -116,7 +130,7 @@ impl StreamViewer {
                 applied_output: None,
                 output_working: true,
                 viewport: (0, 0),
-                attempt: 0,
+                attempt,
             },
             receiver,
             events,

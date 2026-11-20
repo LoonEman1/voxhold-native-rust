@@ -543,3 +543,13 @@ backend/браузер, TURN/ICE на втором ПК, DPI 125/150, запис
 - Ревью P2-диапазона — PASS с одним старым P1; follow-up `f1ebb5a` — финальное ревью PASS, P0/P1 нет.
 - Остаётся P2: leave беседы, от которой переключились, не очищает её draft; тест `conversation_peer` для группы слабый; `channels.changed` без активного reload и без `voice_unconfirmed` не запускает reload.
 - Не проверено: живой backend/WS/POST, block/privacy/leave на реальном сервере, ручной GUI/DPI/мобильное устройство, кадры web ↔ native; общий `C:/vxt` требует `cargo clean -p voxhold-api -p voxhold-native-rust` при параллельных worktree.
+
+### Viewer stall recovery — PR #36
+
+Ветка `codex/viewer-stall-recovery`; эталон backend `7f2a418`, браузерный `mediaRecovery.ts` (`DecodeWatchdog`). Проверки: `cargo test -p voxhold-media --locked viewer`; `cargo test -p voxhold-media --locked`; `cargo check --workspace --locked`; `cargo fmt --all -- --check`.
+
+- Статичный экран на `connected`-транспорте сохраняется: неизменные `bytesReceived`/`framesDecoded` при уже декодированном кадре сбрасывают окно простоя и не запускают keyframe/ICE/re-watch. Молчание RTP больше не эскалируется в `Slow::Transport`; потерю транспорта сообщает только `on_engine_state("disconnected"/"failed")`.
+- Каскад: keyframe (2 на попытку) → re-watch той же публикации с новым attempt id → ошибка после `MAX_RETRIES`. Ошибка с id keyframe-запроса не завершает просмотр. Бюджет сбрасывает только подтверждённое здоровое окно (`connected`, не recovering, нет deadline), поэтому растущая статистика без `on_frame` исчерпывает deadline.
+- `transport_ended` с сохранённым intent сбрасывает `retries`; повторный `disconnected`/`failed` при вооружённом deadline считается одним retry. `missing_windows` после 6 окон без отчёта запускает существующий ICE-путь.
+- `reset_for_new_engine` перенесён в `install_stream` — единственную точку установки движка; тесты проверяют совпадение `Start.attempt` с `watching().attempt`, штамп `VideoStats` и замену движка с тем же sequence/размером.
+- Не проверено: реальный сервер/Pion, браузерный зритель, TURN, живые источник/энкодер; пороги 2 с/4 с/6 окон требуют замеров на реальных источниках.

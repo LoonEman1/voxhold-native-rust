@@ -711,6 +711,7 @@ async fn a_ready_marker_is_shown_but_not_applied(cx: &mut TestAppContext) {
         root: Some(dir.join("updates")),
         ready: Some(staged.clone()),
         error: None,
+        warning: None,
     };
     visual.update(|window, app| {
         view.update(app, |v, cx| v.apply_startup_scan(scan, cx));

@@ -259,6 +259,9 @@ impl Voxhold {
             // A cleanup error is diagnostic only; the app must still start.
             eprintln!("voxhold-update: {error}");
         }
+        if let Some(warning) = scan.warning {
+            eprintln!("voxhold-update: {warning}");
+        }
         if let Some(staged) = scan.ready {
             if matches!(
                 &self.update.phase,

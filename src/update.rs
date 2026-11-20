@@ -9,9 +9,9 @@ use std::path::{Path, PathBuf};
 
 use semver::Version;
 use serde::{Deserialize, Serialize};
-use voxhold_update::apply::cleanup_install_backup;
 use voxhold_update::error::UpdateError;
 use voxhold_update::manifest::{Manifest, Offer, WindowsVersion, BETA_CHANNEL};
+use voxhold_update::recovery::{recover_install, RecoveryMode, RecoveryOutcome};
 use voxhold_update::stage::{
     cleanup_stale_keeping, read_ready, updates_root, StagedUpdate, APP_DIR, READY_FILE,
 };
@@ -283,6 +283,7 @@ pub fn message_for_error(error: &UpdateError) -> String {
             "Дельта обновления повреждена.".into()
         }
         UpdateError::InvalidPackage(_) => "Пакет обновления повреждён.".into(),
+        UpdateError::InvalidState(_) => "Состояние обновления повреждено.".into(),
         UpdateError::NotStaged(_) | UpdateError::Apply(_) | UpdateError::LaunchTimeout(_) => {
             "Не удалось подготовить обновление.".into()
         }
@@ -297,6 +298,8 @@ pub struct StartupScan {
     pub ready: Option<StagedUpdate>,
     /// Best-effort diagnostic; startup continues regardless.
     pub error: Option<String>,
+    /// A non-fatal recovery note (an interrupted operation or a kept backup).
+    pub warning: Option<String>,
 }
 
 /// Clean old staging attempts and find a staged newer version.
@@ -327,8 +330,13 @@ pub fn startup_scan(
         ..Default::default()
     };
     if cleanup_backup {
-        if let Err(error) = cleanup_install_backup(install_dir) {
-            scan.error = Some(message_for_error(&error));
+        match recover_install(install_dir, RecoveryMode::Observer) {
+            Ok(outcome) => {
+                if let Some(message) = recovery_note(&outcome) {
+                    scan.warning = Some(message);
+                }
+            }
+            Err(error) => scan.error = Some(message_for_error(&error)),
         }
     }
     let ready = find_ready(&root, install_dir, current);
@@ -438,15 +446,32 @@ fn paths_equal(left: &Path, right: &Path) -> bool {
         .eq_ignore_ascii_case(&canonical_right.to_string_lossy())
 }
 
-/// Confirm a successful start of the new version to the helper.
-pub fn write_handshake(path: &Path) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+/// User-facing note for a recovery result that kept data for a later run.
+fn recovery_note(outcome: &RecoveryOutcome) -> Option<String> {
+    match outcome {
+        RecoveryOutcome::NeedsUpdater { .. } => {
+            Some("Незавершённое обновление будет восстановлено установщиком.".into())
+        }
+        RecoveryOutcome::Ambiguous { .. } => {
+            Some("Резервная копия обновления сохранена: состояние установки не определено.".into())
+        }
+        RecoveryOutcome::Corrupt { .. } => {
+            Some("Файл состояния обновления повреждён; резервная копия сохранена.".into())
+        }
+        RecoveryOutcome::Clean
+        | RecoveryOutcome::Completed { .. }
+        | RecoveryOutcome::RolledBack { .. } => None,
     }
-    let text = format!("{}\n", current_version());
-    let temporary = path.with_extension("tmp");
-    std::fs::write(&temporary, text.as_bytes())?;
-    std::fs::rename(&temporary, path)
+}
+
+/// Confirm a successful start of the new version to the helper.
+///
+/// `operation` comes from `--update-operation`. An older helper does not pass
+/// it and only checks that the file exists; the file still carries the version.
+pub fn write_handshake(path: &Path, operation: Option<&str>) -> std::io::Result<()> {
+    let version = current_version().to_string();
+    voxhold_update::handshake::write(path, &version, operation)
+        .map_err(|error| std::io::Error::other(error.to_string()))
 }
 
 #[cfg(test)]
@@ -591,9 +616,10 @@ mod tests {
             uuid::Uuid::new_v4()
         ));
         let path = dir.join("nested").join("handshake.ok");
-        write_handshake(&path).unwrap();
+        write_handshake(&path, Some("op-1")).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains(&current_version().to_string()));
+        assert!(text.contains("op-1"));
         std::fs::remove_dir_all(&dir).ok();
     }
 

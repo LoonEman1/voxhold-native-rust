@@ -71,6 +71,8 @@ pub enum UpdateError {
     NotStaged(PathBuf),
     #[error("update apply failed: {0}")]
     Apply(String),
+    #[error("invalid update state: {0}")]
+    InvalidState(String),
     #[error("new version did not confirm startup within {0} seconds")]
     LaunchTimeout(u64),
     #[error("invalid argument: {0}")]
@@ -112,6 +114,7 @@ impl UpdateError {
             Self::Network(_) => "network",
             Self::NotStaged(_) => "not-staged",
             Self::Apply(_) => "apply-failed",
+            Self::InvalidState(_) => "state-invalid",
             Self::LaunchTimeout(_) => "launch-timeout",
             Self::InvalidArgument(_) => "argument-invalid",
         }

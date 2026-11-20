@@ -38,9 +38,9 @@ use std::process::{Command, ExitCode};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use voxhold_update::apply::{
-    apply_staged, cleanup_install_backup, helper_relocation_destination, is_relocated_helper,
-    relocate_helper,
+    apply_staged, helper_relocation_destination, is_relocated_helper, relocate_helper,
 };
+use voxhold_update::recovery::{recover_install, RecoveryMode};
 use voxhold_update::stage::{
     cleanup_after_install, cleanup_after_install_payload, cleanup_stale, updates_root, APPLY_LOG,
     APP_DIR,
@@ -136,20 +136,21 @@ fn main() -> ExitCode {
         }
     }
 
-    match cleanup_install_backup(&arguments.target) {
-        Ok(true) => log(&log_path, "removed leftover installation backup"),
-        Ok(false) => {}
-        Err(error) => log(
-            &log_path,
-            &format!("leftover backup cleanup failed: {}", error.code()),
-        ),
-    }
-
     if let Err(message) = wait_for_process(arguments.pid) {
         log(&log_path, &format!("wait failed: {message}"));
         return ExitCode::from(EXIT_WAIT);
     }
     log(&log_path, "client exited");
+
+    // Directory replacement belongs to the helper, and only after the
+    // application exited. The same recovery runs in the app as an observer.
+    match recover_install(&arguments.target, RecoveryMode::Updater) {
+        Ok(outcome) => log(&log_path, &format!("recovery: {outcome:?}")),
+        Err(error) => log(
+            &log_path,
+            &format!("recovery failed: {} ({error})", error.code()),
+        ),
+    }
 
     let app = arguments.staged.join(APP_DIR);
     match apply_staged(

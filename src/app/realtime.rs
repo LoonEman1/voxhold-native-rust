@@ -657,7 +657,10 @@ impl Voxhold {
                     }
                 }
             }
-            "conversation.message" if !self.access_pending => {
+            // Personal conversations are independent of the channel ACL
+            // reload; their index and events must keep flowing while a
+            // channel access attempt is pending.
+            "conversation.message" => {
                 if let Ok(message) = serde_json::from_value::<Message>(data.clone()) {
                     if self.in_conversation() && message.conversation_id == self.channel {
                         self.merge_message(true, message.clone());

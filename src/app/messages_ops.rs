@@ -682,6 +682,17 @@ impl Voxhold {
                 }
                 s.messaging.open_request = None;
                 match result {
+                    Ok(row) if row.saved => {
+                        // `/me/conversations/search` also returns saved
+                        // favorites. Favorites are W08b, so never offer such a
+                        // hit as a normal chat again in this result set.
+                        s.messaging
+                            .search
+                            .results
+                            .retain(|hit| hit.conversation_id != row.id);
+                        s.messaging.search.error =
+                            "Избранные сообщения откроются в разделе «Избранное».".into();
+                    }
                     Ok(row) => {
                         if let Some(existing) = s
                             .conversations
@@ -897,6 +908,17 @@ impl Voxhold {
         .detach();
     }
 
+    /// One click on the header mute action. A failed GET leaves `loaded=false`;
+    /// the click then retries that GET instead of staying disabled forever.
+    pub(super) fn activate_conversation_mute(&mut self, cx: &mut Context<Self>) {
+        match self.messaging.notifications.as_ref() {
+            Some(note) if note.pending => {}
+            Some(note) if note.loaded => self.toggle_conversation_mute(cx),
+            Some(_) => self.load_conversation_notifications(cx),
+            None => self.load_conversation_notifications(cx),
+        }
+    }
+
     pub(super) fn apply_conversation_muted(&mut self, id: i64, muted: bool) {
         if let Some(row) = self.conversations.iter_mut().find(|row| row.id == id) {
             row.muted = muted;
@@ -947,6 +969,8 @@ impl Voxhold {
     }
 
     pub(super) fn request_leave_conversation(&mut self, cx: &mut Context<Self>) {
+        // Product decision for W08a: only a group has "leave"; a direct (1:1)
+        // conversation has no leave action, matching the web contract.
         if self
             .conversation
             .as_ref()

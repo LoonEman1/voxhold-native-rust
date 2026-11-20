@@ -258,8 +258,12 @@ impl Voxhold {
         let runtime = self.runtime.clone();
         // The whole upload + POST chain runs as one runtime task so `abort()`
         // really stops it; a GPUI task wrapping `block_on` would keep going.
+        // Keep the HTTP status so a conversation 403/404 can clear the ChatKey
+        // instead of only painting a composer error.
         let task = runtime.spawn(async move {
-            let ids = attachments::upload_draft(&client, &plan).await?;
+            let ids = attachments::upload_draft(&client, &plan)
+                .await
+                .map_err(|text| (None, text))?;
             let message = if plan.key.is_conversation() {
                 client
                     .create_conversation_message(
@@ -284,7 +288,7 @@ impl Voxhold {
             };
             message
                 .map(|message| (plan, message))
-                .map_err(|error| draft::describe_error(&error))
+                .map_err(|error| (error.status(), draft::describe_error(&error)))
         });
         let abort = task.abort_handle();
         self.pending_sends
@@ -314,9 +318,16 @@ impl Voxhold {
                 };
                 let (plan, message) = match result {
                     Ok(value) => value,
-                    Err(error) => {
+                    Err((status, text)) => {
                         if s.chat_key() == plan_key {
-                            s.composer_error = error;
+                            if plan_key.is_conversation() && matches!(status, Some(403 | 404)) {
+                                // A conversation revoked/deleted on another
+                                // device owns no writable ChatKey anymore.
+                                s.clear_active_conversation(Some("Диалог недоступен."), window, cx);
+                                s.refresh_recents(cx);
+                            } else {
+                                s.composer_error = text;
+                            }
                         }
                         cx.notify();
                         return;

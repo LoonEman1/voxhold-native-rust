@@ -101,6 +101,9 @@ impl Voxhold {
         self.show_servers = false;
         self.show_inbox = false;
         if self.personal_mode {
+            // Save the open DM under `conversation(id)` before the channel and
+            // conversation are cleared, otherwise the draft is lost.
+            self.save_composer_draft(cx);
             self.personal_mode = false;
             self.personal_return = None;
             self.messaging.epoch = self.messaging.epoch.wrapping_add(1);

@@ -30,6 +30,10 @@ impl Voxhold {
     pub(super) fn select_server(&mut self, id: i64, window: &mut Window, cx: &mut Context<Self>) {
         let Some(c) = self.client.clone() else { return };
         if self.personal_mode {
+            // The draft belongs to the still-open conversation key. Save it
+            // before both ids are cleared so no later `chat_key()` derives a
+            // channel key from the conversation id.
+            self.save_composer_draft(cx);
             self.personal_mode = false;
             self.personal_return = None;
             self.messaging.epoch = self.messaging.epoch.wrapping_add(1);
@@ -40,6 +44,7 @@ impl Voxhold {
             self.messaging.older_request = None;
             self.messaging.open_request = None;
             self.conversation = None;
+            self.channel = 0;
         }
         let previous = self.chat_key();
         if previous.channel != 0 {
@@ -484,6 +489,9 @@ impl Voxhold {
     }
 
     pub(super) fn remove_current_server(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Save the open DM under its conversation key before `channel` is
+        // cleared; `clear_server` below only removes channel-keyed drafts.
+        self.save_composer_draft(cx);
         self.servers.retain(|server| server.id != self.server);
         self.drafts.borrow_mut().clear_server(self.server);
         let next = self.servers.first().map_or(0, |server| server.id);

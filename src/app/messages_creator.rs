@@ -90,7 +90,11 @@ impl Voxhold {
         let Some(client) = self.client.clone() else {
             return;
         };
-        let request = creator.request.wrapping_add(1);
+        // The creator entity is replaced on close/reopen, so a local counter
+        // restarts at 1 and an older answer could match the new form. The
+        // workspace-wide action sequence (used by leave/search) never repeats.
+        self.action_seq = self.action_seq.wrapping_add(1);
+        let request = self.action_seq;
         if let Some(creator) = self.messaging.creator.as_mut() {
             creator.busy = true;
             creator.request = request;

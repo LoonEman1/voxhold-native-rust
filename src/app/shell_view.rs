@@ -519,8 +519,8 @@ impl Render for Voxhold {
                                 .notifications
                                 .as_ref()
                                 .filter(|note| note.id == self.channel);
-                            let loaded = note.is_some_and(|note| note.loaded);
                             let pending = note.is_some_and(|note| note.pending);
+                            let error = note.map(|note| note.error.clone()).unwrap_or_default();
                             let muted = note
                                 .map(|note| note.muted)
                                 .or_else(|| self.conversation.as_ref().map(|row| row.muted))
@@ -540,20 +540,28 @@ impl Render for Voxhold {
                                     .items_center()
                                     .gap_2()
                                     .cursor_pointer()
-                                    .when(!loaded || pending, |button| button.opacity(0.55))
-                                    .on_click(cx.listener(|s, _, _, cx| {
-                                        if s.messaging
-                                            .notifications
-                                            .as_ref()
-                                            .is_some_and(|note| note.loaded && !note.pending)
-                                        {
-                                            s.toggle_conversation_mute(cx);
-                                        }
-                                    }))
+                                    .when(pending, |button| button.opacity(0.55))
+                                    .on_click(
+                                        cx.listener(|s, _, _, cx| s.activate_conversation_mute(cx)),
+                                    )
                                     .child(icon("icons/bell.svg", 16., ink(p.muted)))
-                                    .when(show_labels, |button| button.child(label)),
+                                    .when(show_labels, |button| button.child(label))
+                                    .when(!error.is_empty(), |button| {
+                                        button.child(
+                                            div()
+                                                .id("conversation-mute-error")
+                                                .debug_selector(|| "conversation-mute-error".into())
+                                                .max_w(px(180.))
+                                                .truncate()
+                                                .text_size(px(10.))
+                                                .text_color(ink(p.danger))
+                                                .child(error.clone()),
+                                        )
+                                    }),
                             )
                             .when(
+                                // W08a intentionally offers leaving only for a
+                                // group; a direct chat has no leave action.
                                 self.conversation.as_ref().is_some_and(|chat| !chat.direct),
                                 |row| {
                                     row.child(

@@ -131,7 +131,10 @@ impl Voxhold {
                         }
                     }
                     Err(voxhold_api::Error::Http(403 | 404)) if conversation => {
-                        s.error = "Диалог недоступен.".into();
+                        // A revoked or deleted conversation owns no active
+                        // ChatKey: leave the composer clean and let the index
+                        // remove the row instead of showing a writable window.
+                        s.clear_active_conversation(Some("Диалог недоступен."), window, cx);
                         s.refresh_recents(cx);
                     }
                     Err(voxhold_api::Error::Http(403 | 404)) => {

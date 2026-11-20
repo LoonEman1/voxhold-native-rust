@@ -203,19 +203,33 @@ impl Voxhold {
             self.messages_search_body(cx)
         } else {
             let mut list = div().flex().flex_col().px(px(8.)).gap(px(2.));
-            if tiles.is_empty() {
+            if self.messaging.loading {
                 list = list.child(
                     div()
+                        .id("messages-index-loading")
+                        .debug_selector(|| "messages-index-loading".into())
                         .px(px(8.))
                         .py(px(10.))
                         .text_size(px(12.))
                         .text_color(ink(p.muted))
-                        .child(if filter.is_empty() {
-                            "Начните разговор через + или профиль участника."
-                        } else {
-                            "Разговоры не найдены"
-                        }),
+                        .child("Загрузка…"),
                 );
+            }
+            if tiles.is_empty() {
+                if !self.messaging.loading {
+                    list = list.child(
+                        div()
+                            .px(px(8.))
+                            .py(px(10.))
+                            .text_size(px(12.))
+                            .text_color(ink(p.muted))
+                            .child(if filter.is_empty() {
+                                "Начните разговор через + или профиль участника."
+                            } else {
+                                "Разговоры не найдены"
+                            }),
+                    );
+                }
             } else {
                 for tile in &tiles {
                     let id = tile.id;
@@ -381,13 +395,33 @@ impl Voxhold {
             }
         }
         if !self.messaging.error.is_empty() {
+            let error = self.messaging.error.clone();
             panel = panel.child(
                 div()
                     .px(px(16.))
                     .py(px(6.))
+                    .flex()
+                    .items_center()
+                    .gap_2()
                     .text_size(px(11.))
-                    .text_color(ink(p.danger))
-                    .child(self.messaging.error.clone()),
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .text_color(ink(p.danger))
+                            .child(error),
+                    )
+                    .when(!self.messaging.loading, |row| {
+                        row.child(
+                            div()
+                                .id("messages-index-retry")
+                                .debug_selector(|| "messages-index-retry".into())
+                                .cursor_pointer()
+                                .text_color(ink(p.muted))
+                                .on_click(cx.listener(|s, _, _, cx| s.refresh_recents(cx)))
+                                .child("Повторить"),
+                        )
+                    }),
             );
         }
         #[cfg(feature = "voxhold-media")]

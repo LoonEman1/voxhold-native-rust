@@ -73,7 +73,9 @@ impl Voxhold {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if conversation.id <= 0 || self.client.is_none() || self.access_pending {
+        // A pending channel ACL reload does not gate a personal conversation:
+        // its history, drafts and key are independent of channel access.
+        if conversation.id <= 0 || self.client.is_none() {
             return;
         }
         let previous = self.chat_key();

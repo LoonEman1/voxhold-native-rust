@@ -425,6 +425,15 @@ impl Voxhold {
         match position {
             Ok(index) => merge_revision(&mut self.messages[index], message),
             Err(index) if created => {
+                // A window that ends before the live tail is separated from it
+                // by an unloaded range. Message ids are not contiguous, so a
+                // higher id alone cannot prove that this row is adjacent: keep
+                // it out of the visible window and, while "К последним" owns a
+                // reset request, hold it for that request's confirmed page.
+                if self.history_has_newer && self.messages.last().is_some_and(|row| row.id < id) {
+                    self.buffer_behind_gap(message);
+                    return;
+                }
                 if self.refresh_request.is_some() {
                     self.refresh_new_ids.insert(id);
                 }

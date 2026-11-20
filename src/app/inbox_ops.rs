@@ -75,6 +75,7 @@ impl Voxhold {
         self.pending_anchor = None;
         self.refresh_request = None;
         self.refresh_again = false;
+        self.clear_latest_buffer();
         self.pending_edits.clear();
         self.pending_reactions.clear();
         self.request_seq = self.request_seq.wrapping_add(1);

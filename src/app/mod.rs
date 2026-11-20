@@ -5,6 +5,7 @@ mod auto_login;
 mod avatar_ops;
 mod channel_ops;
 mod channel_view;
+mod chat_gap;
 mod composer;
 mod history_actions;
 mod history_ops;
@@ -453,6 +454,9 @@ pub(crate) struct Voxhold {
     /// The next successful refresh replaces the window instead of merging it.
     /// Used by "К последним" after a quote opened a bounded context page.
     history_reset_pending: bool,
+    /// Realtime rows that arrived behind the gap of a window being replaced by
+    /// an in-flight "К последним" request. Bound to that request and chat.
+    latest_buffer: Option<chat_gap::LatestBuffer>,
     hovered_message: i64,
     /// Bumped when `attachments.changed` confirms a deletion, so the row
     /// re-measures without touching the server revision.
@@ -830,6 +834,7 @@ impl Voxhold {
             context_request: None,
             pending_jump: None,
             history_reset_pending: false,
+            latest_buffer: None,
             hovered_message: 0,
             attachment_epoch: 0,
             media: media::Media::default(),

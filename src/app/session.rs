@@ -318,6 +318,7 @@ impl Voxhold {
         self.refresh_request = None;
         self.refresh_again = false;
         self.refresh_new_ids.clear();
+        self.clear_latest_buffer();
         self.pending_edits.clear();
         self.pending_reactions.clear();
         self.older_request = 0;

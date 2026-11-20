@@ -199,6 +199,7 @@ impl Voxhold {
         self.refresh_request = None;
         self.refresh_again = false;
         self.refresh_new_ids.clear();
+        self.clear_latest_buffer();
         self.context_request = None;
         self.pending_jump = None;
         self.history_reset_pending = false;
@@ -873,6 +874,7 @@ impl Voxhold {
         self.refresh_request = None;
         self.refresh_again = false;
         self.refresh_new_ids.clear();
+        self.clear_latest_buffer();
         self.older_request = 0;
         self.loading_older = false;
         self.context_request = None;
@@ -899,6 +901,9 @@ impl Voxhold {
                     return;
                 }
                 s.refresh_request = None;
+                // This jump owns the window; a replay set collected for it is
+                // meaningless because the answer is not the shared latest page.
+                s.clear_latest_buffer();
                 match result {
                     Ok(page) => {
                         let found = page.messages.iter().any(|row| row.id == message);

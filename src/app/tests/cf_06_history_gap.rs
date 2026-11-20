@@ -236,7 +236,7 @@ async fn latest_page_replays_events_that_arrived_while_it_loaded(cx: &mut TestAp
     cx.update(|cx| gpui_component::init(cx));
     let server = TestServer::spawn(vec![Reply::new(200, &latest_page(&[1000, 1001]))
         .with_path("/api/v1/servers/1/channels/7/messages")
-        .with_delay(Duration::from_millis(40))]);
+        .with_delay(Duration::from_millis(200))]);
     let (window, view) = make_app(cx, direct_client(&server));
     let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
     setup_old_window(&mut visual, &view);
@@ -296,7 +296,7 @@ async fn a_row_deleted_during_the_latest_load_stays_deleted(cx: &mut TestAppCont
     cx.update(|cx| gpui_component::init(cx));
     let server = TestServer::spawn(vec![Reply::new(200, &latest_page(&[1000, 1001]))
         .with_path("/api/v1/servers/1/channels/7/messages")
-        .with_delay(Duration::from_millis(40))]);
+        .with_delay(Duration::from_millis(200))]);
     let (window, view) = make_app(cx, direct_client(&server));
     let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
     setup_old_window(&mut visual, &view);
@@ -437,7 +437,7 @@ async fn ordinary_refresh_closes_the_gap_without_losing_raced_rows(cx: &mut Test
     cx.update(|cx| gpui_component::init(cx));
     let server = TestServer::spawn(vec![Reply::new(200, &latest_page(&[1000, 1001]))
         .with_path("/api/v1/servers/1/channels/7/messages")
-        .with_delay(Duration::from_millis(40))]);
+        .with_delay(Duration::from_millis(200))]);
     let (window, view) = make_app(cx, direct_client(&server));
     let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
     setup_old_window(&mut visual, &view);
@@ -496,7 +496,7 @@ async fn a_buffered_row_deleted_during_the_latest_load_stays_deleted(cx: &mut Te
     cx.update(|cx| gpui_component::init(cx));
     let server = TestServer::spawn(vec![Reply::new(200, &latest_page(&[1000, 1001]))
         .with_path("/api/v1/servers/1/channels/7/messages")
-        .with_delay(Duration::from_millis(40))]);
+        .with_delay(Duration::from_millis(200))]);
     let (window, view) = make_app(cx, direct_client(&server));
     let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
     setup_old_window(&mut visual, &view);
@@ -651,7 +651,7 @@ async fn latest_clicked_during_a_conversation_jump_is_not_lost(cx: &mut TestAppC
     let server = TestServer::spawn(vec![
         Reply::new(200, &dm_page(&[10, 15, 20], false))
             .with_path("/api/v1/conversations/7/messages?before=")
-            .with_delay(Duration::from_millis(40)),
+            .with_delay(Duration::from_millis(200)),
         Reply::new(200, &dm_page(&[], false)).with_path("/api/v1/conversations/7/messages"),
         Reply::new(200, &dm_page(&[90, 91], false)).with_path("/api/v1/conversations/7/messages"),
         Reply::new(200, r#"{"conversation_id":7,"muted":false}"#)

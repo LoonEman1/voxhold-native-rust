@@ -365,6 +365,9 @@ impl Voxhold {
         let Some(request) = self.begin_action(id, "edit") else {
             return;
         };
+        // The previous PATCH error belonged to the attempt that just ended; a
+        // retry clears it while the new request is in flight.
+        self.edit_error = None;
         let Some(client) = self.client.clone() else {
             self.finish_action(id, "edit", &request);
             return;

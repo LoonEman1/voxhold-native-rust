@@ -781,15 +781,20 @@ impl Client {
                     let mut event = event?;
                     // A heartbeat answer belongs to the network loop. A
                     // matching id clears the one wait; a foreign one is still
-                    // swallowed and does not extend the deadline.
-                    if event.kind == "pong" {
-                        if pending_pong
+                    // swallowed and does not extend the deadline. An `error`
+                    // with the heartbeat id is also an answer: older backends
+                    // treat an unknown application event that way, and the
+                    // browser accepts both.
+                    let heartbeat_answer = (event.kind == "pong" || event.kind == "error")
+                        && pending_pong
                             .as_ref()
-                            .is_some_and(|(id, _)| id.as_str() == event.request_id.as_str())
-                        {
-                            pending_pong = None;
-                            next_ping_at = tokio::time::Instant::now() + heartbeat.interval;
-                        }
+                            .is_some_and(|(id, _)| id.as_str() == event.request_id.as_str());
+                    if heartbeat_answer {
+                        pending_pong = None;
+                        next_ping_at = tokio::time::Instant::now() + heartbeat.interval;
+                        continue;
+                    }
+                    if event.kind == "pong" {
                         continue;
                     }
                     if event.kind == "channel.subscribed" {

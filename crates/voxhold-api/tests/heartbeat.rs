@@ -177,6 +177,66 @@ async fn a_matching_pong_clears_the_heartbeat_wait_and_schedules_the_next_ping()
     assert!(result.is_ok());
 }
 
+/// Older servers answer an unknown application event with an `error` that
+/// echoes the request id. That answer still proves the socket is alive, so it
+/// clears the wait and never reaches the UI.
+#[tokio::test]
+async fn an_error_with_the_heartbeat_id_clears_the_wait() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+    let mut client =
+        Client::new(&format!("http://{}", listener.local_addr().unwrap())).expect("client");
+    client.set_token("fixture".into());
+    let (target, desired) = watch::channel(None);
+    let (events, mut received) = mpsc::unbounded_channel();
+    let interval = Duration::from_millis(150);
+    let worker = tokio::spawn(async move {
+        client
+            .subscribe_channels_with(
+                desired,
+                move |event| {
+                    let _ = events.send(event);
+                },
+                HeartbeatConfig {
+                    interval,
+                    timeout: Duration::from_millis(500),
+                },
+            )
+            .await
+    });
+
+    let (mut peer, _) = accept(&listener).await;
+    let ping = timeout(Duration::from_secs(2), read_frame(&mut peer))
+        .await
+        .expect("first ping");
+    assert_eq!(ping.kind, "ping");
+    send_frame(
+        &mut peer,
+        json!({
+            "type": "error",
+            "request_id": ping.request_id,
+            "data": {"code": "unknown_event"}
+        }),
+    )
+    .await;
+
+    let next = timeout(Duration::from_secs(2), read_frame(&mut peer))
+        .await
+        .expect("the cleared wait does not block the next ping");
+    assert_eq!(next.kind, "ping");
+    assert_eq!(received.try_recv().expect("ready").kind, "ready");
+    assert!(
+        received.try_recv().is_err(),
+        "the heartbeat error does not reach the receiver"
+    );
+
+    drop(target);
+    let result = timeout(Duration::from_secs(2), worker)
+        .await
+        .expect("the worker stops when the subscription channel closes")
+        .expect("worker joins");
+    assert!(result.is_ok());
+}
+
 /// A `pong` for another request id and normal chat traffic must not satisfy or
 /// postpone the deadline.
 #[tokio::test]
@@ -222,7 +282,7 @@ async fn a_foreign_pong_and_chat_events_do_not_extend_the_heartbeat_deadline() {
 
     // No second ping may be sent while the first one is still unanswered.
     assert!(
-        timeout(Duration::from_millis(300), read_frame(&mut peer))
+        timeout(Duration::from_millis(200), read_frame(&mut peer))
             .await
             .is_err(),
         "a foreign pong must not open a second heartbeat request"

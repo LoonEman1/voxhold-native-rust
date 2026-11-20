@@ -9,7 +9,7 @@ use gpui_component::Root;
 use serde_json::json;
 use std::time::Duration;
 
-fn make_app(
+pub(super) fn make_app(
     cx: &mut TestAppContext,
     client: voxhold_api::Client,
 ) -> (gpui::WindowHandle<Root>, Entity<Voxhold>) {
@@ -44,7 +44,7 @@ fn make_app(
     (window, view)
 }
 
-fn wait_for(
+pub(super) fn wait_for(
     visual: &mut VisualTestContext,
     view: &Entity<Voxhold>,
     mut done: impl FnMut(&Voxhold) -> bool,
@@ -59,15 +59,26 @@ fn wait_for(
     panic!("condition did not become true");
 }
 
-fn draw(visual: &mut VisualTestContext) {
-    visual.simulate_resize(size(px(1280.), px(900.)));
-    visual.update(|window, app| {
-        window.refresh();
-        window.draw(app).clear();
-    });
+pub(super) fn draw(visual: &mut VisualTestContext) {
+    draw_at(visual, 1280., 900.);
 }
 
-fn conversation(id: i64, name: &str, direct: bool, muted: bool) -> voxhold_api::Conversation {
+pub(super) fn draw_at(visual: &mut VisualTestContext, width: f32, height: f32) {
+    visual.simulate_resize(size(px(width), px(height)));
+    for _ in 0..2 {
+        visual.update(|window, app| {
+            window.refresh();
+            window.draw(app).clear();
+        });
+    }
+}
+
+pub(super) fn conversation(
+    id: i64,
+    name: &str,
+    direct: bool,
+    muted: bool,
+) -> voxhold_api::Conversation {
     serde_json::from_value(json!({
         "id": id,
         "name": name,
@@ -84,7 +95,7 @@ fn conversation(id: i64, name: &str, direct: bool, muted: bool) -> voxhold_api::
     .unwrap()
 }
 
-fn page(value: Vec<voxhold_api::Conversation>) -> String {
+pub(super) fn page(value: Vec<voxhold_api::Conversation>) -> String {
     json!({
         "conversations": value,
         "has_more": false,
@@ -93,11 +104,11 @@ fn page(value: Vec<voxhold_api::Conversation>) -> String {
     .to_string()
 }
 
-fn empty_page() -> String {
+pub(super) fn empty_page() -> String {
     page(Vec::new())
 }
 
-fn message(id: i64, conversation_id: i64) -> voxhold_api::Message {
+pub(super) fn message(id: i64, conversation_id: i64) -> voxhold_api::Message {
     serde_json::from_value(json!({
         "id": id, "channel_id": 0, "conversation_id": conversation_id,
         "content": "row", "author": {"user_id": 1, "username": "me"},
@@ -106,7 +117,7 @@ fn message(id: i64, conversation_id: i64) -> voxhold_api::Message {
     .unwrap()
 }
 
-fn direct_client(server: &TestServer) -> voxhold_api::Client {
+pub(super) fn direct_client(server: &TestServer) -> voxhold_api::Client {
     let mut client = voxhold_api::Client::new(&server.base).unwrap();
     client.set_token("token".into());
     client
@@ -187,7 +198,7 @@ async fn conversation_send_403_keeps_the_chat_when_the_get_confirms_it(cx: &mut 
         });
     });
     wait_for(&mut visual, &view, |v| {
-        v.messaging.send_verify_request.is_none() && !v.composer_error.is_empty()
+        v.messaging.conversation_verify_request.is_none() && !v.composer_error.is_empty()
     });
     view.read_with(&*visual, |v, cx| {
         assert_eq!(
@@ -238,7 +249,7 @@ async fn conversation_send_403_survives_a_transient_verification_failure(cx: &mu
         });
     });
     wait_for(&mut visual, &view, |v| {
-        v.messaging.send_verify_request.is_none()
+        v.messaging.conversation_verify_request.is_none()
             && v.composer_error == "Недостаточно прав доступа."
     });
     view.read_with(&*visual, |v, cx| {
@@ -281,7 +292,7 @@ async fn conversation_send_403_is_cleared_when_the_get_is_forbidden(cx: &mut Tes
     wait_for(&mut visual, &view, |v| {
         v.conversation.is_none()
             && v.error == "Диалог недоступен."
-            && v.messaging.send_verify_request.is_none()
+            && v.messaging.conversation_verify_request.is_none()
     });
     view.read_with(&*visual, |v, cx| {
         assert_eq!(v.channel, 0);
@@ -329,7 +340,7 @@ async fn conversation_send_404_clears_the_active_chat_key(cx: &mut TestAppContex
         assert_eq!(v.channel, 0);
         assert_eq!(v.chat_key().channel, 0);
         assert!(v.conversations.is_empty());
-        assert!(v.messaging.send_verify_request.is_none());
+        assert!(v.messaging.conversation_verify_request.is_none());
     });
     let requests = server.requests();
     assert_eq!(requests[0].method, "POST");
@@ -822,7 +833,7 @@ async fn conversation_send_merges_while_channel_access_is_pending(cx: &mut TestA
     );
 }
 
-fn channel_row(id: i64, name: &str) -> voxhold_api::Channel {
+pub(super) fn channel_row(id: i64, name: &str) -> voxhold_api::Channel {
     voxhold_api::Channel {
         id,
         name: name.into(),

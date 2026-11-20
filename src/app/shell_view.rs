@@ -75,14 +75,17 @@ impl Render for Voxhold {
                         s.forward = None;
                         s.editing = None;
                         s.confirm_delete = None;
-                        s.show_inbox = false;
                         s.show_channels = false;
                         s.show_servers = false;
                         cx.notify();
                         cx.stop_propagation();
                     }
                     "f5" if s.client.is_some() => {
-                        if s.access_pending {
+                        if s.in_conversation() {
+                            // A DM has no channel ACL; F5 refreshes its own
+                            // history even while a channel reload is pending.
+                            s.refresh_history(window, cx);
+                        } else if s.access_pending {
                             s.invalidate_access(window, cx);
                         } else {
                             s.refresh_history(window, cx);
@@ -560,8 +563,8 @@ impl Render for Voxhold {
                                     }),
                             )
                             .when(
-                                // W08a intentionally offers leaving only for a
-                                // group; a direct chat has no leave action.
+                                // W08a scope: only a group offers "leave"; the
+                                // direct-chat action stays outside this stage.
                                 self.conversation.as_ref().is_some_and(|chat| !chat.direct),
                                 |row| {
                                     row.child(
@@ -631,8 +634,15 @@ impl Render for Voxhold {
             chat = chat.child(bar);
         }
         chat = chat.child(history);
-        if self.access_pending {
-            let status = div().p_2().text_color(ink(p.muted));
+        // The channel ACL banner belongs to the channel surface. Personal mode
+        // (an open DM, the empty personal center or the creator) keeps its own
+        // content while the reload runs and must not paint this block.
+        if self.access_pending && !self.personal_mode {
+            let status = div()
+                .id("channel-access-pending")
+                .debug_selector(|| "channel-access-pending".into())
+                .p_2()
+                .text_color(ink(p.muted));
             chat = chat.child(if self.access_reload_in_flight {
                 status.child("Проверяем доступ…")
             } else {
@@ -739,22 +749,47 @@ impl Render for Voxhold {
                     .flex()
                     .text_size(px(12.))
                     .text_color(ink(p.muted))
+                    .when(!self.personal_mode, |row| {
+                        row.child(
+                            div()
+                                .id("bottom-channels")
+                                .flex_1()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .cursor_pointer()
+                                .on_click(cx.listener(|s, _, _, cx| {
+                                    s.show_channels = !s.show_channels;
+                                    cx.notify();
+                                }))
+                                .child("Каналы"),
+                        )
+                    })
                     .child(
                         div()
-                            .id("bottom-channels")
+                            .id("bottom-messages")
+                            .debug_selector(|| "bottom-messages".into())
                             .flex_1()
                             .flex()
                             .items_center()
                             .justify_center()
                             .cursor_pointer()
-                            .on_click(cx.listener(|s, _, _, cx| {
-                                s.show_channels = !s.show_channels;
-                                cx.notify();
+                            .on_click(cx.listener(|s, _, window, cx| {
+                                if s.personal_mode {
+                                    s.return_to_channels(window, cx);
+                                } else {
+                                    // The rail, including its personal entry, is
+                                    // hidden at this width; this bar is the only
+                                    // way into "Сообщения".
+                                    s.enter_personal_mode(window, cx);
+                                    s.show_channels = true;
+                                    cx.notify();
+                                }
                             }))
                             .child(if self.personal_mode {
-                                "Сообщения"
+                                "К каналам"
                             } else {
-                                "Каналы"
+                                "Сообщения"
                             }),
                     )
                     .when(!self.personal_mode, |row| {
@@ -884,7 +919,6 @@ impl Render for Voxhold {
         }
         self.ensure_viewer_scale(window, cx);
         let popup_open = self.show_search
-            || self.show_inbox
             || self.update.panel_open
             || self.message_menu.is_some()
             || self.member_menu.is_some()
@@ -903,9 +937,6 @@ impl Render for Voxhold {
         // dismiss, and below the modal layers that follow.
         if self.update.panel_open {
             root = root.child(self.update_panel(l.chat, mobile, cx));
-        }
-        if let Some(overlay) = self.inbox_overlay(window, cx) {
-            root = root.child(overlay);
         }
         if let Some(overlay) = self.search_overlay(cx) {
             root = root.child(overlay);

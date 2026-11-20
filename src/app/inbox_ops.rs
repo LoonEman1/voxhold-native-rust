@@ -1,69 +1,6 @@
 use super::*;
-use crate::inbox::{conversation_peer, conversation_title, ConversationTile};
 
 impl Voxhold {
-    /// Build the popup rows, including the peer avatar requested from the
-    /// shared bounded cache when the server member list exposes a version.
-    pub(super) fn inbox_tiles(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Vec<ConversationTile> {
-        let self_user_id = self.self_user_id;
-        let mut wanted = Vec::new();
-        let mut tiles = Vec::with_capacity(self.conversations.len());
-        for conversation in &self.conversations {
-            let title = conversation_title(conversation, self_user_id);
-            let peer_id = conversation_peer(conversation, self_user_id);
-            let version = self
-                .members
-                .iter()
-                .find(|member| member.user_id == peer_id)
-                .and_then(|member| member.avatar_version.clone());
-            if let Some(version) = version.as_ref().filter(|version| !version.is_empty()) {
-                wanted.push((peer_id, version.clone()));
-            }
-            tiles.push(ConversationTile {
-                id: conversation.id,
-                title,
-                direct: conversation.direct,
-                unread: conversation.unread_count,
-                muted: conversation.muted,
-                peer_id,
-                avatar: None,
-            });
-        }
-        for (user_id, version) in wanted {
-            self.request_avatar(user_id, version, window, cx);
-        }
-        for tile in &mut tiles {
-            if tile.peer_id <= 0 {
-                continue;
-            }
-            let version = self
-                .members
-                .iter()
-                .find(|member| member.user_id == tile.peer_id)
-                .and_then(|member| member.avatar_version.clone());
-            let Some(version) = version else {
-                continue;
-            };
-            if let Some((image, used)) = self
-                .roster
-                .avatars
-                .get(&(tile.peer_id, version.clone()))
-                .cloned()
-            {
-                if let Some((_, used)) = self.roster.avatars.get_mut(&(tile.peer_id, version)) {
-                    *used = std::time::Instant::now();
-                }
-                let _ = used;
-                tile.avatar = Some(image);
-            }
-        }
-        tiles
-    }
-
     /// Open a personal conversation in the same workspace. The numeric channel
     /// id may equal the conversation id, so every request/guard is keyed by
     /// `ChatKey` and the conversation flag, never by the number alone.
@@ -88,9 +25,11 @@ impl Voxhold {
         self.close_viewer(window);
         self.close_thread(window, cx);
         self.show_search = false;
-        self.show_inbox = false;
         self.show_channels = false;
         self.messaging.clear_leave();
+        // A pending return to a channel belongs to the surface the user just
+        // left; opening a DM owns the next selection instead.
+        self.pending_return_channel = None;
         self.messaging.notifications = None;
         self.messaging.creator = None;
         self._creator_subscriptions.clear();

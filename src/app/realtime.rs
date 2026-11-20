@@ -174,11 +174,15 @@ impl Voxhold {
                     // the server ACL still has to be refreshed: leaving
                     // `voice_unconfirmed` set would hide every room until an
                     // unrelated forced reload.
-                    #[cfg(feature = "voxhold-media")]
-                    if self.voice_unconfirmed.contains(&self.server) {
-                        if self.access_reload_in_flight {
-                            self.access_refresh_again = true;
-                        } else {
+                    // The in-flight answer predates this event, so it cannot
+                    // confirm the new ACL. Replace it once it returns; in a
+                    // personal chat `invalidate_access` is a no-op, so the
+                    // replacement must be started by the callback itself.
+                    if self.access_reload_in_flight {
+                        self.access_refresh_again = true;
+                    } else {
+                        #[cfg(feature = "voxhold-media")]
+                        if self.voice_unconfirmed.contains(&self.server) {
                             self.reload_channels(window, cx);
                         }
                     }

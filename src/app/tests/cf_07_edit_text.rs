@@ -289,6 +289,10 @@ async fn stale_edit_error_does_not_paint_on_a_reopened_editor(cx: &mut TestAppCo
             v.edit_error.is_none(),
             "the stale failure does not paint on the reopened editor"
         );
+        assert!(
+            v.action_error.is_none(),
+            "the stale failure does not leak into the row error slot"
+        );
     });
 
     // The same editor now fails its own request: that error stays visible.
@@ -305,5 +309,179 @@ async fn stale_edit_error_does_not_paint_on_a_reopened_editor(cx: &mut TestAppCo
         assert!(!error.is_empty());
         assert_eq!(v.editing, Some(5), "a failure keeps the form open");
         assert_eq!(editor_text(v, cx), "версия новая");
+        assert!(
+            v.action_error.is_none(),
+            "the PATCH failure is bound to edit_error, not the row slot"
+        );
     });
+}
+
+/// The server may normalize the body. The editor closes against the text that
+/// was sent, while history keeps the normalized answer.
+#[gpui::test]
+async fn server_normalization_closes_the_editor_and_stays_in_history(cx: &mut TestAppContext) {
+    cx.update(|cx| gpui_component::init(cx));
+    let server = TestServer::spawn(vec![
+        Reply::new(200, &patch_body("версия 1")).with_path(PATCH_PATH)
+    ]);
+    let (window, view) = make_app(cx, direct_client(&server));
+    let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            writable_history(v);
+            v.start_edit(5, window, cx);
+            set_editor(v, "  версия 1  ", window, cx);
+            v.save_edit(window, cx);
+        });
+    });
+    wait_for(&mut visual, &view, |v| {
+        v.editing.is_none()
+            && v.messages
+                .iter()
+                .any(|message| message.id == 5 && message.content == "версия 1")
+    });
+    view.read_with(&*visual, |v, _| {
+        assert_eq!(
+            v.messages
+                .iter()
+                .find(|message| message.id == 5)
+                .map(|message| message.content.as_str()),
+            Some("версия 1"),
+            "history keeps the server-normalized body"
+        );
+    });
+    let body: serde_json::Value = serde_json::from_slice(&server.requests()[0].body).unwrap();
+    assert_eq!(body["content"], "  версия 1  ");
+}
+
+/// `close_edit` owns the generation: every cancel that closes an open form
+/// invalidates the previous one.
+#[gpui::test]
+async fn closing_the_editor_bumps_the_open_generation(cx: &mut TestAppContext) {
+    cx.update(|cx| gpui_component::init(cx));
+    let server = TestServer::spawn(Vec::new());
+    let (window, view) = make_app(cx, direct_client(&server));
+    let visual = VisualTestContext::from_window(window.into(), cx).into_mut();
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            writable_history(v);
+            let before = v.edit_open_seq;
+            v.start_edit(5, window, cx);
+            let opened = v.edit_open_seq;
+            assert_ne!(opened, before, "opening starts a new generation");
+            v.cancel_edit(cx);
+            assert!(v.editing.is_none());
+            assert_ne!(
+                v.edit_open_seq, opened,
+                "closing invalidates the closed editor"
+            );
+        });
+    });
+}
+
+/// A second click on «Сохранить» while the first PATCH is pending must not
+/// start another request; the next save is allowed only after it settles.
+#[gpui::test]
+async fn second_save_while_patch_is_pending_sends_nothing(cx: &mut TestAppContext) {
+    cx.update(|cx| gpui_component::init(cx));
+    let gate = Gate::new();
+    let server = TestServer::spawn(vec![Reply::new(200, &patch_body("версия 1"))
+        .with_path(PATCH_PATH)
+        .with_gate(gate.clone())]);
+    let (window, view) = make_app(cx, direct_client(&server));
+    let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
+    gate.arm();
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            writable_history(v);
+            v.start_edit(5, window, cx);
+            set_editor(v, "версия 1", window, cx);
+            v.save_edit(window, cx);
+            assert!(v.action_pending(5, "edit"));
+            v.save_edit(window, cx);
+        });
+    });
+    let waiter = release_on_arrival(gate);
+    wait_for(&mut visual, &view, |v| {
+        !v.action_pending(5, "edit") && v.editing.is_none()
+    });
+    assert!(waiter.join().unwrap(), "the first PATCH reached the server");
+    let patches = server
+        .requests()
+        .into_iter()
+        .filter(|request| request.method == "PATCH")
+        .count();
+    assert_eq!(patches, 1, "the pending action rejects the second click");
+}
+
+/// A late success from an older generation must not clear the validation error
+/// of the editor that is open now.
+#[gpui::test]
+async fn late_success_keeps_the_active_editors_error(cx: &mut TestAppContext) {
+    cx.update(|cx| gpui_component::init(cx));
+    let gate = Gate::new();
+    let server = TestServer::spawn(vec![Reply::new(200, &patch_body("версия 1"))
+        .with_path(PATCH_PATH)
+        .with_gate(gate.clone())]);
+    let (window, view) = make_app(cx, direct_client(&server));
+    let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
+    gate.arm();
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            writable_history(v);
+            v.start_edit(5, window, cx);
+            set_editor(v, "версия 1", window, cx);
+            v.save_edit(window, cx);
+        });
+    });
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            v.cancel_edit(cx);
+            v.start_edit(5, window, cx);
+            set_editor(v, "", window, cx);
+            v.save_edit(window, cx);
+            assert!(v.editing.is_some(), "validation keeps the form open");
+            assert!(v.action_error.is_some(), "the validation error is visible");
+        });
+    });
+    let waiter = release_on_arrival(gate);
+    wait_for(&mut visual, &view, |v| !v.action_pending(5, "edit"));
+    assert!(waiter.join().unwrap(), "the old PATCH reached the server");
+    view.read_with(&*visual, |v, cx| {
+        assert_eq!(v.editing, Some(5));
+        assert!(
+            v.action_error.is_some(),
+            "the late success does not clear the current editor's error"
+        );
+        assert!(v.edit_error.is_none());
+        assert_eq!(editor_text(v, cx), "");
+    });
+}
+
+/// `begin_action` still clears the previous action error when a new save
+/// actually starts its request.
+#[gpui::test]
+async fn starting_a_save_clears_the_previous_action_error(cx: &mut TestAppContext) {
+    cx.update(|cx| gpui_component::init(cx));
+    let server = TestServer::spawn(vec![
+        Reply::new(200, &patch_body("версия 1")).with_path(PATCH_PATH)
+    ]);
+    let (window, view) = make_app(cx, direct_client(&server));
+    let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            writable_history(v);
+            v.start_edit(5, window, cx);
+            set_editor(v, "", window, cx);
+            v.save_edit(window, cx);
+            assert!(v.action_error.is_some());
+            set_editor(v, "версия 1", window, cx);
+            v.save_edit(window, cx);
+            assert!(
+                v.action_error.is_none(),
+                "a started save drops the stale validation error"
+            );
+        });
+    });
+    wait_for(&mut visual, &view, |v| v.editing.is_none());
 }

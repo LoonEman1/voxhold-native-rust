@@ -73,7 +73,7 @@ impl Render for Voxhold {
                         s.show_search = false;
                         s.message_menu = None;
                         s.forward = None;
-                        s.editing = None;
+                        s.close_edit();
                         s.confirm_delete = None;
                         s.show_channels = false;
                         s.show_servers = false;

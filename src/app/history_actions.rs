@@ -316,12 +316,13 @@ impl Voxhold {
         cx.notify();
     }
 
-    /// Close the inline editor and invalidate every request that belongs to it.
-    fn close_edit(&mut self) {
+    /// Close the inline editor, invalidate every request that belongs to it and
+    /// drop the error that was bound to its generation.
+    pub(super) fn close_edit(&mut self) {
         if self.editing.take().is_some() {
             self.edit_open_seq = self.edit_open_seq.wrapping_add(1);
-            self.edit_error = None;
         }
+        self.edit_error = None;
     }
 
     pub(super) fn cancel_edit(&mut self, cx: &mut Context<Self>) {
@@ -389,9 +390,6 @@ impl Voxhold {
                 match result {
                     Ok(updated) => {
                         if updated.id == id {
-                            if s.in_conversation() {
-                                return;
-                            }
                             s.merge_message(false, updated);
                             s.trim_history(false);
                             s.sync_thread_root(window, cx);
@@ -402,7 +400,6 @@ impl Voxhold {
                                 s.close_edit();
                             }
                         }
-                        s.action_error = None;
                     }
                     Err(error) => {
                         // Only the editor that started this attempt may show its
@@ -496,6 +493,9 @@ impl Voxhold {
         self.messages.retain(|message| message.id != id);
         self.pending_edits.remove(&id);
         self.pending_reactions.remove(&id);
+        if self.editing == Some(id) {
+            self.close_edit();
+        }
         self.selected_messages.retain(|selected| *selected != id);
         if self.highlighted_message.is_some_and(|(row, _)| row == id) {
             self.highlighted_message = None;
@@ -794,7 +794,7 @@ impl Voxhold {
                             .message_snapshot(id)
                             .is_some_and(|message| s.permissions_for_row(&message).edit);
                         if !allowed {
-                            s.editing = None;
+                            s.close_edit();
                         }
                     }
                 } else {

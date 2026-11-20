@@ -344,7 +344,7 @@ impl Voxhold {
         self.hovered_action = None;
         self.message_menu = None;
         self.forward = None;
-        self.editing = None;
+        self.close_edit();
         self.confirm_delete = None;
         self.action_requests.clear();
         self.action_error = None;

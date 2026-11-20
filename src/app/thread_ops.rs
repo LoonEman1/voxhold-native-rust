@@ -28,7 +28,7 @@ impl Voxhold {
         self.show_search = false;
         self.message_menu = None;
         self.forward = None;
-        self.editing = None;
+        self.close_edit();
         self.confirm_delete = None;
         self.close_thread(window, cx);
         let writable = self.thread_writable();

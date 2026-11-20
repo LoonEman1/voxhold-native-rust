@@ -758,7 +758,6 @@ impl Voxhold {
                             // the same revision/tombstone rules as every other
                             // history path, so each id appears once.
                             let messages = s.merge_latest_page(page.messages, buffered);
-                            s.history_has_newer = false;
                             s.apply_history_snapshot(
                                 voxhold_api::MessagePage {
                                     messages,
@@ -768,6 +767,21 @@ impl Voxhold {
                             );
                             s.pending_jump = s.messages.last().map(|message| message.id);
                         } else {
+                            // An ordinary refresh started at a known gap also
+                            // replaces the fragment with the latest page.
+                            // Replay the rows it held for us, otherwise the
+                            // race would leave a hole that later rows cannot
+                            // fill. Without a gap the page is passed untouched:
+                            // `refresh_new_ids` still carries the in-flight
+                            // rows that are newer than the page.
+                            let page = if buffered.is_empty() {
+                                page
+                            } else {
+                                voxhold_api::MessagePage {
+                                    messages: s.merge_latest_page(page.messages, buffered),
+                                    pagination: page.pagination,
+                                }
+                            };
                             s.apply_history_snapshot(page, new_ids);
                         }
                         s.sync_open_views(cx);

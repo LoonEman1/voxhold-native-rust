@@ -901,8 +901,6 @@ impl Voxhold {
                     return;
                 }
                 s.refresh_request = None;
-                // This jump owns the window; a replay set collected for it is
-                // meaningless because the answer is not the shared latest page.
                 s.clear_latest_buffer();
                 match result {
                     Ok(page) => {
@@ -913,7 +911,7 @@ impl Voxhold {
                         s.history_list.reset(0);
                         s.before = page.pagination.next_before_id;
                         s.has_more = page.pagination.has_more;
-                        s.history_has_newer = true;
+                        s.history_has_newer = s.conversation_has_newer_tail(conversation);
                         s.pending_anchor = None;
                         s.older_request = 0;
                         s.loading_older = false;
@@ -931,6 +929,7 @@ impl Voxhold {
                     }
                     Err(error) => s.error = error.to_string(),
                 }
+                s.retry_refresh_after_jump(chat, window, cx);
                 cx.notify();
             });
         })

@@ -156,6 +156,17 @@ fn finish_completed(state: &InstallState) -> Result<RecoveryOutcome> {
 }
 
 fn recover_prepared(state: &InstallState, mode: RecoveryMode) -> Result<RecoveryOutcome> {
+    if !state.had_install {
+        // A fresh installation records `OldRenamed` before its only rename, so
+        // `Prepared` proves that nothing was moved: there is no previous
+        // installation to protect. Keeping this state would block every later
+        // update (`apply` refuses a still-present state), so drop the staged
+        // copy instead. No installation directory is renamed.
+        clear_operation(state)?;
+        return Ok(RecoveryOutcome::RolledBack {
+            operation_id: state.operation_id.clone(),
+        });
+    }
     if state.install_dir.exists() {
         // The swap never started; the old installation is intact. Removing the
         // staged copy and the state is safe for the observer too: no directory

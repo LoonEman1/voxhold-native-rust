@@ -61,6 +61,42 @@ fn a_corrupt_state_keeps_the_backup() {
 }
 
 #[test]
+fn an_interrupted_fresh_install_is_cleaned_instead_of_blocking_the_next_update() {
+    let temp = tempfile::tempdir().unwrap();
+    let target = temp.path().join("VoxHold");
+    let operation = "0123456789abcdef";
+    let staging = state::operation_staging_path(&target, operation);
+    std::fs::create_dir_all(&staging).unwrap();
+    std::fs::write(staging.join("Voxhold.exe"), b"new").unwrap();
+    let document = InstallState {
+        schema: state::STATE_SCHEMA,
+        operation_id: operation.into(),
+        stage: OperationStage::Prepared,
+        install_dir: target.clone(),
+        backup_dir: state::backup_path(&target),
+        staging_dir: staging.clone(),
+        handshake_path: temp.path().join("handshake.ok"),
+        version: "1.1.0".into(),
+        previous_version: None,
+        had_install: false,
+        created_at: 1,
+    };
+    state::save(&document).unwrap();
+
+    // Nothing was renamed for a fresh install before `OldRenamed`, so the
+    // staged copy and the state can be dropped without touching an install.
+    let outcome = recover_install(&target, RecoveryMode::Updater).unwrap();
+    assert!(matches!(outcome, RecoveryOutcome::RolledBack { .. }));
+    assert!(!staging.exists());
+    assert!(!state::state_path(&target).exists());
+    assert!(!target.exists());
+    assert!(matches!(
+        recover_install(&target, RecoveryMode::Observer).unwrap(),
+        RecoveryOutcome::Clean
+    ));
+}
+
+#[test]
 fn a_completed_state_without_its_installation_keeps_the_backup() {
     let temp = tempfile::tempdir().unwrap();
     let target = temp.path().join("VoxHold");

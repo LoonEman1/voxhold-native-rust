@@ -193,6 +193,9 @@ impl Messages {
     pub fn clear_search(&mut self) {
         self.global = false;
         self.search.invalidate();
+        // A closed search surface owns no deferred navigation: the hit that is
+        // still loading belongs to the mode the user just left.
+        self.open_request = None;
     }
 
     /// Close the confirmation bar and drop its error. An in-flight DELETE keeps

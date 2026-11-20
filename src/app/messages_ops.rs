@@ -657,6 +657,9 @@ impl Voxhold {
     ) {
         self.messaging.global = !self.messaging.global;
         self.messaging.search.invalidate();
+        // A hit clicked in the old mode must not navigate after the surface
+        // switched to the other kind of results.
+        self.messaging.open_request = None;
         let placeholder = if self.messaging.global {
             "Поиск по сообщениям"
         } else {
@@ -810,6 +813,9 @@ impl Voxhold {
         cx.spawn_in(window, async move |this, window| {
             let result = task.await;
             let _ = this.update_in(window, |s, window, cx| {
+                // The guard runs before the slot is released or anything is
+                // opened: a stale answer must neither navigate nor clear the
+                // slot of a newer search hit.
                 if s.session_generation != session
                     || s.messaging.open_request != Some(request)
                     || !s.personal_mode

@@ -17,6 +17,10 @@ impl Voxhold {
         if conversation.id <= 0 || self.client.is_none() {
             return;
         }
+        // A message-search hit that is still loading must not navigate after
+        // the user picked a chat by hand; its answer belongs to the previous
+        // intent.
+        self.messaging.open_request = None;
         let previous = self.chat_key();
         if previous.channel != 0 {
             let text = self.composer.read(cx).value().to_string();

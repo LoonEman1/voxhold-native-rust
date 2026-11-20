@@ -505,3 +505,274 @@ async fn a_conversation_echo_confirms_the_dm_send(cx: &mut TestAppContext) {
         )
     });
 }
+
+/// A refusal before the POST starts is a definite failure. Its plan is not an
+/// uncertain snapshot, so a later echo with the same key must not consume the
+/// draft or hide the error.
+#[gpui::test]
+async fn an_upload_refusal_before_the_post_keeps_no_snapshot(cx: &mut TestAppContext) {
+    cx.update(|cx| gpui_component::init(cx));
+    let server = TestServer::spawn(Vec::new());
+    let (window, view) = make_app(cx, direct_client(&server));
+    let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
+    let path = std::env::temp_dir().join(format!(
+        "voxhold-cf02-refused-{}-{}.bin",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::write(&path, vec![2u8; 8]).unwrap();
+    let attachment = draft::DraftFile::from_path(path.clone()).unwrap();
+    // The verified upload reopens the file; a missing file refuses the send
+    // before any HTTP request starts.
+    std::fs::remove_file(&path).unwrap();
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            open_channel(v, &[7]);
+            v.drafts
+                .borrow_mut()
+                .add_files(channel_key(), vec![attachment]);
+            compose(v, "с файлом", window, cx);
+            v.send(window, cx);
+        });
+    });
+    wait_for(&mut visual, &view, |v| {
+        !v.is_sending() && !v.composer_error.is_empty()
+    });
+    let (error, key) = view.read_with(&*visual, |v, _| {
+        assert!(
+            v.unconfirmed_sends.is_empty(),
+            "an upload refusal is not an uncertain POST"
+        );
+        assert!(server.requests().is_empty(), "no POST was attempted");
+        (v.composer_error.clone(), send_key(v, channel_key()))
+    });
+    queue(
+        &mut visual,
+        &view,
+        vec![event(
+            "message.created",
+            created(76, 7, &key, 1, "с файлом"),
+        )],
+    );
+    view.read_with(&*visual, |v, cx| {
+        assert_eq!(
+            v.composer_error, error,
+            "a definite upload failure is not confirmed from the socket"
+        );
+        assert_eq!(v.composer.read(cx).value(), "с файлом");
+        assert_eq!(v.drafts.borrow().text(channel_key()), "с файлом");
+        assert_eq!(
+            v.drafts.borrow().files(channel_key()).len(),
+            1,
+            "the attachment stays with the draft for a retry"
+        );
+        assert!(
+            v.messages.iter().any(|row| row.id == 76),
+            "the row still follows the normal history path"
+        );
+    });
+}
+
+/// Two copies of the same own echo in one batch are one confirmation: the
+/// draft is consumed once and the history keeps one row.
+#[gpui::test]
+async fn a_duplicate_echo_in_one_batch_confirms_once(cx: &mut TestAppContext) {
+    cx.update(|cx| gpui_component::init(cx));
+    let gate = Gate::new();
+    gate.arm();
+    let mut answered = message_json(77, 1, "двойное");
+    answered["channel_id"] = json!(7);
+    let server = TestServer::spawn(vec![
+        Reply::new(201, &answered.to_string()).with_gate(gate.clone())
+    ]);
+    let (window, view) = make_app(cx, direct_client(&server));
+    let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            open_channel(v, &[7]);
+            compose(v, "двойное", window, cx);
+            v.send(window, cx);
+        });
+    });
+    assert!(gate.wait_arrived(Duration::from_secs(5)));
+    let key = view.read_with(&*visual, |v, _| send_key(v, channel_key()));
+    queue(
+        &mut visual,
+        &view,
+        vec![
+            event("message.created", created(77, 7, &key, 1, "двойное")),
+            event("message.created", created(77, 7, &key, 1, "двойное")),
+        ],
+    );
+    let state = view.read_with(&*visual, |v, cx| {
+        (
+            v.composer.read(cx).value().to_string(),
+            v.drafts.borrow().text(channel_key()),
+            v.is_sending(),
+            v.messages.iter().map(|row| row.id).collect::<Vec<_>>(),
+            v.composer_error.clone(),
+        )
+    });
+    gate.release();
+    settle(&mut visual);
+    assert_eq!(state.0, "");
+    assert_eq!(state.1, "", "the first echo consumes the draft once");
+    assert!(!state.2);
+    assert_eq!(state.3, vec![77], "the duplicated echo is one history row");
+    assert!(state.4.is_empty());
+    view.read_with(&*visual, |v, _| {
+        assert_eq!(
+            v.messages.iter().map(|row| row.id).collect::<Vec<_>>(),
+            vec![77],
+            "the late HTTP answer does not add a second row"
+        )
+    });
+}
+
+/// A thread comment may reuse the idempotency key only in a broken payload;
+/// it must not settle the main-timeline send.
+#[gpui::test]
+async fn a_thread_echo_with_the_same_key_does_not_confirm(cx: &mut TestAppContext) {
+    cx.update(|cx| gpui_component::init(cx));
+    let gate = Gate::new();
+    gate.arm();
+    let server = TestServer::spawn(vec![
+        Reply::new(504, r#"{"error":"gateway timeout"}"#).with_gate(gate.clone())
+    ]);
+    let (window, view) = make_app(cx, direct_client(&server));
+    let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            open_channel(v, &[7]);
+            compose(v, "первое", window, cx);
+            v.send(window, cx);
+        });
+    });
+    assert!(gate.wait_arrived(Duration::from_secs(5)));
+    gate.release();
+    wait_for(&mut visual, &view, |v| {
+        !v.is_sending() && !v.composer_error.is_empty()
+    });
+    let (error, key) = view.read_with(&*visual, |v, _| {
+        (v.composer_error.clone(), send_key(v, channel_key()))
+    });
+    let mut echo = created(78, 7, &key, 1, "первое");
+    echo["thread_root_id"] = json!(5);
+    queue(&mut visual, &view, vec![event("message.created", echo)]);
+    view.read_with(&*visual, |v, cx| {
+        assert_eq!(v.composer_error, error, "a thread row is not an ack");
+        assert_eq!(v.composer.read(cx).value(), "первое");
+        assert_eq!(v.drafts.borrow().text(channel_key()), "первое");
+        assert!(
+            v.messages.is_empty(),
+            "a thread row stays out of the main timeline"
+        );
+        assert!(
+            v.unconfirmed_sends.contains_key(&channel_key()),
+            "the uncertain snapshot is still available"
+        );
+    });
+}
+
+/// The same key in another channel or on another server cannot confirm a send
+/// of the selected channel: the event carries no server id.
+#[gpui::test]
+async fn an_echo_of_another_chat_with_the_same_key_does_not_confirm(cx: &mut TestAppContext) {
+    cx.update(|cx| gpui_component::init(cx));
+    let gate = Gate::new();
+    gate.arm();
+    let server = TestServer::spawn(vec![
+        Reply::new(504, r#"{"error":"gateway timeout"}"#).with_gate(gate.clone())
+    ]);
+    let (window, view) = make_app(cx, direct_client(&server));
+    let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            open_channel(v, &[7, 8]);
+            compose(v, "первое", window, cx);
+            v.send(window, cx);
+        });
+    });
+    assert!(gate.wait_arrived(Duration::from_secs(5)));
+    gate.release();
+    wait_for(&mut visual, &view, |v| {
+        !v.is_sending() && !v.composer_error.is_empty()
+    });
+    let (error, key) = view.read_with(&*visual, |v, _| {
+        (v.composer_error.clone(), send_key(v, channel_key()))
+    });
+
+    queue(
+        &mut visual,
+        &view,
+        vec![event(
+            "message.created",
+            created(79, 8, &key, 1, "другой канал"),
+        )],
+    );
+    view.read_with(&*visual, |v, cx| {
+        assert_eq!(v.composer_error, error, "another channel is not the ack");
+        assert_eq!(v.composer.read(cx).value(), "первое");
+        assert_eq!(v.drafts.borrow().text(channel_key()), "первое");
+        assert!(v.unconfirmed_sends.contains_key(&channel_key()));
+    });
+
+    // The event names only a channel id; the plan belongs to server 1. While
+    // server 2 is selected, the same numeric channel is not this send.
+    visual.update(|_, app| {
+        view.update(app, |v, _| {
+            v.server = 2;
+            v.channels = vec![channel_row(7, "test")];
+        });
+    });
+    queue(
+        &mut visual,
+        &view,
+        vec![event(
+            "message.created",
+            created(80, 7, &key, 1, "другой сервер"),
+        )],
+    );
+    view.read_with(&*visual, |v, cx| {
+        assert_eq!(v.composer_error, error, "another server is not the ack");
+        assert_eq!(v.composer.read(cx).value(), "первое");
+        assert_eq!(v.drafts.borrow().text(channel_key()), "первое");
+        assert!(v.unconfirmed_sends.contains_key(&channel_key()));
+    });
+}
+
+/// Removing a server drops only that server's uncertain snapshots; personal
+/// conversations and other servers keep theirs.
+#[gpui::test]
+async fn forgetting_a_server_drops_only_its_send_snapshots(cx: &mut TestAppContext) {
+    cx.update(|cx| gpui_component::init(cx));
+    let server = TestServer::spawn(Vec::new());
+    let (window, view) = make_app(cx, direct_client(&server));
+    let visual = VisualTestContext::from_window(window.into(), cx).into_mut();
+    visual.update(|_, app| {
+        view.update(app, |v, _| {
+            let plan = |key: draft::ChatKey, name: &str| draft::SendPlan {
+                key,
+                content: name.into(),
+                composer_text: name.into(),
+                reply: 0,
+                files: Vec::new(),
+                send_key: format!("{}-{}-{name}", key.server, key.channel),
+                revision: 1,
+            };
+            let on_server_1 = draft::ChatKey::channel(1, 7);
+            let on_server_2 = draft::ChatKey::channel(2, 7);
+            let conversation = draft::ChatKey::conversation(9);
+            v.unconfirmed_sends
+                .insert(on_server_1, plan(on_server_1, "first"));
+            v.unconfirmed_sends
+                .insert(on_server_2, plan(on_server_2, "second"));
+            v.unconfirmed_sends
+                .insert(conversation, plan(conversation, "direct"));
+            v.forget_server_sends(1);
+            assert!(!v.unconfirmed_sends.contains_key(&on_server_1));
+            assert!(v.unconfirmed_sends.contains_key(&on_server_2));
+            assert!(v.unconfirmed_sends.contains_key(&conversation));
+        });
+    });
+}

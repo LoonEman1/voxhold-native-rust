@@ -422,6 +422,120 @@ impl Voxhold {
         }
     }
 
+    /// Drop the uncertain send snapshots of a server whose drafts are being
+    /// removed. Conversation keys (`server == 0`) are not tied to a server and
+    /// stay. Temporary attachment files are not touched here: the draft that
+    /// still owns them cleans them up.
+    pub(super) fn forget_server_sends(&mut self, server: i64) {
+        self.unconfirmed_sends.retain(|key, _| key.server != server);
+    }
+
+    /// The send plan whose own message this event confirms. Only the signed-in
+    /// author, a non-empty `client_message_id` equal to the plan's idempotency
+    /// key and the exact chat qualify; the content is never compared. `None`
+    /// means the event is only a history row.
+    fn own_send_plan(
+        &self,
+        kind: &str,
+        message: &Message,
+    ) -> Option<(Option<u64>, draft::SendPlan)> {
+        let key = message.client_message_id.as_str();
+        if key.is_empty()
+            || self.self_user_id <= 0
+            || message.author.user_id != self.self_user_id
+            || message.thread_root_id.is_some()
+        {
+            return None;
+        }
+        let matches = |plan: &draft::SendPlan| {
+            if plan.send_key != key || plan.key.root != 0 {
+                return false;
+            }
+            match kind {
+                // The event carries no server id. The account socket holds one
+                // channel subscription at a time (`update_channel_subscription`),
+                // so a `message.created` can only describe the selected server;
+                // requiring the plan's server rejects a stale plan of another
+                // server that happens to use the same channel id.
+                "message.created" => {
+                    !plan.key.is_conversation()
+                        && plan.key.server == self.server
+                        && plan.key.channel == message.channel_id
+                }
+                "conversation.message" => {
+                    plan.key.is_conversation() && plan.key.channel == message.conversation_id
+                }
+                _ => false,
+            }
+        };
+        if let Some(pending) = self
+            .pending_sends
+            .values()
+            .find(|pending| matches(&pending.plan))
+        {
+            return Some((Some(pending.attempt), pending.plan.clone()));
+        }
+        self.unconfirmed_sends
+            .values()
+            .find(|plan| matches(plan))
+            .cloned()
+            .map(|plan| (None, plan))
+    }
+
+    /// Complete an in-flight send from the server's own echo. It runs through
+    /// the same `apply_send_success` as the HTTP answer, so the first
+    /// confirmation consumes the draft and a later answer is ignored. The HTTP
+    /// task is never aborted: its own attempt/session check settles it. This is
+    /// called from the realtime batch, where the `Window` is available.
+    pub(super) fn confirm_send_from_event(
+        &mut self,
+        event: &voxhold_api::RealtimeEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if event.kind != "message.created" && event.kind != "conversation.message" {
+            return false;
+        }
+        // Most batches are ordinary history traffic: do not pay for a full
+        // `Message` parse when no send can be confirmed.
+        if self.pending_sends.is_empty() && self.unconfirmed_sends.is_empty() {
+            return false;
+        }
+        let Ok(message) = serde_json::from_value::<Message>(event.data.clone()) else {
+            return false;
+        };
+        let Some((attempt, plan)) = self.own_send_plan(&event.kind, &message) else {
+            return false;
+        };
+        if let Some(attempt) = attempt {
+            let owns = self
+                .pending_sends
+                .get(&plan.key)
+                .is_some_and(|pending| pending.attempt == attempt);
+            if !owns {
+                return false;
+            }
+            self.pending_sends.remove(&plan.key);
+        }
+        self.confirm_unconfirmed(&plan);
+        let active = self.chat_key() == plan.key;
+        let composer_now = self.composer.read(cx).value().to_string();
+        if self.apply_send_success(plan, message, &composer_now, cx) {
+            self.composer
+                .update(cx, |input, cx| input.set_value("", window, cx));
+        }
+        if active {
+            // The 504/network error belonged to this attempt and this chat;
+            // the confirmed row replaces it.
+            self.composer_error.clear();
+            // The HTTP path hands the focus back after its answer; a socket
+            // confirmation of the open chat settles the same interaction.
+            self.composer
+                .update(cx, |input, cx| input.focus(window, cx));
+        }
+        true
+    }
+
     /// Apply one confirmed send. Returns true when the composer must be
     /// cleared: only when the draft belongs to the open chat and the user did
     /// not edit it while the request was in flight. A result for another chat

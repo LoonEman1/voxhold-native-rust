@@ -688,9 +688,14 @@ impl Voxhold {
                     && data["conversation_id"].as_i64() == Some(self.channel);
                 if matches {
                     effect.resync = true;
-                    // The next index answer updates the row when it still
-                    // exists and clears the active ChatKey when it is gone.
-                    self.conversations_reconcile = true;
+                    // Scope the marker to this exact event and selection: a
+                    // later page or another conversation cannot replay it.
+                    self.conversations_reconcile = Some(messages::ConversationReconcile {
+                        conversation: self.channel,
+                        select_seq: self.conversation_select_seq,
+                        epoch: self.messaging.epoch,
+                        session: self.session_generation,
+                    });
                 }
                 effect.recents = true;
             }

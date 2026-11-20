@@ -258,7 +258,8 @@ pub(crate) struct Voxhold {
     recents_again: bool,
     /// A `conversation.changed` event asks the next index answer to reconcile
     /// the active conversation: update it when present, clear it when gone.
-    conversations_reconcile: bool,
+    /// Scoped to that conversation, selection, surface epoch and session.
+    conversations_reconcile: Option<messages::ConversationReconcile>,
     /// Bumped on every conversation selection. An index page requested before
     /// the selection cannot clear the newly opened conversation.
     conversation_select_seq: u64,
@@ -665,7 +666,7 @@ impl Voxhold {
             conversations: Vec::new(),
             recents_request: None,
             recents_again: false,
-            conversations_reconcile: false,
+            conversations_reconcile: None,
             conversation_select_seq: 0,
             channel_snapshot_request: None,
             attachments: None,

@@ -390,6 +390,10 @@ impl Voxhold {
                     .child(self.messaging.error.clone()),
             );
         }
+        #[cfg(feature = "voxhold-media")]
+        if let Some(dock) = self.voice_dock(cx) {
+            panel = panel.child(dock);
+        }
         panel
             .child(
                 div()
@@ -409,6 +413,7 @@ impl Voxhold {
                     .child(icon("icons/hash.svg", 14., ink(p.muted)))
                     .child("Вернуться в сообщество"),
             )
+            .child(self.account_footer(cx))
             .into_any_element()
     }
 

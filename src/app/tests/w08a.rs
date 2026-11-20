@@ -5,7 +5,7 @@
 use super::super::*;
 use crate::messages;
 use crate::test_support::{Gate, Reply, TestServer};
-use gpui::{TestAppContext, VisualTestContext};
+use gpui::{Modifiers, TestAppContext, VisualTestContext};
 use gpui_component::Root;
 use serde_json::json;
 use std::time::Duration;
@@ -124,6 +124,11 @@ async fn thirteen_conversations_page_without_duplicates(cx: &mut TestAppContext)
     let first = (1..=13).rev().collect::<Vec<_>>();
     let mut older = rows([1, 14, 15, 16, 17]);
     older[0] = conversation(1, "duplicate", true, 9, true);
+    // The older page is below every row of the first page, exactly like the
+    // backend's activity ordering.
+    for row in &mut older {
+        row.last_message_id = 0;
+    }
     let server = TestServer::spawn(vec![
         Reply::new(200, &page(rows(first), true, Some("MTM6MQ"))),
         Reply::new(200, &page(older, false, None)),
@@ -618,7 +623,7 @@ async fn other_device_events_update_the_index_and_missing_row_clears_active(
         });
     });
     wait_for(&mut visual, &view, |v| {
-        v.conversation.is_none() && v.conversations_reconcile == false
+        v.conversation.is_none() && v.conversations_reconcile.is_none()
     });
     view.read_with(&*visual, |v, _| {
         assert!(v.messages.is_empty());
@@ -691,4 +696,299 @@ async fn returning_to_channels_restores_only_permitted_context(cx: &mut TestAppC
         assert_eq!(v.channel, 8);
         assert_eq!(v.chat_key(), draft::ChatKey::channel(1, 8));
     });
+}
+
+/// 31 conversations, a partial first page and a conversation created after
+/// that page was read: `conversation.changed` must not close the active row.
+#[gpui::test]
+async fn a_partial_index_never_closes_a_conversation_outside_the_page(cx: &mut TestAppContext) {
+    cx.update(|cx| gpui_component::init(cx));
+    // The first page holds 30 of 31 rows; the new conversation has activity 0
+    // and therefore sits outside it.
+    let created = conversation(1, "Новая", true, 0, false);
+    let mut created_reply = serde_json::to_value(&created).unwrap();
+    created_reply["last_message_id"] = json!(0);
+    let created_reply = created_reply.to_string();
+    // Parses as both the history page and the notification answer, so the two
+    // post-selection requests cannot race over the queued reply.
+    let history = json!({
+        "conversation_id": 1,
+        "muted": false,
+        "messages": [],
+        "pagination": {"next_before_id": null, "has_more": false}
+    })
+    .to_string();
+    let server = TestServer::spawn(vec![
+        Reply::new(200, &page(rows((2..=31).rev()), true, Some("FIRST"))),
+        Reply::new(200, &created_reply),
+        Reply::new(200, &history),
+        Reply::new(200, &history),
+        Reply::new(200, &page(rows((2..=31).rev()), true, Some("SECOND"))),
+    ]);
+    let (window, view) = make_app(cx, direct_client(&server));
+    let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
+    visual.update(|_, app| {
+        view.update(app, |v, cx| {
+            v.personal_mode = true;
+            v.refresh_recents(cx);
+        });
+    });
+    wait_for(&mut visual, &view, |v| {
+        !v.messaging.loading && v.conversations.len() == 30
+    });
+
+    // Create and select a direct conversation outside the loaded page.
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            v.open_conversation_creator(window, cx);
+            v.toggle_creator_member(2, cx);
+            v.submit_conversation_creator(window, cx);
+        });
+    });
+    wait_for(&mut visual, &view, |v| {
+        v.conversation.as_ref().map(|row| row.id) == Some(1)
+    });
+    for _ in 0..800 {
+        visual.run_until_parked();
+        if server.requests().len() >= 4 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        server.requests().len() >= 4,
+        "the POST, history and notification answers settled: {:?}",
+        server.requests()
+    );
+
+    visual.update(|_, app| {
+        view.update(app, |v, cx| {
+            let effect =
+                v.apply_realtime_event("conversation.changed", &json!({"conversation_id": 1}));
+            assert!(effect.recents);
+            assert!(effect.resync);
+            v.refresh_recents(cx);
+        });
+    });
+    wait_for(&mut visual, &view, |v| {
+        !v.messaging.loading && v.messaging.cursor.as_deref() == Some("SECOND")
+    });
+    view.read_with(&*visual, |v, _| {
+        assert_eq!(
+            v.conversation.as_ref().map(|row| row.id),
+            Some(1),
+            "a partial page is not proof of deletion"
+        );
+        assert_eq!(v.channel, 1);
+        assert!(
+            v.conversations.iter().any(|row| row.id == 1),
+            "the row outside the page is kept in the index"
+        );
+        assert_eq!(v.conversations.len(), 31, "no row is lost or duplicated");
+        assert!(v.messaging.has_more);
+        assert!(v.error.is_empty(), "no 'Диалог недоступен.': {}", v.error);
+        assert!(
+            v.conversations_reconcile.is_none(),
+            "the marker is consumed"
+        );
+    });
+    let requests = server.requests();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request
+                .path
+                .starts_with("/api/v1/me/conversations?limit=30"))
+            .count(),
+        2,
+        "one first page per refresh: {requests:?}"
+    );
+}
+
+/// Personal search/creator/notification state belongs to the signed-in
+/// account. Logging out resets it, and an account without servers still loads
+/// its conversation index.
+#[gpui::test]
+async fn logout_resets_personal_state_and_the_next_account_loads_its_index(
+    cx: &mut TestAppContext,
+) {
+    cx.update(|cx| gpui_component::init(cx));
+    let server = TestServer::spawn(vec![
+        Reply::new(
+            200,
+            r#"{"user":{"id":2,"username":"bob","created_at":1700000000},"session":{"token":"token-b","expires_at":4102444800}}"#,
+        ),
+        Reply::new(200, "[]"),
+        Reply::new(200, &empty_page()),
+    ]);
+    let (window, view) = make_app(cx, direct_client(&server));
+    let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            // Fill every personal slot the first account could leave behind.
+            v.personal_mode = true;
+            v.personal_return = Some((9, 7));
+            v.open_conversation_creator(window, cx);
+            v.conversations = vec![conversation(4, "старый", true, 3, true)];
+            v.conversation = Some(conversation(4, "старый", true, 3, true));
+            v.channel = 4;
+            v.messages = vec![serde_json::from_value(json!({
+                "id": 5, "channel_id": 0, "conversation_id": 4,
+                "content": "old", "author": {"user_id": 1, "username": "me"},
+                "created_at": 1, "revision": 1, "reactions": [], "attachments": []
+            }))
+            .unwrap()];
+            v.messaging.global = true;
+            v.messaging
+                .search
+                .results
+                .push(voxhold_api::ConversationSearchHit {
+                    id: 11,
+                    conversation_id: 4,
+                    author_id: 2,
+                    author_username: "neva".into(),
+                    content: "budget".into(),
+                    created_at: 1,
+                });
+            v.messaging.search.submitted = "budget".into();
+            v.messaging
+                .query
+                .update(cx, |input, cx| input.set_value("budget", window, cx));
+            v.messaging.notifications = Some(messages::Notifications {
+                id: 4,
+                muted: true,
+                loaded: true,
+                pending: false,
+                error: String::new(),
+                request: 1,
+            });
+            v.messaging.leave_confirm = true;
+            v.messaging.has_more = true;
+            v.messaging.cursor = Some("OLD".into());
+            v.messaging.error = "old error".into();
+            v.conversations_reconcile = Some(messages::ConversationReconcile {
+                conversation: 4,
+                select_seq: v.conversation_select_seq,
+                epoch: v.messaging.epoch,
+                session: v.session_generation,
+            });
+            v.logout(window, cx);
+        });
+    });
+    visual.run_until_parked();
+    view.read_with(&*visual, |v, cx| {
+        assert!(!v.personal_mode);
+        assert!(v.personal_return.is_none());
+        assert!(v.conversation.is_none());
+        assert!(v.conversations.is_empty());
+        assert!(v.messages.is_empty());
+        assert!(!v.messaging.global);
+        assert!(v.messaging.search.results.is_empty());
+        assert!(v.messaging.search.submitted.is_empty());
+        assert!(v.messaging.creator.is_none());
+        assert!(v._creator_subscriptions.is_empty());
+        assert!(v.messaging.notifications.is_none());
+        assert!(!v.messaging.leave_confirm);
+        assert!(!v.messaging.has_more);
+        assert!(v.messaging.cursor.is_none());
+        assert!(v.messaging.error.is_empty());
+        assert!(v.messaging.query.read(cx).value().is_empty());
+        assert!(v.conversations_reconcile.is_none());
+        assert_eq!(v.channel, 0);
+    });
+
+    // The second account has no servers; the index request is still sent.
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            v.auth.origin = server.base.clone();
+            v.username
+                .update(cx, |input, cx| input.set_value("bob", window, cx));
+            v.password
+                .update(cx, |input, cx| input.set_value("password123", window, cx));
+            v.submit_login(window, cx);
+        });
+    });
+    wait_for(&mut visual, &view, |v| {
+        v.self_user_id == 2 && v.client.is_some() && !v.messaging.loading
+    });
+    view.read_with(&*visual, |v, _| {
+        assert!(v.servers.is_empty());
+        assert_eq!(v.server, 0);
+        assert!(!v.personal_mode);
+        assert!(v.conversations.is_empty());
+        assert!(v.messaging.search.results.is_empty());
+        assert!(v.messaging.creator.is_none());
+        assert!(v.messaging.notifications.is_none());
+    });
+    let requests = server.requests();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request
+                .path
+                .starts_with("/api/v1/me/conversations?limit=30"))
+            .count(),
+        1,
+        "the personal index is fetched without a selected server: {requests:?}"
+    );
+}
+
+#[cfg(feature = "voxhold-media")]
+fn draw_window(visual: &mut VisualTestContext) {
+    visual.update(|window, app| {
+        window.refresh();
+        window.draw(app).clear();
+    });
+    visual.run_until_parked();
+}
+
+/// An active call keeps its dock and the account footer inside the personal
+/// sidebar; the dock actions still control the call.
+#[cfg(feature = "voxhold-media")]
+#[gpui::test]
+async fn personal_mode_keeps_the_voice_dock_and_account_controls(cx: &mut TestAppContext) {
+    let (mut visual, view, voice) = super::super::voice_tests::fixture(cx);
+    draw_window(&mut visual);
+    assert!(
+        visual.debug_bounds("voice-dock").is_none(),
+        "the room owns the controls before the personal surface"
+    );
+    let server = TestServer::spawn(vec![Reply::new(200, &empty_page())]);
+    visual.update(|_, app| {
+        view.update(app, |v, _| v.client = Some(direct_client(&server)));
+    });
+    draw_window(&mut visual);
+    let rail = visual
+        .debug_bounds("messages-open")
+        .expect("the rail Messages button");
+    visual.simulate_mouse_move(rail.center(), None, Modifiers::default());
+    visual.simulate_click(rail.center(), Modifiers::default());
+    wait_for(&mut visual, &view, |v| {
+        v.personal_mode && !v.messaging.loading
+    });
+    draw_window(&mut visual);
+    view.read_with(&*visual, |v, app| {
+        assert!(v.personal_mode);
+        assert!(v.voice_dock_visible(app), "the call stays reachable");
+    });
+    assert!(
+        visual.debug_bounds("voice-dock").is_some(),
+        "the dock is painted in the personal sidebar"
+    );
+    assert!(
+        visual.debug_bounds("account-footer").is_some(),
+        "the account controls stay available"
+    );
+    assert!(visual.debug_bounds("messages-return-footer").is_some());
+
+    let mic = visual
+        .debug_bounds("voice-dock-action-voice-mic")
+        .expect("the dock microphone action");
+    let before = voice.read_with(&*visual, |panel, _| panel.action_active_flags()[0]);
+    visual.simulate_mouse_move(mic.center(), None, Modifiers::default());
+    visual.simulate_click(mic.center(), Modifiers::default());
+    draw_window(&mut visual);
+    let after = voice.read_with(&*visual, |panel, _| panel.action_active_flags()[0]);
+    assert!(after, "the dock action still mutes the confirmed call");
+    assert_ne!(before, after);
 }

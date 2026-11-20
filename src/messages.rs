@@ -74,6 +74,18 @@ pub struct Notifications {
     pub request: u64,
 }
 
+/// One `conversation.changed` that asked the next index answer to reconcile
+/// the open row. It is scoped to the exact conversation, selection, surface
+/// epoch and account session so a later page cannot replay it against a
+/// different selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConversationReconcile {
+    pub conversation: i64,
+    pub select_seq: u64,
+    pub epoch: u64,
+    pub session: u64,
+}
+
 pub struct Creator {
     pub selected: Vec<i64>,
     pub name: Entity<InputState>,
@@ -119,6 +131,9 @@ pub struct Messages {
     pub epoch: u64,
     /// One `GET /conversations/{id}` for a search hit outside the loaded page.
     pub open_request: Option<u64>,
+    /// One `GET /conversations/{id}` that decides whether an open row outside
+    /// a partial page still exists.
+    pub reconcile_request: Option<u64>,
 }
 
 impl Messages {
@@ -141,6 +156,7 @@ impl Messages {
             leave_error: String::new(),
             epoch: 0,
             open_request: None,
+            reconcile_request: None,
         }
     }
 
@@ -154,16 +170,66 @@ impl Messages {
         self.leave_request = None;
         self.leave_error.clear();
     }
+
+    /// Drop every personal-surface leftover on session end. The query input and
+    /// the creator entities belong to the signed-in account, so the input is
+    /// cleared and the creator entities are dropped with the window available.
+    pub fn reset(&mut self, window: &mut gpui::Window, cx: &mut gpui::App) {
+        self.loading = false;
+        self.error.clear();
+        self.has_more = false;
+        self.cursor = None;
+        self.older_loading = false;
+        self.older_error.clear();
+        self.older_request = None;
+        self.query.update(cx, |input, cx| {
+            input.set_value("", window, cx);
+            input.set_placeholder("Имя или название беседы", window, cx);
+        });
+        self.clear_search();
+        self.creator = None;
+        self.notifications = None;
+        self.clear_leave();
+        self.epoch = self.epoch.wrapping_add(1);
+        self.open_request = None;
+        self.reconcile_request = None;
+    }
 }
 
-/// Replace the first page, keeping the backend order and dropping rows that
-/// cannot be indexed. Saved favorites are a different surface.
-pub fn replace_page(index: &mut Vec<Conversation>, rows: Vec<Conversation>) {
+/// The backend orders conversations by activity (`last_message_id`) and id,
+/// both descending. Restoring that order keeps a merged tail in place.
+pub fn sort_index(index: &mut [Conversation]) {
+    index.sort_by(|left, right| {
+        right
+            .last_message_id
+            .cmp(&left.last_message_id)
+            .then_with(|| right.id.cmp(&left.id))
+    });
+}
+
+/// Apply a fresh first page. On a partial index (`has_more`) rows previously
+/// loaded from older pages are kept and merged by id, because the page only
+/// proves what it contains, not what is gone. A complete index is
+/// authoritative: its rows are the whole list and the older tail is pruned.
+/// Fresh page values win for a duplicate id.
+pub fn merge_first_page(index: &mut Vec<Conversation>, rows: Vec<Conversation>, has_more: bool) {
+    let previous = std::mem::take(index);
     let mut seen = HashSet::new();
-    *index = rows
-        .into_iter()
-        .filter(|row| row.id > 0 && !row.saved && seen.insert(row.id))
-        .collect();
+    let mut merged: Vec<Conversation> = Vec::new();
+    for row in rows {
+        if row.id > 0 && !row.saved && seen.insert(row.id) {
+            merged.push(row);
+        }
+    }
+    if has_more {
+        for row in previous {
+            if row.id > 0 && !row.saved && seen.insert(row.id) {
+                merged.push(row);
+            }
+        }
+    }
+    sort_index(&mut merged);
+    *index = merged;
 }
 
 /// Append an older page once: duplicate ids never create a second row and the
@@ -263,12 +329,13 @@ mod tests {
     #[test]
     fn pages_append_once_and_keep_the_backend_order() {
         let mut index = Vec::new();
-        replace_page(
+        merge_first_page(
             &mut index,
             vec![
                 conversation(5, "five", true),
                 conversation(4, "four", false),
             ],
+            false,
         );
         assert_eq!(index.len(), 2);
         assert!(append_page(
@@ -290,11 +357,37 @@ mod tests {
     }
 
     #[test]
+    fn a_partial_first_page_keeps_rows_loaded_from_older_pages() {
+        let mut index = vec![conversation(9, "older", true), conversation(1, "new", true)];
+        merge_first_page(
+            &mut index,
+            vec![
+                conversation(9, "fresh", true),
+                conversation(8, "eight", true),
+            ],
+            true,
+        );
+        assert_eq!(
+            index.iter().map(|row| row.id).collect::<Vec<_>>(),
+            vec![9, 8, 1],
+            "the fresh page leads and the older tail is kept once"
+        );
+        assert_eq!(index[0].name, "fresh", "fresh fields win for a duplicate");
+        // A complete index owns the whole list and prunes the tail.
+        merge_first_page(&mut index, vec![conversation(9, "fresh", true)], false);
+        assert_eq!(index.iter().map(|row| row.id).collect::<Vec<_>>(), vec![9]);
+    }
+
+    #[test]
     fn saved_rows_are_not_part_of_the_personal_index() {
         let mut index = Vec::new();
         let mut saved = conversation(9, "Избранное", false);
         saved.saved = true;
-        replace_page(&mut index, vec![saved, conversation(2, "neva", true)]);
+        merge_first_page(
+            &mut index,
+            vec![saved, conversation(2, "neva", true)],
+            false,
+        );
         assert_eq!(index.len(), 1);
         assert_eq!(index[0].id, 2);
     }

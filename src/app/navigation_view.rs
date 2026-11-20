@@ -421,60 +421,65 @@ impl Voxhold {
         if let Some(dock) = self.voice_dock(cx) {
             panel = panel.child(dock);
         }
-        panel
+        panel.child(self.account_footer(cx)).into_any_element()
+    }
+
+    /// The per-account footer. It is shared by the channel sidebar and the
+    /// personal "Сообщения" sidebar, so the account controls never disappear
+    /// while the personal surface is open (web `CommunityNavigation`).
+    pub(super) fn account_footer(&self, cx: &mut Context<Self>) -> AnyElement {
+        let p = self.palette;
+        div()
+            .h(px(58.))
+            .debug_selector(|| "account-footer".into())
+            .px(px(16.))
+            .flex()
+            .items_center()
+            .gap_2()
+            .border_t_1()
+            .border_color(ink(p.line))
             .child(
                 div()
-                    .h(px(58.))
-                    .debug_selector(|| "account-footer".into())
-                    .px(px(16.))
+                    .flex_1()
+                    .text_size(px(13.))
+                    .text_color(ink(p.fg))
+                    .child(format!("@{}", self.auth.username)),
+            )
+            .child(
+                div()
+                    .id("theme-toggle")
+                    .w(px(28.))
+                    .h(px(28.))
+                    .rounded(px(8.))
                     .flex()
                     .items_center()
-                    .gap_2()
-                    .border_t_1()
-                    .border_color(ink(p.line))
-                    .child(
-                        div()
-                            .flex_1()
-                            .text_size(px(13.))
-                            .text_color(ink(p.fg))
-                            .child(format!("@{}", self.auth.username)),
-                    )
-                    .child(
-                        div()
-                            .id("theme-toggle")
-                            .w(px(28.))
-                            .h(px(28.))
-                            .rounded(px(8.))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .cursor_pointer()
-                            .text_color(ink(p.muted))
-                            .on_click(cx.listener(|s, _, window, cx| s.toggle_theme(window, cx)))
-                            .child(icon(
-                                if p.light {
-                                    "icons/moon.svg"
-                                } else {
-                                    "icons/sun.svg"
-                                },
-                                15.,
-                                ink(p.muted),
-                            )),
-                    )
-                    .child(
-                        div()
-                            .id("logout")
-                            .w(px(28.))
-                            .h(px(28.))
-                            .rounded(px(8.))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .cursor_pointer()
-                            .text_color(ink(p.muted))
-                            .on_click(cx.listener(|s, _, w, cx| s.logout(w, cx)))
-                            .child(icon("icons/logout.svg", 15., ink(p.muted))),
-                    ),
+                    .justify_center()
+                    .cursor_pointer()
+                    .text_color(ink(p.muted))
+                    .on_click(cx.listener(|s, _, window, cx| s.toggle_theme(window, cx)))
+                    .child(icon(
+                        if p.light {
+                            "icons/moon.svg"
+                        } else {
+                            "icons/sun.svg"
+                        },
+                        15.,
+                        ink(p.muted),
+                    )),
+            )
+            .child(
+                div()
+                    .id("logout")
+                    .w(px(28.))
+                    .h(px(28.))
+                    .rounded(px(8.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .text_color(ink(p.muted))
+                    .on_click(cx.listener(|s, _, w, cx| s.logout(w, cx)))
+                    .child(icon("icons/logout.svg", 15., ink(p.muted))),
             )
             .into_any_element()
     }

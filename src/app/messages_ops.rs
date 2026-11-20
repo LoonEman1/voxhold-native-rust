@@ -29,6 +29,7 @@ impl Voxhold {
         self.messaging.older_request = None;
         self.messaging.older_loading = false;
         self.messaging.open_request = None;
+        self.conversations_reconcile = None;
         self.conversation = None;
         self.channel = 0;
         self.reset_personal_chat(window, cx);
@@ -63,6 +64,7 @@ impl Voxhold {
         self.messaging.older_loading = false;
         self.messaging.older_error.clear();
         self.messaging.open_request = None;
+        self.conversations_reconcile = None;
         self.conversation = None;
         self.channel = 0;
         self.reset_personal_chat(window, cx);
@@ -239,6 +241,7 @@ impl Voxhold {
             pending.abort.abort();
         }
         self.drafts.borrow_mut().clear(key);
+        self.conversations_reconcile = None;
         self.messaging.notifications = None;
         self.messaging.clear_leave();
         self.reset_personal_chat_state(cx);
@@ -283,13 +286,19 @@ impl Voxhold {
                     }
                     s.recents_request = None;
                     s.messaging.loading = false;
+                    let mut retry_reconcile = false;
                     match result {
                         Ok(page) => {
-                            messages::replace_page(&mut s.conversations, page.conversations);
-                            s.messaging.has_more = page.has_more;
+                            let has_more = page.has_more;
+                            messages::merge_first_page(
+                                &mut s.conversations,
+                                page.conversations,
+                                has_more,
+                            );
+                            s.messaging.has_more = has_more;
                             s.messaging.cursor = page.next_cursor;
                             s.messaging.error.clear();
-                            let reconcile = std::mem::take(&mut s.conversations_reconcile);
+                            let reconcile = s.conversations_reconcile.take();
                             let active = s.conversation.as_ref().map(|row| row.id);
                             if let Some(id) = active {
                                 if let Some(mut row) =
@@ -308,17 +317,29 @@ impl Voxhold {
                                         }
                                     }
                                     s.conversation = Some(row);
-                                } else if reconcile {
+                                } else if let Some(marker) = reconcile.filter(|marker| {
+                                    s.personal_mode
+                                        && marker.conversation == id
+                                        && marker.session == session
+                                        && marker.epoch == s.messaging.epoch
+                                        && marker.select_seq == s.conversation_select_seq
+                                }) {
                                     if s.conversation_select_seq > select_seq {
                                         // The page was requested before this
-                                        // conversation was opened; the next
+                                        // conversation was opened and cannot
+                                        // prove anything about it. The next
                                         // page owns the reconciliation.
-                                        s.conversations_reconcile = true;
+                                        s.conversations_reconcile = Some(marker);
+                                        retry_reconcile = true;
+                                    } else if has_more {
+                                        // A partial page never proves deletion;
+                                        // one explicit lookup decides instead.
+                                        s.verify_conversation(marker, cx);
                                     } else {
-                                        // No `Window` is available in this
-                                        // answer; the next render finishes
-                                        // viewer/composer cleanup for the
-                                        // already-empty surface.
+                                        // A complete index proves the row is
+                                        // gone. No `Window` is available in
+                                        // this answer; the next render finishes
+                                        // the viewer/composer cleanup.
                                         s.clear_active_conversation_state(
                                             Some("Диалог недоступен."),
                                             cx,
@@ -338,8 +359,73 @@ impl Voxhold {
                             s.messaging.error = text;
                         }
                     }
-                    if std::mem::take(&mut s.recents_again) {
+                    if std::mem::take(&mut s.recents_again) || retry_reconcile {
                         s.refresh_recents(cx);
+                    }
+                    cx.notify();
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
+
+    /// A `conversation.changed` for an open row that a partial index cannot
+    /// confirm: one explicit `GET /conversations/{id}` decides between a fresh
+    /// row and a confirmed removal. The page itself is never treated as proof.
+    fn verify_conversation(
+        &mut self,
+        marker: messages::ConversationReconcile,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(client) = self.client.clone() else {
+            return;
+        };
+        self.action_seq = self.action_seq.wrapping_add(1);
+        let request = self.action_seq;
+        self.messaging.reconcile_request = Some(request);
+        let runtime = self.runtime.clone();
+        let task = cx.background_spawn(async move {
+            runtime.block_on(client.conversation(marker.conversation))
+        });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            if let Some(this) = this.upgrade() {
+                this.update(cx, |s, cx| {
+                    if s.messaging.reconcile_request != Some(request) {
+                        return;
+                    }
+                    s.messaging.reconcile_request = None;
+                    let still_open = s.personal_mode
+                        && marker.session == s.session_generation
+                        && marker.epoch == s.messaging.epoch
+                        && marker.select_seq == s.conversation_select_seq
+                        && s.conversation.as_ref().map(|row| row.id) == Some(marker.conversation);
+                    if !still_open {
+                        return;
+                    }
+                    match result {
+                        Ok(row) => {
+                            if let Some(existing) = s
+                                .conversations
+                                .iter_mut()
+                                .find(|current| current.id == row.id)
+                            {
+                                *existing = row.clone();
+                            } else {
+                                s.conversations.push(row.clone());
+                                messages::sort_index(&mut s.conversations);
+                            }
+                            s.conversation = Some(row);
+                        }
+                        Err(voxhold_api::Error::Http(403 | 404)) => {
+                            s.conversations.retain(|row| row.id != marker.conversation);
+                            // No `Window` in this answer; the next render
+                            // finishes the window-owned cleanup.
+                            s.clear_active_conversation_state(Some("Диалог недоступен."), cx);
+                        }
+                        // A transient failure is not proof of deletion.
+                        Err(_) => {}
                     }
                     cx.notify();
                 })
@@ -402,6 +488,10 @@ impl Voxhold {
                     match result {
                         Ok(page) => {
                             messages::append_page(&mut s.conversations, page.conversations);
+                            // The first page may have been merged with a tail
+                            // from older pages, so restore the backend order
+                            // across the whole index after appending.
+                            messages::sort_index(&mut s.conversations);
                             s.messaging.has_more = page.has_more;
                             s.messaging.cursor = page.next_cursor;
                         }

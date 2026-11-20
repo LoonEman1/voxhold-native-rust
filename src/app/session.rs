@@ -208,6 +208,10 @@ impl Voxhold {
         let first_server = self.servers.first().map(|server| server.id);
         if let Some(id) = first_server {
             self.select_server(id, window, cx);
+        } else {
+            // The web loads the personal index regardless of the selected
+            // server. An account without servers still has conversations.
+            self.refresh_recents(cx);
         }
         cx.notify();
     }
@@ -382,6 +386,16 @@ impl Voxhold {
         self.conversations.clear();
         self.recents_request = None;
         self.recents_again = false;
+        // The personal surface belongs to the signed-in account. Keep no
+        // selection, filter, search, creator, notification or cursor state for
+        // the next account; the new workspace always starts from a fresh index.
+        self.personal_mode = false;
+        self.personal_return = None;
+        self.conversations_reconcile = None;
+        self.conversation_select_seq = self.conversation_select_seq.wrapping_add(1);
+        self.messaging.reset(window, cx);
+        self._creator_subscriptions.clear();
+        self.pending_personal_cleanup = false;
         self.channel_snapshot_request = None;
         self.attachments = None;
         self.personal = None;

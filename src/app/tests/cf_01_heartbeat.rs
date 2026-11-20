@@ -216,11 +216,13 @@ async fn starting_a_session_installs_the_live_link(cx: &mut TestAppContext) {
         view.update(app, |v, cx| {
             let client = v.client.clone().expect("client");
             v.start_realtime(client, window, cx);
-            let link = v
-                .realtime_link
-                .as_ref()
-                .expect("the session installs a link");
-            assert!(!link.load(Ordering::Relaxed), "a new socket starts healthy");
+            assert!(
+                v.realtime_link.is_some(),
+                "the session installs the live link"
+            );
+            // The background task owns the link value and may already have
+            // reported a failed connection; the UI field is reset by the
+            // session itself, before the task can touch it.
             assert!(!v.realtime_reconnecting);
             v.stop_realtime();
             assert!(v.realtime_link.is_none(), "the session owns the link");

@@ -701,6 +701,18 @@ fn a_busy_helper_does_not_break_the_startup_scan() {
     std::fs::remove_dir_all(&temp).ok();
 }
 
+#[test]
+fn only_a_written_handshake_allows_recovery_on_an_update_start() {
+    use super::update_ops::startup_recovery_allowed;
+
+    // Normal start: nothing to prove, the observer always runs.
+    assert!(startup_recovery_allowed(false, false));
+    assert!(startup_recovery_allowed(false, true));
+    // Update start: only the handshake proves that the new version is alive.
+    assert!(startup_recovery_allowed(true, true));
+    assert!(!startup_recovery_allowed(true, false));
+}
+
 #[gpui::test]
 async fn a_ready_marker_is_shown_but_not_applied(cx: &mut TestAppContext) {
     cx.update(|cx| gpui_component::init(cx));

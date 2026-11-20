@@ -166,18 +166,28 @@ fn main() {
                     // in the workspace instead of being swallowed. Write it
                     // before the startup cleanup so that cleanup can protect
                     // the staging directory by its handshake marker.
+                    let mut handshake_written = false;
                     if let Some(path) = handshake.as_ref() {
-                        if let Err(error) = update::write_handshake(path, operation.as_deref()) {
-                            eprintln!("voxhold-update: cannot write handshake: {error}");
-                            view.update(cx, |view, cx| {
-                                view.report_handshake_failure(
-                                    "не удалось записать файл подтверждения".into(),
-                                );
-                                cx.notify();
-                            });
+                        match update::write_handshake(path, operation.as_deref()) {
+                            Ok(()) => handshake_written = true,
+                            Err(error) => {
+                                eprintln!("voxhold-update: cannot write handshake: {error}");
+                                view.update(cx, |view, cx| {
+                                    view.report_handshake_failure(
+                                        "не удалось записать файл подтверждения".into(),
+                                    );
+                                    cx.notify();
+                                });
+                            }
                         }
                     }
-                    view.update(cx, |view, cx| view.start_update(handshake.is_some(), cx));
+                    // The observer may finish a confirmed operation. After an
+                    // update the handshake just written is the proof; without
+                    // it the state stays unconfirmed so the helper can roll
+                    // back.
+                    view.update(cx, |view, cx| {
+                        view.start_update(handshake.is_some(), handshake_written, cx)
+                    });
                     cx.new(|cx| Root::new(view.into(), window, cx))
                 },
             )

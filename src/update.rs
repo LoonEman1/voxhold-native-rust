@@ -685,6 +685,111 @@ mod tests {
     }
 
     #[test]
+    fn a_confirmed_update_start_completes_before_the_second_cleanup() {
+        use voxhold_update::recovery::{recover_install, RecoveryMode, RecoveryOutcome};
+        use voxhold_update::state::{self, InstallState, OperationStage, StateLoad};
+
+        fn install_package(root: &std::path::Path, version: &str, exe: &[u8]) {
+            std::fs::create_dir_all(root).unwrap();
+            std::fs::write(root.join("Voxhold.exe"), exe).unwrap();
+            let packed = voxhold_update::package::pack_with_index(root, version).unwrap();
+            std::fs::remove_dir_all(root).unwrap();
+            voxhold_update::package::unpack(&packed.bytes, root).unwrap();
+        }
+
+        let temp = std::env::temp_dir().join(format!(
+            "voxhold-confirmed-start-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let install = temp.join("VoxHold");
+        let root = temp.join("updates");
+        let update_dir = root.join("0.2.0");
+        let backup = state::backup_path(&install);
+        install_package(&install, "0.2.0", b"new exe");
+        install_package(&backup, "0.1.0", b"old exe");
+        std::fs::create_dir_all(&update_dir).unwrap();
+        // The helper stored the handshake in the staged update directory.
+        let handshake = update_dir.join("handshake.ok");
+        write_handshake(&handshake, Some("op-1")).unwrap();
+
+        let state = InstallState {
+            schema: state::STATE_SCHEMA,
+            operation_id: "op-1".into(),
+            stage: OperationStage::NewInPlace,
+            install_dir: install.clone(),
+            backup_dir: backup.clone(),
+            staging_dir: state::operation_staging_path(&install, "op-1"),
+            handshake_path: handshake.clone(),
+            version: "0.2.0".into(),
+            previous_version: Some("0.1.0".into()),
+            had_install: true,
+            created_at: 1,
+        };
+        state::save(&state).unwrap();
+
+        // An update start with a written handshake must run the observer,
+        // which persists completion while the proof still exists.
+        let scan = startup_scan(&install, &Version::new(0, 2, 0), Some(root.as_path()), true);
+        assert!(scan.error.is_none(), "{scan:?}");
+        assert!(handshake.exists(), "the observer must run before cleanup");
+        assert_eq!(state::load(&install), StateLoad::Missing);
+        assert!(!backup.exists());
+
+        // Only now may the 10 s cleanup remove the handshake directory.
+        second_cleanup(&root, None).unwrap();
+        assert!(!update_dir.exists());
+        assert_eq!(
+            recover_install(&install, RecoveryMode::Observer).unwrap(),
+            RecoveryOutcome::Clean
+        );
+        assert_eq!(
+            std::fs::read(install.join("Voxhold.exe")).unwrap(),
+            b"new exe"
+        );
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    #[test]
+    fn a_failed_handshake_keeps_the_update_unconfirmed() {
+        // Without the handshake file the observer must not complete the
+        // operation; recovery keeps the state and the backup for the helper.
+        use voxhold_update::recovery::{recover_install, RecoveryMode, RecoveryOutcome};
+        use voxhold_update::state::{self, InstallState, OperationStage, StateLoad};
+
+        let temp = std::env::temp_dir().join(format!(
+            "voxhold-unconfirmed-start-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let install = temp.join("VoxHold");
+        std::fs::create_dir_all(&install).unwrap();
+        let backup = state::backup_path(&install);
+        std::fs::create_dir_all(&backup).unwrap();
+        let handshake = temp.join("updates").join("handshake.ok");
+        let state = InstallState {
+            schema: state::STATE_SCHEMA,
+            operation_id: "op-1".into(),
+            stage: OperationStage::NewInPlace,
+            install_dir: install.clone(),
+            backup_dir: backup.clone(),
+            staging_dir: state::operation_staging_path(&install, "op-1"),
+            handshake_path: handshake,
+            version: "0.2.0".into(),
+            previous_version: Some("0.1.0".into()),
+            had_install: true,
+            created_at: 1,
+        };
+        state::save(&state).unwrap();
+
+        let outcome = recover_install(&install, RecoveryMode::Observer).unwrap();
+        assert!(matches!(outcome, RecoveryOutcome::NeedsUpdater { .. }));
+        assert!(matches!(state::load(&install), StateLoad::Valid(_)));
+        assert!(backup.exists());
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    #[test]
     fn second_cleanup_keeps_only_the_ready_directory() {
         let temp = std::env::temp_dir().join(format!(
             "voxhold-second-cleanup-{}-{}",

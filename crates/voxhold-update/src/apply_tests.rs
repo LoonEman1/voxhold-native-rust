@@ -104,6 +104,32 @@ fn assert_runnable(target: &Path) {
     assert!(target.join("Voxhold.exe").is_file());
 }
 
+fn staging_siblings(target: &Path) -> Vec<PathBuf> {
+    let Some(parent) = target.parent() else {
+        return Vec::new();
+    };
+    let name = target
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let prefix = format!("{name}{}", state::STAGING_SUFFIX).to_lowercase();
+    let Ok(entries) = fs::read_dir(parent) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter(|entry| entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false))
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .to_lowercase()
+                .starts_with(&prefix)
+        })
+        .map(|entry| entry.path())
+        .collect()
+}
+
 #[test]
 fn applies_and_preserves_user_files() {
     let temp = tempfile::tempdir().unwrap();
@@ -199,14 +225,71 @@ fn every_interruption_point_converges_without_losing_user_files() {
 
         // After launch but before confirmation there must be no handshake.
         let handshake = point != InterruptPoint::Launched;
+        let handshake_path = temp.path().join("ready.handshake");
         let result = run_with(
             &target,
             &staged,
-            &temp.path().join("ready.handshake"),
+            &handshake_path,
             &launcher(handshake),
             &Interrupt(Some(point)),
         );
         assert!(result.is_err(), "{point:?} must stop the helper");
+
+        // Prove the interruption happened where it claims: a test that stops
+        // before the state write must not look like a later one.
+        let saved = state::load(&target);
+        match point {
+            InterruptPoint::Staged | InterruptPoint::Verified => {
+                assert!(matches!(saved, StateLoad::Missing), "{point:?}");
+                assert!(
+                    !staging_siblings(&target).is_empty(),
+                    "{point:?} must leave the copied staging directory"
+                );
+                assert!(!backup_path(&target).exists(), "{point:?}");
+                assert_eq!(fs::read(target.join("Voxhold.exe")).unwrap(), b"old exe");
+            }
+            InterruptPoint::Prepared => {
+                let StateLoad::Valid(state) = &saved else {
+                    panic!("{point:?} must persist the prepared state");
+                };
+                assert_eq!(state.stage, OperationStage::Prepared);
+                assert!(state.staging_dir.exists(), "{point:?}");
+                assert!(target.exists(), "{point:?}");
+                assert!(!backup_path(&target).exists(), "{point:?}");
+            }
+            InterruptPoint::OldRenamed => {
+                let StateLoad::Valid(state) = &saved else {
+                    panic!("{point:?} must persist the renamed state");
+                };
+                assert_eq!(state.stage, OperationStage::OldRenamed);
+                assert!(state.backup_dir.exists(), "{point:?}");
+                assert!(!target.exists(), "{point:?}");
+            }
+            InterruptPoint::NewInPlace | InterruptPoint::Launched => {
+                let StateLoad::Valid(state) = &saved else {
+                    panic!("{point:?} must persist the in-place state");
+                };
+                assert_eq!(state.stage, OperationStage::NewInPlace);
+                assert!(state.backup_dir.exists(), "{point:?}");
+                assert_eq!(fs::read(target.join("Voxhold.exe")).unwrap(), b"new exe");
+                assert!(
+                    !crate::handshake::confirms(&state.handshake_path, &state.operation_id),
+                    "{point:?} must not have confirmation"
+                );
+            }
+            InterruptPoint::Confirmed => {
+                let StateLoad::Valid(state) = &saved else {
+                    panic!("{point:?} must persist the in-place state");
+                };
+                assert_eq!(state.stage, OperationStage::NewInPlace);
+                assert!(state.backup_dir.exists(), "{point:?}");
+                assert!(
+                    crate::handshake::confirms(&state.handshake_path, &state.operation_id),
+                    "{point:?} must leave the handshake that interrupted it"
+                );
+                assert!(handshake_path.exists());
+            }
+        }
 
         let outcome = recover_install(&target, RecoveryMode::Updater).unwrap();
         assert!(
@@ -532,5 +615,65 @@ fn a_locked_backup_is_not_deleted_and_is_cleaned_later() {
         }
     ));
     assert!(!backup.exists());
+    assert_state_cleared(&target);
+}
+
+#[cfg(windows)]
+#[test]
+fn a_locked_completed_backup_does_not_block_the_next_update() {
+    let temp = tempfile::tempdir().unwrap();
+    let target = temp.path().join("VoxHold");
+    let backup = backup_path(&target);
+    // The previous operation was confirmed by the new version, but its backup
+    // is still locked by another process.
+    install_package(&target, "1.1.0", b"confirmed exe");
+    install_package(&backup, "1.0.0", b"old exe");
+    let completed = InstallState {
+        schema: state::STATE_SCHEMA,
+        operation_id: "previous-operation".into(),
+        stage: OperationStage::Completed,
+        install_dir: target.clone(),
+        backup_dir: backup.clone(),
+        staging_dir: state::operation_staging_path(&target, "previous-operation"),
+        handshake_path: temp.path().join("previous.handshake"),
+        version: "1.1.0".into(),
+        previous_version: Some("1.0.0".into()),
+        had_install: true,
+        created_at: 1,
+    };
+    state::save(&completed).unwrap();
+    let _lock = lock_without_sharing(&backup.join("Voxhold.exe"));
+
+    let recovered = recover_install(&target, RecoveryMode::Updater).unwrap();
+    assert!(matches!(
+        recovered,
+        RecoveryOutcome::Completed {
+            backup_removed: false,
+            ..
+        }
+    ));
+    assert!(state::state_path(&target).exists());
+    assert!(backup.exists());
+
+    // A proven completion is not "unresolved": the next update must start and
+    // leave the unknown backup untouched under its canonical name.
+    let staged = staged_package(temp.path());
+    let outcome = run_with(
+        &target,
+        &staged,
+        &temp.path().join("ready.handshake"),
+        &launcher(true),
+        &NoHooks,
+    )
+    .unwrap();
+    assert!(outcome.backup_removed);
+    assert_eq!(fs::read(target.join("Voxhold.exe")).unwrap(), b"new exe");
+    assert!(backup.exists(), "the old completed backup is preserved");
+    drop(_lock);
+    assert_eq!(
+        fs::read(backup.join("Voxhold.exe")).unwrap(),
+        b"old exe",
+        "the old completed backup is preserved"
+    );
     assert_state_cleared(&target);
 }

@@ -18,6 +18,8 @@ use crate::error::{Result, UpdateError};
 pub const BACKUP_SUFFIX: &str = ".voxhold-backup";
 /// Suffix of the per-operation staging directory next to the installation.
 pub const STAGING_SUFFIX: &str = ".voxhold-next-";
+/// Suffix of the directory that holds a failed installation during a rollback.
+pub const FAILED_SUFFIX: &str = ".voxhold-failed-";
 /// Suffix of the state file next to the installation.
 pub const STATE_SUFFIX: &str = ".voxhold-state.json";
 /// Schema accepted by this build.
@@ -93,10 +95,21 @@ impl InstallState {
         if !same_path(&self.install_dir, install_dir) {
             return false;
         }
-        if !is_sibling_artifact(&self.backup_dir, install_dir, BACKUP_SUFFIX) {
+        // A backup may only be the canonical path or this operation's own
+        // sibling. A plain prefix such as `.voxhold-backup-cache` must never be
+        // accepted: completion deletes the directory named here.
+        let canonical_backup = backup_path(install_dir);
+        let operation_backup = operation_backup_path(install_dir, &self.operation_id);
+        if !is_sibling_artifact(&self.backup_dir, install_dir, BACKUP_SUFFIX)
+            || (!same_path(&self.backup_dir, &canonical_backup)
+                && !same_path(&self.backup_dir, &operation_backup))
+        {
             return false;
         }
-        if !is_sibling_artifact(&self.staging_dir, install_dir, STAGING_SUFFIX) {
+        if !same_path(
+            &self.staging_dir,
+            &operation_staging_path(install_dir, &self.operation_id),
+        ) {
             return false;
         }
         self.handshake_path.is_absolute()
@@ -133,6 +146,19 @@ pub fn operation_staging_path(install_dir: &Path, operation_id: &str) -> PathBuf
     sibling(install_dir, &format!("{STAGING_SUFFIX}{operation_id}"))
 }
 
+/// Sibling directory that holds a failed installation during a rollback.
+///
+/// `attempt` 0 is the canonical name; later attempts are used when a stale
+/// directory of the same operation is still locked.
+pub fn operation_failed_path(install_dir: &Path, operation_id: &str, attempt: u32) -> PathBuf {
+    let suffix = if attempt == 0 {
+        format!("{FAILED_SUFFIX}{operation_id}")
+    } else {
+        format!("{FAILED_SUFFIX}{operation_id}-{attempt}")
+    };
+    sibling(install_dir, &suffix)
+}
+
 /// Path of the state file of an installation.
 pub fn state_path(install_dir: &Path) -> PathBuf {
     sibling(install_dir, STATE_SUFFIX)
@@ -155,9 +181,13 @@ pub fn load(install_dir: &Path) -> StateLoad {
 }
 
 /// Atomically persist the state before the next rename.
+///
+/// Every write uses its own temporary file: the application observer and the
+/// helper may save at the same time, and a shared name would make one of the
+/// renames fail.
 pub fn save(state: &InstallState) -> Result<()> {
     let path = state_path(&state.install_dir);
-    let temporary = path.with_extension("json.tmp");
+    let temporary = temporary_path(&path);
     let bytes = serde_json::to_vec_pretty(state).expect("install state serialization");
     let result = (|| -> std::io::Result<()> {
         use std::io::Write;
@@ -171,6 +201,16 @@ pub fn save(state: &InstallState) -> Result<()> {
         let _ = std::fs::remove_file(&temporary);
     }
     result.map_err(|error| UpdateError::io(&path, error))
+}
+
+/// Unique sibling of `path` used for one atomic state write.
+fn temporary_path(path: &Path) -> PathBuf {
+    let mut name = path
+        .file_name()
+        .map(|name| name.to_os_string())
+        .unwrap_or_default();
+    name.push(format!(".{}.tmp", uuid::Uuid::new_v4().simple()));
+    path.with_file_name(name)
 }
 
 /// Remove the state file after the operation reached a stable state.
@@ -213,13 +253,18 @@ fn is_sibling_artifact(candidate: &Path, install_dir: &Path, suffix: &str) -> bo
     ) {
         return false;
     }
-    let prefix = format!("{name}{suffix}");
     // `STAGING_SUFFIX` already ends with the separator; the backup suffix gets
-    // the operation id appended.
+    // the operation id appended. Accept only the exact base name or the base
+    // followed by a `-` separator: a plain prefix such as
+    // `.voxhold-backupextra` is a different directory.
+    let base = format!("{name}{}", suffix.trim_end_matches('-')).to_lowercase();
+    let candidate_name = candidate_name.to_string_lossy().to_lowercase();
+    if candidate_name == base {
+        return true;
+    }
     candidate_name
-        .to_string_lossy()
-        .to_lowercase()
-        .starts_with(&prefix.to_lowercase())
+        .strip_prefix(&base)
+        .is_some_and(|rest| rest.starts_with('-') && rest.len() > 1)
 }
 
 fn is_plain_operation_id(value: &str) -> bool {
@@ -303,5 +348,83 @@ mod tests {
             operation_backup_path(install, "abc"),
             Path::new(r"C:\Users\test\Programs\VoxHold.voxhold-backup-abc")
         );
+        assert_eq!(
+            operation_failed_path(install, "abc", 0),
+            Path::new(r"C:\Users\test\Programs\VoxHold.voxhold-failed-abc")
+        );
+        assert_eq!(
+            operation_failed_path(install, "abc", 2),
+            Path::new(r"C:\Users\test\Programs\VoxHold.voxhold-failed-abc-2")
+        );
+    }
+
+    #[test]
+    fn only_this_operations_artifacts_are_accepted() {
+        let temp = tempfile::tempdir().unwrap();
+        let install = temp.path().join("VoxHold");
+        std::fs::create_dir_all(&install).unwrap();
+
+        let canonical = sample(temp.path());
+        assert!(canonical.is_valid_for(&install));
+
+        let mut per_operation = canonical.clone();
+        per_operation.backup_dir = operation_backup_path(&install, &per_operation.operation_id);
+        assert!(per_operation.is_valid_for(&install));
+
+        // Reject names that merely share a prefix or name somebody else's
+        // artifact: completion would delete the directory in `backup_dir`.
+        for name in [".voxhold-backupextra", ".voxhold-backup-cache"] {
+            let mut foreign = canonical.clone();
+            foreign.backup_dir = install.with_file_name(format!("VoxHold{name}"));
+            assert!(!foreign.is_valid_for(&install), "{name} must be rejected");
+        }
+        let mut foreign = canonical.clone();
+        foreign.backup_dir = operation_backup_path(&install, "another-operation");
+        assert!(!foreign.is_valid_for(&install));
+
+        let mut foreign = canonical.clone();
+        foreign.staging_dir = install.with_file_name("VoxHold.voxhold-next-cache");
+        assert!(!foreign.is_valid_for(&install));
+    }
+
+    #[test]
+    fn concurrent_saves_use_distinct_temporary_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let install = temp.path().join("VoxHold");
+        std::fs::create_dir_all(&install).unwrap();
+        let path = state_path(&install);
+
+        let first = temporary_path(&path);
+        let second = temporary_path(&path);
+        assert_ne!(first, second, "each write needs its own temporary file");
+
+        let root = temp.path().to_path_buf();
+        let handles: Vec<_> = (0..4u32)
+            .map(|index| {
+                let root = root.clone();
+                std::thread::spawn(move || {
+                    let mut state = sample(&root);
+                    state.operation_id = format!("op-{index}");
+                    state.staging_dir =
+                        operation_staging_path(&root.join("VoxHold"), &state.operation_id);
+                    // Repeated writes make a fixed temporary name collide.
+                    for _ in 0..20 {
+                        save(&state)?;
+                    }
+                    Ok::<(), UpdateError>(())
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap().unwrap();
+        }
+
+        assert!(matches!(load(&install), StateLoad::Valid(_)));
+        let leftovers: Vec<_> = std::fs::read_dir(temp.path())
+            .unwrap()
+            .flatten()
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "temporary files must be gone");
     }
 }

@@ -25,7 +25,7 @@ use crate::error::{Result, UpdateError};
 use crate::fsutil;
 use crate::handshake;
 use crate::package::{read_package_json_from_dir, sha256_file, PackageIndex, PACKAGE_JSON};
-use crate::recovery::{self, RecoveryMode};
+use crate::recovery::{self, RecoveryMode, RecoveryOutcome};
 use crate::state::{self, InstallState, OperationStage, StateLoad};
 
 /// Default time the new version has to confirm startup.
@@ -194,11 +194,36 @@ pub(crate) fn apply_staged_with_hooks(
     // Resolve a previous operation first. A state that cannot be resolved is
     // never overwritten: overwriting it would destroy the only proof that the
     // backup is still needed.
-    recovery::recover_install(target_dir, RecoveryMode::Updater)?;
-    if !matches!(state::load(target_dir), StateLoad::Missing) {
-        return Err(UpdateError::InvalidState(
-            "a previous update is still unresolved; its backup was kept".into(),
-        ));
+    let recovery = recovery::recover_install(target_dir, RecoveryMode::Updater)?;
+    match recovery {
+        RecoveryOutcome::Clean
+        | RecoveryOutcome::Completed { .. }
+        | RecoveryOutcome::RolledBack { .. } => {}
+        // Without a state file the backup is an unknown legacy leftover, not
+        // an unfinished operation: there is no proof to preserve and the new
+        // operation uses its own backup name. With a state, ambiguity refuses.
+        RecoveryOutcome::Ambiguous { .. }
+            if matches!(state::load(target_dir), StateLoad::Missing) => {}
+        outcome => {
+            return Err(UpdateError::InvalidState(format!(
+                "a previous update is still unresolved ({outcome:?}); its backup was kept"
+            )));
+        }
+    }
+    match state::load(target_dir) {
+        StateLoad::Missing => {}
+        // A completed operation is proven, not unresolved. Its backup can
+        // still be locked; clearing the state unblocks the next update. The
+        // backup stays untouched on disk and becomes an unknown legacy backup,
+        // so `choose_backup_path` gives the new operation its own name.
+        StateLoad::Valid(state) if state.stage == OperationStage::Completed => {
+            state::clear(target_dir)?;
+        }
+        StateLoad::Valid(_) | StateLoad::Corrupt(_) => {
+            return Err(UpdateError::InvalidState(
+                "a previous update is still unresolved; its backup was kept".into(),
+            ));
+        }
     }
 
     let operation_id = state::new_operation_id();

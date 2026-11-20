@@ -24,6 +24,8 @@ use crate::state::{self, InstallState, OperationStage, StateLoad};
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(1);
 /// Time allowed for removing an operation's staging copy.
 const STAGING_TIMEOUT: Duration = Duration::from_secs(1);
+/// Time allowed for removing the failed installation after a rollback rename.
+const FAILED_CLEANUP_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Who is asking for recovery.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,6 +96,11 @@ pub fn recover_install(install_dir: &Path, mode: RecoveryMode) -> Result<Recover
 }
 
 fn recover_without_state(install_dir: &Path, mode: RecoveryMode) -> Result<RecoveryOutcome> {
+    // With no state file no operation owns a staging sibling. A crash before
+    // the state write leaves a copy of the package and the user files there;
+    // remove those orphans best-effort. A valid or corrupt state above never
+    // reaches this function, so an owned staging copy is never touched.
+    remove_orphan_staging(install_dir);
     let Some(backup) = find_backup(install_dir) else {
         return Ok(RecoveryOutcome::Clean);
     };
@@ -334,20 +341,77 @@ fn rollback_to_backup(state: &InstallState) -> Result<RecoveryOutcome> {
     let mut rolling = state.clone();
     rolling.stage = OperationStage::RollingBack;
     let _ = state::save(&rolling);
-    if state.install_dir.exists() {
+    restore_backup(&rolling)?;
+    clear_operation(&rolling)?;
+    Ok(RecoveryOutcome::RolledBack {
+        operation_id: state.operation_id.clone(),
+    })
+}
+
+/// Put the backup back without ever leaving the installation path empty.
+fn restore_backup(state: &InstallState) -> Result<()> {
+    restore_backup_with(state, &fsutil::rename_retry)
+}
+
+/// [`restore_backup`] with an injectable rename for the failure path tests.
+fn restore_backup_with(
+    state: &InstallState,
+    rename: &dyn Fn(&Path, &Path) -> Result<()>,
+) -> Result<()> {
+    if !state.backup_dir.exists() {
+        return Err(UpdateError::Apply(
+            "the previous installation backup is missing".into(),
+        ));
+    }
+    // Rename the failed installation away first. Deleting it in place could
+    // leave neither a runnable installation nor a backup after a partial
+    // delete (a locked file, a removed volume, a power loss).
+    let failed = if state.install_dir.exists() {
         let version = target_version(&state.install_dir);
         if version.as_deref() != Some(state.version.as_str()) {
             return Err(UpdateError::Apply(
                 "refusing to roll back an installation with an unexpected version".into(),
             ));
         }
-        fsutil::remove_dir_retry(&state.install_dir)?;
+        let failed = unique_failed_path(state);
+        rename(&state.install_dir, &failed)?;
+        Some(failed)
+    } else {
+        None
+    };
+    match rename(&state.backup_dir, &state.install_dir) {
+        Ok(()) => {
+            if let Some(failed) = failed {
+                let _ = fsutil::remove_dir_with_timeout(&failed, FAILED_CLEANUP_TIMEOUT);
+            }
+            Ok(())
+        }
+        Err(error) => {
+            // The backup could not be restored. Put the failed installation
+            // back so the user still has a runnable version.
+            if let Some(failed) = failed {
+                if let Err(put_back) = rename(&failed, &state.install_dir) {
+                    return Err(UpdateError::Apply(format!(
+                        "{error}; the failed installation could not be put back: {put_back}"
+                    )));
+                }
+            }
+            Err(error)
+        }
     }
-    fsutil::rename_retry(&state.backup_dir, &state.install_dir)?;
-    clear_operation(&rolling)?;
-    Ok(RecoveryOutcome::RolledBack {
-        operation_id: state.operation_id.clone(),
-    })
+}
+
+/// Unused sibling name for the failed installation of this operation.
+fn unique_failed_path(state: &InstallState) -> PathBuf {
+    let mut attempt = 0u32;
+    loop {
+        let candidate =
+            state::operation_failed_path(&state.install_dir, &state.operation_id, attempt);
+        if !candidate.exists() {
+            return candidate;
+        }
+        attempt = attempt.saturating_add(1);
+    }
 }
 
 /// Remove the staging copy and the state after the old installation is safe.
@@ -373,19 +437,7 @@ pub(crate) fn rollback_operation(state: &InstallState) -> Result<()> {
             let mut rolling = state.clone();
             rolling.stage = OperationStage::RollingBack;
             let _ = state::save(&rolling);
-            if state.install_dir.exists() {
-                if target_version(&state.install_dir).as_deref() == Some(state.version.as_str()) {
-                    fsutil::remove_dir_retry(&state.install_dir)?;
-                }
-            }
-            if state.install_dir.exists() {
-                return Err(UpdateError::Apply(
-                    "cannot roll back while an unidentified installation is in place".into(),
-                ));
-            }
-            if state.backup_dir.exists() {
-                fsutil::rename_retry(&state.backup_dir, &state.install_dir)?;
-            }
+            restore_backup(&rolling)?;
             clear_operation(&rolling)
         }
         OperationStage::Completed => finish_completed(state).map(|_| ()),
@@ -396,6 +448,33 @@ fn target_version(install_dir: &Path) -> Option<String> {
     read_package_json_from_dir(install_dir)
         .ok()
         .map(|index| index.version)
+}
+
+/// Remove sibling staging directories left by a crash before the state write.
+///
+/// Only called when the state is missing, so none of these directories can
+/// belong to an operation that recovery still has to finish.
+fn remove_orphan_staging(install_dir: &Path) {
+    let Some(parent) = install_dir.parent() else {
+        return;
+    };
+    let name = install_dir
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let prefix = format!("{name}{}", state::STAGING_SUFFIX).to_lowercase();
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if !entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let candidate = entry.file_name().to_string_lossy().to_lowercase();
+        if candidate.starts_with(&prefix) {
+            let _ = fsutil::remove_dir_with_timeout(&entry.path(), STAGING_TIMEOUT);
+        }
+    }
 }
 
 fn find_backup(install_dir: &Path) -> Option<PathBuf> {
@@ -425,3 +504,7 @@ fn find_backup(install_dir: &Path) -> Option<PathBuf> {
     candidates.sort();
     candidates.into_iter().next()
 }
+
+#[cfg(test)]
+#[path = "recovery_tests.rs"]
+mod tests;

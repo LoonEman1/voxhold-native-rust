@@ -184,10 +184,24 @@ impl Voxhold {
     ///
     /// Called from `main` after the view exists, not from `Voxhold::new`, so
     /// tests never touch the real `%LOCALAPPDATA%`.
-    pub(crate) fn start_update(&mut self, after_update: bool, cx: &mut Context<Self>) {
+    ///
+    /// `handshake_written` is `true` only when this process successfully wrote
+    /// the handshake for the update it was started from. Once that file exists
+    /// the operation is confirmed, so the observer must run its usual recovery
+    /// even on an update start: it upgrades `new-in-place` to `completed`
+    /// before the 10 s cleanup can remove the handshake. A failed handshake
+    /// write leaves the operation unconfirmed and the backup in place for the
+    /// helper to roll back.
+    pub(crate) fn start_update(
+        &mut self,
+        after_update: bool,
+        handshake_written: bool,
+        cx: &mut Context<Self>,
+    ) {
         let install = self.update.install_dir.clone();
         let root_override = self.update.root_override.clone();
         let current = update::current_version();
+        let recovery_allowed = startup_recovery_allowed(after_update, handshake_written);
         let executor = cx.background_executor().clone();
         let scan_executor = cx.background_executor().clone();
         self.update.clock_task = Some(cx.spawn(async move |this, cx| {
@@ -197,9 +211,7 @@ impl Voxhold {
                         &install,
                         &current,
                         root_override.as_deref(),
-                        // The helper still needs `<install>.voxhold-backup`
-                        // until this process writes its handshake.
-                        !after_update,
+                        recovery_allowed,
                     )
                 })
                 .await;
@@ -784,6 +796,15 @@ impl Voxhold {
         self.error = format!("Не удалось подтвердить запуск обновления: {message}");
         self.auth.status = self.error.clone();
     }
+}
+
+/// Whether the startup observer may finish the operation it finds on disk.
+///
+/// A normal start has nothing to prove and always recovers. An update start
+/// may only complete the operation once its handshake file exists; otherwise
+/// the state must stay unconfirmed and keep the backup for the helper.
+pub(super) fn startup_recovery_allowed(after_update: bool, handshake_written: bool) -> bool {
+    !after_update || handshake_written
 }
 
 /// The image name the helper must copy back into the installation.

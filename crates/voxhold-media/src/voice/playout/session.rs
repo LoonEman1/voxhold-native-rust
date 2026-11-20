@@ -421,11 +421,20 @@ impl Session {
         let Some(playout) = self.playout.as_ref() else {
             return;
         };
+        // The receiver list is an FFI call and the reattach rebuilds the mixer;
+        // neither may run while the WebRTC callback thread waits for this lock.
+        let receivers: Vec<(String, RtcAudioTrack)> = self
+            .peer
+            .receivers()
+            .into_iter()
+            .filter_map(|receiver| match receiver.track() {
+                Some(MediaStreamTrack::Audio(track)) => Some((track.id(), track)),
+                _ => None,
+            })
+            .collect();
         if let Ok(mut tracks) = self.playout_tracks.lock() {
-            for receiver in self.peer.receivers() {
-                if let Some(MediaStreamTrack::Audio(track)) = receiver.track() {
-                    tracks.offer(track.id(), track);
-                }
+            for (id, track) in receivers {
+                tracks.offer(id, track);
             }
             tracks.reattach(playout, &self.runtime);
         }

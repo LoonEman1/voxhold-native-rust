@@ -168,3 +168,31 @@ impl TrackSet {
         &self.retired
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prune_drops_a_finished_attachment_task() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let task = runtime.spawn(async {});
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !task.is_finished() && Instant::now() < deadline {
+            runtime.block_on(tokio::task::yield_now());
+        }
+        assert!(task.is_finished(), "the task must end before pruning");
+
+        let mut tracks = TrackSet::default();
+        tracks
+            .tasks
+            .insert("done".into(), Attachment { task, mixer: 1 });
+        tracks.prune();
+        assert!(
+            tracks.tasks.is_empty(),
+            "a finished attachment is not kept forever"
+        );
+    }
+}

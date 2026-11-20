@@ -306,6 +306,52 @@ fn a_replaced_attachment_generation_cannot_mix_or_remove_the_new_source() {
 }
 
 #[test]
+fn a_new_attachment_generation_keeps_the_participant_gain_and_mute() {
+    let mut epochs = Epochs::default();
+    let mut pool = SourcePool::default();
+    let mut mixer = Mixer::default();
+    let configured = Source {
+        gain: 0.4,
+        muted: true,
+    };
+    mixer.set_source("track", configured);
+
+    assert!(apply_frame(
+        &mut epochs,
+        &mut pool,
+        "track",
+        1,
+        vec![1_000_i16; BLOCK_SAMPLES]
+    ));
+    assert_eq!(mixer.source("track"), Some(configured));
+
+    // A replacement attachment owns the id now. Dropping the old queued PCM
+    // must not reset the participant's gain and mute.
+    assert!(apply_frame(
+        &mut epochs,
+        &mut pool,
+        "track",
+        2,
+        vec![2_000_i16; BLOCK_SAMPLES]
+    ));
+    assert_eq!(
+        mixer.source("track"),
+        Some(configured),
+        "a new attachment generation must not wipe gain/mute"
+    );
+
+    // The replaced task's late frame is still ignored.
+    assert!(!apply_frame(
+        &mut epochs,
+        &mut pool,
+        "track",
+        1,
+        vec![3_000_i16; BLOCK_SAMPLES]
+    ));
+    assert_eq!(mixer.source("track"), Some(configured));
+}
+
+#[test]
 fn a_full_source_channel_drops_the_frame_but_keeps_the_source() {
     let (clip, receiver, metrics) = test_clip(1);
     assert!(clip.push_frame("track", 1, vec![1_i16; BLOCK_SAMPLES]));
@@ -424,23 +470,6 @@ fn a_closed_tap_is_distinguishable_from_an_empty_one() {
     assert!(matches!(receiver.try_recv(), TapRead::Empty));
     drop(tap);
     assert!(matches!(receiver.try_recv(), TapRead::Closed));
-}
-
-#[test]
-fn finished_track_tasks_are_pruned() {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .build()
-        .unwrap();
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    let mut tasks = vec![runtime.spawn(async move {
-        let _ = tx.send(());
-    })];
-    runtime.block_on(async {
-        let _ = rx.await;
-        tokio::task::yield_now().await;
-    });
-    prune_finished(&mut tasks);
-    assert!(tasks.is_empty(), "a finished handle is not kept forever");
 }
 
 fn wait_for_blocks(playout: &Playout, min: u64) {

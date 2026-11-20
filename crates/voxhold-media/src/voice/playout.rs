@@ -101,6 +101,12 @@ impl StateSlot {
 mod tap;
 use tap::Tap;
 pub(crate) use tap::TapReceiver;
+mod tracks;
+pub(crate) use tracks::TrackSet;
+
+/// Identifies one mixer generation. A task recorded against an older serial
+/// belongs to a replaced playout and must not be trusted again.
+static MIXER_SERIAL: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Default)]
 struct Metrics {
@@ -330,6 +336,9 @@ pub(crate) struct Playout {
     state: StateSlot,
     tap: Tap,
     open: Arc<OpenSink>,
+    /// Generation of this mixer, used to tell a current attachment task from
+    /// one bound to a replaced playout.
+    serial: u64,
     /// Non-blocking shutdown signal; `Drop` sets it instead of sending on a
     /// possibly full channel.
     stop: Arc<AtomicBool>,
@@ -450,6 +459,7 @@ impl Playout {
             state,
             tap,
             open,
+            serial: MIXER_SERIAL.fetch_add(1, Ordering::Relaxed) + 1,
             stop,
             thread: Some(thread),
             stability: Arc::new(Mutex::new(Stability {
@@ -491,6 +501,10 @@ impl Playout {
 
     pub(crate) fn clip(&self) -> PlayoutClip {
         self.clip.clone()
+    }
+
+    pub(crate) fn serial(&self) -> u64 {
+        self.serial
     }
 
     /// Post-mix subscription for the W07 recorder. No consumer is wired in this
@@ -649,6 +663,7 @@ fn run(
     sink.close();
 }
 
+#[cfg(test)]
 fn prune_finished(tasks: &mut Vec<tokio::task::JoinHandle<()>>) {
     tasks.retain(|task| !task.is_finished());
 }

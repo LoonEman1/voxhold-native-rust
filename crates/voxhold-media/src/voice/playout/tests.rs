@@ -452,6 +452,146 @@ fn drain(events: &Events) -> (u32, Option<PlayoutStats>) {
     (errors, last)
 }
 
+/// A synthetic receiver for the attachment tests: no device and no network,
+/// but the same `RtcAudioTrack` the WebRTC callback hands to the worker.
+fn synthetic_track(id: &str) -> RtcAudioTrack {
+    let factory = PeerConnectionFactory::default();
+    let source = libwebrtc::audio_source::native::NativeAudioSource::new(
+        capture::source_options(),
+        capture::SAMPLE_RATE,
+        capture::CHANNELS,
+        0,
+    );
+    factory.create_audio_track(id, source)
+}
+
+/// Builds a headless session whose first mixer uses the fake sink factory.
+fn session_with_mixer(open: Arc<OpenSink>) -> Session {
+    let playout = Playout::start_with(None, open.clone()).expect("the fake mixer opens");
+    Session::test_headless(open).adopt_initial_playout(Some(playout))
+}
+
+/// Aborted tasks finish on the runtime; a dropped-but-not-aborted handle would
+/// keep streaming into the replaced mixer and stay unfinished.
+async fn wait_for_retired(session: &Session, expected: usize) {
+    for _ in 0..50 {
+        let done = session
+            .playout_tracks
+            .lock()
+            .map(|tracks| {
+                tracks.retired().len() == expected
+                    && tracks.retired().iter().all(|task| task.is_finished())
+            })
+            .unwrap_or(false);
+        if done {
+            return;
+        }
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    panic!("the replaced mixer's tasks were not closed");
+}
+
+/// A participant who joins after the call entry must not be bound to the
+/// entry-time clip: the arrival is attached to the mixer that is current when
+/// the worker drains it, and a mixer replacement reattaches the earlier track
+/// instead of dropping it.
+#[tokio::test]
+async fn a_late_track_attaches_to_the_current_mixer() {
+    let writes = Arc::new(Mutex::new(Vec::new()));
+    let (open, _) = failing_then_open(0, writes);
+    let mut session = session_with_mixer(open);
+    let events = session.events.clone();
+    let first_serial = session.playout.as_ref().unwrap().serial();
+
+    session.test_offer_track("early", synthetic_track("early"));
+    session.pump_track_arrivals();
+    assert_eq!(
+        session.playout_tracks.lock().unwrap().attached_to("early"),
+        Some(first_serial)
+    );
+
+    assert!(
+        session.attempt_software_playout(&events, RecoveryCause::Sink),
+        "the fake factory opens the replacement mixer"
+    );
+    let current = session.playout.as_ref().unwrap().serial();
+    assert_ne!(current, first_serial, "the mixer really was replaced");
+
+    session.test_offer_track("late", synthetic_track("late"));
+    session.pump_track_arrivals();
+    let tracks = session.playout_tracks.lock().unwrap();
+    assert_eq!(
+        tracks.attached_to("late"),
+        Some(current),
+        "a track that arrives after entry follows the current mixer"
+    );
+    assert_eq!(
+        tracks.attached_to("early"),
+        Some(current),
+        "the mixer swap must not drop the track that was already mixed"
+    );
+    assert_eq!(tracks.len(), 2, "one task per track id");
+}
+
+/// A re-offered track id replaces its task: the same receiver is never mixed
+/// twice, and the old task is closed.
+#[tokio::test]
+async fn a_reoffered_track_is_attached_once() {
+    let writes = Arc::new(Mutex::new(Vec::new()));
+    let (open, _) = failing_then_open(0, writes);
+    let mut session = session_with_mixer(open);
+    let current = session.playout.as_ref().unwrap().serial();
+
+    session.test_offer_track("dup", synthetic_track("dup"));
+    session.pump_track_arrivals();
+    session.test_offer_track("dup", synthetic_track("dup"));
+    session.pump_track_arrivals();
+
+    let tracks = session.playout_tracks.lock().unwrap();
+    assert_eq!(tracks.len(), 1, "a duplicate id owns exactly one task");
+    assert_eq!(tracks.known_len(), 1);
+    assert_eq!(tracks.attached_to("dup"), Some(current));
+    drop(tracks);
+    wait_for_retired(&session, 1).await;
+}
+
+/// Replacing the mixer closes every task of the old one and attaches each
+/// active track once to the new one.
+#[tokio::test]
+async fn replacing_the_mixer_reattaches_each_active_track_once() {
+    let writes = Arc::new(Mutex::new(Vec::new()));
+    let (open, _) = failing_then_open(0, writes);
+    let mut session = session_with_mixer(open);
+    let events = session.events.clone();
+    let first_serial = session.playout.as_ref().unwrap().serial();
+
+    session.test_offer_track("a", synthetic_track("a"));
+    session.test_offer_track("b", synthetic_track("b"));
+    session.pump_track_arrivals();
+    {
+        let tracks = session.playout_tracks.lock().unwrap();
+        assert_eq!(tracks.attached_to("a"), Some(first_serial));
+        assert_eq!(tracks.attached_to("b"), Some(first_serial));
+    }
+
+    assert!(session.attempt_software_playout(&events, RecoveryCause::Sink));
+    let current = session.playout.as_ref().unwrap().serial();
+    assert_ne!(current, first_serial);
+
+    let tracks = session.playout_tracks.lock().unwrap();
+    assert_eq!(
+        tracks.len(),
+        2,
+        "each active track is attached exactly once"
+    );
+    assert_eq!(tracks.known_len(), 2, "no active track is forgotten");
+    assert_eq!(tracks.attached_to("a"), Some(current));
+    assert_eq!(tracks.attached_to("b"), Some(current));
+    drop(tracks);
+    wait_for_retired(&session, 2).await;
+}
+
 /// The initial sink is opened by `Session::new`; this drives the same
 /// `adopt_initial_playout` constructor tail and `tick_playout` without devices,
 /// so a session that forgets to enter the proof window fails here.

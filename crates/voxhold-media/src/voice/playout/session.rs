@@ -44,6 +44,7 @@ impl Session {
             self.playout_mode = PlayoutMode::Software;
             self.playout_attempts.opened();
             self.last_playout_report = std::time::Instant::now() - Duration::from_secs(1);
+            self.attach_all_tracks();
         }
         self.apply_audio_controls();
         self
@@ -116,7 +117,7 @@ impl Session {
     pub(crate) fn suspend_playout(&mut self, events: &Events) {
         self.playout_suspended = true;
         if self.playout.take().is_some() {
-            self.abort_playout_tasks();
+            self.detach_playout_tracks();
         }
         self.report_audio(events);
     }
@@ -160,7 +161,7 @@ impl Session {
             return;
         }
         self.playout.take();
-        self.abort_playout_tasks();
+        self.detach_playout_tracks();
         self.playout_attempts.reset_for_resume(now);
         if !self.attempt_software_playout(events, RecoveryCause::Resume) {
             // The retry ladder owns the next attempt; the UI must stop saying
@@ -173,7 +174,7 @@ impl Session {
     /// from the UI, and never busy-loops: every transition is counted once.
     pub(crate) fn tick_playout(&mut self, events: &Events) {
         let now = std::time::Instant::now();
-        self.prune_playout_tasks();
+        self.prune_playout_tracks();
         match self.playout_mode {
             PlayoutMode::Software => {
                 if self.playout_suspended {
@@ -207,7 +208,7 @@ impl Session {
                     // is one state transition: one failure, one message, no
                     // reattach and no immediate reopen.
                     self.playout = None;
-                    self.abort_playout_tasks();
+                    self.detach_playout_tracks();
                     let outcome = self.playout_attempts.sink_died(now);
                     if outcome == FailureOutcome::AdmFallback {
                         self.engage_adm_fallback(events, RecoveryCause::Sink);
@@ -301,7 +302,7 @@ impl Session {
                 self.playout = Some(playout);
                 self.playout_mode = PlayoutMode::Software;
                 self.playout_reconnects = self.playout_reconnects.saturating_add(1);
-                self.attach_existing_tracks();
+                self.attach_all_tracks();
                 self.push_playout_state();
                 self.report_audio(events);
                 if let Some(playout) = &self.playout {
@@ -342,7 +343,7 @@ impl Session {
         self.playout_mode = PlayoutMode::AdmFallback;
         self.playout_attempts.to_adm();
         self.playout = None;
-        self.abort_playout_tasks();
+        self.detach_playout_tracks();
         let started = if self.adm_calls_allowed() {
             self.audio.set_playout(true);
             self.audio.start(false)
@@ -379,36 +380,54 @@ impl Session {
         });
     }
 
-    fn abort_playout_tasks(&mut self) {
-        if let Ok(mut tasks) = self.playout_tasks.lock() {
-            for task in tasks.drain(..) {
-                task.abort();
-            }
+    fn detach_playout_tracks(&mut self) {
+        if let Ok(mut tracks) = self.playout_tracks.lock() {
+            tracks.detach();
         }
     }
 
-    /// A finished track task is kept in the shared Vec until the call ends
-    /// unless it is pruned; a call can add a task per renegotiation.
-    fn prune_playout_tasks(&mut self) {
-        if let Ok(mut tasks) = self.playout_tasks.lock() {
-            prune_finished(&mut tasks);
+    /// A finished track task is not kept forever; the next arrival or mixer
+    /// swap would otherwise reattach a track that already ended.
+    fn prune_playout_tracks(&mut self) {
+        if let Ok(mut tracks) = self.playout_tracks.lock() {
+            tracks.prune();
         }
     }
 
-    /// Every receiver that is still present gets a fresh engine sink on the new
-    /// mixer. `on_track` is not repeated for those tracks after a system sleep.
-    fn attach_existing_tracks(&mut self) {
-        self.prune_playout_tasks();
-        let Some(playout) = self.playout.as_ref().map(Playout::clip) else {
+    /// Attach a receiver announced by `on_track` to the mixer that is current
+    /// now. Called from the media worker, never from the WebRTC callback
+    /// thread, so a late participant is not bound to the entry-time playout.
+    pub(crate) fn pump_track_arrivals(&mut self) {
+        let Some(playout) = self.playout.as_ref() else {
             return;
         };
-        for receiver in self.peer.receivers() {
-            if let Some(MediaStreamTrack::Audio(track)) = receiver.track() {
-                let task = playout.attach(track.id(), track, self.runtime.clone());
-                if let Ok(mut tasks) = self.playout_tasks.lock() {
-                    tasks.push(task);
+        if let Ok(mut tracks) = self.playout_tracks.lock() {
+            tracks.pump(playout, &self.runtime);
+        }
+    }
+
+    /// Queue an arrival without the WebRTC callback, which needs a real peer.
+    #[cfg(test)]
+    pub(crate) fn test_offer_track(&self, track_id: &str, track: RtcAudioTrack) {
+        if let Ok(mut tracks) = self.playout_tracks.lock() {
+            tracks.offer(track_id.to_owned(), track);
+        }
+    }
+
+    /// Close the old mixer's attachment tasks and attach every active track to
+    /// the new playout exactly once. Receivers that never reached `on_track`
+    /// are offered first, so the swap cannot drop the last audible track.
+    fn attach_all_tracks(&mut self) {
+        let Some(playout) = self.playout.as_ref() else {
+            return;
+        };
+        if let Ok(mut tracks) = self.playout_tracks.lock() {
+            for receiver in self.peer.receivers() {
+                if let Some(MediaStreamTrack::Audio(track)) = receiver.track() {
+                    tracks.offer(track.id(), track);
                 }
             }
+            tracks.reattach(playout, &self.runtime);
         }
     }
 }

@@ -12,6 +12,7 @@
 
 use libwebrtc::{
     peer_connection::{BitrateSettings, PeerConnection},
+    rtp_parameters::RtpEncodingParameters,
     rtp_sender::RtpSender,
 };
 
@@ -23,6 +24,9 @@ use crate::publisher::Quality;
 pub struct Limits {
     pub video_bps: Option<u64>,
     pub audio_bps: Option<u64>,
+    /// The connection-wide limit. `PeerConnection::set_bitrate` has no readback
+    /// API, so this field is confirmed only by an `Ok(())` call, never by
+    /// reading a value back.
     pub peer_bps: Option<u64>,
 }
 
@@ -52,19 +56,23 @@ impl Target {
 pub struct Failure {
     /// User-facing reason, including whether the previous limits came back.
     pub message: String,
-    /// Every changed stage returned to its previous value.
+    /// Every changed stage returned to its previous value. `false` is a partial
+    /// change; there is no separate `partial` flag.
     pub restored: bool,
-    /// At least one changed stage could not be restored.
-    pub partial: bool,
 }
 
 /// The sender side of one live change.
 pub trait BitrateSink {
-    /// Apply the video encoding limit and return the readback maximum.
+    /// Apply the video encoding limit and return the readback maximum. The
+    /// answer is `None` unless every encoding reports the requested limit.
     fn set_video(&mut self, limit: u64) -> Result<Option<u64>, String>;
     /// Apply the published-audio encoding limit and return the readback maximum.
+    /// The answer is `None` unless every encoding reports the requested limit.
     fn set_audio(&mut self, limit: u64) -> Result<Option<u64>, String>;
     /// Apply the connection-wide limit shared by all RTP streams.
+    ///
+    /// The pinned `PeerConnection` has no readback for this setting: only the
+    /// `Ok(())` of this call confirms it, never a later read.
     fn set_peer(&mut self, total: u64) -> Result<(), String>;
 }
 
@@ -89,7 +97,11 @@ impl Stage {
 ///
 /// The result is the limits the senders really report, never the requested
 /// values. A stage that returned a different readback is a failure even when
-/// the underlying call reported success.
+/// the underlying call reported success. The video and audio stages require a
+/// non-empty encoding list where **every** encoding reports the requested
+/// limit, so a partially applied multi-encoding change is never success. The
+/// peer stage has no readback in the pinned engine: only its `Ok(())` answer
+/// confirms it.
 pub fn apply_verified(
     sink: &mut impl BitrateSink,
     target: Target,
@@ -164,7 +176,7 @@ pub fn apply_verified(
 fn mismatch(expected: u64, readback: Option<u64>) -> String {
     match readback {
         Some(actual) => format!("движок подтвердил {actual} бит/с вместо {expected}"),
-        None => "движок не подтвердил новый предел: у отправителя нет активных кодирований".into(),
+        None => "движок не подтвердил новый предел: нет активных кодирований или не все кодирования приняли его".into(),
     }
 }
 
@@ -218,7 +230,6 @@ fn recover(
             detail.trim_end_matches('.')
         ),
         restored,
-        partial: !restored,
     }
 }
 
@@ -278,8 +289,9 @@ pub(super) fn apply_sender_limits(
 }
 
 /// Set `max_bitrate` on every encoding of one sender and return the value the
-/// sender reports afterwards. `None` means no active encoding could report a
-/// limit, which never confirms a change.
+/// sender reports afterwards. `None` means the encoding list is empty or at
+/// least one encoding still reports another value, which never confirms a
+/// change: a partially applied multi-encoding limit must not look applied.
 fn set_sender_limit(sender: &RtpSender, limit: u64) -> Result<Option<u64>, String> {
     let mut parameters = sender.parameters();
     for encoding in &mut parameters.encodings {
@@ -288,11 +300,27 @@ fn set_sender_limit(sender: &RtpSender, limit: u64) -> Result<Option<u64>, Strin
     sender
         .set_parameters(parameters)
         .map_err(|error| error.to_string())?;
-    Ok(readback(sender))
+    Ok(readback(&sender.parameters().encodings, limit))
 }
 
-/// The actual `max_bitrate` of one sender, read from `parameters()`.
-fn readback(sender: &RtpSender) -> Option<u64> {
+/// Whether every encoding of the sender confirms exactly `limit`.
+///
+/// The pinned sender has no active-encoding filter and an empty list proves
+/// nothing, so both an empty list and any differing/absent `max_bitrate` are a
+/// refusal. The `active` flag is deliberately not used as a shortcut: an
+/// encoding that is not active now may still be selected later, and the limit
+/// must already be the one this operation asked for.
+fn readback(encodings: &[RtpEncodingParameters], limit: u64) -> Option<u64> {
+    (!encodings.is_empty()
+        && encodings
+            .iter()
+            .all(|encoding| encoding.max_bitrate == Some(limit)))
+    .then_some(limit)
+}
+
+/// The highest `max_bitrate` the sender reports, for diagnostics only. The
+/// verification path uses [`readback`], which requires every encoding to agree.
+fn actual_readback(sender: &RtpSender) -> Option<u64> {
     sender
         .parameters()
         .encodings
@@ -306,10 +334,36 @@ fn readback(sender: &RtpSender) -> Option<u64> {
 /// instead of the previously confirmed one.
 pub(super) fn readback_limits(video: &RtpSender, audio: Option<&RtpSender>) -> Limits {
     Limits {
-        video_bps: readback(video),
-        audio_bps: audio.and_then(readback),
+        video_bps: actual_readback(video),
+        audio_bps: audio.and_then(actual_readback),
         peer_bps: None,
     }
+}
+
+/// Name the limits the senders really report after a partially failed restore.
+/// The clean refusal keeps its original message; only a `restored == false`
+/// result appends the actual values, so the user and the diagnostics can see
+/// what is really on air instead of the requested or previously confirmed one.
+pub(super) fn failure_message(failure: Failure, actual: Limits, audio_present: bool) -> String {
+    if failure.restored {
+        return failure.message;
+    }
+    fn describe(value: Option<u64>) -> String {
+        match value {
+            Some(bps) => format!("{bps} бит/с"),
+            None => "не подтверждено".into(),
+        }
+    }
+    let audio = if audio_present {
+        describe(actual.audio_bps)
+    } else {
+        "нет дорожки".into()
+    };
+    format!(
+        "{} Сейчас в движке: видео {}, аудио {audio}.",
+        failure.message,
+        describe(actual.video_bps)
+    )
 }
 
 #[cfg(test)]
@@ -442,7 +496,6 @@ mod tests {
         let failure = apply_verified(&mut sink, target(1_200_000, None), previous)
             .expect_err("a mismatched readback is a failure");
         assert!(failure.restored, "{failure:?}");
-        assert!(!failure.partial, "{failure:?}");
         assert!(
             failure.message.contains("подтвердил 2500000"),
             "the readback is named: {}",
@@ -468,7 +521,6 @@ mod tests {
         let failure = apply_verified(&mut sink, target(1_200_000, Some(64_000)), previous)
             .expect_err("the audio stage refuses the change");
         assert!(failure.restored, "{failure:?}");
-        assert!(!failure.partial, "{failure:?}");
         assert!(
             failure.message.contains("аудио") && !failure.message.contains("часть лимитов"),
             "a clean refusal names the stage: {}",
@@ -494,7 +546,6 @@ mod tests {
         let failure = apply_verified(&mut sink, target(1_200_000, Some(64_000)), previous)
             .expect_err("the audio stage refuses the change");
         assert!(!failure.restored, "{failure:?}");
-        assert!(failure.partial, "{failure:?}");
         assert!(
             failure.message.contains("часть лимитов изменена"),
             "a partial change must say so: {}",
@@ -519,10 +570,95 @@ mod tests {
         let failure = apply_verified(&mut sink, target(1_200_000, Some(64_000)), previous)
             .expect_err("the peer stage refuses the change");
         assert!(failure.restored, "{failure:?}");
-        assert!(!failure.partial, "{failure:?}");
         assert_eq!(sink.video, Some(2_500_000));
         assert_eq!(sink.audio, Some(128_000));
         assert_eq!(sink.peer, Some(2_628_000));
+    }
+
+    #[test]
+    fn a_partially_applied_multi_encoding_limit_is_not_confirmed() {
+        let encoding = |max_bitrate| RtpEncodingParameters {
+            active: true,
+            max_bitrate,
+            ..RtpEncodingParameters::default()
+        };
+        assert_eq!(
+            readback(
+                &[encoding(Some(1_200_000)), encoding(Some(1_200_000))],
+                1_200_000
+            ),
+            Some(1_200_000),
+            "every encoding reports the requested limit"
+        );
+        assert_eq!(
+            readback(
+                &[encoding(Some(1_200_000)), encoding(Some(2_500_000))],
+                1_200_000
+            ),
+            None,
+            "one encoding still reports another limit"
+        );
+        assert_eq!(
+            readback(&[encoding(Some(1_200_000)), encoding(None)], 1_200_000),
+            None,
+            "an encoding without a readback cannot confirm the change"
+        );
+        assert_eq!(
+            readback(&[], 1_200_000),
+            None,
+            "an empty encoding list proves nothing"
+        );
+    }
+
+    #[test]
+    fn a_partial_failure_names_the_actual_limits_and_a_clean_one_does_not() {
+        let actual = Limits {
+            video_bps: Some(1_450_000),
+            audio_bps: None,
+            peer_bps: None,
+        };
+        let clean = failure_message(
+            Failure {
+                message: "Не удалось применить новый битрейт (видео): отказ. Прежние параметры восстановлены.".into(),
+                restored: true,
+            },
+            actual,
+            true,
+        );
+        assert!(
+            !clean.contains("Сейчас в движке"),
+            "a clean refusal keeps its original text: {clean}"
+        );
+
+        let partial = failure_message(
+            Failure {
+                message: "Не удалось применить новый битрейт (видео): отказ. Прежние параметры восстановить не удалось: часть лимитов изменена.".into(),
+                restored: false,
+            },
+            actual,
+            true,
+        );
+        assert!(
+            partial.contains("1450000 бит/с") && partial.contains("аудио не подтверждено"),
+            "a partial change names the actual readback: {partial}"
+        );
+        assert!(
+            partial.contains("часть лимитов изменена"),
+            "the existing error text stays intact: {partial}"
+        );
+
+        let without_audio = failure_message(
+            Failure {
+                message: "Отказ.".into(),
+                restored: false,
+            },
+            actual,
+            false,
+        );
+        assert!(
+            without_audio.contains("аудио нет дорожки"),
+            "an attempt without audio says so: {without_audio}"
+        );
     }
 
     #[test]

@@ -639,6 +639,20 @@ impl VoicePanel {
         if !self.screen.open {
             return;
         }
+        // A live bitrate change is still being applied by the senders. Closing
+        // would hide it while it can still change the on-air limit (and a
+        // stop/cancel does not belong to this operation), so Escape, the
+        // backdrop and Cancel wait for the engine's Applied/Failed answer.
+        let applying = self.screen.pending_quality_op.is_some_and(|op| {
+            self.screen
+                .sharing
+                .quality_status
+                .as_ref()
+                .is_some_and(|status| status.op == op && status.outcome == QualityOutcome::Applying)
+        });
+        if applying {
+            return;
+        }
         let restart_open = self.screen.restart;
         // A preflight is pending as soon as this dialog asked for a restart,
         // even before the worker's `preflighting` update lands or after a

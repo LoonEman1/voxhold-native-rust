@@ -30,6 +30,9 @@ use std::{
 pub const ANSWER_TIMEOUT: Duration = Duration::from_secs(15);
 /// The stop handshake is bounded; a stalled socket never holds the capture.
 pub const STOP_TIMEOUT: Duration = Duration::from_secs(5);
+/// A live bitrate change that the worker does not confirm within this window is
+/// reported as a failure instead of leaving the dialog in `Applying` forever.
+pub const BITRATE_CONFIRM_TIMEOUT: Duration = Duration::from_secs(5);
 /// `MaxChannelPublishers` in `internal/streamcontract/limits.go`.
 pub const MAX_CHANNEL_PUBLISHERS: usize = 8;
 /// SDR is the only rendition of this stage; HDR is a later task.
@@ -193,6 +196,10 @@ pub struct Publisher {
     /// yet. `request` and `confirmed` keep the previous on-air values until
     /// the worker reports an `Applied` result for this operation.
     pending_bitrate: Option<PendingBitrate>,
+    /// The moment a live bitrate change must be confirmed by. If it passes
+    /// while the operation is still `Applying`, the operation fails without
+    /// stopping the publication; a late engine answer is then ignored.
+    bitrate_deadline: Option<Instant>,
     /// The backend broadcasts `stream.stopped` to the whole server and also
     /// answers `stream.stop` directly, so one stop produces two events. After
     /// a confirmed stop the second copy must not end the freshly restarted
@@ -245,6 +252,7 @@ impl Publisher {
             preflighting: false,
             quality_status: None,
             pending_bitrate: None,
+            bitrate_deadline: None,
             ignore_stop_echo: false,
             has_audio: false,
             audio_scope: None,
@@ -392,6 +400,7 @@ impl Publisher {
         request.quality = request.quality.clamped();
         self.quality_status = Some(QualityStatus::new(op, QualityOutcome::Committed));
         self.pending_bitrate = None;
+        self.bitrate_deadline = None;
         // Keep the confirmed live request. If the new attempt fails locally
         // after the old stream was stopped, it is restored once.
         self.rollback = self.request.clone();
@@ -446,6 +455,7 @@ impl Publisher {
                 self.stats = None;
                 self.viewer_wait = None;
                 self.deadline = None;
+                self.bitrate_deadline = None;
                 if self.start_sent {
                     self.stop_deadline = Some(now + STOP_TIMEOUT);
                     out.push(Outcome::State(self.sharing()));
@@ -489,6 +499,14 @@ impl Publisher {
         }
         if self.stop_deadline.is_some_and(|deadline| now >= deadline) {
             return self.finish();
+        }
+        if self.phase == Phase::Live
+            && self
+                .bitrate_deadline
+                .is_some_and(|deadline| now >= deadline)
+            && let Some(op) = self.pending_bitrate.as_ref().map(|pending| pending.op)
+        {
+            return self.bitrate_failed(op, "Медиадвижок не подтвердил новый битрейт.");
         }
         if self.phase == Phase::Publishing && self.deadline.is_some_and(|deadline| now >= deadline)
         {
@@ -861,6 +879,7 @@ impl Publisher {
         self.preflighting = false;
         self.quality_status = None;
         self.pending_bitrate = None;
+        self.bitrate_deadline = None;
         self.ignore_stop_echo = false;
         self.has_audio = false;
         self.audio_scope = None;
@@ -906,6 +925,7 @@ impl Publisher {
         self.restarting = false;
         self.preflighting = false;
         self.pending_bitrate = None;
+        self.bitrate_deadline = None;
         self.has_audio = false;
         self.audio_scope = None;
         vec![
@@ -927,6 +947,7 @@ impl Publisher {
         self.preflighting = false;
         self.quality_status = None;
         self.pending_bitrate = None;
+        self.bitrate_deadline = None;
         self.ignore_stop_echo = false;
         self.has_audio = false;
         self.audio_scope = None;

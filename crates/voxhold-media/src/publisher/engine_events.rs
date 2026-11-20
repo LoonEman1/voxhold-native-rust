@@ -21,11 +21,9 @@ pub enum BitrateResult {
     /// At least one stage refused the limit or reported another readback.
     Failed {
         message: String,
-        /// Every changed stage returned to its previous value.
+        /// Every changed stage returned to its previous value. `false` means a
+        /// partial change whose message names the actual readback limits.
         restored: bool,
-        /// A changed stage could not be restored; the live limits are partially
-        /// changed and the message must say so.
-        partial: bool,
     },
 }
 

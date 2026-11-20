@@ -175,8 +175,8 @@ fn a_full_command_queue_keeps_the_live_attempt_and_its_previous_limit() {
     // operation stays `Applying`, never `Applied`.
     let pending = publisher.bitrate_queued(1);
     assert!(
-        pending.is_empty() || pending == vec![Outcome::State(publisher.sharing())],
-        "a deferred limit may only repeat its status: {pending:?}"
+        pending.is_empty(),
+        "the status is already Applying, so a full queue repeats nothing: {pending:?}"
     );
     assert_eq!(
         publisher.phase(),
@@ -250,6 +250,120 @@ fn a_full_command_queue_keeps_the_live_attempt_and_its_previous_limit() {
     assert!(publisher.bitrate_applied(1).is_empty());
 }
 
+/// A lost engine result must not leave the dialog in `Applying` forever: the
+/// bounded confirmation deadline turns it into a visible refusal, keeps the
+/// previous confirmed limits on air and ignores the late answer.
+#[test]
+fn a_lost_bitrate_confirmation_times_out_and_keeps_the_previous_limit() {
+    let now = Instant::now();
+    let mut publisher = publisher();
+    live(&mut publisher, now);
+    let attempt = publisher.attempt;
+    let previous = publisher.request().cloned().expect("live request");
+    let previous_confirmed = publisher.sharing().confirmed.clone();
+    let next = bitrate_only();
+    publisher.apply_quality(1, next.clone(), now);
+
+    assert!(
+        publisher
+            .tick(now + BITRATE_CONFIRM_TIMEOUT - Duration::from_millis(1))
+            .is_empty(),
+        "the deadline has not expired yet"
+    );
+    let expired = publisher.tick(now + BITRATE_CONFIRM_TIMEOUT);
+    assert!(
+        matches!(expired.as_slice(), [Outcome::State(_)]),
+        "one state update reports the timeout: {expired:?}"
+    );
+    assert_eq!(publisher.phase(), Phase::Live, "the phase stays Live");
+    assert_eq!(
+        publisher.request(),
+        Some(&previous),
+        "the old request stays"
+    );
+    assert_eq!(
+        publisher.sharing().confirmed,
+        previous_confirmed,
+        "the confirmed configuration stays on air"
+    );
+    assert!(
+        publisher
+            .sharing()
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("не подтвердил новый битрейт")),
+        "the timeout is visible: {:?}",
+        publisher.sharing().error
+    );
+    assert_eq!(
+        publisher
+            .sharing()
+            .quality_status
+            .map(|status| status.outcome),
+        Some(QualityOutcome::Failed(
+            "Медиадвижок не подтвердил новый битрейт.".into()
+        ))
+    );
+    assert!(
+        !expired.iter().any(|outcome| matches!(
+            outcome,
+            Outcome::Send(_)
+                | Outcome::StartEngine { .. }
+                | Outcome::StopEngine
+                | Outcome::LeaveViewer
+        )),
+        "a lost answer never stops or restarts the publication: {expired:?}"
+    );
+
+    // The engine answers after the deadline: the operation already failed, so
+    // the late result cannot replace the confirmed limits.
+    let late = publisher.on_engine(
+        EngineEvent::Bitrate {
+            attempt,
+            op: 1,
+            result: BitrateResult::Applied,
+        },
+        now + BITRATE_CONFIRM_TIMEOUT,
+    );
+    assert!(late.is_empty(), "a late result is ignored: {late:?}");
+    assert_eq!(publisher.request(), Some(&previous));
+    let late_failure = publisher.on_engine(
+        EngineEvent::Bitrate {
+            attempt,
+            op: 1,
+            result: BitrateResult::Failed {
+                message: "Поздний отказ.".into(),
+                restored: true,
+            },
+        },
+        now + BITRATE_CONFIRM_TIMEOUT,
+    );
+    assert!(
+        late_failure.is_empty(),
+        "a late refusal must not replace the timeout: {late_failure:?}"
+    );
+    assert_eq!(
+        publisher
+            .sharing()
+            .quality_status
+            .map(|status| status.outcome),
+        Some(QualityOutcome::Failed(
+            "Медиадвижок не подтвердил новый битрейт.".into()
+        ))
+    );
+
+    // The dialog may retry the same change as a new operation.
+    let retry = publisher.apply_quality(2, next.clone(), now + BITRATE_CONFIRM_TIMEOUT);
+    assert!(matches!(
+        retry.first(),
+        Some(Outcome::SetBitrate { attempt: a, op: 2, quality }) if *a == attempt && *quality == next.quality
+    ));
+    assert_eq!(
+        publisher.sharing().quality_status.map(|status| status.op),
+        Some(2)
+    );
+}
+
 /// A refused live change keeps the previous confirmed configuration on air:
 /// phase `Live`, no stop, no restart, and the error names the failure.
 #[test]
@@ -270,7 +384,6 @@ fn a_refused_live_bitrate_keeps_the_confirmed_limits_and_allows_a_retry() {
             result: BitrateResult::Failed {
                 message: "Не удалось применить новый битрейт (видео): отказ.".into(),
                 restored: true,
-                partial: false,
             },
         },
         now,
@@ -463,7 +576,6 @@ fn a_reoffer_after_a_refusal_keeps_the_confirmed_quality() {
             result: BitrateResult::Failed {
                 message: "Отказ.".into(),
                 restored: true,
-                partial: false,
             },
         },
         now,

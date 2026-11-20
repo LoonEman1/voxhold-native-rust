@@ -10,8 +10,8 @@ use serde_json::json;
 use std::time::Instant;
 
 use super::{
-    BitrateResult, Confirmed, Outcome, Phase, PublishRequest, Publisher, QualityChange, QualityOp,
-    QualityOutcome, QualityStatus, STOP_TIMEOUT,
+    BITRATE_CONFIRM_TIMEOUT, BitrateResult, Confirmed, Outcome, Phase, PublishRequest, Publisher,
+    QualityChange, QualityOp, QualityOutcome, QualityStatus, STOP_TIMEOUT,
 };
 
 /// The status of a live bitrate change that the sender really received.
@@ -48,7 +48,7 @@ impl Publisher {
         &mut self,
         op: QualityOp,
         request: PublishRequest,
-        _now: Instant,
+        now: Instant,
     ) -> Vec<Outcome> {
         if self.phase != Phase::Live {
             return Vec::new();
@@ -70,6 +70,7 @@ impl Publisher {
             attempt: self.attempt,
             request,
         });
+        self.bitrate_deadline = Some(now + BITRATE_CONFIRM_TIMEOUT);
         self.error = None;
         self.status = BITRATE_APPLYING_STATUS.into();
         self.quality_status = Some(QualityStatus::new(op, QualityOutcome::Applying));
@@ -110,6 +111,7 @@ impl Publisher {
         let Some(pending) = self.pending_bitrate.take() else {
             return Vec::new();
         };
+        self.bitrate_deadline = None;
         if pending.op != op || pending.attempt != self.attempt {
             return Vec::new();
         }
@@ -130,10 +132,14 @@ impl Publisher {
     /// live publication, its attempt and its previous limits stay untouched:
     /// no `stream.stop`, no `StopEngine`, no viewer teardown.
     pub fn bitrate_failed(&mut self, op: QualityOp, message: &str) -> Vec<Outcome> {
-        if self.phase != Phase::Live || !self.operation_current(op) {
+        if self.phase != Phase::Live
+            || !self.operation_current(op)
+            || self.pending_bitrate.is_none()
+        {
             return Vec::new();
         }
         self.pending_bitrate = None;
+        self.bitrate_deadline = None;
         self.status = message.to_owned();
         self.error = Some(message.to_owned());
         self.quality_status = Some(QualityStatus::new(
@@ -160,7 +166,6 @@ impl Publisher {
             BitrateResult::Failed {
                 message,
                 restored: _,
-                partial: _,
             } => self.bitrate_failed(op, &message),
         }
     }
@@ -176,6 +181,7 @@ impl Publisher {
         // A different operation replaced the live-bitrate request; its late
         // engine result must not update the confirmed configuration.
         self.pending_bitrate = None;
+        self.bitrate_deadline = None;
         self.error = None;
         self.status = "Проверяем новую настройку…".into();
         self.quality_status = Some(QualityStatus::new(op, QualityOutcome::Preflighting));

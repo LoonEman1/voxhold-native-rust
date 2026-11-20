@@ -15,7 +15,7 @@
 use std::{
     collections::VecDeque,
     sync::{
-        Arc, Mutex, OnceLock,
+        Arc, OnceLock,
         atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
@@ -43,7 +43,9 @@ use crate::{
     Candidate, IceServer,
     publisher::{
         BitrateResult, PublishRequest, Quality, QualityOp,
-        bitrate::{Limits, apply_sender_limits, confirmed_quality, readback_limits},
+        bitrate::{
+            Limits, apply_sender_limits, confirmed_quality, failure_message, readback_limits,
+        },
     },
     screen_capture::{
         CaptureFailure, CapturedImage, LatestImage, PreviewStore, ScreenCapture, preview_from_i420,
@@ -283,30 +285,8 @@ impl FrameProducer for SyntheticProducer {
 /// An event that belongs to the current publishing attempt.
 pub use crate::publisher::EngineEvent;
 
-#[derive(Default)]
-struct EventQueue {
-    items: Mutex<VecDeque<EngineEvent>>,
-}
-
-impl EventQueue {
-    fn push(&self, event: EngineEvent) {
-        let Ok(mut items) = self.items.lock() else {
-            return;
-        };
-        if matches!(event, EngineEvent::Stats(_)) {
-            // Only the latest counters matter.
-            items.retain(|item| !matches!(item, EngineEvent::Stats(_)));
-        }
-        if items.len() >= ENGINE_EVENT_CAPACITY {
-            items.pop_front();
-        }
-        items.push_back(event);
-    }
-
-    fn pop(&self) -> Option<EngineEvent> {
-        self.items.lock().ok()?.pop_front()
-    }
-}
+mod queue;
+use queue::EventQueue;
 
 /// Capture-side counters that the outbound stats poll merges into one
 /// `PublishStats`. The frame loop owns them; the command loop only reads.
@@ -899,11 +879,9 @@ async fn run(
                             }
                             limits.store(&applied);
                             quality = confirmed_quality(quality, next, false);
-                            BitrateResult::Failed {
-                                message: failure.message,
-                                restored: failure.restored,
-                                partial: failure.partial,
-                            }
+                            let restored = failure.restored;
+                            let message = failure_message(failure, actual, audio_sender.is_some());
+                            BitrateResult::Failed { message, restored }
                         }
                     };
                 events.push(EngineEvent::Bitrate {

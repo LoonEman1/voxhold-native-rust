@@ -366,6 +366,76 @@ async fn a_live_bitrate_stays_applying_until_the_engine_confirms_it(cx: &mut Tes
     });
 }
 
+/// Escape/backdrop/Cancel must not silently close the dialog while the live
+/// limit is still `Applying`: the user would lose the only visible status and
+/// a stop/cancel would not belong to this operation. Once the engine refuses
+/// the change, the same close intent works.
+#[gpui::test]
+async fn an_applying_live_bitrate_cannot_be_closed_until_the_engine_answers(
+    cx: &mut TestAppContext,
+) {
+    let (mut visual, _view, voice) = super::voice_tests::fixture(cx);
+    draw(&mut visual);
+    let live = window(11, "Документ");
+    visual.update(|_window, app| {
+        voice.update(app, |panel, cx| {
+            open_quality_dialog(panel, live.clone(), Quality::default(), false, cx);
+            panel.test_change_screen_bitrate(200, cx);
+            panel.test_start_screen_share(cx);
+            let op = panel
+                .test_pending_quality_op()
+                .expect("the bitrate change carries an operation id");
+            assert_eq!(panel.test_take_screen_commands(), vec![("bitrate", op)]);
+
+            let applying = bitrate_sharing(Quality::default(), op, QualityOutcome::Applying, None);
+            assert!(panel.test_apply_screen_sharing(applying));
+            assert!(panel.screen_share_open());
+            assert!(panel.screen_share_busy());
+            assert_eq!(panel.test_pending_quality_op(), Some(op));
+
+            // Escape, the backdrop and Cancel all use this close intent.
+            panel.test_close_screen_share(cx);
+            assert!(
+                panel.screen_share_open(),
+                "an applying change must not close the dialog"
+            );
+            assert!(
+                panel.screen_share_busy(),
+                "the operation is still in flight"
+            );
+            assert_eq!(panel.test_pending_quality_op(), Some(op));
+            assert!(
+                panel.test_take_screen_commands().is_empty(),
+                "closing while applying must not stop or cancel anything"
+            );
+
+            // The engine refused the limit: the dialog stays open with the
+            // reason, and the next close intent works again.
+            let message = "Медиадвижок не подтвердил новый битрейт.";
+            let failed = bitrate_sharing(
+                Quality::default(),
+                op,
+                QualityOutcome::Failed(message.into()),
+                Some(message),
+            );
+            assert!(panel.test_apply_screen_sharing(failed));
+            assert!(panel.screen_share_open());
+            assert!(!panel.screen_share_busy());
+            assert_eq!(panel.test_pending_quality_op(), None);
+
+            panel.test_close_screen_share(cx);
+            assert!(
+                !panel.screen_share_open(),
+                "a refused change may be closed like before"
+            );
+            assert!(
+                panel.test_take_screen_commands().is_empty(),
+                "the refused change still must not stop the live stream"
+            );
+        });
+    });
+}
+
 /// A verified `Applied` closes the dialog and stops the busy state.
 #[gpui::test]
 async fn an_applied_live_bitrate_closes_the_dialog(cx: &mut TestAppContext) {

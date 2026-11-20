@@ -17,7 +17,7 @@ use std::{
 
 use crate::{
     publisher::{
-        Access, Outcome as PublisherOutcome, Phase, PublishRequest, Publisher,
+        Access, Outcome as PublisherOutcome, Phase, PublishRequest, Publisher, QualityOp,
         preflight::{PreflightReport, run},
     },
     runtime::prep::{PrepBinding, PrepEvent, ScreenPrep, access_violation},
@@ -42,6 +42,7 @@ pub(super) enum PreflightEvent {
 /// a result nobody wants.
 pub(super) struct PendingRestart {
     prep: ScreenPrep<PreflightReport>,
+    op: QualityOp,
     request: PublishRequest,
 }
 
@@ -49,10 +50,11 @@ impl PendingRestart {
     pub(super) fn start(
         binding: PrepBinding,
         now: Instant,
+        op: QualityOp,
         request: PublishRequest,
     ) -> Result<Self, String> {
         let plan = request.clone();
-        Self::start_with(binding, now, request, move |cancelled| {
+        Self::start_with(binding, now, op, request, move |cancelled| {
             run(&plan, cancelled, PREFLIGHT_BUDGET)
         })
     }
@@ -62,6 +64,7 @@ impl PendingRestart {
     pub(super) fn start_with<F>(
         binding: PrepBinding,
         now: Instant,
+        op: QualityOp,
         request: PublishRequest,
         launch: F,
     ) -> Result<Self, String>
@@ -72,11 +75,15 @@ impl PendingRestart {
             let report = launch(cancelled)?;
             Ok((report, false, None))
         })?;
-        Ok(Self { prep, request })
+        Ok(Self { prep, op, request })
     }
 
     pub(super) fn binding(&self) -> &PrepBinding {
         self.prep.binding()
+    }
+
+    pub(super) fn op(&self) -> QualityOp {
+        self.op
     }
 
     pub(super) fn request(&self) -> &PublishRequest {
@@ -109,6 +116,7 @@ pub(super) fn finish_preflight(
     current: &PrepBinding,
     access: Access,
     event: PreflightEvent,
+    op: QualityOp,
     request: PublishRequest,
     now: Instant,
 ) -> Vec<PublisherOutcome> {
@@ -125,20 +133,20 @@ pub(super) fn finish_preflight(
             {
                 // The gate that allowed the preflight is gone. The live stream
                 // stays untouched; the server will decide about the old one.
-                return publisher.preflight_failed(message);
+                return publisher.preflight_failed(op, message);
             }
-            publisher.restart(request, now)
+            publisher.restart(op, request, now)
         }
         PreflightEvent::Failed(message) => {
             if current_attempt {
-                publisher.preflight_failed(&message)
+                publisher.preflight_failed(op, &message)
             } else {
                 Vec::new()
             }
         }
         PreflightEvent::Timeout => {
             if current_attempt {
-                publisher.preflight_failed(PREFLIGHT_TIMEOUT_MESSAGE)
+                publisher.preflight_failed(op, PREFLIGHT_TIMEOUT_MESSAGE)
             } else {
                 Vec::new()
             }
@@ -237,8 +245,9 @@ mod tests {
         let now = Instant::now();
         let mut publisher = live_publisher(now);
         let binding = binding(&publisher);
+        publisher.preflight_started(1);
         let mut pending =
-            PendingRestart::start_with(binding.clone(), now, request(changed()), |_| {
+            PendingRestart::start_with(binding.clone(), now, 1, request(changed()), |_| {
                 Ok(PreflightReport {
                     width: 1280,
                     height: 720,
@@ -254,6 +263,7 @@ mod tests {
             &binding,
             allowed(),
             event,
+            1,
             request(changed()),
             now,
         );
@@ -293,8 +303,9 @@ mod tests {
         let mut publisher = live_publisher(now);
         let binding = binding(&publisher);
         let attempt = publisher.sharing().attempt;
+        publisher.preflight_started(1);
         let mut pending =
-            PendingRestart::start_with(binding.clone(), now, request(changed()), |_| {
+            PendingRestart::start_with(binding.clone(), now, 1, request(changed()), |_| {
                 Err("Системный звук недоступен".into())
             })
             .expect("the preflight thread starts");
@@ -305,6 +316,7 @@ mod tests {
             &binding,
             allowed(),
             event,
+            1,
             request(changed()),
             now,
         );
@@ -369,8 +381,9 @@ mod tests {
         let mut publisher = live_publisher(now);
         let binding = binding(&publisher);
         let attempt = publisher.sharing().attempt;
+        publisher.preflight_started(1);
         let mut pending =
-            PendingRestart::start_with(binding.clone(), now, request(changed()), move |_| {
+            PendingRestart::start_with(binding.clone(), now, 1, request(changed()), move |_| {
                 Err(error.message().to_owned())
             })
             .expect("the preflight thread starts");
@@ -382,6 +395,7 @@ mod tests {
             &binding,
             allowed(),
             event,
+            1,
             request(changed()),
             now,
         );
@@ -406,12 +420,14 @@ mod tests {
         let now = Instant::now();
         let mut publisher = live_publisher(now);
         let binding = binding(&publisher);
+        publisher.preflight_started(1);
         let outcomes = finish_preflight(
             &mut publisher,
             &binding,
             &binding,
             allowed(),
             PreflightEvent::Timeout,
+            1,
             request(changed()),
             now,
         );
@@ -430,12 +446,14 @@ mod tests {
         let now = Instant::now();
         let mut publisher = live_publisher(now);
         let binding = binding(&publisher);
+        publisher.preflight_started(1);
         let outcomes = finish_preflight(
             &mut publisher,
             &binding,
             &binding,
             allowed(),
             PreflightEvent::Failed("Устройство вывода отключено.".into()),
+            1,
             request(changed()),
             now,
         );
@@ -467,12 +485,14 @@ mod tests {
             attempt: binding.attempt.wrapping_sub(1),
             ..binding.clone()
         };
+        publisher.preflight_started(1);
         let outcomes = finish_preflight(
             &mut publisher,
             &stale,
             &binding,
             allowed(),
             PreflightEvent::Failed("late".into()),
+            1,
             request(changed()),
             now,
         );
@@ -495,7 +515,7 @@ mod tests {
         let finished = Arc::new(AtomicBool::new(false));
         let worker_finished = finished.clone();
         let mut pending =
-            PendingRestart::start_with(binding, now, request(changed()), move |cancelled| {
+            PendingRestart::start_with(binding, now, 1, request(changed()), move |cancelled| {
                 // The worker observes the token like the real device stages do.
                 while !cancelled.load(Ordering::SeqCst) {
                     std::thread::sleep(Duration::from_millis(2));

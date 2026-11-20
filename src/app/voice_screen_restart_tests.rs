@@ -7,7 +7,9 @@ use super::voice_screen_tests::{draw, focused, monitor, wait_for, window};
 use gpui::TestAppContext;
 use std::sync::Arc;
 use std::time::Duration;
-use voxhold_media::publisher::{Codec, Phase, PublishRequest, Quality, Sharing};
+use voxhold_media::publisher::{
+    Codec, Phase, PublishRequest, Quality, QualityOutcome, QualityStatus, Sharing,
+};
 use voxhold_media::screen_capture::SourceKind;
 use voxhold_media::system_audio::AudioDeviceInfo;
 use voxhold_media::system_audio::AudioScope;
@@ -344,27 +346,28 @@ async fn a_same_phase_live_stats_update_keeps_an_uncommitted_restart_dialog_open
                 "Start queues exactly one restart: {commands:?}"
             );
             assert!(panel.screen_share_busy(), "the restart is committed");
+            let op = panel
+                .test_pending_quality_op()
+                .expect("the restart carries an operation id");
 
-            // Once committed, the accepted live update closes the dialog as
-            // before and the room card takes over the status.
+            // Once the publisher commits the stop, the dialog closes as before
+            // and the room card takes over the status.
             let accepted = Sharing {
-                phase: Phase::Live,
-                live: true,
+                phase: Phase::Stopping,
+                live: false,
+                restarting: true,
+                quality_status: Some(QualityStatus::new(op, QualityOutcome::Committed)),
                 quality: Some(Quality::default()),
                 has_audio: true,
-                stats: Some(voxhold_media::publisher::engine::PublishStats {
-                    audio_active: true,
-                    audio_kbps: 97.0,
-                    ..Default::default()
-                }),
                 ..Sharing::default()
             };
             panel.test_apply_screen_sharing(accepted);
             assert!(
                 !panel.screen_share_open(),
-                "the committed dialog closes on the accepted live update"
+                "the committed dialog closes on the accepted snapshot"
             );
             assert!(!panel.screen_share_busy());
+            assert_eq!(panel.test_pending_quality_op(), None);
         });
     });
 }
@@ -421,12 +424,27 @@ fn sharing_with(quality: Quality, has_audio: bool) -> Sharing {
     }
 }
 
-/// The worker reporting that the restart preflight of this attempt runs. The
-/// live stream keeps running and nothing was stopped yet.
-fn preflighting() -> Sharing {
+/// The worker reporting that the restart preflight of `op` runs. The live
+/// stream keeps running and nothing was stopped yet.
+pub(super) fn preflighting(op: u64) -> Sharing {
     Sharing {
         preflighting: true,
+        quality_status: Some(QualityStatus::new(op, QualityOutcome::Preflighting)),
         status: "Проверяем новую настройку…".into(),
+        ..sharing_with(Quality::default(), false)
+    }
+}
+
+/// The failure of `op`; the live publication is untouched.
+pub(super) fn failed_preflight(op: u64, message: &str) -> Sharing {
+    Sharing {
+        preflighting: false,
+        quality_status: Some(QualityStatus::new(
+            op,
+            QualityOutcome::Failed(message.into()),
+        )),
+        error: Some(message.into()),
+        status: message.into(),
         ..sharing_with(Quality::default(), false)
     }
 }
@@ -434,7 +452,7 @@ fn preflighting() -> Sharing {
 /// Open the live quality dialog with a fully described accepted request, so
 /// the dialog's classification sees the same audio and scope the engine
 /// confirmed.
-fn open_quality_dialog(
+pub(super) fn open_quality_dialog(
     panel: &mut crate::voice_panel::VoicePanel,
     live_source: voxhold_media::screen_capture::ScreenSource,
     quality: Quality,
@@ -535,15 +553,13 @@ async fn closing_the_dialog_during_a_preflight_cancels_it_and_keeps_live(cx: &mu
             panel.test_set_screen_resolution(voxhold_media::publisher::Resolution::P720, cx);
             panel.test_start_screen_share(cx);
             assert_eq!(panel.test_take_screen_commands(), vec![("restart", 0)]);
+            let op = panel
+                .test_pending_quality_op()
+                .expect("the restart carries an operation id");
 
             // The worker reports the running preflight without stopping the
             // live stream. The dialog must stay open so closing it cancels.
-            let preflighting = Sharing {
-                preflighting: true,
-                status: "Проверяем новую настройку…".into(),
-                ..sharing_with(Quality::default(), false)
-            };
-            assert!(panel.test_apply_screen_sharing(preflighting));
+            assert!(panel.test_apply_screen_sharing(preflighting(op)));
             assert!(
                 panel.screen_share_open(),
                 "a running preflight must keep the dialog open"
@@ -558,6 +574,10 @@ async fn closing_the_dialog_during_a_preflight_cancels_it_and_keeps_live(cx: &mu
                 commands,
                 vec![("cancel-restart", 0)],
                 "closing cancels the preflight, not the live stream: {commands:?}"
+            );
+            assert!(
+                !commands.iter().any(|(kind, _)| *kind == "stop"),
+                "a cancelled preflight never sends stream.stop: {commands:?}"
             );
             assert_eq!(panel.test_screen_phase(), Phase::Live);
         });
@@ -575,16 +595,14 @@ async fn a_failed_preflight_keeps_live_and_shows_the_error(cx: &mut TestAppConte
             panel.test_set_screen_resolution(voxhold_media::publisher::Resolution::P720, cx);
             panel.test_start_screen_share(cx);
             assert_eq!(panel.test_take_screen_commands(), vec![("restart", 0)]);
+            let op = panel
+                .test_pending_quality_op()
+                .expect("the restart carries an operation id");
 
             // The worker confirms the running preflight before it can fail it.
-            assert!(panel.test_apply_screen_sharing(preflighting()));
-            let failed = Sharing {
-                preflighting: false,
-                error: Some("Новая настройка не открылась.".into()),
-                status: "Новая настройка не открылась.".into(),
-                ..sharing_with(Quality::default(), false)
-            };
-            assert!(panel.test_apply_screen_sharing(failed));
+            assert!(panel.test_apply_screen_sharing(preflighting(op)));
+            assert!(panel
+                .test_apply_screen_sharing(failed_preflight(op, "Новая настройка не открылась.",)));
             assert!(
                 panel.screen_share_open(),
                 "a failed preflight keeps the dialog open for a correction"
@@ -629,13 +647,11 @@ async fn a_preflight_cancel_survives_a_stale_failure_state_and_keeps_live(cx: &m
             // The first Apply fails: the dialog stays open with the reason.
             panel.test_start_screen_share(cx);
             assert_eq!(panel.test_take_screen_commands(), vec![("restart", 0)]);
-            assert!(panel.test_apply_screen_sharing(preflighting()));
-            let failed = Sharing {
-                preflighting: false,
-                error: Some("Новая настройка не открылась.".into()),
-                status: "Новая настройка не открылась.".into(),
-                ..sharing_with(Quality::default(), false)
-            };
+            let first_op = panel
+                .test_pending_quality_op()
+                .expect("the restart carries an operation id");
+            assert!(panel.test_apply_screen_sharing(preflighting(first_op)));
+            let failed = failed_preflight(first_op, "Новая настройка не открылась.");
             assert!(panel.test_apply_screen_sharing(failed.clone()));
             assert!(!panel.screen_share_busy());
             assert!(panel.screen_share_open());
@@ -644,6 +660,10 @@ async fn a_preflight_cancel_survives_a_stale_failure_state_and_keeps_live(cx: &m
             // Apply again. Start must drop the previous attempt's reason.
             panel.test_start_screen_share(cx);
             assert_eq!(panel.test_take_screen_commands(), vec![("restart", 0)]);
+            let second_op = panel
+                .test_pending_quality_op()
+                .expect("the retry carries a new operation id");
+            assert_ne!(second_op, first_op);
             assert!(panel.screen_share_busy());
             assert!(
                 panel.test_screen_sharing().error.is_none(),
@@ -677,7 +697,7 @@ async fn a_preflight_cancel_survives_a_stale_failure_state_and_keeps_live(cx: &m
 
             // The worker's preflight update lands afterwards. The dialog keeps
             // its cancel intent, and Start is refused while it runs.
-            assert!(panel.test_apply_screen_sharing(preflighting()));
+            assert!(panel.test_apply_screen_sharing(preflighting(second_op)));
             assert!(panel.screen_share_open());
             assert!(panel.test_screen_sharing().preflighting);
             assert!(
@@ -718,13 +738,11 @@ async fn a_preflight_cancel_survives_a_stale_failure_state_before_the_confirmati
             // so the next Start sees the same stale answer as the field case.
             panel.test_start_screen_share(cx);
             assert_eq!(panel.test_take_screen_commands(), vec![("restart", 0)]);
-            assert!(panel.test_apply_screen_sharing(preflighting()));
-            let failed = Sharing {
-                preflighting: false,
-                error: Some("Новая настройка не открылась.".into()),
-                status: "Новая настройка не открылась.".into(),
-                ..sharing_with(Quality::default(), false)
-            };
+            let first_op = panel
+                .test_pending_quality_op()
+                .expect("the restart carries an operation id");
+            assert!(panel.test_apply_screen_sharing(preflighting(first_op)));
+            let failed = failed_preflight(first_op, "Новая настройка не открылась.");
             assert!(panel.test_apply_screen_sharing(failed.clone()));
             assert!(!panel.screen_share_busy());
             assert!(panel.test_screen_error().contains("не открылась"));
@@ -733,6 +751,11 @@ async fn a_preflight_cancel_survives_a_stale_failure_state_before_the_confirmati
             // `preflighting`, and Start drops the previous attempt's reason.
             panel.test_start_screen_share(cx);
             assert_eq!(panel.test_take_screen_commands(), vec![("restart", 0)]);
+            assert_ne!(
+                panel.test_pending_quality_op(),
+                Some(first_op),
+                "the retry is a new operation"
+            );
             assert!(panel.screen_share_busy());
 
             // The stale failed sample arrives before the confirmation. It must

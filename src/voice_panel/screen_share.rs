@@ -10,8 +10,8 @@
 
 use super::*;
 use voxhold_media::publisher::{
-    Codec, Phase, Preset, PublishRequest, Quality, QualityChange, Resolution, Sharing,
-    AUDIO_BITRATES, MAX_CHANNEL_PUBLISHERS,
+    Codec, Phase, Preset, PublishRequest, Quality, QualityChange, QualityOutcome, Resolution,
+    Sharing, AUDIO_BITRATES, MAX_CHANNEL_PUBLISHERS,
 };
 use voxhold_media::screen_capture::{
     self, PreviewFrame, ScreenSource, SourceId, SourceIdentity, SourceKind, ThumbnailError,
@@ -121,9 +121,12 @@ pub(super) struct ScreenShareUi {
     /// failure answer, a commit or closing the dialog clears it. It survives a
     /// stale state that clears `busy`, so closing always cancels the preflight.
     pub(super) preflight: bool,
-    /// The worker really confirmed this preflight (`preflighting: true`). Until
-    /// then a stale failure sample of the previous preflight cannot end it.
-    pub(super) preflight_confirmed: bool,
+    /// Next tag of a quality-change operation. It survives closing the dialog,
+    /// so a delayed answer of an older operation can never match a newer one.
+    pub(super) quality_op: u64,
+    /// The operation whose result this dialog is waiting for. `busy` belongs
+    /// to it; a result of another operation never clears it.
+    pub(super) pending_quality_op: Option<u64>,
     pub(super) error: String,
     pub(super) sharing: Sharing,
     pub(super) preview: Option<Arc<RenderImage>>,
@@ -186,7 +189,8 @@ impl Default for ScreenShareUi {
             last_request: None,
             busy: false,
             preflight: false,
-            preflight_confirmed: false,
+            quality_op: 0,
+            pending_quality_op: None,
             error: String::new(),
             sharing: Sharing::default(),
             preview: None,
@@ -493,7 +497,7 @@ impl VoicePanel {
         self.screen.restart = false;
         self.screen.busy = false;
         self.screen.preflight = false;
-        self.screen.preflight_confirmed = false;
+        self.screen.pending_quality_op = None;
         self.screen.error.clear();
         self.screen.selected = None;
         self.screen.selected_identity = None;
@@ -565,7 +569,7 @@ impl VoicePanel {
         self.screen.open = true;
         self.screen.busy = false;
         self.screen.preflight = false;
-        self.screen.preflight_confirmed = false;
+        self.screen.pending_quality_op = None;
         self.screen.error.clear();
         self.screen.focus_placed = false;
         self.sync_screen_access();
@@ -633,11 +637,12 @@ impl VoicePanel {
         } else {
             self.screen.busy || self.share_active()
         };
+        let pending_op = self.screen.pending_quality_op;
         self.screen.open = false;
         self.screen.restart = false;
         self.screen.busy = false;
         self.screen.preflight = false;
-        self.screen.preflight_confirmed = false;
+        self.screen.pending_quality_op = None;
         self.screen.error.clear();
         self.screen.selected = None;
         self.screen.selected_identity = None;
@@ -653,7 +658,9 @@ impl VoicePanel {
             if committed {
                 handle.stop_screen_share();
             } else if restart_busy {
-                handle.cancel_screen_restart();
+                if let Some(op) = pending_op {
+                    handle.cancel_screen_restart(op);
+                }
             } else if !restart_open {
                 // A restart dialog never opened a picker: nothing to cancel.
                 handle.cancel_screen_picker(self.screen.picker);
@@ -870,13 +877,21 @@ impl VoicePanel {
         let slot_available = self.active_publishers_in_room() < MAX_CHANNEL_PUBLISHERS;
         let live_bitrate =
             self.screen.restart && self.screen.restart_change() == Some(QualityChange::LiveBitrate);
-        if self.screen.restart {
+        // Every quality change gets its own tag, so a delayed answer of an
+        // older Apply cannot clear the busy state of this one.
+        let quality_op = if self.screen.restart {
+            self.screen.quality_op = self.screen.quality_op.wrapping_add(1);
+            Some(self.screen.quality_op)
+        } else {
+            None
+        };
+        if let Some(op) = quality_op {
             // A bitrate-only change goes to the live sender; the worker
             // repeats the classification before it applies anything.
             if live_bitrate {
-                handle.apply_screen_quality(request.clone(), self.can_stream, slot_available);
+                handle.apply_screen_quality(op, request.clone(), self.can_stream, slot_available);
             } else {
-                handle.restart_screen_share(request.clone(), self.can_stream, slot_available);
+                handle.restart_screen_share(op, request.clone(), self.can_stream, slot_available);
             }
         } else {
             handle.publish_screen(
@@ -890,9 +905,9 @@ impl VoicePanel {
         self.screen.busy = true;
         // A restart without a live bitrate starts a preflight; closing the
         // dialog while it runs must cancel it instead of stopping the stream.
-        // Only a `preflighting` sample of this attempt confirms it.
+        // The pending operation tag is the only confirmation this dialog needs.
         self.screen.preflight = self.screen.restart && !live_bitrate;
-        self.screen.preflight_confirmed = false;
+        self.screen.pending_quality_op = quality_op;
         // The previous attempt's error belongs to its own answer. A stale
         // `Sharing` snapshot must not turn this Start into an instant failure.
         self.screen.sharing.error = None;
@@ -954,138 +969,6 @@ impl VoicePanel {
             self.screen.audio_scope = scope;
         }
         cx.notify();
-    }
-
-    /// Apply one runtime update. Returns whether the panel must repaint.
-    pub(super) fn apply_screen_update(&mut self, update: VoiceUpdate) -> bool {
-        match update {
-            VoiceUpdate::ScreenShare(sharing) => {
-                let previous = self.screen.sharing.phase;
-                self.screen.sharing = sharing;
-                let phase = self.screen.sharing.phase;
-                if self.screen.sharing.restarting && self.screen.open {
-                    // The stop of the quality change is committed; the card
-                    // now shows the restart and the dialog must not allow a
-                    // second action.
-                    self.screen.open = false;
-                    self.screen.restart = false;
-                    self.screen.busy = false;
-                    self.screen.preflight = false;
-                    self.screen.preflight_confirmed = false;
-                    self.screen.clear_previews();
-                }
-                if self.screen.sharing.preflighting {
-                    // The worker confirmed the preflight of this dialog. Keep
-                    // the dialog (and its cancel intent) alive even when a
-                    // stale state cleared `busy` in between.
-                    self.screen.preflight = true;
-                    self.screen.preflight_confirmed = true;
-                    self.screen.busy = true;
-                }
-                // A failed preflight keeps the dialog open with its reason.
-                // Only an answer to the confirmed preflight of this attempt may
-                // end `busy`: a stale sample with the previous error is not it.
-                let preflight_failure = phase == Phase::Live
-                    && self.screen.preflight
-                    && self.screen.busy
-                    && !self.screen.sharing.restarting
-                    && !self.screen.sharing.preflighting
-                    && self.screen.sharing.error.is_some();
-                if preflight_failure && self.screen.preflight_confirmed {
-                    self.screen.busy = false;
-                    self.screen.preflight = false;
-                    self.screen.preflight_confirmed = false;
-                    self.screen.error = self.screen.sharing.error.clone().unwrap_or_default();
-                }
-                if phase == Phase::Idle || phase == Phase::Failed {
-                    self.screen.restart = false;
-                    self.screen.preflight = false;
-                    self.screen.preflight_confirmed = false;
-                }
-                if matches!(phase, Phase::Publishing | Phase::Live)
-                    && self.screen.open
-                    && !self.screen.sharing.preflighting
-                    && !preflight_failure
-                    && (self.screen.busy || previous != phase)
-                {
-                    // Either this dialog committed the attempt (busy) or the
-                    // phase really changed: the card in the room now owns the
-                    // status and the stop action. A same-phase stats update
-                    // must not close an uncommitted restart dialog, and a
-                    // pending preflight stays open so closing cancels it.
-                    self.screen.open = false;
-                    self.screen.busy = false;
-                    self.screen.preflight = false;
-                    self.screen.preflight_confirmed = false;
-                    self.screen.focus_placed = false;
-                    self.screen.clear_previews();
-                }
-                if phase == Phase::Failed {
-                    self.screen.busy = false;
-                    self.screen.focus_placed = false;
-                    self.screen.error = self.screen.sharing.error.clone().unwrap_or_default();
-                    // A failed attempt has no picker any more; reopening the
-                    // dialog calls `begin_picker` again.
-                    if self.screen.open {
-                        self.screen.open = false;
-                        self.screen.clear_previews();
-                    }
-                }
-                if phase == Phase::Idle {
-                    if self.screen.open {
-                        // The session ended (or a new one replaced the worker)
-                        // while the dialog was open; its picker id is stale.
-                        self.screen.open = false;
-                        self.screen.busy = false;
-                        self.screen.focus_placed = false;
-                        self.screen.clear_previews();
-                        if previous != Phase::Idle {
-                            self.screen.error =
-                                "Соединение было восстановлено, выберите экран снова.".into();
-                        }
-                    }
-                }
-                if phase == Phase::Idle && previous != Phase::Idle {
-                    self.screen.preview = None;
-                }
-                // The gate can change without a picker click: the attempt is
-                // now open or closed, and the worker needs the current value.
-                self.sync_screen_access();
-                true
-            }
-            VoiceUpdate::ScreenSources {
-                generation,
-                kind,
-                sources,
-                error,
-            } => {
-                match kind {
-                    SourceKind::Monitor if generation >= self.screen.monitor_generation => {
-                        self.screen.monitor_generation = generation;
-                        self.screen.monitor_loading = false;
-                        self.screen.monitor_error = error.unwrap_or_default();
-                        self.screen.retain_selection(SourceKind::Monitor, &sources);
-                        self.screen
-                            .retain_preview_snapshot(SourceKind::Monitor, &sources);
-                        // The non-active kind still refreshes its cache; the
-                        // picker reads it when the user switches tabs.
-                        self.screen.monitors = sources;
-                    }
-                    SourceKind::Window if generation >= self.screen.window_generation => {
-                        self.screen.window_generation = generation;
-                        self.screen.window_loading = false;
-                        self.screen.window_error = error.unwrap_or_default();
-                        self.screen.retain_selection(SourceKind::Window, &sources);
-                        self.screen
-                            .retain_preview_snapshot(SourceKind::Window, &sources);
-                        self.screen.windows = sources;
-                    }
-                    _ => return false,
-                }
-                true
-            }
-            _ => false,
-        }
     }
 
     /// Take the newest local preview for the on-air card.
@@ -1195,3 +1078,4 @@ mod card;
 mod dialog;
 mod preview;
 mod selection;
+mod update;

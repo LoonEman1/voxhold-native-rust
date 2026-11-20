@@ -68,8 +68,12 @@ impl Codec {
 
 mod quality;
 pub use quality::{
-    AUDIO_BITRATES, Preset, Quality, QualityChange, Resolution, normalize_audio_bitrate,
+    AUDIO_BITRATES, Preset, Quality, QualityChange, QualityOp, QualityOutcome, QualityStatus,
+    Resolution, normalize_audio_bitrate,
 };
+
+mod sharing;
+pub use sharing::Sharing;
 
 /// One capture attempt chosen in the picker.
 #[derive(Clone, Debug, PartialEq)]
@@ -85,50 +89,6 @@ pub struct PublishRequest {
     /// engine resolves it to a process id for this attempt. `stream.start` has
     /// no scope field, so this stays a local engine parameter.
     pub audio_scope: AudioScope,
-}
-
-/// The UI-facing snapshot. The panel never guesses a phase itself.
-#[derive(Clone, Debug, PartialEq)]
-pub struct Sharing {
-    pub phase: Phase,
-    pub attempt: u64,
-    pub live: bool,
-    pub quality: Option<Quality>,
-    pub codec: Option<Codec>,
-    /// The engine really added the system-audio track (and `stream.start`
-    /// reported it), not merely that the user ticked the box.
-    pub has_audio: bool,
-    /// Actual scope of the opened system-audio capture, as the engine reports
-    /// it (the real process/area). `None` when the track is not published.
-    pub audio_scope: Option<String>,
-    /// A confirmed stop+start is in flight. The UI must warn that the stream
-    /// will restart instead of claiming a live change.
-    pub restarting: bool,
-    /// A restart preflight is validating the new capture while the live stream
-    /// keeps running. Nothing was stopped yet.
-    pub preflighting: bool,
-    pub status: String,
-    pub error: Option<String>,
-    pub stats: Option<engine::PublishStats>,
-}
-
-impl Default for Sharing {
-    fn default() -> Self {
-        Self {
-            phase: Phase::Idle,
-            attempt: 0,
-            live: false,
-            quality: None,
-            codec: None,
-            has_audio: false,
-            audio_scope: None,
-            restarting: false,
-            preflighting: false,
-            status: String::new(),
-            error: None,
-            stats: None,
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -184,6 +144,7 @@ pub enum Outcome {
     /// sender. No renegotiation and no new `stream.start` follows.
     SetBitrate {
         attempt: u64,
+        op: QualityOp,
         quality: Quality,
     },
     /// The engine must apply this remote offer and produce an answer.
@@ -237,6 +198,9 @@ pub struct Publisher {
     /// A restart preflight is validating a new capture; the live stream was
     /// not touched. The UI keeps the dialog open so closing it can cancel.
     preflighting: bool,
+    /// The accepted quality-change operation and its last result. Results of
+    /// an older operation are ignored instead of overwriting a newer one.
+    quality_status: Option<QualityStatus>,
     /// The backend broadcasts `stream.stopped` to the whole server and also
     /// answers `stream.stop` directly, so one stop produces two events. After
     /// a confirmed stop the second copy must not end the freshly restarted
@@ -286,6 +250,7 @@ impl Publisher {
             rollback_used: false,
             restarting: false,
             preflighting: false,
+            quality_status: None,
             ignore_stop_echo: false,
             has_audio: false,
             audio_scope: None,
@@ -321,6 +286,7 @@ impl Publisher {
             audio_scope: self.audio_scope.clone(),
             restarting: self.restarting,
             preflighting: self.preflighting,
+            quality_status: self.quality_status.clone(),
             status: self.status.clone(),
             error: self.error.clone(),
             stats: self.stats,
@@ -418,12 +384,18 @@ impl Publisher {
     /// event, so this is a confirmed stop+start: one `stream.stop` now and one
     /// new `stream.start` after the acknowledgement (or its bounded timeout).
     /// Returns nothing outside `Live`, where the UI has no restart action.
-    pub fn restart(&mut self, request: PublishRequest, now: Instant) -> Vec<Outcome> {
-        if self.phase != Phase::Live {
+    pub fn restart(
+        &mut self,
+        op: QualityOp,
+        request: PublishRequest,
+        now: Instant,
+    ) -> Vec<Outcome> {
+        if self.phase != Phase::Live || !self.operation_current(op) {
             return Vec::new();
         }
         let mut request = request;
         request.quality = request.quality.clamped();
+        self.quality_status = Some(QualityStatus::new(op, QualityOutcome::Committed));
         // Keep the confirmed live request. If the new attempt fails locally
         // after the old stream was stopped, it is restored once.
         self.rollback = self.request.clone();
@@ -877,6 +849,7 @@ impl Publisher {
         self.rollback_used = false;
         self.restarting = false;
         self.preflighting = false;
+        self.quality_status = None;
         self.ignore_stop_echo = false;
         self.has_audio = false;
         self.audio_scope = None;
@@ -939,6 +912,7 @@ impl Publisher {
         self.rollback_used = false;
         self.restarting = false;
         self.preflighting = false;
+        self.quality_status = None;
         self.ignore_stop_echo = false;
         self.has_audio = false;
         self.audio_scope = None;

@@ -36,6 +36,7 @@ pub(super) enum ScreenCommand {
     },
     /// New settings of a live attempt: one stop followed by one new start.
     Restart {
+        op: u64,
         request: PublishRequest,
         stream_permission: bool,
         slot_available: bool,
@@ -43,13 +44,16 @@ pub(super) enum ScreenCommand {
     /// Only the bitrates changed: the live sender applies them without a stop
     /// or a new start.
     LiveQuality {
+        op: u64,
         request: PublishRequest,
         stream_permission: bool,
         slot_available: bool,
     },
     /// The user closed the quality dialog while the restart preflight was
     /// running. The live stream stays untouched.
-    CancelRestart,
+    CancelRestart {
+        op: u64,
+    },
     Stop,
 }
 

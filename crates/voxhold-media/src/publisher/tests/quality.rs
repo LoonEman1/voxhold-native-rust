@@ -134,7 +134,9 @@ fn a_live_quality_change_is_one_confirmed_stop_and_one_new_start() {
         bitrate_kbps: 9000,
         audio_bitrate_kbps: 256,
     };
+    publisher.preflight_started(1);
     let restart = publisher.restart(
+        1,
         PublishRequest {
             quality: changed,
             audio: true,
@@ -169,6 +171,7 @@ fn a_live_quality_change_is_one_confirmed_stop_and_one_new_start() {
     let mut idle = Publisher::new(1, 2);
     assert!(
         idle.restart(
+            1,
             PublishRequest {
                 quality: changed,
                 ..request()
@@ -309,12 +312,13 @@ fn a_bitrate_only_change_is_applied_to_the_live_sender_without_a_restart() {
         QualityChange::LiveBitrate
     );
 
-    let outcomes = publisher.apply_quality(next.clone(), now);
+    let outcomes = publisher.apply_quality(1, next.clone(), now);
     assert_eq!(
         outcomes,
         vec![
             Outcome::SetBitrate {
                 attempt,
+                op: 1,
                 quality: next.quality,
             },
             Outcome::State(publisher.sharing()),
@@ -368,7 +372,7 @@ fn a_bitrate_only_change_is_applied_to_the_live_sender_without_a_restart() {
         EngineEvent::State(crate::publisher::Connection::FirstFrame),
         now,
     );
-    let applied = audio_publisher.apply_quality(louder_audio.clone(), now);
+    let applied = audio_publisher.apply_quality(1, louder_audio.clone(), now);
     assert!(matches!(
         applied.first(),
         Some(Outcome::SetBitrate { quality, .. }) if *quality == louder_audio.quality
@@ -384,10 +388,10 @@ fn a_full_command_queue_keeps_the_live_attempt_and_its_previous_limit() {
     let attempt = publisher.attempt;
     let applied_limit = publisher.request().expect("live request").quality;
     let queued = bitrate_only();
-    publisher.apply_quality(queued.clone(), now);
+    publisher.apply_quality(1, queued.clone(), now);
 
     // The worker queue was full; the newest value was not accepted yet.
-    let pending = publisher.bitrate_queued();
+    let pending = publisher.bitrate_queued(1);
     assert_eq!(
         pending,
         vec![Outcome::State(publisher.sharing())],
@@ -415,7 +419,7 @@ fn a_full_command_queue_keeps_the_live_attempt_and_its_previous_limit() {
 
     // The next tick accepted the value; the limit is the requested one and the
     // request has already been recorded by `apply_quality`.
-    let applied = publisher.bitrate_applied();
+    let applied = publisher.bitrate_applied(1);
     assert!(matches!(applied.as_slice(), [Outcome::State(_)]));
     assert_eq!(publisher.phase(), Phase::Live);
     assert_eq!(publisher.sharing().quality, Some(queued.quality));
@@ -424,7 +428,7 @@ fn a_full_command_queue_keeps_the_live_attempt_and_its_previous_limit() {
         Some(queued.quality)
     );
     assert_eq!(
-        publisher.bitrate_applied(),
+        publisher.bitrate_applied(1),
         Vec::new(),
         "a repeated confirmation is not a new status"
     );
@@ -442,8 +446,8 @@ fn a_full_command_queue_keeps_the_live_attempt_and_its_previous_limit() {
     assert_eq!(publisher.phase(), Phase::Failed);
     assert!(failed.contains(&Outcome::StopEngine));
     assert!(publisher.sharing().error.is_some());
-    assert!(publisher.bitrate_queued().is_empty());
-    assert!(publisher.bitrate_applied().is_empty());
+    assert!(publisher.bitrate_queued(1).is_empty());
+    assert!(publisher.bitrate_applied(1).is_empty());
 }
 
 #[test]
@@ -487,7 +491,7 @@ fn resolution_frame_rate_or_audio_scope_change_keeps_the_restart_path() {
         let mut publisher = publisher();
         live(&mut publisher, now);
         assert!(
-            publisher.apply_quality(next.clone(), now).is_empty(),
+            publisher.apply_quality(1, next.clone(), now).is_empty(),
             "a live apply must refuse a change that needs a new capture: {next:?}"
         );
         assert_eq!(publisher.phase(), Phase::Live);
@@ -506,13 +510,13 @@ fn a_failed_or_cancelled_preflight_keeps_the_live_attempt_and_sends_nothing() {
     live(&mut publisher, now);
     let attempt = publisher.attempt;
 
-    let started = publisher.preflight_started();
+    let started = publisher.preflight_started(1);
     assert!(matches!(started.as_slice(), [Outcome::State(_)]));
     assert!(publisher.sharing().preflighting);
     assert_eq!(publisher.phase(), Phase::Live);
     assert!(!publisher.sharing().restarting);
 
-    let failed = publisher.preflight_failed("Новая настройка не открылась.");
+    let failed = publisher.preflight_failed(1, "Новая настройка не открылась.");
     assert_eq!(publisher.phase(), Phase::Live);
     assert_eq!(publisher.sharing().attempt, attempt);
     assert!(!publisher.sharing().preflighting);
@@ -526,12 +530,76 @@ fn a_failed_or_cancelled_preflight_keeps_the_live_attempt_and_sends_nothing() {
     );
 
     // The user closing the dialog cancels the preflight and clears the error.
-    publisher.preflight_started();
-    let cancelled = publisher.preflight_cancelled(None);
+    publisher.preflight_started(2);
+    let cancelled = publisher.preflight_cancelled(2, None);
     assert_eq!(publisher.phase(), Phase::Live);
     assert_eq!(publisher.sharing().error, None);
     assert_eq!(publisher.sharing().status, "В эфире");
     assert!(matches!(cancelled.as_slice(), [Outcome::State(_)]));
+}
+
+#[test]
+fn a_quality_result_names_its_operation_and_an_older_one_is_ignored() {
+    let now = Instant::now();
+    let mut publisher = publisher();
+    live(&mut publisher, now);
+
+    // The fast failure keeps its operation tag even when no preflighting
+    // snapshot was observed by the consumer.
+    publisher.preflight_started(7);
+    let failed = publisher.preflight_failed(7, "Новая настройка не открылась.");
+    assert!(matches!(failed.as_slice(), [Outcome::State(_)]));
+    let status = publisher
+        .sharing()
+        .quality_status
+        .expect("the result is kept");
+    assert_eq!(status.op, 7);
+    assert_eq!(
+        status.outcome,
+        crate::publisher::QualityOutcome::Failed("Новая настройка не открылась.".into())
+    );
+
+    // A newer operation replaces the tag. A late result of operation 7 must
+    // neither overwrite it nor change the live status or error.
+    publisher.preflight_started(8);
+    assert_eq!(
+        publisher.sharing().quality_status.map(|status| status.op),
+        Some(8)
+    );
+    assert_eq!(
+        publisher.preflight_failed(7, "старая ошибка"),
+        Vec::new(),
+        "a result of an older operation is discarded"
+    );
+    assert_eq!(
+        publisher.preflight_cancelled(7, None),
+        Vec::new(),
+        "a cancel of an older operation is discarded"
+    );
+    let status = publisher
+        .sharing()
+        .quality_status
+        .expect("operation 8 is current");
+    assert_eq!(status.op, 8);
+    assert_eq!(
+        status.outcome,
+        crate::publisher::QualityOutcome::Preflighting
+    );
+    assert!(publisher.sharing().error.is_none());
+    assert!(publisher.sharing().preflighting);
+
+    // The result of the current operation is handled.
+    publisher.preflight_failed(8, "вторая ошибка");
+    let status = publisher
+        .sharing()
+        .quality_status
+        .expect("the result is kept");
+    assert_eq!(status.op, 8);
+    assert_eq!(
+        status.outcome,
+        crate::publisher::QualityOutcome::Failed("вторая ошибка".into())
+    );
+    assert_eq!(publisher.phase(), Phase::Live);
 }
 
 #[test]
@@ -551,7 +619,8 @@ fn a_local_failure_after_the_stop_restores_the_previous_request_once() {
         },
         ..request()
     };
-    publisher.restart(changed.clone(), now);
+    publisher.preflight_started(1);
+    publisher.restart(1, changed.clone(), now);
     let ack = publisher.on_server_event("stream.stopped", "", &json!({}), now);
     let (new_attempt, new_request) = ack
         .iter()
@@ -608,7 +677,8 @@ fn a_restore_after_a_sent_start_waits_for_the_stop_acknowledgement() {
         },
         ..request()
     };
-    publisher.restart(changed.clone(), now);
+    publisher.preflight_started(1);
+    publisher.restart(1, changed.clone(), now);
     publisher.on_server_event("stream.stopped", "", &json!({}), now);
     let ready = publisher.engine_ready(now, false, None);
     assert_eq!(
@@ -657,7 +727,9 @@ fn a_server_failure_does_not_restore_the_previous_request() {
     let now = Instant::now();
     let mut publisher = publisher();
     live(&mut publisher, now);
+    publisher.preflight_started(1);
     publisher.restart(
+        1,
         PublishRequest {
             quality: Quality {
                 resolution: Resolution::P720,
@@ -697,7 +769,9 @@ fn a_viewer_sees_one_stop_and_one_start_in_order() {
     );
 
     let mut kinds = Vec::new();
+    publisher.preflight_started(1);
     let stop = publisher.restart(
+        1,
         PublishRequest {
             quality: Quality {
                 resolution: Resolution::P720,

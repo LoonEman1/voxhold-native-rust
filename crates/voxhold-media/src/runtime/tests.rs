@@ -699,7 +699,7 @@ fn a_full_bitrate_queue_defers_the_newest_value_and_a_closed_worker_is_terminal(
         bitrate_kbps: 1200,
         ..Quality::default()
     };
-    queue.request(4, first);
+    queue.request(4, 1, first);
     assert_eq!(
         queue.flush(4, |_| BitrateSend::Full),
         super::screen::BitrateDelivery::Full,
@@ -715,7 +715,7 @@ fn a_full_bitrate_queue_defers_the_newest_value_and_a_closed_worker_is_terminal(
         bitrate_kbps: 900,
         ..Quality::default()
     };
-    queue.request(4, newest);
+    queue.request(4, 2, newest);
     let mut sent = None;
     assert_eq!(
         queue.flush(4, |quality| {
@@ -735,7 +735,7 @@ fn a_full_bitrate_queue_defers_the_newest_value_and_a_closed_worker_is_terminal(
     );
 
     // A request that belongs to an older attempt never reaches a new sender.
-    queue.request(3, newest);
+    queue.request(3, 3, newest);
     assert_eq!(
         queue.flush(4, |_| panic!("a stale attempt must not be sent")),
         super::screen::BitrateDelivery::Idle
@@ -744,7 +744,7 @@ fn a_full_bitrate_queue_defers_the_newest_value_and_a_closed_worker_is_terminal(
 
     // A closed worker is terminal: the value is dropped, not retried, and the
     // publisher ends the live attempt instead of claiming the new limit.
-    queue.request(4, newest);
+    queue.request(4, 4, newest);
     assert_eq!(
         queue.flush(4, |_| BitrateSend::Closed),
         super::screen::BitrateDelivery::Closed

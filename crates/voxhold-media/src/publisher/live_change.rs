@@ -9,7 +9,10 @@
 use serde_json::json;
 use std::time::Instant;
 
-use super::{Outcome, Phase, PublishRequest, Publisher, QualityChange, STOP_TIMEOUT};
+use super::{
+    Outcome, Phase, PublishRequest, Publisher, QualityChange, QualityOp, QualityOutcome,
+    QualityStatus, STOP_TIMEOUT,
+};
 
 /// The status of a live bitrate change that the sender really received.
 const BITRATE_APPLIED_STATUS: &str = "Битрейт обновлён в эфире.";
@@ -32,7 +35,12 @@ impl Publisher {
     /// capture, the phase and the viewer stay exactly where they are. Any
     /// other difference is refused here: the runtime must preflight it and
     /// call [`Publisher::restart`] after the confirmed stop.
-    pub fn apply_quality(&mut self, request: PublishRequest, _now: Instant) -> Vec<Outcome> {
+    pub fn apply_quality(
+        &mut self,
+        op: QualityOp,
+        request: PublishRequest,
+        _now: Instant,
+    ) -> Vec<Outcome> {
         if self.phase != Phase::Live {
             return Vec::new();
         }
@@ -48,9 +56,11 @@ impl Publisher {
         self.request = Some(request);
         self.error = None;
         self.status = BITRATE_APPLIED_STATUS.into();
+        self.quality_status = Some(QualityStatus::new(op, QualityOutcome::Applied));
         vec![
             Outcome::SetBitrate {
                 attempt: self.attempt,
+                op,
                 quality,
             },
             Outcome::State(self.sharing()),
@@ -60,28 +70,36 @@ impl Publisher {
     /// The bounded command queue of the live worker was full, so the newest
     /// quality is still pending. This is not a failure: no `stream.stop`, no
     /// `Phase::Failed`, and the previous limit keeps applying until the retry.
-    pub fn bitrate_queued(&mut self) -> Vec<Outcome> {
-        if self.phase != Phase::Live || self.status == BITRATE_QUEUED_STATUS {
+    pub fn bitrate_queued(&mut self, op: QualityOp) -> Vec<Outcome> {
+        if self.phase != Phase::Live
+            || !self.operation_current(op)
+            || self.status == BITRATE_QUEUED_STATUS
+        {
             return Vec::new();
         }
         self.status = BITRATE_QUEUED_STATUS.into();
         self.error = None;
+        self.quality_status = Some(QualityStatus::new(op, QualityOutcome::Applied));
         vec![Outcome::State(self.sharing())]
     }
 
     /// The retried limit reached the worker of the live attempt.
-    pub fn bitrate_applied(&mut self) -> Vec<Outcome> {
-        if self.phase != Phase::Live || self.status == BITRATE_APPLIED_STATUS {
+    pub fn bitrate_applied(&mut self, op: QualityOp) -> Vec<Outcome> {
+        if self.phase != Phase::Live
+            || !self.operation_current(op)
+            || self.status == BITRATE_APPLIED_STATUS
+        {
             return Vec::new();
         }
         self.status = BITRATE_APPLIED_STATUS.into();
         self.error = None;
+        self.quality_status = Some(QualityStatus::new(op, QualityOutcome::Applied));
         vec![Outcome::State(self.sharing())]
     }
 
     /// A restart preflight started. The live stream keeps running and no
     /// `stream.stop` is sent until the preflight confirmed the new capture.
-    pub fn preflight_started(&mut self) -> Vec<Outcome> {
+    pub fn preflight_started(&mut self, op: QualityOp) -> Vec<Outcome> {
         if self.phase != Phase::Live {
             return Vec::new();
         }
@@ -89,27 +107,34 @@ impl Publisher {
         self.restarting = false;
         self.error = None;
         self.status = "Проверяем новую настройку…".into();
+        self.quality_status = Some(QualityStatus::new(op, QualityOutcome::Preflighting));
         vec![Outcome::State(self.sharing())]
     }
 
     /// The preflight of the new capture failed: the live stream is untouched
-    /// and the reason is shown without leaving `Live`.
-    pub fn preflight_failed(&mut self, message: &str) -> Vec<Outcome> {
-        if self.phase != Phase::Live {
+    /// and the reason is shown without leaving `Live`. A result of an older
+    /// operation is ignored.
+    pub fn preflight_failed(&mut self, op: QualityOp, message: &str) -> Vec<Outcome> {
+        if self.phase != Phase::Live || !self.operation_current(op) {
             return Vec::new();
         }
         self.preflighting = false;
         self.restarting = false;
         self.status = message.to_owned();
         self.error = Some(message.to_owned());
+        self.quality_status = Some(QualityStatus::new(
+            op,
+            QualityOutcome::Failed(message.into()),
+        ));
         vec![Outcome::State(self.sharing())]
     }
 
     /// A preflight of the live attempt was cancelled. `message` reports a
     /// session or device loss; `None` is the user closing the dialog and the
-    /// card returns to the plain on-air status.
-    pub fn preflight_cancelled(&mut self, message: Option<&str>) -> Vec<Outcome> {
-        if self.phase != Phase::Live {
+    /// card returns to the plain on-air status. A cancel of an older operation
+    /// is ignored.
+    pub fn preflight_cancelled(&mut self, op: QualityOp, message: Option<&str>) -> Vec<Outcome> {
+        if self.phase != Phase::Live || !self.operation_current(op) {
             return Vec::new();
         }
         self.preflighting = false;
@@ -124,7 +149,16 @@ impl Publisher {
                 self.status = "В эфире".into();
             }
         }
+        self.quality_status = Some(QualityStatus::new(op, QualityOutcome::Cancelled));
         vec![Outcome::State(self.sharing())]
+    }
+
+    /// Whether `op` is still the operation this attempt accepted. A result of
+    /// an older operation must not overwrite the newer one.
+    pub(super) fn operation_current(&self, op: QualityOp) -> bool {
+        self.quality_status
+            .as_ref()
+            .is_some_and(|status| status.op == op)
     }
 
     /// A gate or session refusal of the current attempt. It is terminal and

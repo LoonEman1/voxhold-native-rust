@@ -24,6 +24,13 @@ impl VoiceHandle {
         }
     }
 
+    /// Push one update through the real coalescing queue, exactly as the
+    /// worker does. The panel tests use this to model a burst that is read as
+    /// one latest snapshot.
+    pub fn push_update_for_tests(&self, update: VoiceUpdate) {
+        self.updates.push(update);
+    }
+
     /// The newest control snapshot waiting for the media worker, if the UI
     /// queued one. The slot holds one value, so this is also the count of
     /// pending snapshots.
@@ -66,7 +73,7 @@ impl VoiceHandle {
                 ScreenCommand::Publish { picker, .. } => ("publish", picker),
                 ScreenCommand::Restart { .. } => ("restart", 0),
                 ScreenCommand::LiveQuality { .. } => ("bitrate", 0),
-                ScreenCommand::CancelRestart => ("cancel-restart", 0),
+                ScreenCommand::CancelRestart { .. } => ("cancel-restart", 0),
                 ScreenCommand::CancelPicker { picker } => ("cancel", picker),
                 ScreenCommand::Stop => ("stop", 0),
             });

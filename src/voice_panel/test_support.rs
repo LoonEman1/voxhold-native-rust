@@ -615,6 +615,28 @@ impl VoicePanel {
         self.apply_screen_update(VoiceUpdate::ScreenShare(sharing))
     }
 
+    /// Put one screen snapshot into the real coalescing queue, exactly as the
+    /// worker does. A following `test_poll_screen_sharing` reads what the panel
+    /// would read after a burst.
+    pub fn test_push_screen_sharing(&self, sharing: Sharing) {
+        if let Some(handle) = &self.handle {
+            handle.push_update_for_tests(VoiceUpdate::ScreenShare(sharing));
+        }
+    }
+
+    /// Read one update from the real queue, as the panel poll does.
+    pub fn test_poll_screen_sharing(&self) -> Option<Sharing> {
+        match self.handle.as_ref()?.try_update()? {
+            VoiceUpdate::ScreenShare(sharing) => Some(sharing),
+            _ => None,
+        }
+    }
+
+    /// The quality-change operation whose answer this dialog waits for.
+    pub fn test_pending_quality_op(&self) -> Option<u64> {
+        self.screen.pending_quality_op
+    }
+
     /// Queued screen actions of the detached handle, as (kind, picker) pairs.
     pub fn test_take_screen_commands(&mut self) -> Vec<(&'static str, u64)> {
         self.handle

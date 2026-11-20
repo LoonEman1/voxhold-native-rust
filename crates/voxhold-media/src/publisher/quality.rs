@@ -187,6 +187,43 @@ pub enum QualityChange {
     Restart,
 }
 
+/// The tag of one quality-change operation. The dialog increments it for every
+/// Apply; the worker reports the result under the same tag. Coalescing the
+/// snapshots can then never detach a fast failure from the request it answers.
+pub type QualityOp = u64;
+
+/// The last result of one quality-change operation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QualityStatus {
+    pub op: QualityOp,
+    pub outcome: QualityOutcome,
+}
+
+/// What happened to the operation `QualityStatus::op`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum QualityOutcome {
+    /// The worker accepted the operation and its preflight is running. The
+    /// live publication is untouched.
+    Preflighting,
+    /// The operation stopped before any restart. The live publication keeps
+    /// running; the message belongs to the dialog.
+    Failed(String),
+    /// The user or the session cancelled the operation; nothing was stopped.
+    Cancelled,
+    /// The confirmed stop of a restart was sent. The new attempt starts after
+    /// its acknowledgement.
+    Committed,
+    /// A live-bitrate command was handed to the sender queue. This stage does
+    /// not prove the measured rate; that remains a later task.
+    Applied,
+}
+
+impl QualityStatus {
+    pub fn new(op: QualityOp, outcome: QualityOutcome) -> Self {
+        Self { op, outcome }
+    }
+}
+
 impl PublishRequest {
     /// Classify the difference against the live request. The source identity,
     /// not its display title, decides whether the same capture can continue.

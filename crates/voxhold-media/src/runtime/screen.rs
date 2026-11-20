@@ -26,7 +26,9 @@ use crate::screen_capture::SourceKind;
 /// request replaces the pending one: only the latest quality is ever applied.
 #[derive(Default)]
 pub(super) struct BitrateQueue {
-    pending: Option<(u64, Quality)>,
+    /// `(attempt, operation, quality)`. The operation tag travels with the
+    /// value so a deferred retry still answers the Apply that asked for it.
+    pending: Option<(u64, u64, Quality)>,
 }
 
 /// What one delivery attempt of [`BitrateQueue`] did.
@@ -45,8 +47,14 @@ pub(super) enum BitrateDelivery {
 impl BitrateQueue {
     /// Keep the newest request of `attempt`; a newer request replaces an older
     /// pending one.
-    pub(super) fn request(&mut self, attempt: u64, quality: Quality) {
-        self.pending = Some((attempt, quality));
+    pub(super) fn request(&mut self, attempt: u64, op: u64, quality: Quality) {
+        self.pending = Some((attempt, op, quality));
+    }
+
+    /// The operation of the pending value, so its result can be reported under
+    /// the tag the dialog is waiting for.
+    pub(super) fn pending_op(&self) -> Option<u64> {
+        self.pending.map(|(_, op, _)| op)
     }
 
     /// Forget the pending value: the attempt it belonged to is gone.
@@ -67,7 +75,7 @@ impl BitrateQueue {
         current_attempt: u64,
         send: impl FnOnce(Quality) -> BitrateSend,
     ) -> BitrateDelivery {
-        let Some((attempt, quality)) = self.pending else {
+        let Some((attempt, _, quality)) = self.pending else {
             return BitrateDelivery::Idle;
         };
         if attempt != current_attempt {
@@ -139,6 +147,7 @@ impl VoiceHandle {
     /// successful preflight commits the confirmed stop+start.
     pub fn restart_screen_share(
         &self,
+        op: u64,
         request: crate::publisher::PublishRequest,
         stream_permission: bool,
         slot_available: bool,
@@ -146,6 +155,7 @@ impl VoiceHandle {
         push_screen(
             &self.requests,
             ScreenCommand::Restart {
+                op,
                 request,
                 stream_permission,
                 slot_available,
@@ -159,6 +169,7 @@ impl VoiceHandle {
     /// anything else changed.
     pub fn apply_screen_quality(
         &self,
+        op: u64,
         request: crate::publisher::PublishRequest,
         stream_permission: bool,
         slot_available: bool,
@@ -166,6 +177,7 @@ impl VoiceHandle {
         push_screen(
             &self.requests,
             ScreenCommand::LiveQuality {
+                op,
                 request,
                 stream_permission,
                 slot_available,
@@ -175,9 +187,10 @@ impl VoiceHandle {
     }
 
     /// The user closed the quality dialog while its restart preflight was
-    /// running. The live stream stays untouched.
-    pub fn cancel_screen_restart(&self) {
-        push_screen(&self.requests, ScreenCommand::CancelRestart);
+    /// running. The live stream stays untouched; a cancel of an older
+    /// operation is ignored by the worker.
+    pub fn cancel_screen_restart(&self, op: u64) {
+        push_screen(&self.requests, ScreenCommand::CancelRestart { op });
         self.requests.wake();
     }
 
@@ -274,7 +287,11 @@ impl Live {
                     }
                 }
                 PublisherOutcome::Send(signal) => self.send_signal(signal).await?,
-                PublisherOutcome::SetBitrate { attempt, quality } => {
+                PublisherOutcome::SetBitrate {
+                    attempt,
+                    op,
+                    quality,
+                } => {
                     // A stale decision of an older attempt must not change the
                     // new sender. The engine applies the limit on its worker.
                     if attempt != self.publisher.sharing().attempt {
@@ -283,7 +300,7 @@ impl Live {
                     // Keep the newest quality even when the bounded worker
                     // queue is full: it is retried on the next tick, and only a
                     // closed channel ends the attempt.
-                    self.bitrate.request(attempt, quality);
+                    self.bitrate.request(attempt, op, quality);
                     for outcome in self.flush_screen_bitrate().into_iter().rev() {
                         work.push_front(outcome);
                     }
@@ -346,6 +363,7 @@ impl Live {
             return Vec::new();
         }
         let attempt = self.publisher.sharing().attempt;
+        let op = self.bitrate.pending_op();
         let delivery = self
             .bitrate
             .flush(attempt, |quality| match self.screen.as_ref() {
@@ -353,8 +371,12 @@ impl Live {
                 None => BitrateSend::Closed,
             });
         match delivery {
-            BitrateDelivery::Sent => self.publisher.bitrate_applied(),
-            BitrateDelivery::Full => self.publisher.bitrate_queued(),
+            BitrateDelivery::Sent => op
+                .map(|op| self.publisher.bitrate_applied(op))
+                .unwrap_or_default(),
+            BitrateDelivery::Full => op
+                .map(|op| self.publisher.bitrate_queued(op))
+                .unwrap_or_default(),
             BitrateDelivery::Closed => self.publisher.on_engine(
                 crate::publisher::EngineEvent::Error("Медиадвижок трансляции уже закрыт.".into()),
                 Instant::now(),
@@ -446,9 +468,10 @@ impl Live {
     /// stopped until it confirms the new capture and audio scope.
     fn start_restart_prep(
         &mut self,
+        op: u64,
         request: crate::publisher::PublishRequest,
     ) -> Result<(), String> {
-        let pending = PendingRestart::start(self.prep_binding(), Instant::now(), request)?;
+        let pending = PendingRestart::start(self.prep_binding(), Instant::now(), op, request)?;
         self.restart = Some(pending);
         Ok(())
     }
@@ -464,10 +487,25 @@ impl Live {
     /// Cancel a pending preflight and keep the live attempt. `message` reports
     /// a device/session loss; `None` is the user closing the dialog.
     fn cancel_restart_prep(&mut self, message: Option<&str>) -> Vec<PublisherOutcome> {
-        if self.restart.take().is_none() {
+        let Some(pending) = self.restart.take() else {
+            return Vec::new();
+        };
+        let op = pending.op();
+        drop(pending);
+        self.publisher.preflight_cancelled(op, message)
+    }
+
+    /// Cancel only the preflight of `op`. A stale close of an older dialog
+    /// must not cancel the operation that replaced it.
+    fn cancel_restart_for_op(&mut self, op: u64) -> Vec<PublisherOutcome> {
+        if self
+            .restart
+            .as_ref()
+            .is_none_or(|pending| pending.op() != op)
+        {
             return Vec::new();
         }
-        self.publisher.preflight_cancelled(message)
+        self.cancel_restart_prep(None)
     }
 
     /// Observe the preflight once per tick. The result is applied only to the
@@ -485,6 +523,7 @@ impl Live {
         };
         let binding = pending.binding().clone();
         let request = pending.request().clone();
+        let op = pending.op();
         drop(pending);
         let current = self.prep_binding();
         let access = self.access_value();
@@ -494,6 +533,7 @@ impl Live {
             &current,
             access,
             event,
+            op,
             request,
             now,
         );
@@ -770,10 +810,11 @@ impl Live {
                 let outcomes = self.publisher.stop(now);
                 self.apply_screen(outcomes, viewer).await?;
             }
-            ScreenCommand::CancelRestart => {
+            ScreenCommand::CancelRestart { op } => {
                 // The dialog that requested the change is gone. The live
-                // attempt was never stopped and stays exactly as it was.
-                let outcomes = self.cancel_restart_prep(None);
+                // attempt was never stopped and stays exactly as it was; a
+                // cancel of an older operation is ignored.
+                let outcomes = self.cancel_restart_for_op(op);
                 self.apply_screen(outcomes, viewer).await?;
             }
             ScreenCommand::Publish {
@@ -796,11 +837,13 @@ impl Live {
                 self.apply_screen(outcomes, viewer).await?;
             }
             ScreenCommand::Restart {
+                op,
                 request,
                 stream_permission,
                 slot_available,
             }
             | ScreenCommand::LiveQuality {
+                op,
                 request,
                 stream_permission,
                 slot_available,
@@ -828,17 +871,17 @@ impl Live {
                     .map(|current| current.change_to(&request))
                     .unwrap_or(QualityChange::Restart);
                 if change == QualityChange::LiveBitrate {
-                    let outcomes = self.publisher.apply_quality(request, now);
+                    let outcomes = self.publisher.apply_quality(op, request, now);
                     self.apply_screen(outcomes, viewer).await?;
                     return Ok(());
                 }
-                let outcomes = self.publisher.preflight_started();
+                let outcomes = self.publisher.preflight_started(op);
                 self.apply_screen(outcomes, viewer).await?;
                 if self.publisher.phase() != crate::publisher::Phase::Live {
                     return Ok(());
                 }
-                if let Err(message) = self.start_restart_prep(request) {
-                    let outcomes = self.publisher.preflight_failed(&message);
+                if let Err(message) = self.start_restart_prep(op, request) {
+                    let outcomes = self.publisher.preflight_failed(op, &message);
                     self.apply_screen(outcomes, viewer).await?;
                 }
             }

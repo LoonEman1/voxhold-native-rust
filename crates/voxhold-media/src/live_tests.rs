@@ -222,7 +222,7 @@ fn restart_quality(
         audio,
         audio_scope: crate::system_audio::AudioScope::Device,
     };
-    handle.restart_screen_share(request, true, true);
+    handle.restart_screen_share(1, request, true, true);
     let started = Instant::now();
     let deadline = started + LIVE_BUDGET;
     let mut saw_stopping = false;

@@ -3,6 +3,8 @@
 
 use super::*;
 
+mod stall;
+
 fn publication(connection: &str, user: i64) -> Publication {
     Publication {
         server_id: 1,
@@ -314,6 +316,11 @@ fn recovery_is_bounded_and_always_targets_the_active_publisher() {
     let first = viewer.on_engine_state("disconnected", now);
     let restart = sends(&first, "stream.p2p_restart");
     assert_eq!(restart.len(), 1);
+    // The same ICE failure reported again as `failed` is still one retry.
+    let duplicate = viewer.on_engine_state("failed", now);
+    assert!(sends(&duplicate, "stream.p2p_restart").is_empty());
+    // A decoded frame ends the recovery; the next loss spends retry two.
+    viewer.on_frame();
     let second = viewer.on_engine_state("failed", now);
     assert_eq!(sends(&second, "stream.p2p_restart").len(), 1);
     // The third failure does not send another restart; the deadline ends it.

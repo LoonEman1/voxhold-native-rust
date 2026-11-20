@@ -42,6 +42,8 @@ use updates::Updates;
 pub use updates::VoiceUpdate;
 
 mod engine;
+mod player;
+use player::install_stream;
 mod preflight;
 mod prep;
 mod recovery;
@@ -541,10 +543,9 @@ impl Live {
     async fn execute(&mut self, actions: Vec<Action>) -> Result<bool, SessionEnd> {
         for action in actions {
             match action {
-                Action::Media(command) => self
-                    .media
-                    .command(command)
-                    .map_err(|error| SessionEnd::Error(format!("Ошибка медиадвижка: {error:?}")))?,
+                Action::Media(command) => self.media.command(command).map_err(|error| {
+                    SessionEnd::Error(format!("РћС€РёР±РєР° РјРµРґРёР°РґРІРёР¶РєР°: {error:?}"))
+                })?,
                 Action::Send(signal) => self.send_signal(signal).await?,
                 Action::Notice(message) => {
                     self.updates.push(VoiceUpdate::DeviceError(message.into()))
@@ -578,22 +579,35 @@ impl Live {
             match outcome {
                 ViewerOutcome::Start {
                     selection,
+                    attempt,
                     publication,
                     muted,
                     request,
                 } => {
+                    // Defensive: the viewer starts only after the previous
+                    // attempt closed, but an engine must never be dropped on the
+                    // signaling thread if that ever changes.
                     match StreamViewer::start(
                         self.servers.clone(),
                         self.policy.clone(),
                         self.output.clone(),
                         muted,
+                        attempt,
                     ) {
                         Ok(engine) => {
-                            self.stream = Some(engine);
-                            self.stream_selection = Some(selection);
+                            // A replacement engine has its own frame sequence.
+                            // Keeping the old identity would hide its first
+                            // frame when the sequence and size happen to match.
+                            install_stream(
+                                &mut self.stream,
+                                &mut self.stream_selection,
+                                &self.frame,
+                                &mut self.render,
+                                engine,
+                                selection,
+                            );
                             if let Err(end) = self.send_signal(request).await {
-                                self.stream = None;
-                                self.stream_selection = None;
+                                self.close_stream();
                                 return Err(end);
                             }
                             let _ = publication;
@@ -610,9 +624,7 @@ impl Live {
                     }
                 }
                 ViewerOutcome::Close => {
-                    self.stream = None;
-                    self.stream_selection = None;
-                    self.clear_frame();
+                    self.close_stream();
                 }
                 ViewerOutcome::Send(signal) => self.send_signal(signal).await?,
                 ViewerOutcome::Offer(sdp) => {
@@ -674,9 +686,7 @@ impl Live {
                 }
                 ViewerOutcome::Clear { selection } => {
                     if self.stream_selection == Some(selection) {
-                        self.stream = None;
-                        self.stream_selection = None;
-                        self.clear_frame();
+                        self.close_stream();
                     }
                     self.updates.push(VoiceUpdate::StreamStatus {
                         selection,
@@ -685,9 +695,7 @@ impl Live {
                 }
                 ViewerOutcome::Failed { selection, message } => {
                     if self.stream_selection == Some(selection) {
-                        self.stream = None;
-                        self.stream_selection = None;
-                        self.clear_frame();
+                        self.close_stream();
                     }
                     self.updates.push(VoiceUpdate::StreamError {
                         selection,

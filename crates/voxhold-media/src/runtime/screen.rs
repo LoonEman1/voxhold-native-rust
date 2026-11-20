@@ -769,6 +769,10 @@ impl Drop for Live {
         // Capture only the confirmed on-air request. The publisher has
         // already cleared it for a user Stop/Leave or a revoked attempt.
         self.capture_publish_recovery();
+        // The player peer is released on the same short-lived thread as a
+        // publication engine: closing it must not hold the voice worker after
+        // `stream.leave` was already sent.
+        self.close_stream();
         if let Some(engine) = self.screen.take() {
             release_off_loop(engine, true);
         }

@@ -84,6 +84,16 @@ pub(super) fn apply_engine_update(
         EngineUpdate::Answer(sdp) => EngineEffect::Outcomes(viewer.on_answer(sdp)),
         EngineUpdate::Ice(candidate) => EngineEffect::Outcomes(viewer.on_ice(candidate)),
         EngineUpdate::State(state) => EngineEffect::Outcomes(viewer.on_engine_state(state, now)),
+        EngineUpdate::Stats {
+            attempt,
+            bytes_received,
+            frames_decoded,
+        } => EngineEffect::Outcomes(viewer.on_video_stats(
+            attempt,
+            bytes_received,
+            frames_decoded,
+            now,
+        )),
         EngineUpdate::Error(message) => {
             EngineEffect::Outcomes(viewer.on_engine_error(&message, now))
         }

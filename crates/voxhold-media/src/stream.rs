@@ -12,8 +12,15 @@ pub enum EngineUpdate {
     Frame,
     /// The cached last frame was re-read at a new viewport size. It refreshes
     /// the picture only: connection state, status text and the recovery
-    /// deadline must stay exactly as they were.
+    /// deadline must stay exactly as they were. It is never video progress.
     Repaint,
+    /// Cumulative inbound video counters of this attempt. A resize repaint and
+    /// a missing report must not be confused with these values.
+    Stats {
+        attempt: u64,
+        bytes_received: u64,
+        frames_decoded: u32,
+    },
     Answer(String),
     Ice(Candidate),
     State(&'static str),
@@ -41,6 +48,10 @@ pub struct StreamViewer {
     /// the still-current frame so a static stream repaints at the new texture
     /// size instead of waiting for another RTP frame.
     viewport: (u32, u32),
+    /// Viewer attempt this engine was created for. Every statistics report is
+    /// stamped with it so the state machine can reject a late report of a
+    /// replaced engine.
+    attempt: u64,
 }
 
 impl StreamViewer {
@@ -50,6 +61,7 @@ impl StreamViewer {
         policy: String,
         output: Option<String>,
         muted: bool,
+        attempt: u64,
     ) -> Result<Self, String> {
         let media = Media::new().map_err(|error| format!("{error:?}"))?;
         media
@@ -71,6 +83,7 @@ impl StreamViewer {
             applied_output: output,
             output_working: true,
             viewport: (0, 0),
+            attempt,
         })
     }
 
@@ -84,6 +97,20 @@ impl StreamViewer {
         std::sync::Arc<crate::Events>,
         std::sync::Arc<crate::video::VideoStore>,
     ) {
+        Self::detached_for_attempt(0)
+    }
+
+    /// Headless engine with an explicit attempt id, so a test can prove that
+    /// `poll` stamps statistics with the attempt the runtime installed.
+    #[cfg(test)]
+    pub(crate) fn detached_for_attempt(
+        attempt: u64,
+    ) -> (
+        Self,
+        tokio::sync::mpsc::Receiver<Command>,
+        std::sync::Arc<crate::Events>,
+        std::sync::Arc<crate::video::VideoStore>,
+    ) {
         let (commands, receiver) = tokio::sync::mpsc::channel(8);
         let events = std::sync::Arc::new(crate::Events::default());
         let video = std::sync::Arc::new(crate::video::VideoStore::default());
@@ -92,6 +119,7 @@ impl StreamViewer {
             events: events.clone(),
             capture: std::sync::Arc::new(crate::voice::CaptureGate::default()),
             video: video.clone(),
+            stop: std::sync::Arc::new(tokio::sync::Notify::new()),
             worker: None,
         };
         (
@@ -102,11 +130,58 @@ impl StreamViewer {
                 applied_output: None,
                 output_working: true,
                 viewport: (0, 0),
+                attempt,
             },
             receiver,
             events,
             video,
         )
+    }
+
+    /// Headless engine whose worker blocks until the gate opens. The runtime
+    /// tests use it to prove that closing a player never joins the peer on the
+    /// signaling thread.
+    #[cfg(test)]
+    pub(crate) fn blocked_for_tests(
+        gate: std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+        released: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        let (commands, _receiver) = tokio::sync::mpsc::channel(1);
+        let events = std::sync::Arc::new(crate::Events::default());
+        let video = std::sync::Arc::new(crate::video::VideoStore::default());
+        let worker = std::thread::Builder::new()
+            .name("voxhold-media-test".into())
+            .spawn(move || {
+                let (open, changed) = &*gate;
+                let mut open = open.lock().unwrap();
+                while !*open {
+                    let (next, timeout) = changed
+                        .wait_timeout(open, std::time::Duration::from_secs(2))
+                        .unwrap();
+                    open = next;
+                    if timeout.timed_out() {
+                        break;
+                    }
+                }
+                released.store(true, std::sync::atomic::Ordering::SeqCst);
+            })
+            .expect("the test media worker starts");
+        Self {
+            media: Media {
+                commands,
+                events,
+                capture: std::sync::Arc::new(crate::voice::CaptureGate::default()),
+                video,
+                stop: std::sync::Arc::new(tokio::sync::Notify::new()),
+                worker: Some(worker),
+            },
+            muted: false,
+            requested_output: None,
+            applied_output: None,
+            output_working: true,
+            viewport: (0, 0),
+            attempt: 0,
+        }
     }
 
     pub fn set_muted(&mut self, muted: bool) -> Result<(), String> {
@@ -201,6 +276,14 @@ impl StreamViewer {
             Event::Answer { sdp } => Some(EngineUpdate::Answer(sdp)),
             Event::Ice(candidate) => Some(EngineUpdate::Ice(candidate)),
             Event::State { state } => Some(EngineUpdate::State(state)),
+            Event::VideoStats {
+                bytes_received,
+                frames_decoded,
+            } => Some(EngineUpdate::Stats {
+                attempt: self.attempt,
+                bytes_received,
+                frames_decoded,
+            }),
             Event::Error { message } => Some(EngineUpdate::Error(message.into())),
             Event::Output {
                 applied,
@@ -408,6 +491,24 @@ mod tests {
             Some(EngineUpdate::Repaint)
         ));
         assert_eq!((frame.width(), frame.height()), (160, 90));
+    }
+
+    #[test]
+    fn a_video_stats_event_is_stamped_with_the_engine_attempt() {
+        let (mut viewer, _commands, events, _video) = headless(None);
+        events.push(Event::VideoStats {
+            bytes_received: 10,
+            frames_decoded: 2,
+        });
+        let mut frame = VideoFrame::default();
+        assert!(matches!(
+            viewer.poll(&mut frame, 1, 1),
+            Some(EngineUpdate::Stats {
+                attempt: 0,
+                bytes_received: 10,
+                frames_decoded: 2
+            })
+        ));
     }
 
     #[test]

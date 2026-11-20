@@ -153,6 +153,7 @@ fn switching_back_to_software_stops_the_adm_recording() {
         Controls::default(),
         &events,
         capture,
+        Arc::new(Notify::new()),
         None,
     )
     .expect("default microphone");
@@ -181,6 +182,7 @@ fn a_failed_software_capture_recovers_on_the_system_input() {
         Controls::default(),
         &events,
         capture,
+        Arc::new(Notify::new()),
         None,
     )
     .expect("default microphone");
@@ -211,8 +213,16 @@ fn an_explicit_missing_microphone_retry_keeps_the_system_input() {
         input: Some("9999:Definitely Missing".into()),
         ..Controls::default()
     };
-    let mut session = Session::new(Vec::new(), "all", controls, &events, capture, None)
-        .expect("the call must start on the system input");
+    let mut session = Session::new(
+        Vec::new(),
+        "all",
+        controls,
+        &events,
+        capture,
+        Arc::new(Notify::new()),
+        None,
+    )
+    .expect("the call must start on the system input");
     assert!(session.controls.input.is_none());
     session
         .switch_input(Some("9999:Definitely Missing".into()), true, &events)
@@ -268,8 +278,16 @@ fn a_missing_saved_microphone_does_not_fail_the_join() {
         input: Some("9999:Definitely Missing".into()),
         ..Controls::default()
     };
-    let session = Session::new(Vec::new(), "all", controls, &events, capture, None)
-        .expect("a stale saved microphone must not abort the join");
+    let session = Session::new(
+        Vec::new(),
+        "all",
+        controls,
+        &events,
+        capture,
+        Arc::new(Notify::new()),
+        None,
+    )
+    .expect("a stale saved microphone must not abort the join");
     assert!(
         session.controls.input.is_none(),
         "the dead saved id must be cleared after the fallback"

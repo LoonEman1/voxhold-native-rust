@@ -18,10 +18,9 @@ use libwebrtc::{
     },
     rtp_sender::RtpSender,
     session_description::{SdpType, SessionDescription},
-    stats::RtcStats,
 };
 use tokio::{
-    sync::{mpsc, watch},
+    sync::{Notify, mpsc, watch},
     task::JoinHandle,
     time,
 };
@@ -40,9 +39,12 @@ use input::normalize_input;
 mod platform;
 use platform::PlatformAudio;
 mod playout;
-use playout::{Playout, PlayoutMode, RetryAt, SinkRecovery};
+use playout::{Playout, PlayoutMode, RetryAt, SinkRecovery, TrackSet};
+mod steps;
+use steps::Step;
 #[cfg(test)]
 mod loopback;
+mod stats;
 #[cfg(test)]
 mod test_support;
 mod winmm_out;
@@ -71,26 +73,71 @@ pub async fn run(
     events: Arc<Events>,
     capture: Arc<CaptureGate>,
     video: Arc<VideoStore>,
+    stop: Arc<tokio::sync::Notify>,
 ) {
     let mut session: Option<Session> = None;
+    let track_notify = Arc::new(Notify::new());
     let mut stats = time::interval(Duration::from_millis(250));
     stats.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     loop {
-        tokio::select! {
-            biased;
-            command = commands.recv() => {
-                let Some(command) = command else { break };
+        let step = steps::next_step(
+            &mut commands,
+            &stop,
+            &track_notify,
+            &mut stats,
+            session.is_some(),
+        )
+        .await;
+        match step {
+            Step::Stopped | Step::Closed => break,
+            Step::Stats => {
+                if let Some(session) = &mut session {
+                    session.tick_playout(&events);
+                    session.check_devices(&events);
+                    session.sample_levels(&events).await;
+                }
+            }
+            Step::Command(command) => {
                 let result = match command {
-                    Command::Start { ice_servers, ice_transport_policy, controls } => {
+                    Command::Start {
+                        ice_servers,
+                        ice_transport_policy,
+                        controls,
+                    } => {
                         session.take();
-                        Session::new(ice_servers, &ice_transport_policy, controls, &events, capture.clone(), None).map(|new_session| {
+                        Session::new(
+                            ice_servers,
+                            &ice_transport_policy,
+                            controls,
+                            &events,
+                            capture.clone(),
+                            track_notify.clone(),
+                            None,
+                        )
+                        .map(|new_session| {
                             session = Some(new_session);
                         })
                     }
-                    Command::ViewStart { ice_servers, ice_transport_policy, output } => {
+                    Command::ViewStart {
+                        ice_servers,
+                        ice_transport_policy,
+                        output,
+                    } => {
                         session.take();
-                        let controls = Controls { output, ..Controls::default() };
-                        Session::new(ice_servers, &ice_transport_policy, controls, &events, capture.clone(), Some(video.clone())).map(|new_session| {
+                        let controls = Controls {
+                            output,
+                            ..Controls::default()
+                        };
+                        Session::new(
+                            ice_servers,
+                            &ice_transport_policy,
+                            controls,
+                            &events,
+                            capture.clone(),
+                            track_notify.clone(),
+                            Some(video.clone()),
+                        )
+                        .map(|new_session| {
                             session = Some(new_session);
                         })
                     }
@@ -101,17 +148,15 @@ pub async fn run(
                     command => match session.as_mut() {
                         Some(session) => session.apply(command, &events).await,
                         None => Err("Голосовое соединение ещё не открыто."),
-                    }
+                    },
                 };
                 if let Err(message) = result {
                     events.push(Event::Error { message });
                 }
             }
-            _ = stats.tick(), if session.is_some() => {
+            Step::Tracks => {
                 if let Some(session) = &mut session {
-                    session.tick_playout(&events);
-                    session.check_devices(&events);
-                    session.sample_levels(&events).await;
+                    session.pump_track_arrivals();
                 }
             }
         }
@@ -163,9 +208,9 @@ struct Session {
     playout_reconnects: u32,
     /// Sink factory; tests substitute a fake without a Windows device.
     playout_open: Arc<winmm_out::OpenSink>,
-    /// Source tasks of the software playout; they end with the track and are
-    /// aborted when the session drops.
-    playout_tasks: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    /// Source tasks of the software playout, one per track id; they end with
+    /// the track and are aborted when the session drops.
+    playout_tracks: Arc<Mutex<TrackSet>>,
     /// Tokio handle for spawning the audio-sink tasks from the WebRTC
     /// callback thread.
     runtime: tokio::runtime::Handle,
@@ -224,6 +269,7 @@ impl Session {
         mut controls: Controls,
         events: &Arc<Events>,
         capture: Arc<CaptureGate>,
+        track_notify: Arc<Notify>,
         viewer: Option<Arc<VideoStore>>,
     ) -> Result<Self, &'static str> {
         let audio = PlatformAudio::new(false)?;
@@ -247,8 +293,7 @@ impl Session {
                 }),
             }
         }
-        let playout_tasks: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>> =
-            Arc::new(Mutex::new(Vec::new()));
+        let playout_tracks: Arc<Mutex<TrackSet>> = Arc::new(Mutex::new(TrackSet::default()));
         // A saved device that is gone at join time must not fail the call:
         // keep the default path and report it once. The software capture path
         // opens the recording device itself; the platform ADM recording side
@@ -314,9 +359,8 @@ impl Session {
             (None, Some((video, task)))
         } else {
             let track_events = events.clone();
-            let clip = initial_playout.as_ref().map(Playout::clip);
-            let runtime = tokio::runtime::Handle::current();
-            let tasks = playout_tasks.clone();
+            let arrivals = playout_tracks.clone();
+            let notify = track_notify.clone();
             peer.on_track(Some(Box::new(move |event| {
                 if let MediaStreamTrack::Audio(track) = &event.track {
                     let track_id = track.id();
@@ -325,14 +369,13 @@ impl Session {
                         stream_id: event.streams.first().map(|stream| stream.id()),
                         mid: event.transceiver.mid(),
                     });
-                    // The mixer receives decoded PCM per receiver. The sink is
-                    // created with the room playout and follows a resume.
-                    if let Some(clip) = &clip {
-                        let task = clip.attach(track_id, track.clone(), runtime.clone());
-                        if let Ok(mut tasks) = tasks.lock() {
-                            tasks.push(task);
-                        }
+                    // The mixer belongs to the media worker: queue the
+                    // receiver by id and let it attach to the Playout that is
+                    // current then, not the one that existed at call entry.
+                    if let Ok(mut tracks) = arrivals.lock() {
+                        tracks.offer(track_id, track.clone());
                     }
+                    notify.notify_one();
                 }
             })));
             // The software path owns capture so the gate, gain and mute are
@@ -501,7 +544,7 @@ impl Session {
             playout_suspended: false,
             playout_reconnects: 0,
             playout_open,
-            playout_tasks,
+            playout_tracks,
             runtime: tokio::runtime::Handle::current(),
             last_playout_report: std::time::Instant::now() - Duration::from_secs(1),
             speaking: HashMap::new(),
@@ -854,96 +897,12 @@ impl Session {
             let _ = self.peer.add_ice_candidate(parsed).await;
         }
     }
-
-    async fn sample_levels(&mut self, events: &Events) {
-        if self.peer.connection_state() != PeerConnectionState::Connected {
-            return;
-        }
-        if self.mic.is_none() && !self.input_connected {
-            self.input_connected = true;
-            self.input_started_at = std::time::Instant::now();
-        }
-        let Ok(Ok(report)) = time::timeout(Duration::from_millis(125), self.peer.get_stats()).await
-        else {
-            return;
-        };
-        let mut local_level = 0.0_f64;
-        for stat in report {
-            match stat {
-                RtcStats::MediaSource(source) => {
-                    local_level = local_level.max(source.audio.audio_level);
-                    if self.mic.is_none() {
-                        // The platform ADM has no software block counter. Its
-                        // cumulative captured-sample count is the real proof
-                        // that recording is still delivering PCM.
-                        let total = source.audio.total_samples_duration;
-                        if self.input_duration != Some(total) {
-                            self.input_duration = Some(total);
-                            self.input_progress_at = std::time::Instant::now();
-                        }
-                    }
-                }
-                RtcStats::InboundRtp(inbound) if inbound.stream.kind == "audio" => {
-                    // Only the dedicated stream-viewer peer carries the
-                    // publication's audio; the room voice peer must not be
-                    // counted as screen audio in the live proof.
-                    #[cfg(test)]
-                    if self.viewer.is_some() {
-                        crate::live_probe::record_viewer_audio(inbound.received.packets_received);
-                    }
-                    let track_id = inbound.inbound.track_identifier;
-                    if track_id.is_empty() {
-                        continue;
-                    }
-                    let level = inbound.inbound.audio_level;
-                    let speaking = level >= SPEAKING_THRESHOLD;
-                    if let Some(previous) = self.speaking.get_mut(&track_id) {
-                        if *previous == speaking {
-                            continue;
-                        }
-                        *previous = speaking;
-                    } else {
-                        if !speaking || self.speaking.len() >= 64 {
-                            continue;
-                        }
-                        self.speaking.insert(track_id.clone(), speaking);
-                    }
-                    events.push(Event::Level {
-                        track_id: Some(track_id),
-                        level,
-                    });
-                }
-                RtcStats::MediaPlayout(playout) => {
-                    // The ADM's cumulative played duration is the only proof
-                    // that the platform fallback is delivering PCM; initialized
-                    // alone is not enough (same rule as the capture watchdog).
-                    let total = playout.audio_playout.total_samples_duration;
-                    if self.adm_playout_duration != Some(total) {
-                        self.adm_playout_duration = Some(total);
-                        self.adm_playout_progress_at = std::time::Instant::now();
-                    }
-                }
-                _ => {}
-            }
-        }
-        let speaking =
-            local_level >= SPEAKING_THRESHOLD && !self.controls.muted && !self.controls.deafened;
-        if self.local_speaking != speaking {
-            self.local_speaking = speaking;
-            events.push(Event::Level {
-                track_id: None,
-                level: if speaking { local_level } else { 0.0 },
-            });
-        }
-    }
 }
 
 impl Drop for Session {
     fn drop(&mut self) {
-        if let Ok(mut tasks) = self.playout_tasks.lock() {
-            for task in tasks.drain(..) {
-                task.abort();
-            }
+        if let Ok(mut tracks) = self.playout_tracks.lock() {
+            tracks.detach();
         }
         self.playout.take();
         if let Some(mut mic) = self.mic.take() {

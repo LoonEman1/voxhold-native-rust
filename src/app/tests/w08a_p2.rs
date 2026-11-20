@@ -770,6 +770,58 @@ async fn opening_the_creator_does_not_abort_an_inflight_send(cx: &mut TestAppCon
     );
 }
 
+/// A confirmed DM send merges its row while a channel ACL reload is pending.
+/// A replayed send (`replayed=true`) emits no `conversation.message` echo, so
+/// the client must put the row into the feed from the POST answer itself.
+#[gpui::test]
+async fn conversation_send_merges_while_channel_access_is_pending(cx: &mut TestAppContext) {
+    cx.update(|cx| gpui_component::init(cx));
+    let server = TestServer::spawn(vec![
+        Reply::new(200, &serde_json::to_string(&message(70, 7)).unwrap()),
+        Reply::new(200, &page(vec![conversation(7, "Нева", true, false)])),
+    ]);
+    let (window, view) = make_app(cx, direct_client(&server));
+    let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
+    let key = draft::ChatKey::conversation(7);
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            let row = conversation(7, "Нева", true, false);
+            v.personal_mode = true;
+            // A channel ACL reload is pending while the DM is open.
+            v.access_pending = true;
+            v.conversations = vec![row.clone()];
+            v.conversation = Some(row);
+            v.channel = 7;
+            v.composer
+                .update(cx, |input, cx| input.set_value("replay", window, cx));
+            v.send(window, cx);
+            assert!(v.pending_sends.contains_key(&key));
+        });
+    });
+    // No `conversation.message` echo is delivered: this is the replay case.
+    wait_for(&mut visual, &view, |v| {
+        v.pending_sends.is_empty() && !v.messaging.loading
+    });
+    view.read_with(&*visual, |v, cx| {
+        assert!(
+            v.messages.iter().any(|message| message.id == 70),
+            "the confirmed DM row is merged without a WS echo"
+        );
+        assert_eq!(v.composer.read(cx).value(), "");
+        assert_eq!(v.drafts.borrow().text(key), "");
+        assert!(v.composer_error.is_empty());
+        assert!(
+            v.access_pending,
+            "the channel ACL reload is still pending, not cleared by the DM send"
+        );
+    });
+    assert_eq!(server.requests()[0].method, "POST");
+    assert_eq!(
+        server.requests()[0].path,
+        "/api/v1/conversations/7/messages"
+    );
+}
+
 fn channel_row(id: i64, name: &str) -> voxhold_api::Channel {
     voxhold_api::Channel {
         id,

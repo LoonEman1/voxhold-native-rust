@@ -379,11 +379,17 @@ impl Voxhold {
             &sent_ids,
             active.then_some(composer_now),
         );
-        // The draft still belongs to the original chat, but the feed may only
-        // receive the confirmed row while access to the open channel is
-        // confirmed. `invalidate_access` clears history and sets this flag;
-        // a late POST answer must not put a private row back into that gap.
-        if !self.access_pending
+        // The draft still belongs to the original chat, but a channel feed may
+        // only receive the confirmed row while access to the open channel is
+        // confirmed. `invalidate_access` clears that history and sets the flag;
+        // a late channel POST answer must not put a private row back into that
+        // gap. A personal conversation is independent of the channel ACL, so a
+        // DM row may merge once `active`/`message_in_scope` prove it belongs to
+        // the open conversation. The WS `conversation.message` echo normally
+        // hides this, but a replayed send (`replayed=true`) has no echo.
+        let access_ready =
+            !self.access_pending || (plan.key.is_conversation() && self.in_conversation());
+        if access_ready
             && active
             && self.message_in_scope(&message)
             && !self.deleted_ids.contains(&message.id)

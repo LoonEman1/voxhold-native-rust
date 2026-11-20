@@ -934,6 +934,7 @@ async fn paste_and_drop_add_only_metadata_to_the_draft(cx: &mut TestAppContext) 
 mod auth_session_tests;
 mod cf_03_draft_restore;
 mod cf_04_forward_key;
+mod cf_05_search_cancel;
 mod cf_07_edit_text;
 mod fixes;
 mod followup;

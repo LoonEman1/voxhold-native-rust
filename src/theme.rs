@@ -166,11 +166,14 @@ pub struct Palette {
     pub toggle_ink: u32,
 }
 
+/// The Windows UI face has metrics and hinting designed for small native labels.
+pub const UI_FONT: &str = if cfg!(windows) { "Segoe UI" } else { "Inter" };
+
 pub const fn dark_palette() -> Palette {
     Palette {
         light: false,
         fg: 0xf5f3ec,
-        muted: 0x96968e,
+        muted: 0xa6a69e,
         lime: 0xe7ff5b,
         bg: 0x10100f,
         panel: 0x151513,
@@ -312,11 +315,11 @@ mod tests {
     }
 
     #[test]
-    fn dark_tokens_match_the_go_reference() {
+    fn dark_tokens_include_a_higher_contrast_muted_color() {
         let p = dark_palette();
         assert_eq!(p.bg, 0x10100f);
         assert_eq!(p.fg, 0xf5f3ec);
-        assert_eq!(p.muted, 0x96968e);
+        assert_eq!(p.muted, 0xa6a69e);
         assert_eq!(p.lime, 0xe7ff5b);
         assert_eq!(p.panel, 0x151513);
         assert_eq!(p.surface, 0x191917);

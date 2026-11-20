@@ -88,12 +88,14 @@ impl Voxhold {
             .unwrap_or_default();
         // Avatars are requested only for the neighbourhood of the viewport. The
         // member list carries the version; the cache is shared with the rail.
-        let start = self
-            .history_list
-            .logical_scroll_top()
-            .item_ix
-            .saturating_sub(3);
-        let end = (start + 40).min(self.messages.len());
+        let count = self.messages.len();
+        let top = self.history_list.logical_scroll_top().item_ix.min(count);
+        let at_bottom = top == count;
+        // GPUI reports the item count when a bottom-aligned list sticks to
+        // its end. In that case the visible rows precede the logical offset.
+        let window_rows = ((chat.h / 24.).ceil() as usize + 4).max(40);
+        let start = top.saturating_sub(if at_bottom { window_rows } else { 3 });
+        let end = (start + window_rows).min(count);
         let mut wanted: Vec<(i64, String)> = self.messages[start..end]
             .iter()
             .filter_map(|message| {
@@ -143,6 +145,10 @@ impl Voxhold {
             }
             let (_, hrefs) = links::scan(&message.content);
             wanted_previews.extend(hrefs);
+        }
+        if at_bottom {
+            wanted_thumbs.reverse();
+            wanted_previews.reverse();
         }
         for key in wanted_thumbs {
             self.request_thumbnail(key.clone(), window, cx);
@@ -324,6 +330,7 @@ impl Voxhold {
             let mut row = div()
                 .id(("message", message.id as u64))
                 .relative()
+                .debug_selector(move || format!("message-row-{id}").into())
                 .w_full()
                 .cursor_pointer()
                 .when(selected_row, |row| {
@@ -361,9 +368,6 @@ impl Voxhold {
                             };
                             if s.hovered_message != next {
                                 s.hovered_message = next;
-                                if next == 0 {
-                                    s.hovered_action = None;
-                                }
                                 cx.notify();
                             }
                         });
@@ -380,95 +384,6 @@ impl Voxhold {
                     p.bg,
                     true,
                 ));
-            }
-            if hovered_message == id && menu_closed {
-                let buttons = message_tools::hover_actions(permissions, conversation, false);
-                let mut bar = div()
-                    .id(gpui::ElementId::Name(format!("hover-actions-{id}").into()))
-                    .absolute()
-                    .right(px(12.))
-                    .top(px(-10.))
-                    .h(px(29.))
-                    .flex()
-                    .items_center()
-                    .rounded(px(8.))
-                    .border_1()
-                    .border_color(ink(0x3b3b36))
-                    .bg(ink(0x252522))
-                    .occlude();
-                for (index, action) in buttons.into_iter().enumerate() {
-                    let key = action.key();
-                    let hovered_key = (id, key.to_string());
-                    let active = match action {
-                        HoverAction::Quick(emoji) => message
-                            .reactions
-                            .iter()
-                            .any(|reaction| reaction.emoji == emoji && reaction.me),
-                        _ => false,
-                    };
-                    let weak_button = weak.clone();
-                    let mut button = div()
-                        .id(gpui::ElementId::Name(format!("hover-{id}-{index}").into()))
-                        .w(px(29.))
-                        .h(px(29.))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .rounded(px(6.))
-                        .cursor_pointer()
-                        .when(active, |button| button.bg(ink(0x393a2e)))
-                        .on_hover(move |hovered, _, cx| {
-                            if let Some(view) = weak_button.upgrade() {
-                                view.update(cx, |s, cx| {
-                                    let next = if *hovered {
-                                        Some(hovered_key.clone())
-                                    } else if s.hovered_action.as_ref() == Some(&hovered_key) {
-                                        None
-                                    } else {
-                                        s.hovered_action.clone()
-                                    };
-                                    if s.hovered_action != next {
-                                        s.hovered_action = next;
-                                        cx.notify();
-                                    }
-                                });
-                            }
-                        });
-                    button = match action {
-                        HoverAction::Quick(emoji) => button.child(
-                            div()
-                                .font_family(crate::reactions::EMOJI_FONT)
-                                .text_size(px(16.))
-                                .child(emoji),
-                        ),
-                        HoverAction::Picker => {
-                            button.child(icon("icons/emoji.svg", 15., ink(p.muted)))
-                        }
-                        HoverAction::Reply => {
-                            button.child(icon("icons/reply.svg", 15., ink(p.muted)))
-                        }
-                        HoverAction::Forward => {
-                            button.child(icon("icons/forward.svg", 15., ink(p.muted)))
-                        }
-                        HoverAction::More => {
-                            button.child(icon("icons/more.svg", 15., ink(p.muted)))
-                        }
-                    };
-                    let weak_click = weak.clone();
-                    button = button.on_click(move |event, window, cx| {
-                        let Some(view) = weak_click.upgrade() else {
-                            return;
-                        };
-                        let x: f32 = event.position().x.into();
-                        let y: f32 = event.position().y.into();
-                        view.update(cx, |s, cx| {
-                            s.dispatch_hover_action(id, action, scroll_epoch, x, y, window, cx)
-                        });
-                        cx.stop_propagation();
-                    });
-                    bar = bar.child(button);
-                }
-                row = row.child(bar);
             }
             let mut head = div()
                 .flex()
@@ -686,7 +601,8 @@ impl Voxhold {
                     ))
                     .w_full()
                     .max_w(px(580.))
-                    .h(px(96.))
+                    .debug_selector(move || format!("link-card-{id}").into())
+                    .h(px(124.))
                     .mb(px(4.))
                     .rounded(px(10.))
                     .border_1()
@@ -707,15 +623,17 @@ impl Voxhold {
                 body = body.child(if let Some(image) = image {
                     card.child(
                         div()
-                            .w(px(98.))
-                            .h(px(76.))
+                            .debug_selector(move || format!("link-preview-image-{id}").into())
+                            .w(gpui::relative(0.42))
+                            .max_w(px(media::PREVIEW_IMAGE.0 as f32))
+                            .h(px(media::PREVIEW_IMAGE.1 as f32))
+                            .rounded(px(6.))
                             .flex_shrink_0()
                             .overflow_hidden()
                             .child(
                                 gpui::img(image)
-                                    .w(px(98.))
-                                    .h(px(76.))
-                                    .object_fit(gpui::ObjectFit::Cover),
+                                    .size_full()
+                                    .object_fit(gpui::ObjectFit::Contain),
                             ),
                     )
                 } else {
@@ -1000,6 +918,78 @@ impl Voxhold {
                     )));
                 }
                 row = row.child(checks);
+            }
+            if hovered_message == id && menu_closed {
+                let buttons = message_tools::hover_actions(permissions, false);
+                let mut bar = div()
+                    .id(gpui::ElementId::Name(format!("hover-actions-{id}").into()))
+                    .absolute()
+                    .right(px(12.))
+                    .top_0()
+                    .h(px(29.))
+                    .flex()
+                    .items_center()
+                    .rounded(px(8.))
+                    .border_1()
+                    .border_color(ink(p.line))
+                    .bg(ink(p.surface));
+                for (index, action) in buttons.into_iter().enumerate() {
+                    let active = match action {
+                        HoverAction::Quick(emoji) => message
+                            .reactions
+                            .iter()
+                            .any(|reaction| reaction.emoji == emoji && reaction.me),
+                        _ => false,
+                    };
+                    let mut button = div()
+                        .id(gpui::ElementId::Name(format!("hover-{id}-{index}").into()))
+                        .debug_selector(move || {
+                            format!("message-action-{id}-{}", action.key()).into()
+                        })
+                        .w(px(29.))
+                        .h(px(29.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(6.))
+                        .cursor_pointer()
+                        .hover(|button| button.bg(ink(p.selection)))
+                        .when(active, |button| button.bg(ink(p.selection)));
+                    button = match action {
+                        HoverAction::Quick(emoji) => button.child(
+                            div()
+                                .font_family(crate::reactions::EMOJI_FONT)
+                                .text_size(px(16.))
+                                .child(emoji),
+                        ),
+                        HoverAction::Picker => {
+                            button.child(icon("icons/emoji.svg", 15., ink(p.muted)))
+                        }
+                        HoverAction::Reply => {
+                            button.child(icon("icons/reply.svg", 15., ink(p.muted)))
+                        }
+                        HoverAction::Forward => {
+                            button.child(icon("icons/forward.svg", 15., ink(p.muted)))
+                        }
+                        HoverAction::More => {
+                            button.child(icon("icons/more.svg", 15., ink(p.muted)))
+                        }
+                    };
+                    let weak_click = weak.clone();
+                    button = button.on_click(move |event, window, cx| {
+                        let Some(view) = weak_click.upgrade() else {
+                            return;
+                        };
+                        let x: f32 = event.position().x.into();
+                        let y: f32 = event.position().y.into();
+                        view.update(cx, |s, cx| {
+                            s.dispatch_hover_action(id, action, scroll_epoch, x, y, window, cx)
+                        });
+                        cx.stop_propagation();
+                    });
+                    bar = bar.child(button);
+                }
+                row = row.child(bar);
             }
             row.child(
                 gpui::canvas(

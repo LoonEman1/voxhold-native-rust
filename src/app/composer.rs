@@ -219,7 +219,7 @@ impl Voxhold {
                         ))
                         .child(
                             TextInput::new(&self.composer)
-                                .font_family("Inter")
+                                .font_family(theme::UI_FONT)
                                 .text_size(px(14.))
                                 .h_full(),
                         ),

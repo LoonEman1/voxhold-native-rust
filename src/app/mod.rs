@@ -7,6 +7,7 @@ mod channel_ops;
 mod channel_view;
 mod chat_gap;
 mod composer;
+mod context_menus;
 mod history_actions;
 mod history_ops;
 mod history_view;
@@ -25,6 +26,7 @@ mod overlays_view;
 mod personal_ops;
 #[cfg(feature = "voxhold-media")]
 mod power;
+mod preview_ops;
 mod profile_view;
 mod realtime;
 mod recordings_download;
@@ -160,7 +162,9 @@ struct MemberMenu {
     user_id: i64,
     x: f32,
     y: f32,
-    profile: bool,
+    profile: Option<uuid::Uuid>,
+    profile_result: Option<Result<voxhold_api::Profile, String>>,
+    voice: bool,
     confirm_block: bool,
     confirm_ban: bool,
 }
@@ -282,6 +286,7 @@ pub(crate) struct Voxhold {
     show_thread: bool,
     message_menu: Option<MessageMenu>,
     member_menu: Option<MemberMenu>,
+    channel_menu: Option<context_menus::ChannelMenu>,
     forward: Option<ForwardState>,
     action_requests: std::collections::HashMap<String, ActionRequest>,
     action_seq: u64,
@@ -300,7 +305,6 @@ pub(crate) struct Voxhold {
     pinned_ids: std::collections::HashSet<i64>,
     pinned_request: Option<u64>,
     scroll_epoch: u64,
-    hovered_action: Option<(i64, String)>,
     highlighted_message: Option<(i64, u64)>,
     highlight_seq: u64,
     selected_messages: Vec<i64>,
@@ -363,7 +367,7 @@ pub(crate) struct Voxhold {
     settings_close_focus: FocusHandle,
     settings_entry_focus: FocusHandle,
     server_entry_focus: FocusHandle,
-    channel_entry_focus: FocusHandle,
+    #[cfg(test)]
     notifications_entry_focus: FocusHandle,
     window_active: bool,
     /// Personal "Сообщения" mode. The server/channel context is kept in
@@ -604,7 +608,6 @@ impl Voxhold {
                     // never touch `ListState` here. Both follow-ups recompute
                     // their range from a later frame.
                     s.scroll_epoch = s.scroll_epoch.wrapping_add(1);
-                    s.hovered_action = None;
                     if !s.loading_older && !s.older_scheduled && s.has_more {
                         s.schedule_older_check(window, cx);
                     }
@@ -730,6 +733,7 @@ impl Voxhold {
             show_thread: false,
             message_menu: None,
             member_menu: None,
+            channel_menu: None,
             forward: None,
             action_requests: Default::default(),
             action_seq: 0,
@@ -748,7 +752,6 @@ impl Voxhold {
             pinned_ids: Default::default(),
             pinned_request: None,
             scroll_epoch: 0,
-            hovered_action: None,
             highlighted_message: None,
             highlight_seq: 0,
             selected_messages: Vec::new(),
@@ -790,7 +793,7 @@ impl Voxhold {
             settings_close_focus: cx.focus_handle(),
             settings_entry_focus: cx.focus_handle(),
             server_entry_focus: cx.focus_handle(),
-            channel_entry_focus: cx.focus_handle(),
+            #[cfg(test)]
             notifications_entry_focus: cx.focus_handle(),
             window_active: true,
             personal_mode: false,
@@ -924,7 +927,7 @@ impl Voxhold {
             Some(window),
             cx,
         );
-        gpui_component::Theme::global_mut(cx).font_family = "Inter".into();
+        gpui_component::Theme::global_mut(cx).font_family = theme::UI_FONT.into();
         window_chrome::apply(window, view.palette.light);
         Self::bind_composer_keys(cx);
         view

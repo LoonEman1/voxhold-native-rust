@@ -2,8 +2,65 @@ use super::ui::channel_icon;
 use super::*;
 
 impl Voxhold {
-    pub(super) fn rail(&self, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn rail(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let p = self.palette;
+        let mut recents = div()
+            .id("rail-recent-conversations")
+            .w_full()
+            .flex_1()
+            .min_h(px(0.))
+            .overflow_y_scroll()
+            .flex()
+            .flex_col()
+            .items_center()
+            .gap_2();
+        let conversations: Vec<_> = self
+            .conversations
+            .iter()
+            .filter(|row| !row.saved)
+            .take(12)
+            .cloned()
+            .collect();
+        for row in conversations {
+            let id = row.id;
+            let name = inbox::conversation_title(&row, self.self_user_id);
+            let peer = inbox::conversation_peer(&row, self.self_user_id);
+            let unread = row.unread_count.min(99);
+            let face = if row.direct {
+                let image = self.member_avatar(peer, window, cx);
+                super::ui::avatar(image, &name, 36.)
+            } else {
+                icon("icons/people.svg", 21., ink(p.muted))
+            };
+            let selected = self.conversation.as_ref().is_some_and(|chat| chat.id == id);
+            recents = recents.child(
+                self.rail_button(("rail-chat", id as u64), selected, face)
+                    .when(unread > 0, |button| {
+                        button.child(
+                            div()
+                                .absolute()
+                                .right_0()
+                                .bottom_0()
+                                .rounded(px(6.))
+                                .px(px(4.))
+                                .bg(ink(p.lime))
+                                .text_color(ink(0x17170f))
+                                .text_size(px(10.))
+                                .font_weight(gpui::FontWeight::BOLD)
+                                .child(unread.to_string()),
+                        )
+                    })
+                    .on_click(cx.listener(move |s, _, window, cx| {
+                        if let Some(row) = s.conversations.iter().find(|row| row.id == id).cloned()
+                        {
+                            if !s.personal_mode {
+                                s.enter_personal_mode(window, cx);
+                            }
+                            s.select_conversation(row, window, cx);
+                        }
+                    })),
+            );
+        }
         let rail = div()
             .size_full()
             .flex()
@@ -75,7 +132,16 @@ impl Voxhold {
                         }
                     })),
             );
-        rail.child(div().flex_1())
+        rail.child(div().w(px(32.)).h(px(1.)).bg(ink(p.line)))
+            .child(recents)
+            .child(
+                self.rail_button(
+                    "rail-new-conversation",
+                    false,
+                    icon("icons/add.svg", 20., ink(p.muted)),
+                )
+                .on_click(cx.listener(|s, _, window, cx| s.open_conversation_creator(window, cx))),
+            )
             .child(
                 div()
                     .id("settings-open")
@@ -95,6 +161,28 @@ impl Voxhold {
                     })),
             )
             .into_any_element()
+    }
+
+    fn rail_button(
+        &self,
+        id: impl Into<gpui::ElementId>,
+        active: bool,
+        face: AnyElement,
+    ) -> gpui::Stateful<gpui::Div> {
+        let p = self.palette;
+        div()
+            .id(id)
+            .relative()
+            .size(px(48.))
+            .flex_shrink_0()
+            .rounded(px(14.))
+            .bg(ink(if active { p.selection } else { p.surface }))
+            .hover(|row| row.bg(ink(p.selection)))
+            .flex()
+            .items_center()
+            .justify_center()
+            .cursor_pointer()
+            .child(face)
     }
 
     pub(super) fn open_server(&mut self, id: i64, window: &mut Window, cx: &mut Context<Self>) {
@@ -170,11 +258,6 @@ impl Voxhold {
         let p = self.palette;
         #[cfg(feature = "voxhold-media")]
         let voice_colors = crate::voice_panel::VoiceColors::resolve(p);
-        let can_manage = self
-            .servers
-            .iter()
-            .find(|s| s.id == self.server)
-            .is_some_and(|s| s.role == "owner" || s.role == "admin");
         let owner = self.servers.iter().any(|server| {
             server.id == self.server
                 && crate::settings::Role::parse(&server.role).can_manage_server()
@@ -195,14 +278,59 @@ impl Voxhold {
             .child(
                 div()
                     .h(px(67.))
-                    .px(px(16.))
+                    .flex_shrink_0()
+                    .px(px(17.))
+                    .border_b_1()
+                    .border_color(ink(p.line))
                     .flex()
                     .items_center()
-                    .justify_between()
-                    .text_size(px(15.))
-                    .font_weight(gpui::FontWeight::BOLD)
-                    .child(name)
-                    .child(div().text_size(px(12.)).text_color(ink(p.muted)).child("‹")),
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_size(px(11.))
+                                    .line_height(px(14.))
+                                    .font_weight(gpui::FontWeight::BOLD)
+                                    .text_color(ink(p.muted))
+                                    .child("ПРОСТРАНСТВО"),
+                            )
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_size(px(17.))
+                                    .line_height(px(22.))
+                                    .font_weight(gpui::FontWeight::BOLD)
+                                    .child(name),
+                            ),
+                    )
+                    .when(owner, |header| {
+                        header.child(
+                            div()
+                                .id("server-settings-open")
+                                .debug_selector(|| "server-settings-open".into())
+                                .flex_shrink_0()
+                                .flex()
+                                .size(px(32.))
+                                .items_center()
+                                .justify_center()
+                                .rounded(px(7.))
+                                .hover(|button| button.bg(ink(p.selection)))
+                                .cursor_pointer()
+                                .track_focus(&self.server_entry_focus)
+                                .tab_index(0)
+                                .child(icon("icons/settings.svg", 18., ink(p.muted)))
+                                .on_click(cx.listener(|s, _, window, cx| {
+                                    let focus = s.server_entry_focus.clone();
+                                    s.open_settings(SettingsKind::Server, focus, window, cx);
+                                })),
+                        )
+                    }),
             );
         // Without the rail (narrow layout) the channels overlay is the only
         // place to switch servers, so it carries the server strip.
@@ -245,74 +373,11 @@ impl Voxhold {
             }
             panel = panel.child(strip);
         }
-        if owner {
-            panel = panel.child(
-                div()
-                    .id("server-settings-open")
-                    .px(px(16.))
-                    .py(px(6.))
-                    .cursor_pointer()
-                    .text_size(px(12.))
-                    .text_color(ink(p.muted))
-                    .track_focus(&self.server_entry_focus)
-                    .tab_index(0)
-                    .child("Настройки сервера")
-                    .on_click(cx.listener(|s, _, window, cx| {
-                        let focus = s.server_entry_focus.clone();
-                        s.open_settings(SettingsKind::Server, focus, window, cx);
-                    })),
-            );
-        }
-        if self.channel != 0 && self.conversation.is_none() {
-            if can_manage {
-                panel = panel.child(
-                    div()
-                        .id("channel-settings-open")
-                        .px(px(16.))
-                        .py(px(6.))
-                        .cursor_pointer()
-                        .text_size(px(12.))
-                        .text_color(ink(p.muted))
-                        .track_focus(&self.channel_entry_focus)
-                        .tab_index(0)
-                        .child("Настройки канала")
-                        .on_click(cx.listener(|s, _, window, cx| {
-                            let focus = s.channel_entry_focus.clone();
-                            s.open_settings(SettingsKind::Channel, focus, window, cx);
-                        })),
-                );
-            }
-            // Notifications are a per-account preference; a regular member
-            // sees this action without the channel administration form.
-            let notification_channel = self
-                .channels
-                .iter()
-                .find(|channel| channel.id == self.channel && channel.has_history())
-                .cloned();
-            if let Some(channel) = notification_channel {
-                panel = panel.child(
-                    div()
-                        .id("channel-notifications-open")
-                        .px(px(16.))
-                        .py(px(6.))
-                        .cursor_pointer()
-                        .text_size(px(12.))
-                        .text_color(ink(p.muted))
-                        .track_focus(&self.notifications_entry_focus)
-                        .tab_index(0)
-                        .child(format!("Уведомления · {}", channel.name))
-                        .on_click(cx.listener(|s, _, window, cx| {
-                            let focus = s.notifications_entry_focus.clone();
-                            s.open_settings(SettingsKind::ChannelNotifications, focus, window, cx);
-                        })),
-                );
-            }
-        }
         let now = super::recordings_ops::now_secs();
         // The list grows with the participants of every voice channel, so it
         // scrolls inside its own area and never pushes the account footer off
         // the panel.
-        let mut list = div().flex().flex_col();
+        let mut list = div().flex().flex_col().px(px(8.));
         for (kind, title) in [
             ("news", "НОВОСТНЫЕ КАНАЛЫ"),
             ("text", "ТЕКСТОВЫЕ КАНАЛЫ"),
@@ -329,19 +394,35 @@ impl Voxhold {
             }
             list = list.child(
                 div()
-                    .px(px(16.))
-                    .pt(px(10.))
-                    .pb(px(4.))
-                    .text_size(px(10.))
+                    .px(px(9.))
+                    .pt(px(17.))
+                    .pb(px(6.))
+                    .text_size(px(12.))
+                    .line_height(px(17.))
                     .font_weight(gpui::FontWeight::BOLD)
                     .text_color(ink(p.muted))
                     .child(title),
             );
             for channel in items {
                 let id = channel.id;
+                let focus = window
+                    .use_keyed_state(("channel-focus", id as u64), cx, |_, cx| cx.focus_handle())
+                    .read(cx)
+                    .clone();
+                let entry = focus.clone();
+                let edit_entry = focus.clone();
+                let can_manage = self.can_manage_channel_now() && !self.access_pending;
                 let active = id == self.channel && self.conversation.is_none();
                 let locked = channel.kind == "news" && !channel.writable() || !channel.readable();
-                let color = if active { ink(p.fg) } else { ink(p.muted) };
+                let color = ink(if locked {
+                    p.muted
+                } else if active {
+                    p.fg
+                } else {
+                    p.label
+                });
+                #[cfg(feature = "voxhold-media")]
+                let streams = self.voice_stream_list(self.server, id);
                 #[cfg(feature = "voxhold-media")]
                 let roster = if channel.kind == "voice" {
                     self.voice_roster(self.server, id)
@@ -352,11 +433,18 @@ impl Voxhold {
                     div()
                         .id(("channel", id as u64))
                         .debug_selector(move || format!("channel-{id}").into())
-                        .h(px(35.))
-                        .px(px(16.))
+                        .track_focus(&focus)
+                        .tab_index(0)
+                        .group("sidebar-channel")
+                        .h(px(36.))
+                        .mx_1()
+                        .px(px(10.))
+                        .relative()
                         .flex()
                         .items_center()
                         .gap_2()
+                        .rounded(px(7.))
+                        .hover(|row| row.bg(ink(p.selection)))
                         .cursor_pointer()
                         .bg(if active {
                             ink(p.selection)
@@ -365,18 +453,45 @@ impl Voxhold {
                         })
                         .text_color(color)
                         .child(channel_icon(&channel.kind, color))
-                        .child(
-                            div()
-                                .flex_1()
-                                .overflow_hidden()
-                                .text_size(px(14.))
-                                .child(channel.name.clone()),
-                        )
+                        .when(active, |row| {
+                            row.child(
+                                div()
+                                    .absolute()
+                                    .left_0()
+                                    .top(px(9.))
+                                    .w(px(2.))
+                                    .h(px(18.))
+                                    .rounded_full()
+                                    .bg(ink(p.lime)),
+                            )
+                        })
                         .when(
                             channel.access_restricted
                                 || channel.e2ee_required
                                 || !channel.readable(),
-                            |row| row.child(icon("icons/lock.svg", 12., ink(p.muted))),
+                            |row| {
+                                row.child(
+                                    div()
+                                        .size(px(21.))
+                                        .rounded(px(5.))
+                                        .flex_shrink_0()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .bg(ink(p.selection))
+                                        .child(icon("icons/lock.svg", 14., ink(p.accent_ink))),
+                                )
+                            },
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.))
+                                .truncate()
+                                .text_size(px(15.))
+                                .line_height(px(22.))
+                                .when(active, |name| name.font_weight(gpui::FontWeight::BOLD))
+                                .child(channel.name.clone()),
                         )
                         .when(
                             channel.kind == "voice" && self.recordings.live(id, now).is_some(),
@@ -386,10 +501,6 @@ impl Voxhold {
                                 )
                             },
                         )
-                        .when(
-                            channel.kind == "voice" && self.voice_has_stream(id),
-                            |row| row.child(icon("icons/monitor.svg", 12., ink(p.lime))),
-                        )
                         .when(channel.kind == "voice" && self.voice_count(id) > 0, |row| {
                             row.child(
                                 div()
@@ -398,18 +509,53 @@ impl Voxhold {
                                     .child(self.voice_count(id).to_string()),
                             )
                         })
-                        .when(locked, |row| row.text_color(ink(p.muted)))
-                        .on_click(cx.listener(move |s, _, w, cx| s.select_channel(id, w, cx))),
+                        .on_mouse_down(
+                            MouseButton::Right,
+                            cx.listener(move |s, event: &gpui::MouseDownEvent, _, cx| {
+                                s.open_channel_menu(id, event.position, entry.clone(), cx);
+                                cx.stop_propagation();
+                            }),
+                        )
+                        .on_click(cx.listener(move |s, _, w, cx| s.select_channel(id, w, cx)))
+                        .when(can_manage, |row| {
+                            row.child(
+                                div()
+                                    .id(("channel-settings", id as u64))
+                                    .flex_shrink_0()
+                                    .size(px(24.))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded(px(5.))
+                                    .invisible()
+                                    .group_hover("sidebar-channel", |style| style.visible())
+                                    .hover(|button| button.bg(ink(p.surface)))
+                                    .child(icon("icons/edit.svg", 14., ink(p.muted)))
+                                    .on_click(cx.listener(move |s, _, window, cx| {
+                                        s.open_channel_settings_menu_action(
+                                            id,
+                                            edit_entry.clone(),
+                                            window,
+                                            cx,
+                                        );
+                                        cx.stop_propagation();
+                                    })),
+                            )
+                        }),
                 );
                 #[cfg(feature = "voxhold-media")]
                 for participant in &roster {
-                    list = list.child(self.voice_participant_row(
-                        participant,
-                        id,
-                        voice_colors,
-                        window,
-                        cx,
-                    ));
+                    list =
+                        list.child(self.voice_participant_row(
+                            participant,
+                            id,
+                            voice_colors,
+                            streams.iter().find(|item| {
+                                item.publisher_connection_id == participant.connection_id
+                            }),
+                            window,
+                            cx,
+                        ));
                 }
             }
         }
@@ -426,14 +572,23 @@ impl Voxhold {
         if let Some(dock) = self.voice_dock(cx) {
             panel = panel.child(dock);
         }
-        panel.child(self.account_footer(cx)).into_any_element()
+        panel
+            .child(self.account_footer(window, cx))
+            .into_any_element()
     }
 
     /// The per-account footer. It is shared by the channel sidebar and the
     /// personal "Сообщения" sidebar, so the account controls never disappear
     /// while the personal surface is open (web `CommunityNavigation`).
-    pub(super) fn account_footer(&self, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn account_footer(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let p = self.palette;
+        let id = self.self_user_id;
+        let name = self.auth.username.clone();
+        let avatar = self.member_avatar(id, window, cx);
         div()
             .h(px(58.))
             .debug_selector(|| "account-footer".into())
@@ -445,10 +600,32 @@ impl Voxhold {
             .border_color(ink(p.line))
             .child(
                 div()
+                    .id("account-profile")
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |s, event: &gpui::ClickEvent, _, cx| {
+                        s.open_member_profile(id, event.position(), cx)
+                    }))
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |s, event: &gpui::MouseDownEvent, _, cx| {
+                            s.open_member_menu(id, event.position, false, cx);
+                            cx.stop_propagation();
+                        }),
+                    )
                     .flex_1()
-                    .text_size(px(13.))
-                    .text_color(ink(p.fg))
-                    .child(format!("@{}", self.auth.username)),
+                    .min_w(px(0.))
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(super::ui::avatar(avatar, &name, 32.))
+                    .child(
+                        div()
+                            .min_w(px(0.))
+                            .truncate()
+                            .text_size(px(14.))
+                            .text_color(ink(p.fg))
+                            .child(format!("@{name}")),
+                    ),
             )
             .child(
                 div()
@@ -499,6 +676,7 @@ impl Voxhold {
         participant: &voxhold_media::controller::Participant,
         channel: i64,
         voice: crate::voice_panel::VoiceColors,
+        stream: Option<&voxhold_media::controller::Publication>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -530,7 +708,11 @@ impl Voxhold {
             muted,
         );
         let name_color = if speaking || self_user {
-            voice.accent_text
+            if self_user {
+                p.story_accent
+            } else {
+                voice.accent_text
+            }
         } else if muted || !active_room {
             p.muted
         } else {
@@ -545,42 +727,10 @@ impl Voxhold {
             .as_ref()
             .map(|member| member.username.clone())
             .unwrap_or_else(|| format!("Участник {}", participant.user_id));
-        let avatar = member
-            .as_ref()
-            .and_then(|member| member.avatar_version.clone())
-            .filter(|version| !version.is_empty())
-            .and_then(|version| {
-                let key = (participant.user_id, version.clone());
-                if let Some((image, used)) = self.roster.avatars.get_mut(&key) {
-                    *used = std::time::Instant::now();
-                    return Some(image.clone());
-                }
-                self.request_avatar(participant.user_id, version, window, cx);
-                None
-            });
-        let circle = div()
-            .w(px(22.))
-            .h(px(22.))
-            .flex_shrink_0()
-            .flex()
-            .items_center()
-            .justify_center()
-            .rounded_full();
-        let face = if let Some(image) = avatar {
-            circle.child(
-                gpui::img(image)
-                    .size_full()
-                    .rounded_full()
-                    .object_fit(gpui::ObjectFit::Cover),
-            )
-        } else {
-            circle
-                .bg(ink(crate::members::avatar_color(&name)))
-                .text_color(ink(0x151510))
-                .text_size(px(10.))
-                .font_weight(gpui::FontWeight::BOLD)
-                .child(crate::members::initials(&name))
-        };
+        let avatar = self.member_avatar(participant.user_id, window, cx);
+        let face = super::ui::avatar(avatar, &name, 27.);
+        let user_id = participant.user_id;
+        let stream = stream.cloned();
         let connection = participant.connection_id.clone();
         // The badge mirrors the room card: any non-healthy state uses the
         // danger tone, the healthy dot uses the accent ink.
@@ -619,16 +769,36 @@ impl Voxhold {
                 channel.max(0) as usize,
             ))
             .debug_selector(move || format!("voice-member-{connection}").into())
-            .h(px(32.))
-            .pl(px(42.))
+            .h(px(38.))
+            .rounded(px(7.))
+            .cursor_pointer()
+            .hover(|row| row.bg(ink(p.selection)))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |s, event: &gpui::MouseDownEvent, _, cx| {
+                    s.open_voice_member_menu(user_id, event.position, cx);
+                    cx.stop_propagation();
+                }),
+            )
+            .on_click(cx.listener({
+                let stream = stream.clone();
+                move |s, event: &gpui::ClickEvent, window, cx| {
+                    if let Some(stream) = &stream {
+                        s.watch_sidebar_stream(channel, stream, window, cx);
+                    } else {
+                        s.open_member_profile(user_id, event.position(), cx);
+                    }
+                }
+            }))
+            .pl(px(31.))
             .pr(px(16.))
             .flex()
             .items_center()
             .gap_2()
             .child(
                 div()
-                    .w(px(26.))
-                    .h(px(26.))
+                    .w(px(31.))
+                    .h(px(31.))
                     .flex_shrink_0()
                     .rounded_full()
                     .border_2()
@@ -646,10 +816,27 @@ impl Voxhold {
                 div()
                     .flex_1()
                     .truncate()
-                    .text_size(px(13.))
+                    .text_size(px(14.))
+                    .line_height(px(20.))
                     .text_color(ink(name_color))
                     .child(name),
             )
+            .when(stream.is_some(), |row| {
+                row.child(
+                    div()
+                        .debug_selector(move || format!("channel-live-{user_id}").into())
+                        .flex_shrink_0()
+                        .px(px(5.))
+                        .py(px(2.))
+                        .rounded(px(5.))
+                        .bg(ink(0xb92d36))
+                        .text_color(ink(0xffffff))
+                        .text_size(px(11.))
+                        .line_height(px(14.))
+                        .font_weight(gpui::FontWeight::BOLD)
+                        .child("LIVE"),
+                )
+            })
             .child(badge)
             .into_any_element()
     }

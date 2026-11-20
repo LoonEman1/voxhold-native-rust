@@ -60,6 +60,14 @@ struct PlayerDrag {
     offset_y: f32,
 }
 
+pub(crate) struct ParticipantClick {
+    pub user_id: i64,
+    pub position: gpui::Point<gpui::Pixels>,
+    pub menu: bool,
+}
+
+impl gpui::EventEmitter<ParticipantClick> for VoicePanel {}
+
 pub struct VoicePanel {
     focus: FocusHandle,
     _subscriptions: Vec<Subscription>,
@@ -124,6 +132,8 @@ pub struct VoicePanel {
     /// Publications of the displayed room from the account WebSocket; the
     /// call's runtime owns `streams` for the room it is in.
     room_streams: Vec<Publication>,
+    sidebar_watch: Option<Publication>,
+    live_clock_second: Option<i64>,
     /// Permission Stream of the displayed room, confirmed by the channel list.
     can_stream: bool,
     /// Screen-share picker, on-air card and preview.
@@ -291,6 +301,8 @@ impl VoicePanel {
             input_generation: 0,
             streams: Vec::new(),
             room_streams: Vec::new(),
+            sidebar_watch: None,
+            live_clock_second: None,
             can_stream: false,
             screen: ScreenShareUi::default(),
             screen_audio_probe: 0,
@@ -465,6 +477,7 @@ impl VoicePanel {
         streams: Vec<Publication>,
     ) {
         if self.room != room {
+            self.sidebar_watch = None;
             self.room = room;
             self.room_scroll = 0.0;
         }
@@ -665,6 +678,7 @@ impl VoicePanel {
     /// Normal leave: stream session and voice session are both released and
     /// the room falls back to the join button.
     pub fn leave_call(&mut self, cx: &mut Context<Self>) {
+        self.sidebar_watch = None;
         if let Some(handle) = &self.handle {
             if let Some(selection) = self.watching_selection {
                 handle.leave_stream(selection);
@@ -878,6 +892,7 @@ impl VoicePanel {
     /// Start watching the selected publication. The runtime leaves the previous
     /// attempt and waits for its acknowledgement.
     pub fn watch(&mut self, publication: Publication, cx: &mut Context<Self>) {
+        self.sidebar_watch = None;
         if !self.access_confirmed
             || self.call_channel == 0
             || publication.channel_id != self.call_channel
@@ -1006,13 +1021,14 @@ impl VoicePanel {
     fn poll(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.sync_viewport();
         let preview_changed = self.take_screen_preview();
+        let clock_changed = self.live_clock_changed();
         let Some(handle) = &self.handle else {
-            if preview_changed {
+            if preview_changed || clock_changed {
                 cx.notify();
             }
             return;
         };
-        let mut changed = preview_changed;
+        let mut changed = preview_changed || clock_changed;
         let mut updates = Vec::new();
         while let Some(update) = handle.try_update() {
             updates.push(update);
@@ -1021,6 +1037,7 @@ impl VoicePanel {
         for update in updates {
             changed |= self.apply_update(update, window, cx);
         }
+        self.watch_after_join(cx);
         if let Some(frame) = frame {
             if self.watching_selection != Some(frame.selection) {
                 // A frame that was already in the last-value slot when the
@@ -1130,6 +1147,7 @@ mod focus;
 mod player;
 mod screen_share;
 use screen_share::ScreenShareUi;
+mod sidebar;
 #[cfg(test)]
 mod test_support;
 mod updates;

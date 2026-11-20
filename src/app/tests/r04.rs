@@ -208,7 +208,6 @@ async fn a_hover_click_from_before_the_scroll_is_ignored(cx: &mut TestAppContext
             v.channel = 7;
             v.messages.push(dto(message_json(5, 1, "row")));
             v.hovered_message = 5;
-            v.hovered_action = Some((5, "more".into()));
             v.scroll_epoch = 4;
             v.dispatch_hover_action(5, message_tools::HoverAction::More, 3, 0., 0., window, cx);
             assert!(
@@ -218,7 +217,6 @@ async fn a_hover_click_from_before_the_scroll_is_ignored(cx: &mut TestAppContext
             v.dispatch_hover_action(5, message_tools::HoverAction::More, 4, 0., 0., window, cx);
             assert!(v.message_menu.is_some(), "the current frame still works");
             v.message_menu = None;
-            v.hovered_action = Some((5, "emoji".into()));
             v.dispatch_hover_action(
                 5,
                 message_tools::HoverAction::Picker,

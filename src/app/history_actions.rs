@@ -145,6 +145,8 @@ impl Voxhold {
                 picker.reset_for_message(mine, cx);
             });
         }
+        self.member_menu = None;
+        self.channel_menu = None;
         self.message_menu = Some(MessageMenu {
             message_id,
             x,
@@ -168,11 +170,10 @@ impl Voxhold {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if epoch != self.scroll_epoch {
-            return;
-        }
-        let expected = (message_id, action.key().to_string());
-        if self.hovered_action.as_ref() != Some(&expected) {
+        if epoch != self.scroll_epoch
+            || self.hovered_message != message_id
+            || self.message_menu.is_some()
+        {
             return;
         }
         match action {

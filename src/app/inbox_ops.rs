@@ -26,6 +26,7 @@ impl Voxhold {
             let text = self.composer.read(cx).value().to_string();
             self.drafts.borrow_mut().set_text(previous, &text);
         }
+        self.media.preview_pending.clear();
         self.close_viewer(window);
         self.close_thread(window, cx);
         self.show_search = false;
@@ -47,7 +48,6 @@ impl Voxhold {
         self.selected_messages.clear();
         self.highlighted_message = None;
         self.hovered_message = 0;
-        self.hovered_action = None;
         let id = conversation.id;
         self.conversation_select_seq = self.conversation_select_seq.wrapping_add(1);
         self.conversation = Some(conversation);

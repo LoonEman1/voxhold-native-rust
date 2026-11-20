@@ -96,6 +96,7 @@ impl Voxhold {
         self.show_search = false;
         self.message_menu = None;
         self.member_menu = None;
+        self.channel_menu = None;
         self.forward = None;
         self.close_edit();
         self.confirm_delete = None;

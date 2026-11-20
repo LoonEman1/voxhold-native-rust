@@ -58,6 +58,14 @@ impl VoicePanel {
         // the scope is really in the card. The inner line keeps the stable
         // `screen-on-air-quality` key used by layout tests.
         let selector_line = line.clone();
+        let title = self
+            .room_streams()
+            .iter()
+            .find(|item| {
+                live && Some(&item.publisher_connection_id) == self.self_connection.as_ref()
+            })
+            .map(|publication| voice_room::live_metadata(publication, voice_room::now_millis()))
+            .unwrap_or_else(|| "Ваш экран".into());
         let mut card = div()
             .id("screen-on-air")
             .debug_selector(|| "screen-on-air".into())
@@ -121,7 +129,7 @@ impl VoicePanel {
                     .text_size(px(12.))
                     .font_weight(gpui::FontWeight::BOLD)
                     .truncate()
-                    .child("Ваш экран"),
+                    .child(title),
             )
             .child(
                 div()

@@ -13,7 +13,7 @@ impl Render for Voxhold {
         let mut root = div()
             .relative()
             .size_full()
-            .font_family("Inter")
+            .font_family(theme::UI_FONT)
             .bg(ink(p.bg))
             .text_color(ink(p.fg))
             .capture_key_down(cx.listener(|s, event: &gpui::KeyDownEvent, window, cx| {
@@ -50,7 +50,7 @@ impl Render for Voxhold {
                             cx.stop_propagation();
                             return;
                         }
-                        if s.member_menu.take().is_some() {
+                        if s.member_menu.take().is_some() || s.channel_menu.take().is_some() {
                             cx.notify();
                             cx.stop_propagation();
                             return;
@@ -259,7 +259,7 @@ impl Render for Voxhold {
                     .top(px(l.rail.y))
                     .w(px(l.rail.w))
                     .h(px(l.rail.h))
-                    .child(self.rail(cx)),
+                    .child(self.rail(window, cx)),
             );
         }
         let personal_empty = self.personal_mode && self.conversation.is_none();
@@ -950,6 +950,7 @@ impl Render for Voxhold {
             || self.update.panel_open
             || self.message_menu.is_some()
             || self.member_menu.is_some()
+            || self.channel_menu.is_some()
             || self.forward.is_some();
         if popup_open {
             root = root.child(
@@ -958,7 +959,11 @@ impl Render for Voxhold {
                     .debug_selector(|| "overlay-backdrop".into())
                     .absolute()
                     .size_full()
-                    .on_click(cx.listener(|s, _, _, cx| s.dismiss_overlays(cx))),
+                    .on_click(cx.listener(|s, _, _, cx| s.dismiss_overlays(cx)))
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(|s, _, _, cx| s.dismiss_overlays(cx)),
+                    ),
             );
         }
         // The popup sits above the backdrop so a click inside it is not a
@@ -975,7 +980,10 @@ impl Render for Voxhold {
         if let Some(overlay) = self.message_menu_overlay(window, cx) {
             root = root.child(overlay);
         }
-        if let Some(overlay) = self.member_menu_overlay(cx) {
+        if let Some(overlay) = self.member_menu_overlay(window, cx) {
+            root = root.child(overlay);
+        }
+        if let Some(overlay) = self.channel_menu_overlay(cx) {
             root = root.child(overlay);
         }
         if let Some(notice) = self.notice_overlay() {

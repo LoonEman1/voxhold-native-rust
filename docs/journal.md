@@ -527,3 +527,19 @@ backend/браузер, TURN/ICE на втором ПК, DPI 125/150, запис
 - Ревью: три раунда. Первый — 3 P1 (частичная страница, logout, voice dock) + P2; второй — 2 P1 (классификация 403, потеря черновика при «+») + P2; третий — 1 P1 (отправка при ACL reload). Финальное ревью диапазона `96bdb6d..d0a6f50` — PASS.
 - Остаются P2: fallback при возврате отозванного канала, второй `channels.changed` во время reload, мобильный вход, мёртвый R04 inbox popup, cursor/retry старой страницы, favorites-поверхность W08b, API-тесты wire-контракта.
 - Не проверено: живой backend/WS/POST, два физических устройства, block/privacy на реальном сервере, ручной GUI/DPI/узкие окна и кадры web ↔ native; это остаётся для стенда и `W13`.
+- Интеграция: PR #27 влит в `dev` коммитом `df306fc`; W05a — `6345627`, W08a — `d0a6f50`.
+
+### W08a P2 — полировка «Сообщений» и ACL-сценариев — PR #31
+
+Ветка `codex/w08a-p2` от `df306fc`, итог `f1ebb5a`. Проверки: fmt; `cargo test --workspace --locked` — 852 passed, 0 failed, 13 ignored (API 14+8+1, media 199/12 ignored, app 550/1 ignored, release 3, update 72, updater 5); release; лимиты файлов 286, `messages_ops.rs` 1193 с исключением 1200.
+
+- Возврат «К каналам» во время ACL-reload: fallback на первый читаемый канал, сохранение черновика канала, очистка pending после ошибки reload.
+- Второй `channels.changed` во время reload перезапускает запрос; мобильная нижняя панель входит/выходит из «Сообщений».
+- Удалён недостижимый R04 inbox popup (`Inbox`, tiles, overlay, `show_inbox`); общие `conversation_title/peer` оставлены.
+- Старая страница индекса: retry и отбрасывание ответа при смене cursor/параллельном refresh.
+- 403/404 после «+»/переключения и reaction 403 проверяют беседу точечным `GET`; удалённая неактивная беседа очищает draft/pending send.
+- F5 в ЛС обновляет историю; ACL-баннер только на канале; leave применяется после переключения; cap поиска и текст пустого состояния исправлены.
+- Добавлены wire-тесты `crates/voxhold-api/tests/conversations_wire.rs`; P1 по потере черновика при pending-возврате исправлен в `f1ebb5a`.
+- Ревью P2-диапазона — PASS с одним старым P1; follow-up `f1ebb5a` — финальное ревью PASS, P0/P1 нет.
+- Остаётся P2: leave беседы, от которой переключились, не очищает её draft; тест `conversation_peer` для группы слабый; `channels.changed` без активного reload и без `voice_unconfirmed` не запускает reload.
+- Не проверено: живой backend/WS/POST, block/privacy/leave на реальном сервере, ручной GUI/DPI/мобильное устройство, кадры web ↔ native; общий `C:/vxt` требует `cargo clean -p voxhold-api -p voxhold-native-rust` при параллельных worktree.

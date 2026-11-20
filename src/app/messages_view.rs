@@ -224,7 +224,7 @@ impl Voxhold {
                             .text_size(px(12.))
                             .text_color(ink(p.muted))
                             .child(if filter.is_empty() {
-                                "Начните разговор через + или профиль участника."
+                                "Начните разговор кнопкой +."
                             } else {
                                 "Разговоры не найдены"
                             }),
@@ -375,9 +375,26 @@ impl Voxhold {
                     div()
                         .px(px(16.))
                         .py(px(6.))
+                        .flex()
+                        .items_center()
+                        .gap_2()
                         .text_size(px(11.))
-                        .text_color(ink(p.danger))
-                        .child(self.messaging.older_error.clone()),
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.))
+                                .text_color(ink(p.danger))
+                                .child(self.messaging.older_error.clone()),
+                        )
+                        .child(
+                            div()
+                                .id("conversation-older-retry")
+                                .debug_selector(|| "conversation-older-retry".into())
+                                .cursor_pointer()
+                                .text_color(ink(p.muted))
+                                .on_click(cx.listener(|s, _, _, cx| s.load_older_conversations(cx)))
+                                .child("Повторить"),
+                        ),
                 );
             } else if self.messaging.has_more {
                 panel = panel.child(
@@ -543,6 +560,16 @@ impl Voxhold {
                     .text_size(px(11.))
                     .text_color(ink(p.muted))
                     .child("Загрузка…"),
+            );
+        } else if self.messaging.search.truncated {
+            body = body.child(
+                div()
+                    .id("conversation-search-truncated")
+                    .debug_selector(|| "conversation-search-truncated".into())
+                    .py(px(6.))
+                    .text_size(px(11.))
+                    .text_color(ink(p.muted))
+                    .child("Показаны первые 200 результатов."),
             );
         } else if self.messaging.search.has_more {
             body = body.child(

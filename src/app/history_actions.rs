@@ -894,7 +894,6 @@ impl Voxhold {
             });
         }
         self.show_search = true;
-        self.show_inbox = false;
         self.message_menu = None;
         self.forward = None;
         cx.notify();

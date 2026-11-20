@@ -26,6 +26,9 @@ pub struct SearchState {
     pub error: String,
     pub request: u64,
     pub submitted: String,
+    /// The client row cap was hit while the server still had more rows. The
+    /// "Ещё результаты" action must not promise rows that cannot be shown.
+    pub truncated: bool,
 }
 
 impl SearchState {
@@ -39,6 +42,21 @@ impl SearchState {
         self.loading_more = false;
         self.error.clear();
         self.submitted.clear();
+        self.truncated = false;
+    }
+
+    /// A submitted query owns the next answer: drop the previous rows, the
+    /// cursor and the cap note before the request leaves.
+    pub fn begin(&mut self, request: u64, query: &str) {
+        self.request = request;
+        self.submitted = query.to_string();
+        self.results.clear();
+        self.has_more = false;
+        self.next_before = None;
+        self.loading = true;
+        self.loading_more = false;
+        self.error.clear();
+        self.truncated = false;
     }
 
     pub fn apply_page(&mut self, page: ConversationSearchPage, append: bool) {
@@ -55,9 +73,13 @@ impl SearchState {
             }
         }
         rows.truncate(MAX_SEARCH_ROWS);
+        // The 200-row cap is silent by itself; stop advertising a next page the
+        // list can never paint and let the view explain the bound.
+        let truncated = page.has_more && rows.len() >= MAX_SEARCH_ROWS;
         self.results = rows;
-        self.has_more = page.has_more;
-        self.next_before = page.next_before;
+        self.has_more = page.has_more && !truncated;
+        self.next_before = if truncated { None } else { page.next_before };
+        self.truncated |= truncated;
         self.loading = false;
         self.loading_more = false;
         self.error.clear();
@@ -125,6 +147,9 @@ pub struct Messages {
     pub notifications: Option<Notifications>,
     pub leave_confirm: bool,
     pub leave_request: Option<u64>,
+    /// Conversation id owned by `leave_request`. A switch keeps the DELETE
+    /// answer applicable to its own row only.
+    pub leave_target: i64,
     pub leave_error: String,
     /// Bumped when the personal surface closes; an older page answer cannot
     /// append into a view that the user already left.
@@ -134,9 +159,9 @@ pub struct Messages {
     /// One `GET /conversations/{id}` that decides whether an open row outside
     /// a partial page still exists.
     pub reconcile_request: Option<u64>,
-    /// One `GET /conversations/{id}` after a send `403`, which is used both for
-    /// a lost membership and for a `canContact` refusal.
-    pub send_verify_request: Option<u64>,
+    /// One `GET /conversations/{id}` after a send or reaction `403`. It decides
+    /// between a transient refusal and real revocation.
+    pub conversation_verify_request: Option<u64>,
 }
 
 impl Messages {
@@ -156,11 +181,12 @@ impl Messages {
             notifications: None,
             leave_confirm: false,
             leave_request: None,
+            leave_target: 0,
             leave_error: String::new(),
             epoch: 0,
             open_request: None,
             reconcile_request: None,
-            send_verify_request: None,
+            conversation_verify_request: None,
         }
     }
 
@@ -169,10 +195,20 @@ impl Messages {
         self.search.invalidate();
     }
 
+    /// Close the confirmation bar and drop its error. An in-flight DELETE keeps
+    /// its slot: its answer is still authoritative for its own row even after
+    /// the user switches chats.
     pub fn clear_leave(&mut self) {
         self.leave_confirm = false;
-        self.leave_request = None;
         self.leave_error.clear();
+    }
+
+    /// Cancel the pending DELETE too. Used when the surface it belongs to is
+    /// discarded for good (logout, a revoked conversation).
+    pub fn abort_leave(&mut self) {
+        self.clear_leave();
+        self.leave_request = None;
+        self.leave_target = 0;
     }
 
     /// Drop every personal-surface leftover on session end. The query input and
@@ -193,11 +229,11 @@ impl Messages {
         self.clear_search();
         self.creator = None;
         self.notifications = None;
-        self.clear_leave();
+        self.abort_leave();
         self.epoch = self.epoch.wrapping_add(1);
         self.open_request = None;
         self.reconcile_request = None;
-        self.send_verify_request = None;
+        self.conversation_verify_request = None;
     }
 }
 
@@ -473,5 +509,38 @@ mod tests {
         assert_eq!(search_preview("a\nb"), "a b");
         let long: String = "x".repeat(130);
         assert_eq!(search_preview(&long).chars().count(), 121);
+    }
+
+    #[test]
+    fn search_cap_stops_advertising_more_rows() {
+        let hit = |id: i64| ConversationSearchHit {
+            id,
+            conversation_id: 1,
+            author_id: 2,
+            author_username: "neva".into(),
+            content: "row".into(),
+            created_at: 1,
+        };
+        let mut state = SearchState::default();
+        state.apply_page(
+            ConversationSearchPage {
+                results: (1..=MAX_SEARCH_ROWS as i64).map(hit).collect(),
+                has_more: true,
+                next_before: Some(1),
+            },
+            false,
+        );
+        assert_eq!(state.results.len(), MAX_SEARCH_ROWS);
+        assert!(state.truncated, "the cap is reported");
+        assert!(!state.has_more, "no next page can add paintable rows");
+        assert!(state.next_before.is_none());
+        state.begin(7, "fresh");
+        assert!(!state.truncated, "a new query resets the cap note");
+        assert!(state.loading);
+        assert!(state.results.is_empty());
+        assert_eq!(state.request, 7);
+        assert_eq!(state.submitted, "fresh");
+        state.invalidate();
+        assert!(!state.truncated, "a closed surface resets the note");
     }
 }

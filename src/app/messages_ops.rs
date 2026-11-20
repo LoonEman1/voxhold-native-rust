@@ -19,6 +19,8 @@ impl Voxhold {
         self.save_composer_draft(cx);
         self.personal_mode = true;
         self.personal_return = Some((self.server, self.channel));
+        self.pending_return_channel = None;
+        self.personal_members = self.show_members;
         self.messaging.epoch = self.messaging.epoch.wrapping_add(1);
         self.messaging.clear_search();
         self.messaging.clear_leave();
@@ -54,6 +56,9 @@ impl Voxhold {
         }
         self.save_composer_draft(cx);
         self.personal_mode = false;
+        self.show_members = self.personal_members;
+        self.personal_members = false;
+        self.pending_return_channel = None;
         self.messaging.epoch = self.messaging.epoch.wrapping_add(1);
         self.messaging.clear_search();
         self.messaging.clear_leave();
@@ -92,8 +97,15 @@ impl Voxhold {
         if self.access_pending && self.access_reload_in_flight {
             // The ACL answer owns the fresh channel list. Remember which
             // channel to reopen; its callback selects it once access is
-            // confirmed, without cancelling the reload here.
+            // confirmed. `select_channel` is blocked while access is pending,
+            // so restore the saved draft here; otherwise the empty composer
+            // would overwrite it when the callback selects the channel.
+            let key = draft::ChatKey::channel(self.server, saved_channel);
+            let draft = self.drafts.borrow().text(key);
+            self.composer
+                .update(cx, |input, cx| input.set_value(draft, window, cx));
             self.channel = saved_channel;
+            self.pending_return_channel = Some(saved_channel);
             cx.notify();
             return;
         }
@@ -201,7 +213,7 @@ impl Voxhold {
         self.channel_snapshot_request = None;
         self.search_permissions_request = None;
         self.search_permissions_ready = false;
-        self.messaging.send_verify_request = None;
+        self.messaging.conversation_verify_request = None;
         self.composer_error.clear();
         self.error.clear();
         self.pinned_ids.clear();
@@ -217,6 +229,35 @@ impl Voxhold {
             attachments.update(cx, |panel, cx| panel.set_scope(None, false, cx));
         }
         self.update_channel_subscription(false);
+    }
+
+    /// A confirmed removal drops the index row together with the draft scope
+    /// and pending send of that conversation. The open chat is only cleared
+    /// when it is the removed row; another chat keeps its draft and composer.
+    pub(super) fn forget_conversation(
+        &mut self,
+        id: i64,
+        reason: Option<&str>,
+        cx: &mut Context<Self>,
+    ) {
+        self.conversations.retain(|row| row.id != id);
+        if self.conversation.as_ref().map(|row| row.id) == Some(id) {
+            // No `Window` here; the next render finishes the window-owned
+            // cleanup.
+            self.clear_active_conversation_state(reason, cx);
+            return;
+        }
+        let key = draft::ChatKey::conversation(id);
+        if let Some(pending) = self.pending_sends.remove(&key) {
+            pending.abort.abort();
+        }
+        self.drafts.borrow_mut().clear(key);
+    }
+
+    /// A confirmed 403/404 for a conversation row that is not the current chat
+    /// still removes that row from the index.
+    pub(super) fn note_conversation_unavailable(&mut self, id: i64, cx: &mut Context<Self>) {
+        self.forget_conversation(id, Some("Диалог недоступен."), cx);
     }
 
     /// A leave, 403 or missing index row owns the next frame. Pending sends for
@@ -248,7 +289,7 @@ impl Voxhold {
         self.drafts.borrow_mut().clear(key);
         self.conversations_reconcile = None;
         self.messaging.notifications = None;
-        self.messaging.clear_leave();
+        self.messaging.abort_leave();
         self.reset_personal_chat_state(cx);
         self.channel = 0;
         if let Some(reason) = reason {
@@ -300,9 +341,6 @@ impl Voxhold {
         self.messaging.loading = true;
         self.messaging.older_error.clear();
         let select_seq = self.conversation_select_seq;
-        if let Some(inbox) = &self.inbox {
-            inbox.update(cx, |inbox, cx| inbox.set_loading(true, cx));
-        }
         let runtime = self.runtime.clone();
         let session = self.session_generation;
         let task = cx.background_spawn(async move {
@@ -381,12 +419,6 @@ impl Voxhold {
                         }
                         Err(error) => {
                             let text = error.to_string();
-                            if let Some(inbox) = &s.inbox {
-                                inbox.update(cx, |inbox, cx| {
-                                    inbox.set_loading(false, cx);
-                                    inbox.set_error(text.clone(), cx);
-                                });
-                            }
                             s.messaging.error = text;
                         }
                     }
@@ -450,10 +482,11 @@ impl Voxhold {
                             s.conversation = Some(row);
                         }
                         Err(voxhold_api::Error::Http(403 | 404)) => {
-                            s.conversations.retain(|row| row.id != marker.conversation);
-                            // No `Window` in this answer; the next render
-                            // finishes the window-owned cleanup.
-                            s.clear_active_conversation_state(Some("Диалог недоступен."), cx);
+                            s.forget_conversation(
+                                marker.conversation,
+                                Some("Диалог недоступен."),
+                                cx,
+                            );
                         }
                         // A transient failure is not proof of deletion.
                         Err(_) => {}
@@ -466,24 +499,27 @@ impl Voxhold {
         .detach();
     }
 
-    /// A conversation send `403` is ambiguous: the backend returns it both for
-    /// a lost membership and for a `canContact` refusal (block, privacy `none`,
+    /// A conversation `403` is ambiguous: the backend returns it both for a
+    /// lost membership and for a `canContact` refusal (block, privacy `none`,
     /// no shared server), where both users can stay members. One explicit
-    /// `GET /conversations/{id}` decides; until it answers (or on a transient
-    /// failure) the chat, composer text, attachments and draft stay untouched.
-    pub(super) fn verify_conversation_after_send_403(
+    /// `GET /conversations/{id}` decides. The request is scoped to the row, so a
+    /// revoked row is cleaned up even when the user already switched away; only
+    /// the still-open chat is closed.
+    pub(super) fn verify_conversation_after_403(
         &mut self,
         key: draft::ChatKey,
-        error: String,
+        send_error: Option<String>,
         cx: &mut Context<Self>,
     ) {
         let Some(client) = self.client.clone() else {
-            self.composer_error = error;
+            if let Some(error) = send_error.filter(|_| self.chat_key() == key) {
+                self.composer_error = error;
+            }
             return;
         };
         self.action_seq = self.action_seq.wrapping_add(1);
         let request = self.action_seq;
-        self.messaging.send_verify_request = Some(request);
+        self.messaging.conversation_verify_request = Some(request);
         let session = self.session_generation;
         let id = key.channel;
         let runtime = self.runtime.clone();
@@ -493,11 +529,12 @@ impl Voxhold {
             if let Some(this) = this.upgrade() {
                 this.update(cx, |s, cx| {
                     if s.session_generation != session
-                        || s.messaging.send_verify_request != Some(request)
+                        || s.messaging.conversation_verify_request != Some(request)
                     {
                         return;
                     }
-                    s.messaging.send_verify_request = None;
+                    s.messaging.conversation_verify_request = None;
+                    let active = s.chat_key() == key;
                     match result {
                         Ok(row) => {
                             if let Some(existing) = s
@@ -507,21 +544,20 @@ impl Voxhold {
                             {
                                 *existing = row.clone();
                             }
-                            if s.chat_key() == key {
+                            if active {
                                 s.conversation = Some(row);
                             }
                         }
                         Err(voxhold_api::Error::Http(403 | 404)) => {
-                            s.conversations.retain(|row| row.id != id);
-                            if s.chat_key() == key {
-                                s.clear_active_conversation_state(Some("Диалог недоступен."), cx);
-                            }
+                            s.forget_conversation(id, Some("Диалог недоступен."), cx);
                         }
                         // A transient failure is not proof of revocation. The
                         // send error stays visible and the draft can be retried.
                         Err(_) => {
-                            if s.chat_key() == key {
-                                s.composer_error = error;
+                            if active {
+                                if let Some(error) = send_error {
+                                    s.composer_error = error;
+                                }
                             }
                         }
                     }
@@ -563,6 +599,7 @@ impl Voxhold {
             return;
         }
         let cursor = self.messaging.cursor.clone().unwrap_or_default();
+        let task_cursor = cursor.clone();
         self.action_seq = self.action_seq.wrapping_add(1);
         let request = self.action_seq;
         self.messaging.older_request = Some(request);
@@ -572,7 +609,7 @@ impl Voxhold {
         let session = self.session_generation;
         let runtime = self.runtime.clone();
         let task = cx.background_spawn(async move {
-            runtime.block_on(client.conversations_page(PAGE_SIZE, Some(&cursor)))
+            runtime.block_on(client.conversations_page(PAGE_SIZE, Some(&task_cursor)))
         });
         cx.spawn(async move |this, cx| {
             let result = task.await;
@@ -583,6 +620,16 @@ impl Voxhold {
                     }
                     s.messaging.older_request = None;
                     s.messaging.older_loading = false;
+                    // A first-page refresh that landed while this page was in
+                    // flight owns the cursor and `has_more`. Applying the older
+                    // page would regress the cursor or skip rows, so discard it;
+                    // the fresh page keeps the retry available.
+                    let stale = s.recents_request.is_some()
+                        || s.messaging.cursor.as_deref() != Some(cursor.as_str());
+                    if stale {
+                        cx.notify();
+                        return;
+                    }
                     match result {
                         Ok(page) => {
                             messages::append_page(&mut s.conversations, page.conversations);
@@ -628,6 +675,7 @@ impl Voxhold {
         if query.is_empty() || query.chars().count() > 200 {
             self.messaging.search.request = self.messaging.search.request.wrapping_add(1);
             self.messaging.search.results.clear();
+            self.messaging.search.truncated = false;
             self.messaging.search.has_more = false;
             self.messaging.search.next_before = None;
             self.messaging.search.loading = false;
@@ -647,17 +695,7 @@ impl Voxhold {
         self.action_seq = self.action_seq.wrapping_add(1);
         let request = self.action_seq;
         let session = self.session_generation;
-        {
-            let search = &mut self.messaging.search;
-            search.request = request;
-            search.submitted = query.clone();
-            search.results.clear();
-            search.has_more = false;
-            search.next_before = None;
-            search.loading = true;
-            search.loading_more = false;
-            search.error.clear();
-        }
+        self.messaging.search.begin(request, &query);
         let runtime = self.runtime.clone();
         let task =
             cx.background_spawn(
@@ -1067,8 +1105,9 @@ impl Voxhold {
     }
 
     pub(super) fn request_leave_conversation(&mut self, cx: &mut Context<Self>) {
-        // Product decision for W08a: only a group has "leave"; a direct (1:1)
-        // conversation has no leave action, matching the web contract.
+        // W08a product scope: only a group has "leave" in this client. The
+        // pinned web also shows the action for a direct chat; direct leave
+        // stays outside W08a and is not implemented here.
         if self
             .conversation
             .as_ref()
@@ -1103,6 +1142,7 @@ impl Voxhold {
         self.action_seq = self.action_seq.wrapping_add(1);
         let request = self.action_seq;
         self.messaging.leave_request = Some(request);
+        self.messaging.leave_target = conversation.id;
         self.messaging.leave_error.clear();
         let id = conversation.id;
         let session = self.session_generation;
@@ -1112,10 +1152,16 @@ impl Voxhold {
         cx.spawn_in(window, async move |this, window| {
             let result = task.await;
             let _ = this.update_in(window, |s, window, cx| {
-                if s.session_generation != session || s.messaging.leave_request != Some(request) {
+                // The DELETE stays owned by its conversation: switching chats
+                // must not drop a confirmed removal of the old row.
+                if s.session_generation != session
+                    || s.messaging.leave_request != Some(request)
+                    || s.messaging.leave_target != id
+                {
                     return;
                 }
                 s.messaging.leave_request = None;
+                s.messaging.leave_target = 0;
                 match result {
                     Ok(()) => {
                         // An older page requested before the DELETE must not
@@ -1131,8 +1177,12 @@ impl Voxhold {
                         s.refresh_recents(cx);
                     }
                     Err(error) => {
-                        s.messaging.leave_error = error.to_string();
-                        s.messaging.leave_confirm = true;
+                        // The confirmation bar belongs to the conversation the
+                        // user is looking at; a switched surface stays clean.
+                        if s.conversation.as_ref().map(|row| row.id) == Some(id) {
+                            s.messaging.leave_error = error.to_string();
+                            s.messaging.leave_confirm = true;
+                        }
                     }
                 }
                 cx.notify();

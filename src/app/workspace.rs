@@ -36,6 +36,9 @@ impl Voxhold {
             self.save_composer_draft(cx);
             self.personal_mode = false;
             self.personal_return = None;
+            self.pending_return_channel = None;
+            self.show_members = self.personal_members;
+            self.personal_members = false;
             self.messaging.epoch = self.messaging.epoch.wrapping_add(1);
             self.messaging.clear_search();
             self.messaging.creator = None;
@@ -53,7 +56,6 @@ impl Voxhold {
         }
         self.conversation = None;
         self.close_thread(window, cx);
-        self.show_inbox = false;
         self.message_menu = None;
         self.member_menu = None;
         self.forward = None;
@@ -118,33 +120,6 @@ impl Voxhold {
             }));
         });
         self.search = Some(search);
-        if self.inbox.is_none() {
-            let inbox = cx.new(|_| inbox::Inbox::new());
-            let weak_inbox = cx.entity().downgrade();
-            let weak_refresh = weak_inbox.clone();
-            inbox.update(cx, |inbox, _| {
-                inbox.set_select_handler(Box::new(move |id, window, cx| {
-                    if let Some(view) = weak_inbox.upgrade() {
-                        view.update(cx, |view, cx| {
-                            if let Some(conversation) = view
-                                .conversations
-                                .iter()
-                                .find(|conversation| conversation.id == id)
-                                .cloned()
-                            {
-                                view.select_conversation(conversation, window, cx);
-                            }
-                        });
-                    }
-                }));
-                inbox.set_refresh_handler(Box::new(move |_window, cx| {
-                    if let Some(view) = weak_refresh.upgrade() {
-                        view.update(cx, |view, cx| view.refresh_recents(cx));
-                    }
-                }));
-            });
-            self.inbox = Some(inbox);
-        }
         if self.personal.is_none() {
             self.personal = Some(personal_settings::PersonalSettings::new(window, cx));
         }
@@ -177,6 +152,7 @@ impl Voxhold {
         self.access_pending = false;
         self.access_reload_in_flight = false;
         self.access_refresh_again = false;
+        self.pending_return_channel = None;
         self.refresh_request = None;
         self.refresh_again = false;
         self.channel_snapshot_request = None;
@@ -301,6 +277,7 @@ impl Voxhold {
         self.access_pending = false;
         self.access_reload_in_flight = false;
         self.access_refresh_again = false;
+        self.pending_return_channel = None;
         self.refresh_request = None;
         self.refresh_again = false;
         self.pending_edits.clear();
@@ -528,7 +505,15 @@ impl Voxhold {
                 }
                 s.access_reload_in_flight = false;
                 if std::mem::take(&mut s.access_refresh_again) {
-                    s.invalidate_access(window, cx);
+                    // This answer predates the last `channels.changed`. While a
+                    // personal chat is open `invalidate_access` is a no-op, so
+                    // the replacement reload must start directly; otherwise
+                    // `access_pending` would stay set without a request.
+                    if s.in_conversation() {
+                        s.reload_channels(window, cx);
+                    } else {
+                        s.invalidate_access(window, cx);
+                    }
                     return;
                 }
                 match result {
@@ -553,6 +538,9 @@ impl Voxhold {
                             s.close_settings(false, window, cx);
                         }
                         if s.in_conversation() {
+                            // A DM opened after "К каналам" owns the surface;
+                            // the saved channel must not be selected later.
+                            s.pending_return_channel = None;
                             s.access_pending = false;
                             s.error.clear();
                             s.refresh_recents(cx);
@@ -582,6 +570,19 @@ impl Voxhold {
                             .iter()
                             .find(|c| c.id == s.channel && c.readable() && !c.e2ee_required)
                             .map(|c| c.id);
+                        // "К каналам" during the reload restored a channel that
+                        // this fresh list may no longer contain. Use the same
+                        // first-readable fallback as the non-pending return.
+                        let returning = s.pending_return_channel.take().is_some();
+                        let fallback = if returning {
+                            s.channels
+                                .iter()
+                                .find(|c| c.readable() && !c.e2ee_required)
+                                .map(|c| c.id)
+                        } else {
+                            None
+                        };
+                        let channel = channel.or(fallback);
                         s.access_pending = false;
                         s.error.clear();
                         let channel = channel.unwrap_or_default();
@@ -604,7 +605,13 @@ impl Voxhold {
                     Err(voxhold_api::Error::Http(403 | 404)) => {
                         s.remove_current_server(window, cx);
                     }
-                    Err(error) => s.error = error.to_string(),
+                    Err(error) => {
+                        // A failed reload never restores the pending channel:
+                        // a later unrelated success must not auto-fallback
+                        // into it.
+                        s.pending_return_channel = None;
+                        s.error = error.to_string();
+                    }
                 }
                 cx.notify();
             });

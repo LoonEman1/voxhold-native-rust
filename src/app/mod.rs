@@ -314,12 +314,16 @@ pub(crate) struct Voxhold {
     channel_entry_focus: FocusHandle,
     notifications_entry_focus: FocusHandle,
     window_active: bool,
-    inbox: Option<Entity<inbox::Inbox>>,
-    show_inbox: bool,
     /// Personal "Сообщения" mode. The server/channel context is kept in
     /// `personal_return` so "К каналам" can restore it when still permitted.
     personal_mode: bool,
     personal_return: Option<(i64, i64)>,
+    /// Channel the user asked to reopen while an ACL reload was still in
+    /// flight. Its answer picks this channel or the first readable fallback.
+    pending_return_channel: Option<i64>,
+    /// `show_members` from the channel surface, restored when personal mode
+    /// closes instead of permanently discarding the drawer state.
+    personal_members: bool,
     messaging: messages::Messages,
     /// A background answer cleared the active chat; the next render closes the
     /// window-owned viewer/thread/settings and clears the composer.
@@ -703,10 +707,10 @@ impl Voxhold {
             channel_entry_focus: cx.focus_handle(),
             notifications_entry_focus: cx.focus_handle(),
             window_active: true,
-            inbox: None,
-            show_inbox: false,
             personal_mode: false,
             personal_return: None,
+            pending_return_channel: None,
+            personal_members: false,
             messaging,
             pending_personal_cleanup: false,
             _conversation_query_subscription: conversation_query_subscription,

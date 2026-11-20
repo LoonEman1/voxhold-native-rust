@@ -99,13 +99,15 @@ impl Voxhold {
 
     pub(super) fn open_server(&mut self, id: i64, window: &mut Window, cx: &mut Context<Self>) {
         self.show_servers = false;
-        self.show_inbox = false;
         if self.personal_mode {
             // Save the open DM under `conversation(id)` before the channel and
             // conversation are cleared, otherwise the draft is lost.
             self.save_composer_draft(cx);
             self.personal_mode = false;
             self.personal_return = None;
+            self.pending_return_channel = None;
+            self.show_members = self.personal_members;
+            self.personal_members = false;
             self.messaging.epoch = self.messaging.epoch.wrapping_add(1);
             self.messaging.clear_search();
             self.messaging.creator = None;

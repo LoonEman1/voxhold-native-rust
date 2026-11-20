@@ -7,7 +7,6 @@ impl Voxhold {
         self.member_menu = None;
         self.forward = None;
         self.show_search = false;
-        self.show_inbox = false;
         self.editing = None;
         self.confirm_delete = None;
         if self.update.panel_open {
@@ -28,27 +27,6 @@ impl Voxhold {
                 .left(px(x))
                 .top(px(72.))
                 .child(panel)
-                .into_any_element(),
-        )
-    }
-
-    pub(super) fn inbox_overlay(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Option<AnyElement> {
-        if !self.show_inbox {
-            return None;
-        }
-        let tiles = self.inbox_tiles(window, cx);
-        let inbox = self.inbox.clone()?;
-        inbox.update(cx, |inbox, cx| inbox.set_tiles(tiles, cx));
-        Some(
-            div()
-                .absolute()
-                .left(px(crate::layout::RAIL_WIDTH + 8.))
-                .top(px(70.))
-                .child(inbox)
                 .into_any_element(),
         )
     }

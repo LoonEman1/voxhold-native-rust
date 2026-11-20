@@ -323,21 +323,44 @@ impl Voxhold {
                 let (plan, message) = match result {
                     Ok(value) => value,
                     Err((status, text)) => {
-                        if s.chat_key() == plan_key {
-                            if plan_key.is_conversation() && status == Some(404) {
-                                // A missing conversation is authoritative.
-                                s.clear_active_conversation(Some("Диалог недоступен."), window, cx);
-                                s.refresh_recents(cx);
-                            } else if plan_key.is_conversation() && status == Some(403) {
-                                // A conversation `403` also covers a
-                                // `canContact` refusal while both users stay
-                                // members. Keep the draft and ask one explicit
-                                // GET before clearing anything.
-                                s.composer_error = text.clone();
-                                s.verify_conversation_after_send_403(plan_key, text, cx);
-                            } else {
-                                s.composer_error = text;
+                        let active = s.chat_key() == plan_key;
+                        if plan_key.is_conversation() {
+                            match status {
+                                Some(404) => {
+                                    // A missing conversation is authoritative for
+                                    // its row even after a switch; only the live
+                                    // surface is cleared with a window, while a
+                                    // background row's draft scope goes too.
+                                    if active {
+                                        s.conversations.retain(|row| row.id != plan_key.channel);
+                                        s.clear_active_conversation(
+                                            Some("Диалог недоступен."),
+                                            window,
+                                            cx,
+                                        );
+                                    } else {
+                                        s.forget_conversation(plan_key.channel, None, cx);
+                                    }
+                                    s.refresh_recents(cx);
+                                }
+                                Some(403) => {
+                                    // A conversation `403` also covers a
+                                    // `canContact` refusal while both users stay
+                                    // members. Keep the active draft and ask one
+                                    // explicit GET scoped to the row.
+                                    if active {
+                                        s.composer_error = text.clone();
+                                    }
+                                    s.verify_conversation_after_403(plan_key, Some(text), cx);
+                                }
+                                _ => {
+                                    if active {
+                                        s.composer_error = text;
+                                    }
+                                }
                             }
+                        } else if active {
+                            s.composer_error = text;
                         }
                         cx.notify();
                         return;
@@ -423,7 +446,7 @@ impl Voxhold {
 
     /// OS file drop. Go ignores drops while another overlay owns the screen.
     pub(super) fn drop_files(&mut self, paths: Vec<std::path::PathBuf>, cx: &mut Context<Self>) {
-        if !self.composer_writable() || self.active_settings.is_some() || self.show_inbox {
+        if !self.composer_writable() || self.active_settings.is_some() {
             return;
         }
         if let Some(attachments) = &self.attachments {

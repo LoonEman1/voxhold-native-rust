@@ -161,33 +161,6 @@ impl Voxhold {
         self.server_settings = Some(server_settings::ServerSettings::new(window, cx));
         self.channel_settings = Some(channel_settings::ChannelSettings::new(window, cx));
         self.channel_notifications = Some(channel_settings::ChannelNotifications::new());
-        self.inbox = Some(cx.new(|_| inbox::Inbox::new()));
-        let inbox = self.inbox.clone().expect("inbox");
-        let weak = cx.entity().downgrade();
-        inbox.update(cx, |inbox, _| {
-            inbox.set_select_handler(Box::new(move |id, window, cx| {
-                if let Some(view) = weak.upgrade() {
-                    view.update(cx, |view, cx| {
-                        if let Some(conversation) = view
-                            .conversations
-                            .iter()
-                            .find(|conversation| conversation.id == id)
-                            .cloned()
-                        {
-                            view.select_conversation(conversation, window, cx);
-                        }
-                    });
-                }
-            }));
-        });
-        let weak = cx.entity().downgrade();
-        inbox.update(cx, |inbox, _| {
-            inbox.set_refresh_handler(Box::new(move |_window, cx| {
-                if let Some(view) = weak.upgrade() {
-                    view.update(cx, |view, cx| view.refresh_recents(cx));
-                }
-            }));
-        });
         self.self_user_id = login_session.user_id();
         self.auth.username = login_session.username().to_owned();
         self.active_profile_save = None;
@@ -405,11 +378,11 @@ impl Voxhold {
         self.active_settings = None;
         self.settings_return_focus = None;
         self.settings_ring.clear();
-        self.inbox = None;
         self.search = None;
-        self.show_inbox = false;
         self.show_search = false;
         self.show_servers = false;
+        self.pending_return_channel = None;
+        self.personal_members = false;
         self.auth = auth::AuthState::with_prefill(&origin);
         self.auth.screen = auth::AuthScreen::Login;
         self.auth.status = reason;

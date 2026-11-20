@@ -94,7 +94,6 @@ impl Voxhold {
         }
         // Go `toggleRecordings`: one modal and no stale overlays under it.
         self.show_search = false;
-        self.show_inbox = false;
         self.message_menu = None;
         self.member_menu = None;
         self.forward = None;

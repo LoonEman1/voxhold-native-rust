@@ -222,12 +222,23 @@ impl Voxhold {
             if let Some(this) = this.upgrade() {
                 this.update(cx, |s, cx| {
                     s.reaction_requests.remove(&key);
-                    if s.generation != generation
-                        || s.access_generation != access
-                        || s.chat_key() != chat
-                        || s.server != server
-                        || s.channel != channel
-                    {
+                    let failure = result.as_ref().err().and_then(|error| error.status());
+                    let in_scope = s.generation == generation
+                        && s.access_generation == access
+                        && s.chat_key() == chat
+                        && s.server == server
+                        && s.channel == channel;
+                    if conversation && matches!(failure, Some(403 | 404)) {
+                        // A conversation `403` is ambiguous like a send: one
+                        // explicit GET decides. A `404` removes the row at once.
+                        if failure == Some(403) {
+                            s.verify_conversation_after_403(chat, None, cx);
+                        } else {
+                            s.note_conversation_unavailable(chat.channel, cx);
+                        }
+                    }
+                    if !in_scope {
+                        cx.notify();
                         return;
                     }
                     match result {
@@ -241,7 +252,7 @@ impl Voxhold {
                         }
                         Err(error) => {
                             s.action_error = Some((message_id, error.to_string()));
-                            if error.status() == Some(403) {
+                            if !conversation && failure == Some(403) {
                                 s.recheck_channel_snapshot_no_window(cx);
                             }
                         }

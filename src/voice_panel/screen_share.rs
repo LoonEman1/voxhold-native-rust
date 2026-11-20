@@ -217,6 +217,7 @@ impl ScreenShareUi {
     }
 
     /// The selected source as the current snapshot describes it.
+    #[cfg(test)]
     pub(super) fn selected_source(&self) -> Option<&ScreenSource> {
         self.selected.and_then(|id| self.source_for(id))
     }

@@ -130,6 +130,7 @@ struct SharedStats {
     overflow_blocks: AtomicU64,
     dropped_blocks: AtomicU64,
     late_ticks: AtomicU64,
+    late_sends: AtomicU64,
     wait_timeouts: AtomicU64,
     wait_errors: AtomicU64,
     driver_errors: AtomicU64,
@@ -150,6 +151,7 @@ impl SharedStats {
         self.dropped_blocks
             .store(stats.dropped_blocks, Ordering::Relaxed);
         self.late_ticks.store(stats.late_ticks, Ordering::Relaxed);
+        self.late_sends.store(stats.late_sends, Ordering::Relaxed);
         self.wait_timeouts
             .store(stats.wait_timeouts, Ordering::Relaxed);
         self.wait_errors.store(stats.wait_errors, Ordering::Relaxed);
@@ -167,6 +169,7 @@ impl SharedStats {
             overflow_blocks: self.overflow_blocks.load(Ordering::Relaxed),
             dropped_blocks: self.dropped_blocks.load(Ordering::Relaxed),
             late_ticks: self.late_ticks.load(Ordering::Relaxed),
+            late_sends: self.late_sends.load(Ordering::Relaxed),
             wait_timeouts: self.wait_timeouts.load(Ordering::Relaxed),
             wait_errors: self.wait_errors.load(Ordering::Relaxed),
             driver_errors: self.driver_errors.load(Ordering::Relaxed),
@@ -300,8 +303,9 @@ impl MicCapture {
         self.stats().captured_blocks
     }
 
-    /// Aggregate capture counters, including underruns, overflow, late ticks
-    /// and source/wait errors. Contains no PCM or personal content.
+    /// Aggregate capture counters, including underruns, overflow, missed and
+    /// short-late ticks, and source/wait errors. Contains no PCM or personal
+    /// content.
     pub fn stats(&self) -> CaptureStats {
         self.stats.snapshot()
     }
@@ -318,6 +322,8 @@ impl MicCapture {
         self.stop();
         self.stop = Arc::new(AtomicBool::new(false));
         self.failed = Arc::new(AtomicBool::new(false));
+        // The new capture thread owns a fresh `PcmJitter`, so a device change
+        // cannot replay the previous queue, fade state or ramp.
         self.stats = Arc::new(SharedStats::default());
         let id = self.id;
         let source = self.source.clone();
@@ -447,8 +453,8 @@ fn capture_loop(
                     publish_stats(&shared, &counters, &jitter);
                     continue;
                 }
-                jitter.note_last_sample(block[BLOCK - 1]);
-                deliver(&source, &block, &mut counters);
+                let send = deliver(&source, &block, &mut counters);
+                note_delivered(&mut jitter, &block, send);
                 counters.captured_blocks += 1;
                 level = f64::from(metered);
                 muted = silenced;
@@ -487,18 +493,31 @@ fn capture_loop(
     publish_stats(&shared, &counters, &jitter);
 }
 
-/// One synchronous source poll, with Ok/Err/Pending counted separately.
-fn deliver(source: &NativeAudioSource, block: &[i16; BLOCK], counters: &mut CaptureStats) {
+/// One synchronous source poll, with Ok/Err/Pending counted separately. The
+/// outcome is returned so only a delivered block can seed the underrun fade.
+fn deliver(
+    source: &NativeAudioSource,
+    block: &[i16; BLOCK],
+    counters: &mut CaptureStats,
+) -> SourceSend {
     let frame = AudioFrame {
         data: std::borrow::Cow::Borrowed(block),
         sample_rate: SAMPLE_RATE,
         num_channels: CHANNELS,
         samples_per_channel: BLOCK as u32,
     };
-    record_source(
-        counters,
-        classify_source(poll_once(source.capture_frame(&frame))),
-    );
+    let send = classify_source(poll_once(source.capture_frame(&frame)));
+    record_source(counters, send);
+    send
+}
+
+/// The fade-out after a gap must start from the amplitude that the far end
+/// actually heard. A failed `capture_frame` never reached the source, so it
+/// must not overwrite the last delivered sample and hide the real step.
+fn note_delivered(jitter: &mut PcmJitter, block: &[i16; BLOCK], send: SourceSend) {
+    if send == SourceSend::Ok {
+        jitter.note_last_sample(block[BLOCK - 1]);
+    }
 }
 
 fn report_level(
@@ -526,6 +545,7 @@ fn publish_stats(shared: &SharedStats, counters: &CaptureStats, jitter: &PcmJitt
         overflow_blocks: jitter.overflow_blocks(),
         dropped_blocks: jitter.dropped_blocks(),
         late_ticks: jitter.late_ticks(),
+        late_sends: jitter.late_sends(),
         ..*counters
     });
 }

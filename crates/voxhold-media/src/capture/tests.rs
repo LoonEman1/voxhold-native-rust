@@ -4,6 +4,7 @@
 //! the handwritten-file budget; the tests still use the parent module's
 //! private helpers through `use super::*`.
 
+use super::timeline::FADE_SAMPLES;
 use super::*;
 use std::time::Duration;
 
@@ -23,6 +24,67 @@ fn source_and_wait_outcomes_reach_distinct_counters() {
     assert_eq!(stats.wait_timeouts, 1);
     assert_eq!(stats.wait_errors, 1);
     assert_eq!(stats.source_errors, 1, "wait errors are separate");
+}
+
+#[test]
+fn the_underrun_fade_starts_from_the_last_delivered_amplitude() {
+    fn fade_after_sends(send: SourceSend) -> [i16; BLOCK] {
+        let base = Instant::now();
+        let mut jitter = PcmJitter::new();
+        let mut block = [0_i16; BLOCK];
+        jitter.push(&vec![5_000_i16; BLOCK * 2], 0);
+        jitter.push(&vec![5_000_i16; BLOCK * 2], 0);
+        for step in 0..4 {
+            assert_eq!(
+                jitter.tick(base + Duration::from_millis(step * 10), &mut block),
+                Tick::Send
+            );
+            // Same ordering as `capture_loop`: note only what was accepted.
+            note_delivered(&mut jitter, &block, send);
+        }
+        assert_eq!(
+            jitter.tick(base + Duration::from_millis(40), &mut block),
+            Tick::Fade
+        );
+        block
+    }
+
+    let delivered = fade_after_sends(SourceSend::Ok);
+    assert!(
+        delivered[0] > 4_000,
+        "the fade must start from the delivered 5 000 amplitude: {}",
+        delivered[0]
+    );
+    assert_eq!(delivered[BLOCK - 1], 0, "the fade reaches silence");
+
+    let failed = fade_after_sends(SourceSend::Error);
+    assert_eq!(
+        failed[0], 0,
+        "a block that never reached the source must not seed the fade"
+    );
+    assert!(failed.iter().all(|sample| *sample == 0));
+}
+
+#[test]
+fn short_late_sends_are_published_in_shared_stats() {
+    let base = Instant::now();
+    let mut jitter = PcmJitter::new();
+    let mut block = [0_i16; BLOCK];
+    jitter.push(&vec![222_i16; BLOCK * 2], 0);
+    jitter.push(&vec![222_i16; BLOCK * 2], 0);
+    assert_eq!(jitter.tick(base, &mut block), Tick::Send);
+    assert_eq!(
+        jitter.tick(base + Duration::from_millis(19), &mut block),
+        Tick::Send,
+        "a 9 ms late wake still sends the due block"
+    );
+    let shared = SharedStats::default();
+    publish_stats(&shared, &CaptureStats::default(), &jitter);
+    let snapshot = shared.snapshot();
+    assert_eq!(snapshot.late_sends, 1);
+    assert_eq!(snapshot.late_ticks, 0);
+    assert_eq!(snapshot.underruns, 0);
+    assert_eq!(snapshot.overflow_blocks, 0);
 }
 
 #[test]
@@ -319,7 +381,8 @@ fn permission_epoch_discards_queued_audio_across_fast_ptt() {
     );
     jitter.push(&vec![222_i16; BLOCK * 2], 2);
     assert_eq!(jitter.tick(Instant::now(), &mut block), Tick::Send);
-    assert!(block.iter().all(|sample| *sample == 222));
+    assert_eq!(block[0], 0, "the first post-epoch block ramps in");
+    assert!(block[FADE_SAMPLES..].iter().all(|sample| *sample == 222));
     // End-to-end view of the same transition: the first processed block
     // after the flush comes from the post-transition buffer, not from the
     // 9 000-amplitude audio captured before unmute.
@@ -360,7 +423,8 @@ fn a_block_read_before_a_generation_change_is_not_sent_after_unmute() {
     assert_eq!(jitter.tick(Instant::now(), &mut block), Tick::None);
     jitter.push(&vec![222_i16; BLOCK * 2], 8);
     assert_eq!(jitter.tick(Instant::now(), &mut block), Tick::Send);
-    assert!(block.iter().all(|sample| *sample == 222));
+    assert_eq!(block[0], 0, "the first post-epoch block ramps in");
+    assert!(block[FADE_SAMPLES..].iter().all(|sample| *sample == 222));
 }
 
 #[test]

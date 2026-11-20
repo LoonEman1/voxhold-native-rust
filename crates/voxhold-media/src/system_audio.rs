@@ -202,10 +202,13 @@ impl Shared {
 
     /// Drop audio queued by a capture client that is being replaced. The
     /// converter itself is per client and starts fresh, so this covers the
-    /// block queue.
+    /// block queue. The dropped PCM still counts in the publisher's statistics,
+    /// just like a block evicted by [`push_block`].
     fn clear_audio(&self) {
         if let Ok(mut queue) = self.blocks.lock() {
+            let cleared = queue.len() as u64;
             queue.clear();
+            self.dropped.fetch_add(cleared, Ordering::Relaxed);
         }
     }
 }
@@ -420,6 +423,34 @@ mod tests {
         }
         assert_eq!(last[0], 99);
         assert!(next_block(&shared).is_none());
+    }
+
+    #[test]
+    fn clearing_a_full_queue_counts_every_cleared_block_as_dropped() {
+        let shared = Shared::default();
+        for index in 0..MAX_QUEUE_BLOCKS {
+            push_block(&shared, vec![index as i16; BLOCK_SAMPLES]);
+        }
+        assert_eq!(shared.dropped.load(Ordering::Relaxed), 0);
+
+        shared.clear_audio();
+
+        assert!(
+            next_block(&shared).is_none(),
+            "a device change must not replay the old endpoint's PCM"
+        );
+        assert_eq!(
+            shared.dropped.load(Ordering::Relaxed),
+            MAX_QUEUE_BLOCKS as u64,
+            "publication statistics must report the cleared ~40 ms"
+        );
+
+        // Clearing an empty queue changes nothing and does not count.
+        shared.clear_audio();
+        assert_eq!(
+            shared.dropped.load(Ordering::Relaxed),
+            MAX_QUEUE_BLOCKS as u64
+        );
     }
 
     #[test]

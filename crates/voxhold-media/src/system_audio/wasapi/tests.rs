@@ -187,3 +187,20 @@ fn a_window_id_resolves_to_the_owning_process() {
 fn an_absent_window_is_an_explicit_error() {
     assert!(window_process_id(0).is_err());
 }
+
+#[test]
+fn an_unknown_endpoint_id_does_not_report_a_default_device_change() {
+    const DEFAULT: &str = "{0.0.0.00000000}.{real-endpoint}";
+    assert!(
+        !default_device_changed(DEFAULT, ""),
+        "an unreadable opened id is unknown, not a moved device"
+    );
+    assert!(
+        !default_device_changed(DEFAULT, DEFAULT),
+        "the same endpoint is not a change"
+    );
+    assert!(
+        default_device_changed(DEFAULT, "{0.0.0.00000000}.{other}"),
+        "a genuinely different endpoint is a change"
+    );
+}

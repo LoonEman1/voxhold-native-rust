@@ -3,8 +3,9 @@
 //! A failure is either an open that produced no client or a client that stopped
 //! before proving itself. Both consume the same retry budget, so a device that
 //! opens and is invalidated immediately cannot loop forever. The budget resets
-//! only after a session kept polling the client for [`STABLE_WINDOW`]; a silent
-//! endpoint still answers every poll, so silence counts as healthy.
+//! only after a session kept polling the client for [`STABLE_WINDOW`] without a
+//! gap above [`MAX_POLL_GAP`]; a silent endpoint still answers every poll, so
+//! silence counts as healthy.
 
 use std::{
     sync::{Arc, mpsc},
@@ -21,9 +22,14 @@ pub(super) const REOPEN_DELAY: Duration = Duration::from_millis(300);
 /// A session must keep answering for this long before a later failure resets
 /// the budget again.
 pub(super) const STABLE_WINDOW: Duration = Duration::from_secs(2);
-/// No poll for this long means the thread was not reading; the healthy streak
-/// starts over instead of claiming time it did not observe.
-pub(super) const STALL: Duration = Duration::from_secs(1);
+/// A gap between answered polls means the thread was blocked, and time it did
+/// not observe must not count as healthy. The capture loop polls a few
+/// milliseconds apart (`POLL` is 5 ms, blocks are 10 ms) and a blocking WASAPI
+/// call normally returns far below this bound, so 500 ms is conservative: a
+/// client that answers as rarely as every 900 ms cannot accumulate a streak,
+/// while a silent endpoint still answers `GetNextPacketSize() == 0` on every
+/// poll and stays healthy.
+pub(super) const MAX_POLL_GAP: Duration = Duration::from_millis(500);
 
 /// How one successfully opened session ended.
 pub(super) enum SessionEnd {
@@ -67,7 +73,7 @@ impl Health {
     pub(super) fn record(&mut self, now: Instant) {
         let gap = now.saturating_duration_since(self.last);
         self.last = now;
-        self.streak = if gap > STALL {
+        self.streak = if gap > MAX_POLL_GAP {
             Duration::ZERO
         } else {
             self.streak + gap
@@ -250,6 +256,32 @@ mod tests {
             !health.stable(),
             "the full window is needed again after a stall"
         );
+    }
+
+    #[test]
+    fn answered_polls_as_slow_as_every_900ms_never_earn_a_stable_session() {
+        let start = Instant::now();
+        let mut health = Health::new(start);
+        // A client that returns from every call only every 900 ms is blocked
+        // most of the time. Summing those gaps used to reach STABLE_WINDOW
+        // after three polls, which let a later failure reset the retry budget
+        // forever.
+        for beat in 1..=12 {
+            health.record(start + Duration::from_millis(900) * beat);
+            assert!(
+                !health.stable(),
+                "a 900 ms poll gap must reset the streak (beat {beat})"
+            );
+        }
+        assert!(
+            Duration::from_millis(900) * 12 > STABLE_WINDOW,
+            "the beats span more than the window; only the gaps keep it unstable"
+        );
+
+        // The invalidation itself is recorded before the stability question, so
+        // this session must spend the budget rather than refresh it.
+        health.record(start + Duration::from_millis(900) * 13);
+        assert!(!health.stable(), "the invalidation spends the budget");
     }
 
     #[test]

@@ -172,6 +172,14 @@ fn device_id(device: &IMMDevice) -> Option<String> {
     text
 }
 
+/// Compare the endpoint a session opened with the current default. An empty
+/// opened id means `GetId` failed, so the endpoint is unknown rather than
+/// moved: comparing it would report a change (or a false terminal stop) on a
+/// device that never moved. The id is re-learned when the next session opens.
+fn default_device_changed(current: &str, opened: &str) -> bool {
+    !opened.is_empty() && current != opened
+}
+
 fn parse_mix(pointer: *const WAVEFORMATEX) -> Result<SourceFormat, Failure> {
     if pointer.is_null() {
         return Err(Failure::Fatal(
@@ -611,8 +619,11 @@ fn capture(shared: &Shared, opened: &Opened) -> SessionEnd {
     let mut converter = Converter::new(opened.format);
     let mut scratch = Vec::with_capacity(BLOCK_SAMPLES * 4);
     let mut blocks = BlockBuffer::default();
-    let mut next_device_check = Instant::now() + DEVICE_CHECK;
-    let mut health = Health::new(Instant::now());
+    // One `now` for both clocks: a switch within the first check window must be
+    // classified against the same origin the health streak started from.
+    let now = Instant::now();
+    let mut next_device_check = now + DEVICE_CHECK;
+    let mut health = Health::new(now);
     loop {
         if shared.stopping() {
             // End of stream: finish the sample that was waiting for the next
@@ -626,7 +637,9 @@ fn capture(shared: &Shared, opened: &Opened) -> SessionEnd {
             next_device_check = Instant::now() + DEVICE_CHECK;
             if opened.check_default {
                 if let Ok(device) = default_device() {
-                    if device_id(&device).is_some_and(|current| current != opened.info.id) {
+                    if device_id(&device)
+                        .is_some_and(|current| default_device_changed(&current, &opened.info.id))
+                    {
                         return ended(
                             Failure::Reopen("Устройство вывода по умолчанию изменилось.".into()),
                             &mut health,

@@ -38,18 +38,52 @@ pub async fn check_signed_manifest(request: CheckRequest<'_>) -> Result<Verified
             "the manifest and signature URLs must share an origin".into(),
         ));
     }
-    let manifest_bytes =
-        fetch_limited(request.manifest_url, MAX_MANIFEST_BYTES, &request.cancel).await?;
-    let signature_bytes =
-        fetch_limited(request.signature_url, MAX_SIGNATURE_BYTES, &request.cancel).await?;
+    let client = build_client()?;
+    let first = fetch_signed_manifest(&client, &request).await;
+    // A channel publication can briefly expose the old manifest with the new
+    // signature, or a missing asset while GitHub replaces it.
+    if !matches!(
+        first,
+        Err(UpdateError::BadSignature | UpdateError::HttpStatus { status: 404, .. })
+    ) {
+        return first;
+    }
+    tokio::select! {
+        _ = request.cancel.cancelled() => Err(UpdateError::Cancelled),
+        _ = tokio::time::sleep(Duration::from_secs(1)) => fetch_signed_manifest(&client, &request).await,
+    }
+}
+
+async fn fetch_signed_manifest(
+    client: &reqwest::Client,
+    request: &CheckRequest<'_>,
+) -> Result<VerifiedManifest> {
+    let manifest_bytes = fetch_limited(
+        client,
+        request.manifest_url,
+        MAX_MANIFEST_BYTES,
+        &request.cancel,
+    )
+    .await?;
+    let signature_bytes = fetch_limited(
+        client,
+        request.signature_url,
+        MAX_SIGNATURE_BYTES,
+        &request.cancel,
+    )
+    .await?;
     let signature =
         String::from_utf8(signature_bytes).map_err(|_| UpdateError::BadSignatureEncoding)?;
     verify_and_parse(request.key, &manifest_bytes, &signature)
 }
 
-async fn fetch_limited(url: &str, limit: u64, cancel: &CancelToken) -> Result<Vec<u8>> {
+async fn fetch_limited(
+    client: &reqwest::Client,
+    url: &str,
+    limit: u64,
+    cancel: &CancelToken,
+) -> Result<Vec<u8>> {
     let parsed = validate_update_url(url)?;
-    let client = build_client()?;
     let mut response = tokio::select! {
         _ = cancel.cancelled() => return Err(UpdateError::Cancelled),
         response = tokio::time::timeout(Duration::from_secs(30), client.get(parsed).send()) => {

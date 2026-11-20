@@ -17,6 +17,7 @@ use std::time::Duration;
 pub struct Route {
     pub body: Vec<u8>,
     pub status: u16,
+    pub first_status: Option<u16>,
     pub interrupt_after: Option<usize>,
     /// Interrupt every response, not only the first one.
     pub interrupt_every: bool,
@@ -146,14 +147,19 @@ fn handle_connection(
         first
     };
 
-    if route.status != 0 && route.status != 200 {
-        let status_text = status_text(route.status);
+    let status = if first {
+        route.first_status.unwrap_or(route.status)
+    } else {
+        route.status
+    };
+    if status != 0 && status != 200 {
+        let status_text = status_text(status);
         let response = format!(
             "HTTP/1.1 {} {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-            route.status, status_text
+            status, status_text
         );
         let _ = stream.write_all(response.as_bytes());
-        record(requests, &path, range, 0, route.status);
+        record(requests, &path, range, 0, status);
         return;
     }
 

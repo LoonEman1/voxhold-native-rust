@@ -58,6 +58,7 @@ async fn verifies_a_signed_manifest() {
         "/latest.json.sig".to_string(),
         Route {
             body: format!("{signature}\n").into_bytes(),
+            first_status: Some(404),
             ..Route::default()
         },
     );
@@ -74,6 +75,10 @@ async fn verifies_a_signed_manifest() {
     .unwrap();
     assert_eq!(manifest.version, "0.2.0");
     assert_eq!(manifest.deltas.len(), 1);
+    assert!(server
+        .requests()
+        .iter()
+        .any(|request| request.status == 404));
 }
 
 #[tokio::test]

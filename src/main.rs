@@ -59,12 +59,14 @@ fn parse_args_from<I: Iterator<Item = String>>(
     f32,
     f32,
     Option<std::path::PathBuf>,
+    Option<String>,
 ) {
     let mut server = String::new();
     let mut layout_path = layout::Settings::default_path();
     let mut width = 1280.0f32;
     let mut height = 900.0f32;
     let mut handshake = None;
+    let mut operation = None;
     let mut args = args;
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -93,10 +95,15 @@ fn parse_args_from<I: Iterator<Item = String>>(
                     handshake = Some(std::path::PathBuf::from(value));
                 }
             }
+            "--update-operation" => {
+                if let Some(value) = args.next() {
+                    operation = Some(value);
+                }
+            }
             _ => {}
         }
     }
-    (server, layout_path, width, height, handshake)
+    (server, layout_path, width, height, handshake, operation)
 }
 
 fn parse_args() -> (
@@ -105,12 +112,13 @@ fn parse_args() -> (
     f32,
     f32,
     Option<std::path::PathBuf>,
+    Option<String>,
 ) {
     parse_args_from(std::env::args().skip(1))
 }
 
 fn main() {
-    let (server, layout_path, width, height, handshake) = parse_args();
+    let (server, layout_path, width, height, handshake, operation) = parse_args();
     let instance_path = instance_prefs::InstancePrefs::default_path();
     let session_path = session_store::SessionStore::default_path();
     Application::new()
@@ -128,6 +136,7 @@ fn main() {
             let instance_path = instance_path.clone();
             let session_path = session_path.clone();
             let handshake = handshake.clone();
+            let operation = operation.clone();
             cx.open_window(
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
@@ -157,18 +166,28 @@ fn main() {
                     // in the workspace instead of being swallowed. Write it
                     // before the startup cleanup so that cleanup can protect
                     // the staging directory by its handshake marker.
+                    let mut handshake_written = false;
                     if let Some(path) = handshake.as_ref() {
-                        if let Err(error) = update::write_handshake(path) {
-                            eprintln!("voxhold-update: cannot write handshake: {error}");
-                            view.update(cx, |view, cx| {
-                                view.report_handshake_failure(
-                                    "не удалось записать файл подтверждения".into(),
-                                );
-                                cx.notify();
-                            });
+                        match update::write_handshake(path, operation.as_deref()) {
+                            Ok(()) => handshake_written = true,
+                            Err(error) => {
+                                eprintln!("voxhold-update: cannot write handshake: {error}");
+                                view.update(cx, |view, cx| {
+                                    view.report_handshake_failure(
+                                        "не удалось записать файл подтверждения".into(),
+                                    );
+                                    cx.notify();
+                                });
+                            }
                         }
                     }
-                    view.update(cx, |view, cx| view.start_update(handshake.is_some(), cx));
+                    // The observer may finish a confirmed operation. After an
+                    // update the handshake just written is the proof; without
+                    // it the state stays unconfirmed so the helper can roll
+                    // back.
+                    view.update(cx, |view, cx| {
+                        view.start_update(handshake.is_some(), handshake_written, cx)
+                    });
                     cx.new(|cx| Root::new(view.into(), window, cx))
                 },
             )
@@ -186,14 +205,18 @@ mod tests {
         let args = vec![
             "--update-handshake".to_string(),
             r"C:\Temp\handshake.ok".to_string(),
+            "--update-operation".to_string(),
+            "op-1".to_string(),
         ];
-        let (_, _, _, _, handshake) = parse_args_from(args.into_iter());
+        let (_, _, _, _, handshake, operation) = parse_args_from(args.into_iter());
         assert_eq!(
             handshake.as_deref(),
             Some(std::path::Path::new(r"C:\Temp\handshake.ok"))
         );
-        let (_, _, _, _, missing) =
+        assert_eq!(operation.as_deref(), Some("op-1"));
+        let (_, _, _, _, missing, no_operation) =
             parse_args_from(vec!["--update-handshake".to_string()].into_iter());
         assert!(missing.is_none());
+        assert!(no_operation.is_none());
     }
 }

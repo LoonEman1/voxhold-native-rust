@@ -144,6 +144,10 @@ impl Voxhold {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // The attachment panel captures the shared draft set when it is
+        // created, so the kept set must be installed first. A different
+        // account or origin gets a clean set.
+        self.restore_drafts(&login_session);
         let runtime = self.runtime.clone();
         let attachment_client = c.clone();
         let drafts = self.drafts.clone();
@@ -206,6 +210,8 @@ impl Voxhold {
             .as_ref()
             .map(|session| (session.origin().to_owned(), session.username().to_owned()));
         self.end_session(window, cx, String::new());
+        // An explicit logout never keeps drafts for a later sign-in.
+        self.saved_drafts = None;
         self.forget_stored(stored, window, cx);
         if let Some(revocation) = revocation {
             let runtime = self.runtime.clone();
@@ -227,11 +233,57 @@ impl Voxhold {
             .session
             .as_ref()
             .map(|session| (session.origin().to_owned(), session.username().to_owned()));
+        // Keep the drafts of this account in memory. This runs before
+        // `end_session`, whose normal clear empties the live (now new) set.
+        self.preserve_drafts(window, cx);
         if let Some(session) = self.session.as_mut() {
             session.invalidate();
         }
         self.end_session(window, cx, "Сессия истекла. Войдите снова.".into());
         self.forget_stored(stored, window, cx);
+    }
+
+    /// Move the current drafts out of the live slot before the session is
+    /// cleared. The composer of the open chat and an open thread save through
+    /// their normal paths first; the old attachment scope is invalidated so a
+    /// late file-dialog or paste answer cannot append to the kept set.
+    fn preserve_drafts(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((origin, user_id)) = self
+            .session
+            .as_ref()
+            .map(|session| (session.origin().to_owned(), session.user_id()))
+        else {
+            return;
+        };
+        self.save_composer_draft(cx);
+        self.close_thread(window, cx);
+        if let Some(panel) = self.attachments.as_ref() {
+            panel.update(cx, |panel, cx| panel.set_scope(None, false, cx));
+        }
+        let drafts = std::mem::replace(&mut self.drafts, draft::Drafts::shared());
+        // Defensive, unreachable in the current flow: `saved_drafts` is filled
+        // only here and taken by the next `enter_workspace`, so a live session
+        // never coexists with a kept set. If a future path does, assigning over
+        // the stale set drops it and releases its temporary clipboard files.
+        self.saved_drafts = Some(SavedDrafts {
+            origin,
+            user_id,
+            drafts,
+        });
+    }
+
+    /// Install the kept drafts only for the account that owned them. Any other
+    /// identity or origin clears the set through the normal path, which also
+    /// removes temporary clipboard files.
+    fn restore_drafts(&mut self, session: &crate::auth_session::Session) {
+        let Some(saved) = self.saved_drafts.take() else {
+            return;
+        };
+        if saved.origin == session.origin() && saved.user_id == session.user_id() {
+            self.drafts = saved.drafts;
+        } else {
+            saved.drafts.borrow_mut().clear_all();
+        }
     }
 
     /// Drop the whole signed-in state. `reason` is shown on the login screen;
@@ -266,6 +318,7 @@ impl Voxhold {
         for (_, pending) in self.pending_sends.drain() {
             pending.abort.abort();
         }
+        self.unconfirmed_sends.clear();
         // The pending voice save would be aborted by the generation bump; write
         // it before the session it belongs to goes away.
         self.voice_settings.flush();
@@ -317,6 +370,7 @@ impl Voxhold {
         self.refresh_request = None;
         self.refresh_again = false;
         self.refresh_new_ids.clear();
+        self.clear_latest_buffer();
         self.pending_edits.clear();
         self.pending_reactions.clear();
         self.older_request = 0;
@@ -344,7 +398,7 @@ impl Voxhold {
         self.hovered_action = None;
         self.message_menu = None;
         self.forward = None;
-        self.editing = None;
+        self.close_edit();
         self.confirm_delete = None;
         self.action_requests.clear();
         self.action_error = None;

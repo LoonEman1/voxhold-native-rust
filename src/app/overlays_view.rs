@@ -5,9 +5,12 @@ impl Voxhold {
     pub(super) fn dismiss_overlays(&mut self, cx: &mut Context<Self>) {
         self.message_menu = None;
         self.member_menu = None;
-        self.forward = None;
+        // A pending forward keeps its modal and its per-recipient keys.
+        if !self.forward_is_sending() {
+            self.forward = None;
+        }
         self.show_search = false;
-        self.editing = None;
+        self.close_edit();
         self.confirm_delete = None;
         if self.update.panel_open {
             self.close_update_panel(cx);
@@ -260,10 +263,7 @@ impl Voxhold {
                             .id("forward-close")
                             .cursor_pointer()
                             .text_size(px(12.))
-                            .on_click(cx.listener(|s, _, _, cx| {
-                                s.forward = None;
-                                cx.notify();
-                            }))
+                            .on_click(cx.listener(|s, _, _, cx| s.close_forward(cx)))
                             .child("Закрыть"),
                     ),
             );

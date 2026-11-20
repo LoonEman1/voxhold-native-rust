@@ -17,6 +17,10 @@ impl Voxhold {
         if conversation.id <= 0 || self.client.is_none() {
             return;
         }
+        // A message-search hit that is still loading must not navigate after
+        // the user picked a chat by hand; its answer belongs to the previous
+        // intent.
+        self.messaging.open_request = None;
         let previous = self.chat_key();
         if previous.channel != 0 {
             let text = self.composer.read(cx).value().to_string();
@@ -35,7 +39,7 @@ impl Voxhold {
         self._creator_subscriptions.clear();
         self.message_menu = None;
         self.forward = None;
-        self.editing = None;
+        self.close_edit();
         self.confirm_delete = None;
         self.action_error = None;
         self.action_notice.clear();
@@ -75,6 +79,7 @@ impl Voxhold {
         self.pending_anchor = None;
         self.refresh_request = None;
         self.refresh_again = false;
+        self.clear_latest_buffer();
         self.pending_edits.clear();
         self.pending_reactions.clear();
         self.request_seq = self.request_seq.wrapping_add(1);

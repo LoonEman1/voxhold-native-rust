@@ -170,7 +170,7 @@ impl Voxhold {
         self.message_menu = None;
         self.member_menu = None;
         self.forward = None;
-        self.editing = None;
+        self.close_edit();
         self.confirm_delete = None;
         self.action_requests.clear();
         self.selected_messages.clear();
@@ -199,6 +199,7 @@ impl Voxhold {
         self.refresh_request = None;
         self.refresh_again = false;
         self.refresh_new_ids.clear();
+        self.clear_latest_buffer();
         self.context_request = None;
         self.pending_jump = None;
         self.history_reset_pending = false;
@@ -251,6 +252,7 @@ impl Voxhold {
         if let Some(pending) = self.pending_sends.remove(&key) {
             pending.abort.abort();
         }
+        self.unconfirmed_sends.remove(&key);
         self.drafts.borrow_mut().clear(key);
     }
 
@@ -286,6 +288,7 @@ impl Voxhold {
         if let Some(pending) = self.pending_sends.remove(&key) {
             pending.abort.abort();
         }
+        self.unconfirmed_sends.remove(&key);
         self.drafts.borrow_mut().clear(key);
         self.conversations_reconcile = None;
         self.messaging.notifications = None;
@@ -657,6 +660,8 @@ impl Voxhold {
     ) {
         self.messaging.global = !self.messaging.global;
         self.messaging.search.invalidate();
+        // A hit clicked in the old mode must not navigate after the switch.
+        self.messaging.open_request = None;
         let placeholder = if self.messaging.global {
             "Поиск по сообщениям"
         } else {
@@ -672,15 +677,10 @@ impl Voxhold {
 
     pub(super) fn submit_messages_search(&mut self, cx: &mut Context<Self>) {
         let query = self.messaging.query.read(cx).value().trim().to_string();
+        // A new query owns the next navigation; an older hit must not open.
+        self.messaging.open_request = None;
         if query.is_empty() || query.chars().count() > 200 {
-            self.messaging.search.request = self.messaging.search.request.wrapping_add(1);
-            self.messaging.search.results.clear();
-            self.messaging.search.truncated = false;
-            self.messaging.search.has_more = false;
-            self.messaging.search.next_before = None;
-            self.messaging.search.loading = false;
-            self.messaging.search.loading_more = false;
-            self.messaging.search.submitted.clear();
+            self.messaging.search.invalidate();
             self.messaging.search.error = if query.is_empty() {
                 "Введите запрос.".into()
             } else {
@@ -810,13 +810,16 @@ impl Voxhold {
         cx.spawn_in(window, async move |this, window| {
             let result = task.await;
             let _ = this.update_in(window, |s, window, cx| {
-                if s.session_generation != session
-                    || s.messaging.open_request != Some(request)
-                    || !s.personal_mode
-                {
+                // Only the latest hit of the current session may navigate.
+                if s.session_generation != session || s.messaging.open_request != Some(request) {
                     return;
                 }
+                // The slot is still this request's own; the surface may have
+                // changed in flight, so release it before deciding.
                 s.messaging.open_request = None;
+                if !s.personal_mode || !s.messaging.global {
+                    return;
+                }
                 match result {
                     Ok(row) if row.saved => {
                         // `/me/conversations/search` also returns saved
@@ -871,6 +874,7 @@ impl Voxhold {
         self.refresh_request = None;
         self.refresh_again = false;
         self.refresh_new_ids.clear();
+        self.clear_latest_buffer();
         self.older_request = 0;
         self.loading_older = false;
         self.context_request = None;
@@ -897,6 +901,7 @@ impl Voxhold {
                     return;
                 }
                 s.refresh_request = None;
+                s.clear_latest_buffer();
                 match result {
                     Ok(page) => {
                         let found = page.messages.iter().any(|row| row.id == message);
@@ -906,7 +911,7 @@ impl Voxhold {
                         s.history_list.reset(0);
                         s.before = page.pagination.next_before_id;
                         s.has_more = page.pagination.has_more;
-                        s.history_has_newer = true;
+                        s.history_has_newer = s.conversation_has_newer_tail(conversation);
                         s.pending_anchor = None;
                         s.older_request = 0;
                         s.loading_older = false;
@@ -924,6 +929,7 @@ impl Voxhold {
                     }
                     Err(error) => s.error = error.to_string(),
                 }
+                s.retry_refresh_after_jump(chat, window, cx);
                 cx.notify();
             });
         })

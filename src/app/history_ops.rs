@@ -75,6 +75,11 @@ impl Voxhold {
         let conversation = self.in_conversation();
         if !window.is_window_active()
             || self.read_pending
+            // The loaded window ends before the live tail. A read mark taken
+            // from it would be cumulative up to the old right edge and would
+            // also bless a fresh row that a broken path appended to the gap.
+            // The confirmed latest page clears the flag before the next mark.
+            || self.history_has_newer
             || (self.access_pending && !conversation)
             || self
                 .read_retry_at
@@ -306,6 +311,7 @@ impl Voxhold {
         self.refresh_request = None;
         self.refresh_again = false;
         self.refresh_new_ids.clear();
+        self.clear_latest_buffer();
         self.request_seq = self.request_seq.wrapping_add(1);
         let request = self.request_seq;
         self.context_request = Some(request);
@@ -444,6 +450,7 @@ impl Voxhold {
         self.refresh_request = None;
         self.refresh_again = false;
         self.refresh_new_ids.clear();
+        self.clear_latest_buffer();
         self.older_request = 0;
         self.loading_older = false;
         self.older_error.clear();
@@ -697,13 +704,19 @@ impl Voxhold {
             return;
         }
         if self.refresh_request.is_some() {
+            // One reset already asked the running page to replace the window;
+            // from now on its rows also belong to that page's replay set.
             self.refresh_again = true;
+            if let Some(request) = self.refresh_request {
+                self.bind_latest_buffer(request);
+            }
             return;
         }
         self.request_seq = self.request_seq.wrapping_add(1);
         let request = self.request_seq;
         self.refresh_request = Some(request);
         self.refresh_new_ids.clear();
+        self.bind_latest_buffer(request);
         self.older_request = 0;
         self.loading_older = false;
         let runtime = self.runtime.clone();
@@ -721,6 +734,10 @@ impl Voxhold {
                     return;
                 }
                 s.refresh_request = None;
+                // The replay set belongs to this answer only. A failed or
+                // superseded answer drops it; the confirmed page then either
+                // consumes it or the normal repeat asks again.
+                let buffered = s.take_latest_buffer(request);
                 let refresh_again = std::mem::take(&mut s.refresh_again);
                 let new_ids = std::mem::take(&mut s.refresh_new_ids);
                 match result {
@@ -736,10 +753,36 @@ impl Voxhold {
                             s.history_keys.clear();
                             s.history_list.reset(0);
                             s.before = None;
-                        }
-                        s.apply_history_snapshot(page, new_ids);
-                        if return_to_latest {
+                            // The confirmed latest page is the new right edge.
+                            // Merge the rows that arrived while it loaded with
+                            // the same revision/tombstone rules as every other
+                            // history path, so each id appears once.
+                            let messages = s.merge_latest_page(page.messages, buffered);
+                            s.apply_history_snapshot(
+                                voxhold_api::MessagePage {
+                                    messages,
+                                    pagination: page.pagination,
+                                },
+                                new_ids,
+                            );
                             s.pending_jump = s.messages.last().map(|message| message.id);
+                        } else {
+                            // An ordinary refresh started at a known gap also
+                            // replaces the fragment with the latest page.
+                            // Replay the rows it held for us, otherwise the
+                            // race would leave a hole that later rows cannot
+                            // fill. Without a gap the page is passed untouched:
+                            // `refresh_new_ids` still carries the in-flight
+                            // rows that are newer than the page.
+                            let page = if buffered.is_empty() {
+                                page
+                            } else {
+                                voxhold_api::MessagePage {
+                                    messages: s.merge_latest_page(page.messages, buffered),
+                                    pagination: page.pagination,
+                                }
+                            };
+                            s.apply_history_snapshot(page, new_ids);
                         }
                         s.sync_open_views(cx);
                         s.older_error.clear();

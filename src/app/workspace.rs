@@ -59,7 +59,7 @@ impl Voxhold {
         self.message_menu = None;
         self.member_menu = None;
         self.forward = None;
-        self.editing = None;
+        self.close_edit();
         self.confirm_delete = None;
         self.action_requests.clear();
         self.selected_messages.clear();
@@ -155,6 +155,7 @@ impl Voxhold {
         self.pending_return_channel = None;
         self.refresh_request = None;
         self.refresh_again = false;
+        self.clear_latest_buffer();
         self.channel_snapshot_request = None;
         self.conversation_reaction_requests.clear();
         self.search_permissions_request = None;
@@ -229,7 +230,7 @@ impl Voxhold {
         self.message_menu = None;
         self.member_menu = None;
         self.forward = None;
-        self.editing = None;
+        self.close_edit();
         self.confirm_delete = None;
         self.action_requests.clear();
         self.selected_messages.clear();
@@ -280,6 +281,7 @@ impl Voxhold {
         self.pending_return_channel = None;
         self.refresh_request = None;
         self.refresh_again = false;
+        self.clear_latest_buffer();
         self.pending_edits.clear();
         self.pending_reactions.clear();
         self.request_seq = self.request_seq.wrapping_add(1);
@@ -395,6 +397,7 @@ impl Voxhold {
         self.search_permissions_request = None;
         self.search_permissions_ready = false;
         self.refresh_new_ids.clear();
+        self.clear_latest_buffer();
         self.pending_edits.clear();
         self.pending_reactions.clear();
         self.messages.clear();
@@ -446,7 +449,7 @@ impl Voxhold {
         self.pinned_request = None;
         self.message_menu = None;
         self.forward = None;
-        self.editing = None;
+        self.close_edit();
         self.confirm_delete = None;
         self.action_requests.clear();
         self.selected_messages.clear();
@@ -471,6 +474,7 @@ impl Voxhold {
         self.save_composer_draft(cx);
         self.servers.retain(|server| server.id != self.server);
         self.drafts.borrow_mut().clear_server(self.server);
+        self.forget_server_sends(self.server);
         let next = self.servers.first().map_or(0, |server| server.id);
         self.channel = 0;
         self.select_server(next, window, cx);

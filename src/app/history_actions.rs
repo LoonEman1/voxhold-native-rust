@@ -302,6 +302,10 @@ impl Voxhold {
         if !self.permissions_for_row(&message).edit {
             return;
         }
+        // Every opening installs a new editor generation; a PATCH started for an
+        // older opening must not close this form.
+        self.edit_open_seq = self.edit_open_seq.wrapping_add(1);
+        self.edit_error = None;
         self.edit_input.update(cx, |input, cx| {
             input.set_value(message.content.clone(), window, cx);
             input.focus(window, cx);
@@ -312,8 +316,19 @@ impl Voxhold {
         cx.notify();
     }
 
-    pub(super) fn cancel_edit(&mut self, cx: &mut Context<Self>) {
+    /// Close the inline editor, invalidate every request that belongs to it and
+    /// drop the error that was bound to its generation.
+    pub(super) fn close_edit(&mut self) {
         if self.editing.take().is_some() {
+            self.edit_open_seq = self.edit_open_seq.wrapping_add(1);
+        }
+        self.edit_error = None;
+    }
+
+    pub(super) fn cancel_edit(&mut self, cx: &mut Context<Self>) {
+        let was_open = self.editing.is_some();
+        self.close_edit();
+        if was_open {
             cx.notify();
         }
     }
@@ -323,13 +338,13 @@ impl Voxhold {
             return;
         };
         let Some(message) = self.message_snapshot(id) else {
-            self.editing = None;
+            self.close_edit();
             cx.notify();
             return;
         };
         if !self.permissions_for_row(&message).edit {
             self.action_error = Some((id, "Недостаточно прав доступа.".into()));
-            self.editing = None;
+            self.close_edit();
             cx.notify();
             return;
         }
@@ -343,13 +358,16 @@ impl Voxhold {
             return;
         }
         if text == message.content {
-            self.editing = None;
+            self.close_edit();
             cx.notify();
             return;
         }
         let Some(request) = self.begin_action(id, "edit") else {
             return;
         };
+        // The previous PATCH error belonged to the attempt that just ended; a
+        // retry clears it while the new request is in flight.
+        self.edit_error = None;
         let Some(client) = self.client.clone() else {
             self.finish_action(id, "edit", &request);
             return;
@@ -357,6 +375,11 @@ impl Voxhold {
         let (server, channel) = (self.server, self.channel);
         let runtime = self.runtime.clone();
         let session = self.session_generation;
+        // The generation and the exact text that go on the wire decide whether
+        // the answer may close the editor. The server may normalize the text,
+        // so the comparison uses the sent value, not the answer body.
+        let open_seq = self.edit_open_seq;
+        let sent = text.clone();
         let task = cx.background_spawn(async move {
             runtime.block_on(client.edit_message(server, channel, id, &text))
         });
@@ -370,20 +393,23 @@ impl Voxhold {
                 match result {
                     Ok(updated) => {
                         if updated.id == id {
-                            if s.in_conversation() {
-                                return;
-                            }
                             s.merge_message(false, updated);
                             s.trim_history(false);
                             s.sync_thread_root(window, cx);
                         }
-                        if s.editing == Some(id) {
-                            s.editing = None;
+                        if s.editing == Some(id) && s.edit_open_seq == open_seq {
+                            s.edit_error = None;
+                            if s.edit_input.read(cx).value().to_string() == sent {
+                                s.close_edit();
+                            }
                         }
-                        s.action_error = None;
                     }
                     Err(error) => {
-                        s.action_error = Some((id, error.to_string()));
+                        // Only the editor that started this attempt may show its
+                        // error while it is still open.
+                        if s.editing == Some(id) && s.edit_open_seq == open_seq {
+                            s.edit_error = Some((id, open_seq, error.to_string()));
+                        }
                         if error.status() == Some(403) {
                             s.recheck_channel_snapshot(window, cx);
                         } else if error.status() == Some(404) {
@@ -470,6 +496,9 @@ impl Voxhold {
         self.messages.retain(|message| message.id != id);
         self.pending_edits.remove(&id);
         self.pending_reactions.remove(&id);
+        if self.editing == Some(id) {
+            self.close_edit();
+        }
         self.selected_messages.retain(|selected| *selected != id);
         if self.highlighted_message.is_some_and(|(row, _)| row == id) {
             self.highlighted_message = None;
@@ -768,7 +797,7 @@ impl Voxhold {
                             .message_snapshot(id)
                             .is_some_and(|message| s.permissions_for_row(&message).edit);
                         if !allowed {
-                            s.editing = None;
+                            s.close_edit();
                         }
                     }
                 } else {

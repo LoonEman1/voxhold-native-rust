@@ -31,6 +31,15 @@ impl VoiceHandle {
         self.updates.push(update);
     }
 
+    /// Whether a rotation currently owns the next authorization.
+    pub fn test_rotation_active(&self) -> bool {
+        self.requests
+            .rotation
+            .lock()
+            .map(|rotation| rotation.active())
+            .unwrap_or(false)
+    }
+
     /// The newest control snapshot waiting for the media worker, if the UI
     /// queued one. The slot holds one value, so this is also the count of
     /// pending snapshots.

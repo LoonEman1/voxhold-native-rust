@@ -627,35 +627,69 @@ async fn a_transient_refresh_failure_keeps_the_session_for_a_retry(cx: &mut Test
 
 #[cfg(feature = "voxhold-media")]
 #[gpui::test]
-async fn a_rotation_that_restarts_the_call_reports_the_stopped_broadcast(cx: &mut TestAppContext) {
+async fn a_rotated_token_keeps_the_voice_handle_and_does_not_rejoin(cx: &mut TestAppContext) {
+    use crate::auth_session::Session;
     use voxhold_media::publisher::{Phase, Sharing};
 
-    let (visual, _view, voice) = super::super::voice_tests::fixture(cx);
+    let (visual, view, voice) = super::super::voice_tests::fixture(cx);
     visual.update(|_window, app| {
-        voice.update(app, |panel, cx| {
+        voice.update(app, |panel, _| {
+            panel.test_attach_detached_handle();
             panel.test_set_screen_sharing(Sharing {
                 phase: Phase::Live,
                 live: true,
                 ..Default::default()
             });
-            assert_eq!(panel.screen_share_notice(), None);
-            panel.rejoin_call(7, cx);
-            assert_eq!(
-                panel.screen_share_notice(),
-                Some("Трансляция остановлена после обновления сессии."),
-                "the stopped broadcast is stated, not silently lost"
-            );
-            assert_eq!(panel.test_screen_phase(), Phase::Idle);
+            // `start_refresh` announces the rotation before the request runs.
+            panel.begin_token_rotation();
         });
     });
-    // The room paints the notice where the screen-share status line lives.
-    visual.update(|window, app| {
-        window.refresh();
-        window.draw(app).clear();
+    let attempt = voice.read_with(&*visual, |panel, _| {
+        panel
+            .test_handle_attempt()
+            .expect("the fixture attached one handle")
     });
-    visual.run_until_parked();
-    assert!(
-        visual.debug_bounds("voice-screen-reason").is_some(),
-        "the stopped-broadcast notice is painted in the room"
-    );
+
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            // No client object is needed to prove the session path: the panel
+            // still receives the rotated-token notification, and no real
+            // WebSocket is opened by this test.
+            v.session = Some(
+                Session::new(
+                    "http://127.0.0.1:1".into(),
+                    1,
+                    "alice".into(),
+                    "token-1".into(),
+                    now_unix() + 3600,
+                )
+                .expect("session"),
+            );
+            v.session_epoch = v.session_epoch.wrapping_add(1);
+            v.client = None;
+            v.apply_rotated_token(window, cx);
+        });
+    });
+
+    voice.read_with(&*visual, |panel, _| {
+        assert_eq!(
+            panel.test_handle_attempt(),
+            Some(attempt),
+            "the rotation must keep the one media worker"
+        );
+        assert_eq!(
+            panel.call_channel(),
+            7,
+            "the call is not left and re-joined"
+        );
+        assert!(
+            panel.test_rotation_active(),
+            "the worker now owns the one deferred authorization"
+        );
+        assert_eq!(
+            panel.test_screen_phase(),
+            Phase::Live,
+            "the confirmed broadcast is kept for the worker's recovery"
+        );
+    });
 }

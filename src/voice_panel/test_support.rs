@@ -24,6 +24,19 @@ impl VoicePanel {
         self.requested_viewport = None;
     }
 
+    /// The identity of the installed worker, so a test can prove a session
+    /// rotation kept the same handle instead of rebuilding it.
+    pub fn test_handle_attempt(&self) -> Option<u64> {
+        self.handle.as_ref().map(VoiceHandle::attempt)
+    }
+
+    /// Whether the handle currently defers re-authorization for a rotation.
+    pub fn test_rotation_active(&self) -> bool {
+        self.handle
+            .as_ref()
+            .is_some_and(VoiceHandle::test_rotation_active)
+    }
+
     /// Take the viewport the UI queued for the detached media worker.
     pub fn test_take_viewport(&mut self) -> Option<(u32, u32)> {
         self.handle.as_ref()?.take_viewport_for_tests()

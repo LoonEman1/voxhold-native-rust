@@ -124,9 +124,6 @@ pub struct VoicePanel {
     can_stream: bool,
     /// Screen-share picker, on-air card and preview.
     screen: ScreenShareUi,
-    /// Room-level screen-share message that outlives the reset publication,
-    /// e.g. the explicit notice that a rotation stopped the broadcast.
-    screen_notice: String,
     /// Monotonic id of the newest screen-audio probe. A slower, older probe
     /// must not overwrite the availability of a newer dialog.
     screen_audio_probe: u64,
@@ -291,7 +288,6 @@ impl VoicePanel {
             room_streams: Vec::new(),
             can_stream: false,
             screen: ScreenShareUi::default(),
-            screen_notice: String::new(),
             screen_audio_probe: 0,
             access_confirmed: true,
             frame: None,
@@ -612,9 +608,6 @@ impl VoicePanel {
                 self.tracks.clear();
                 self.local_mutes.clear();
                 self.close_player();
-                // A fresh call starts without the previous session's notice;
-                // `rejoin_call` sets it after this successful join.
-                self.screen_notice.clear();
                 self.refresh_capture();
                 self.notify_call_changed(cx);
             }
@@ -628,35 +621,28 @@ impl VoicePanel {
         self.leave_call(cx);
     }
 
-    /// Install a client that already carries a rotated token. The next join
-    /// uses it; an active call is restarted through `rejoin_call`.
+    /// Install a client that already carries a rotated token. The active
+    /// `VoiceHandle` keeps running and reads the new token from this shared
+    /// client on its next authorization; no handle is rebuilt.
     pub fn set_client(&mut self, client: Client) {
         self.client = client;
     }
 
-    /// Restart the call that is already active in `channel` with the current
-    /// client and access snapshot. The normal leave/join path is used, so the
-    /// server sees one clean lease and media never runs on the old credential.
-    ///
-    /// `leave_call` releases the screen publication together with the lease.
-    /// The capture cannot be handed to the new lease, so the broadcast really
-    /// stops; the room says so instead of losing it silently.
-    pub fn rejoin_call(&mut self, channel: i64, cx: &mut Context<Self>) {
-        if channel <= 0 {
-            return;
+    /// A refresh request started. The media worker defers re-authorization
+    /// until the answer arrives (or its bounded deadline), so an old socket
+    /// close cannot reconnect with the revoked token.
+    pub fn begin_token_rotation(&mut self) {
+        if let Some(handle) = &self.handle {
+            handle.token_rotation_started();
         }
-        let was_sharing = self.share_active();
-        self.leave_call(cx);
-        let viewing = self.room;
-        self.room = channel;
-        self.join(cx);
-        // A successful join clears the previous notice, so state the loss
-        // after it. The call itself is already back on the new credential.
-        if was_sharing {
-            self.screen_notice = SCREEN_ROTATION_NOTICE.into();
+    }
+
+    /// The refresh result was applied to the shared client. A waiting voice
+    /// worker may now open its one new socket and restore the call.
+    pub fn token_rotated(&mut self) {
+        if let Some(handle) = &self.handle {
+            handle.token_rotation_finished();
         }
-        self.room = viewing;
-        cx.notify();
     }
 
     /// Normal leave: stream session and voice session are both released and
@@ -671,7 +657,6 @@ impl VoicePanel {
         self.handle.take();
         self.close_player();
         self.reset_screen();
-        self.screen_notice.clear();
         self.call_channel = 0;
         self.transition_phase(CallPhase::Idle, cx);
         self.status.clear();
@@ -1124,7 +1109,7 @@ mod cues;
 mod focus;
 mod player;
 mod screen_share;
-use screen_share::{ScreenShareUi, SCREEN_ROTATION_NOTICE};
+use screen_share::ScreenShareUi;
 #[cfg(test)]
 mod test_support;
 mod updates;

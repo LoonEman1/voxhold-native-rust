@@ -169,6 +169,9 @@ impl VoiceHandle {
         stream_permission: bool,
         slot_available: bool,
     ) {
+        // An explicit publish is a newer user choice; it supersedes any
+        // broadcast recovery that has not started yet.
+        self.requests.cancel_publish_recovery();
         push_screen(
             &self.requests,
             ScreenCommand::Publish {
@@ -198,6 +201,7 @@ impl VoiceHandle {
         stream_permission: bool,
         slot_available: bool,
     ) {
+        self.requests.cancel_publish_recovery();
         push_screen(
             &self.requests,
             ScreenCommand::Restart {
@@ -242,6 +246,9 @@ impl VoiceHandle {
 
     /// One stop intent. The capture stops before the socket answer arrives.
     pub fn stop_screen_share(&self) {
+        // Stop cancels a recovery intent synchronously, before a late join
+        // confirmation or the worker's next tick can read it.
+        self.requests.cancel_publish_recovery();
         push_screen(&self.requests, ScreenCommand::Stop);
         self.requests.wake();
     }
@@ -380,6 +387,13 @@ impl Live {
                     }
                 }
                 PublisherOutcome::State(sharing) => {
+                    // Only an attempt that really reached the air may be
+                    // replayed after a transport loss. Remember the epoch it
+                    // was confirmed under, so a later Stop cannot resurrect it.
+                    if sharing.phase == crate::publisher::Phase::Live && sharing.confirmed.is_some()
+                    {
+                        self.recovery_epoch = self.cancel_epoch.load(Ordering::SeqCst);
+                    }
                     self.updates.push(VoiceUpdate::ScreenShare(sharing));
                 }
             }
@@ -589,7 +603,10 @@ impl Live {
             .ok()
             .and_then(|mut slot| slot.take());
         match latest {
-            Some(access) => self.apply_screen_access(access),
+            Some(access) => {
+                self.note_access();
+                self.apply_screen_access(access)
+            }
             None => {
                 self.publisher.set_access(self.access_value());
                 Vec::new()
@@ -749,6 +766,9 @@ impl Drop for Live {
     /// the voice worker for up to `WORKER_JOIN_TIMEOUT` after the leave
     /// handshake; hand it to the same release thread as every other stop.
     fn drop(&mut self) {
+        // Capture only the confirmed on-air request. The publisher has
+        // already cleared it for a user Stop/Leave or a revoked attempt.
+        self.capture_publish_recovery();
         if let Some(engine) = self.screen.take() {
             release_off_loop(engine, true);
         }

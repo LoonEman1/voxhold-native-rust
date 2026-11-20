@@ -840,3 +840,69 @@ fn a_snapshot_that_arrives_before_ready_starts_after_the_join() {
         "the retained snapshot must start the selection after voice.joined: {joined:?}"
     );
 }
+
+#[test]
+fn transport_loss_keeps_the_exact_publication_and_player_audio_state() {
+    let now = Instant::now();
+    let a = publication("publisher-a", 3);
+    let mut viewer = Viewer::new(1, 10);
+    snapshot(&mut viewer, &[a.clone()], now);
+    viewer.set_joined(true, now);
+    let started = viewer.select(&a, 11, now);
+    let (_, started_publication) = start_of(&started);
+    assert_eq!(started_publication.publisher_connection_id, "publisher-a");
+    viewer.set_muted(11, true);
+    assert!(viewer.muted());
+
+    // The disconnected attempt is closed but its exact identity and muted
+    // state survive. Nothing starts before the fresh snapshot and join.
+    let ended = viewer.transport_ended(now);
+    assert!(
+        ended
+            .iter()
+            .any(|outcome| matches!(outcome, Outcome::Close))
+    );
+    assert_eq!(
+        viewer.intent().unwrap().publisher_connection_id,
+        "publisher-a"
+    );
+    assert!(
+        viewer.muted(),
+        "the player stays muted across the reconnect"
+    );
+    assert!(viewer.set_joined(true, now).is_empty());
+    let fresh = snapshot(&mut viewer, &[a.clone()], now);
+    let (_, rewatched) = start_of(&fresh);
+    assert_eq!(
+        rewatched.publisher_connection_id, "publisher-a",
+        "the same publisher connection, not another connection of the user"
+    );
+}
+
+#[test]
+fn a_publication_that_disappears_after_the_loss_is_dropped_with_a_reason() {
+    let now = Instant::now();
+    let a = publication("publisher-a", 3);
+    let other = publication("publisher-b", 3);
+    let mut viewer = Viewer::new(1, 10);
+    snapshot(&mut viewer, &[a.clone()], now);
+    viewer.set_joined(true, now);
+    viewer.select(&a, 12, now);
+    viewer.transport_ended(now);
+    viewer.set_joined(true, now);
+
+    // The fresh snapshot has only another connection of the same user. The
+    // intent must not be retargeted to it.
+    let fresh = snapshot(&mut viewer, &[other], now);
+    assert!(
+        !fresh
+            .iter()
+            .any(|outcome| matches!(outcome, Outcome::Start { .. })),
+        "a different publisher is never substituted: {fresh:?}"
+    );
+    assert!(fresh.iter().any(|outcome| matches!(
+        outcome,
+        Outcome::Failed { selection: 12, message } if message.contains("недоступна")
+    )));
+    assert!(viewer.intent().is_none());
+}

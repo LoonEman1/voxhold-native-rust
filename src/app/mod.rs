@@ -118,6 +118,15 @@ struct PendingSend {
     abort: tokio::task::AbortHandle,
 }
 
+/// The unsent drafts of the account whose session expired in this process.
+/// They are held only for the same canonical origin and user id; any other
+/// sign-in, or an explicit logout, releases them with their temporary files.
+struct SavedDrafts {
+    origin: String,
+    user_id: i64,
+    drafts: draft::Shared,
+}
+
 /// One runtime preview request. The generation is the dialog preview scope; an
 /// answer from a previous scope may not clear or replace the next request's
 /// pending entry.
@@ -495,6 +504,8 @@ pub(crate) struct Voxhold {
     /// header popup. It never blocks the UI thread.
     update: update_ops::UpdateUi,
     drafts: draft::Shared,
+    /// Drafts kept across a forced expiry for the same `(origin, user_id)`.
+    saved_drafts: Option<SavedDrafts>,
     auth: auth::AuthState,
     palette: theme::Palette,
     theme_mode: theme::ThemeMode,
@@ -836,6 +847,7 @@ impl Voxhold {
             generation: 0,
             update: update_ops::UpdateUi::new(),
             drafts: draft::Drafts::shared(),
+            saved_drafts: None,
             auth: {
                 let mut auth = auth::AuthState::with_prefill(&start_address);
                 auth.remember_instance = start_remember;

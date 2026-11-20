@@ -101,6 +101,9 @@ impl VoicePanel {
             }
         }
         self.screen.selected = selected;
+        self.screen.selected_identity = selected
+            .and_then(|id| self.screen.source_for(id))
+            .and_then(ScreenSource::identity);
         self.screen.reset_audio_scope(kind);
         self.screen.audio_availability = Some(Ok(voxhold_media::system_audio::AudioDeviceInfo {
             id: "test".into(),
@@ -240,13 +243,19 @@ impl VoicePanel {
             height,
             bgra: vec![0x40; width as usize * height as usize * 4],
         };
-        self.screen.insert_preview(source.source_id(), frame)
+        let Some(identity) = source.identity() else {
+            return false;
+        };
+        self.screen.insert_preview(identity, frame)
     }
 
     /// Inject a preview failure for one card without touching the selection.
     pub fn test_inject_screen_preview_error(&mut self, source: &ScreenSource, message: &str) {
+        let Some(identity) = source.identity() else {
+            return;
+        };
         self.screen
-            .insert_preview_failure(source.source_id(), message.to_owned());
+            .insert_preview_failure(identity, message.to_owned());
     }
 
     /// Run the production preview request against the current picker state, so
@@ -275,8 +284,10 @@ impl VoicePanel {
         source: &ScreenSource,
         ok: bool,
     ) -> bool {
-        let id = source.source_id();
-        self.screen.preview_pending.insert(id);
+        let Some(identity) = source.identity() else {
+            return false;
+        };
+        self.screen.preview_pending.insert(identity.clone());
         let result = if ok {
             Ok(PreviewFrame {
                 width: 8,
@@ -286,7 +297,7 @@ impl VoicePanel {
         } else {
             Err(ThumbnailError::Timeout)
         };
-        self.screen.finish_preview(epoch, id, result)
+        self.screen.finish_preview(epoch, identity, result)
     }
 
     /// The current preview session epoch.
@@ -316,7 +327,8 @@ impl VoicePanel {
 
     /// The painted failure note of one card, if its capture failed.
     pub fn test_screen_preview_error(&self, id: SourceId) -> Option<String> {
-        self.screen.preview_failures.get(&id).cloned()
+        let identity = self.screen.source_for(id)?.identity()?;
+        self.screen.preview_failures.get(&identity).cloned()
     }
 
     /// The hard bounds the cache enforces, for a test assertion.
@@ -479,6 +491,8 @@ impl VoicePanel {
                     display_id: -1,
                     width: 0,
                     height: 0,
+                    monitor: None,
+                    topology: None,
                 },
             );
             voxhold_media::publisher::PublishRequest {

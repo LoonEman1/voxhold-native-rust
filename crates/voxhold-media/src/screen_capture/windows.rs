@@ -45,6 +45,18 @@ pub(super) fn list_sources(kind: SourceKind) -> Result<Vec<ScreenSource>, &'stat
         SourceKind::Monitor => monitor_descriptors(),
         SourceKind::Window => Vec::new(),
     };
+    let capturer_monitors: Vec<CapturerMonitor> = sources
+        .iter()
+        .map(|source| CapturerMonitor {
+            id: source.id(),
+            title: source.title(),
+        })
+        .collect();
+    let mapping = match kind {
+        SourceKind::Monitor => confirmed_mapping(&monitors, &capturer_monitors),
+        SourceKind::Window => Vec::new(),
+    };
+    let topology = TopologySnapshot::from_monitors(monitors.clone());
     let mut result = Vec::with_capacity(sources.len());
     for source in sources {
         let id = source.id();
@@ -52,14 +64,16 @@ pub(super) fn list_sources(kind: SourceKind) -> Result<Vec<ScreenSource>, &'stat
         match kind {
             SourceKind::Monitor => {
                 // The pinned capturer reports `display_id = -1` on this
-                // host. Metadata is matched by the capturer's own title,
-                // never by list position: an unmatched title keeps the
-                // size unknown instead of taking a neighbour's.
+                // host. Identity and metadata are matched by the capturer's
+                // own title against the Windows device list, never by list
+                // position. An unmatched or ambiguous title keeps the row
+                // identity-less, so it cannot be selected or captured.
                 let title = title.trim().to_owned();
-                let matched = monitor_descriptor_for_title(&title, &monitors);
-                let (width, height) = matched
-                    .map(|monitor| (monitor.width, monitor.height))
-                    .unwrap_or((0, 0));
+                let matched = mapping
+                    .iter()
+                    .find(|(source_id, _)| *source_id == id)
+                    .map(|(_, monitor)| monitor);
+                let (width, height) = matched.map(|monitor| monitor.size()).unwrap_or((0, 0));
                 let title = if title.is_empty() {
                     matched
                         .map(|monitor| monitor.device.trim().to_owned())
@@ -75,6 +89,8 @@ pub(super) fn list_sources(kind: SourceKind) -> Result<Vec<ScreenSource>, &'stat
                     display_id: source.display_id(),
                     width,
                     height,
+                    monitor: matched.cloned(),
+                    topology: Some(topology.clone()),
                 });
             }
             SourceKind::Window => {
@@ -93,6 +109,8 @@ pub(super) fn list_sources(kind: SourceKind) -> Result<Vec<ScreenSource>, &'stat
                     display_id: source.display_id(),
                     width,
                     height,
+                    monitor: None,
+                    topology: None,
                 });
             }
         }
@@ -114,10 +132,35 @@ pub(super) fn capture_thumbnail(
     let Some(mut capturer) = DesktopCapturer::new(options) else {
         return Err(ThumbnailError::Unavailable);
     };
-    let Some(selected) = capturer
-        .get_source_list()
+    let list = capturer.get_source_list();
+    let selected_id = match source.kind {
+        SourceKind::Monitor => {
+            let Some(identity) = source.monitor.as_ref() else {
+                return Err(ThumbnailError::Changed);
+            };
+            let monitors = monitor_descriptors();
+            let capturer_monitors: Vec<CapturerMonitor> = list
+                .iter()
+                .map(|candidate| CapturerMonitor {
+                    id: candidate.id(),
+                    title: candidate.title(),
+                })
+                .collect();
+            resolve_monitor(identity, &monitors, &capturer_monitors).map_err(
+                |error| match error {
+                    ResolveError::Missing => ThumbnailError::Missing,
+                    ResolveError::Ambiguous | ResolveError::TopologyChanged => {
+                        ThumbnailError::Changed
+                    }
+                },
+            )?
+        }
+        // A window id is its `HWND`, a durable identity of its own.
+        SourceKind::Window => source.id,
+    };
+    let Some(selected) = list
         .into_iter()
-        .find(|candidate| candidate.id() == source.id)
+        .find(|candidate| candidate.id() == selected_id)
     else {
         return Err(ThumbnailError::Missing);
     };
@@ -204,8 +247,21 @@ unsafe extern "system" fn monitor_callback(
             device.push(char::from_u32(u32::from(unit)).unwrap_or('?'));
         }
         let rect = info.monitorInfo.rcMonitor;
-        list.push(MonitorDescriptor {
+        let work = info.monitorInfo.rcWork;
+        list.push(MonitorIdentity {
             device,
+            bounds: MonitorRect::new(
+                rect.left,
+                rect.top,
+                (rect.right - rect.left).max(0) as u32,
+                (rect.bottom - rect.top).max(0) as u32,
+            ),
+            work: MonitorRect::new(
+                work.left,
+                work.top,
+                (work.right - work.left).max(0) as u32,
+                (work.bottom - work.top).max(0) as u32,
+            ),
             width: (rect.right - rect.left).max(0) as u32,
             height: (rect.bottom - rect.top).max(0) as u32,
         });
@@ -214,8 +270,8 @@ unsafe extern "system" fn monitor_callback(
 }
 
 /// Monitor descriptors in enumeration order. The order is only a cache
-/// detail; [`monitor_descriptor_for_title`] matches a capturer source by
-/// its device name, never by this position.
+/// detail; the topology mapping matches a capturer source by its title and
+/// device name, never by this position.
 fn monitor_descriptors() -> Vec<MonitorDescriptor> {
     let mut list: Vec<MonitorDescriptor> = Vec::new();
     unsafe {
@@ -227,6 +283,11 @@ fn monitor_descriptors() -> Vec<MonitorDescriptor> {
         );
     }
     list
+}
+
+/// The current configuration, for the first-frame topology check.
+pub(super) fn topology_snapshot() -> TopologySnapshot {
+    TopologySnapshot::from_monitors(monitor_descriptors())
 }
 
 fn window_size(id: u64) -> (u32, u32) {
@@ -258,12 +319,39 @@ pub(super) fn run(
         let _ = ready.send(Err("Системный захват экрана недоступен."));
         return;
     };
-    let selected = capturer
-        .get_source_list()
+    let list = capturer.get_source_list();
+    let selected_id = match source.kind {
+        SourceKind::Monitor => {
+            let Some(identity) = source.monitor.as_ref() else {
+                let _ = ready.send(Err(
+                    "Не удалось однозначно определить выбранный экран. Обновите список и выберите экран снова.",
+                ));
+                return;
+            };
+            let monitors = monitor_descriptors();
+            let capturer_monitors: Vec<CapturerMonitor> = list
+                .iter()
+                .map(|candidate| CapturerMonitor {
+                    id: candidate.id(),
+                    title: candidate.title(),
+                })
+                .collect();
+            match resolve_monitor(identity, &monitors, &capturer_monitors) {
+                Ok(id) => id,
+                Err(error) => {
+                    let _ = ready.send(Err(error.message()));
+                    return;
+                }
+            }
+        }
+        // A window id is its `HWND`, a durable identity of its own.
+        SourceKind::Window => source.id,
+    };
+    let selected = list
         .into_iter()
-        .find(|candidate| candidate.id() == source.id);
+        .find(|candidate| candidate.id() == selected_id);
     let Some(selected) = selected else {
-        let _ = ready.send(Err("Выбранный источник захвата больше недоступен."));
+        let _ = ready.send(Err(ResolveError::Missing.message()));
         return;
     };
     if let Ok(mut slot) = failure.lock() {

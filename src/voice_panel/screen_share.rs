@@ -14,7 +14,7 @@ use voxhold_media::publisher::{
     AUDIO_BITRATES, MAX_CHANNEL_PUBLISHERS,
 };
 use voxhold_media::screen_capture::{
-    self, PreviewFrame, ScreenSource, SourceId, SourceKind, ThumbnailError,
+    self, PreviewFrame, ScreenSource, SourceId, SourceIdentity, SourceKind, ThumbnailError,
 };
 use voxhold_media::system_audio::{self, AudioDeviceInfo, AudioScope};
 
@@ -31,6 +31,10 @@ pub(crate) const AUDIO_PENDING_REASON: &str = "Дождитесь проверк
 /// repeats this check, so a stale dialog never sends a request.
 pub(crate) const SOURCE_GONE_REASON: &str =
     "Выбранный источник больше недоступен. Обновите список и выберите источник снова.";
+/// The chosen monitor moved to another capturer number or its geometry
+/// changed: the numeric id still exists but no longer proves the same screen.
+pub(crate) const SOURCE_CHANGED_REASON: &str =
+    "Выбранный экран изменился. Обновите список и выберите экран снова.";
 /// A session rotation restarts the call lease, so the old publication cannot
 /// survive it. Say that plainly instead of letting the card disappear.
 pub(crate) const SCREEN_ROTATION_NOTICE: &str = "Трансляция остановлена после обновления сессии.";
@@ -92,8 +96,12 @@ pub(super) struct ScreenShareUi {
     pub(super) window_loading: bool,
     pub(super) monitor_error: String,
     pub(super) window_error: String,
-    /// Stable identity of the chosen source, resolved from the current snapshot.
+    /// Current enumeration key of the chosen row. It is re-resolved when a
+    /// snapshot moves the monitor to another id.
     pub(super) selected: Option<SourceId>,
+    /// The surface the user really chose. A monitor is its Windows identity;
+    /// a window is its `HWND` in [`SourceId::id`].
+    pub(super) selected_identity: Option<SourceIdentity>,
     pub(super) resolution: Resolution,
     pub(super) fps: u32,
     pub(super) bitrate_kbps: u32,
@@ -119,15 +127,16 @@ pub(super) struct ScreenShareUi {
     pub(super) error: String,
     pub(super) sharing: Sharing,
     pub(super) preview: Option<Arc<RenderImage>>,
-    /// Picker thumbnails keyed by the stable `kind + id`. The cache is bounded
-    /// by [`MAX_SCREEN_PREVIEWS`] and [`MAX_SCREEN_PREVIEW_BYTES`].
-    pub(super) previews: HashMap<SourceId, PreviewThumb>,
-    /// Cards whose thumbnail attempt failed. The message is painted on the
+    /// Picker thumbnails keyed by the stable surface identity, so a capturer
+    /// reorder keeps the picture of the same display. Bounded by
+    /// [`MAX_SCREEN_PREVIEWS`] and [`MAX_SCREEN_PREVIEW_BYTES`].
+    pub(super) previews: HashMap<SourceIdentity, PreviewThumb>,
+    /// Surfaces whose thumbnail attempt failed. The message is painted on the
     /// card; the selection and the publish request never change because of it.
-    pub(super) preview_failures: HashMap<SourceId, String>,
-    /// Ids whose thumbnail is being captured, so a refresh never queues the
-    /// same source twice.
-    pub(super) preview_pending: HashSet<SourceId>,
+    pub(super) preview_failures: HashMap<SourceIdentity, String>,
+    /// Identities whose thumbnail is being captured, so a refresh never
+    /// queues the same surface twice.
+    pub(super) preview_pending: HashSet<SourceIdentity>,
     /// One preview batch is running for this picker. Only one batch may run at
     /// a time; a request made while it is set returns, and the running batch
     /// picks up newly visible rows at its next safe point and re-requests at
@@ -165,6 +174,7 @@ impl Default for ScreenShareUi {
             monitor_error: String::new(),
             window_error: String::new(),
             selected: None,
+            selected_identity: None,
             resolution: Resolution::P1080,
             fps: 30,
             bitrate_kbps: 6000,
@@ -206,27 +216,6 @@ impl ScreenShareUi {
         }
     }
 
-    /// Resolve an identity in its snapshot; a duplicate id resolves to `None`.
-    pub(super) fn source_for(&self, id: SourceId) -> Option<&ScreenSource> {
-        let mut found = self
-            .snapshot(id.kind)
-            .iter()
-            .filter(|item| item.id == id.id);
-        let source = found.next()?;
-        found.next().is_none().then_some(source)
-    }
-
-    /// The selected source as the current snapshot describes it.
-    #[cfg(test)]
-    pub(super) fn selected_source(&self) -> Option<&ScreenSource> {
-        self.selected.and_then(|id| self.source_for(id))
-    }
-
-    /// Whether the selection is in the visible category and still present.
-    pub(super) fn selection_is_current(&self) -> bool {
-        matches!(self.selected, Some(id) if id.kind == self.kind && self.source_for(id).is_some())
-    }
-
     /// The confirmed live source of a restart dialog. It comes from the
     /// accepted request only; enumeration answers never define or inject it.
     pub(super) fn restart_source(&self) -> Option<&ScreenSource> {
@@ -239,8 +228,9 @@ impl ScreenShareUi {
     /// Whether the restart still points at the identity the engine accepted.
     /// The snapshot is irrelevant: the live source may be absent from it.
     pub(super) fn restart_is_confirmed(&self) -> bool {
-        self.restart_source()
-            .is_some_and(|source| self.selected == Some(source.source_id()))
+        self.restart_source().is_some_and(|source| {
+            self.selected == Some(source.source_id()) && self.selected_identity == source.identity()
+        })
     }
 
     /// The request a restart dialog would send: the confirmed live source with
@@ -263,22 +253,6 @@ impl ScreenShareUi {
         let live = self.last_request.as_ref()?;
         let next = self.restart_request()?;
         Some(live.change_to(&next))
-    }
-
-    /// Drop a selection the newest snapshot no longer contains. A restart is
-    /// bound to the accepted source, so a background answer never clears it.
-    fn retain_selection(&mut self, kind: SourceKind, sources: &[ScreenSource]) {
-        if self.restart {
-            return;
-        }
-        let Some(id) = self.selected else { return };
-        if id.kind != kind {
-            return;
-        }
-        if sources.iter().filter(|item| item.id == id.id).count() != 1 {
-            self.selected = None;
-            self.error = SOURCE_GONE_REASON.into();
-        }
     }
 
     fn loading(&self) -> bool {
@@ -522,6 +496,7 @@ impl VoicePanel {
         self.screen.preflight_confirmed = false;
         self.screen.error.clear();
         self.screen.selected = None;
+        self.screen.selected_identity = None;
         self.screen.last_request = None;
         self.screen.kind = SourceKind::Monitor;
         // A new picker starts with no rows: no identity from the previous
@@ -665,6 +640,7 @@ impl VoicePanel {
         self.screen.preflight_confirmed = false;
         self.screen.error.clear();
         self.screen.selected = None;
+        self.screen.selected_identity = None;
         // No row of this dialog may survive into the next picker. The
         // confirmed live identity lives in `last_request`, not in these caches.
         self.screen.monitors.clear();
@@ -721,7 +697,9 @@ impl VoicePanel {
         // pictures and running attempts are kept, and an absent source is
         // still requested only after its new answer describes it.
         let kind = self.screen.kind;
-        self.screen.preview_failures.retain(|id, _| id.kind != kind);
+        self.screen
+            .preview_failures
+            .retain(|id, _| selection::identity_kind(id) != kind);
         self.request_screen_previews(cx);
         cx.notify();
     }
@@ -732,11 +710,21 @@ impl VoicePanel {
         if self.screen.restart {
             return;
         }
-        // A row may only select a source the current snapshot really offers.
-        if id.kind != self.screen.kind || self.screen.source_for(id).is_none() {
+        // A row may only select a source the current snapshot really offers,
+        // and a monitor must carry a confirmed display identity.
+        if id.kind != self.screen.kind {
             return;
         }
+        let Some(source) = self.screen.source_for(id) else {
+            return;
+        };
+        let Some(identity) = source.identity() else {
+            self.screen.error = SOURCE_CHANGED_REASON.into();
+            cx.notify();
+            return;
+        };
         self.screen.selected = Some(id);
+        self.screen.selected_identity = Some(identity);
         self.screen.error.clear();
         cx.notify();
     }
@@ -753,6 +741,7 @@ impl VoicePanel {
         self.screen.kind = kind;
         if self.screen.selected.is_some_and(|id| id.kind != kind) {
             self.screen.selected = None;
+            self.screen.selected_identity = None;
         }
         // The safe default follows the source kind; an explicit whole-device
         // choice survives a tab switch.
@@ -762,7 +751,9 @@ impl VoicePanel {
         // Only the visible category is captured. A batch for the hidden one
         // stops at its next check; its pending ids are dropped so switching
         // back requests them again instead of treating them as in flight.
-        self.screen.preview_pending.retain(|id| id.kind == kind);
+        self.screen
+            .preview_pending
+            .retain(|id| selection::identity_kind(id) == kind);
         self.request_screen_previews(cx);
         cx.notify();
     }
@@ -833,7 +824,7 @@ impl VoicePanel {
                 cx.notify();
                 return;
             };
-            if live.source_id() != id {
+            if live.source_id() != id || self.screen.selected_identity != live.identity() {
                 self.screen.error = SOURCE_GONE_REASON.into();
                 cx.notify();
                 return;
@@ -841,7 +832,7 @@ impl VoicePanel {
             live
         } else {
             // The dialog may be stale: build the request from the row that
-            // exists now, and refuse an absent or duplicated id.
+            // exists now, and refuse an absent, duplicated or re-used id.
             let source = self
                 .screen
                 .source_for(id)
@@ -852,6 +843,11 @@ impl VoicePanel {
                 cx.notify();
                 return;
             };
+            if source.identity().is_none() || !self.screen.selection_matches(&source) {
+                self.screen.error = SOURCE_CHANGED_REASON.into();
+                cx.notify();
+                return;
+            }
             source
         };
         let request = PublishRequest {
@@ -1126,13 +1122,14 @@ impl VoicePanel {
         self.picker_focus[index.min(self.picker_focus.len() - 1)].clone()
     }
 
-    /// Element id of one source row, named by `kind + id` so a reorder keeps focus.
-    pub(super) fn source_element_id(id: SourceId) -> gpui::ElementId {
-        let name = match id.kind {
+    /// Element id of one source row, named by the stable surface identity so
+    /// a reorder keeps focus on the same display.
+    pub(super) fn source_element_id(source: &ScreenSource) -> gpui::ElementId {
+        let name = match source.kind {
             SourceKind::Monitor => "share-source-monitor",
             SourceKind::Window => "share-source-window",
         };
-        gpui::ElementId::from((name, id.id))
+        gpui::ElementId::from((name, source.focus_key()))
     }
 }
 
@@ -1197,3 +1194,4 @@ mod audio_scope;
 mod card;
 mod dialog;
 mod preview;
+mod selection;

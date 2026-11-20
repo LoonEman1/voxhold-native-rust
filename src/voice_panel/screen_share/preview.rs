@@ -3,6 +3,7 @@
 //! Kept apart from the dialog painter so the session epoch, the memory bound,
 //! the one-batch rule and the one-source-at-a-time rule are reviewed together.
 
+use super::selection::identity_kind;
 use super::*;
 
 impl ScreenShareUi {
@@ -45,16 +46,22 @@ impl ScreenShareUi {
             .snapshot(kind)
             .iter()
             .filter(|source| {
-                let id = source.source_id();
-                !self.previews.contains_key(&id)
-                    && !self.preview_failures.contains_key(&id)
-                    && !self.preview_pending.contains(&id)
+                let Some(identity) = source.identity() else {
+                    return false;
+                };
+                !self.previews.contains_key(&identity)
+                    && !self.preview_failures.contains_key(&identity)
+                    && !self.preview_pending.contains(&identity)
             })
-            // A duplicated id is ambiguous and can never be accepted by
+            // A duplicated identity is ambiguous and can never be accepted by
             // `finish_preview`, so it is not captured at all.
-            .find(|source| self.source_for(source.source_id()).is_some())?
+            .find(|source| {
+                source
+                    .identity()
+                    .is_some_and(|identity| self.source_for_identity(&identity).is_some())
+            })?
             .clone();
-        self.preview_pending.insert(source.source_id());
+        self.preview_pending.insert(source.identity()?);
         Some(source)
     }
 
@@ -72,7 +79,7 @@ impl ScreenShareUi {
 
     /// Add one picture to the bounded cache. A picture over the width, count
     /// or byte bound is counted as rejected and never queued.
-    pub(crate) fn insert_preview(&mut self, id: SourceId, frame: PreviewFrame) -> bool {
+    pub(crate) fn insert_preview(&mut self, identity: SourceIdentity, frame: PreviewFrame) -> bool {
         if frame.width == 0
             || frame.height == 0
             || frame.width > SCREEN_THUMBNAIL_WIDTH
@@ -82,7 +89,11 @@ impl ScreenShareUi {
             return false;
         }
         let bytes = frame.bgra.len();
-        let existing = self.previews.get(&id).map(|thumb| thumb.bytes).unwrap_or(0);
+        let existing = self
+            .previews
+            .get(&identity)
+            .map(|thumb| thumb.bytes)
+            .unwrap_or(0);
         let grows_count = usize::from(existing == 0);
         if self.previews.len() + grows_count > MAX_SCREEN_PREVIEWS
             || self.preview_bytes.saturating_sub(existing) + bytes > MAX_SCREEN_PREVIEW_BYTES
@@ -95,15 +106,16 @@ impl ScreenShareUi {
             return false;
         };
         self.preview_bytes = self.preview_bytes.saturating_sub(existing) + bytes;
-        self.previews.insert(id, PreviewThumb { image, bytes });
-        self.preview_failures.remove(&id);
-        self.preview_pending.remove(&id);
+        self.previews
+            .insert(identity.clone(), PreviewThumb { image, bytes });
+        self.preview_failures.remove(&identity);
+        self.preview_pending.remove(&identity);
         true
     }
 
-    pub(crate) fn insert_preview_failure(&mut self, id: SourceId, message: String) {
-        self.preview_pending.remove(&id);
-        self.preview_failures.insert(id, message);
+    pub(crate) fn insert_preview_failure(&mut self, identity: SourceIdentity, message: String) {
+        self.preview_pending.remove(&identity);
+        self.preview_failures.insert(identity, message);
     }
 
     /// Apply a background result. A different epoch (closed/old picker), a
@@ -112,51 +124,59 @@ impl ScreenShareUi {
     pub(crate) fn finish_preview(
         &mut self,
         epoch: u64,
-        id: SourceId,
+        identity: SourceIdentity,
         result: Result<PreviewFrame, ThumbnailError>,
     ) -> bool {
         if self.preview_epoch != epoch {
             return false;
         }
-        if !self.preview_pending.remove(&id) {
+        if !self.preview_pending.remove(&identity) {
             return false;
         }
-        if self.source_for(id).is_none() {
+        // The result belongs to the surface, not to the number its capture
+        // started with: after a reorder the same id can name another display.
+        if self.source_for_identity(&identity).is_none() {
             return false;
         }
         match result {
             Ok(frame) => {
-                if !self.insert_preview(id, frame) {
-                    self.insert_preview_failure(id, PREVIEW_MEMORY_REASON.to_owned());
+                if !self.insert_preview(identity.clone(), frame) {
+                    self.insert_preview_failure(identity, PREVIEW_MEMORY_REASON.to_owned());
                 }
             }
-            Err(error) => self.insert_preview_failure(id, error.message().to_owned()),
+            Err(error) => self.insert_preview_failure(identity, error.message().to_owned()),
         }
         true
     }
 
-    /// Drop cached previews/failures/pending ids that the newest snapshot of a
-    /// kind no longer offers. A duplicated id is ambiguous, so it is dropped as
-    /// well; the next answer may describe it unambiguously again.
+    /// Drop cached previews/failures/pending identities that the newest
+    /// snapshot of a kind no longer offers. A duplicated identity is
+    /// ambiguous, so it is dropped as well; the next answer may describe it
+    /// unambiguously again.
     pub(super) fn retain_preview_snapshot(&mut self, kind: SourceKind, sources: &[ScreenSource]) {
-        let present = |id: SourceId| {
-            id.kind == kind && sources.iter().filter(|source| source.id == id.id).count() == 1
+        let present = |identity: &SourceIdentity| {
+            identity_kind(identity) == kind
+                && sources
+                    .iter()
+                    .filter(|source| source.identity().as_ref() == Some(identity))
+                    .count()
+                    == 1
         };
-        let gone: Vec<SourceId> = self
+        let gone: Vec<SourceIdentity> = self
             .previews
             .keys()
-            .copied()
-            .filter(|id| id.kind == kind && !present(*id))
+            .filter(|identity| identity_kind(identity) == kind && !present(identity))
+            .cloned()
             .collect();
-        for id in gone {
-            if let Some(thumb) = self.previews.remove(&id) {
+        for identity in gone {
+            if let Some(thumb) = self.previews.remove(&identity) {
                 self.preview_bytes = self.preview_bytes.saturating_sub(thumb.bytes);
             }
         }
         self.preview_failures
-            .retain(|id, _| id.kind != kind || present(*id));
+            .retain(|identity, _| identity_kind(identity) != kind || present(identity));
         self.preview_pending
-            .retain(|id| id.kind != kind || present(*id));
+            .retain(|identity| identity_kind(identity) != kind || present(identity));
     }
 }
 
@@ -209,7 +229,9 @@ impl VoicePanel {
         cx.spawn(async move |this, cx| {
             let mut next = Some(first);
             while let Some(source) = next {
-                let id = source.source_id();
+                let Some(identity) = source.identity() else {
+                    break;
+                };
                 #[cfg(test)]
                 let provider = provider.clone();
                 let keep = this
@@ -218,8 +240,8 @@ impl VoicePanel {
                             && !panel.screen.restart
                             && panel.screen.preview_epoch == epoch
                             && panel.screen.kind == kind
-                            && panel.screen.preview_pending.contains(&id)
-                            && panel.screen.source_for(id).is_some()
+                            && panel.screen.preview_pending.contains(&identity)
+                            && panel.screen.source_for_identity(&identity).is_some()
                     })
                     .unwrap_or(false);
                 if !keep {
@@ -247,7 +269,7 @@ impl VoicePanel {
                 let _ = this.update(cx, |panel, cx| {
                     // A vanished id is ignored but does not stop the rest of
                     // the batch; only an epoch/category change above does.
-                    if panel.screen.finish_preview(epoch, id, result) {
+                    if panel.screen.finish_preview(epoch, identity, result) {
                         cx.notify();
                     }
                 });
@@ -287,17 +309,14 @@ mod tests {
     /// exposes its frame buffer as-is, so this is the atlas input.
     fn cached_bytes(color: [u8; 4]) -> Vec<u8> {
         let mut screen = ScreenShareUi::default();
-        let id = SourceId {
-            kind: SourceKind::Monitor,
-            id: 7,
-        };
+        let id = SourceIdentity::Window(7);
         let frame = PreviewFrame {
             width: 2,
             height: 1,
             bgra: [color, color].concat(),
         };
         assert!(
-            screen.insert_preview(id, frame),
+            screen.insert_preview(id.clone(), frame),
             "the picture fits the cache"
         );
         let thumb = screen.previews.get(&id).expect("the picture is cached");

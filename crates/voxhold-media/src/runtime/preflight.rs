@@ -163,6 +163,8 @@ mod tests {
             display_id: -1,
             width: 1920,
             height: 1080,
+            monitor: None,
+            topology: None,
         }
     }
 
@@ -333,6 +335,71 @@ mod tests {
             Some(Quality::default()),
             "the live quality is unchanged"
         );
+    }
+
+    #[test]
+    fn a_restart_whose_confirmed_display_is_missing_never_stops_the_live_stream() {
+        use crate::screen_capture::{
+            CapturerMonitor, MonitorIdentity, MonitorRect, ResolveError, resolve_monitor,
+        };
+
+        let identity = MonitorIdentity {
+            device: r"\\.\DISPLAY1".into(),
+            bounds: MonitorRect::new(0, 0, 1920, 1080),
+            work: MonitorRect::new(0, 0, 1920, 1080),
+            width: 1920,
+            height: 1080,
+        };
+        let other = MonitorIdentity {
+            device: r"\\.\DISPLAY2".into(),
+            ..identity.clone()
+        };
+        // The confirmed display is gone; the capturer now only offers another
+        // one, possibly under the same numeric id.
+        let error = resolve_monitor(
+            &identity,
+            &[other],
+            &[CapturerMonitor {
+                id: 0,
+                title: "Screen 2".into(),
+            }],
+        )
+        .expect_err("the confirmed display must not resolve");
+
+        let now = Instant::now();
+        let mut publisher = live_publisher(now);
+        let binding = binding(&publisher);
+        let attempt = publisher.sharing().attempt;
+        let mut pending =
+            PendingRestart::start_with(binding.clone(), now, request(changed()), move |_| {
+                Err(error.message().to_owned())
+            })
+            .expect("the preflight thread starts");
+        let event = poll_ready(&mut pending);
+        assert!(matches!(event, PreflightEvent::Failed(_)));
+        let outcomes = finish_preflight(
+            &mut publisher,
+            &binding,
+            &binding,
+            allowed(),
+            event,
+            request(changed()),
+            now,
+        );
+        assert!(
+            !outcomes.iter().any(|outcome| matches!(
+                outcome,
+                PublisherOutcome::Send(_)
+                    | PublisherOutcome::StartEngine { .. }
+                    | PublisherOutcome::StopEngine
+            )),
+            "a missing restart display must not stop or replace the live attempt: {outcomes:?}"
+        );
+        let sharing = publisher.sharing();
+        assert_eq!(sharing.phase, Phase::Live);
+        assert_eq!(sharing.attempt, attempt);
+        assert!(!sharing.restarting);
+        assert_eq!(error, ResolveError::Missing);
     }
 
     #[test]

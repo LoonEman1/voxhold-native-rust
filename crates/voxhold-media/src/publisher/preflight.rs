@@ -90,6 +90,15 @@ pub fn run(
                 .into(),
         );
     };
+    // The capturer is addressed by a numeric monitor id for the moment the
+    // real capture starts. If the display configuration changed between the
+    // picker and this first frame, that id may now name another screen.
+    if let Err(error) = crate::screen_capture::confirm_source_topology(&request.source) {
+        return Err(format!(
+            "{}. Текущая трансляция не тронута.",
+            error.message()
+        ));
+    }
     if cancelled.load(Ordering::SeqCst) {
         return Err(PREFLIGHT_CANCELLED.into());
     }
@@ -140,6 +149,8 @@ mod tests {
                 display_id: -1,
                 width: 1920,
                 height: 1080,
+                monitor: None,
+                topology: None,
             },
             quality: Quality::default(),
             codec: Codec::Vp8,

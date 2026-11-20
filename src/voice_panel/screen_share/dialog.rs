@@ -18,15 +18,17 @@ impl ScreenShareUi {
     /// into the enumeration caches, so a later normal picker cannot select it.
     pub(super) fn bind_confirmed_live_source(&mut self) {
         self.selected = None;
+        self.selected_identity = None;
         let Some(live) = self
             .last_request
             .as_ref()
-            .map(|request| request.source.source_id())
+            .map(|request| request.source.clone())
         else {
             return;
         };
         self.kind = live.kind;
-        self.selected = Some(live);
+        self.selected = Some(live.source_id());
+        self.selected_identity = live.identity();
         if self.error == SOURCE_GONE_REASON {
             self.error.clear();
         }
@@ -99,8 +101,13 @@ impl VoicePanel {
     ) -> gpui::AnyElement {
         let c = self.colors();
         let key = ScreenShareUi::source_kind_name(id);
-        let thumb = self.screen.previews.get(&id);
-        let failure = self.screen.preview_failures.get(&id);
+        let identity = source.identity();
+        let thumb = identity
+            .as_ref()
+            .and_then(|identity| self.screen.previews.get(identity));
+        let failure = identity
+            .as_ref()
+            .and_then(|identity| self.screen.preview_failures.get(identity));
         let size = if source.width > 0 && source.height > 0 {
             format!("{}×{}", source.width, source.height)
         } else {
@@ -187,7 +194,7 @@ impl VoicePanel {
         }
 
         let mut card = div()
-            .id(Self::source_element_id(id))
+            .id(Self::source_element_id(source))
             .debug_selector(move || card_selector.clone())
             .w(px(card_width))
             .h(px(124.))
@@ -335,10 +342,12 @@ impl VoicePanel {
             let mut current: Vec<gpui::AnyElement> = Vec::new();
             for source in sources.iter() {
                 let id = source.source_id();
-                // Focus belongs to the source, not to the grid position: the
-                // keyed handle survives a reorder and follows the same id.
+                // Focus belongs to the surface, not to the grid position or
+                // the capturer number: the keyed handle survives a reorder.
                 let focus = window
-                    .use_keyed_state(Self::source_element_id(id), cx, |_, cx| cx.focus_handle())
+                    .use_keyed_state(Self::source_element_id(source), cx, |_, cx| {
+                        cx.focus_handle()
+                    })
                     .read(cx)
                     .clone();
                 ring.push((focus.clone(), ShareKey::Source(id)));

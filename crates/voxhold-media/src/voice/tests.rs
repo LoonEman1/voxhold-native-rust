@@ -53,6 +53,8 @@ fn a_screen_publication_never_touches_the_microphone_gate() {
                 display_id: -1,
                 width: 640,
                 height: 360,
+                monitor: None,
+                topology: None,
             },
             quality: crate::publisher::Quality {
                 resolution: crate::publisher::Resolution::P720,

@@ -93,6 +93,8 @@ fn request() -> PublishRequest {
             display_id: -1,
             width: 1280,
             height: 720,
+            monitor: None,
+            topology: None,
         },
         quality: Quality {
             resolution: Resolution::P720,

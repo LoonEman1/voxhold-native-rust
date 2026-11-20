@@ -17,8 +17,9 @@
 //! - [`PreviewStore`] keeps one small BGRA picture for the local on-air card.
 //!   It is bounded by [`MAX_PREVIEW_BYTES`] and never grows while idle.
 //! - [`capture_thumbnail`] grabs one bounded BGRA picture for the picker grid.
-//!   It creates its own capturer, rejects a source that is no longer listed and
-//!   gives up after [`THUMBNAIL_TIMEOUT`]; it never queues more than one frame.
+//!   It creates its own capturer, resolves a monitor through its confirmed
+//!   Windows identity in the fresh list and gives up after
+//!   [`THUMBNAIL_TIMEOUT`]; it never queues more than one frame.
 //!
 //! The `libwebrtc 0.4.0` desktop capturer has no Windows system picker:
 //! `DesktopCapturerOptions::set_sck_system_picker` is compiled only for macOS.
@@ -32,6 +33,14 @@ use std::sync::{
 use std::time::Duration;
 
 use libwebrtc::video_frame::{I420Buffer, VideoBuffer};
+
+mod topology;
+
+#[cfg_attr(not(windows), allow(unused_imports))]
+pub(crate) use topology::{
+    CapturerMonitor, ResolveError, confirm_prepared, confirmed_mapping, resolve_monitor,
+};
+pub use topology::{MonitorIdentity, MonitorRect, TopologySnapshot};
 
 /// The largest side of the local preview. The on-air card is a room tile.
 pub const MAX_PREVIEW_WIDTH: u32 = 640;
@@ -65,7 +74,9 @@ impl SourceKind {
 /// One entry of the picker.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScreenSource {
-    /// Source id of the desktop capturer. For a window this is its `HWND`.
+    /// Capturer id from the enumeration that produced this row. For a window
+    /// this is its `HWND`; for a monitor it is only the current lookup key and
+    /// may move to another display after a re-enumeration.
     pub id: u64,
     pub kind: SourceKind,
     pub title: String,
@@ -75,6 +86,13 @@ pub struct ScreenSource {
     /// Best known size; `0` when the platform did not report one.
     pub width: u32,
     pub height: u32,
+    /// Confirmed Windows display this monitor row names. `None` for a window
+    /// (its `id` is the `HWND`) and for a monitor whose row could not be
+    /// matched uniquely; such a monitor is never selectable.
+    pub monitor: Option<MonitorIdentity>,
+    /// Monitor configuration at the moment this row was enumerated. The
+    /// preparation path re-checks it before the first frame is accepted.
+    pub topology: Option<TopologySnapshot>,
 }
 
 impl ScreenSource {
@@ -87,8 +105,26 @@ impl ScreenSource {
         }
     }
 
-    /// The stable identity of the source: the category plus the capturer id.
-    /// Titles, sizes and list order are presentation data and never identity.
+    /// The identity the picker binds to: a monitor surface or a window
+    /// `HWND`. The numeric capturer id is never an identity by itself.
+    pub fn identity(&self) -> Option<SourceIdentity> {
+        match self.kind {
+            SourceKind::Monitor => self.monitor.clone().map(SourceIdentity::Monitor),
+            SourceKind::Window => Some(SourceIdentity::Window(self.id)),
+        }
+    }
+
+    /// Key of the painted card and its focus handle. A monitor keeps the key
+    /// across a capturer reorder; a window keys on its `HWND`.
+    pub fn focus_key(&self) -> u64 {
+        match (&self.monitor, self.kind) {
+            (Some(monitor), SourceKind::Monitor) => monitor.focus_key(),
+            _ => self.id,
+        }
+    }
+
+    /// The enumeration key of this row. Used for the current list lookup and
+    /// the keyboard action, not for the publication request.
     pub fn source_id(&self) -> SourceId {
         SourceId {
             kind: self.kind,
@@ -97,12 +133,24 @@ impl ScreenSource {
     }
 }
 
-/// Identity of one capture source for the whole picker lifetime.
+/// Stable identity of a capture source for the whole picker lifetime.
 ///
-/// A window id is its `HWND`; a monitor id is the capturer's screen id. Both
-/// stay stable across re-enumerations, so selection, focus, labels and the
-/// publish request all bind to this value instead of a position or a whole
-/// [`ScreenSource`] snapshot.
+/// A window is its `HWND`. A monitor is the Windows display identity, so a
+/// capturer reorder still resolves to the same screen and a reused capturer
+/// number resolves to nothing.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum SourceIdentity {
+    Monitor(MonitorIdentity),
+    Window(u64),
+}
+
+/// Current enumeration key of one picker row.
+///
+/// A window id is its `HWND`, a durable identity. A monitor id is only the
+/// capturer's number in one list and may move to another display after a
+/// re-enumeration, so selection and the publish request bind to [`SourceId`]
+/// plus [`SourceIdentity`]. The id is used for the painted element and the
+/// current-list lookup.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SourceId {
     pub kind: SourceKind,
@@ -119,100 +167,12 @@ impl std::fmt::Debug for SourceId {
     }
 }
 
-/// One monitor as Windows enumerates it. The device name is the only string
-/// that can be matched against the capturer's own source title.
+/// One monitor as Windows enumerates it (the device name is the durable part).
 #[cfg_attr(not(windows), allow(dead_code))]
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct MonitorDescriptor {
-    pub device: String,
-    pub width: u32,
-    pub height: u32,
-}
+pub(crate) type MonitorDescriptor = MonitorIdentity;
 
-/// Match a capturer source title to the monitor descriptor it names.
-///
-/// The pinned capturer does not report a usable display id on every host, so
-/// list order must never attach metadata. An exact device substring wins;
-/// otherwise the display number at the end of the device name is matched
-/// against a number in the title. An absent or ambiguous match is `None`, so
-/// the caller keeps the size unknown instead of borrowing a neighbour's.
-#[cfg_attr(not(windows), allow(dead_code))]
-pub(crate) fn monitor_descriptor_for_title<'a>(
-    title: &str,
-    monitors: &'a [MonitorDescriptor],
-) -> Option<&'a MonitorDescriptor> {
-    let title = title.trim().to_lowercase();
-    if title.is_empty() {
-        return None;
-    }
-    let named: Vec<&MonitorDescriptor> = monitors
-        .iter()
-        .filter(|monitor| {
-            let device = monitor.device.trim().to_lowercase();
-            !device.is_empty() && title.contains(&device)
-        })
-        .collect();
-    if !named.is_empty() {
-        // Only a unique longest device name is trusted, so a device that is a
-        // prefix of another one cannot pick the wrong monitor.
-        let longest = named
-            .iter()
-            .max_by_key(|monitor| monitor.device.len())
-            .copied()?;
-        let tied = named
-            .iter()
-            .filter(|monitor| monitor.device.len() == longest.device.len())
-            .count();
-        return (tied == 1).then_some(longest);
-    }
-    // Fall back to the display number, e.g. `\\.\DISPLAY2` -> 2.
-    let numbers = title_numbers(&title);
-    let mut matched = monitors.iter().filter(|monitor| {
-        display_number(&monitor.device).is_some_and(|number| numbers.contains(&number))
-    });
-    let first = matched.next()?;
-    matched.next().is_none().then_some(first)
-}
-
-/// Trailing number of a device name such as `\\.\DISPLAY2`.
-#[cfg_attr(not(windows), allow(dead_code))]
-fn display_number(device: &str) -> Option<u64> {
-    let digits: String = device
-        .chars()
-        .rev()
-        .take_while(|character| character.is_ascii_digit())
-        .collect::<String>()
-        .chars()
-        .rev()
-        .collect();
-    if digits.is_empty() {
-        return None;
-    }
-    digits.parse().ok()
-}
-
-/// Every number that appears in a title, in order.
-#[cfg_attr(not(windows), allow(dead_code))]
-fn title_numbers(title: &str) -> Vec<u64> {
-    let mut numbers = Vec::new();
-    let mut current = String::new();
-    for character in title.chars() {
-        if character.is_ascii_digit() {
-            current.push(character);
-        } else if !current.is_empty() {
-            if let Ok(number) = current.parse::<u64>() {
-                numbers.push(number);
-            }
-            current.clear();
-        }
-    }
-    if !current.is_empty() {
-        if let Ok(number) = current.parse::<u64>() {
-            numbers.push(number);
-        }
-    }
-    numbers
-}
+#[cfg(test)]
+pub(crate) use topology::monitor_for_title as monitor_descriptor_for_title;
 
 /// Enumerate monitors or windows for the picker.
 ///
@@ -233,13 +193,13 @@ pub fn list_sources(kind: SourceKind) -> Result<Vec<ScreenSource>, &'static str>
 
 /// Capture one small BGRA thumbnail for the picker card of `source`.
 ///
-/// The identity is exactly `source.kind + source.id`, the same value used by
-/// `PublishRequest.source` and [`ScreenCapture::start`]. The capturer is
-/// created fresh, the exact source id is looked up in its current list (a
-/// missing id is [`ThumbnailError::Missing`], never a neighbour) and only one
-/// frame is kept. The call is bounded by [`THUMBNAIL_TIMEOUT`], includes no
-/// cursor and is safe to run on a background thread; it logs no title or
-/// picture content.
+/// A monitor row is resolved through its confirmed [`MonitorIdentity`], never
+/// its number: the fresh list is mapped against the current Windows monitors
+/// and only a unique match is captured. A missing display is
+/// [`ThumbnailError::Missing`]; a reused number or an ambiguous list is
+/// [`ThumbnailError::Changed`], never a neighbour. A window keeps its `HWND`.
+/// The call is bounded by [`THUMBNAIL_TIMEOUT`], includes no cursor and is
+/// safe to run on a background thread; it logs no title or picture content.
 pub fn capture_thumbnail(
     source: &ScreenSource,
     max_width: u32,
@@ -253,6 +213,30 @@ pub fn capture_thumbnail(
     {
         let _ = (source, max_width);
         Err(ThumbnailError::Unavailable)
+    }
+}
+
+/// Confirm that the monitor configuration still matches the one the picker
+/// recorded when the source was chosen.
+///
+/// The capturer is still addressed by a numeric id for the moment the capture
+/// starts. If Windows reorders or replaces displays between the selection and
+/// the first frame, that id can name another screen, so a prepared result is
+/// discarded instead of published. A source without a recorded snapshot (a
+/// window, or a test fixture) has nothing to compare.
+pub(crate) fn confirm_source_topology(source: &ScreenSource) -> Result<(), ResolveError> {
+    let Some(selected) = source.topology.as_ref() else {
+        return Ok(());
+    };
+    #[cfg(windows)]
+    {
+        let current = windows::topology_snapshot();
+        confirm_prepared(Some(selected), &current)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = selected;
+        Ok(())
     }
 }
 
@@ -318,6 +302,9 @@ pub enum ThumbnailError {
     /// The exact `kind + id` is missing from the capturer's current list: the
     /// window closed or the monitor was unplugged after the enumeration.
     Missing,
+    /// The monitor identity cannot be confirmed in the fresh enumeration: the
+    /// capturer number now names another display or the match is ambiguous.
+    Changed,
     /// The source delivered no frame within [`THUMBNAIL_TIMEOUT`].
     Timeout,
 }
@@ -327,6 +314,7 @@ impl ThumbnailError {
         match self {
             Self::Unavailable => "Системный захват экрана недоступен.",
             Self::Missing => "Выбранный источник захвата больше недоступен.",
+            Self::Changed => "Выбранный экран изменился. Обновите список и выберите экран снова.",
             Self::Timeout => "Предпросмотр источника не получен.",
         }
     }
@@ -335,6 +323,7 @@ impl ThumbnailError {
         match self {
             Self::Unavailable => "unavailable",
             Self::Missing => "missing",
+            Self::Changed => "changed",
             Self::Timeout => "timeout",
         }
     }

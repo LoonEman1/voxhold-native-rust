@@ -63,6 +63,8 @@ fn screen_request() -> PublishRequest {
             display_id: -1,
             width: 1920,
             height: 1080,
+            monitor: None,
+            topology: None,
         },
         quality: Quality::default(),
         codec: Codec::Vp8,

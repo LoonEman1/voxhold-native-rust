@@ -436,6 +436,8 @@ mod tests {
             display_id: -1,
             width: 1280,
             height: 720,
+            monitor: None,
+            topology: None,
         }
     }
 
@@ -447,6 +449,8 @@ mod tests {
             display_id: -1,
             width: 1920,
             height: 1080,
+            monitor: None,
+            topology: None,
         }
     }
 

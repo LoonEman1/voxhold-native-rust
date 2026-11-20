@@ -15,6 +15,8 @@ fn source() -> ScreenSource {
         display_id: -1,
         width: 2560,
         height: 1440,
+        monitor: None,
+        topology: None,
     }
 }
 

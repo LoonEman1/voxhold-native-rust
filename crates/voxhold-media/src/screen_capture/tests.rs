@@ -371,8 +371,10 @@ fn a_real_window_yields_a_bounded_thumbnail() {
 }
 
 fn descriptor(device: &str, width: u32, height: u32) -> MonitorDescriptor {
-    MonitorDescriptor {
+    MonitorIdentity {
         device: device.into(),
+        bounds: MonitorRect::new(0, 0, width, height),
+        work: MonitorRect::new(0, 0, width, height),
         width,
         height,
     }
@@ -424,6 +426,7 @@ fn an_unmatched_or_ambiguous_monitor_title_never_borrows_a_size() {
 
 #[test]
 fn a_monitor_source_identity_ignores_its_mutable_label() {
+    let identity = descriptor(r"\\.\DISPLAY1", 1920, 1080);
     let source = ScreenSource {
         id: 7,
         kind: SourceKind::Monitor,
@@ -431,6 +434,8 @@ fn a_monitor_source_identity_ignores_its_mutable_label() {
         display_id: -1,
         width: 1920,
         height: 1080,
+        monitor: Some(identity.clone()),
+        topology: Some(TopologySnapshot::from_monitors(vec![identity.clone()])),
     };
     let renamed = ScreenSource {
         title: "Другое имя".into(),
@@ -439,5 +444,19 @@ fn a_monitor_source_identity_ignores_its_mutable_label() {
         ..source.clone()
     };
     assert_eq!(source.source_id(), renamed.source_id());
+    assert_eq!(source.identity(), renamed.identity());
+    assert_eq!(source.identity(), Some(SourceIdentity::Monitor(identity)));
     assert_ne!(source.describe(), renamed.describe());
+
+    // The card/focus key follows the display, not the capturer number.
+    let moved = ScreenSource {
+        id: 9,
+        ..source.clone()
+    };
+    assert_eq!(source.focus_key(), moved.focus_key());
+    let other = ScreenSource {
+        monitor: Some(descriptor(r"\\.\DISPLAY2", 2560, 1440)),
+        ..source.clone()
+    };
+    assert_ne!(source.focus_key(), other.focus_key());
 }

@@ -10,30 +10,64 @@ use std::{
     },
     time::{Duration, Instant},
 };
-use voxhold_media::screen_capture::{ScreenSource, SourceKind};
+use voxhold_media::screen_capture::{
+    MonitorIdentity, MonitorRect, ScreenSource, SourceKind, TopologySnapshot,
+};
 use voxhold_media::system_audio::AudioDeviceInfo;
 
-fn screen_source(id: u64, kind: SourceKind, title: &str, width: u32, height: u32) -> ScreenSource {
+pub(super) fn monitor_identity(display: u32) -> MonitorIdentity {
+    let left = display.saturating_sub(1) as i32 * 1920;
+    let bounds = MonitorRect::new(left, 0, 1920, 1080);
+    MonitorIdentity {
+        device: format!("\\\\.\\DISPLAY{display}"),
+        bounds,
+        work: bounds,
+        width: bounds.width,
+        height: bounds.height,
+    }
+}
+
+/// A monitor row whose display is `display`, independent of the capturer id
+/// so a test can model the same number moving to another display.
+pub(super) fn monitor_on(
+    id: u64,
+    display: u32,
+    title: &str,
+    width: u32,
+    height: u32,
+) -> ScreenSource {
+    let identity = monitor_identity(display);
     ScreenSource {
         id,
-        kind,
+        kind: SourceKind::Monitor,
         title: title.into(),
         display_id: -1,
         width,
         height,
+        topology: Some(TopologySnapshot::from_monitors(vec![identity.clone()])),
+        monitor: Some(identity),
+    }
+}
+
+pub(super) fn monitor(id: u64, title: &str, width: u32, height: u32) -> ScreenSource {
+    monitor_on(id, id as u32 + 1, title, width, height)
+}
+
+pub(super) fn window(id: u64, title: &str) -> ScreenSource {
+    ScreenSource {
+        id,
+        kind: SourceKind::Window,
+        title: title.into(),
+        display_id: -1,
+        width: 1280,
+        height: 720,
+        monitor: None,
+        topology: None,
     }
 }
 
 fn source() -> ScreenSource {
-    screen_source(3, SourceKind::Monitor, "Экран 1", 1920, 1080)
-}
-
-pub(super) fn monitor(id: u64, title: &str, width: u32, height: u32) -> ScreenSource {
-    screen_source(id, SourceKind::Monitor, title, width, height)
-}
-
-pub(super) fn window(id: u64, title: &str) -> ScreenSource {
-    screen_source(id, SourceKind::Window, title, 1280, 720)
+    monitor(3, "Экран 1", 1920, 1080)
 }
 
 pub(super) fn draw(visual: &mut gpui::VisualTestContext) {

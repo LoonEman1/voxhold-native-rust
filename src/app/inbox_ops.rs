@@ -73,8 +73,10 @@ impl Voxhold {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // A pending channel ACL reload does not gate a personal conversation:
-        // its history, drafts and key are independent of channel access.
+        // A pending channel ACL reload is not cancelled by opening a personal
+        // conversation: its surface is independent of channel access and the
+        // fresh channel list (including `voice_unconfirmed`) must still apply
+        // when it arrives.
         if conversation.id <= 0 || self.client.is_none() {
             return;
         }
@@ -132,10 +134,6 @@ impl Voxhold {
         self.history_reset_pending = false;
         self.deleted_ids.clear();
         self.pending_anchor = None;
-        self.access_generation = self.access_generation.wrapping_add(1);
-        self.access_pending = false;
-        self.access_reload_in_flight = false;
-        self.access_refresh_again = false;
         self.refresh_request = None;
         self.refresh_again = false;
         self.pending_edits.clear();

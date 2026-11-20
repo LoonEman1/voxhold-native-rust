@@ -179,6 +179,7 @@ fn recording_preview_requires_jpeg_and_bounds() {
         gate: None,
         body_gate: None,
         delay: None,
+        path: None,
     };
     let server = TestServer::spawn(vec![jpeg_reply()]);
     let image = run(client(&server.base).recording_preview(ID, "etag-1234")).unwrap();
@@ -194,6 +195,7 @@ fn recording_preview_requires_jpeg_and_bounds() {
         gate: None,
         body_gate: None,
         delay: None,
+        path: None,
     }]);
     assert!(run(client(&server.base).recording_preview(ID, "etag-1234")).is_err());
 }
@@ -526,6 +528,7 @@ async fn recording_preview_waits_for_access_confirmation(cx: &mut TestAppContext
             gate: None,
             body_gate: None,
             delay: None,
+            path: None,
         },
     ]);
     let (window, view) = make_app(cx, client(&server.base));
@@ -708,6 +711,7 @@ async fn slow_recording_preview_does_not_poison_a_slot(cx: &mut TestAppContext) 
         gate: None,
         body_gate: None,
         delay: None,
+        path: None,
     };
     let mut replies = vec![Reply::new(200, &list)];
     replies.push(Reply {
@@ -717,6 +721,7 @@ async fn slow_recording_preview_does_not_poison_a_slot(cx: &mut TestAppContext) 
         gate: None,
         body_gate: Some(gate.clone()),
         delay: None,
+        path: None,
     });
     replies.extend((0..8).map(|_| jpeg_reply()));
     replies.extend((0..2).map(|_| Reply {
@@ -805,6 +810,7 @@ async fn recording_preview_cache_is_hidden_during_refresh_and_after_503(cx: &mut
             gate: None,
             body_gate: None,
             delay: None,
+            path: None,
         },
         Reply::new(503, "{\"error\":\"unavailable\"}").with_delay(Duration::from_secs(1)),
     ]);
@@ -929,6 +935,7 @@ async fn recording_preview_stops_when_dialog_closes(cx: &mut TestAppContext) {
             gate: None,
             body_gate: Some(gate.clone()),
             delay: None,
+            path: None,
         },
     ]);
     let (window, view) = make_app(cx, client(&server.base));

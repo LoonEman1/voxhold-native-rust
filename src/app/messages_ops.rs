@@ -89,6 +89,14 @@ impl Voxhold {
             cx.notify();
             return;
         }
+        if self.access_pending && self.access_reload_in_flight {
+            // The ACL answer owns the fresh channel list. Remember which
+            // channel to reopen; its callback selects it once access is
+            // confirmed, without cancelling the reload here.
+            self.channel = saved_channel;
+            cx.notify();
+            return;
+        }
         let allowed = |channel: &Channel| {
             channel.id == saved_channel && channel.readable() && !channel.e2ee_required
         };
@@ -188,15 +196,12 @@ impl Voxhold {
         self.conversation_reaction_requests.clear();
         self.deleted_ids.clear();
         self.pending_anchor = None;
-        self.access_generation = self.access_generation.wrapping_add(1);
-        self.access_pending = false;
-        self.access_reload_in_flight = false;
-        self.access_refresh_again = false;
         self.generation = self.generation.wrapping_add(1);
         self.busy = false;
         self.channel_snapshot_request = None;
         self.search_permissions_request = None;
         self.search_permissions_ready = false;
+        self.messaging.send_verify_request = None;
         self.composer_error.clear();
         self.error.clear();
         self.pinned_ids.clear();
@@ -249,6 +254,32 @@ impl Voxhold {
         if let Some(reason) = reason {
             self.error = reason.into();
         }
+        cx.notify();
+    }
+
+    /// Leave the open conversation for the creator form without destroying the
+    /// composition. The draft keeps its text, its attachment metadata and any
+    /// temporary files; an in-flight send is not aborted. Reopening the
+    /// conversation restores the saved draft and its attachments.
+    pub(super) fn suspend_active_conversation(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.conversation.is_none() {
+            return;
+        }
+        let key = draft::ChatKey::conversation(self.channel);
+        let text = self.composer.read(cx).value().to_string();
+        self.drafts.borrow_mut().set_text(key, &text);
+        self.conversation = None;
+        self.channel = 0;
+        self.conversations_reconcile = None;
+        self.messaging.notifications = None;
+        self.messaging.clear_leave();
+        self.reset_personal_chat(window, cx);
+        self.composer
+            .update(cx, |input, cx| input.set_value("", window, cx));
         cx.notify();
     }
 
@@ -426,6 +457,73 @@ impl Voxhold {
                         }
                         // A transient failure is not proof of deletion.
                         Err(_) => {}
+                    }
+                    cx.notify();
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
+
+    /// A conversation send `403` is ambiguous: the backend returns it both for
+    /// a lost membership and for a `canContact` refusal (block, privacy `none`,
+    /// no shared server), where both users can stay members. One explicit
+    /// `GET /conversations/{id}` decides; until it answers (or on a transient
+    /// failure) the chat, composer text, attachments and draft stay untouched.
+    pub(super) fn verify_conversation_after_send_403(
+        &mut self,
+        key: draft::ChatKey,
+        error: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(client) = self.client.clone() else {
+            self.composer_error = error;
+            return;
+        };
+        self.action_seq = self.action_seq.wrapping_add(1);
+        let request = self.action_seq;
+        self.messaging.send_verify_request = Some(request);
+        let session = self.session_generation;
+        let id = key.channel;
+        let runtime = self.runtime.clone();
+        let task = cx.background_spawn(async move { runtime.block_on(client.conversation(id)) });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            if let Some(this) = this.upgrade() {
+                this.update(cx, |s, cx| {
+                    if s.session_generation != session
+                        || s.messaging.send_verify_request != Some(request)
+                    {
+                        return;
+                    }
+                    s.messaging.send_verify_request = None;
+                    match result {
+                        Ok(row) => {
+                            if let Some(existing) = s
+                                .conversations
+                                .iter_mut()
+                                .find(|current| current.id == row.id)
+                            {
+                                *existing = row.clone();
+                            }
+                            if s.chat_key() == key {
+                                s.conversation = Some(row);
+                            }
+                        }
+                        Err(voxhold_api::Error::Http(403 | 404)) => {
+                            s.conversations.retain(|row| row.id != id);
+                            if s.chat_key() == key {
+                                s.clear_active_conversation_state(Some("Диалог недоступен."), cx);
+                            }
+                        }
+                        // A transient failure is not proof of revocation. The
+                        // send error stays visible and the draft can be retried.
+                        Err(_) => {
+                            if s.chat_key() == key {
+                                s.composer_error = error;
+                            }
+                        }
                     }
                     cx.notify();
                 })

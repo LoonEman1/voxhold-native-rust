@@ -16,9 +16,10 @@ impl Voxhold {
         if self.messaging.creator.is_some() {
             return;
         }
-        if self.conversation.is_some() {
-            self.clear_active_conversation(None, window, cx);
-        }
+        // Opening the form suspends the open chat without clearing its draft,
+        // attachments or an in-flight send; the web keeps per-destination
+        // drafts while the creator is open.
+        self.suspend_active_conversation(window, cx);
         self.messaging.clear_search();
         self.messaging.clear_leave();
         let creator = Creator::new(window, cx);

@@ -75,7 +75,7 @@ impl Voxhold {
         let conversation = self.in_conversation();
         if !window.is_window_active()
             || self.read_pending
-            || self.access_pending
+            || (self.access_pending && !conversation)
             || self
                 .read_retry_at
                 .is_some_and(|at| at > std::time::Instant::now())
@@ -171,7 +171,9 @@ impl Voxhold {
         cx: &mut Context<Self>,
     ) {
         let conversation = self.in_conversation();
-        if self.access_pending || (!conversation && !self.channel_chat_readable(self.channel)) {
+        if (self.access_pending && !conversation)
+            || (!conversation && !self.channel_chat_readable(self.channel))
+        {
             return;
         }
         let Some(message) = self.message_snapshot(message_id) else {
@@ -529,7 +531,6 @@ impl Voxhold {
     ) {
         if !self.in_conversation()
             || self.channel != conversation_id
-            || self.access_pending
             || !self.messages.iter().any(|row| row.id == message_id)
             || self.deleted_ids.contains(&message_id)
         {
@@ -679,7 +680,9 @@ impl Voxhold {
             self.access_generation,
         );
         let chat = self.chat_key();
-        if self.access_pending || (!conversation && !self.channel_chat_readable(channel)) {
+        if (self.access_pending && !conversation)
+            || (!conversation && !self.channel_chat_readable(channel))
+        {
             return;
         }
         if self.refresh_request.is_some() {
@@ -831,7 +834,7 @@ impl Voxhold {
     pub(super) fn load_older(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.loading_older
             || !self.has_more
-            || self.access_pending
+            || (self.access_pending && !self.in_conversation())
             || self.refresh_request.is_some()
         {
             return;

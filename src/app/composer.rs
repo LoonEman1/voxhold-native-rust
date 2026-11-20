@@ -35,7 +35,8 @@ impl Voxhold {
 
     pub(super) fn composer_writable(&self) -> bool {
         if self.conversation.is_some() {
-            return !self.access_pending && self.channel > 0;
+            // A channel ACL reload is independent of the personal surface.
+            return self.channel > 0;
         }
         !self.access_pending && self.channel_chat_writable(self.channel)
     }
@@ -59,7 +60,10 @@ impl Voxhold {
             .is_some_and(|attachments| attachments.read(cx).is_reading());
         let attachments_ready = self.attachments.is_some() && !self.is_sending() && !reading;
         let valid = draft::validate_send(&text, &files).is_ok();
-        let can_send = valid && !self.is_sending() && !reading && !self.access_pending;
+        let can_send = valid
+            && !self.is_sending()
+            && !reading
+            && !(self.access_pending && !self.in_conversation());
         let reply_id = self.drafts.borrow().reply(self.chat_key());
         if reply_id > 0 {
             let (author, excerpt) = self
@@ -258,8 +262,8 @@ impl Voxhold {
         let runtime = self.runtime.clone();
         // The whole upload + POST chain runs as one runtime task so `abort()`
         // really stops it; a GPUI task wrapping `block_on` would keep going.
-        // Keep the HTTP status so a conversation 403/404 can clear the ChatKey
-        // instead of only painting a composer error.
+        // Keep the HTTP status so a conversation 404 can clear the ChatKey and
+        // a 403 can be disambiguated with one explicit conversation GET.
         let task = runtime.spawn(async move {
             let ids = attachments::upload_draft(&client, &plan)
                 .await
@@ -320,11 +324,17 @@ impl Voxhold {
                     Ok(value) => value,
                     Err((status, text)) => {
                         if s.chat_key() == plan_key {
-                            if plan_key.is_conversation() && matches!(status, Some(403 | 404)) {
-                                // A conversation revoked/deleted on another
-                                // device owns no writable ChatKey anymore.
+                            if plan_key.is_conversation() && status == Some(404) {
+                                // A missing conversation is authoritative.
                                 s.clear_active_conversation(Some("Диалог недоступен."), window, cx);
                                 s.refresh_recents(cx);
+                            } else if plan_key.is_conversation() && status == Some(403) {
+                                // A conversation `403` also covers a
+                                // `canContact` refusal while both users stay
+                                // members. Keep the draft and ask one explicit
+                                // GET before clearing anything.
+                                s.composer_error = text.clone();
+                                s.verify_conversation_after_send_403(plan_key, text, cx);
                             } else {
                                 s.composer_error = text;
                             }

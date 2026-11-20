@@ -702,7 +702,7 @@ impl Voxhold {
                 }
                 effect.recents = true;
             }
-            "conversation.reactions" if !self.access_pending => {
+            "conversation.reactions" => {
                 if self.in_conversation() && data["conversation_id"].as_i64() == Some(self.channel)
                 {
                     if let Some(message_id) = data["message_id"].as_i64().filter(|id| *id > 0) {

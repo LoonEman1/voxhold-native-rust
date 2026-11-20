@@ -504,7 +504,8 @@ impl Voxhold {
             return;
         };
         self.access_reload_in_flight = true;
-        let (server, generation, access) = (self.server, self.generation, self.access_generation);
+        let (server, access, session) =
+            (self.server, self.access_generation, self.session_generation);
         let runtime = self.runtime.clone();
         let task = cx.background_spawn(async move {
             runtime.block_on(async {
@@ -516,7 +517,12 @@ impl Voxhold {
         cx.spawn_in(window, async move |this, window| {
             let result = task.await;
             let _ = this.update_in(window, |s, window, cx| {
-                if s.generation != generation || s.server != server || s.access_generation != access
+                // The reload belongs to the server ACL scope, not to the
+                // history generation: opening a personal conversation bumps
+                // `generation` but must still receive this answer.
+                if s.server != server
+                    || s.access_generation != access
+                    || s.session_generation != session
                 {
                     return;
                 }

@@ -134,6 +134,9 @@ pub struct Messages {
     /// One `GET /conversations/{id}` that decides whether an open row outside
     /// a partial page still exists.
     pub reconcile_request: Option<u64>,
+    /// One `GET /conversations/{id}` after a send `403`, which is used both for
+    /// a lost membership and for a `canContact` refusal.
+    pub send_verify_request: Option<u64>,
 }
 
 impl Messages {
@@ -157,6 +160,7 @@ impl Messages {
             epoch: 0,
             open_request: None,
             reconcile_request: None,
+            send_verify_request: None,
         }
     }
 
@@ -193,6 +197,7 @@ impl Messages {
         self.epoch = self.epoch.wrapping_add(1);
         self.open_request = None;
         self.reconcile_request = None;
+        self.send_verify_request = None;
     }
 }
 

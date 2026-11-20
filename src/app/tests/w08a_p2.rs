@@ -161,13 +161,151 @@ async fn stale_creator_answer_does_not_touch_the_reopened_form(cx: &mut TestAppC
     });
 }
 
-/// A conversation POST rejected with 403 removes the ChatKey and reloads the
-/// index instead of leaving a writable window with only text in the composer.
+/// A conversation send `403` may be a `canContact` refusal while both members
+/// stay in the conversation. One explicit GET keeps the chat, its draft and
+/// its composer text when it confirms the row.
 #[gpui::test]
-async fn conversation_send_403_clears_the_active_chat_key(cx: &mut TestAppContext) {
+async fn conversation_send_403_keeps_the_chat_when_the_get_confirms_it(cx: &mut TestAppContext) {
+    cx.update(|cx| gpui_component::init(cx));
+    let row = conversation(7, "Проект", true, false);
+    let server = TestServer::spawn(vec![
+        Reply::new(403, r#"{"error":"forbidden"}"#),
+        Reply::new(200, &serde_json::to_string(&row).unwrap()),
+    ]);
+    let (window, view) = make_app(cx, direct_client(&server));
+    let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            let row = conversation(7, "Проект", true, false);
+            v.personal_mode = true;
+            v.conversations = vec![row.clone()];
+            v.conversation = Some(row);
+            v.channel = 7;
+            v.composer
+                .update(cx, |input, cx| input.set_value("hello", window, cx));
+            v.send(window, cx);
+        });
+    });
+    wait_for(&mut visual, &view, |v| {
+        v.messaging.send_verify_request.is_none() && !v.composer_error.is_empty()
+    });
+    view.read_with(&*visual, |v, cx| {
+        assert_eq!(
+            v.conversation.as_ref().map(|row| row.id),
+            Some(7),
+            "a contact refusal keeps the conversation open"
+        );
+        assert_eq!(v.channel, 7);
+        assert_eq!(v.chat_key(), draft::ChatKey::conversation(7));
+        assert_eq!(v.composer.read(cx).value(), "hello");
+        assert_eq!(
+            v.drafts.borrow().text(draft::ChatKey::conversation(7)),
+            "hello",
+            "the draft survives the ambiguity"
+        );
+        assert_eq!(v.composer_error, "Недостаточно прав доступа.");
+        assert_eq!(v.conversations.len(), 1, "the row stays in the index");
+    });
+    let requests = server.requests();
+    assert_eq!(requests.len(), 2, "one POST and one explicit GET");
+    assert_eq!(requests[0].method, "POST");
+    assert_eq!(requests[0].path, "/api/v1/conversations/7/messages");
+    assert_eq!(requests[1].method, "GET");
+    assert_eq!(requests[1].path, "/api/v1/conversations/7");
+}
+
+/// A transient verification failure is not proof of revocation: the chat,
+/// draft and composer stay, and the send error remains visible.
+#[gpui::test]
+async fn conversation_send_403_survives_a_transient_verification_failure(cx: &mut TestAppContext) {
     cx.update(|cx| gpui_component::init(cx));
     let server = TestServer::spawn(vec![
         Reply::new(403, r#"{"error":"forbidden"}"#),
+        Reply::new(500, r#"{"error":"failed"}"#),
+    ]);
+    let (window, view) = make_app(cx, direct_client(&server));
+    let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            let row = conversation(7, "Проект", true, false);
+            v.personal_mode = true;
+            v.conversations = vec![row.clone()];
+            v.conversation = Some(row);
+            v.channel = 7;
+            v.composer
+                .update(cx, |input, cx| input.set_value("hello", window, cx));
+            v.send(window, cx);
+        });
+    });
+    wait_for(&mut visual, &view, |v| {
+        v.messaging.send_verify_request.is_none()
+            && v.composer_error == "Недостаточно прав доступа."
+    });
+    view.read_with(&*visual, |v, cx| {
+        assert_eq!(v.conversation.as_ref().map(|row| row.id), Some(7));
+        assert_eq!(v.chat_key(), draft::ChatKey::conversation(7));
+        assert_eq!(v.composer.read(cx).value(), "hello");
+        assert_eq!(
+            v.drafts.borrow().text(draft::ChatKey::conversation(7)),
+            "hello"
+        );
+        assert_eq!(v.conversations.len(), 1);
+    });
+    assert_eq!(server.requests()[1].method, "GET");
+    assert_eq!(server.requests()[1].path, "/api/v1/conversations/7");
+}
+
+/// A send `403` whose verification GET also answers `403` is a real
+/// revocation: the ChatKey, index row and draft are dropped.
+#[gpui::test]
+async fn conversation_send_403_is_cleared_when_the_get_is_forbidden(cx: &mut TestAppContext) {
+    cx.update(|cx| gpui_component::init(cx));
+    let server = TestServer::spawn(vec![
+        Reply::new(403, r#"{"error":"forbidden"}"#),
+        Reply::new(403, r#"{"error":"forbidden"}"#),
+    ]);
+    let (window, view) = make_app(cx, direct_client(&server));
+    let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            let row = conversation(7, "Проект", true, false);
+            v.personal_mode = true;
+            v.conversations = vec![row.clone()];
+            v.conversation = Some(row);
+            v.channel = 7;
+            v.composer
+                .update(cx, |input, cx| input.set_value("hello", window, cx));
+            v.send(window, cx);
+        });
+    });
+    wait_for(&mut visual, &view, |v| {
+        v.conversation.is_none()
+            && v.error == "Диалог недоступен."
+            && v.messaging.send_verify_request.is_none()
+    });
+    view.read_with(&*visual, |v, cx| {
+        assert_eq!(v.channel, 0);
+        assert_eq!(v.chat_key().channel, 0);
+        assert!(v.composer.read(cx).value().is_empty());
+        assert!(v.conversations.is_empty(), "the revoked row is gone");
+        assert!(v
+            .drafts
+            .borrow()
+            .text(draft::ChatKey::conversation(7))
+            .is_empty());
+    });
+    let requests = server.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[1].method, "GET");
+    assert_eq!(requests[1].path, "/api/v1/conversations/7");
+}
+
+/// A `404` on the send itself is already authoritative and clears at once.
+#[gpui::test]
+async fn conversation_send_404_clears_the_active_chat_key(cx: &mut TestAppContext) {
+    cx.update(|cx| gpui_component::init(cx));
+    let server = TestServer::spawn(vec![
+        Reply::new(404, r#"{"error":"missing"}"#),
         Reply::new(200, &empty_page()),
     ]);
     let (window, view) = make_app(cx, direct_client(&server));
@@ -187,18 +325,20 @@ async fn conversation_send_403_clears_the_active_chat_key(cx: &mut TestAppContex
     wait_for(&mut visual, &view, |v| {
         v.conversation.is_none() && v.error == "Диалог недоступен." && !v.messaging.loading
     });
-    view.read_with(&*visual, |v, cx| {
+    view.read_with(&*visual, |v, _| {
         assert_eq!(v.channel, 0);
-        assert_eq!(v.chat_key().channel, 0, "no writable ChatKey points at 7");
-        assert!(v.composer.read(cx).value().is_empty());
-        assert!(
-            v.conversations.is_empty(),
-            "the index reload removed the row"
-        );
+        assert_eq!(v.chat_key().channel, 0);
+        assert!(v.conversations.is_empty());
+        assert!(v.messaging.send_verify_request.is_none());
     });
     let requests = server.requests();
     assert_eq!(requests[0].method, "POST");
     assert_eq!(requests[0].path, "/api/v1/conversations/7/messages");
+    assert_eq!(
+        requests.len(),
+        2,
+        "no explicit GET after an authoritative 404"
+    );
     assert!(requests[1]
         .path
         .starts_with("/api/v1/me/conversations?limit=30"));
@@ -498,4 +638,223 @@ async fn saved_favorite_search_hit_is_not_opened_as_a_normal_conversation(cx: &m
         assert!(v.messaging.search.error.contains("Избранные сообщения"));
     });
     assert_eq!(server.requests()[0].path, "/api/v1/conversations/50");
+}
+
+/// Opening the "+" creator suspends the open chat without destroying its
+/// composition; reopening restores the text and the attachment metadata.
+#[gpui::test]
+async fn opening_the_creator_keeps_the_suspended_draft_and_attachments(cx: &mut TestAppContext) {
+    cx.update(|cx| gpui_component::init(cx));
+    let server = TestServer::spawn(vec![
+        Reply::new(200, r#"{"messages":[],"has_more":false}"#),
+        Reply::new(200, r#"{"conversation_id":7,"muted":false}"#),
+    ]);
+    let (window, view) = make_app(cx, direct_client(&server));
+    let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
+    let path = std::env::temp_dir().join(format!(
+        "voxhold-w08a-creator-{}-{}.bin",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::write(&path, vec![3u8; 32]).unwrap();
+    let key = draft::ChatKey::conversation(7);
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            let row = conversation(7, "Нева", true, false);
+            v.personal_mode = true;
+            v.conversations = vec![row.clone()];
+            v.conversation = Some(row);
+            v.channel = 7;
+            v.drafts.borrow_mut().set_text(key, "черновик ЛС");
+            v.drafts.borrow_mut().add_files(
+                key,
+                vec![draft::DraftFile::from_path(path.clone()).unwrap()],
+            );
+            v.composer
+                .update(cx, |input, cx| input.set_value("черновик ЛС", window, cx));
+
+            v.open_conversation_creator(window, cx);
+            assert!(v.messaging.creator.is_some(), "the creator is open");
+            assert!(v.conversation.is_none(), "the chat surface is suspended");
+            assert_eq!(v.channel, 0);
+            assert_eq!(
+                v.drafts.borrow().text(key),
+                "черновик ЛС",
+                "the suspended draft is saved under its conversation key"
+            );
+            assert_eq!(v.drafts.borrow().files(key).len(), 1);
+            assert!(path.exists(), "temporary attachment files stay on disk");
+
+            v.close_conversation_creator(cx);
+            v.select_conversation(conversation(7, "Нева", true, false), window, cx);
+            assert_eq!(v.conversation.as_ref().map(|row| row.id), Some(7));
+            assert_eq!(v.chat_key(), key);
+            assert_eq!(v.composer.read(cx).value(), "черновик ЛС");
+            assert_eq!(v.drafts.borrow().files(key).len(), 1);
+            assert_eq!(v.drafts.borrow().files(key)[0].path, path);
+        });
+    });
+    wait_for(&mut visual, &view, |v| {
+        v.messaging
+            .notifications
+            .as_ref()
+            .is_some_and(|note| note.loaded)
+    });
+    std::fs::remove_file(path).ok();
+}
+
+/// An in-flight send completes normally while the creator is open; opening the
+/// form neither aborts the request nor drops the draft saved on suspend.
+#[gpui::test]
+async fn opening_the_creator_does_not_abort_an_inflight_send(cx: &mut TestAppContext) {
+    cx.update(|cx| gpui_component::init(cx));
+    let gate = Gate::new();
+    let mut fresh = conversation(7, "Нева", true, false);
+    fresh.last_message_id = 99;
+    let server = TestServer::spawn(vec![
+        Reply::new(200, &serde_json::to_string(&message(70, 7)).unwrap()).with_gate(gate.clone()),
+        Reply::new(200, &page(vec![fresh])),
+    ]);
+    let (window, view) = make_app(cx, direct_client(&server));
+    let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
+    let key = draft::ChatKey::conversation(7);
+    gate.arm();
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            let row = conversation(7, "Нева", true, false);
+            v.personal_mode = true;
+            v.conversations = vec![row.clone()];
+            v.conversation = Some(row);
+            v.channel = 7;
+            v.composer
+                .update(cx, |input, cx| input.set_value("первая", window, cx));
+            v.send(window, cx);
+            assert!(v.pending_sends.contains_key(&key), "the send is in flight");
+
+            // The user edits the draft, then opens the creator before the
+            // gated answer arrives.
+            v.composer
+                .update(cx, |input, cx| input.set_value("вторая версия", window, cx));
+            v.open_conversation_creator(window, cx);
+            assert!(v.messaging.creator.is_some());
+            assert!(
+                v.pending_sends.contains_key(&key),
+                "opening the creator must not abort the send"
+            );
+            assert_eq!(v.drafts.borrow().text(key), "вторая версия");
+        });
+    });
+    assert!(
+        gate.wait_arrived(Duration::from_secs(5)),
+        "the send reached the server"
+    );
+    gate.release();
+    wait_for(&mut visual, &view, |v| {
+        v.pending_sends.is_empty()
+            && !v.messaging.loading
+            && v.conversations.first().map(|row| row.last_message_id) == Some(99)
+    });
+    view.read_with(&*visual, |v, _| {
+        assert!(v.messaging.creator.is_some(), "the creator stays open");
+        assert!(v.conversation.is_none());
+        assert_eq!(
+            v.drafts.borrow().text(key),
+            "вторая версия",
+            "the completed send does not drop the newer saved draft"
+        );
+    });
+    assert_eq!(server.requests()[0].method, "POST");
+    assert!(
+        server.requests().len() >= 2,
+        "the send answer refreshed recents"
+    );
+}
+
+fn channel_row(id: i64, name: &str) -> voxhold_api::Channel {
+    voxhold_api::Channel {
+        id,
+        name: name.into(),
+        kind: "text".into(),
+        permissions: 3,
+        ..Default::default()
+    }
+}
+
+/// A channel ACL reload survives opening a DM: its answer still applies the
+/// fresh channel list and clears `voice_unconfirmed`, without blocking the
+/// personal selection.
+#[gpui::test]
+async fn channel_acl_reload_survives_opening_a_dm(cx: &mut TestAppContext) {
+    cx.update(|cx| gpui_component::init(cx));
+    let gate = Gate::new();
+    let channels = serde_json::to_string(&vec![channel_row(5, "general")]).unwrap();
+    let server = TestServer::spawn(vec![
+        Reply::new(200, &channels)
+            .with_path("/api/v1/servers/1/channels")
+            .with_gate(gate.clone()),
+        Reply::new(200, "[]").with_path("/api/v1/servers/1/members"),
+        Reply::new(200, r#"{"messages":[],"has_more":false}"#)
+            .with_path("/api/v1/conversations/7/messages"),
+        Reply::new(200, r#"{"conversation_id":7,"muted":false}"#)
+            .with_path("/api/v1/conversations/7/notifications"),
+        Reply::new(200, &page(vec![conversation(7, "Нева", true, false)]))
+            .with_path("/api/v1/me/conversations"),
+    ]);
+    let (window, view) = make_app(cx, direct_client(&server));
+    let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            v.server = 1;
+            v.channel = 5;
+            v.personal_mode = false;
+            #[cfg(feature = "voxhold-media")]
+            v.voice_unconfirmed.insert(1);
+            gate.arm();
+            v.invalidate_access(window, cx);
+            assert!(v.access_pending);
+            assert!(v.access_reload_in_flight);
+            let access = v.access_generation;
+            // The reload was captured before the DM selection; opening the DM
+            // must not bump it or clear the pending state.
+            v.personal_mode = true;
+            v.personal_return = Some((1, 5));
+            v.select_conversation(conversation(7, "Нева", true, false), window, cx);
+            assert_eq!(v.conversation.as_ref().map(|row| row.id), Some(7));
+            assert_eq!(v.channel, 7, "personal selection is not blocked");
+            assert_eq!(
+                v.access_generation, access,
+                "opening a DM keeps the pending ACL generation"
+            );
+            assert!(v.access_pending, "the channel ACL reload is still pending");
+        });
+    });
+    gate.release();
+    wait_for(&mut visual, &view, |v| {
+        !v.access_pending
+            && !v.access_reload_in_flight
+            && v.channels.iter().any(|channel| channel.id == 5)
+    });
+    view.read_with(&*visual, |v, _| {
+        assert_eq!(
+            v.conversation.as_ref().map(|row| row.id),
+            Some(7),
+            "the ACL answer does not close the personal conversation"
+        );
+        #[cfg(feature = "voxhold-media")]
+        assert!(
+            !v.voice_unconfirmed.contains(&1),
+            "the fresh channel list confirms voice access again"
+        );
+    });
+    visual.update(|window, app| {
+        view.update(app, |v, cx| v.return_to_channels(window, cx));
+    });
+    view.read_with(&*visual, |v, _| {
+        assert!(!v.personal_mode);
+        assert!(v.conversation.is_none());
+        assert_eq!(
+            v.channel, 5,
+            "the saved channel reopens from the fresh list"
+        );
+    });
 }

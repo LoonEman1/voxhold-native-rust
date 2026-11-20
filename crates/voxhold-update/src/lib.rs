@@ -9,8 +9,11 @@
 //! * `delta` — content deltas with an optional block patch for large files;
 //! * `download` — HTTPS-only background download with `Range` resume;
 //! * `stage` — verified staging under `%LOCALAPPDATA%\VoxHold\updates`;
-//! * `apply` — backup, atomic swap, handshake, rollback, helper relocation
-//!   and backup cleanup.
+//! * `state` — durable swap state with an operation id and its atomic file;
+//! * `recovery` — the one recovery algorithm used by the helper and the app
+//!   start (the app never renames an installation);
+//! * `apply` — verified sibling staging, backup, atomic swap, operation-id
+//!   handshake, rollback and helper relocation.
 //!
 //! Logs never contain query strings or tokens; use [`error::redact_url`] when
 //! a URL must appear in diagnostics.
@@ -20,10 +23,14 @@ pub mod check;
 pub mod delta;
 pub mod download;
 pub mod error;
+mod fsutil;
+pub mod handshake;
 pub mod manifest;
 pub mod package;
 pub mod patch;
+pub mod recovery;
 pub mod stage;
+pub mod state;
 pub mod timefmt;
 pub mod urls;
 pub mod verify;

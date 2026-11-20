@@ -220,6 +220,9 @@ pub struct Publisher {
     /// engine, so its terminal decision must not emit `StopEngine`.
     engine_live: bool,
     answered: bool,
+    /// The `stream.webrtc_answer` whose confirmation is still awaited, and
+    /// whether that answer is an ICE restart of an already confirmed attempt.
+    pending_answer: answer::PendingAnswer,
     stop_sent: bool,
     connected: bool,
     sent_frame: bool,
@@ -264,6 +267,7 @@ impl Publisher {
             start_sent: false,
             engine_live: false,
             answered: false,
+            pending_answer: answer::PendingAnswer::default(),
             stop_sent: false,
             connected: false,
             sent_frame: false,
@@ -528,17 +532,7 @@ impl Publisher {
             "stream.started" => self.on_started(request_id, data, now),
             "stream.webrtc_offer" => self.on_offer(data),
             "stream.ice_candidate" => self.on_ice(data),
-            "stream.webrtc_answered" => {
-                if !self.active() || !self.tracked(request_id) {
-                    return Vec::new();
-                }
-                if !data["accepted"].as_bool().unwrap_or(false) {
-                    return self.fail("Сервер отклонил ответ трансляции.", now);
-                }
-                self.answered = true;
-                self.status = "Подключаемся…".into();
-                vec![Outcome::State(self.sharing())]
-            }
+            "stream.webrtc_answered" => self.on_answer_confirmed(request_id, data, now),
             "stream.stopped" => self.on_stopped(request_id, data, now),
             // The pinned backend may acknowledge `stream.stop` with
             // `stream.left` instead of `stream.stopped`. Only a tagged answer
@@ -547,7 +541,18 @@ impl Publisher {
             "stream.left" => self.on_left_ack(request_id),
             "stream.webrtc_closed" => self.on_closed(data, now),
             "error" => {
-                if !self.active() || !self.tracked(request_id) {
+                if !self.active() {
+                    return Vec::new();
+                }
+                // The pinned backend reports a refused answer as `error`
+                // tagged with that `stream.webrtc_answer` id; it never sends
+                // `accepted:false`. Once a newer offer/answer replaced that
+                // answer, the refusal no longer decides this negotiation. The
+                // current answer's error still fails the publication.
+                if self.pending_answer.is_superseded(request_id) {
+                    return Vec::new();
+                }
+                if !self.tracked(request_id) {
                     return Vec::new();
                 }
                 self.fail(&reason::server_error(data), now)
@@ -563,14 +568,7 @@ impl Publisher {
             return Vec::new();
         }
         match event {
-            EngineEvent::Answer(sdp) => {
-                if self.phase != Phase::Publishing || sdp.is_empty() {
-                    return Vec::new();
-                }
-                self.answered = false;
-                let signal = self.signal("stream.webrtc_answer", json!({"sdp": sdp}));
-                vec![Outcome::Send(signal)]
-            }
+            EngineEvent::Answer(sdp) => self.on_answer(sdp),
             EngineEvent::Ice(candidate) => {
                 let data = json!({
                     "candidate": candidate.candidate,
@@ -646,6 +644,10 @@ impl Publisher {
         // The offer may arrive before `stream.started`; the engine with its
         // sendonly transceiver exists since `StartEngine`, so the answer is
         // produced without waiting for the started event.
+        //
+        // A repeated offer (ICE restart) supersedes an answer that is still
+        // unconfirmed, so its late confirmation cannot decide this one.
+        self.supersede_answer();
         vec![Outcome::Offer(sdp.to_owned())]
     }
 
@@ -771,6 +773,7 @@ impl Publisher {
         self.start_sent = false;
         self.engine_live = false;
         self.answered = false;
+        self.clear_answer();
         self.stop_sent = false;
         self.connected = false;
         self.sent_frame = false;
@@ -914,6 +917,7 @@ impl Publisher {
         self.start_sent = false;
         self.engine_live = false;
         self.answered = false;
+        self.clear_answer();
         self.stop_sent = false;
         self.connected = false;
         self.sent_frame = false;
@@ -959,6 +963,7 @@ impl Publisher {
         self.start_sent = false;
         self.engine_live = false;
         self.answered = false;
+        self.clear_answer();
         self.stop_sent = false;
         self.connected = false;
         self.sent_frame = false;
@@ -984,11 +989,12 @@ impl Publisher {
     }
 }
 
+mod answer;
 pub mod engine;
-
 mod live_change;
 pub mod preflight;
 mod reason;
+mod recovery;
 
 #[cfg(test)]
 mod tests;

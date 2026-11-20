@@ -5,6 +5,8 @@ use crate::runtime::requests::ScreenCommand;
 use crate::stream::EngineUpdate;
 use std::collections::HashMap;
 
+mod player;
+
 fn publication(connection: &str) -> Publication {
     Publication {
         server_id: 1,

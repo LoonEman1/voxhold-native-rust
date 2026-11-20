@@ -28,6 +28,13 @@ const STALE_CLOSE_GRACE: Duration = Duration::from_secs(5);
 /// but the set stays bounded across a long viewing session.
 const RETIRED_UFRAG_TTL: Duration = Duration::from_secs(600);
 const RETIRED_UFRAG_CAPACITY: usize = 64;
+/// Keyframe request ids of the current attempt remembered for error routing.
+/// The decoder budget permits two per stall cycle and a long session may run
+/// several cycles, so the set is bounded instead of growing forever.
+const KEYFRAME_REQUEST_CAPACITY: usize = 8;
+
+mod stats;
+use stats::StatsWatch;
 
 #[derive(Clone, Debug)]
 struct Intent {
@@ -45,11 +52,17 @@ struct Active {
     /// Request ids whose error belongs to this attempt. Numbering is not
     /// enough: a request from a previous attempt may have the same number.
     requests: HashSet<String>,
+    /// Keyframe requests of this attempt. Their error reply rejects only that
+    /// bounded recovery and must not end the view.
+    keyframes: VecDeque<String>,
     publication: Publication,
     connected: bool,
     recovering: bool,
     received_signal: bool,
     remote_ufrags: Vec<String>,
+    /// Inbound RTP/video counters of this engine. A stale report from an older
+    /// engine of the same selection is rejected by `attempt`.
+    stats: StatsWatch,
 }
 
 /// One decision produced by the state machine. The runtime executes them in
@@ -59,6 +72,9 @@ pub enum Outcome {
     /// Create an engine with this attempt's watch request.
     Start {
         selection: u64,
+        /// Viewer attempt the engine belongs to. Statistics of an engine of an
+        /// older attempt are ignored even when the selection id is unchanged.
+        attempt: u64,
         publication: Publication,
         muted: bool,
         request: Signal,
@@ -148,6 +164,13 @@ impl Viewer {
         &self.catalog
     }
 
+    /// A `stream.snapshot` was parsed and accepted for this connection. A
+    /// malformed snapshot leaves the previous value untouched, so callers that
+    /// gate recovery on a fresh list must ask this before acting.
+    pub fn snapshot_accepted(&self) -> bool {
+        self.snapshot_ready
+    }
+
     /// The publication the user selected, even while it is waiting for the
     /// previous attempt to leave.
     pub fn intent(&self) -> Option<&Publication> {
@@ -218,7 +241,15 @@ impl Viewer {
             self.retire(&active, now);
             out.push(Outcome::Close);
         }
-        if let Some(intent) = &self.intent {
+        if let Some(intent) = &mut self.intent {
+            // The rejoin is a new viewing attempt: its engine must not inherit
+            // statistics reports of the peer that was just closed, and the
+            // automatic-reconnect budget belongs to the previous socket
+            // session. Without the reset the first stall of the fresh session
+            // would fail with no re-watch at all.
+            self.attempt = self.attempt.wrapping_add(1);
+            intent.attempt = self.attempt;
+            self.retries = 0;
             out.push(Outcome::Status {
                 selection: intent.selection,
                 text: "Восстанавливаем трансляцию…".into(),
@@ -410,7 +441,17 @@ impl Viewer {
                 let Some(active) = &self.active else {
                     return Vec::new();
                 };
-                if request_id.is_empty() || !active.requests.contains(request_id) {
+                if request_id.is_empty() {
+                    return Vec::new();
+                }
+                if active.keyframes.iter().any(|id| id == request_id) {
+                    // The server rejected the keyframe request, not the view.
+                    // The bounded keyframe/ICE/rewatch cascade owns this
+                    // failure; ending the viewer here would turn a repairable
+                    // decoder stall into a terminal error.
+                    return Vec::new();
+                }
+                if !active.requests.contains(request_id) {
                     return Vec::new();
                 }
                 self.fail("Сервер отклонил просмотр трансляции", now)
@@ -658,7 +699,7 @@ impl Viewer {
                 connected: false,
             },
         ];
-        out.extend(self.close_active(now));
+        out.extend(self.restart(now));
         out
     }
 
@@ -707,6 +748,12 @@ impl Viewer {
         let Some(active) = &mut self.active else {
             return Vec::new();
         };
+        // A real decoded frame is the only proof that the picture is moving. A
+        // cached repaint never reaches this method. A decoded frame clears the
+        // idle/keyframe counters, but only a full healthy stats window clears
+        // the reconnect budget: one frame after a reconnect must not hide a
+        // stream that freezes again immediately.
+        active.stats.on_decoded();
         if active.connected && !active.recovering {
             return Vec::new();
         }
@@ -730,9 +777,20 @@ impl Viewer {
     }
 
     /// The engine reports `failed`/`disconnected`: ask the server for one
-    /// bounded recovery and keep the picture until the deadline.
+    /// bounded recovery and keep the picture until the deadline. This is the
+    /// only transport-loss path: RTP silence on a connected peer is a static
+    /// screen (see `stats`), not a disconnect. One ICE failure often surfaces
+    /// as `disconnected` followed by `failed`; while its recovery deadline is
+    /// armed the duplicate state must not spend a second retry.
     pub fn on_engine_state(&mut self, state: &str, now: Instant) -> Vec<Outcome> {
         if state != "failed" && state != "disconnected" {
+            return Vec::new();
+        }
+        let already_recovering = self
+            .active
+            .as_ref()
+            .is_some_and(|active| active.recovering && self.deadline.is_some());
+        if already_recovering {
             return Vec::new();
         }
         let Some(active) = &self.active else {
@@ -808,7 +866,7 @@ impl Viewer {
                     out.extend(self.fail("Не удалось восстановить трансляцию", now));
                 } else {
                     self.retries += 1;
-                    out.extend(self.close_active(now));
+                    out.extend(self.restart(now));
                     if let Some(selection) = self.selection() {
                         out.push(Outcome::Status {
                             selection,
@@ -822,6 +880,9 @@ impl Viewer {
                 }
             }
         }
+        // Frozen-picture detection runs on the browser's two-second video-stats
+        // cadence, not on this 25 ms session tick.
+        out.extend(self.poll_stats(now));
         out
     }
 
@@ -875,11 +936,13 @@ impl Viewer {
             attempt: intent.attempt,
             watch_request: watch_request.clone(),
             requests: HashSet::from([watch_request]),
+            keyframes: VecDeque::new(),
             publication: publication.clone(),
             connected: false,
             recovering: false,
             received_signal: false,
             remote_ufrags: Vec::new(),
+            stats: StatsWatch::new(now),
         });
         self.intent = Some(Intent {
             publication: publication.clone(),
@@ -897,11 +960,24 @@ impl Viewer {
             },
             Outcome::Start {
                 selection,
+                attempt: intent.attempt,
                 publication,
                 muted,
                 request,
             },
         ]
+    }
+
+    /// Close the active attempt for an automatic recovery and give the next
+    /// watch a fresh attempt id. Statistics of the engine that is being closed
+    /// must not be credited to its replacement, especially when a re-watch
+    /// keeps the same publication and selection.
+    fn restart(&mut self, now: Instant) -> Vec<Outcome> {
+        if let Some(intent) = &mut self.intent {
+            self.attempt = self.attempt.wrapping_add(1);
+            intent.attempt = self.attempt;
+        }
+        self.close_active(now)
     }
 
     fn close_active(&mut self, now: Instant) -> Vec<Outcome> {
@@ -986,6 +1062,17 @@ impl Viewer {
     fn track_request(&mut self, request_id: Option<&str>) {
         if let (Some(active), Some(id)) = (&mut self.active, request_id) {
             active.requests.insert(id.to_owned());
+        }
+    }
+
+    /// Remember a keyframe request so an `error` tagged with it is routed to
+    /// the bounded picture recovery instead of ending the viewer.
+    fn track_keyframe(&mut self, request_id: Option<&str>) {
+        if let (Some(active), Some(id)) = (&mut self.active, request_id) {
+            active.keyframes.push_back(id.to_owned());
+            while active.keyframes.len() > KEYFRAME_REQUEST_CAPACITY {
+                active.keyframes.pop_front();
+            }
         }
     }
 }

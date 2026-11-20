@@ -26,6 +26,17 @@ pub struct VideoRead {
     pub(crate) height: u32,
 }
 
+impl VideoRead {
+    /// Forget which frame was decoded last, but keep the viewport bounds. A
+    /// replacement engine has its own frame sequence; its first frame may even
+    /// reuse sequence 1 at the same fitted size.
+    pub(crate) fn forget_frame(&mut self) {
+        self.sequence = 0;
+        self.width = 0;
+        self.height = 0;
+    }
+}
+
 struct Frame {
     sequence: u64,
     video: BoxVideoFrame,

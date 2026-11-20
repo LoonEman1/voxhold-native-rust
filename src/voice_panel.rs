@@ -73,6 +73,10 @@ pub struct VoicePanel {
     attempt: u64,
     call_channel: i64,
     phase: CallPhase,
+    /// A token refresh is in flight. It is latched on the panel, not only on a
+    /// handle, so a call joined while no handle existed still defers its first
+    /// authorization until the refresh answer (or the 30 s worker deadline).
+    rotation_in_flight: bool,
     /// Local cues from real transitions; the parent drains them onto the output.
     cues: cues::CueQueue,
     status: String,
@@ -124,9 +128,6 @@ pub struct VoicePanel {
     can_stream: bool,
     /// Screen-share picker, on-air card and preview.
     screen: ScreenShareUi,
-    /// Room-level screen-share message that outlives the reset publication,
-    /// e.g. the explicit notice that a rotation stopped the broadcast.
-    screen_notice: String,
     /// Monotonic id of the newest screen-audio probe. A slower, older probe
     /// must not overwrite the availability of a newer dialog.
     screen_audio_probe: u64,
@@ -263,6 +264,7 @@ impl VoicePanel {
             attempt: 0,
             call_channel: 0,
             phase: CallPhase::Idle,
+            rotation_in_flight: false,
             cues: cues::CueQueue::default(),
             status: String::new(),
             error: String::new(),
@@ -291,7 +293,6 @@ impl VoicePanel {
             room_streams: Vec::new(),
             can_stream: false,
             screen: ScreenShareUi::default(),
-            screen_notice: String::new(),
             screen_audio_probe: 0,
             access_confirmed: true,
             frame: None,
@@ -593,34 +594,39 @@ impl VoicePanel {
         if self.handle.is_some() {
             return;
         }
-        match VoiceHandle::join(
+        match VoiceHandle::join_with_rotation(
             self.client.clone(),
             self.server,
             self.room,
             self.controls.clone(),
             self.self_muted,
+            self.rotation_in_flight,
         ) {
             Ok(handle) => {
-                self.attempt = handle.attempt();
-                self.handle = Some(handle);
                 self.call_channel = self.room;
-                self.begin_attempt();
-                self.status = "Подключение…".into();
-                self.error.clear();
-                self.participants.clear();
-                self.clear_speaking(cx);
-                self.tracks.clear();
-                self.local_mutes.clear();
-                self.close_player();
-                // A fresh call starts without the previous session's notice;
-                // `rejoin_call` sets it after this successful join.
-                self.screen_notice.clear();
-                self.refresh_capture();
-                self.notify_call_changed(cx);
+                self.install_handle(handle, cx);
             }
             Err(error) => self.error = error,
         }
         cx.notify();
+    }
+
+    /// Adopt the one worker of this call. The rotation gate is already armed by
+    /// `VoiceHandle::join_with_rotation` before its thread starts, so a call
+    /// joined during a refresh never authorizes with the revoked token.
+    fn install_handle(&mut self, handle: VoiceHandle, cx: &mut Context<Self>) {
+        self.attempt = handle.attempt();
+        self.handle = Some(handle);
+        self.begin_attempt();
+        self.status = "Подключение…".into();
+        self.error.clear();
+        self.participants.clear();
+        self.clear_speaking(cx);
+        self.tracks.clear();
+        self.local_mutes.clear();
+        self.close_player();
+        self.refresh_capture();
+        self.notify_call_changed(cx);
     }
 
     pub fn leave_in_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -628,35 +634,32 @@ impl VoicePanel {
         self.leave_call(cx);
     }
 
-    /// Install a client that already carries a rotated token. The next join
-    /// uses it; an active call is restarted through `rejoin_call`.
+    /// Install a client that already carries a rotated token. The active
+    /// `VoiceHandle` keeps running and reads the new token from this shared
+    /// client on its next authorization; no handle is rebuilt.
     pub fn set_client(&mut self, client: Client) {
         self.client = client;
     }
 
-    /// Restart the call that is already active in `channel` with the current
-    /// client and access snapshot. The normal leave/join path is used, so the
-    /// server sees one clean lease and media never runs on the old credential.
-    ///
-    /// `leave_call` releases the screen publication together with the lease.
-    /// The capture cannot be handed to the new lease, so the broadcast really
-    /// stops; the room says so instead of losing it silently.
-    pub fn rejoin_call(&mut self, channel: i64, cx: &mut Context<Self>) {
-        if channel <= 0 {
-            return;
+    /// A refresh request started. The media worker defers re-authorization
+    /// until the answer arrives (or its bounded deadline), so an old socket
+    /// close cannot reconnect with the revoked token.
+    pub fn begin_token_rotation(&mut self) {
+        // Latch on the panel: a handle created later in this flight inherits
+        // the gate from `join_with_rotation`.
+        self.rotation_in_flight = true;
+        if let Some(handle) = &self.handle {
+            handle.token_rotation_started();
         }
-        let was_sharing = self.share_active();
-        self.leave_call(cx);
-        let viewing = self.room;
-        self.room = channel;
-        self.join(cx);
-        // A successful join clears the previous notice, so state the loss
-        // after it. The call itself is already back on the new credential.
-        if was_sharing {
-            self.screen_notice = SCREEN_ROTATION_NOTICE.into();
+    }
+
+    /// The refresh result was applied to the shared client. A waiting voice
+    /// worker may now open its one new socket and restore the call.
+    pub fn token_rotated(&mut self) {
+        self.rotation_in_flight = false;
+        if let Some(handle) = &self.handle {
+            handle.token_rotation_finished();
         }
-        self.room = viewing;
-        cx.notify();
     }
 
     /// Normal leave: stream session and voice session are both released and
@@ -671,8 +674,10 @@ impl VoicePanel {
         self.handle.take();
         self.close_player();
         self.reset_screen();
-        self.screen_notice.clear();
         self.call_channel = 0;
+        // A failed refresh or an explicit leave ends the flight without a
+        // `token_rotated`; the next call must not inherit a stale gate.
+        self.rotation_in_flight = false;
         self.transition_phase(CallPhase::Idle, cx);
         self.status.clear();
         self.error.clear();
@@ -1124,7 +1129,7 @@ mod cues;
 mod focus;
 mod player;
 mod screen_share;
-use screen_share::{ScreenShareUi, SCREEN_ROTATION_NOTICE};
+use screen_share::ScreenShareUi;
 #[cfg(test)]
 mod test_support;
 mod updates;

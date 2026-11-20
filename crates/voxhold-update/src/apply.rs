@@ -1,9 +1,20 @@
 //! Applying a staged update from the helper process.
 //!
-//! The installed directory is moved to `<name>.voxhold-backup`, the staged
-//! package is copied in, user files outside the package are preserved and the
-//! new executable is started. The new version must write a handshake file
-//! within the timeout; otherwise the previous directory is restored.
+//! The protocol is:
+//!
+//! 1. recover any earlier operation;
+//! 2. copy the verified package into a sibling staging directory on the same
+//!    volume and migrate user files there *before* anything is renamed;
+//! 3. persist [`InstallState`] with a fresh operation id;
+//! 4. rename the old installation to the backup and the staging directory into
+//!    place, persisting each step;
+//! 5. start the new version and wait for a handshake carrying that operation
+//!    id;
+//! 6. persist completion and only then remove the backup.
+//!
+//! A failure before the handshake rolls back. A failure after the handshake
+//! never deletes the running installation; the durable state lets the next
+//! helper run finish the cleanup.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -11,18 +22,26 @@ use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
 use crate::error::{Result, UpdateError};
+use crate::fsutil;
+use crate::handshake;
 use crate::package::{read_package_json_from_dir, sha256_file, PackageIndex, PACKAGE_JSON};
+use crate::recovery::{self, RecoveryMode, RecoveryOutcome};
+use crate::state::{self, InstallState, OperationStage, StateLoad};
 
 /// Default time the new version has to confirm startup.
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Suffix of the backup directory next to the installation.
-pub const BACKUP_SUFFIX: &str = ".voxhold-backup";
+pub const BACKUP_SUFFIX: &str = state::BACKUP_SUFFIX;
 /// Argument passed to the new executable so it can confirm startup.
-pub const HANDSHAKE_ARG: &str = "--update-handshake";
+pub const HANDSHAKE_ARG: &str = handshake::ARG;
+/// Argument carrying the operation id to the new executable.
+pub const OPERATION_ARG: &str = handshake::OPERATION_ARG;
 /// Name of a helper image relocated into the staging directory.
 pub const HELPER_FILE: &str = "helper.exe";
 /// Time allowed for removing the backup after a successful handshake.
 const BACKUP_CLEANUP_TIMEOUT: Duration = Duration::from_secs(1);
+/// Time allowed for removing the sibling staging copy.
+const STAGING_CLEANUP_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Result of a successful apply.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,8 +49,7 @@ pub struct ApplyOutcome {
     /// `true` when the previous installation backup is gone.
     ///
     /// `false` means the backup was still locked (for example a file held by
-    /// another process); [`cleanup_install_backup`] removes it on the next
-    /// start.
+    /// another process); a later recovery run removes it.
     pub backup_removed: bool,
 }
 
@@ -43,7 +61,13 @@ pub trait LaunchedProcess {
 
 /// Starts the new executable.
 pub trait UpdateLauncher {
-    fn launch(&self, exe: &Path, handshake: &Path) -> Result<Box<dyn LaunchedProcess>>;
+    /// Start `exe`, ask it to confirm `operation` through `handshake`.
+    fn launch(
+        &self,
+        exe: &Path,
+        handshake: &Path,
+        operation: &str,
+    ) -> Result<Box<dyn LaunchedProcess>>;
 }
 
 /// Launcher used in production.
@@ -51,9 +75,18 @@ pub trait UpdateLauncher {
 pub struct ProcessLauncher;
 
 impl UpdateLauncher for ProcessLauncher {
-    fn launch(&self, exe: &Path, handshake: &Path) -> Result<Box<dyn LaunchedProcess>> {
+    fn launch(
+        &self,
+        exe: &Path,
+        handshake: &Path,
+        operation: &str,
+    ) -> Result<Box<dyn LaunchedProcess>> {
         let mut command = Command::new(exe);
-        command.arg(HANDSHAKE_ARG).arg(handshake);
+        command
+            .arg(HANDSHAKE_ARG)
+            .arg(handshake)
+            .arg(OPERATION_ARG)
+            .arg(operation);
         if let Some(parent) = exe.parent() {
             command.current_dir(parent);
         }
@@ -109,113 +142,238 @@ pub fn apply_staged_with(
     launcher: &dyn UpdateLauncher,
     timeout: Duration,
 ) -> Result<ApplyOutcome> {
+    apply_staged_with_hooks(
+        target_dir,
+        staged_app,
+        exe_name,
+        handshake_path,
+        launcher,
+        timeout,
+        &NoHooks,
+    )
+}
+
+/// Steps a test can stop at to emulate a killed helper.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InterruptPoint {
+    Staged,
+    Verified,
+    Prepared,
+    OldRenamed,
+    NewInPlace,
+    Launched,
+    Confirmed,
+}
+
+/// Test seam. Production uses [`NoHooks`].
+pub(crate) trait ApplyHooks {
+    fn interrupt(&self, _point: InterruptPoint) -> bool {
+        false
+    }
+}
+
+pub(crate) struct NoHooks;
+
+impl ApplyHooks for NoHooks {}
+
+pub(crate) fn apply_staged_with_hooks(
+    target_dir: &Path,
+    staged_app: &Path,
+    exe_name: &str,
+    handshake_path: &Path,
+    launcher: &dyn UpdateLauncher,
+    timeout: Duration,
+    hooks: &dyn ApplyHooks,
+) -> Result<ApplyOutcome> {
     let new_index = read_package_json_from_dir(staged_app)?;
     let exe = staged_app.join(exe_name);
     if !exe.is_file() {
         return Err(UpdateError::NotStaged(exe));
     }
-    let backup = backup_path(target_dir);
 
-    // Restore an interrupted swap or drop a backup left by an earlier run.
-    cleanup_install_backup(target_dir)?;
-    let old_index = read_package_json_from_dir(target_dir).ok();
-
-    let had_target = target_dir.exists();
-    if had_target {
-        rename_retry(target_dir, &backup)?;
+    // Resolve a previous operation first. A state that cannot be resolved is
+    // never overwritten: overwriting it would destroy the only proof that the
+    // backup is still needed.
+    let recovery = recovery::recover_install(target_dir, RecoveryMode::Updater)?;
+    match recovery {
+        RecoveryOutcome::Clean
+        | RecoveryOutcome::Completed { .. }
+        | RecoveryOutcome::RolledBack { .. } => {}
+        // Without a state file the backup is an unknown legacy leftover, not
+        // an unfinished operation: there is no proof to preserve and the new
+        // operation uses its own backup name. With a state, ambiguity refuses.
+        RecoveryOutcome::Ambiguous { .. }
+            if matches!(state::load(target_dir), StateLoad::Missing) => {}
+        outcome => {
+            return Err(UpdateError::InvalidState(format!(
+                "a previous update is still unresolved ({outcome:?}); its backup was kept"
+            )));
+        }
     }
-    let result = (|| {
-        std::fs::create_dir_all(target_dir).map_err(|error| UpdateError::io(target_dir, error))?;
-        populate(
+    match state::load(target_dir) {
+        StateLoad::Missing => {}
+        // A completed operation is proven, not unresolved. Its backup can
+        // still be locked; clearing the state unblocks the next update. The
+        // backup stays untouched on disk and becomes an unknown legacy backup,
+        // so `choose_backup_path` gives the new operation its own name.
+        StateLoad::Valid(state) if state.stage == OperationStage::Completed => {
+            state::clear(target_dir)?;
+        }
+        StateLoad::Valid(_) | StateLoad::Corrupt(_) => {
+            return Err(UpdateError::InvalidState(
+                "a previous update is still unresolved; its backup was kept".into(),
+            ));
+        }
+    }
+
+    let operation_id = state::new_operation_id();
+    let staging_dir = state::operation_staging_path(target_dir, &operation_id);
+    let old_index = read_package_json_from_dir(target_dir).ok();
+    let had_target = target_dir.exists();
+    let backup_dir = choose_backup_path(target_dir, &operation_id);
+    let mut state = InstallState {
+        schema: state::STATE_SCHEMA,
+        operation_id: operation_id.clone(),
+        stage: OperationStage::Prepared,
+        install_dir: target_dir.to_path_buf(),
+        backup_dir,
+        staging_dir: staging_dir.clone(),
+        handshake_path: handshake_path.to_path_buf(),
+        version: new_index.version.clone(),
+        previous_version: old_index.as_ref().map(|index| index.version.clone()),
+        had_install: had_target,
+        created_at: state::now_unix(),
+    };
+
+    let mut interrupted = false;
+    let mut applied: Option<InstallState> = None;
+
+    macro_rules! checkpoint {
+        ($point:expr) => {
+            if hooks.interrupt($point) {
+                interrupted = true;
+                return Err(UpdateError::Apply("apply interrupted by test hook".into()));
+            }
+        };
+    }
+
+    let result = (|| -> Result<()> {
+        copy_payload(staged_app, &staging_dir, &new_index)?;
+        checkpoint!(InterruptPoint::Staged);
+        if had_target {
+            migrate_user_files(target_dir, &staging_dir, old_index.as_ref(), &new_index)?;
+        }
+        verify_payload(&staging_dir, &new_index)?;
+        checkpoint!(InterruptPoint::Verified);
+
+        // Durable before the first rename.
+        state::save(&state)?;
+        applied = Some(state.clone());
+        checkpoint!(InterruptPoint::Prepared);
+
+        if had_target {
+            fsutil::rename_retry(target_dir, &state.backup_dir)?;
+        }
+        state.stage = OperationStage::OldRenamed;
+        state::save(&state)?;
+        applied = Some(state.clone());
+        checkpoint!(InterruptPoint::OldRenamed);
+
+        fsutil::rename_retry(&staging_dir, target_dir)?;
+        state.stage = OperationStage::NewInPlace;
+        state::save(&state)?;
+        applied = Some(state.clone());
+        checkpoint!(InterruptPoint::NewInPlace);
+
+        let process = launch_new(
             target_dir,
-            staged_app,
-            &new_index,
-            old_index.as_ref(),
-            had_target,
-            &backup,
+            exe_name,
+            handshake_path,
+            &operation_id,
+            launcher,
         )?;
-        launch_and_wait(target_dir, exe_name, handshake_path, launcher, timeout)
+        checkpoint!(InterruptPoint::Launched);
+        wait_for_confirmation(process, handshake_path, &operation_id, timeout)?;
+        checkpoint!(InterruptPoint::Confirmed);
+        Ok(())
     })();
 
     match result {
         Ok(()) => {
-            // The helper must not run from the installation or backup
-            // directory (see `helper_relocation_destination`). If something
-            // still holds the backup, report it and let the next start clean
-            // up through `cleanup_install_backup`.
-            let backup_removed = remove_dir_with_timeout(&backup, BACKUP_CLEANUP_TIMEOUT).is_ok();
-            let _ = std::fs::remove_dir_all(staged_app);
-            Ok(ApplyOutcome { backup_removed })
+            let applied = applied.expect("state is persisted before launch");
+            finish_success(&applied, target_dir, staged_app)
         }
+        Err(error) if interrupted => Err(error),
         Err(error) => {
-            let restored = if had_target {
-                rollback(target_dir).map(|_| ())
-            } else {
-                remove_dir_retry(target_dir)
+            let rollback = match applied.as_ref() {
+                Some(applied) => recovery::rollback_operation(applied),
+                None => {
+                    let _ = fsutil::remove_dir_with_timeout(&staging_dir, STAGING_CLEANUP_TIMEOUT);
+                    Ok(())
+                }
             };
-            let _ = std::fs::remove_dir_all(staged_app);
-            if let Err(rollback_error) = restored {
-                return Err(UpdateError::Apply(format!(
+            let _ = fsutil::remove_dir_with_timeout(staged_app, STAGING_CLEANUP_TIMEOUT);
+            match rollback {
+                Ok(()) => Err(error),
+                Err(rollback_error) => Err(UpdateError::Apply(format!(
                     "{error}; rollback failed: {rollback_error}"
-                )));
+                ))),
             }
-            Err(error)
         }
     }
 }
 
-fn populate(
-    target_dir: &Path,
-    staged_app: &Path,
-    new_index: &PackageIndex,
-    old_index: Option<&PackageIndex>,
-    had_target: bool,
-    backup: &Path,
-) -> Result<()> {
+fn copy_payload(staged_app: &Path, staging: &Path, new_index: &PackageIndex) -> Result<()> {
+    if staging.exists() {
+        fsutil::remove_dir_retry(staging)?;
+    }
+    std::fs::create_dir_all(staging).map_err(|error| UpdateError::io(staging, error))?;
     for file in &new_index.files {
         let source = staged_app.join(Path::new(&file.path));
-        let destination = target_dir.join(Path::new(&file.path));
-        if let Some(parent) = destination.parent() {
-            std::fs::create_dir_all(parent).map_err(|error| UpdateError::io(parent, error))?;
-        }
-        std::fs::copy(&source, &destination)
-            .map_err(|error| UpdateError::io(&destination, error))?;
-        if sha256_file(&destination)? != file.sha256 {
-            return Err(UpdateError::HashMismatch { path: destination });
-        }
+        let destination = staging.join(Path::new(&file.path));
+        copy_file(&source, &destination)?;
     }
-    let staged_json = staged_app.join(PACKAGE_JSON);
-    let target_json = target_dir.join(PACKAGE_JSON);
-    std::fs::copy(&staged_json, &target_json)
-        .map_err(|error| UpdateError::io(&target_json, error))?;
+    copy_file(&staged_app.join(PACKAGE_JSON), &staging.join(PACKAGE_JSON))
+}
 
-    if had_target && backup.exists() {
-        let old_files: BTreeSet<String> = old_index
-            .map(|index| {
-                index
-                    .files
-                    .iter()
-                    .map(|file| file.path.to_lowercase())
-                    .collect()
-            })
-            .unwrap_or_default();
-        let new_files: BTreeSet<String> = new_index
-            .files
-            .iter()
-            .map(|file| file.path.to_lowercase())
-            .collect();
-        copy_user_files(backup, target_dir, &old_files, &new_files)?;
+fn copy_file(source: &Path, destination: &Path) -> Result<()> {
+    if let Some(parent) = destination.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| UpdateError::io(parent, error))?;
     }
+    std::fs::copy(source, destination).map_err(|error| UpdateError::io(destination, error))?;
     Ok(())
 }
 
+fn migrate_user_files(
+    source: &Path,
+    staging: &Path,
+    old_index: Option<&PackageIndex>,
+    new_index: &PackageIndex,
+) -> Result<()> {
+    let old_files: BTreeSet<String> = old_index
+        .map(|index| {
+            index
+                .files
+                .iter()
+                .map(|file| file.path.to_lowercase())
+                .collect()
+        })
+        .unwrap_or_default();
+    let new_files: BTreeSet<String> = new_index
+        .files
+        .iter()
+        .map(|file| file.path.to_lowercase())
+        .collect();
+    copy_user_files(source, staging, &old_files, &new_files)
+}
+
 fn copy_user_files(
-    backup: &Path,
-    target_dir: &Path,
+    source: &Path,
+    staging: &Path,
     old_files: &BTreeSet<String>,
     new_files: &BTreeSet<String>,
 ) -> Result<()> {
-    let mut stack = vec![backup.to_path_buf()];
+    let mut stack = vec![source.to_path_buf()];
     while let Some(current) = stack.pop() {
         for entry in
             std::fs::read_dir(&current).map_err(|error| UpdateError::io(&current, error))?
@@ -233,7 +391,7 @@ fn copy_user_files(
                 continue;
             }
             let relative = path
-                .strip_prefix(backup)
+                .strip_prefix(source)
                 .unwrap_or(&path)
                 .components()
                 .map(|component| component.as_os_str().to_string_lossy().into_owned())
@@ -243,39 +401,55 @@ fn copy_user_files(
             if key == PACKAGE_JSON || old_files.contains(&key) || new_files.contains(&key) {
                 continue;
             }
-            let destination = target_dir.join(Path::new(&relative));
-            if let Some(parent) = destination.parent() {
-                std::fs::create_dir_all(parent).map_err(|error| UpdateError::io(parent, error))?;
-            }
-            std::fs::copy(&path, &destination)
-                .map_err(|error| UpdateError::io(&destination, error))?;
+            copy_file(&path, &staging.join(Path::new(&relative)))?;
         }
     }
     Ok(())
 }
 
-fn launch_and_wait(
+fn verify_payload(staging: &Path, new_index: &PackageIndex) -> Result<()> {
+    for file in &new_index.files {
+        let path = staging.join(Path::new(&file.path));
+        if sha256_file(&path)? != file.sha256 {
+            return Err(UpdateError::HashMismatch { path });
+        }
+    }
+    if !staging.join(PACKAGE_JSON).is_file() {
+        return Err(UpdateError::NotStaged(staging.to_path_buf()));
+    }
+    Ok(())
+}
+
+fn launch_new(
     target_dir: &Path,
     exe_name: &str,
     handshake_path: &Path,
+    operation_id: &str,
     launcher: &dyn UpdateLauncher,
-    timeout: Duration,
-) -> Result<()> {
+) -> Result<Box<dyn LaunchedProcess>> {
     if let Some(parent) = handshake_path.parent() {
         std::fs::create_dir_all(parent).map_err(|error| UpdateError::io(parent, error))?;
     }
     let _ = std::fs::remove_file(handshake_path);
     let exe = target_dir.join(exe_name);
-    let mut process = launcher.launch(&exe, handshake_path)?;
+    launcher.launch(&exe, handshake_path, operation_id)
+}
+
+fn wait_for_confirmation(
+    mut process: Box<dyn LaunchedProcess>,
+    handshake_path: &Path,
+    operation_id: &str,
+    timeout: Duration,
+) -> Result<()> {
     let deadline = Instant::now() + timeout;
     loop {
-        if handshake_path.is_file() {
+        if handshake::confirms(handshake_path, operation_id) {
             return Ok(());
         }
         match process.try_wait() {
             Ok(Some(code)) => {
                 // The child may have written the handshake after the first check.
-                if handshake_path.is_file() {
+                if handshake::confirms(handshake_path, operation_id) {
                     return Ok(());
                 }
                 return Err(UpdateError::Apply(format!(
@@ -296,33 +470,40 @@ fn launch_and_wait(
     }
 }
 
-/// Path of the backup directory next to the installation.
-pub fn backup_path(target_dir: &Path) -> PathBuf {
-    let name = target_dir
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "VoxHold".into());
-    target_dir.with_file_name(format!("{name}{BACKUP_SUFFIX}"))
+fn finish_success(
+    applied: &InstallState,
+    target_dir: &Path,
+    staged_app: &Path,
+) -> Result<ApplyOutcome> {
+    let mut completed = applied.clone();
+    completed.stage = OperationStage::Completed;
+    // The new version is already running. If completion cannot be persisted,
+    // leave the handshake and the previous state for the next recovery run
+    // instead of rolling back a working installation.
+    state::save(&completed)?;
+    let backup_removed =
+        fsutil::remove_dir_with_timeout(&completed.backup_dir, BACKUP_CLEANUP_TIMEOUT).is_ok();
+    if backup_removed {
+        let _ = state::clear(target_dir);
+    }
+    let _ = fsutil::remove_dir_with_timeout(staged_app, STAGING_CLEANUP_TIMEOUT);
+    Ok(ApplyOutcome { backup_removed })
 }
 
-/// Remove a leftover `<install>.voxhold-backup` directory.
-///
-/// Returns `Ok(true)` when a backup existed and is no longer present. If the
-/// installation directory itself is missing (an interrupted swap), the backup
-/// is restored instead of deleted. The helper calls this on start and the
-/// application should call it on start before staging the next update.
-pub fn cleanup_install_backup(install_dir: &Path) -> Result<bool> {
-    let backup = backup_path(install_dir);
-    if !backup.exists() {
-        return Ok(false);
+fn choose_backup_path(target_dir: &Path, operation_id: &str) -> PathBuf {
+    let canonical = state::backup_path(target_dir);
+    if canonical.exists() {
+        // A backup without usable state is kept untouched; this operation uses
+        // its own sibling name so it cannot overwrite it.
+        state::operation_backup_path(target_dir, operation_id)
+    } else {
+        canonical
     }
-    if !install_dir.exists() {
-        std::fs::rename(&backup, install_dir)
-            .map_err(|error| UpdateError::io(install_dir, error))?;
-        return Ok(true);
-    }
-    remove_dir_retry(&backup)?;
-    Ok(true)
+}
+
+/// Path of the backup directory next to the installation.
+pub fn backup_path(target_dir: &Path) -> PathBuf {
+    state::backup_path(target_dir)
 }
 
 /// Where the helper must move itself before touching the installation.
@@ -366,390 +547,6 @@ fn canonical_or(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
-fn rename_retry(from: &Path, to: &Path) -> Result<()> {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        match std::fs::rename(from, to) {
-            Ok(()) => return Ok(()),
-            Err(error) if Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(100));
-                let _ = error;
-            }
-            Err(error) => return Err(UpdateError::io(to, error)),
-        }
-    }
-}
-
-fn remove_dir_retry(path: &Path) -> Result<()> {
-    remove_dir_with_timeout(path, Duration::from_secs(10))
-}
-
-fn remove_dir_with_timeout(path: &Path, timeout: Duration) -> Result<()> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        match std::fs::remove_dir_all(path) {
-            Ok(()) => return Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(error) if Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(100));
-                let _ = error;
-            }
-            Err(error) => return Err(UpdateError::io(path, error)),
-        }
-    }
-}
-
-/// Restore the backup if it still exists.
-pub fn rollback(target_dir: &Path) -> Result<bool> {
-    let backup = backup_path(target_dir);
-    if !backup.exists() {
-        return Ok(false);
-    }
-    if target_dir.exists() {
-        remove_dir_retry(target_dir)?;
-    }
-    std::fs::rename(&backup, target_dir).map_err(|error| UpdateError::io(target_dir, error))?;
-    Ok(true)
-}
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::stage::APP_DIR;
-    use std::fs;
-
-    struct FakeLauncher {
-        handshake: bool,
-    }
-
-    struct FakeProcess;
-
-    impl LaunchedProcess for FakeProcess {
-        fn try_wait(&mut self) -> Result<Option<i32>> {
-            Ok(None)
-        }
-        fn kill(&mut self) {}
-    }
-
-    impl UpdateLauncher for FakeLauncher {
-        fn launch(&self, _exe: &Path, handshake: &Path) -> Result<Box<dyn LaunchedProcess>> {
-            if self.handshake {
-                fs::write(handshake, b"ok").unwrap();
-            }
-            Ok(Box::new(FakeProcess))
-        }
-    }
-
-    fn install_package(root: &Path, version: &str, exe: &[u8]) {
-        fs::create_dir_all(root).unwrap();
-        fs::write(root.join("Voxhold.exe"), exe).unwrap();
-        fs::write(root.join("README.md"), b"readme").unwrap();
-        let packed = crate::package::pack_with_index(root, version).unwrap();
-        fs::remove_dir_all(root).unwrap();
-        crate::package::unpack(&packed.bytes, root).unwrap();
-    }
-
-    #[test]
-    fn applies_and_preserves_user_files() {
-        let temp = tempfile::tempdir().unwrap();
-        let target = temp.path().join("VoxHold");
-        install_package(&target, "1.0.0", b"old exe");
-        fs::write(target.join("settings.json"), b"user settings").unwrap();
-
-        let staged = temp.path().join("staged").join(APP_DIR);
-        fs::create_dir_all(&staged).unwrap();
-        fs::write(staged.join("Voxhold.exe"), b"new exe").unwrap();
-        fs::write(staged.join("README.md"), b"readme").unwrap();
-        let packed = crate::package::pack_with_index(&staged, "1.1.0").unwrap();
-        fs::remove_dir_all(&staged).unwrap();
-        crate::package::unpack(&packed.bytes, &staged).unwrap();
-
-        let handshake = temp.path().join("ready.handshake");
-        let outcome = apply_staged_with(
-            &target,
-            &staged,
-            "Voxhold.exe",
-            &handshake,
-            &FakeLauncher { handshake: true },
-            Duration::from_millis(500),
-        )
-        .unwrap();
-
-        assert!(outcome.backup_removed);
-        assert_eq!(fs::read(target.join("Voxhold.exe")).unwrap(), b"new exe");
-        assert_eq!(
-            fs::read(target.join("settings.json")).unwrap(),
-            b"user settings"
-        );
-        assert!(!backup_path(&target).exists());
-        assert!(!staged.exists());
-    }
-
-    #[test]
-    fn preserves_new_package_files_when_an_existing_path_differs_only_in_case() {
-        let temp = tempfile::tempdir().unwrap();
-        let target = temp.path().join("VoxHold");
-        fs::create_dir_all(&target).unwrap();
-        fs::write(target.join("VOXHOLD.EXE"), b"old exe").unwrap();
-
-        let staged = temp.path().join("staged").join(APP_DIR);
-        install_package(&staged, "1.1.0", b"new exe");
-        apply_staged_with(
-            &target,
-            &staged,
-            "Voxhold.exe",
-            &temp.path().join("ready.handshake"),
-            &FakeLauncher { handshake: true },
-            Duration::from_millis(500),
-        )
-        .unwrap();
-
-        assert_eq!(fs::read(target.join("Voxhold.exe")).unwrap(), b"new exe");
-        assert_eq!(fs::read_dir(&target).unwrap().count(), 3);
-    }
-
-    #[test]
-    fn rolls_back_when_launch_fails() {
-        let temp = tempfile::tempdir().unwrap();
-        let target = temp.path().join("VoxHold");
-        install_package(&target, "1.0.0", b"old exe");
-        fs::write(target.join("settings.json"), b"user settings").unwrap();
-
-        let staged = temp.path().join("staged").join(APP_DIR);
-        fs::create_dir_all(&staged).unwrap();
-        fs::write(staged.join("Voxhold.exe"), b"new exe").unwrap();
-        fs::write(staged.join("README.md"), b"readme").unwrap();
-        let packed = crate::package::pack_with_index(&staged, "1.1.0").unwrap();
-        fs::remove_dir_all(&staged).unwrap();
-        crate::package::unpack(&packed.bytes, &staged).unwrap();
-
-        let handshake = temp.path().join("ready.handshake");
-        let error = apply_staged_with(
-            &target,
-            &staged,
-            "Voxhold.exe",
-            &handshake,
-            &FakeLauncher { handshake: false },
-            Duration::from_millis(300),
-        )
-        .unwrap_err();
-        assert!(matches!(error, UpdateError::LaunchTimeout(_)));
-        assert_eq!(fs::read(target.join("Voxhold.exe")).unwrap(), b"old exe");
-        assert_eq!(
-            fs::read(target.join("settings.json")).unwrap(),
-            b"user settings"
-        );
-        assert!(!backup_path(&target).exists());
-    }
-
-    #[test]
-    fn explicit_rollback_restores_backup() {
-        let temp = tempfile::tempdir().unwrap();
-        let target = temp.path().join("VoxHold");
-        fs::create_dir_all(&target).unwrap();
-        fs::write(target.join("file"), b"new").unwrap();
-        let backup = backup_path(&target);
-        fs::create_dir_all(&backup).unwrap();
-        fs::write(backup.join("file"), b"old").unwrap();
-        assert!(rollback(&target).unwrap());
-        assert_eq!(fs::read(target.join("file")).unwrap(), b"old");
-        assert!(!backup.exists());
-    }
-
-    fn staged_package_at(staging: &Path) -> PathBuf {
-        let staged = staging.join(APP_DIR);
-        fs::create_dir_all(&staged).unwrap();
-        fs::write(staged.join("Voxhold.exe"), b"new exe").unwrap();
-        fs::write(staged.join("README.md"), b"readme").unwrap();
-        let packed = crate::package::pack_with_index(&staged, "1.1.0").unwrap();
-        fs::remove_dir_all(&staged).unwrap();
-        crate::package::unpack(&packed.bytes, &staged).unwrap();
-        staged
-    }
-
-    fn staged_package(temp: &Path) -> PathBuf {
-        staged_package_at(&temp.join("staged"))
-    }
-
-    #[test]
-    fn helper_in_the_installation_is_relocated_before_apply() {
-        let temp = tempfile::tempdir().unwrap();
-        let target = temp.path().join("VoxHold");
-        install_package(&target, "1.0.0", b"old exe");
-        let staging = temp.path().join("updates").join("0.2.0");
-        let staged = staged_package_at(&staging);
-        // The application starts the helper from `{app}`, so its image sits
-        // inside the installation that is about to be renamed.
-        let helper = target.join("voxhold-updater.exe");
-        fs::write(&helper, b"helper image").unwrap();
-
-        let destination = helper_relocation_destination(&helper, &target, &staging).unwrap();
-        assert_eq!(destination, staging.join(HELPER_FILE));
-        relocate_helper(&helper, &destination).unwrap();
-        fs::remove_file(&helper).unwrap();
-
-        let handshake = temp.path().join("ready.handshake");
-        let outcome = apply_staged_with(
-            &target,
-            &staged,
-            "Voxhold.exe",
-            &handshake,
-            &FakeLauncher { handshake: true },
-            Duration::from_millis(500),
-        )
-        .unwrap();
-        assert!(outcome.backup_removed);
-        assert!(!backup_path(&target).exists());
-        assert_eq!(fs::read(&destination).unwrap(), b"helper image");
-    }
-
-    #[test]
-    fn cleanup_install_backup_removes_a_leftover() {
-        let temp = tempfile::tempdir().unwrap();
-        let target = temp.path().join("VoxHold");
-        fs::create_dir_all(&target).unwrap();
-        let backup = backup_path(&target);
-        fs::create_dir_all(&backup).unwrap();
-        fs::write(backup.join("old.exe"), b"old").unwrap();
-
-        assert!(cleanup_install_backup(&target).unwrap());
-        assert!(!backup.exists());
-        assert!(!cleanup_install_backup(&target).unwrap());
-    }
-
-    #[test]
-    fn cleanup_install_backup_restores_a_missing_installation() {
-        let temp = tempfile::tempdir().unwrap();
-        let target = temp.path().join("VoxHold");
-        let backup = backup_path(&target);
-        fs::create_dir_all(&backup).unwrap();
-        fs::write(backup.join("Voxhold.exe"), b"old").unwrap();
-
-        assert!(cleanup_install_backup(&target).unwrap());
-        assert!(target.join("Voxhold.exe").exists());
-        assert!(!backup.exists());
-    }
-
-    #[test]
-    fn helper_relocates_out_of_the_installation() {
-        let temp = tempfile::tempdir().unwrap();
-        let target = temp.path().join("VoxHold");
-        let staged = temp.path().join("updates").join("0.2.0");
-        fs::create_dir_all(&target).unwrap();
-        fs::create_dir_all(&staged).unwrap();
-        let helper = target.join(HELPER_FILE);
-        fs::write(&helper, b"helper image").unwrap();
-
-        let destination = helper_relocation_destination(&helper, &target, &staged).unwrap();
-        assert_eq!(destination, staged.join(HELPER_FILE));
-        relocate_helper(&helper, &destination).unwrap();
-        assert_eq!(fs::read(&destination).unwrap(), b"helper image");
-        // The relocated copy is neutral and must not move again.
-        assert!(helper_relocation_destination(&destination, &target, &staged).is_none());
-    }
-
-    #[test]
-    fn helper_outside_the_trees_is_not_relocated() {
-        let temp = tempfile::tempdir().unwrap();
-        let target = temp.path().join("VoxHold");
-        let staged = temp.path().join("updates").join("0.2.0");
-        let elsewhere = temp.path().join("tools");
-        fs::create_dir_all(&target).unwrap();
-        fs::create_dir_all(&staged).unwrap();
-        fs::create_dir_all(&elsewhere).unwrap();
-        let helper = elsewhere.join(HELPER_FILE);
-        fs::write(&helper, b"helper image").unwrap();
-        assert!(helper_relocation_destination(&helper, &target, &staged).is_none());
-    }
-
-    #[cfg(windows)]
-    struct LockedFile(windows_sys::Win32::Foundation::HANDLE);
-
-    #[cfg(windows)]
-    impl Drop for LockedFile {
-        fn drop(&mut self) {
-            // SAFETY: the handle was created by `CreateFileW` and is closed once.
-            unsafe { windows_sys::Win32::Foundation::CloseHandle(self.0) };
-        }
-    }
-
-    #[cfg(windows)]
-    fn lock_without_sharing(path: &Path) -> LockedFile {
-        use std::os::windows::ffi::OsStrExt;
-        use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
-        use windows_sys::Win32::Storage::FileSystem::{
-            CreateFileW, FILE_ATTRIBUTE_NORMAL, OPEN_EXISTING,
-        };
-
-        const GENERIC_READ: u32 = 0x8000_0000;
-        let wide: Vec<u16> = path
-            .as_os_str()
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect();
-        // SAFETY: `wide` is NUL-terminated and outlives the call.
-        let handle = unsafe {
-            CreateFileW(
-                wide.as_ptr(),
-                GENERIC_READ,
-                0,
-                std::ptr::null(),
-                OPEN_EXISTING,
-                FILE_ATTRIBUTE_NORMAL,
-                std::ptr::null_mut(),
-            )
-        };
-        assert_ne!(handle, INVALID_HANDLE_VALUE, "CreateFileW failed");
-        LockedFile(handle)
-    }
-
-    #[cfg(windows)]
-    struct LockingLauncher {
-        backup_lock: std::cell::RefCell<Option<LockedFile>>,
-    }
-
-    #[cfg(windows)]
-    impl UpdateLauncher for LockingLauncher {
-        fn launch(&self, exe: &Path, handshake: &Path) -> Result<Box<dyn LaunchedProcess>> {
-            // Emulates a helper image that still runs from the backup: the
-            // installation has already been renamed, so the old executable
-            // lives in `<install>.voxhold-backup`.
-            let backup = backup_path(exe.parent().expect("installation directory"));
-            let image = backup.join(exe.file_name().expect("executable name"));
-            *self.backup_lock.borrow_mut() = Some(lock_without_sharing(&image));
-            fs::write(handshake, b"ok").unwrap();
-            Ok(Box::new(FakeProcess))
-        }
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn delayed_backup_removal_is_reported_and_cleaned_later() {
-        let temp = tempfile::tempdir().unwrap();
-        let target = temp.path().join("VoxHold");
-        install_package(&target, "1.0.0", b"old exe");
-        let staged = staged_package(temp.path());
-        let handshake = temp.path().join("ready.handshake");
-        let launcher = LockingLauncher {
-            backup_lock: std::cell::RefCell::new(None),
-        };
-
-        let outcome = apply_staged_with(
-            &target,
-            &staged,
-            "Voxhold.exe",
-            &handshake,
-            &launcher,
-            Duration::from_millis(500),
-        )
-        .unwrap();
-        assert!(!outcome.backup_removed);
-        let backup = backup_path(&target);
-        assert!(backup.exists());
-        assert_eq!(fs::read(target.join("Voxhold.exe")).unwrap(), b"new exe");
-
-        drop(launcher.backup_lock.borrow_mut().take());
-        assert!(cleanup_install_backup(&target).unwrap());
-        assert!(!backup.exists());
-    }
-}
+#[path = "apply_tests.rs"]
+mod tests;

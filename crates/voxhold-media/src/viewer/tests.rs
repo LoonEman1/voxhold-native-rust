@@ -3,6 +3,8 @@
 
 use super::*;
 
+mod stall;
+
 fn publication(connection: &str, user: i64) -> Publication {
     Publication {
         server_id: 1,
@@ -19,6 +21,30 @@ fn publication(connection: &str, user: i64) -> Publication {
 
 fn snapshot(viewer: &mut Viewer, streams: &[Publication], now: Instant) -> Vec<Outcome> {
     viewer.on_server_event("stream.snapshot", "", &json!({"streams": streams}), now)
+}
+
+#[test]
+fn a_malformed_snapshot_is_not_authoritative_for_recovery() {
+    let now = Instant::now();
+    let mut viewer = Viewer::new(1, 10);
+    assert!(!viewer.snapshot_accepted());
+    let outcomes = viewer.on_server_event(
+        "stream.snapshot",
+        "",
+        &json!({"streams": "not-a-list"}),
+        now,
+    );
+    assert!(outcomes.is_empty());
+    assert!(
+        !viewer.snapshot_accepted(),
+        "a rejected snapshot must not satisfy the recovery gate"
+    );
+
+    snapshot(&mut viewer, &[publication("a", 1)], now);
+    assert!(
+        viewer.snapshot_accepted(),
+        "only a parsed snapshot is authoritative"
+    );
 }
 
 /// Pull the one `Start` out of the outcome list.
@@ -290,6 +316,11 @@ fn recovery_is_bounded_and_always_targets_the_active_publisher() {
     let first = viewer.on_engine_state("disconnected", now);
     let restart = sends(&first, "stream.p2p_restart");
     assert_eq!(restart.len(), 1);
+    // The same ICE failure reported again as `failed` is still one retry.
+    let duplicate = viewer.on_engine_state("failed", now);
+    assert!(sends(&duplicate, "stream.p2p_restart").is_empty());
+    // A decoded frame ends the recovery; the next loss spends retry two.
+    viewer.on_frame();
     let second = viewer.on_engine_state("failed", now);
     assert_eq!(sends(&second, "stream.p2p_restart").len(), 1);
     // The third failure does not send another restart; the deadline ends it.
@@ -839,4 +870,70 @@ fn a_snapshot_that_arrives_before_ready_starts_after_the_join() {
             .any(|outcome| matches!(outcome, Outcome::Start { selection: 4, .. })),
         "the retained snapshot must start the selection after voice.joined: {joined:?}"
     );
+}
+
+#[test]
+fn transport_loss_keeps_the_exact_publication_and_player_audio_state() {
+    let now = Instant::now();
+    let a = publication("publisher-a", 3);
+    let mut viewer = Viewer::new(1, 10);
+    snapshot(&mut viewer, &[a.clone()], now);
+    viewer.set_joined(true, now);
+    let started = viewer.select(&a, 11, now);
+    let (_, started_publication) = start_of(&started);
+    assert_eq!(started_publication.publisher_connection_id, "publisher-a");
+    viewer.set_muted(11, true);
+    assert!(viewer.muted());
+
+    // The disconnected attempt is closed but its exact identity and muted
+    // state survive. Nothing starts before the fresh snapshot and join.
+    let ended = viewer.transport_ended(now);
+    assert!(
+        ended
+            .iter()
+            .any(|outcome| matches!(outcome, Outcome::Close))
+    );
+    assert_eq!(
+        viewer.intent().unwrap().publisher_connection_id,
+        "publisher-a"
+    );
+    assert!(
+        viewer.muted(),
+        "the player stays muted across the reconnect"
+    );
+    assert!(viewer.set_joined(true, now).is_empty());
+    let fresh = snapshot(&mut viewer, &[a.clone()], now);
+    let (_, rewatched) = start_of(&fresh);
+    assert_eq!(
+        rewatched.publisher_connection_id, "publisher-a",
+        "the same publisher connection, not another connection of the user"
+    );
+}
+
+#[test]
+fn a_publication_that_disappears_after_the_loss_is_dropped_with_a_reason() {
+    let now = Instant::now();
+    let a = publication("publisher-a", 3);
+    let other = publication("publisher-b", 3);
+    let mut viewer = Viewer::new(1, 10);
+    snapshot(&mut viewer, &[a.clone()], now);
+    viewer.set_joined(true, now);
+    viewer.select(&a, 12, now);
+    viewer.transport_ended(now);
+    viewer.set_joined(true, now);
+
+    // The fresh snapshot has only another connection of the same user. The
+    // intent must not be retargeted to it.
+    let fresh = snapshot(&mut viewer, &[other], now);
+    assert!(
+        !fresh
+            .iter()
+            .any(|outcome| matches!(outcome, Outcome::Start { .. })),
+        "a different publisher is never substituted: {fresh:?}"
+    );
+    assert!(fresh.iter().any(|outcome| matches!(
+        outcome,
+        Outcome::Failed { selection: 12, message } if message.contains("недоступна")
+    )));
+    assert!(viewer.intent().is_none());
 }

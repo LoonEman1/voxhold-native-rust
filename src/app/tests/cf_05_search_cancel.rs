@@ -1,13 +1,15 @@
 //! CF-05 regressions: a deferred navigation started from a message-search hit
-//! must lose its right to open a conversation as soon as the user picks a chat
-//! or another hit. A late answer may neither select its own row, show its
-//! error nor clear the slot of a newer search request.
+//! must lose its right to open a conversation as soon as the user changes the
+//! intent (picks a chat, another hit, a new query, closes the search or leaves
+//! the personal surface). A late answer may neither select its own row, show
+//! its error, drop fresh results nor clear the slot of a newer request.
 
 use super::super::*;
-use crate::test_support::{Reply, TestServer};
+use crate::test_support::{Gate, Reply, TestServer};
 use gpui::{TestAppContext, VisualTestContext};
 use gpui_component::Root;
 use serde_json::json;
+use std::sync::Arc;
 use std::time::Duration;
 
 pub(super) fn make_app(
@@ -45,12 +47,22 @@ pub(super) fn make_app(
     (window, view)
 }
 
+/// Release the gate as soon as the request reaches the server, without
+/// blocking the GPUI test thread that has to drive the background task.
+pub(super) fn release_on_arrival(gate: Arc<Gate>) -> std::thread::JoinHandle<bool> {
+    std::thread::spawn(move || {
+        let arrived = gate.wait_arrived(Duration::from_secs(5));
+        gate.release();
+        arrived
+    })
+}
+
 pub(super) fn wait_for(
     visual: &mut VisualTestContext,
     view: &Entity<Voxhold>,
     mut done: impl FnMut(&Voxhold) -> bool,
 ) {
-    for _ in 0..1500 {
+    for _ in 0..1000 {
         visual.run_until_parked();
         if view.read_with(&*visual, |v, _| done(v)) {
             return;
@@ -58,16 +70,6 @@ pub(super) fn wait_for(
         std::thread::sleep(Duration::from_millis(5));
     }
     panic!("condition did not become true");
-}
-
-/// Drive the request and its callback to completion. The test executor runs a
-/// background request inline, so a `with_delay` answer is already late by the
-/// time this returns and no manual gate can be released from this thread.
-fn pump(visual: &mut VisualTestContext) {
-    for _ in 0..80 {
-        visual.run_until_parked();
-        std::thread::sleep(Duration::from_millis(5));
-    }
 }
 
 pub(super) fn conversation(
@@ -119,17 +121,40 @@ fn conversation_json(id: i64, name: &str) -> String {
     serde_json::to_string(&conversation(id, name, true, false)).unwrap()
 }
 
-/// `GET /conversations/50` is delayed; chat 8 is selected by hand before the
-/// answer arrives. The late hit must not replace chat 8.
+/// A pinned conversation that would only be loaded by a stale navigation.
+fn saved_conversation_json(id: i64) -> String {
+    let mut row = conversation(id, "Избранное", false, false);
+    row.saved = true;
+    serde_json::to_string(&row).unwrap()
+}
+
+/// The stale hit would refresh its history and notifications if it ever opened.
+fn assert_no_open_side_effects(server: &TestServer) {
+    let requests = server.requests();
+    let paths: Vec<_> = requests.iter().map(|row| row.path.clone()).collect();
+    assert!(
+        !requests.iter().any(|row| {
+            row.path.starts_with("/api/v1/conversations/50/messages")
+                || row
+                    .path
+                    .starts_with("/api/v1/conversations/50/notifications")
+        }),
+        "a cancelled hit must not load its conversation: {paths:?}"
+    );
+}
+
+/// `GET /conversations/50` is held; chat 8 is selected by hand. The answer is
+/// released only afterwards and must not replace chat 8.
 #[gpui::test]
 async fn manual_chat_selection_keeps_itself_when_the_search_open_arrives_late(
     cx: &mut TestAppContext,
 ) {
     cx.update(|cx| gpui_component::init(cx));
+    let gate = Gate::new();
     let server = TestServer::spawn(vec![
         Reply::new(200, &conversation_json(50, "Пять"))
             .with_path("/api/v1/conversations/50")
-            .with_delay(Duration::from_millis(200)),
+            .with_gate(gate.clone()),
         Reply::new(200, &messages_page(vec![message(800, 8)]))
             .with_path("/api/v1/conversations/8/messages"),
         Reply::new(200, r#"{"conversation_id":8,"muted":false}"#)
@@ -139,6 +164,7 @@ async fn manual_chat_selection_keeps_itself_when_the_search_open_arrives_late(
     ]);
     let (window, view) = make_app(cx, direct_client(&server));
     let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
+    gate.arm();
     visual.update(|window, app| {
         view.update(app, |v, cx| {
             v.personal_mode = true;
@@ -147,7 +173,10 @@ async fn manual_chat_selection_keeps_itself_when_the_search_open_arrives_late(
             v.open_conversation_message(50, 300, window, cx);
             assert!(v.messaging.open_request.is_some(), "the hit owns a slot");
             assert!(v.conversation.is_none(), "nothing opened before the answer");
-            // The user picks chat 8 in the index while the hit is in flight.
+        });
+    });
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
             v.select_conversation(conversation(8, "Восемь", true, false), window, cx);
             assert!(
                 v.messaging.open_request.is_none(),
@@ -155,7 +184,15 @@ async fn manual_chat_selection_keeps_itself_when_the_search_open_arrives_late(
             );
         });
     });
-    pump(&mut visual);
+    let waiter = release_on_arrival(gate.clone());
+    visual.run_until_parked();
+    assert!(
+        waiter.join().unwrap(),
+        "the held search open reached the server"
+    );
+    wait_for(&mut visual, &view, |v| {
+        v.messages.iter().any(|row| row.id == 800)
+    });
     view.read_with(&*visual, |v, _| {
         assert_eq!(
             v.conversation.as_ref().map(|row| row.id),
@@ -164,10 +201,6 @@ async fn manual_chat_selection_keeps_itself_when_the_search_open_arrives_late(
         );
         assert_eq!(v.channel, 8);
         assert_eq!(v.chat_key(), draft::ChatKey::conversation(8));
-        assert!(
-            v.messages.iter().any(|row| row.id == 800),
-            "the chosen chat loaded its own history"
-        );
         assert!(v.messaging.open_request.is_none());
         assert!(
             v.messaging.search.error.is_empty(),
@@ -178,26 +211,21 @@ async fn manual_chat_selection_keeps_itself_when_the_search_open_arrives_late(
             "chat 8 remains in the index"
         );
     });
-    assert!(
-        server
-            .requests()
-            .iter()
-            .any(|row| row.path == "/api/v1/conversations/50"),
-        "the delayed search open reached the server"
-    );
+    assert_no_open_side_effects(&server);
 }
 
-/// A stale `GET /conversations/{id}` that ends with a `500` after the manual
-/// selection must not show its error over the chosen chat.
+/// A held `GET /conversations/{id}` that ends with a `500` after the manual
+/// selection must not paint its error over the chosen chat.
 #[gpui::test]
 async fn stale_search_open_error_does_not_replace_the_manually_chosen_chat(
     cx: &mut TestAppContext,
 ) {
     cx.update(|cx| gpui_component::init(cx));
+    let gate = Gate::new();
     let server = TestServer::spawn(vec![
         Reply::new(500, r#"{"error":"failed"}"#)
             .with_path("/api/v1/conversations/50")
-            .with_delay(Duration::from_millis(200)),
+            .with_gate(gate.clone()),
         Reply::new(200, &messages_page(vec![message(800, 8)]))
             .with_path("/api/v1/conversations/8/messages"),
         Reply::new(200, r#"{"conversation_id":8,"muted":false}"#)
@@ -206,44 +234,55 @@ async fn stale_search_open_error_does_not_replace_the_manually_chosen_chat(
     ]);
     let (window, view) = make_app(cx, direct_client(&server));
     let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
+    gate.arm();
     visual.update(|window, app| {
         view.update(app, |v, cx| {
             v.personal_mode = true;
             v.messaging.global = true;
             v.conversations = vec![conversation(8, "Восемь", true, false)];
             v.open_conversation_message(50, 300, window, cx);
+        });
+    });
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
             v.select_conversation(conversation(8, "Восемь", true, false), window, cx);
         });
     });
-    pump(&mut visual);
+    let waiter = release_on_arrival(gate.clone());
+    visual.run_until_parked();
+    assert!(
+        waiter.join().unwrap(),
+        "the held search open reached the server"
+    );
+    wait_for(&mut visual, &view, |v| {
+        v.messages.iter().any(|row| row.id == 800)
+    });
     view.read_with(&*visual, |v, _| {
         assert_eq!(v.conversation.as_ref().map(|row| row.id), Some(8));
         assert_eq!(v.channel, 8);
-        assert!(
-            v.messages.iter().any(|row| row.id == 800),
-            "the chosen chat loaded its own history"
-        );
         assert!(
             v.messaging.search.error.is_empty(),
             "the stale error must not be painted over the chosen chat"
         );
         assert!(v.messaging.open_request.is_none());
     });
+    assert_no_open_side_effects(&server);
 }
 
 /// Two hits clicked in a row: the second click owns the navigation. The answer
-/// for the first hit arrives later and must not replace the second chat.
+/// for the first hit is released afterwards and must not replace the second
+/// chat.
 #[gpui::test]
 async fn two_search_hits_in_a_row_leave_navigation_to_the_last_one(cx: &mut TestAppContext) {
     cx.update(|cx| gpui_component::init(cx));
+    let gate = Gate::new();
     let server = TestServer::spawn(vec![
         Reply::new(200, &conversation_json(50, "Пять"))
             .with_path("/api/v1/conversations/50")
-            .with_delay(Duration::from_millis(200)),
+            .with_gate(gate.clone()),
         Reply::new(200, &messages_page(vec![message(400, 60)]))
             .with_path("/api/v1/conversations/60/messages?before=401"),
-        Reply::new(200, &messages_page(Vec::new()))
-            .with_path("/api/v1/conversations/60/messages"),
+        Reply::new(200, &messages_page(Vec::new())).with_path("/api/v1/conversations/60/messages"),
         Reply::new(200, r#"{"conversation_id":60,"muted":false}"#)
             .with_path("/api/v1/conversations/60/notifications"),
         Reply::new(200, &messages_page(Vec::new())),
@@ -251,25 +290,37 @@ async fn two_search_hits_in_a_row_leave_navigation_to_the_last_one(cx: &mut Test
     ]);
     let (window, view) = make_app(cx, direct_client(&server));
     let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
-    let second = visual.update(|window, app| {
+    gate.arm();
+    visual.update(|window, app| {
         view.update(app, |v, cx| {
             v.personal_mode = true;
             v.messaging.global = true;
             // The first hit is outside the index and starts the deferred open.
             v.open_conversation_message(50, 300, window, cx);
-            assert!(v.messaging.open_request.is_some(), "the first hit owns a slot");
+            assert!(
+                v.messaging.open_request.is_some(),
+                "the first hit owns a slot"
+            );
             // The second hit points at a chat the index already knows, so it
             // opens immediately and must own the navigation.
             v.conversations = vec![conversation(60, "Шесть", true, false)];
             v.open_conversation_message(60, 400, window, cx);
-            v.messaging.open_request
-        })
+            assert!(
+                v.messaging.open_request.is_none(),
+                "an immediate hit cannot leave a deferred slot behind"
+            );
+        });
     });
+    let waiter = release_on_arrival(gate.clone());
+    visual.run_until_parked();
     assert!(
-        second.is_none(),
-        "an immediate hit cannot leave a deferred slot behind"
+        waiter.join().unwrap(),
+        "the first search open reached the server"
     );
-    pump(&mut visual);
+    wait_for(&mut visual, &view, |v| {
+        v.conversation.as_ref().map(|row| row.id) == Some(60)
+            && v.messages.iter().any(|row| row.id == 400)
+    });
     view.read_with(&*visual, |v, _| {
         assert_eq!(
             v.conversation.as_ref().map(|row| row.id),
@@ -277,18 +328,11 @@ async fn two_search_hits_in_a_row_leave_navigation_to_the_last_one(cx: &mut Test
             "the later hit owns the opened conversation"
         );
         assert_eq!(v.channel, 60);
-        assert!(v.messages.iter().any(|row| row.id == 400));
         assert!(v.messages.iter().all(|row| row.id != 300));
         assert_eq!(v.messaging.open_request, None);
         assert!(v.messaging.search.error.is_empty());
     });
-    assert!(
-        server
-            .requests()
-            .iter()
-            .any(|row| row.path == "/api/v1/conversations/50"),
-        "the delayed search open reached the server"
-    );
+    assert_no_open_side_effects(&server);
 }
 
 /// Two unloaded hits clicked in a row: the newer `open_request` replaces the
@@ -296,15 +340,16 @@ async fn two_search_hits_in_a_row_leave_navigation_to_the_last_one(cx: &mut Test
 #[gpui::test]
 async fn two_unloaded_search_hits_keep_only_the_last_navigation(cx: &mut TestAppContext) {
     cx.update(|cx| gpui_component::init(cx));
+    let older = Gate::new();
+    let newer = Gate::new();
     let server = TestServer::spawn(vec![
         Reply::new(200, &conversation_json(50, "Пять"))
             .with_path("/api/v1/conversations/50")
-            .with_delay(Duration::from_millis(100)),
+            .with_gate(older.clone()),
         Reply::new(200, &conversation_json(60, "Шесть"))
             .with_path("/api/v1/conversations/60")
-            .with_delay(Duration::from_millis(400)),
-        Reply::new(200, &messages_page(Vec::new()))
-            .with_path("/api/v1/conversations/60/messages"),
+            .with_gate(newer.clone()),
+        Reply::new(200, &messages_page(Vec::new())).with_path("/api/v1/conversations/60/messages"),
         Reply::new(200, r#"{"conversation_id":60,"muted":false}"#)
             .with_path("/api/v1/conversations/60/notifications"),
         Reply::new(200, &messages_page(Vec::new())),
@@ -312,18 +357,46 @@ async fn two_unloaded_search_hits_keep_only_the_last_navigation(cx: &mut TestApp
     ]);
     let (window, view) = make_app(cx, direct_client(&server));
     let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
-    let slots = visual.update(|window, app| {
+    older.arm();
+    visual.update(|window, app| {
         view.update(app, |v, cx| {
             v.personal_mode = true;
             v.messaging.global = true;
             v.open_conversation_message(50, 300, window, cx);
-            let older = v.messaging.open_request.expect("the first hit owns a slot");
+            assert!(
+                v.messaging.open_request.is_some(),
+                "the first hit owns a slot"
+            );
+        });
+    });
+    newer.arm();
+    let slots = visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            let older_slot = v.messaging.open_request.expect("the first slot");
             v.open_conversation_message(60, 400, window, cx);
-            (older, v.messaging.open_request.expect("the second hit owns a slot"))
+            (
+                older_slot,
+                v.messaging
+                    .open_request
+                    .expect("the second hit owns a slot"),
+            )
         })
     });
     assert_ne!(slots.0, slots.1, "each hit gets a fresh request id");
-    pump(&mut visual);
+    let waiter_older = release_on_arrival(older.clone());
+    let waiter_newer = release_on_arrival(newer.clone());
+    visual.run_until_parked();
+    assert!(
+        waiter_older.join().unwrap(),
+        "the older hit reached the server"
+    );
+    assert!(
+        waiter_newer.join().unwrap(),
+        "the newer hit reached the server"
+    );
+    wait_for(&mut visual, &view, |v| {
+        v.conversation.as_ref().map(|row| row.id) == Some(60)
+    });
     view.read_with(&*visual, |v, _| {
         assert_eq!(
             v.conversation.as_ref().map(|row| row.id),
@@ -331,19 +404,16 @@ async fn two_unloaded_search_hits_keep_only_the_last_navigation(cx: &mut TestApp
             "only the last hit owns the navigation"
         );
         assert_eq!(v.channel, 60);
-        assert!(v.messaging.open_request.is_none());
+        assert_eq!(
+            v.messaging.open_request, None,
+            "a late answer must not clear a newer slot"
+        );
         assert!(
             v.messaging.search.error.is_empty(),
             "the older answer must not be reported as a failure"
         );
     });
-    let requests = server.requests();
-    assert!(requests
-        .iter()
-        .any(|row| row.path == "/api/v1/conversations/50"));
-    assert!(requests
-        .iter()
-        .any(|row| row.path == "/api/v1/conversations/60"));
+    assert_no_open_side_effects(&server);
 }
 
 /// The normal path stays intact: one search hit loads its row outside the index
@@ -355,8 +425,7 @@ async fn a_single_search_hit_still_opens_its_conversation_and_message(cx: &mut T
         Reply::new(200, &conversation_json(50, "Пять")).with_path("/api/v1/conversations/50"),
         Reply::new(200, &messages_page(vec![message(300, 50)]))
             .with_path("/api/v1/conversations/50/messages?before=301"),
-        Reply::new(200, &messages_page(Vec::new()))
-            .with_path("/api/v1/conversations/50/messages"),
+        Reply::new(200, &messages_page(Vec::new())).with_path("/api/v1/conversations/50/messages"),
         Reply::new(200, r#"{"conversation_id":50,"muted":false}"#)
             .with_path("/api/v1/conversations/50/notifications"),
     ]);
@@ -384,11 +453,277 @@ async fn a_single_search_hit_still_opens_its_conversation_and_message(cx: &mut T
             "the loaded row joins the index"
         );
     });
-    assert!(
-        server
-            .requests()
-            .iter()
-            .any(|row| row.path == "/api/v1/conversations/50"),
-        "the delayed search open reached the server"
-    );
+    assert!(server
+        .requests()
+        .iter()
+        .any(|row| row.path == "/api/v1/conversations/50"));
+}
+
+/// Switching the search to the name filter hides the message results; a hit
+/// clicked before the switch must not open or report anything.
+#[gpui::test]
+async fn switching_the_search_mode_cancels_a_deferred_open(cx: &mut TestAppContext) {
+    cx.update(|cx| gpui_component::init(cx));
+    let gate = Gate::new();
+    let server = TestServer::spawn(vec![
+        Reply::new(200, &conversation_json(50, "Пять"))
+            .with_path("/api/v1/conversations/50")
+            .with_gate(gate.clone()),
+        Reply::new(200, &messages_page(Vec::new())),
+        Reply::new(200, r#"{"conversation_id":50,"muted":false}"#),
+    ]);
+    let (window, view) = make_app(cx, direct_client(&server));
+    let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
+    gate.arm();
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            v.personal_mode = true;
+            v.messaging.global = true;
+            v.open_conversation_message(50, 300, window, cx);
+            assert!(v.messaging.open_request.is_some());
+        });
+    });
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            v.toggle_messages_search_mode(window, cx);
+            assert!(!v.messaging.global);
+            assert!(
+                v.messaging.open_request.is_none(),
+                "the mode switch cancels the deferred open"
+            );
+        });
+    });
+    let waiter = release_on_arrival(gate.clone());
+    visual.run_until_parked();
+    assert!(waiter.join().unwrap(), "the held hit reached the server");
+    visual.run_until_parked();
+    view.read_with(&*visual, |v, _| {
+        assert!(v.conversation.is_none());
+        assert!(v.messaging.search.error.is_empty());
+        assert!(v.messaging.open_request.is_none());
+    });
+    assert_no_open_side_effects(&server);
+}
+
+/// Leaving the personal surface drops the search and its deferred navigation.
+#[gpui::test]
+async fn leaving_the_personal_surface_cancels_a_deferred_open(cx: &mut TestAppContext) {
+    cx.update(|cx| gpui_component::init(cx));
+    let gate = Gate::new();
+    let server = TestServer::spawn(vec![
+        Reply::new(200, &conversation_json(50, "Пять"))
+            .with_path("/api/v1/conversations/50")
+            .with_gate(gate.clone()),
+        Reply::new(200, &messages_page(Vec::new())),
+        Reply::new(200, r#"{"conversation_id":50,"muted":false}"#),
+    ]);
+    let (window, view) = make_app(cx, direct_client(&server));
+    let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
+    gate.arm();
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            v.personal_mode = true;
+            v.personal_return = Some((1, 0));
+            v.messaging.global = true;
+            v.open_conversation_message(50, 300, window, cx);
+            assert!(v.messaging.open_request.is_some());
+        });
+    });
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            v.return_to_channels(window, cx);
+            assert!(!v.personal_mode);
+            assert!(v.messaging.open_request.is_none());
+        });
+    });
+    let waiter = release_on_arrival(gate.clone());
+    visual.run_until_parked();
+    assert!(waiter.join().unwrap(), "the held hit reached the server");
+    visual.run_until_parked();
+    view.read_with(&*visual, |v, _| {
+        assert!(v.conversation.is_none());
+        assert!(v.messaging.search.error.is_empty());
+        assert!(v.messaging.open_request.is_none());
+    });
+    assert_no_open_side_effects(&server);
+}
+
+/// A hit belongs to the query it was found with. Typing a new query cancels it
+/// before the answer arrives.
+#[gpui::test]
+async fn editing_the_search_query_cancels_a_deferred_open(cx: &mut TestAppContext) {
+    cx.update(|cx| gpui_component::init(cx));
+    let gate = Gate::new();
+    let server = TestServer::spawn(vec![
+        Reply::new(200, &conversation_json(50, "Пять"))
+            .with_path("/api/v1/conversations/50")
+            .with_gate(gate.clone()),
+        Reply::new(200, &messages_page(Vec::new())),
+        Reply::new(200, r#"{"conversation_id":50,"muted":false}"#),
+    ]);
+    let (window, view) = make_app(cx, direct_client(&server));
+    let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
+    gate.arm();
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            v.personal_mode = true;
+            v.messaging.global = true;
+            v.messaging.search.results = vec![voxhold_api::ConversationSearchHit {
+                id: 3,
+                conversation_id: 50,
+                author_id: 2,
+                author_username: "neva".into(),
+                content: "hit".into(),
+                created_at: 1,
+            }];
+            v.open_conversation_message(50, 300, window, cx);
+            assert!(v.messaging.open_request.is_some());
+        });
+    });
+    visual.update(|window, app| {
+        let query = view.read_with(app, |v, _| v.messaging.query.clone());
+        query.update(app, |input, cx| input.set_value("neva", window, cx));
+    });
+    // The change is delivered as an effect after the update that emitted it.
+    visual.update(|_, app| {
+        view.update(app, |v, _| {
+            assert!(
+                v.messaging.open_request.is_none(),
+                "editing the query cancels the deferred open"
+            );
+            assert!(
+                v.messaging.search.results.is_empty(),
+                "the old result set is dropped with the query"
+            );
+        });
+    });
+    let waiter = release_on_arrival(gate.clone());
+    visual.run_until_parked();
+    assert!(waiter.join().unwrap(), "the held hit reached the server");
+    visual.run_until_parked();
+    view.read_with(&*visual, |v, _| {
+        assert!(v.conversation.is_none());
+        assert!(
+            v.messaging.search.error.is_empty(),
+            "the stale saved answer must not repaint the error"
+        );
+        assert!(v.messaging.search.results.is_empty());
+        assert!(v.messaging.open_request.is_none());
+    });
+    assert_no_open_side_effects(&server);
+}
+
+/// A new submit replaces the query and its results. A held hit of the previous
+/// query must not report a failure or drop the fresh rows (even when it points
+/// at the same conversation and is a saved favorite).
+#[gpui::test]
+async fn a_new_search_submit_cancels_the_previous_hit(cx: &mut TestAppContext) {
+    cx.update(|cx| gpui_component::init(cx));
+    let gate = Gate::new();
+    let fresh = json!({
+        "results": [{
+            "id": 7, "conversation_id": 50, "author_id": 2,
+            "author_username": "neva", "content": "fresh", "created_at": 2
+        }],
+        "has_more": false,
+        "next_before": null
+    })
+    .to_string();
+    let server = TestServer::spawn(vec![
+        Reply::new(200, &saved_conversation_json(50))
+            .with_path("/api/v1/conversations/50")
+            .with_gate(gate.clone()),
+        Reply::new(200, &fresh).with_path("/api/v1/me/conversations/search"),
+        Reply::new(200, &messages_page(Vec::new())),
+        Reply::new(200, r#"{"conversation_id":50,"muted":false}"#),
+    ]);
+    let (window, view) = make_app(cx, direct_client(&server));
+    let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            v.personal_mode = true;
+            v.messaging.global = true;
+            // The query is set before the hit, so only the submit can cancel it.
+            v.messaging
+                .query
+                .update(cx, |input, cx| input.set_value("ol", window, cx));
+        });
+    });
+    gate.arm();
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            v.open_conversation_message(50, 300, window, cx);
+            assert!(v.messaging.open_request.is_some());
+        });
+    });
+    visual.update(|_, app| {
+        view.update(app, |v, cx| {
+            v.submit_messages_search(cx);
+            assert!(
+                v.messaging.open_request.is_none(),
+                "a new submit cancels the previous hit"
+            );
+        });
+    });
+    let waiter = release_on_arrival(gate.clone());
+    visual.run_until_parked();
+    assert!(waiter.join().unwrap(), "the stale hit reached the server");
+    wait_for(&mut visual, &view, |v| !v.messaging.search.loading);
+    view.read_with(&*visual, |v, _| {
+        assert!(
+            v.messaging.search.error.is_empty(),
+            "the stale saved answer must not repaint the error"
+        );
+        assert_eq!(
+            v.messaging.search.results.len(),
+            1,
+            "the fresh result set survives the stale answer"
+        );
+        assert_eq!(v.messaging.search.results[0].id, 7);
+        assert!(v.conversation.is_none());
+        assert!(v.messaging.open_request.is_none());
+    });
+    assert_no_open_side_effects(&server);
+}
+
+/// Invariant guard: an answer never navigates when the search surface is no
+/// longer showing message results, even if the slot survived a mode change.
+#[gpui::test]
+async fn a_hit_answer_is_ignored_when_the_search_surface_is_hidden(cx: &mut TestAppContext) {
+    cx.update(|cx| gpui_component::init(cx));
+    let gate = Gate::new();
+    let server = TestServer::spawn(vec![
+        Reply::new(200, &conversation_json(50, "Пять"))
+            .with_path("/api/v1/conversations/50")
+            .with_gate(gate.clone()),
+        Reply::new(200, &messages_page(Vec::new())),
+        Reply::new(200, r#"{"conversation_id":50,"muted":false}"#),
+    ]);
+    let (window, view) = make_app(cx, direct_client(&server));
+    let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
+    gate.arm();
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            v.personal_mode = true;
+            v.messaging.global = true;
+            v.open_conversation_message(50, 300, window, cx);
+            assert!(v.messaging.open_request.is_some());
+            // The surface stops showing message results while the slot is
+            // still set; the callback must not trust the hit any more.
+            v.messaging.global = false;
+        });
+    });
+    let waiter = release_on_arrival(gate.clone());
+    visual.run_until_parked();
+    assert!(waiter.join().unwrap(), "the held hit reached the server");
+    visual.run_until_parked();
+    view.read_with(&*visual, |v, _| {
+        assert!(v.conversation.is_none());
+        assert!(v.messaging.search.error.is_empty());
+        assert!(
+            v.messaging.open_request.is_none(),
+            "the hidden surface releases its own stale slot"
+        );
+    });
+    assert_no_open_side_effects(&server);
 }

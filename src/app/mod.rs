@@ -625,6 +625,9 @@ impl Voxhold {
             |this, _, event: &InputEvent, cx| match event {
                 InputEvent::Change => {
                     if this.messaging.global {
+                        // A new query is a new intent: a hit clicked for the
+                        // previous query must not open behind fresh results.
+                        this.messaging.open_request = None;
                         this.messaging.search.invalidate();
                     }
                     cx.notify();

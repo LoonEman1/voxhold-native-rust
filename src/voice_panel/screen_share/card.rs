@@ -44,6 +44,14 @@ impl VoicePanel {
         });
         let quality = self.screen.quality_label();
         let sound = self.screen.sound_label();
+        // One shared helper builds the line for the card and the test hook, so
+        // a painted-card test checks the real rendering rather than a copy.
+        let line = screen_on_air_line(&sharing, &quality, &sound, stats.as_deref());
+        // GPUI's test context has no text query. The exact painted line is a
+        // debug selector on the text box, so a painted-card test can prove that
+        // the scope is really in the card. The inner line keeps the stable
+        // `screen-on-air-quality` key used by layout tests.
+        let selector_line = line.clone();
         let mut card = div()
             .id("screen-on-air")
             .debug_selector(|| "screen-on-air".into())
@@ -115,14 +123,16 @@ impl VoicePanel {
                     .left(px(12.))
                     .top(px(rect.h - 50.))
                     .w(px((rect.w - 24.).max(0.)))
-                    .text_size(px(10.))
-                    .text_color(rgb(c.muted))
-                    .truncate()
-                    .debug_selector(|| "screen-on-air-quality".into())
-                    .child(match stats {
-                        Some(stats) => format!("{quality} · {stats}"),
-                        None => format!("{quality} · {sound}"),
-                    }),
+                    .debug_selector(move || format!("screen-on-air-line:{selector_line}").into())
+                    .child(
+                        div()
+                            .w_full()
+                            .text_size(px(10.))
+                            .text_color(rgb(c.muted))
+                            .truncate()
+                            .debug_selector(|| "screen-on-air-quality".into())
+                            .child(line),
+                    ),
             );
         if sharing.phase != Phase::Stopping {
             let mut actions = div()

@@ -266,7 +266,7 @@ impl ScreenShareUi {
     }
 
     /// The settings that a live attempt applies. Shown on the on-air card.
-    fn quality_label(&self) -> String {
+    pub(super) fn quality_label(&self) -> String {
         self.sharing
             .quality
             .unwrap_or_else(|| self.quality())
@@ -327,6 +327,31 @@ impl ScreenShareUi {
 
     pub(super) fn restart_warning(&self) -> Option<&'static str> {
         self.restart.then_some(RESTART_WARNING)
+    }
+}
+
+/// The exact line the on-air card paints under its title. `stats` carries the
+/// measured counters once the engine sampled them, `sound` is the fallback
+/// label (which already names the scope). The engine's real scope is appended
+/// exactly once, so the measured-stats card names the capture instead of hiding
+/// it behind the counters.
+pub(in crate::voice_panel) fn screen_on_air_line(
+    sharing: &Sharing,
+    quality: &str,
+    sound: &str,
+    stats: Option<&str>,
+) -> String {
+    let scope = sharing
+        .audio_scope
+        .as_deref()
+        .filter(|scope| sharing.has_audio && !scope.is_empty());
+    match (stats, scope) {
+        (Some(stats), Some(scope)) => format!("{quality} · {stats} · {scope}"),
+        (Some(stats), None) => format!("{quality} · {stats}"),
+        (None, Some(scope)) if !sound.contains(scope) => {
+            format!("{quality} · {sound} · {scope}")
+        }
+        (None, _) => format!("{quality} · {sound}"),
     }
 }
 

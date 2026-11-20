@@ -7,7 +7,7 @@
 //!
 //! Windows offers two loopback scopes. The plain endpoint loopback captures
 //! everything the default render endpoint plays, including Voxhold's own room
-//! and stream player. Windows 10 2004+ and Windows 11 also expose process
+//! and stream player. Windows 10 build 20348+ and Windows 11 also expose process
 //! loopback (`ActivateAudioInterfaceAsync` with
 //! `PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE` /
 //! `EXCLUDE_TARGET_PROCESS_TREE`), which is the only way to keep the room voice
@@ -675,9 +675,9 @@ mod wasapi_manual {
     }
 
     /// Manual proof of the window scope: process loopback INCLUDE of this test
-    /// process must carry the tone this process plays. Needs Windows 10 2004+
-    /// or Windows 11. No other application has to be quiet for the positive
-    /// assertion; the negative one is checked by the next test.
+    /// process must carry the tone this process plays. Needs Windows 10 build
+    /// 20348+ or Windows 11. No other application has to be quiet for the
+    /// positive assertion; the negative one is checked by the next test.
     #[test]
     #[ignore = "manual: requires Windows process loopback and plays a short tone"]
     fn process_loopback_of_this_process_captures_its_own_tone() {

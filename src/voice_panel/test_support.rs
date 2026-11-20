@@ -462,13 +462,37 @@ impl VoicePanel {
         });
         request.quality = self.screen.quality();
         request.audio = self.screen.audio_requested();
-        request.audio_scope = self.screen.audio_scope;
+        // Mirror the production `commit_screen_share`: the selected identity
+        // decides the kind, so a stale window-only choice for a monitor (or the
+        // reverse) cannot slip through the test seam. The fallback request uses
+        // its own source kind when no row is selected.
+        let kind = self
+            .screen
+            .selected
+            .map(|id| id.kind)
+            .unwrap_or(request.source.kind);
+        request.audio_scope = self.screen.effective_audio_scope(kind);
         request
     }
 
     /// The on-air sound line the card paints.
     pub fn test_sound_label(&self) -> String {
         self.screen.sound_label()
+    }
+
+    /// The exact on-air card line, including the engine's real audio scope.
+    /// It is built by the same helper as the painted card.
+    pub fn test_screen_on_air_line(&self) -> String {
+        let sharing = &self.screen.sharing;
+        let quality = self.screen.quality_label();
+        let sound = self.screen.sound_label();
+        let stats = sharing.stats.map(|stats| stats.describe());
+        crate::voice_panel::screen_share::screen_on_air_line(
+            sharing,
+            &quality,
+            &sound,
+            stats.as_deref(),
+        )
     }
 
     /// The restart warning shown in the live dialog, if any.

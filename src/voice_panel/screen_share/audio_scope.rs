@@ -2,8 +2,8 @@
 //!
 //! Windows offers three honest scopes for the screen-share sound: the process
 //! tree of the selected window, the whole endpoint except this client, or the
-//! whole endpoint. The first two are process loopback (`Windows 10 2004+` or
-//! Windows 11); the third is the plain endpoint loopback. The picker states
+//! whole endpoint. The first two are process loopback (`Windows 10 build 20348+`
+//! or Windows 11); the third is the plain endpoint loopback. The picker states
 //! what the engine really captures instead of promising echo-free audio it
 //! cannot deliver with the whole-device scope.
 
@@ -17,7 +17,7 @@ pub(super) const DEVICE_LABEL: &str = "Всё устройство вывода"
 pub(super) const WINDOW_SENTENCE: &str =
     "Захватываются только процессы выбранного окна через Windows process loopback; если Windows его не поддерживает, трансляция завершится ошибкой.";
 pub(super) const EXCLUDE_SENTENCE: &str =
-    "Захватывается весь звук устройства вывода, кроме процессов Voxhold: голос комнаты и плеер в трансляцию не попадут.";
+    "Захватывается весь звук устройства вывода, кроме процессов Voxhold: голос комнаты и плеер в трансляцию не попадут. Если Windows не поддерживает process loopback, запуск завершится ошибкой, а не переходом на весь звук устройства.";
 pub(super) const DEVICE_SENTENCE: &str =
     "Захватывается всё, что воспроизводится на устройстве вывода по умолчанию, включая голос комнаты и плеер Voxhold.";
 

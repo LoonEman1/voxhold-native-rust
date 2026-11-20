@@ -1,5 +1,5 @@
-//! WASAPI loopback of the default render endpoint and, on Windows 10 2004+
-//! (or Windows 11), process loopback of one process tree.
+//! WASAPI loopback of the default render endpoint and, on Windows 10 build
+//! 20348+ or Windows 11, process loopback of one process tree.
 //!
 //! Shared mode with `AUDCLNT_STREAMFLAGS_LOOPBACK` is the only capture that
 //! needs no new dependency: `windows 0.61` already exposes the interfaces. The
@@ -288,11 +288,39 @@ fn process_loopback_params(pid: u32, mode: PROCESS_LOOPBACK_MODE) -> AUDIOCLIENT
     }
 }
 
+/// Owns the activation payload and the `VT_BLOB` `PROPVARIANT` for the whole
+/// asynchronous activation. The parameters live in a `Box`, so moving this
+/// value into the COM handler never moves the bytes `pBlobData` points at.
+/// The variant is deliberately `ManuallyDrop`: the crate's `Drop` calls
+/// `PropVariantClear`, which would `CoTaskMemFree` the caller-owned params
+/// through `pBlobData`. Releasing this struct after the callback drops only the
+/// boxed params; the variant needs no clear.
+struct ActivationKeepAlive {
+    _params: Box<AUDIOCLIENT_ACTIVATION_PARAMS>,
+    variant: Box<ManuallyDrop<PROPVARIANT>>,
+}
+
+impl ActivationKeepAlive {
+    fn new(pid: u32, mode: PROCESS_LOOPBACK_MODE) -> Self {
+        let mut params = Box::new(process_loopback_params(pid, mode));
+        let variant = Box::new(activation_blob(&mut params));
+        Self {
+            _params: params,
+            variant,
+        }
+    }
+
+    fn variant(&self) -> &PROPVARIANT {
+        &self.variant
+    }
+
+    fn variant_ptr(&self) -> *const PROPVARIANT {
+        ptr::from_ref(self.variant())
+    }
+}
+
 /// `ActivateAudioInterfaceAsync` expects the parameters as a `VT_BLOB`
 /// `PROPVARIANT`. The blob points at `params`, which must outlive the call.
-/// The result is deliberately `ManuallyDrop`: the crate's `Drop` calls
-/// `PropVariantClear`, which would `CoTaskMemFree` the caller's stack
-/// parameters through `pBlobData`.
 fn activation_blob(params: &mut AUDIOCLIENT_ACTIVATION_PARAMS) -> ManuallyDrop<PROPVARIANT> {
     let mut variant = PROPVARIANT::default();
     variant.Anonymous.Anonymous = ManuallyDrop::new(PROPVARIANT_0_0 {
@@ -313,6 +341,9 @@ fn activation_blob(params: &mut AUDIOCLIENT_ACTIVATION_PARAMS) -> ManuallyDrop<P
 #[implement(IActivateAudioInterfaceCompletionHandler)]
 struct ActivationHandler {
     sender: mpsc::Sender<Result<IAudioClient, String>>,
+    /// Released only when COM releases the handler after `ActivateCompleted`.
+    /// The activation blob points into this owned parameter block.
+    _keepalive: ActivationKeepAlive,
 }
 
 impl IActivateAudioInterfaceCompletionHandler_Impl for ActivationHandler_Impl {
@@ -348,6 +379,46 @@ impl IActivateAudioInterfaceCompletionHandler_Impl for ActivationHandler_Impl {
     }
 }
 
+/// The COM pair of one activation that has not answered yet. On a timeout the
+/// pair is deliberately leaked: dropping the operation may cancel a callback
+/// that is already in flight, and dropping the handler would release the
+/// `ActivationKeepAlive` while Windows may still read the parameter blob.
+struct PendingActivation {
+    _handler: IActivateAudioInterfaceCompletionHandler,
+    _operation: IActivateAudioInterfaceAsyncOperation,
+}
+
+/// The timeout branch must not release the COM pair and its keepalive while
+/// Windows may still call the handler.
+trait LeakOnTimeout {
+    fn leak(self);
+}
+
+impl LeakOnTimeout for PendingActivation {
+    fn leak(self) {
+        std::mem::forget(self);
+    }
+}
+
+/// Wait for the completion handler with a deadline. On timeout `pending` is
+/// leaked instead of dropped; the callback may otherwise read freed
+/// parameters. `pending` is released normally when the callback answered.
+fn await_activation<T>(
+    receiver: &mpsc::Receiver<Result<T, String>>,
+    timeout: Duration,
+    pending: impl LeakOnTimeout,
+) -> Result<T, String> {
+    match receiver.recv_timeout(timeout) {
+        Ok(result) => result,
+        Err(_) => {
+            pending.leak();
+            Err(format!(
+                "Активация process loopback не завершилась за {timeout:?}."
+            ))
+        }
+    }
+}
+
 /// Activate a process-loopback client. `AUDIOCLIENT_ACTIVATION_PARAMS` tells
 /// Windows which process tree to include or exclude; an unavailable API or a
 /// rejected target is returned to the caller unchanged.
@@ -355,11 +426,17 @@ fn activate_process_loopback(
     pid: u32,
     mode: PROCESS_LOOPBACK_MODE,
 ) -> Result<IAudioClient, String> {
-    let mut params = process_loopback_params(pid, mode);
-    let variant = activation_blob(&mut params);
+    let keepalive = ActivationKeepAlive::new(pid, mode);
+    // Both the params and the variant are boxed, so these allocations stay
+    // valid when the keepalive is moved into the COM handler below.
+    let variant = keepalive.variant_ptr();
     let (sender, receiver) = mpsc::channel();
-    let handler: IActivateAudioInterfaceCompletionHandler = ActivationHandler { sender }.into();
-    let _operation = unsafe {
+    let handler = ActivationHandler {
+        sender,
+        _keepalive: keepalive,
+    };
+    let handler: IActivateAudioInterfaceCompletionHandler = handler.into();
+    let operation = unsafe {
         ActivateAudioInterfaceAsync(
             VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK,
             &IAudioClient::IID,
@@ -368,21 +445,36 @@ fn activate_process_loopback(
         )
     }
     .map_err(|error| format!("Не удалось запустить активацию process loopback: {error}"))?;
-    match receiver.recv_timeout(ACTIVATION_TIMEOUT) {
-        Ok(result) => result,
-        Err(_) => Err(format!(
-            "Активация process loopback не завершилась за {ACTIVATION_TIMEOUT:?}."
-        )),
-    }
+    let pending = PendingActivation {
+        _handler: handler,
+        _operation: operation,
+    };
+    // Windows may still call the handler later. On timeout the operation and
+    // handler are intentionally leaked, keeping both the COM objects and their
+    // boxed parameter blob alive; the callback then sends into a disconnected
+    // channel and is ignored. This is one bounded leak per hung activation, and
+    // activation only starts after an explicit user action.
+    await_activation(&receiver, ACTIVATION_TIMEOUT, pending)
 }
 
 fn open_process(pid: u32, mode: PROCESS_LOOPBACK_MODE) -> Result<Opened, Failure> {
+    open_process_with(pid, mode, activate_process_loopback)
+}
+
+/// The process-loopback open with the activation call injectable, so a test
+/// can prove an activation failure is returned unchanged instead of falling
+/// back to the whole endpoint.
+fn open_process_with(
+    pid: u32,
+    mode: PROCESS_LOOPBACK_MODE,
+    activate: impl FnOnce(u32, PROCESS_LOOPBACK_MODE) -> Result<IAudioClient, String>,
+) -> Result<Opened, Failure> {
     if pid == 0 {
         return Err(Failure::Fatal(
             "Процесс для захвата звука не определён.".into(),
         ));
     }
-    let client = activate_process_loopback(pid, mode).map_err(Failure::Fatal)?;
+    let client = activate(pid, mode).map_err(Failure::Fatal)?;
     // Process loopback rejects `GetMixFormat` and `IsFormatSupported` with
     // E_NOTIMPL (the client is AudioSes!CMixerClient, not an endpoint). The
     // documented path is to initialise it with an explicit format and let the
@@ -702,6 +794,105 @@ mod tests {
         assert_eq!(read_inner.TargetProcessId, 7);
         // The `ManuallyDrop` wrapper is intentionally not unwrapped: the blob
         // borrows this stack value and must not be freed by `PropVariantClear`.
+    }
+
+    #[test]
+    fn the_keepalive_blob_points_into_its_owned_params_after_moving() {
+        let keepalive =
+            ActivationKeepAlive::new(7, PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE);
+        let variant_before = keepalive.variant_ptr();
+        // Moving the keepalive must not move the boxed variant or params: the
+        // COM activation keeps both pointers past this function's stack frame.
+        let mut moved = Box::new(keepalive);
+        assert_eq!(
+            moved.variant_ptr(),
+            variant_before,
+            "the boxed variant keeps its address when the keepalive moves"
+        );
+        let inner = unsafe { &*moved.variant().Anonymous.Anonymous };
+        assert_eq!(inner.vt, VT_BLOB);
+        let blob = unsafe { inner.Anonymous.blob };
+        assert_eq!(
+            blob.cbSize as usize,
+            size_of::<AUDIOCLIENT_ACTIVATION_PARAMS>()
+        );
+        assert_eq!(
+            blob.pBlobData,
+            ptr::from_mut(&mut *moved._params).cast(),
+            "the blob points into the owned params allocation"
+        );
+        let read_back = unsafe { *(blob.pBlobData.cast::<AUDIOCLIENT_ACTIVATION_PARAMS>()) };
+        let read_inner = unsafe { read_back.Anonymous.ProcessLoopbackParams };
+        assert_eq!(read_inner.TargetProcessId, 7);
+    }
+
+    #[test]
+    fn a_timed_out_activation_does_not_release_the_pending_guard() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct DropProbe(Arc<AtomicBool>);
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        impl LeakOnTimeout for DropProbe {
+            fn leak(self) {
+                std::mem::forget(self);
+            }
+        }
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        // Keep the sender alive: this is a real timeout, not a disconnect.
+        let (_sender, receiver) = mpsc::channel::<Result<(), String>>();
+        let error = await_activation(
+            &receiver,
+            Duration::from_millis(1),
+            DropProbe(dropped.clone()),
+        )
+        .expect_err("an activation that never answers is a timeout");
+        assert!(error.contains("не завершилась"), "{error}");
+        assert!(
+            !dropped.load(Ordering::SeqCst),
+            "the pending COM guard must stay alive after the timeout"
+        );
+    }
+
+    #[test]
+    fn an_activation_failure_is_returned_instead_of_opening_the_device() {
+        let mut asked = None;
+        let result = open_process_with(
+            4_242,
+            PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE,
+            |pid, mode| {
+                asked = Some((pid, mode));
+                Err("fake activation failure".into())
+            },
+        );
+        let error = match result {
+            Ok(_) => panic!("a failed activation must not open a capture"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            asked,
+            Some((4_242, PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE)),
+            "the requested process and mode reach the activation call"
+        );
+        match error {
+            Failure::Fatal(message) => {
+                assert!(
+                    message.contains("fake activation failure"),
+                    "the activation error must propagate unchanged: {message}"
+                );
+                assert!(
+                    !message.contains("Устройство вывода по умолчанию"),
+                    "the failure must not describe a whole-device capture: {message}"
+                );
+            }
+            Failure::Reopen(message) => {
+                panic!("an activation failure is terminal, not a reopen: {message}")
+            }
+        }
     }
 
     #[test]

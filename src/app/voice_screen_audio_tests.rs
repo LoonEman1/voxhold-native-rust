@@ -8,6 +8,63 @@ use voxhold_media::screen_capture::SourceKind;
 use voxhold_media::system_audio::AudioScope;
 
 #[gpui::test]
+async fn the_painted_on_air_card_names_the_audio_scope_with_stats(cx: &mut TestAppContext) {
+    use voxhold_media::publisher::engine::PublishStats;
+    use voxhold_media::publisher::{Phase, Quality, Sharing};
+    let (mut visual, _view, voice) = super::voice_tests::fixture(cx);
+    let scope = "Только звук app.exe (PID 42)";
+    visual.update(|_window, app| {
+        voice.update(app, |panel, _| {
+            panel.test_set_screen_sharing(Sharing {
+                phase: Phase::Live,
+                live: true,
+                quality: Some(Quality::default()),
+                has_audio: true,
+                audio_scope: Some(scope.into()),
+                stats: Some(PublishStats {
+                    fps: 30.0,
+                    dropped: 2,
+                    width: 1920,
+                    height: 1080,
+                    sources: 1,
+                    audio_active: true,
+                    audio_kbps: 96.0,
+                    audio_packets_sent: 120,
+                    audio_dropped: 0,
+                    ..Default::default()
+                }),
+                ..Sharing::default()
+            });
+        });
+    });
+    draw(&mut visual);
+    let line = voice.read_with(&*visual, |panel, _| panel.test_screen_on_air_line());
+    assert!(
+        line.contains(scope),
+        "the shared on-air line must carry the real scope with stats: {line}"
+    );
+    assert!(
+        line.contains("96"),
+        "the measured audio rate must stay in the line: {line}"
+    );
+    assert!(
+        line.ends_with(scope),
+        "the scope must be appended to the measured line: {line}"
+    );
+    assert!(
+        visual.debug_bounds("screen-on-air-quality").is_some(),
+        "the stable quality selector must still mark the painted line"
+    );
+    // The text box embeds the exact painted line in its selector, so this
+    // proves the scope reached the card and not only `sound_label`.
+    let selector: &'static str = Box::leak(format!("screen-on-air-line:{line}").into_boxed_str());
+    assert!(
+        visual.debug_bounds(selector).is_some(),
+        "the painted card must contain the exact on-air line: {line}"
+    );
+}
+
+#[gpui::test]
 async fn system_audio_is_off_by_default_and_the_scope_is_explicit(cx: &mut TestAppContext) {
     let (mut visual, _view, voice) = super::voice_tests::fixture(cx);
     draw(&mut visual);

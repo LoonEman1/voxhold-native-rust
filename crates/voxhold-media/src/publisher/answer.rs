@@ -86,6 +86,13 @@ impl Publisher {
             return Vec::new();
         }
         self.answered = true;
+        if self.phase == Phase::Live {
+            // The first frame and the transport can win the race against the
+            // server's confirmation. The publication is already on air, so a
+            // late initial confirmation must not put the card back to
+            // "Подключаемся…" (the same rule as a restart confirmation).
+            return Vec::new();
+        }
         self.status = "Подключаемся…".into();
         vec![Outcome::State(self.sharing())]
     }

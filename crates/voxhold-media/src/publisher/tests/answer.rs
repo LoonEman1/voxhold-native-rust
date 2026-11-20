@@ -180,6 +180,42 @@ fn the_initial_answer_confirmation_still_moves_the_card_to_connecting() {
 }
 
 #[test]
+fn a_late_initial_confirmation_does_not_regress_a_live_card() {
+    let now = Instant::now();
+    let mut publisher = publisher();
+    publishing(&mut publisher, now);
+    publisher.on_server_event("stream.webrtc_offer", "", &json!({"sdp": "v=0 offer"}), now);
+    let answer = publisher.on_engine(EngineEvent::Answer("v=0 answer".into()), now);
+    let id = sends(&answer)[0].request_id.clone().expect("tagged answer");
+
+    // The transport and the first frame reach the air before the server
+    // confirmation of the initial answer.
+    publisher.on_engine(
+        EngineEvent::State(crate::publisher::Connection::Connected),
+        now,
+    );
+    publisher.on_engine(
+        EngineEvent::State(crate::publisher::Connection::FirstFrame),
+        now,
+    );
+    assert_eq!(publisher.phase(), Phase::Live);
+
+    let confirmed = publisher.on_server_event(
+        "stream.webrtc_answered",
+        &id,
+        &json!({"accepted": true}),
+        now,
+    );
+    assert!(
+        confirmed.is_empty(),
+        "the confirmation changes nothing on air: {confirmed:?}"
+    );
+    assert_eq!(publisher.phase(), Phase::Live);
+    assert_eq!(publisher.sharing().status, "В эфире");
+    assert!(publisher.answered);
+}
+
+#[test]
 fn a_confirmation_of_a_superseded_answer_is_ignored() {
     let now = Instant::now();
     let mut publisher = publisher();

@@ -474,6 +474,7 @@ impl Voxhold {
         self.save_composer_draft(cx);
         self.servers.retain(|server| server.id != self.server);
         self.drafts.borrow_mut().clear_server(self.server);
+        self.forget_server_sends(self.server);
         let next = self.servers.first().map_or(0, |server| server.id);
         self.channel = 0;
         self.select_server(next, window, cx);

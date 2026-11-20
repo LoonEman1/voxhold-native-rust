@@ -1,10 +1,11 @@
 //! Bounded queue from the media worker to the runtime.
 //!
-//! Most events are replaceable diagnostics, but a `Bitrate` result decides
-//! whether the dialog leaves `Applying`, and an `Error` decides whether the
-//! attempt survives. An overflow may therefore only evict the oldest
-//! unprotected event; a burst of protected events grows the queue instead of
-//! dropping a result the state machine still needs.
+//! Most events are replaceable diagnostics, but an `Answer` must still reach
+//! the runtime after `set_local_description`, a `Bitrate` result decides
+//! whether the dialog leaves `Applying`, and an `Error`/`Closed` decides
+//! whether the attempt survives. An overflow may therefore only evict the
+//! oldest unprotected event; a burst of protected events grows the queue
+//! instead of dropping a result the state machine still needs.
 
 use std::{collections::VecDeque, sync::Mutex};
 
@@ -28,12 +29,13 @@ impl EventQueue {
             if let Some(index) = items.iter().position(|item| !protected(item)) {
                 items.remove(index);
             } else if !protected(&event) {
-                // Every slot holds a Bitrate/Error event. A replaceable sample
-                // is not worth losing one of them.
+                // Every slot holds a protected event. A replaceable sample is
+                // not worth losing one of them.
                 return;
             }
             // All slots are protected and so is the incoming event: grow rather
-            // than drop a Bitrate result that the publisher still waits for.
+            // than drop an answer, a Bitrate result or a terminal event that
+            // the publisher still waits for.
         }
         items.push_back(event);
     }
@@ -43,10 +45,17 @@ impl EventQueue {
     }
 }
 
-/// A `Bitrate` result ends the `Applying` state, and an `Error` may end the
-/// attempt: neither may be evicted by a diagnostics burst.
+/// An `Answer` is the SDP the runtime still has to send; a `Bitrate` result
+/// ends the `Applying` state; an `Error`/`Closed` ends the attempt. None of
+/// them may be evicted by a diagnostics or ICE burst.
 fn protected(event: &EngineEvent) -> bool {
-    matches!(event, EngineEvent::Bitrate { .. } | EngineEvent::Error(_))
+    matches!(
+        event,
+        EngineEvent::Answer(_)
+            | EngineEvent::Bitrate { .. }
+            | EngineEvent::Error(_)
+            | EngineEvent::Closed
+    )
 }
 
 #[cfg(test)]
@@ -64,6 +73,15 @@ mod tests {
             op,
             result: BitrateResult::Applied,
         }
+    }
+
+    fn ice() -> EngineEvent {
+        EngineEvent::Ice(crate::Candidate {
+            candidate: "candidate:1 1 udp 1 127.0.0.1 5000 typ host".into(),
+            sdp_mid: Some("0".into()),
+            sdp_mline_index: Some(0),
+            username_fragment: None,
+        })
     }
 
     fn drain(queue: &EventQueue) -> Vec<EngineEvent> {
@@ -110,6 +128,45 @@ mod tests {
                     event,
                     EngineEvent::State(Connection::Connected) | EngineEvent::Stats(_)
                 )),
+            "only replaceable samples may remain or be dropped"
+        );
+    }
+
+    /// An answer sits behind an ICE burst in the same queue. `set_local_description`
+    /// succeeds before the runtime drains it, so the burst may evict only its
+    /// own samples: the SDP and the terminal `Closed` still reach the runtime.
+    #[test]
+    fn an_ice_burst_never_evicts_an_answer_or_a_closed_event() {
+        let queue = EventQueue::default();
+        for _ in 0..ENGINE_EVENT_CAPACITY / 2 {
+            queue.push(ice());
+        }
+        let answer = EngineEvent::Answer("v=0\r\na=mid:0\r\n".into());
+        let closed = EngineEvent::Closed;
+        queue.push(answer.clone());
+        queue.push(closed.clone());
+        for _ in 0..ENGINE_EVENT_CAPACITY * 2 {
+            queue.push(ice());
+            queue.push(EngineEvent::Stats(super::super::PublishStats::default()));
+        }
+
+        let drained = drain(&queue);
+        assert_eq!(
+            drained.iter().filter(|event| **event == answer).count(),
+            1,
+            "the ICE burst must not swallow the answer: {} events",
+            drained.len()
+        );
+        assert!(
+            drained.contains(&closed),
+            "the ICE burst must not swallow Closed: {} events",
+            drained.len()
+        );
+        assert!(
+            drained
+                .iter()
+                .filter(|event| !protected(event))
+                .all(|event| matches!(event, EngineEvent::Ice(_) | EngineEvent::Stats(_))),
             "only replaceable samples may remain or be dropped"
         );
     }

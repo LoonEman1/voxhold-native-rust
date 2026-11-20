@@ -541,7 +541,18 @@ impl Publisher {
             "stream.left" => self.on_left_ack(request_id),
             "stream.webrtc_closed" => self.on_closed(data, now),
             "error" => {
-                if !self.active() || !self.tracked(request_id) {
+                if !self.active() {
+                    return Vec::new();
+                }
+                // The pinned backend reports a refused answer as `error`
+                // tagged with that `stream.webrtc_answer` id; it never sends
+                // `accepted:false`. Once a newer offer/answer replaced that
+                // answer, the refusal no longer decides this negotiation. The
+                // current answer's error still fails the publication.
+                if self.pending_answer.is_superseded(request_id) {
+                    return Vec::new();
+                }
+                if !self.tracked(request_id) {
                     return Vec::new();
                 }
                 self.fail(&reason::server_error(data), now)
@@ -636,7 +647,7 @@ impl Publisher {
         //
         // A repeated offer (ICE restart) supersedes an answer that is still
         // unconfirmed, so its late confirmation cannot decide this one.
-        self.clear_answer();
+        self.supersede_answer();
         vec![Outcome::Offer(sdp.to_owned())]
     }
 

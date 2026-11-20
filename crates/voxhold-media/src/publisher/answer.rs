@@ -6,11 +6,22 @@
 //! attempt and the confirmed settings exactly where they are. A newer offer
 //! supersedes an answer that is still unconfirmed, so a late confirmation of
 //! the older SDP cannot decide the current negotiation.
+//!
+//! The pinned backend has no `accepted:false`: a refused answer arrives as
+//! `error` tagged with the request id of that `stream.webrtc_answer`. Only the
+//! ids of the last superseded answers are remembered (a bounded history), so a
+//! refusal of an answer this attempt has already replaced is ignored while the
+//! current answer's error still fails the publication.
 
 use serde_json::{Value, json};
 use std::time::Instant;
 
 use super::{Outcome, Phase, Publisher};
+
+/// How many replaced answer ids are remembered. Only the immediate
+/// renegotiation matters: a newer offer supersedes the previous answer, so two
+/// slots cover an offer/answer that itself replaced another one.
+const SUPERSEDED_ANSWERS: usize = 2;
 
 /// The answer whose `stream.webrtc_answered` is still awaited. The backend
 /// echoes the request id of `stream.webrtc_answer`, so only this tag may
@@ -21,12 +32,50 @@ pub(super) struct PendingAnswer {
     /// The answer belongs to a renegotiation after the initial one was
     /// confirmed. Its confirmation changes nothing on air.
     restart: bool,
+    /// Request ids of answers that a newer offer/answer replaced before they
+    /// were decided. Oldest first, bounded by [`SUPERSEDED_ANSWERS`].
+    superseded: Vec<String>,
 }
 
 impl PendingAnswer {
-    fn clear(&mut self) {
+    /// Start a new answer, remembering the one it replaces.
+    fn begin(&mut self, request: Option<String>, restart: bool) {
+        self.supersede();
+        self.request = request;
+        self.restart = restart;
+    }
+
+    /// A newer offer or answer replaces the unconfirmed one. The replaced id
+    /// stays in the bounded history so its refusal cannot decide the attempt.
+    fn supersede(&mut self) {
+        if let Some(request) = self.request.take()
+            && !self.superseded.contains(&request)
+        {
+            if self.superseded.len() == SUPERSEDED_ANSWERS {
+                self.superseded.remove(0);
+            }
+            self.superseded.push(request);
+        }
+        self.restart = false;
+    }
+
+    /// The current answer was decided; the superseded history belongs to the
+    /// same attempt and stays until the attempt itself ends.
+    fn resolve(&mut self) {
         self.request = None;
         self.restart = false;
+    }
+
+    /// A new attempt never inherits the answers or their history.
+    fn clear(&mut self) {
+        self.resolve();
+        self.superseded.clear();
+    }
+
+    /// The backend rejected this answer, and a newer offer/answer has already
+    /// taken over the negotiation.
+    pub(super) fn is_superseded(&self, request_id: &str) -> bool {
+        !request_id.is_empty() && self.superseded.iter().any(|id| id == request_id)
     }
 }
 
@@ -41,17 +90,21 @@ impl Publisher {
         // restart on the same publication, even if the card is not live yet.
         let restart = self.answered || self.phase == Phase::Live;
         let signal = self.signal("stream.webrtc_answer", json!({"sdp": sdp}));
-        self.pending_answer = PendingAnswer {
-            request: signal.request_id.clone(),
-            restart,
-        };
+        self.pending_answer
+            .begin(signal.request_id.clone(), restart);
         vec![Outcome::Send(signal)]
     }
 
-    /// A newer offer, or the start/end of an attempt, replaces the answer that
-    /// is still unconfirmed with the one that now decides the negotiation.
+    /// The start or end of an attempt drops the answer that is still
+    /// unconfirmed (and its superseded history) before a new one decides.
     pub(super) fn clear_answer(&mut self) {
         self.pending_answer.clear();
+    }
+
+    /// A newer offer replaces the answer that is still unconfirmed. The
+    /// replaced id is remembered so its refusal cannot decide this attempt.
+    pub(super) fn supersede_answer(&mut self) {
+        self.pending_answer.supersede();
     }
 
     /// `stream.webrtc_answered`. A tagged confirmation must name the answer
@@ -73,7 +126,7 @@ impl Publisher {
             return Vec::new();
         }
         let restart = self.pending_answer.restart;
-        self.pending_answer.clear();
+        self.pending_answer.resolve();
         if !data["accepted"].as_bool().unwrap_or(false) {
             // A refusal is real even for a restart: the backend did not apply
             // the new SDP, so the publication cannot continue.

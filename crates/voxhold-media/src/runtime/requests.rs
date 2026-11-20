@@ -40,6 +40,16 @@ pub(super) enum ScreenCommand {
         stream_permission: bool,
         slot_available: bool,
     },
+    /// Only the bitrates changed: the live sender applies them without a stop
+    /// or a new start.
+    LiveQuality {
+        request: PublishRequest,
+        stream_permission: bool,
+        slot_available: bool,
+    },
+    /// The user closed the quality dialog while the restart preflight was
+    /// running. The live stream stays untouched.
+    CancelRestart,
     Stop,
 }
 

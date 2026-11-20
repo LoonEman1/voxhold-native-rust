@@ -67,7 +67,9 @@ impl Codec {
 }
 
 mod quality;
-pub use quality::{AUDIO_BITRATES, Preset, Quality, Resolution, normalize_audio_bitrate};
+pub use quality::{
+    AUDIO_BITRATES, Preset, Quality, QualityChange, Resolution, normalize_audio_bitrate,
+};
 
 /// One capture attempt chosen in the picker.
 #[derive(Clone, Debug, PartialEq)]
@@ -102,6 +104,9 @@ pub struct Sharing {
     /// A confirmed stop+start is in flight. The UI must warn that the stream
     /// will restart instead of claiming a live change.
     pub restarting: bool,
+    /// A restart preflight is validating the new capture while the live stream
+    /// keeps running. Nothing was stopped yet.
+    pub preflighting: bool,
     pub status: String,
     pub error: Option<String>,
     pub stats: Option<engine::PublishStats>,
@@ -118,6 +123,7 @@ impl Default for Sharing {
             has_audio: false,
             audio_scope: None,
             restarting: false,
+            preflighting: false,
             status: String::new(),
             error: None,
             stats: None,
@@ -174,6 +180,12 @@ pub enum Outcome {
     /// Drop the viewer first and wait for `stream.left` (or five seconds).
     LeaveViewer,
     Send(Signal),
+    /// The engine must apply this video/audio bitrate limit to its live
+    /// sender. No renegotiation and no new `stream.start` follows.
+    SetBitrate {
+        attempt: u64,
+        quality: Quality,
+    },
     /// The engine must apply this remote offer and produce an answer.
     Offer(String),
     Ice(crate::Candidate),
@@ -215,7 +227,16 @@ pub struct Publisher {
     /// reconfigure, so the new request waits for the current `stream.stop`
     /// acknowledgement (or its bounded timeout) and then starts a new attempt.
     pending_restart: Option<PublishRequest>,
+    /// The request of the attempt that was live when a restart began. A local
+    /// failure of the new attempt may restore it exactly once.
+    rollback: Option<PublishRequest>,
+    /// The one automatic restore was already used; a second local failure is
+    /// terminal instead of looping.
+    rollback_used: bool,
     restarting: bool,
+    /// A restart preflight is validating a new capture; the live stream was
+    /// not touched. The UI keeps the dialog open so closing it can cancel.
+    preflighting: bool,
     /// The backend broadcasts `stream.stopped` to the whole server and also
     /// answers `stream.stop` directly, so one stop produces two events. After
     /// a confirmed stop the second copy must not end the freshly restarted
@@ -261,7 +282,10 @@ impl Publisher {
             attempt: 0,
             request: None,
             pending_restart: None,
+            rollback: None,
+            rollback_used: false,
             restarting: false,
+            preflighting: false,
             ignore_stop_echo: false,
             has_audio: false,
             audio_scope: None,
@@ -296,6 +320,7 @@ impl Publisher {
             has_audio: self.has_audio,
             audio_scope: self.audio_scope.clone(),
             restarting: self.restarting,
+            preflighting: self.preflighting,
             status: self.status.clone(),
             error: self.error.clone(),
             stats: self.stats,
@@ -399,6 +424,11 @@ impl Publisher {
         }
         let mut request = request;
         request.quality = request.quality.clamped();
+        // Keep the confirmed live request. If the new attempt fails locally
+        // after the old stream was stopped, it is restored once.
+        self.rollback = self.request.clone();
+        self.rollback_used = false;
+        self.preflighting = false;
         self.pending_restart = Some(request);
         self.restarting = true;
         self.status = "Перезапускаем трансляцию…".into();
@@ -479,9 +509,10 @@ impl Publisher {
         out
     }
 
-    /// The engine could not be created for this attempt.
+    /// The engine could not be created for this attempt, or the local media
+    /// path failed. A restart attempt may restore the previous request once.
     pub fn on_start_failed(&mut self, message: &str, now: Instant) -> Vec<Outcome> {
-        self.fail(message, now)
+        self.fail_local(message, now)
     }
 
     pub fn tick(&mut self, now: Instant) -> Vec<Outcome> {
@@ -533,7 +564,7 @@ impl Publisher {
                 if !self.active() || !self.tracked(request_id) {
                     return Vec::new();
                 }
-                self.fail(&server_error(data), now)
+                self.fail(&reason::server_error(data), now)
             }
             _ => Vec::new(),
         }
@@ -578,8 +609,8 @@ impl Publisher {
                 }
                 Vec::new()
             }
-            EngineEvent::Error(message) => self.fail(&message, now),
-            EngineEvent::Closed => self.fail("Соединение трансляции закрыто.", now),
+            EngineEvent::Error(message) => self.fail_local(&message, now),
+            EngineEvent::Closed => self.fail_local("Соединение трансляции закрыто.", now),
         }
     }
 
@@ -675,7 +706,7 @@ impl Publisher {
                 let message = if reason.is_empty() || reason == "stream stopped by user" {
                     "Трансляция остановлена."
                 } else {
-                    reason_message(reason)
+                    reason::reason_message(reason)
                 };
                 self.fail(message, now)
             }
@@ -703,13 +734,13 @@ impl Publisher {
                 // the confirmed stop and belongs to the attempt that is
                 // already gone. A real failure of the new peer is reported by
                 // the local `EngineEvent::Closed`/error path.
-                if self.ignore_stop_echo && stale_media_close(reason) {
+                if self.ignore_stop_echo && reason::stale_media_close(reason) {
                     return Vec::new();
                 }
                 let message = if reason.is_empty() {
                     "Соединение трансляции закрыто сервером.".to_owned()
                 } else {
-                    reason_message(reason).to_owned()
+                    reason::reason_message(reason).to_owned()
                 };
                 self.fail(&message, now)
             }
@@ -812,6 +843,11 @@ impl Publisher {
         self.phase = Phase::Live;
         self.deadline = None;
         self.status = "В эфире".into();
+        // A fresh confirmed attempt can serve as the rollback target of the
+        // next restart and may restore itself once.
+        self.rollback = None;
+        self.rollback_used = false;
+        self.preflighting = false;
         vec![Outcome::State(self.sharing())]
     }
 
@@ -837,7 +873,10 @@ impl Publisher {
         self.deadline = None;
         self.stop_deadline = None;
         self.pending_restart = None;
+        self.rollback = None;
+        self.rollback_used = false;
         self.restarting = false;
+        self.preflighting = false;
         self.ignore_stop_echo = false;
         self.has_audio = false;
         self.audio_scope = None;
@@ -880,6 +919,7 @@ impl Publisher {
         self.stats = None;
         self.error = None;
         self.restarting = false;
+        self.preflighting = false;
         self.has_audio = false;
         self.audio_scope = None;
         vec![
@@ -895,7 +935,10 @@ impl Publisher {
         self.phase = Phase::Idle;
         self.request = None;
         self.pending_restart = None;
+        self.rollback = None;
+        self.rollback_used = false;
         self.restarting = false;
+        self.preflighting = false;
         self.ignore_stop_echo = false;
         self.has_audio = false;
         self.audio_scope = None;
@@ -931,50 +974,11 @@ impl Publisher {
     }
 }
 
-/// Media-session reasons the backend emits while tearing down a publication
-/// that the client already stopped. They are not a permission or voice loss.
-fn stale_media_close(reason: &str) -> bool {
-    matches!(
-        reason,
-        "stream WebRTC connection closed"
-            | "stream signaling connection was lost"
-            | "stream WebRTC recovery exhausted"
-    )
-}
-
-fn server_error(data: &Value) -> String {
-    let message = data["message"].as_str().unwrap_or_default();
-    match data["code"].as_str().unwrap_or_default() {
-        "forbidden" => "Нет права запускать трансляцию.".into(),
-        "invalid_payload" => "Сервер отклонил параметры трансляции.".into(),
-        "internal_error" => "Сервер не смог запустить трансляцию.".into(),
-        "invalid_state" if message.contains("limit reached") => {
-            "В канале уже 8 трансляций. Дождитесь завершения одной из них.".into()
-        }
-        "invalid_state" if message.contains("same voice channel") => {
-            "Сначала подключитесь к голосовому каналу.".into()
-        }
-        "invalid_state" if message.contains("already active") => "Трансляция уже запущена.".into(),
-        _ => "Сервер отклонил запуск трансляции.".into(),
-    }
-}
-
-fn reason_message(reason: &str) -> &'static str {
-    let reason = reason.to_lowercase();
-    if reason.contains("permission") || reason.contains("access") {
-        "Доступ к трансляции отозван."
-    } else if reason.contains("voice") {
-        "Голосовое соединение завершилось, трансляция остановлена."
-    } else if reason.contains("bitrate") {
-        "Превышен битрейт трансляции."
-    } else if reason.contains("rendition") {
-        "Сервер не принял параметры трансляции."
-    } else {
-        "Сервер остановил трансляцию."
-    }
-}
-
 pub mod engine;
+
+mod live_change;
+pub mod preflight;
+mod reason;
 
 #[cfg(test)]
 mod tests;

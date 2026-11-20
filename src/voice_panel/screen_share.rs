@@ -10,8 +10,8 @@
 
 use super::*;
 use voxhold_media::publisher::{
-    Codec, Phase, Preset, PublishRequest, Quality, Resolution, Sharing, AUDIO_BITRATES,
-    MAX_CHANNEL_PUBLISHERS,
+    Codec, Phase, Preset, PublishRequest, Quality, QualityChange, Resolution, Sharing,
+    AUDIO_BITRATES, MAX_CHANNEL_PUBLISHERS,
 };
 use voxhold_media::screen_capture::{
     self, PreviewFrame, ScreenSource, SourceId, SourceKind, ThumbnailError,
@@ -20,7 +20,11 @@ use voxhold_media::system_audio::{self, AudioDeviceInfo, AudioScope};
 
 /// The backend has no runtime reconfigure; the dialog must warn honestly.
 pub(crate) const RESTART_WARNING: &str =
-    "Изменение качества перезапустит трансляцию: текущая сессия будет остановлена, зрители увидят новое подключение.";
+    "Изменение разрешения, частоты кадров или звука перезапустит трансляцию: текущая сессия будет остановлена, зрители увидят новое подключение.";
+/// A bitrate-only change reaches the running sender; the dialog says so
+/// instead of promising a restart.
+pub(crate) const LIVE_BITRATE_HINT: &str =
+    "Изменится только битрейт: он применится в эфире без перезапуска и без отключения зрителей.";
 /// A Start pressed before the endpoint probe answered; cleared by the answer.
 pub(crate) const AUDIO_PENDING_REASON: &str = "Дождитесь проверки системного звука.";
 /// The selected identity is gone from the current snapshot; the publish path
@@ -229,6 +233,28 @@ impl ScreenShareUi {
             .is_some_and(|source| self.selected == Some(source.source_id()))
     }
 
+    /// The request a restart dialog would send: the confirmed live source with
+    /// the quality and audio fields shown by the dialog.
+    pub(super) fn restart_request(&self) -> Option<PublishRequest> {
+        let live = self.last_request.as_ref()?;
+        let mut request = live.clone();
+        request.quality = self.quality().clamped();
+        request.audio = self.audio_requested();
+        request.audio_scope = self.effective_audio_scope(live.source.kind);
+        Some(request)
+    }
+
+    /// What the dialog's current values would change. `None` outside a restart
+    /// dialog or before the confirmed live request is known.
+    pub(super) fn restart_change(&self) -> Option<QualityChange> {
+        if !self.restart {
+            return None;
+        }
+        let live = self.last_request.as_ref()?;
+        let next = self.restart_request()?;
+        Some(live.change_to(&next))
+    }
+
     /// Drop a selection the newest snapshot no longer contains. A restart is
     /// bound to the accepted source, so a background answer never clears it.
     fn retain_selection(&mut self, kind: SourceKind, sources: &[ScreenSource]) {
@@ -328,8 +354,16 @@ impl ScreenShareUi {
         }
     }
 
+    /// The honest hint of the live quality dialog: a bitrate-only change is
+    /// applied in place, everything else restarts the publication.
     pub(super) fn restart_warning(&self) -> Option<&'static str> {
-        self.restart.then_some(RESTART_WARNING)
+        if !self.restart {
+            return None;
+        }
+        match self.restart_change() {
+            Some(QualityChange::LiveBitrate) => Some(LIVE_BITRATE_HINT),
+            _ => Some(RESTART_WARNING),
+        }
     }
 }
 
@@ -603,10 +637,13 @@ impl VoicePanel {
             return;
         }
         let restart_open = self.screen.restart;
+        let restart_busy = restart_open && self.screen.busy;
         // The live publication existed before this dialog; closing it without
-        // pressing Restart must leave the stream untouched.
+        // a committed change must leave the stream untouched. A restart only
+        // commits once the publisher confirmed the stop; while its preflight
+        // runs, closing cancels the preflight instead.
         let committed = if restart_open {
-            self.screen.busy
+            self.screen.sharing.restarting && self.screen.busy
         } else {
             self.screen.busy || self.share_active()
         };
@@ -627,6 +664,8 @@ impl VoicePanel {
         if let Some(handle) = &self.handle {
             if committed {
                 handle.stop_screen_share();
+            } else if restart_busy {
+                handle.cancel_screen_restart();
             } else if !restart_open {
                 // A restart dialog never opened a picker, so there is nothing
                 // to cancel and the live publication stays untouched.
@@ -822,7 +861,13 @@ impl VoicePanel {
         };
         let slot_available = self.active_publishers_in_room() < MAX_CHANNEL_PUBLISHERS;
         if self.screen.restart {
-            handle.restart_screen_share(request.clone(), self.can_stream, slot_available);
+            // A bitrate-only change goes to the live sender; the worker
+            // repeats the classification before it applies anything.
+            if self.screen.restart_change() == Some(QualityChange::LiveBitrate) {
+                handle.apply_screen_quality(request.clone(), self.can_stream, slot_available);
+            } else {
+                handle.restart_screen_share(request.clone(), self.can_stream, slot_available);
+            }
         } else {
             handle.publish_screen(
                 self.screen.picker,
@@ -849,7 +894,7 @@ impl VoicePanel {
         cx.notify();
     }
 
-    fn change_bitrate(&mut self, delta: i64, cx: &mut Context<Self>) {
+    pub(super) fn change_bitrate(&mut self, delta: i64, cx: &mut Context<Self>) {
         let next = (self.screen.bitrate_kbps as i64 + delta).clamp(500, 16_000);
         self.screen.bitrate_kbps = ((next / 100) * 100) as u32;
         cx.notify();
@@ -909,18 +954,32 @@ impl VoicePanel {
                     self.screen.busy = false;
                     self.screen.clear_previews();
                 }
+                // A failed preflight keeps the dialog open with its reason:
+                // nothing was stopped and the user may correct the settings.
+                let preflight_failed = phase == Phase::Live
+                    && self.screen.busy
+                    && !self.screen.sharing.restarting
+                    && !self.screen.sharing.preflighting
+                    && self.screen.sharing.error.is_some();
+                if preflight_failed {
+                    self.screen.busy = false;
+                    self.screen.error = self.screen.sharing.error.clone().unwrap_or_default();
+                }
                 if phase == Phase::Idle || phase == Phase::Failed {
                     self.screen.restart = false;
                 }
                 if matches!(phase, Phase::Publishing | Phase::Live)
                     && self.screen.open
+                    && !self.screen.sharing.preflighting
+                    && !preflight_failed
                     && (self.screen.busy || previous != phase)
                 {
                     // Either this dialog committed the attempt (busy) or the
                     // phase really changed: the card in the room now owns the
                     // status and the stop action. A periodic stats update in
                     // the same phase must not close an uncommitted restart
-                    // dialog, or its Start could never be reached.
+                    // dialog, or its Start could never be reached. A running
+                    // preflight keeps the dialog open so closing it cancels.
                     self.screen.open = false;
                     self.screen.busy = false;
                     self.screen.focus_placed = false;

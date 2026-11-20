@@ -9,7 +9,8 @@
 
 use super::*;
 use crate::publisher::engine::PublisherEngine;
-use crate::publisher::{Access, Outcome as PublisherOutcome, Publisher};
+use crate::publisher::{Access, Outcome as PublisherOutcome, Publisher, QualityChange};
+use crate::runtime::preflight::{PendingRestart, finish_preflight};
 use crate::runtime::prep::{
     PREP_BUDGET, PrepBinding, ScreenPrep, access_violation, cancel_prep, finish_prep,
 };
@@ -62,9 +63,11 @@ impl VoiceHandle {
         self.requests.wake();
     }
 
-    /// Change the quality of the live publication. The backend has no runtime
-    /// reconfigure, so the worker stops the current attempt and starts a new
-    /// one after the stop acknowledgement.
+    /// Change the quality of the live publication.
+    ///
+    /// A bitrate-only change is applied to the live sender. Anything that
+    /// needs a new capture is preflighted off the voice loop first; only a
+    /// successful preflight commits the confirmed stop+start.
     pub fn restart_screen_share(
         &self,
         request: crate::publisher::PublishRequest,
@@ -79,6 +82,33 @@ impl VoiceHandle {
                 slot_available,
             },
         );
+        self.requests.wake();
+    }
+
+    /// Apply a bitrate-only change to the live sender. The worker still
+    /// classifies the request itself and falls back to the restart path when
+    /// anything else changed.
+    pub fn apply_screen_quality(
+        &self,
+        request: crate::publisher::PublishRequest,
+        stream_permission: bool,
+        slot_available: bool,
+    ) {
+        push_screen(
+            &self.requests,
+            ScreenCommand::LiveQuality {
+                request,
+                stream_permission,
+                slot_available,
+            },
+        );
+        self.requests.wake();
+    }
+
+    /// The user closed the quality dialog while its restart preflight was
+    /// running. The live stream stays untouched.
+    pub fn cancel_screen_restart(&self) {
+        push_screen(&self.requests, ScreenCommand::CancelRestart);
         self.requests.wake();
     }
 
@@ -141,7 +171,8 @@ impl Live {
                     // overlaps the new device start) and a preparation still
                     // opening a device is replaced.
                     self.release_engine();
-                    let _ = cancel_prep(&mut self.prep, &mut self.publisher, None, Instant::now());
+                    let _ = self.cancel_screen_prep(None);
+                    self.drop_restart_prep();
                     // Bind the capture to the gate the panel has right now.
                     let _ = self.refresh_screen_access();
                     let started = match access_violation(self.access_value()) {
@@ -150,7 +181,9 @@ impl Live {
                     };
                     let outcomes = match started {
                         Ok(()) => Vec::new(),
-                        Err(message) => self.publisher.on_start_failed(&message, Instant::now()),
+                        Err(message) => {
+                            self.publisher.on_attempt_rejected(&message, Instant::now())
+                        }
                     };
                     for outcome in outcomes.into_iter().rev() {
                         work.push_front(outcome);
@@ -170,6 +203,32 @@ impl Live {
                     }
                 }
                 PublisherOutcome::Send(signal) => self.send_signal(signal).await?,
+                PublisherOutcome::SetBitrate { attempt, quality } => {
+                    // A stale decision of an older attempt must not change the
+                    // new sender. The engine applies the limit on its worker.
+                    if attempt != self.publisher.sharing().attempt {
+                        continue;
+                    }
+                    let failure = match self.screen.as_ref() {
+                        Some(screen) => screen.set_bitrate(quality).err(),
+                        None => Some("Медиадвижок трансляции уже закрыт.".to_string()),
+                    };
+                    if let Some(message) = failure {
+                        // The worker is gone, so the attempt cannot keep
+                        // sending; this is a local failure of the live attempt.
+                        for outcome in self
+                            .publisher
+                            .on_engine(
+                                crate::publisher::EngineEvent::Error(message),
+                                Instant::now(),
+                            )
+                            .into_iter()
+                            .rev()
+                        {
+                            work.push_front(outcome);
+                        }
+                    }
+                }
                 PublisherOutcome::Offer(sdp) => {
                     let failure = self
                         .screen
@@ -204,6 +263,11 @@ impl Live {
         if self.prep.is_some() && self.publisher.phase() != crate::publisher::Phase::Publishing {
             let _ = self.cancel_screen_prep(None);
         }
+        // A preflight only belongs to a live attempt; anything else releases
+        // its temporary capture without touching the publisher.
+        if self.restart.is_some() && self.publisher.phase() != crate::publisher::Phase::Live {
+            self.drop_restart_prep();
+        }
         Ok(true)
     }
 
@@ -225,6 +289,7 @@ impl Live {
     /// one starts closing before the socket is touched (the join itself runs on
     /// the release thread), and a late picker of this session is rejected.
     pub(super) async fn abandon_screen(&mut self, viewer: &mut Viewer) -> Result<(), SessionEnd> {
+        self.drop_restart_prep();
         let _ = self.cancel_screen_prep(None);
         let outcomes = self.publisher.abandon();
         let _ = self.apply_screen(outcomes, viewer).await?;
@@ -285,17 +350,83 @@ impl Live {
         cancel_prep(&mut self.prep, &mut self.publisher, message, Instant::now())
     }
 
+    /// Start the off-loop preflight of a live quality change. Nothing is
+    /// stopped until it confirms the new capture and audio scope.
+    fn start_restart_prep(
+        &mut self,
+        request: crate::publisher::PublishRequest,
+    ) -> Result<(), String> {
+        let pending = PendingRestart::start(self.prep_binding(), Instant::now(), request)?;
+        self.restart = Some(pending);
+        Ok(())
+    }
+
+    /// Release a preflight without reporting anything: the attempt it belonged
+    /// to is leaving, stopping or being replaced.
+    fn drop_restart_prep(&mut self) {
+        if let Some(mut pending) = self.restart.take() {
+            pending.cancel();
+        }
+    }
+
+    /// Cancel a pending preflight and keep the live attempt. `message` reports
+    /// a device/session loss; `None` is the user closing the dialog.
+    fn cancel_restart_prep(&mut self, message: Option<&str>) -> Vec<PublisherOutcome> {
+        if self.restart.take().is_none() {
+            return Vec::new();
+        }
+        self.publisher.preflight_cancelled(message)
+    }
+
+    /// Observe the preflight once per tick. The result is applied only to the
+    /// live attempt it was started for; a failure leaves the stream running.
+    async fn poll_restart_prep(
+        &mut self,
+        now: Instant,
+        viewer: &mut Viewer,
+    ) -> Result<(), SessionEnd> {
+        let Some(event) = self.restart.as_mut().and_then(|pending| pending.poll(now)) else {
+            return Ok(());
+        };
+        let Some(pending) = self.restart.take() else {
+            return Ok(());
+        };
+        let binding = pending.binding().clone();
+        let request = pending.request().clone();
+        drop(pending);
+        let current = self.prep_binding();
+        let access = self.access_value();
+        let outcomes = finish_preflight(
+            &mut self.publisher,
+            &binding,
+            &current,
+            access,
+            event,
+            request,
+            now,
+        );
+        let _ = self.apply_screen(outcomes, viewer).await?;
+        Ok(())
+    }
+
     /// Apply the freshest gate written by the panel. While a preparation is
     /// pending a revocation cancels it and fails the attempt before its late
-    /// engine can reach `stream.start`.
+    /// engine can reach `stream.start`. A preflight of a live attempt is
+    /// cancelled without touching the stream.
     pub(super) fn apply_screen_access(&mut self, access: ScreenAccess) -> Vec<PublisherOutcome> {
-        apply_access(
+        let gate = screen_access(self.joined, access.stream_permission, access.slot_available);
+        let mut outcomes = Vec::new();
+        if let Some(message) = access_violation(gate) {
+            outcomes.extend(self.cancel_restart_prep(Some(message)));
+        }
+        outcomes.extend(apply_access(
             self.joined,
             &mut self.access,
             &mut self.prep,
             &mut self.publisher,
             access,
-        )
+        ));
+        outcomes
     }
 
     /// Pull the newest gate out of the shared last-value slot and apply it.
@@ -325,7 +456,11 @@ impl Live {
         if joined {
             Vec::new()
         } else {
-            self.cancel_screen_prep(Some("Сначала подключитесь к голосовому каналу."))
+            let mut outcomes =
+                self.cancel_restart_prep(Some("Сначала подключитесь к голосовому каналу."));
+            outcomes
+                .extend(self.cancel_screen_prep(Some("Сначала подключитесь к голосовому каналу.")));
+            outcomes
         }
     }
 
@@ -338,13 +473,15 @@ impl Live {
         }
         self.connection = connection.clone();
         self.publisher.set_connection(connection);
+        let mut outcomes = self.cancel_restart_prep(Some(
+            "Голосовое соединение изменилось; запустите трансляцию снова.",
+        ));
         if self.prep.is_some() {
-            self.cancel_screen_prep(Some(
+            outcomes.extend(self.cancel_screen_prep(Some(
                 "Голосовое соединение изменилось; запустите трансляцию снова.",
-            ))
-        } else {
-            Vec::new()
+            )));
         }
+        outcomes
     }
 
     /// Observe the preparation worker once per tick. This never waits for the
@@ -536,8 +673,15 @@ impl Live {
             ScreenCommand::Stop => {
                 // One stop intent also cancels a capture that is still being
                 // prepared; the publisher has not sent `stream.start` yet.
+                self.drop_restart_prep();
                 let _ = self.cancel_screen_prep(None);
                 let outcomes = self.publisher.stop(now);
+                self.apply_screen(outcomes, viewer).await?;
+            }
+            ScreenCommand::CancelRestart => {
+                // The dialog that requested the change is gone. The live
+                // attempt was never stopped and stays exactly as it was.
+                let outcomes = self.cancel_restart_prep(None);
                 self.apply_screen(outcomes, viewer).await?;
             }
             ScreenCommand::Publish {
@@ -563,10 +707,20 @@ impl Live {
                 request,
                 stream_permission,
                 slot_available,
+            }
+            | ScreenCommand::LiveQuality {
+                request,
+                stream_permission,
+                slot_available,
             } => {
-                // A restart is a newer attempt: a preparation of the previous
-                // one must not run beside the confirmed stop+start.
+                // A change is only possible on a live attempt. The publisher
+                // itself decides whether the request needs a new capture; the
+                // dialog's split is a rendering hint, not the decision.
+                if self.publisher.phase() != crate::publisher::Phase::Live {
+                    return Ok(());
+                }
                 let _ = self.cancel_screen_prep(None);
+                self.drop_restart_prep();
                 let connection = self.set_connection(controller.resume_connection_id.clone());
                 self.apply_screen(connection, viewer).await?;
                 let joined = self.set_joined(controller.joined);
@@ -576,8 +730,25 @@ impl Live {
                     slot_available,
                 };
                 self.publisher.set_access(self.access_value());
-                let outcomes = self.publisher.restart(request, now);
+                let change = self
+                    .publisher
+                    .request()
+                    .map(|current| current.change_to(&request))
+                    .unwrap_or(QualityChange::Restart);
+                if change == QualityChange::LiveBitrate {
+                    let outcomes = self.publisher.apply_quality(request, now);
+                    self.apply_screen(outcomes, viewer).await?;
+                    return Ok(());
+                }
+                let outcomes = self.publisher.preflight_started();
                 self.apply_screen(outcomes, viewer).await?;
+                if self.publisher.phase() != crate::publisher::Phase::Live {
+                    return Ok(());
+                }
+                if let Err(message) = self.start_restart_prep(request) {
+                    let outcomes = self.publisher.preflight_failed(&message);
+                    self.apply_screen(outcomes, viewer).await?;
+                }
             }
         }
         Ok(())
@@ -625,6 +796,9 @@ impl Live {
         // A prepared engine may have become ready since the last tick; the
         // result is probed without waiting for the capture.
         self.poll_screen_prep(now, viewer).await?;
+        // A preflight of a live change is observed the same way: one bounded
+        // probe per tick, never a wait for a device.
+        self.poll_restart_prep(now, viewer).await?;
         let outcomes = self.publisher.tick(now);
         self.apply_screen(outcomes, viewer).await?;
         if viewer_cleared(viewer) {

@@ -111,6 +111,18 @@ fn the_publisher_answer_keeps_the_offered_mid_and_sends_frames() {
     loopback_with_frame_size((1280, 720));
 }
 
+/// A live bitrate change must reach the negotiated sender without a new offer
+/// or answer: the fake SFU keeps receiving frames from the same track.
+#[test]
+fn a_live_bitrate_change_reaches_the_negotiated_sender_without_renegotiation() {
+    let change = Quality {
+        bitrate_kbps: 1200,
+        audio_bitrate_kbps: 64,
+        ..request().quality
+    };
+    loopback((1280, 720), Some(change));
+}
+
 /// A 21:9 monitor inside a 720p publication is encoded at 1280×540. The
 /// declared source resolution stays 720p, so this proves the encoder accepts
 /// a frame size that differs from the advertised quality.
@@ -120,6 +132,10 @@ fn a_smaller_21_by_9_frame_still_reaches_the_sfu() {
 }
 
 fn loopback_with_frame_size(frame_size: (u32, u32)) {
+    loopback(frame_size, None);
+}
+
+fn loopback(frame_size: (u32, u32), change: Option<Quality>) {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -184,13 +200,19 @@ fn loopback_with_frame_size(frame_size: (u32, u32)) {
         engine.offer(offer_sdp.clone()).expect("offer command");
 
         let mut answer: Option<String> = None;
+        let mut answers = 0_u32;
         let mut remote_answer_set = false;
         let mut reader = None;
+        let mut change_applied = false;
+        let mut frames_at_change = 0_u64;
         let deadline = Instant::now() + Duration::from_secs(20);
         while Instant::now() < deadline {
             while let Some(event) = engine.poll() {
                 match event {
-                    crate::publisher::EngineEvent::Answer(sdp) => answer = Some(sdp),
+                    crate::publisher::EngineEvent::Answer(sdp) => {
+                        answers += 1;
+                        answer = Some(sdp);
+                    }
                     crate::publisher::EngineEvent::Ice(candidate) => {
                         let mid = candidate.sdp_mid.clone().unwrap_or_default();
                         let index = candidate.sdp_mline_index.map(i32::from).unwrap_or(-1);
@@ -239,7 +261,23 @@ fn loopback_with_frame_size(frame_size: (u32, u32)) {
                 }
             }
             if remote_answer_set && frames.load(Ordering::SeqCst) > 0 {
-                break;
+                match change {
+                    Some(next) if !change_applied => {
+                        // The negotiated sender is live; apply the new limit
+                        // exactly like `Outcome::SetBitrate` does.
+                        engine.set_bitrate(next).expect("live bitrate command");
+                        change_applied = true;
+                        frames_at_change = frames.load(Ordering::SeqCst);
+                    }
+                    Some(next) => {
+                        let applied = engine.applied_bitrate_limits().0;
+                        let expected = u64::from(next.bitrate_kbps) * 1000;
+                        if applied == expected && frames.load(Ordering::SeqCst) > frames_at_change {
+                            break;
+                        }
+                    }
+                    None => break,
+                }
             }
             sleep(Duration::from_millis(25)).await;
         }
@@ -263,6 +301,17 @@ fn loopback_with_frame_size(frame_size: (u32, u32)) {
             decoded > 0,
             "on_track fired but no frame was decoded on the SFU"
         );
+        if let Some(next) = change {
+            assert_eq!(
+                engine.applied_bitrate_limits(),
+                (u64::from(next.bitrate_kbps) * 1000, 0),
+                "the live video limit never reached the sender"
+            );
+            assert_eq!(
+                answers, 1,
+                "a live bitrate change must not renegotiate the publication"
+            );
+        }
 
         if let Some(reader) = reader {
             reader.abort();

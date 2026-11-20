@@ -608,13 +608,24 @@ impl VoicePanel {
         let cancel_focus = row(self, &mut ring, ShareKey::Cancel);
         let start_focus = row(self, &mut ring, ShareKey::Start);
         let can_start = self.screen_can_start();
-        let start_label = if self.screen.restart {
-            "Перезапустить"
+        let live_bitrate = self.screen.restart_change() == Some(QualityChange::LiveBitrate);
+        let start_label = if self.screen.sharing.preflighting {
+            "Проверяем…"
+        } else if self.screen.restart {
+            if live_bitrate {
+                "Применить"
+            } else {
+                "Перезапустить"
+            }
         } else if self.screen.busy {
             "Запускаем…"
         } else {
             "Начать трансляцию"
         };
+        // A restart dialog may be closed while its preflight runs: that
+        // cancels the preflight and leaves the live stream alone.
+        let cancel_active =
+            !self.screen.busy || (self.screen.restart && !self.screen.sharing.restarting);
         let error = if self.screen.error.is_empty() {
             None
         } else {
@@ -634,14 +645,20 @@ impl VoicePanel {
                     .border_1()
                     .border_color(rgb(c.line))
                     .text_size(px(12.))
-                    .text_color(rgb(if self.screen.busy { c.muted } else { c.fg }))
+                    .text_color(rgb(if self.screen.busy && !cancel_active {
+                        c.muted
+                    } else {
+                        c.fg
+                    }))
                     .flex()
                     .items_center()
                     .track_focus(&cancel_focus)
                     // Once Start was pressed the attempt is committed: the
                     // explicit Cancel button is unavailable, while Escape and
-                    // the backdrop turn into one stop intent.
-                    .when(!self.screen.busy, |button| {
+                    // the backdrop turn into one stop intent. A restart
+                    // preflight is the exception: closing it only cancels the
+                    // preflight and leaves the live stream running.
+                    .when(cancel_active, |button| {
                         button
                             .cursor_pointer()
                             .on_click(cx.listener(|panel, _, _, cx| panel.close_screen_share(cx)))

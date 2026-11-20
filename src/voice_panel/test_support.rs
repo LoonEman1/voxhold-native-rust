@@ -422,6 +422,35 @@ impl VoicePanel {
         });
     }
 
+    /// Record a fully described accepted attempt, for a test that needs the
+    /// live audio flag or scope to match the dialog.
+    pub fn test_set_screen_live_request(
+        &mut self,
+        request: voxhold_media::publisher::PublishRequest,
+    ) {
+        self.screen.last_request = Some(request);
+    }
+
+    /// Step the dialog's video bitrate exactly like the picker button does.
+    pub fn test_change_screen_bitrate(&mut self, delta: i64, cx: &mut Context<Self>) {
+        self.change_bitrate(delta, cx);
+    }
+
+    /// Choose a resolution exactly like the picker button does.
+    pub fn test_set_screen_resolution(
+        &mut self,
+        resolution: voxhold_media::publisher::Resolution,
+        cx: &mut Context<Self>,
+    ) {
+        self.screen.resolution = resolution;
+        cx.notify();
+    }
+
+    /// The newest screen snapshot the panel holds.
+    pub fn test_screen_sharing(&self) -> Sharing {
+        self.screen.sharing.clone()
+    }
+
     /// Put the live dialog back into the pending endpoint-probe state, so a
     /// test can observe that Start waits for the repeated probe answer.
     pub fn test_set_screen_audio_pending(

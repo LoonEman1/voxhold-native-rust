@@ -7,9 +7,10 @@ use super::voice_screen_tests::{draw, focused, monitor, wait_for, window};
 use gpui::TestAppContext;
 use std::sync::Arc;
 use std::time::Duration;
-use voxhold_media::publisher::{Phase, Quality, Sharing};
+use voxhold_media::publisher::{Codec, Phase, PublishRequest, Quality, Sharing};
 use voxhold_media::screen_capture::SourceKind;
 use voxhold_media::system_audio::AudioDeviceInfo;
+use voxhold_media::system_audio::AudioScope;
 
 fn device() -> AudioDeviceInfo {
     AudioDeviceInfo {
@@ -405,6 +406,196 @@ async fn a_normal_picker_after_a_restart_starts_with_no_rows(cx: &mut TestAppCon
             panel.test_apply_screen_sources(SourceKind::Window, vec![live.clone()]);
             panel.test_try_select_screen_source(live.clone(), cx);
             assert_eq!(panel.test_selected_source_id(), Some(live.source_id()));
+        });
+    });
+}
+
+fn sharing_with(quality: Quality, has_audio: bool) -> Sharing {
+    Sharing {
+        phase: Phase::Live,
+        live: true,
+        quality: Some(quality),
+        has_audio,
+        status: "В эфире".into(),
+        ..Sharing::default()
+    }
+}
+
+/// Open the live quality dialog with a fully described accepted request, so
+/// the dialog's classification sees the same audio and scope the engine
+/// confirmed.
+fn open_quality_dialog(
+    panel: &mut crate::voice_panel::VoicePanel,
+    live_source: voxhold_media::screen_capture::ScreenSource,
+    quality: Quality,
+    audio: bool,
+    cx: &mut gpui::Context<crate::voice_panel::VoicePanel>,
+) {
+    panel.test_attach_detached_handle();
+    panel.test_set_audio_probe(Arc::new(|| Ok(device())));
+    panel.test_open_screen_picker_with(live_source.kind, Vec::new(), None);
+    panel.test_set_screen_sharing(sharing_with(quality, audio));
+    panel.test_set_screen_live_request(PublishRequest {
+        source: live_source,
+        quality,
+        codec: Codec::Vp8,
+        audio,
+        audio_scope: AudioScope::Device,
+    });
+    panel.test_open_live_screen_settings(cx);
+}
+
+#[gpui::test]
+async fn a_bitrate_only_change_applies_live_without_a_restart(cx: &mut TestAppContext) {
+    let (mut visual, _view, voice) = super::voice_tests::fixture(cx);
+    draw(&mut visual);
+    let live = window(11, "Документ");
+    visual.update(|_window, app| {
+        voice.update(app, |panel, cx| {
+            open_quality_dialog(panel, live.clone(), Quality::default(), false, cx);
+            assert!(panel.screen_share_open());
+            assert!(panel.test_screen_restart());
+            assert!(panel.test_can_start());
+
+            panel.test_change_screen_bitrate(200, cx);
+            assert!(
+                panel
+                    .test_restart_warning()
+                    .is_some_and(|warning| warning.contains("без перезапуска")),
+                "the dialog must say that only the bitrate is live: {:?}",
+                panel.test_restart_warning()
+            );
+            panel.test_start_screen_share(cx);
+            let commands = panel.test_take_screen_commands();
+            assert_eq!(
+                commands,
+                vec![("bitrate", 0)],
+                "a bitrate-only change must not queue a restart: {commands:?}"
+            );
+            let request = panel.test_screen_request();
+            assert_eq!(request.quality.bitrate_kbps, 6200);
+            assert_eq!(request.source, live);
+            assert_eq!(
+                panel.test_screen_phase(),
+                Phase::Live,
+                "the phase stays Live while the limit is applied"
+            );
+            assert!(panel.screen_share_busy());
+        });
+    });
+}
+
+#[gpui::test]
+async fn a_resolution_change_keeps_the_confirmed_restart(cx: &mut TestAppContext) {
+    let (mut visual, _view, voice) = super::voice_tests::fixture(cx);
+    draw(&mut visual);
+    let live = window(11, "Документ");
+    visual.update(|_window, app| {
+        voice.update(app, |panel, cx| {
+            open_quality_dialog(panel, live.clone(), Quality::default(), false, cx);
+            panel.test_set_screen_resolution(voxhold_media::publisher::Resolution::P720, cx);
+            assert!(
+                panel
+                    .test_restart_warning()
+                    .is_some_and(|warning| warning.contains("перезапустит")),
+                "a resolution change must warn about the restart: {:?}",
+                panel.test_restart_warning()
+            );
+            assert!(panel.test_can_start());
+
+            panel.test_start_screen_share(cx);
+            let commands = panel.test_take_screen_commands();
+            assert_eq!(
+                commands,
+                vec![("restart", 0)],
+                "a resolution change still needs the confirmed stop+start: {commands:?}"
+            );
+        });
+    });
+}
+
+#[gpui::test]
+async fn closing_the_dialog_during_a_preflight_cancels_it_and_keeps_live(cx: &mut TestAppContext) {
+    let (mut visual, _view, voice) = super::voice_tests::fixture(cx);
+    draw(&mut visual);
+    let live = window(11, "Документ");
+    visual.update(|_window, app| {
+        voice.update(app, |panel, cx| {
+            open_quality_dialog(panel, live.clone(), Quality::default(), false, cx);
+            panel.test_set_screen_resolution(voxhold_media::publisher::Resolution::P720, cx);
+            panel.test_start_screen_share(cx);
+            assert_eq!(panel.test_take_screen_commands(), vec![("restart", 0)]);
+
+            // The worker reports the running preflight without stopping the
+            // live stream. The dialog must stay open so closing it cancels.
+            let preflighting = Sharing {
+                preflighting: true,
+                status: "Проверяем новую настройку…".into(),
+                ..sharing_with(Quality::default(), false)
+            };
+            assert!(panel.test_apply_screen_sharing(preflighting));
+            assert!(
+                panel.screen_share_open(),
+                "a running preflight must keep the dialog open"
+            );
+            assert!(panel.screen_share_busy());
+            assert_eq!(panel.test_screen_phase(), Phase::Live);
+
+            panel.test_close_screen_share(cx);
+            assert!(!panel.screen_share_open());
+            let commands = panel.test_take_screen_commands();
+            assert_eq!(
+                commands,
+                vec![("cancel-restart", 0)],
+                "closing cancels the preflight, not the live stream: {commands:?}"
+            );
+            assert_eq!(panel.test_screen_phase(), Phase::Live);
+        });
+    });
+}
+
+#[gpui::test]
+async fn a_failed_preflight_keeps_live_and_shows_the_error(cx: &mut TestAppContext) {
+    let (mut visual, _view, voice) = super::voice_tests::fixture(cx);
+    draw(&mut visual);
+    let live = window(11, "Документ");
+    visual.update(|_window, app| {
+        voice.update(app, |panel, cx| {
+            open_quality_dialog(panel, live.clone(), Quality::default(), false, cx);
+            panel.test_set_screen_resolution(voxhold_media::publisher::Resolution::P720, cx);
+            panel.test_start_screen_share(cx);
+            assert_eq!(panel.test_take_screen_commands(), vec![("restart", 0)]);
+
+            let failed = Sharing {
+                preflighting: false,
+                error: Some("Новая настройка не открылась.".into()),
+                status: "Новая настройка не открылась.".into(),
+                ..sharing_with(Quality::default(), false)
+            };
+            assert!(panel.test_apply_screen_sharing(failed));
+            assert!(
+                panel.screen_share_open(),
+                "a failed preflight keeps the dialog open for a correction"
+            );
+            assert!(!panel.screen_share_busy());
+            assert!(
+                panel.test_screen_error().contains("не открылась"),
+                "the preflight reason is visible: {}",
+                panel.test_screen_error()
+            );
+            assert_eq!(
+                panel.test_screen_phase(),
+                Phase::Live,
+                "the live attempt is untouched"
+            );
+            assert!(
+                panel.test_can_start(),
+                "the user may correct the settings and try again"
+            );
+            assert!(
+                panel.test_take_screen_commands().is_empty(),
+                "a failed preflight must not send stream.stop"
+            );
         });
     });
 }

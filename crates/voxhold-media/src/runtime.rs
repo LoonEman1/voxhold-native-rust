@@ -42,6 +42,7 @@ use updates::Updates;
 pub use updates::VoiceUpdate;
 
 mod engine;
+mod preflight;
 mod prep;
 mod requests;
 mod screen;
@@ -328,6 +329,10 @@ struct Live {
     /// The one preparation that may be opening a capture or a peer. The session
     /// loop only observes and cancels it.
     prep: Option<prep::ScreenPrep<crate::publisher::engine::PublisherEngine>>,
+    /// A preflight of a live quality change. The live engine above keeps
+    /// running until this confirms the new capture and the publisher commits
+    /// the existing stop+start.
+    restart: Option<preflight::PendingRestart>,
     /// Room identity a preparation result must still match.
     server: i64,
     channel: i64,
@@ -707,6 +712,7 @@ async fn run_session(
         publisher: crate::publisher::Publisher::new(controller.server_id, controller.channel_id),
         screen: None,
         prep: None,
+        restart: None,
         server: controller.server_id,
         channel: controller.channel_id,
         connection: controller.resume_connection_id.clone(),

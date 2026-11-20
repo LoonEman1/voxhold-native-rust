@@ -2,6 +2,8 @@
 //! bitrate and the four web presets. Kept in its own module so the publisher
 //! state machine stays within the repository file-size budget.
 
+use super::PublishRequest;
+
 /// Resolution choices of the SDR publisher, matching the web dialog. Defined
 /// beside [`Quality`] so the state machine stays inside the file-size budget.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -164,5 +166,48 @@ impl Preset {
             .into_iter()
             .find(|preset| preset.values() == Some((quality.fps, quality.bitrate_kbps)))
             .unwrap_or(Self::Custom)
+    }
+}
+
+/// What a new request would change relative to the live one.
+///
+/// The pinned backend has no runtime reconfigure and rejects a second
+/// `stream.start` while the client already publishes, so only the bitrates can
+/// reach the running sender. They are applied through the existing RTP
+/// `set_parameters`/`set_bitrate` path. A source, resolution, frame-rate or
+/// audio-scope change needs a new capture and therefore a confirmed stop+start.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QualityChange {
+    /// The request is the live one; nothing has to be sent anywhere.
+    Unchanged,
+    /// Only the video or the published-audio bitrate changed.
+    LiveBitrate,
+    /// A new capture is required: source, resolution, frame rate, audio scope,
+    /// the audio flag or the codec changed.
+    Restart,
+}
+
+impl PublishRequest {
+    /// Classify the difference against the live request. The source identity,
+    /// not its display title, decides whether the same capture can continue.
+    pub fn change_to(&self, next: &Self) -> QualityChange {
+        if self.source.source_id() != next.source.source_id()
+            || self.codec != next.codec
+            || self.audio != next.audio
+            || self.audio_scope != next.audio_scope
+            || self.quality.resolution != next.quality.resolution
+            || self.quality.fps != next.quality.fps
+        {
+            return QualityChange::Restart;
+        }
+        // An audio bitrate that is not published cannot be observed, so it is
+        // not a live change either; the dialog stays off that control when the
+        // track is disabled.
+        let audio_bitrate_changed =
+            self.audio && self.quality.audio_bitrate_kbps != next.quality.audio_bitrate_kbps;
+        if self.quality.bitrate_kbps != next.quality.bitrate_kbps || audio_bitrate_changed {
+            return QualityChange::LiveBitrate;
+        }
+        QualityChange::Unchanged
     }
 }

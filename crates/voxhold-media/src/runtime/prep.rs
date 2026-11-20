@@ -41,7 +41,7 @@ pub(super) struct PrepBinding {
 impl PrepBinding {
     /// Everything except the live gate. A revoked gate is a terminal error of
     /// the same attempt, not a stale result of another one.
-    fn same_attempt(&self, current: &Self) -> bool {
+    pub(super) fn same_attempt(&self, current: &Self) -> bool {
         self.attempt == current.attempt
             && self.server == current.server
             && self.channel == current.channel
@@ -214,7 +214,7 @@ pub(super) fn cancel_prep<E: Send + 'static>(
     }
     match message {
         Some(message) if publisher.phase() == Phase::Publishing => {
-            publisher.on_start_failed(message, now)
+            publisher.on_attempt_rejected(message, now)
         }
         _ => Vec::new(),
     }
@@ -253,14 +253,14 @@ pub(super) fn finish_prep<E>(
             if let Some(message) = access_violation(binding.access) {
                 return PrepFinish {
                     discard: Some(engine),
-                    outcomes: publisher.on_start_failed(message, now),
+                    outcomes: publisher.on_attempt_rejected(message, now),
                     ..PrepFinish::default()
                 };
             }
             if let Some(message) = access_violation(access) {
                 return PrepFinish {
                     discard: Some(engine),
-                    outcomes: publisher.on_start_failed(message, now),
+                    outcomes: publisher.on_attempt_rejected(message, now),
                     ..PrepFinish::default()
                 };
             }

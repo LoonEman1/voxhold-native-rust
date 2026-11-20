@@ -315,12 +315,42 @@ struct FrameCounters {
     height: AtomicU32,
 }
 
+/// The limits the worker really handed to the negotiated senders. A live
+/// quality change is applied here; the state machine can report `SetBitrate`
+/// only after this value moved, and the loopback test reads it.
+#[derive(Default)]
+struct AppliedLimits {
+    video_bps: AtomicU64,
+    audio_bps: AtomicU64,
+}
+
+impl AppliedLimits {
+    fn store(&self, video: Option<u64>, audio: Option<u64>) {
+        if let Some(video) = video {
+            self.video_bps.store(video, Ordering::Relaxed);
+        }
+        if let Some(audio) = audio {
+            self.audio_bps.store(audio, Ordering::Relaxed);
+        }
+    }
+
+    #[cfg(test)]
+    fn pair(&self) -> (u64, u64) {
+        (
+            self.video_bps.load(Ordering::Relaxed),
+            self.audio_bps.load(Ordering::Relaxed),
+        )
+    }
+}
+
 mod audio;
 use audio::{AudioCounters, AudioMeter, audio_loop};
 
 enum Command {
     Offer(String),
     Ice(Candidate),
+    /// A live bitrate change: no renegotiation, no new `stream.start`.
+    Bitrate(Quality),
     Stop,
 }
 
@@ -333,6 +363,10 @@ pub struct PublisherEngine {
     events: Arc<EventQueue>,
     preview: Arc<PreviewStore>,
     ice_dropped: AtomicU64,
+    /// Read by the loopback test through `applied_bitrate_limits`; production
+    /// only writes it from the worker.
+    #[cfg_attr(not(test), allow(dead_code))]
+    limits: Arc<AppliedLimits>,
     has_audio: bool,
     /// Actual scope of the opened system-audio capture.
     audio_scope: Option<String>,
@@ -460,11 +494,13 @@ impl PublisherEngine {
         let events = Arc::new(EventQueue::default());
         let counters = Arc::new(FrameCounters::default());
         let audio_counters = Arc::new(AudioCounters::default());
+        let limits = Arc::new(AppliedLimits::default());
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let worker_events = events.clone();
         let worker_preview = preview.clone();
         let worker_counters = counters.clone();
         let worker_audio_counters = audio_counters.clone();
+        let worker_limits = limits.clone();
         let thread = std::thread::Builder::new()
             .name("voxhold-screen-publisher".into())
             .spawn(move || {
@@ -481,6 +517,7 @@ impl PublisherEngine {
                     worker_preview,
                     worker_counters,
                     worker_audio_counters,
+                    worker_limits,
                     request,
                     servers,
                     policy,
@@ -496,6 +533,7 @@ impl PublisherEngine {
                 events,
                 preview,
                 ice_dropped: AtomicU64::new(0),
+                limits,
                 has_audio,
                 audio_scope: if has_audio { audio_scope } else { None },
                 thread: Some(thread),
@@ -520,6 +558,26 @@ impl PublisherEngine {
             .ok_or_else(|| "Медиадвижок трансляции уже закрыт.".to_string())?
             .try_send(Command::Offer(sdp))
             .map_err(|_| "Медиадвижок трансляции не принимает команды.".to_string())
+    }
+
+    /// Change the video and published-audio bitrate of the live sender.
+    ///
+    /// No offer, answer or `stream.start` is involved: the worker applies the
+    /// same `RtpSender::set_parameters` + `PeerConnection::set_bitrate` path
+    /// that the initial answer used. An error means the engine worker is gone,
+    /// which the caller must report instead of claiming a live change.
+    pub fn set_bitrate(&self, quality: Quality) -> Result<(), String> {
+        self.commands
+            .as_ref()
+            .ok_or_else(|| "Медиадвижок трансляции уже закрыт.".to_string())?
+            .try_send(Command::Bitrate(quality))
+            .map_err(|_| "Медиадвижок трансляции не принимает команды.".to_string())
+    }
+
+    /// The limits the worker really handed to the negotiated senders.
+    #[cfg(test)]
+    pub(crate) fn applied_bitrate_limits(&self) -> (u64, u64) {
+        self.limits.pair()
     }
 
     /// Apply one server ICE candidate. A full queue drops the candidate; the
@@ -581,6 +639,7 @@ async fn run(
     preview: Arc<PreviewStore>,
     counters: Arc<FrameCounters>,
     audio_counters: Arc<AudioCounters>,
+    limits: Arc<AppliedLimits>,
     request: PublishRequest,
     servers: Vec<IceServer>,
     policy: String,
@@ -745,6 +804,7 @@ async fn run(
                     &sdp,
                     request.quality,
                     &events,
+                    Some(&limits),
                 )
                 .await
                 {
@@ -754,6 +814,15 @@ async fn run(
                 while let Some(candidate) = pending.pop_front() {
                     add_ice(&peer, candidate).await;
                 }
+            }
+            Some(Command::Bitrate(quality)) => {
+                apply_bitrate(
+                    &peer,
+                    &sender,
+                    audio_sender.as_ref(),
+                    quality,
+                    Some(&limits),
+                );
             }
             Some(Command::Ice(candidate)) => {
                 if remote_set {
@@ -783,6 +852,7 @@ async fn apply_offer(
     sdp: &str,
     quality: Quality,
     events: &EventQueue,
+    limits: Option<&AppliedLimits>,
 ) -> bool {
     let offer = match SessionDescription::parse(sdp, SdpType::Offer) {
         Ok(offer) => offer,
@@ -815,7 +885,7 @@ async fn apply_offer(
         ));
         return false;
     }
-    apply_bitrate(peer, sender, audio_sender, quality);
+    apply_bitrate(peer, sender, audio_sender, quality, limits);
     events.push(EngineEvent::Answer(text));
     true
 }
@@ -823,12 +893,14 @@ async fn apply_offer(
 /// The video limit comes from the dialog; the audio limit is the Opus maximum
 /// of the same settings and is clamped to the backend's 32–510 kbit/s range.
 /// `RtpEncodingParameters` has no degradation preference, so nothing here
-/// pretends to set one.
+/// pretends to set one. The same function serves the initial answer and a live
+/// change; no renegotiation happens on this path.
 fn apply_bitrate(
     peer: &PeerConnection,
     sender: &RtpSender,
     audio_sender: Option<&RtpSender>,
     quality: Quality,
+    limits: Option<&AppliedLimits>,
 ) {
     let video_max = Some(u64::from(quality.bitrate_kbps.clamp(500, 16_000)) * 1000);
     let mut parameters = sender.parameters();
@@ -850,6 +922,9 @@ fn apply_bitrate(
         max_bitrate_bps: Some(total),
         ..BitrateSettings::default()
     });
+    if let Some(limits) = limits {
+        limits.store(video_max, audio_max.flatten());
+    }
 }
 
 async fn add_ice(peer: &PeerConnection, candidate: Candidate) {

@@ -29,7 +29,13 @@ impl VoicePanel {
         let c = self.colors();
         let live = sharing.phase == Phase::Live;
         let status = if live {
-            "В ЭФИРЕ".to_owned()
+            // The publisher reports what really happened: a live bitrate
+            // change, a running restart preflight or the plain on-air state.
+            if sharing.status.is_empty() {
+                "В ЭФИРЕ".to_owned()
+            } else {
+                sharing.status.clone()
+            }
         } else if sharing.phase == Phase::Failed {
             "ОШИБКА".to_owned()
         } else if sharing.phase == Phase::Stopping {

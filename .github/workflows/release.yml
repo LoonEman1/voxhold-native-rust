@@ -7,20 +7,7 @@ on:
       - Cargo.toml
       - .github/workflows/release.yml
   pull_request:
-    branches: [dev, main]
-    paths:
-      - Cargo.toml
-      - Cargo.lock
-      - build.rs
-      - .github/workflows/release.yml
-      - crates/voxhold-release/**
-      - crates/voxhold-update/**
-      - crates/voxhold-updater/**
-      - installer/**
-      - scripts/install-inno-compiler.ps1
-      - scripts/*release*.ps1
-      - src/app/update_*.rs
-      - src/update.rs
+    branches: [main]
   workflow_dispatch:
     inputs:
       publish:

@@ -105,6 +105,26 @@ impl PendingRestart {
     }
 }
 
+/// Cancel the preflight of `op` and keep the live attempt untouched. A cancel
+/// of an older operation leaves the preflight of the newer one running, so a
+/// late close of an old dialog can never abandon the current change.
+pub(super) fn cancel_restart(
+    pending: &mut Option<PendingRestart>,
+    publisher: &mut Publisher,
+    op: QualityOp,
+) -> Vec<PublisherOutcome> {
+    if pending.as_ref().is_none_or(|pending| pending.op() != op) {
+        return Vec::new();
+    }
+    let Some(pending) = pending.take() else {
+        return Vec::new();
+    };
+    // Dropping the pending preflight cancels its token and releases a result
+    // nobody wants; the live engine is not stopped.
+    drop(pending);
+    publisher.preflight_cancelled(op, None)
+}
+
 /// Apply one preflight event to the live publisher.
 ///
 /// A ready result commits the existing confirmed stop+start. A failure and a
@@ -159,6 +179,7 @@ mod tests {
     use super::*;
     use crate::publisher::{
         Access, Codec, Connection, EngineEvent, Outcome as PublisherOutcome, Publisher, Quality,
+        QualityOutcome,
     };
     use crate::screen_capture::{ScreenSource, SourceKind};
     use crate::system_audio::AudioScope;
@@ -537,5 +558,72 @@ mod tests {
             pending.poll(Instant::now()).is_none(),
             "a cancelled preflight must not report a result"
         );
+    }
+
+    #[test]
+    fn a_cancel_of_an_older_operation_leaves_the_newer_preflight_running() {
+        let now = Instant::now();
+        let mut publisher = live_publisher(now);
+        let binding = binding(&publisher);
+        let attempt = publisher.sharing().attempt;
+
+        // Operation N+1 is in flight; operation N is the one a stale dialog
+        // still names.
+        let (older, current) = (1, 2);
+        publisher.preflight_started(current);
+        let mut restart = Some(
+            PendingRestart::start_with(binding, now, current, request(changed()), |_| {
+                Ok(PreflightReport {
+                    width: 1280,
+                    height: 720,
+                    audio_scope: None,
+                })
+            })
+            .expect("the preflight thread starts"),
+        );
+
+        // A late CancelRestart of operation N must not cancel N+1: the live
+        // attempt stays untouched and the newer preflight keeps its tag.
+        let stale = cancel_restart(&mut restart, &mut publisher, older);
+        assert!(stale.is_empty(), "{stale:?}");
+        assert!(restart.is_some(), "the newer preflight stays in flight");
+        let sharing = publisher.sharing();
+        assert_eq!(sharing.phase, Phase::Live);
+        assert_eq!(sharing.attempt, attempt);
+        assert!(sharing.preflighting);
+        assert!(!sharing.restarting);
+        assert_eq!(
+            sharing.quality_status.map(|status| status.op),
+            Some(current)
+        );
+        assert!(sharing.error.is_none());
+
+        // The owning operation cancels it without a stop or a new start.
+        let cancelled = cancel_restart(&mut restart, &mut publisher, current);
+        assert!(restart.is_none());
+        assert!(
+            matches!(cancelled.as_slice(), [PublisherOutcome::State(_)]),
+            "{cancelled:?}"
+        );
+        assert!(
+            !cancelled.iter().any(|outcome| matches!(
+                outcome,
+                PublisherOutcome::Send(_)
+                    | PublisherOutcome::StartEngine { .. }
+                    | PublisherOutcome::StopEngine
+            )),
+            "cancelling a preflight must not touch the live stream: {cancelled:?}"
+        );
+        let sharing = publisher.sharing();
+        assert_eq!(sharing.phase, Phase::Live);
+        assert_eq!(sharing.attempt, attempt);
+        assert!(!sharing.preflighting);
+        assert!(!sharing.restarting);
+        assert!(sharing.error.is_none());
+        assert_eq!(sharing.status, "В эфире");
+        assert!(matches!(
+            sharing.quality_status.expect("the cancelled tag").outcome,
+            QualityOutcome::Cancelled
+        ));
     }
 }

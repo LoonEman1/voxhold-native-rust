@@ -434,11 +434,15 @@ async fn the_live_quality_dialog_warns_and_restarts_with_the_new_values(cx: &mut
     }
     assert_eq!(focused(&mut visual, &voice).as_deref(), Some("Start"));
     visual.simulate_keystrokes("enter");
-    let commands = visual
-        .update(|_window, app| voice.update(app, |panel, _| panel.test_take_screen_commands()));
+    let (commands, op) = visual.update(|_window, app| {
+        voice.update(app, |panel, _| {
+            let commands = panel.test_take_screen_commands();
+            (commands, panel.test_pending_quality_op())
+        })
+    });
     assert_eq!(
         commands,
-        vec![("restart", 0)],
+        vec![("restart", op.expect("the restart carries an operation id"))],
         "Start in the live dialog queues exactly one restart"
     );
     voice.read_with(&*visual, |panel, _| {

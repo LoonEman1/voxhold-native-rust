@@ -39,6 +39,13 @@ impl VoicePanel {
                             self.screen.busy = false;
                             self.screen.pending_quality_op = None;
                             self.screen.preflight = false;
+                            // A session or device loss keeps its reason in the
+                            // snapshot; the dialog stays open and must explain
+                            // it. `None` is the user closing the dialog, which
+                            // adds no error.
+                            if let Some(message) = self.screen.sharing.error.clone() {
+                                self.screen.error = message;
+                            }
                         }
                         QualityOutcome::Committed | QualityOutcome::Applied => {
                             self.screen.busy = false;

@@ -10,7 +10,7 @@
 use super::*;
 use crate::publisher::engine::{BitrateSend, PublisherEngine};
 use crate::publisher::{Access, Outcome as PublisherOutcome, Publisher, Quality, QualityChange};
-use crate::runtime::preflight::{PendingRestart, finish_preflight};
+use crate::runtime::preflight::{PendingRestart, cancel_restart, finish_preflight};
 use crate::runtime::prep::{
     PREP_BUDGET, PrepBinding, ScreenPrep, access_violation, cancel_prep, finish_prep,
 };
@@ -498,14 +498,7 @@ impl Live {
     /// Cancel only the preflight of `op`. A stale close of an older dialog
     /// must not cancel the operation that replaced it.
     fn cancel_restart_for_op(&mut self, op: u64) -> Vec<PublisherOutcome> {
-        if self
-            .restart
-            .as_ref()
-            .is_none_or(|pending| pending.op() != op)
-        {
-            return Vec::new();
-        }
-        self.cancel_restart_prep(None)
+        cancel_restart(&mut self.restart, &mut self.publisher, op)
     }
 
     /// Observe the preflight once per tick. The result is applied only to the

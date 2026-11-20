@@ -3,7 +3,9 @@
 //! update can therefore never lose a fast failure or let a late answer of an
 //! older operation touch a newer dialog.
 
-use super::voice_screen_restart_tests::{failed_preflight, open_quality_dialog, preflighting};
+use super::voice_screen_restart_tests::{
+    cancelled_preflight, failed_preflight, open_quality_dialog, preflighting,
+};
 use super::voice_screen_tests::{draw, window};
 use gpui::TestAppContext;
 use voxhold_media::publisher::{Phase, Quality, QualityOutcome, QualityStatus, Sharing};
@@ -23,10 +25,10 @@ async fn a_fast_preflight_failure_through_the_update_queue_unblocks_the_dialog(
             open_quality_dialog(panel, live.clone(), Quality::default(), false, cx);
             panel.test_set_screen_resolution(voxhold_media::publisher::Resolution::P720, cx);
             panel.test_start_screen_share(cx);
-            assert_eq!(panel.test_take_screen_commands(), vec![("restart", 0)]);
             let op = panel
                 .test_pending_quality_op()
                 .expect("the restart carries an operation id");
+            assert_eq!(panel.test_take_screen_commands(), vec![("restart", op)]);
 
             // Both samples are queued before the panel reads anything. The
             // real queue keeps only the newest slot, so the GUI first sees the
@@ -60,13 +62,16 @@ async fn a_fast_preflight_failure_through_the_update_queue_unblocks_the_dialog(
             assert!(panel.test_can_start(), "the user may try again");
 
             panel.test_start_screen_share(cx);
+            let retry = panel
+                .test_pending_quality_op()
+                .expect("the retry carries an operation id");
             assert_eq!(
                 panel.test_take_screen_commands(),
-                vec![("restart", 0)],
+                vec![("restart", retry)],
                 "the retry sends a new restart command"
             );
             assert_ne!(
-                panel.test_pending_quality_op(),
+                Some(retry),
                 Some(op),
                 "a retry is a new operation, not the failed one"
             );
@@ -91,7 +96,10 @@ async fn a_late_failure_of_an_earlier_operation_does_not_touch_the_new_dialog(
             let first_op = panel
                 .test_pending_quality_op()
                 .expect("the first restart has an operation id");
-            assert_eq!(panel.test_take_screen_commands(), vec![("restart", 0)]);
+            assert_eq!(
+                panel.test_take_screen_commands(),
+                vec![("restart", first_op)]
+            );
             assert!(panel.test_apply_screen_sharing(failed_preflight(
                 first_op,
                 "Первая проверка не открылась.",
@@ -100,10 +108,13 @@ async fn a_late_failure_of_an_earlier_operation_does_not_touch_the_new_dialog(
 
             // The user corrects the settings and applies again.
             panel.test_start_screen_share(cx);
-            assert_eq!(panel.test_take_screen_commands(), vec![("restart", 0)]);
             let second_op = panel
                 .test_pending_quality_op()
                 .expect("the second restart has an operation id");
+            assert_eq!(
+                panel.test_take_screen_commands(),
+                vec![("restart", second_op)]
+            );
             assert_ne!(second_op, first_op);
 
             // The old failure arrives after the new Apply. It belongs to the
@@ -147,12 +158,12 @@ async fn a_late_failure_after_closing_the_dialog_is_ignored(cx: &mut TestAppCont
             let op = panel
                 .test_pending_quality_op()
                 .expect("the restart has an operation id");
-            assert_eq!(panel.test_take_screen_commands(), vec![("restart", 0)]);
+            assert_eq!(panel.test_take_screen_commands(), vec![("restart", op)]);
 
             panel.test_close_screen_share(cx);
             assert_eq!(
                 panel.test_take_screen_commands(),
-                vec![("cancel-restart", 0)],
+                vec![("cancel-restart", op)],
                 "closing before the confirmation cancels the preflight"
             );
 
@@ -216,6 +227,63 @@ async fn two_sequential_operations_keep_their_own_results(cx: &mut TestAppContex
                 panel.test_screen_error()
             );
             assert!(panel.test_can_start(), "a third attempt is available");
+        });
+    });
+}
+
+/// A cancelled preflight that carries a reason (a revoked permission or a lost
+/// device) must explain it in the still-open dialog. `None` is the user closing
+/// the dialog and adds no error; neither case stops the live stream.
+#[gpui::test]
+async fn a_cancelled_preflight_with_a_reason_is_shown_in_the_dialog(cx: &mut TestAppContext) {
+    let (mut visual, _view, voice) = super::voice_tests::fixture(cx);
+    draw(&mut visual);
+    let live = window(11, "Документ");
+    visual.update(|_window, app| {
+        voice.update(app, |panel, cx| {
+            open_quality_dialog(panel, live.clone(), Quality::default(), false, cx);
+            panel.test_set_screen_resolution(voxhold_media::publisher::Resolution::P720, cx);
+            panel.test_start_screen_share(cx);
+            let op = panel.test_pending_quality_op().expect("operation id");
+            assert_eq!(panel.test_take_screen_commands(), vec![("restart", op)]);
+            assert!(panel.test_apply_screen_sharing(preflighting(op)));
+            assert!(panel.screen_share_open());
+
+            // A revoked permission or a lost device keeps the reason in the
+            // snapshot; the open dialog must show it instead of staying mute.
+            let reason = "Разрешение на трансляцию отозвано.";
+            assert!(panel.test_apply_screen_sharing(cancelled_preflight(op, Some(reason))));
+            assert!(
+                panel.screen_share_open(),
+                "the dialog stays open to explain the cancellation"
+            );
+            assert!(!panel.screen_share_busy());
+            assert_eq!(panel.test_pending_quality_op(), None);
+            assert!(
+                panel.test_screen_error().contains("Разрешение"),
+                "the cancellation reason is visible: {}",
+                panel.test_screen_error()
+            );
+            assert_eq!(panel.test_screen_phase(), Phase::Live);
+            assert!(
+                panel.test_take_screen_commands().is_empty(),
+                "a cancelled preflight must not stop the live stream"
+            );
+
+            // The user closing the dialog reports no reason: Start cleared the
+            // previous answer and the cancelled snapshot adds no new error.
+            panel.test_start_screen_share(cx);
+            let next = panel.test_pending_quality_op().expect("operation id");
+            assert!(panel.test_apply_screen_sharing(cancelled_preflight(next, None)));
+            assert!(panel.screen_share_open());
+            assert!(!panel.screen_share_busy());
+            assert_eq!(panel.test_pending_quality_op(), None);
+            assert!(
+                panel.test_screen_error().is_empty(),
+                "a user close adds no error: {}",
+                panel.test_screen_error()
+            );
+            assert_eq!(panel.test_screen_phase(), Phase::Live);
         });
     });
 }

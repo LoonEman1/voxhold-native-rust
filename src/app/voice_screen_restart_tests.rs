@@ -107,11 +107,15 @@ async fn a_live_window_restart_binds_to_the_confirmed_source_with_an_empty_list(
     }
     assert_eq!(focused(&mut visual, &voice).as_deref(), Some("Start"));
     visual.simulate_keystrokes("enter");
-    let commands = visual
-        .update(|_window, app| voice.update(app, |panel, _| panel.test_take_screen_commands()));
+    let (commands, op) = visual.update(|_window, app| {
+        voice.update(app, |panel, _| {
+            let commands = panel.test_take_screen_commands();
+            (commands, panel.test_pending_quality_op())
+        })
+    });
     assert_eq!(
         commands,
-        vec![("restart", 0)],
+        vec![("restart", op.expect("the restart carries an operation id"))],
         "Start in a window restart queues exactly one restart: {commands:?}"
     );
     voice.read_with(&*visual, |panel, _| {
@@ -192,9 +196,16 @@ async fn restart_rows_are_inert_for_mouse_and_keyboard(cx: &mut TestAppContext) 
     }
     assert_eq!(focused(&mut visual, &voice).as_deref(), Some("Start"));
     visual.simulate_keystrokes("enter");
-    let commands = visual
-        .update(|_window, app| voice.update(app, |panel, _| panel.test_take_screen_commands()));
-    assert_eq!(commands, vec![("restart", 0)]);
+    let (commands, op) = visual.update(|_window, app| {
+        voice.update(app, |panel, _| {
+            let commands = panel.test_take_screen_commands();
+            (commands, panel.test_pending_quality_op())
+        })
+    });
+    assert_eq!(
+        commands,
+        vec![("restart", op.expect("the restart carries an operation id"))]
+    );
     voice.read_with(&*visual, |panel, _| {
         assert_eq!(
             panel.test_selected_source_id(),
@@ -242,8 +253,11 @@ async fn a_restart_ignores_the_category_and_refresh_with_a_stale_snapshot(cx: &m
             );
 
             panel.test_start_screen_share(cx);
+            let op = panel
+                .test_pending_quality_op()
+                .expect("the restart carries an operation id");
             let commands = panel.test_take_screen_commands();
-            assert_eq!(commands, vec![("restart", 0)]);
+            assert_eq!(commands, vec![("restart", op)]);
             assert_eq!(
                 panel.test_screen_request().source,
                 live,
@@ -287,8 +301,11 @@ async fn a_restart_keeps_the_confirmed_identity_when_the_row_was_renamed(cx: &mu
             );
 
             panel.test_start_screen_share(cx);
+            let op = panel
+                .test_pending_quality_op()
+                .expect("the restart carries an operation id");
             let commands = panel.test_take_screen_commands();
-            assert_eq!(commands, vec![("restart", 0)]);
+            assert_eq!(commands, vec![("restart", op)]);
             assert_eq!(
                 panel.test_screen_request().source,
                 live,
@@ -339,16 +356,16 @@ async fn a_same_phase_live_stats_update_keeps_an_uncommitted_restart_dialog_open
             assert!(panel.test_can_start(), "Start must stay reachable");
 
             panel.test_start_screen_share(cx);
-            let commands = panel.test_take_screen_commands();
-            assert_eq!(
-                commands,
-                vec![("restart", 0)],
-                "Start queues exactly one restart: {commands:?}"
-            );
-            assert!(panel.screen_share_busy(), "the restart is committed");
             let op = panel
                 .test_pending_quality_op()
                 .expect("the restart carries an operation id");
+            let commands = panel.test_take_screen_commands();
+            assert_eq!(
+                commands,
+                vec![("restart", op)],
+                "Start queues exactly one restart: {commands:?}"
+            );
+            assert!(panel.screen_share_busy(), "the restart is committed");
 
             // Once the publisher commits the stop, the dialog closes as before
             // and the room card takes over the status.
@@ -449,6 +466,18 @@ pub(super) fn failed_preflight(op: u64, message: &str) -> Sharing {
     }
 }
 
+/// The cancelled preflight of `op`. A reason reports a session or device loss;
+/// `None` is the user closing the dialog, which adds no error.
+pub(super) fn cancelled_preflight(op: u64, message: Option<&str>) -> Sharing {
+    Sharing {
+        preflighting: false,
+        quality_status: Some(QualityStatus::new(op, QualityOutcome::Cancelled)),
+        error: message.map(str::to_owned),
+        status: message.unwrap_or("В эфире").into(),
+        ..sharing_with(Quality::default(), false)
+    }
+}
+
 /// Open the live quality dialog with a fully described accepted request, so
 /// the dialog's classification sees the same audio and scope the engine
 /// confirmed.
@@ -494,10 +523,13 @@ async fn a_bitrate_only_change_applies_live_without_a_restart(cx: &mut TestAppCo
                 panel.test_restart_warning()
             );
             panel.test_start_screen_share(cx);
+            let op = panel
+                .test_pending_quality_op()
+                .expect("the bitrate change carries an operation id");
             let commands = panel.test_take_screen_commands();
             assert_eq!(
                 commands,
-                vec![("bitrate", 0)],
+                vec![("bitrate", op)],
                 "a bitrate-only change must not queue a restart: {commands:?}"
             );
             let request = panel.test_screen_request();
@@ -532,10 +564,13 @@ async fn a_resolution_change_keeps_the_confirmed_restart(cx: &mut TestAppContext
             assert!(panel.test_can_start());
 
             panel.test_start_screen_share(cx);
+            let op = panel
+                .test_pending_quality_op()
+                .expect("the restart carries an operation id");
             let commands = panel.test_take_screen_commands();
             assert_eq!(
                 commands,
-                vec![("restart", 0)],
+                vec![("restart", op)],
                 "a resolution change still needs the confirmed stop+start: {commands:?}"
             );
         });
@@ -552,10 +587,10 @@ async fn closing_the_dialog_during_a_preflight_cancels_it_and_keeps_live(cx: &mu
             open_quality_dialog(panel, live.clone(), Quality::default(), false, cx);
             panel.test_set_screen_resolution(voxhold_media::publisher::Resolution::P720, cx);
             panel.test_start_screen_share(cx);
-            assert_eq!(panel.test_take_screen_commands(), vec![("restart", 0)]);
             let op = panel
                 .test_pending_quality_op()
                 .expect("the restart carries an operation id");
+            assert_eq!(panel.test_take_screen_commands(), vec![("restart", op)]);
 
             // The worker reports the running preflight without stopping the
             // live stream. The dialog must stay open so closing it cancels.
@@ -572,7 +607,7 @@ async fn closing_the_dialog_during_a_preflight_cancels_it_and_keeps_live(cx: &mu
             let commands = panel.test_take_screen_commands();
             assert_eq!(
                 commands,
-                vec![("cancel-restart", 0)],
+                vec![("cancel-restart", op)],
                 "closing cancels the preflight, not the live stream: {commands:?}"
             );
             assert!(
@@ -594,10 +629,10 @@ async fn a_failed_preflight_keeps_live_and_shows_the_error(cx: &mut TestAppConte
             open_quality_dialog(panel, live.clone(), Quality::default(), false, cx);
             panel.test_set_screen_resolution(voxhold_media::publisher::Resolution::P720, cx);
             panel.test_start_screen_share(cx);
-            assert_eq!(panel.test_take_screen_commands(), vec![("restart", 0)]);
             let op = panel
                 .test_pending_quality_op()
                 .expect("the restart carries an operation id");
+            assert_eq!(panel.test_take_screen_commands(), vec![("restart", op)]);
 
             // The worker confirms the running preflight before it can fail it.
             assert!(panel.test_apply_screen_sharing(preflighting(op)));
@@ -646,10 +681,13 @@ async fn a_preflight_cancel_survives_a_stale_failure_state_and_keeps_live(cx: &m
 
             // The first Apply fails: the dialog stays open with the reason.
             panel.test_start_screen_share(cx);
-            assert_eq!(panel.test_take_screen_commands(), vec![("restart", 0)]);
             let first_op = panel
                 .test_pending_quality_op()
                 .expect("the restart carries an operation id");
+            assert_eq!(
+                panel.test_take_screen_commands(),
+                vec![("restart", first_op)]
+            );
             assert!(panel.test_apply_screen_sharing(preflighting(first_op)));
             let failed = failed_preflight(first_op, "Новая настройка не открылась.");
             assert!(panel.test_apply_screen_sharing(failed.clone()));
@@ -659,10 +697,13 @@ async fn a_preflight_cancel_survives_a_stale_failure_state_and_keeps_live(cx: &m
 
             // Apply again. Start must drop the previous attempt's reason.
             panel.test_start_screen_share(cx);
-            assert_eq!(panel.test_take_screen_commands(), vec![("restart", 0)]);
             let second_op = panel
                 .test_pending_quality_op()
                 .expect("the retry carries a new operation id");
+            assert_eq!(
+                panel.test_take_screen_commands(),
+                vec![("restart", second_op)]
+            );
             assert_ne!(second_op, first_op);
             assert!(panel.screen_share_busy());
             assert!(
@@ -710,7 +751,7 @@ async fn a_preflight_cancel_survives_a_stale_failure_state_and_keeps_live(cx: &m
             assert!(!panel.screen_share_open());
             assert_eq!(
                 panel.test_take_screen_commands(),
-                vec![("cancel-restart", 0)],
+                vec![("cancel-restart", second_op)],
                 "closing during a preflight must cancel it"
             );
             assert_eq!(panel.test_screen_phase(), Phase::Live);
@@ -737,10 +778,13 @@ async fn a_preflight_cancel_survives_a_stale_failure_state_before_the_confirmati
             // The first preflight is confirmed by the worker and then fails,
             // so the next Start sees the same stale answer as the field case.
             panel.test_start_screen_share(cx);
-            assert_eq!(panel.test_take_screen_commands(), vec![("restart", 0)]);
             let first_op = panel
                 .test_pending_quality_op()
                 .expect("the restart carries an operation id");
+            assert_eq!(
+                panel.test_take_screen_commands(),
+                vec![("restart", first_op)]
+            );
             assert!(panel.test_apply_screen_sharing(preflighting(first_op)));
             let failed = failed_preflight(first_op, "Новая настройка не открылась.");
             assert!(panel.test_apply_screen_sharing(failed.clone()));
@@ -750,7 +794,13 @@ async fn a_preflight_cancel_survives_a_stale_failure_state_before_the_confirmati
             // Apply again: this attempt is unconfirmed until the worker says
             // `preflighting`, and Start drops the previous attempt's reason.
             panel.test_start_screen_share(cx);
-            assert_eq!(panel.test_take_screen_commands(), vec![("restart", 0)]);
+            let second_op = panel
+                .test_pending_quality_op()
+                .expect("the retry carries a new operation id");
+            assert_eq!(
+                panel.test_take_screen_commands(),
+                vec![("restart", second_op)]
+            );
             assert_ne!(
                 panel.test_pending_quality_op(),
                 Some(first_op),
@@ -779,7 +829,7 @@ async fn a_preflight_cancel_survives_a_stale_failure_state_before_the_confirmati
             assert!(!panel.screen_share_open());
             assert_eq!(
                 panel.test_take_screen_commands(),
-                vec![("cancel-restart", 0)],
+                vec![("cancel-restart", second_op)],
                 "closing before the confirmation must still cancel the preflight"
             );
             assert_eq!(panel.test_screen_phase(), Phase::Live);

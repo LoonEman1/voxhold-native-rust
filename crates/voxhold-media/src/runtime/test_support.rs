@@ -60,8 +60,10 @@ impl VoiceHandle {
             .map(|access| (access.stream_permission, access.slot_available))
     }
 
-    /// Drain the queued screen actions as (kind, picker) pairs. The detached
-    /// handle has no worker, so this is exactly what the UI sent.
+    /// Drain the queued screen actions as `(kind, target)` pairs. The detached
+    /// handle has no worker, so this is exactly what the UI sent. The target is
+    /// the picker id for picker actions and the real quality-operation id for
+    /// `restart`, `bitrate` and `cancel-restart`; `stop` has none.
     pub fn take_screen_commands_for_tests(&self) -> Vec<(&'static str, u64)> {
         let mut out = Vec::new();
         while let Some(pending) = self.requests.take() {
@@ -71,9 +73,9 @@ impl VoiceHandle {
             out.push(match command {
                 ScreenCommand::OpenPicker { picker } => ("open", picker),
                 ScreenCommand::Publish { picker, .. } => ("publish", picker),
-                ScreenCommand::Restart { .. } => ("restart", 0),
-                ScreenCommand::LiveQuality { .. } => ("bitrate", 0),
-                ScreenCommand::CancelRestart { .. } => ("cancel-restart", 0),
+                ScreenCommand::Restart { op, .. } => ("restart", op),
+                ScreenCommand::LiveQuality { op, .. } => ("bitrate", op),
+                ScreenCommand::CancelRestart { op } => ("cancel-restart", op),
                 ScreenCommand::CancelPicker { picker } => ("cancel", picker),
                 ScreenCommand::Stop => ("stop", 0),
             });

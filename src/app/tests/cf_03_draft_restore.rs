@@ -5,7 +5,7 @@
 
 use super::super::*;
 use crate::auth_session::{now_unix, Session};
-use crate::test_support::{Reply, TestServer};
+use crate::test_support::{Gate, Reply, TestServer};
 use gpui::{TestAppContext, VisualTestContext};
 use std::{cell::RefCell, path::PathBuf, rc::Rc, time::Duration};
 
@@ -249,21 +249,27 @@ async fn same_owner_restores_channel_other_and_thread_drafts(cx: &mut TestAppCon
 }
 
 /// A different `user_id` on the same origin receives nothing, and the kept set
-/// releases its temporary clipboard file.
+/// releases its temporary clipboard file. The open composer and a second chat
+/// both carry text, so a wrong owner check is visible even though
+/// `save_composer_draft` rewrites only the open chat.
 #[gpui::test]
 async fn another_user_does_not_receive_the_kept_drafts(cx: &mut TestAppContext) {
     let server = TestServer::spawn(Vec::new());
     let base = server.base.clone();
     let (visual, view) = make_app(cx, client_for(&base, "token-1"));
-    let key = draft::ChatKey::channel(1, 7);
+    let key_open = draft::ChatKey::channel(1, 7);
+    // Never overwritten by `save_composer_draft`, which saves the open chat.
+    let key_other = draft::ChatKey::channel(1, 8);
     let clipboard = write_temp("other-user.png", 16);
 
     visual.update(|window, app| {
         view.update(app, |v, cx| {
             workspace(v);
-            v.drafts.borrow_mut().set_text(key, "черновик 7");
+            v.composer
+                .update(cx, |input, cx| input.set_value("черновик 7", window, cx));
+            v.drafts.borrow_mut().set_text(key_other, "черновик 8");
             v.drafts.borrow_mut().add_files(
-                key,
+                key_other,
                 vec![
                     draft::DraftFile::from_temporary(clipboard.clone(), "clipboard.png")
                         .expect("clipboard attachment"),
@@ -283,10 +289,14 @@ async fn another_user_does_not_receive_the_kept_drafts(cx: &mut TestAppContext) 
     });
     view.read_with(&*visual, |v, _| {
         assert!(
-            v.drafts.borrow().text(key).is_empty(),
+            v.drafts.borrow().text(key_other).is_empty(),
             "another account starts without the previous drafts"
         );
-        assert!(v.drafts.borrow().files(key).is_empty());
+        assert!(
+            v.drafts.borrow().text(key_open).is_empty(),
+            "the open conversation's draft is not handed over either"
+        );
+        assert!(v.drafts.borrow().files(key_other).is_empty());
         assert!(
             !clipboard.exists(),
             "the kept set was cleared with its files"
@@ -300,15 +310,18 @@ async fn another_origin_does_not_receive_the_kept_drafts(cx: &mut TestAppContext
     let server = TestServer::spawn(Vec::new());
     let base = server.base.clone();
     let (visual, view) = make_app(cx, client_for(&base, "token-1"));
-    let key = draft::ChatKey::channel(1, 7);
+    let key_open = draft::ChatKey::channel(1, 7);
+    let key_other = draft::ChatKey::channel(1, 8);
     let clipboard = write_temp("other-origin.png", 16);
 
     visual.update(|window, app| {
         view.update(app, |v, cx| {
             workspace(v);
-            v.drafts.borrow_mut().set_text(key, "черновик 7");
+            v.composer
+                .update(cx, |input, cx| input.set_value("черновик 7", window, cx));
+            v.drafts.borrow_mut().set_text(key_other, "черновик 8");
             v.drafts.borrow_mut().add_files(
-                key,
+                key_other,
                 vec![
                     draft::DraftFile::from_temporary(clipboard.clone(), "clipboard.png")
                         .expect("clipboard attachment"),
@@ -328,8 +341,9 @@ async fn another_origin_does_not_receive_the_kept_drafts(cx: &mut TestAppContext
         });
     });
     view.read_with(&*visual, |v, _| {
-        assert!(v.drafts.borrow().text(key).is_empty());
-        assert!(v.drafts.borrow().files(key).is_empty());
+        assert!(v.drafts.borrow().text(key_other).is_empty());
+        assert!(v.drafts.borrow().text(key_open).is_empty());
+        assert!(v.drafts.borrow().files(key_other).is_empty());
         assert!(!clipboard.exists());
     });
 }
@@ -435,4 +449,106 @@ async fn a_late_file_pick_cannot_append_to_the_kept_drafts(cx: &mut TestAppConte
         );
     });
     std::fs::remove_file(&late).ok();
+}
+
+/// An in-flight channel send is aborted by expiry, and its late confirmation
+/// cannot revive the composition that the user replaced meanwhile. The restored
+/// set keeps only the edited text; the sent text and its file do not return.
+#[gpui::test]
+async fn a_late_send_answer_after_expiry_cannot_revive_the_sent_draft(cx: &mut TestAppContext) {
+    let gate = Gate::new();
+    let path = write_temp("inflight.bin", 24);
+    let file = draft::DraftFile::from_path(path.clone()).expect("attachment");
+    let file_id = file.id.clone();
+    let upload_body = format!(
+        "{{\"id\":\"{}\",\"filename\":\"{}\",\"mime_type\":\"application/octet-stream\",\"size_bytes\":{},\"deleted\":false}}",
+        file.id, file.name, file.size
+    );
+    let upload = Reply::new(200, &upload_body).with_path("/api/v1/channels/7/attachments/");
+    let reply = Reply::new(200, &super::message_json(31, 1, "отправка").to_string())
+        .with_path("/api/v1/servers/1/channels/7/messages")
+        .with_gate(gate.clone());
+    let unexpected = Reply::new(500, r#"{"error":"unexpected"}"#);
+    let server = TestServer::spawn(vec![upload, reply, unexpected]);
+    let base = server.base.clone();
+    let (visual, view) = make_app(cx, client_for(&base, "token-1"));
+    let key = draft::ChatKey::channel(1, 7);
+
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            workspace(v);
+            v.composer
+                .update(cx, |input, cx| input.set_value("отправка", window, cx));
+            v.drafts.borrow_mut().add_files(key, vec![file.clone()]);
+            install_session(v, &base, 1, "alice");
+            gate.arm();
+            v.send(window, cx);
+            assert!(v.pending_sends.contains_key(&key), "the send is in flight");
+        });
+    });
+    assert!(
+        gate.wait_arrived(Duration::from_secs(5)),
+        "the POST reached the test server"
+    );
+
+    let generation = view.read_with(&*visual, |v, _| v.session_generation);
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            // The user revises the composition while the POST is on the wire.
+            v.composer
+                .update(cx, |input, cx| input.set_value("новый текст", window, cx));
+            assert!(
+                v.drafts.borrow_mut().remove_file(key, &file_id).is_some(),
+                "the user removes the sent attachment"
+            );
+            expire(v, window, cx);
+        });
+    });
+    view.read_with(&*visual, |v, _| {
+        assert!(
+            v.pending_sends.is_empty(),
+            "expiry aborts the in-flight send"
+        );
+        assert_ne!(
+            v.session_generation, generation,
+            "the next session cannot accept this answer"
+        );
+    });
+
+    // The confirmation arrives after the session ended.
+    gate.release();
+    pump(visual);
+
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            let client = client_for(&base, "token-2");
+            let session = session_for(&base, 1, "alice", "token-2");
+            v.enter_workspace(client, Vec::new(), session, window, cx);
+        });
+    });
+    view.read_with(&*visual, |v, _| {
+        assert_eq!(
+            v.drafts.borrow().text(key),
+            "новый текст",
+            "only the composition that existed at expiry is restored"
+        );
+        assert!(!v.drafts.borrow().text(key).contains("отправка"));
+        assert!(
+            v.drafts.borrow().files(key).is_empty(),
+            "the sent attachment does not come back"
+        );
+        assert!(
+            !v.messages.iter().any(|message| message.id == 31),
+            "the late answer did not insert its row into the new session"
+        );
+    });
+    assert!(
+        server
+            .requests()
+            .iter()
+            .any(|request| request.method == "POST"
+                && request.path == "/api/v1/servers/1/channels/7/messages"),
+        "one message POST reached the server"
+    );
+    std::fs::remove_file(path).ok();
 }

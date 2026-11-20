@@ -261,8 +261,10 @@ impl Voxhold {
             panel.update(cx, |panel, cx| panel.set_scope(None, false, cx));
         }
         let drafts = std::mem::replace(&mut self.drafts, draft::Drafts::shared());
-        // A set kept from an earlier expiry belongs to another attempt; placing
-        // it here drops that set and releases its temporary clipboard files.
+        // Defensive, unreachable in the current flow: `saved_drafts` is filled
+        // only here and taken by the next `enter_workspace`, so a live session
+        // never coexists with a kept set. If a future path does, assigning over
+        // the stale set drops it and releases its temporary clipboard files.
         self.saved_drafts = Some(SavedDrafts {
             origin,
             user_id,

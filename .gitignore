@@ -1,5 +1,6 @@
 /target/
 **/target/
+/.cargo/local.toml
 **/Cargo.lock
 !/Cargo.lock
 *.pdb

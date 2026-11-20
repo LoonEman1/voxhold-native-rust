@@ -10,7 +10,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  # Keep each push eligible to run even if a newer push only changes docs.
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
@@ -18,27 +19,68 @@ jobs:
     runs-on: windows-latest
     env:
       CARGO_PROFILE_TEST_DEBUG: "0"
+    outputs:
+      build: ${{ steps.changes.outputs.build }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
       - name: Check repository file limits
         shell: pwsh
         run: pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/check-file-sizes.ps1 -All
       - name: Self-test file limit checker
         shell: pwsh
         run: pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/check-file-sizes.ps1 -SelfTest
+      - name: Detect changes that need a build
+        id: changes
+        shell: pwsh
+        env:
+          PUSH_BEFORE: ${{ github.event.before }}
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          $build = 'true'
+          $base = switch ($env:GITHUB_EVENT_NAME) {
+            # Compare the checked-out test merge with its base parent.
+            'pull_request' { 'HEAD^1' }
+            'push' {
+              if ($env:PUSH_BEFORE -cmatch '^[0-9a-f]{40}$' -and $env:PUSH_BEFORE -ne ('0' * 40)) {
+                git cat-file -e "${env:PUSH_BEFORE}^{commit}" 2>$null
+                if ($LASTEXITCODE -ne 0) {
+                  git fetch --no-tags --depth=1 origin $env:PUSH_BEFORE | Out-Host
+                }
+                $env:PUSH_BEFORE
+              }
+            }
+          }
+          if ($base) {
+            # Count both paths of moves into or out of the documentation.
+            git diff --quiet --no-ext-diff --no-renames $base HEAD -- . ':(exclude,glob)docs/**/*.md' ':(exclude,top,literal)README.md' ':(exclude,top,literal)AGENTS.md'
+            if ($LASTEXITCODE -eq 0) {
+              $build = 'false'
+              Write-Host 'Only documentation changed. Skipping Rust tests and packaging.'
+            } elseif ($LASTEXITCODE -ne 1) {
+              Write-Warning 'Could not determine all changed files. Running full checks.'
+            }
+          }
+          "build=$build" >> $env:GITHUB_OUTPUT
+          exit 0
       - uses: dtolnay/rust-toolchain@stable
+        if: steps.changes.outputs.build != 'false'
         with:
           components: rustfmt
-      - run: cargo fmt --all -- --check
+      - if: steps.changes.outputs.build != 'false'
+        run: cargo fmt --all -- --check
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        if: steps.changes.outputs.build != 'false'
         with:
           cache-bin: "false"
       # This compiles the workspace with default features and runs the GPUI,
       # API and media tests.
-      - run: cargo test --workspace --locked
+      - if: steps.changes.outputs.build != 'false'
+        run: cargo test --workspace --locked
 
   package:
-    if: github.event_name != 'pull_request'
+    if: github.event_name != 'pull_request' && needs.text-client.outputs.build != 'false'
     needs: text-client
     runs-on: windows-latest
     steps:

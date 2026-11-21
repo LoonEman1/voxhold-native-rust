@@ -1,6 +1,7 @@
 //! Interpretation of one engine update. Publishing the decoded picture lives
-//! here so a fresh RTP frame and a cached viewport repaint stay visibly
-//! distinct: only the former may confirm the connection.
+//! here so a prepared picture and a transport confirmation stay visibly
+//! distinct: `Frame` and `Decoded` confirm the connection, `Repaint` never
+//! does, and `Decoded` publishes no picture at all.
 
 use crate::{
     VideoFrame,
@@ -39,10 +40,11 @@ fn publish_frame(slot: &Mutex<Option<StreamFrame>>, render: &mut VideoFrame, sel
     }
 }
 
-/// Publish the decoded picture for the current selection. Only a fresh RTP
-/// frame confirms the connection; a cached repaint at a new viewport size must
-/// leave recovery and its deadline alone, otherwise a failed ICE restart would
-/// never time out behind a frozen picture.
+/// Publish the decoded picture for the current selection. `fresh` marks a new
+/// RTP frame, which also confirms the connection; a cached repaint at a new
+/// viewport size must leave recovery and its deadline alone, otherwise a
+/// failed ICE restart would never time out behind a frozen picture. `Decoded`
+/// confirms the connection in `apply_engine_update` without reaching here.
 fn picture_outcomes(
     slot: &Mutex<Option<StreamFrame>>,
     render: &mut VideoFrame,
@@ -78,6 +80,10 @@ pub(super) fn apply_engine_update(
 ) -> EngineEffect {
     match update {
         EngineUpdate::Frame => EngineEffect::Outcomes(picture_outcomes(slot, render, viewer, true)),
+        // The decode still confirms the transport; only its picture was not
+        // prepared because the player had not asked for one. Publishing the
+        // previous surface here would redraw a stale size after a switch.
+        EngineUpdate::Decoded => EngineEffect::Outcomes(viewer.on_frame()),
         EngineUpdate::Repaint => {
             EngineEffect::Outcomes(picture_outcomes(slot, render, viewer, false))
         }

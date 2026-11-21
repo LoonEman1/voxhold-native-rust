@@ -47,6 +47,10 @@ pub struct VideoStore {
     next_sequence: AtomicU64,
     latest: Mutex<Option<Arc<Frame>>>,
     scratch: Mutex<Option<I420Buffer>>,
+    /// Test-only: number of pictures actually scaled and converted. A skipped
+    /// identity (same sequence and size, or no frame) does not count.
+    #[cfg(test)]
+    conversions: AtomicU64,
 }
 
 impl VideoStore {
@@ -118,6 +122,10 @@ impl VideoStore {
             }
             bgra(scaled, output, width, height);
         }
+        // Count only a picture that really reached the output buffer: a
+        // rejected read or a failed scale is not a conversion.
+        #[cfg(test)]
+        self.conversions.fetch_add(1, Ordering::Relaxed);
         request.sequence = frame.sequence;
         request.width = width;
         request.height = height;
@@ -134,6 +142,12 @@ impl VideoStore {
             libwebrtc::video_frame::VideoRotation::VideoRotation0,
             Box::new(buffer) as Box<dyn VideoBuffer>,
         ))
+    }
+
+    /// Test-only: how many pictures were actually converted. A read that finds
+    /// the same sequence and size (or no frame) is not counted.
+    pub(crate) fn conversions(&self) -> u64 {
+        self.conversions.load(Ordering::Relaxed)
     }
 }
 
@@ -378,6 +392,37 @@ mod tests {
         assert_eq!(store.read(&mut request, &mut output), 8 * 8 * 4);
         assert!(output[2] > 250 && output[0] < 4);
         assert_eq!(store.read(&mut request, &mut output), 0);
+    }
+
+    #[test]
+    fn a_rejected_read_is_not_a_conversion() {
+        let store = VideoStore::default();
+        assert!(store.publish_i420(I420Buffer::new_black(320, 180)));
+        let mut request = VideoRead {
+            viewport_width: 160,
+            viewport_height: 90,
+            ..VideoRead::default()
+        };
+        // A surface one pixel row short cannot receive the fitted picture: the
+        // read is refused with the required length and nothing is converted.
+        let len = (160 * 90 * 4) as isize;
+        let mut short = vec![0; len as usize - 4];
+        assert_eq!(store.read(&mut request, &mut short), -len);
+        assert_eq!(
+            store.conversions(),
+            0,
+            "a rejected read is not a conversion"
+        );
+        assert_eq!(
+            (request.width, request.height),
+            (0, 0),
+            "no frame was claimed"
+        );
+        // The same picture in a surface of the right size is converted once,
+        // and only then does the counter move.
+        let mut output = vec![0; len as usize];
+        assert_eq!(store.read(&mut request, &mut output), len);
+        assert_eq!(store.conversions(), 1);
     }
 
     #[test]

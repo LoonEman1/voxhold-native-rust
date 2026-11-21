@@ -196,6 +196,10 @@ pub(super) struct Requests {
     /// runtime cache still describes the pre-unplug device.
     pub(super) output: Mutex<Option<Option<String>>>,
     pub(super) viewport: Mutex<Option<(u32, u32)>>,
+    /// The player asked for its next picture. It is a last-value flag, not a
+    /// queue: one request permits one conversion, and a request that arrives
+    /// while the worker is preparing a picture stays pending for the next one.
+    pub(super) frame_request: Arc<AtomicBool>,
     /// System resume/suspend. Last-value: only the newest transition matters.
     pub(super) power: Mutex<Option<bool>>,
     /// The confirmed broadcast captured before transport loss.
@@ -283,6 +287,14 @@ impl Requests {
         }
         let item = self.local_mutes.lock().ok()?.pop_front();
         item.map(|(connection, muted)| Pending::LocalMute(connection, muted))
+    }
+
+    /// The player is about to take its frame and wants the next picture
+    /// prepared. The worker performs the conversion off the UI thread; the
+    /// flag is last-value, so a burst of polls cannot grow the work.
+    pub(super) fn request_frame(&self) {
+        self.frame_request.store(true, Ordering::SeqCst);
+        self.wake();
     }
 
     pub(super) fn viewport(&self) -> (u32, u32) {

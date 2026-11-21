@@ -240,7 +240,12 @@ impl VoiceHandle {
         self.requests.wake();
     }
 
+    /// Take the last prepared picture and ask the worker for the next one.
+    /// The request is a last-value flag: the UI never converts pixels, it only
+    /// states that a picture is wanted, and the background loop scales the
+    /// latest decoded frame off the UI thread.
     pub fn take_frame(&self) -> Option<StreamFrame> {
+        self.requests.request_frame();
         self.frame.lock().ok()?.take()
     }
 
@@ -403,9 +408,45 @@ struct Live {
     screen_preview: Arc<crate::screen_capture::PreviewStore>,
     render: VideoFrame,
     viewport: (u32, u32),
+    /// True while the player has asked for a picture that the worker has not
+    /// prepared yet. One request allows one conversion; a viewport change is
+    /// its own reason to re-read the cached frame.
+    frame_request: Arc<AtomicBool>,
     local_level: Option<(f64, bool)>,
     frame: Arc<Mutex<Option<StreamFrame>>>,
     updates: Arc<Updates>,
+}
+
+/// One drain batch's claim on the player's last-value picture request. Taking
+/// it clears the shared flag, so a burst of polls cannot grow the work; if the
+/// batch ends without a successful read (no engine, or a signaling, statistics
+/// or audio update that never touched the decoder), `Drop` puts the claim
+/// back. The flag is never cleared again after the swap: a request that
+/// arrived during the batch must survive it.
+struct FrameClaim {
+    flag: Arc<AtomicBool>,
+    pending: bool,
+}
+
+impl FrameClaim {
+    fn take(flag: Arc<AtomicBool>) -> Self {
+        Self {
+            pending: flag.swap(false, Ordering::SeqCst),
+            flag,
+        }
+    }
+
+    fn pending(&mut self) -> &mut bool {
+        &mut self.pending
+    }
+}
+
+impl Drop for FrameClaim {
+    fn drop(&mut self) {
+        if self.pending {
+            self.flag.store(true, Ordering::SeqCst);
+        }
+    }
 }
 
 impl Live {
@@ -502,16 +543,22 @@ impl Live {
 
     async fn drain_viewer(&mut self, viewer: &mut Viewer) -> Result<bool, SessionEnd> {
         let (width, height) = self.viewport;
+        // One request allows one prepared picture per drain batch. Events
+        // (signaling, stats, audio) do not consume it, so a request that
+        // arrives between two decodes is still served by this batch. An
+        // unspent claim returns to the shared flag when it is dropped.
+        let mut request = FrameClaim::take(self.frame_request.clone());
+        let mut result = Ok(true);
         for _ in 0..FRAMES_PER_TICK {
             let update = {
                 let Self { stream, render, .. } = self;
                 let Some(engine) = stream.as_mut() else {
-                    return Ok(true);
+                    break;
                 };
-                engine.poll(render, width, height)
+                engine.poll(render, width, height, request.pending())
             };
             let Some(update) = update else {
-                return Ok(true);
+                break;
             };
             let now = Instant::now();
             let outcomes =
@@ -536,11 +583,22 @@ impl Live {
                         Vec::new()
                     }
                 };
-            if !self.apply(outcomes, viewer).await? {
-                return Ok(false);
+            match self.apply(outcomes, viewer).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    result = Ok(false);
+                    break;
+                }
+                Err(end) => {
+                    result = Err(end);
+                    break;
+                }
             }
         }
-        Ok(true)
+        // `request` returns an unspent claim to `frame_request` on drop; the
+        // batch may have ended on signaling or an audio update without
+        // touching the decoder.
+        result
     }
 
     async fn execute(&mut self, actions: Vec<Action>) -> Result<bool, SessionEnd> {

@@ -78,6 +78,12 @@ impl VoiceHandle {
         self.requests.viewport.lock().ok()?.take()
     }
 
+    /// Take the player's pending picture request exactly like the worker does.
+    /// `true` means one conversion is allowed.
+    pub fn take_frame_request_for_tests(&self) -> bool {
+        self.requests.frame_request.swap(false, Ordering::SeqCst)
+    }
+
     /// The newest screen gate the UI pushed for the worker while a picker or
     /// an attempt was open.
     pub fn take_screen_access_for_tests(&self) -> Option<(bool, bool)> {

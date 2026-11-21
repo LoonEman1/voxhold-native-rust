@@ -26,6 +26,8 @@ pub(crate) enum TrayAction {
     Restore,
     /// Re-registration failed; the hidden window must come back.
     RestoreFailed,
+    /// The subclassed HWND was destroyed; the icon bound to it is gone.
+    WindowGone(isize),
 }
 
 /// Result of the close handler before it touches the platform.
@@ -189,6 +191,11 @@ impl Voxhold {
                 }
             }
             TrayAction::RestoreFailed => self.tray_restore_failed(window, cx),
+            TrayAction::WindowGone(hwnd) => {
+                // The shell entry died with its HWND; a stale `registered`
+                // flag must not let the close hook hide into nothing.
+                self.notification_tray.invalidate(hwnd);
+            }
         }
     }
 
@@ -200,7 +207,8 @@ impl Voxhold {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        match close_decision(self.notification_tray.is_registered(), self.quitting) {
+        let available = self.notification_tray.is_available_for(window_hwnd(window));
+        match close_decision(available, self.quitting) {
             CloseDecision::Hide => {
                 self.hide_to_tray(window, cx);
                 false
@@ -237,7 +245,7 @@ impl Voxhold {
         self.window_active = !self.hidden_to_tray && window_is_active;
     }
 
-    fn clear_tray_error(&mut self) {
+    pub(super) fn clear_tray_error(&mut self) {
         if !self.tray_notice.is_empty() && self.error == self.tray_notice {
             self.error.clear();
         }
@@ -324,7 +332,9 @@ impl Voxhold {
     pub(super) fn finish_quit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.quitting = true;
         let hwnd = window_hwnd(window);
-        self.notification_tray.unregister(hwnd);
+        // Retirement is permanent: a late balloon or `TaskbarCreated` queued
+        // behind the close must not recreate an icon after `NIM_DELETE`.
+        self.notification_tray.shut_down(hwnd);
         cx.quit();
     }
 }
@@ -558,6 +568,9 @@ unsafe extern "system" fn tray_proc(
             let _ = RemoveWindowSubclass(hwnd, Some(tray_proc), SUBCLASS_ID);
         }
         clear_proc_hwnd(hwnd as isize);
+        // The icon outlives this message only as a stale flag. Invalidate it
+        // on the UI task; a closed channel simply drops the notification.
+        post(TrayAction::WindowGone(hwnd as isize));
     }
     unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) }
 }
@@ -576,9 +589,14 @@ fn point_from_wparam(wparam: usize) -> Option<(i32, i32)> {
 }
 
 /// The context-menu point: the shell point when it is usable, otherwise the
-/// current cursor position (the icon for a keyboard invocation).
+/// current cursor position (the icon for a keyboard invocation). A zero
+/// `wParam` decodes as `(0, 0)`, which is not an anchor and would put the menu
+/// in the top-left corner of the screen.
 #[cfg(windows)]
 fn menu_point(wparam: usize, cursor: (i32, i32)) -> (i32, i32) {
+    if wparam == 0 {
+        return cursor;
+    }
     point_from_wparam(wparam).unwrap_or(cursor)
 }
 
@@ -767,6 +785,10 @@ mod tests {
         assert_eq!(point_from_wparam(0xffff_ffff), None);
         assert_eq!(point_from_wparam(0x0000_ffff), None);
         assert_eq!(menu_point(0xffff_ffff, (640, 480)), (640, 480));
+        // A zero wParam decodes as (0, 0); that is a missing anchor, not the
+        // top-left corner, so the cursor position wins.
+        assert_eq!(menu_point(0, (640, 480)), (640, 480));
         assert_eq!(menu_point((300 << 16) | 200, (640, 480)), (200, 300));
+        assert_eq!(point_from_wparam(0), Some((0, 0)));
     }
 }

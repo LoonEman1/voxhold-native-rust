@@ -57,9 +57,8 @@ mod shell_view;
 mod tests;
 mod theme_ops;
 mod thread_ops;
-// The Win32 plumbing below is intentionally unreachable in tests: each entry
-// point has a `cfg(test)` seam, so dead-code analysis would flag the real API
-// calls even though they are exercised in production.
+// Unreachable in tests: each entry point has a `cfg(test)` seam, so dead-code
+// analysis would flag the real API calls even though production uses them.
 #[cfg_attr(test, allow(dead_code))]
 mod tray;
 pub(crate) mod ui;

@@ -854,6 +854,11 @@ release p50/p95 1/1 мкс. Лимитер восстанавливается с
 - `TaskbarCreated` после перезапуска Проводника перерегистрирует иконку.
   При неудаче окно возвращается только если оно было скрыто кнопкой
   (`hidden_to_tray`); видимое окно не активируется и не крадёт фокус.
+  Регистрация привязана к HWND: иконка для другого окна сначала удаляется,
+  а `WM_NCDESTROY` через `TrayAction::WindowGone` инвалидирует состояние, так
+  что крестик мёртвого окна не скрывает его «в никуда». Меню по
+  `WM_CONTEXTMENU` с нулевой/недостоверной точкой открывается у курсора,
+  а не в (0,0).
 - `window_active` — единственный источник истины для «окно видимо и на
   переднем плане»: `Window::is_window_active()` кэширует `WM_ACTIVATE` и не
   сбрасывается при `SW_HIDE`. Скрытое окно показывает balloon-уведомления и
@@ -863,18 +868,23 @@ release p50/p95 1/1 мкс. Лимитер восстанавливается с
   Voxhold». Она использует тот же путь выхода, что и меню трея: остановка
   голоса/медиа/preview, `save_shell`, `voice_settings.flush`, `NIM_DELETE`,
   флаг `quitting` и `cx.quit()`. Установка обновления идёт через тот же
-  `finish_quit`.
+  `finish_quit`. Успешная регистрация из balloon снимает устаревший
+  tray-баннер, а после `finish_quit` запоздавшие balloon/`TaskbarCreated`
+  не возвращают иконку.
 - Тестовые ветки не вызывают `Shell_NotifyIconW`, `LoadIconW`/`LoadImageW`,
   `DestroyIcon`, `SetWindowSubclass`, `ShowWindow` и остальные Win32-вызовы:
   считаются add/delete/version/balloon/icon-load. Покрыты закрытие в трей,
   ошибка без трея, `quitting`, read при скрытом окне, уведомления скрытого
   и активного окна, `TaskbarCreated` успех/неудача, возврат только скрытого
-  окна и идемпотентность `show_main_window`.
+  окна, идемпотентность `show_main_window`, нулевая точка контекстного меню,
+  смена HWND, инвалидация после `WM_NCDESTROY`, снятие tray-ошибки успешным
+  balloon и запрет поздней регистрации после выхода.
 - Проверки: `cargo metadata --no-deps --format-version 1` даёт
   `target_directory = C:/vxt` без переопределений; `cargo check --workspace
   --locked` успешен (два прежних предупреждения — `recordings_download::id` и
   `search::set_allowed_channels`); `cargo test --locked --bin
-  voxhold-native-rust` — 744 passed, 1 ignored, 0 failed; `cargo fmt --all --
+  voxhold-native-rust` (features по умолчанию, включая `voxhold-media`) —
+  753 passed, 1 ignored, 0 failed; `cargo fmt --all --
   --check`; `scripts/check-file-sizes.ps1 -All` — 369 файлов в лимитах
   1000/1200.
 

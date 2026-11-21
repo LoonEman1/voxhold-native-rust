@@ -191,6 +191,15 @@ pub struct TrayIcon {
     /// balloon must never create the icon on its own when the close hook could
     /// not work; that would hide the window with no way back.
     proc_available: bool,
+    /// The HWND the shell entry currently belongs to. A registration is only
+    /// valid for the window whose procedure receives its callback; after
+    /// `WM_NCDESTROY` this is cleared so the close hook cannot hide into a
+    /// dead window.
+    hwnd: Option<isize>,
+    /// Set by `shut_down` on the single quit path. Late balloons or
+    /// `TaskbarCreated` re-registrations must not resurrect the icon after
+    /// `NIM_DELETE`.
+    retired: bool,
     /// Loaded once and reused by every `register`/`restore`, so an Explorer
     /// restart does not leak a new `HICON` and does not touch the disk again.
     icon: Option<IconHandle>,
@@ -211,15 +220,25 @@ pub struct TrayIcon {
 
 #[cfg(windows)]
 impl TrayIcon {
-    /// Add the icon for `hwnd`. Idempotent: a second call while the icon is
-    /// registered is a no-op. A zero handle is reported instead of silently
-    /// pretending that the tray works.
+    /// Add the icon for `hwnd`. Idempotent for the same window; a registration
+    /// that belongs to another HWND is removed first, because that entry would
+    /// call back into a window that no longer owns the tray. A zero handle is
+    /// reported instead of silently pretending that the tray works.
     pub fn register(&mut self, hwnd: isize) -> Result<(), String> {
-        if self.registered {
-            return Ok(());
+        if self.retired {
+            return Err("Значок Voxhold уже удалён при выходе из приложения.".into());
         }
         if hwnd == 0 {
             return Err("Не удалось добавить значок Voxhold в системный трей.".into());
+        }
+        if self.registered && self.hwnd == Some(hwnd) {
+            return Ok(());
+        }
+        if self.registered {
+            // Replace the stale entry of the previous window instead of
+            // leaving two icons that both point at one callback slot.
+            let previous = self.hwnd.unwrap_or(0);
+            self.unregister(previous);
         }
         let icon = self.icon();
         let mut data = tray_data(hwnd);
@@ -229,6 +248,7 @@ impl TrayIcon {
         }
         self.apply_version(hwnd);
         self.registered = true;
+        self.hwnd = Some(hwnd);
         Ok(())
     }
 
@@ -236,9 +256,17 @@ impl TrayIcon {
     /// talks to the shell because the previous registration was lost with the
     /// old taskbar window.
     pub fn restore(&mut self, hwnd: isize) -> Result<(), String> {
+        if self.retired {
+            return Err("Значок Voxhold уже удалён при выходе из приложения.".into());
+        }
         if hwnd == 0 {
             self.registered = false;
+            self.hwnd = None;
             return Err("Не удалось восстановить значок Voxhold в системном трее.".into());
+        }
+        if self.registered && self.hwnd != Some(hwnd) {
+            let previous = self.hwnd.unwrap_or(0);
+            self.unregister(previous);
         }
         self.registered = false;
         let icon = self.icon();
@@ -249,6 +277,7 @@ impl TrayIcon {
         }
         self.apply_version(hwnd);
         self.registered = true;
+        self.hwnd = Some(hwnd);
         Ok(())
     }
 
@@ -256,11 +285,15 @@ impl TrayIcon {
     /// handle; used by the single quit path before `cx.quit()`.
     pub fn unregister(&mut self, hwnd: isize) {
         let was_registered = self.registered;
+        let registered_hwnd = self.hwnd.take();
         self.registered = false;
         // A removed icon cannot be reused; an owned file icon is destroyed
         // here. The resource icon stays shared and needs no cleanup.
         let icon = self.icon.take();
-        if !was_registered || hwnd == 0 {
+        // The shell entry is keyed by the HWND it was added for; deleting it
+        // through a different window would silently leave it behind.
+        let target = registered_hwnd.unwrap_or(hwnd);
+        if !was_registered || target == 0 {
             return;
         }
         #[cfg(test)]
@@ -269,7 +302,7 @@ impl TrayIcon {
         }
         #[cfg(not(test))]
         {
-            let mut data = tray_data(hwnd);
+            let mut data = tray_data(target);
             unsafe {
                 shell_notify_icon(NIM_DELETE, &mut data);
             }
@@ -277,8 +310,40 @@ impl TrayIcon {
         drop(icon);
     }
 
+    /// Forget the icon because its HWND was destroyed (`WM_NCDESTROY`). No
+    /// `NIM_DELETE` is attempted: the shell entry died with the window. An
+    /// invalidation for an older HWND must not erase a newer registration.
+    pub fn invalidate(&mut self, hwnd: isize) {
+        if self.hwnd.is_some() && self.hwnd != Some(hwnd) {
+            return;
+        }
+        self.registered = false;
+        self.proc_available = false;
+        self.hwnd = None;
+    }
+
+    /// Permanent retirement on the quit path. Unlike `unregister`, this also
+    /// rejects every later `register`/`restore`/`notification`.
+    pub fn shut_down(&mut self, hwnd: isize) {
+        self.retired = true;
+        self.unregister(hwnd);
+        self.proc_available = false;
+    }
+
     pub fn is_registered(&self) -> bool {
         self.registered
+    }
+
+    /// A registration is trusted only while the window procedure that receives
+    /// the callback is also live. `registered` alone can outlive its HWND.
+    pub fn is_available(&self) -> bool {
+        self.registered && self.proc_available && self.hwnd.is_some()
+    }
+
+    /// Whether the icon is registered for this exact window. Used by the close
+    /// hook so an icon left on a previous HWND cannot hide this one.
+    pub(crate) fn is_available_for(&self, hwnd: isize) -> bool {
+        self.is_available() && self.hwnd == Some(hwnd)
     }
 
     /// Record whether `SetWindowSubclass` succeeded. The installer calls this
@@ -293,7 +358,19 @@ impl TrayIcon {
     /// procedure is known to be live; otherwise the call fails without
     /// creating a tray entry whose clicks would go nowhere.
     pub fn notification(&mut self, hwnd: isize, title: &str, message: &str) -> Result<(), String> {
-        if !self.registered {
+        if self.retired {
+            return Err("Значок Voxhold уже удалён при выходе из приложения.".into());
+        }
+        if hwnd == 0 {
+            return Err("Не удалось показать системное уведомление.".into());
+        }
+        if self.registered && self.hwnd != Some(hwnd) {
+            // The icon belongs to a previous HWND; move it so the balloon's
+            // clicks reach the current window.
+            let previous = self.hwnd.unwrap_or(0);
+            self.unregister(previous);
+        }
+        if !self.is_available() {
             if !self.proc_available {
                 return Err(
                     "Не удалось показать системное уведомление: значок Voxhold недоступен.".into(),
@@ -301,8 +378,10 @@ impl TrayIcon {
             }
             self.register(hwnd)?;
         }
-        if hwnd == 0 {
-            return Err("Не удалось показать системное уведомление.".into());
+        if !self.is_available() {
+            return Err(
+                "Не удалось показать системное уведомление: значок Voxhold недоступен.".into(),
+            );
         }
         #[cfg(test)]
         {
@@ -332,6 +411,11 @@ impl TrayIcon {
     #[cfg(test)]
     pub(crate) fn set_test_add_result(&mut self, result: bool) {
         self.test_add_result = Some(result);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_add_calls(&self) -> u32 {
+        self.test_add_calls
     }
 
     #[cfg(test)]
@@ -596,9 +680,27 @@ impl TrayIcon {
         self.registered = false;
     }
 
+    pub fn invalidate(&mut self, _hwnd: isize) {
+        self.registered = false;
+    }
+
+    pub fn shut_down(&mut self, _hwnd: isize) {
+        self.registered = false;
+    }
+
     pub fn is_registered(&self) -> bool {
         self.registered
     }
+
+    pub fn is_available(&self) -> bool {
+        false
+    }
+
+    pub(crate) fn is_available_for(&self, _hwnd: isize) -> bool {
+        false
+    }
+
+    pub fn set_proc_available(&mut self, _available: bool) {}
 
     pub fn notification(
         &mut self,
@@ -727,6 +829,7 @@ mod tests {
     #[test]
     fn a_balloon_uses_the_test_seam_without_the_shell() {
         let mut tray = TrayIcon::default();
+        tray.set_proc_available(true);
         tray.register(1).unwrap();
         assert!(tray.notification(1, "title", "body").is_ok());
         assert_eq!(tray.test_balloon_calls, 1);
@@ -745,6 +848,84 @@ mod tests {
         assert!(tray.notification(1, "title", "body").is_ok());
         assert_eq!(tray.test_add_calls, 1);
         assert_eq!(tray.test_balloon_calls, 1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_registration_is_bound_to_its_hwnd() {
+        let mut tray = TrayIcon::default();
+        tray.set_test_add_result(true);
+        tray.set_proc_available(true);
+        tray.register(1).unwrap();
+        assert!(tray.is_available_for(1));
+        assert!(!tray.is_available_for(2));
+
+        // A second window replaces the entry: the old callback slot is dead.
+        tray.register(2).unwrap();
+        assert_eq!(tray.test_add_calls(), 2);
+        assert_eq!(tray.test_delete_calls(), 1);
+        assert!(tray.is_available_for(2));
+        assert!(!tray.is_available_for(1));
+        // The same window stays idempotent.
+        assert!(tray.register(2).is_ok());
+        assert_eq!(tray.test_add_calls(), 2);
+
+        // An invalidation for the old HWND must not erase the new entry.
+        tray.invalidate(1);
+        assert!(tray.is_available_for(2));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_destroyed_window_cannot_hide_or_show_a_balloon() {
+        let mut tray = TrayIcon::default();
+        tray.set_test_add_result(true);
+        tray.set_proc_available(true);
+        tray.register(1).unwrap();
+
+        tray.invalidate(1);
+        assert!(!tray.is_registered());
+        assert!(!tray.is_available());
+        assert!(!tray.is_available_for(1));
+        let adds = tray.test_add_calls();
+        assert!(tray.notification(1, "title", "body").is_err());
+        assert_eq!(tray.test_add_calls(), adds);
+        assert_eq!(tray.test_balloon_calls(), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_registered_icon_without_a_live_proc_is_not_available() {
+        let mut tray = TrayIcon::default();
+        tray.set_test_add_result(true);
+        tray.set_proc_available(true);
+        tray.register(1).unwrap();
+        tray.set_proc_available(false);
+        assert!(tray.is_registered());
+        assert!(!tray.is_available());
+        let adds = tray.test_add_calls();
+        assert!(tray.notification(1, "title", "body").is_err());
+        assert_eq!(tray.test_add_calls(), adds);
+        assert_eq!(tray.test_balloon_calls(), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_late_balloon_does_not_resurrect_a_finished_tray() {
+        let mut tray = TrayIcon::default();
+        tray.set_test_add_result(true);
+        tray.set_proc_available(true);
+        tray.register(1).unwrap();
+        tray.shut_down(1);
+        assert!(!tray.is_registered());
+        assert_eq!(tray.test_delete_calls(), 1);
+
+        let adds = tray.test_add_calls();
+        assert!(tray.notification(1, "title", "body").is_err());
+        assert!(tray.register(1).is_err());
+        assert!(tray.restore(1).is_err());
+        assert_eq!(tray.test_add_calls(), adds);
+        assert_eq!(tray.test_balloon_calls(), 0);
     }
 
     #[cfg(windows)]

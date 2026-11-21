@@ -283,6 +283,11 @@ impl Voxhold {
         event: &voxhold_api::RealtimeEvent,
         window: &Window,
     ) {
+        // A quit is already removing the icon; a queued balloon must not
+        // register it again after `NIM_DELETE`.
+        if self.quitting {
+            return;
+        }
         let Some((key, title, body)) = self.notifications.offer(
             &event.kind,
             &event.data,
@@ -293,7 +298,15 @@ impl Voxhold {
         };
         let hwnd = notification_hwnd(window);
         match self.notification_tray.notification(hwnd, &title, &body) {
-            Ok(()) => self.notifications.shown(&key),
+            Ok(()) => {
+                self.notifications.shown(&key);
+                // A balloon may be the call that finally registers the icon;
+                // a stale close block would then keep the redundant exit
+                // banner even though the tray works again.
+                if self.notification_tray.is_available_for(hwnd) {
+                    self.clear_tray_error();
+                }
+            }
             Err(error) => self.notifications.failed(error),
         }
     }

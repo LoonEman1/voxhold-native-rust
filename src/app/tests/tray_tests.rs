@@ -32,6 +32,7 @@ async fn the_close_hook_hides_with_the_tray_and_keeps_the_window_without_it(
     visual.update(|window, app| {
         view.update(app, |v, cx| {
             // The fake registration replaces Shell_NotifyIcon in tests.
+            v.notification_tray.set_proc_available(true);
             v.notification_tray.set_test_add_result(true);
             v.notification_tray.register(1).unwrap();
             assert!(!v.should_close_window(window, cx));
@@ -84,6 +85,7 @@ async fn a_hidden_window_ignores_activation_from_the_tray_menu(cx: &mut TestAppC
         view.update(app, |v, cx| {
             v.notifications.enabled = true;
             v.auth.username = "owner".into();
+            v.notification_tray.set_proc_available(true);
             v.notification_tray.set_test_add_result(true);
             v.notification_tray.register(1).unwrap();
             assert!(!v.should_close_window(window, cx));
@@ -117,6 +119,7 @@ async fn taskbar_restore_only_brings_back_a_hidden_window(cx: &mut TestAppContex
     let mut visual = VisualTestContext::from_window(window.into(), cx);
     visual.update(|window, app| {
         view.update(app, |v, cx| {
+            v.notification_tray.set_proc_available(true);
             v.notification_tray.set_test_add_result(true);
             v.notification_tray.register(1).unwrap();
             assert!(!v.should_close_window(window, cx));
@@ -160,6 +163,7 @@ async fn a_hidden_window_shows_balloons_and_an_active_one_suppresses_them(cx: &m
         view.update(app, |v, cx| {
             v.notifications.enabled = true;
             v.auth.username = "owner".into();
+            v.notification_tray.set_proc_available(true);
             v.notification_tray.set_test_add_result(true);
             v.notification_tray.register(1).unwrap();
             assert!(!v.should_close_window(window, cx));
@@ -174,6 +178,76 @@ async fn a_hidden_window_shows_balloons_and_an_active_one_suppresses_them(cx: &m
             v.deliver_notification(&message_event(2), window);
             assert_eq!(v.notification_tray.test_balloon_calls(), 1);
             assert_eq!(v.notifications.shown, 1);
+        });
+    });
+}
+
+#[gpui::test]
+async fn a_balloon_registration_clears_a_stale_tray_error(cx: &mut TestAppContext) {
+    cx.update(|cx| gpui_component::init(cx));
+    let (window, view) = add_auth_window(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            v.notifications.enabled = true;
+            v.auth.username = "owner".into();
+            v.notification_tray.set_proc_available(true);
+            // The window procedure is live, but the first registration fails.
+            v.notification_tray.set_test_add_result(false);
+            assert!(v.notification_tray.register(1).is_err());
+            assert!(!v.should_close_window(window, cx));
+            assert!(v.tray_exit_offered());
+            assert!(!v.tray_notice.is_empty());
+
+            // The hidden window's balloon retries the registration and wins.
+            v.notification_tray.set_test_add_result(true);
+            v.window_active = false;
+            v.deliver_notification(&message_event(1), window);
+            assert!(v.notification_tray.is_registered());
+            assert!(v.notification_tray.is_available());
+            assert!(!v.tray_exit_offered());
+            assert!(v.tray_notice.is_empty());
+            assert!(v.error.is_empty());
+            assert_eq!(v.notification_tray.test_balloon_calls(), 1);
+        });
+    });
+}
+
+#[gpui::test]
+async fn a_destroyed_window_invalidates_the_tray_icon(cx: &mut TestAppContext) {
+    cx.update(|cx| gpui_component::init(cx));
+    let (window, view) = add_auth_window(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            v.notifications.enabled = true;
+            v.auth.username = "owner".into();
+            v.notification_tray.set_proc_available(true);
+            v.notification_tray.set_test_add_result(true);
+            v.notification_tray.register(1).unwrap();
+            assert!(!v.should_close_window(window, cx));
+            assert!(v.hidden_to_tray);
+            v.show_main_window(window, cx);
+            assert!(!v.hidden_to_tray);
+
+            // `WM_NCDESTROY` invalidates the state instead of trusting a flag
+            // whose HWND is gone.
+            v.tray_action(TrayAction::WindowGone(1), window, cx);
+            assert!(!v.notification_tray.is_registered());
+            assert!(!v.notification_tray.is_available());
+
+            // The close hook is blocked again and offers the exit button.
+            assert!(!v.should_close_window(window, cx));
+            assert!(v.tray_exit_offered());
+
+            // A balloon must not re-add the icon for the dead window.
+            let adds = v.notification_tray.test_add_calls();
+            let balloons = v.notification_tray.test_balloon_calls();
+            v.window_active = false;
+            v.deliver_notification(&message_event(2), window);
+            assert_eq!(v.notification_tray.test_add_calls(), adds);
+            assert_eq!(v.notification_tray.test_balloon_calls(), balloons);
+            assert!(!v.notification_tray.is_registered());
         });
     });
 }

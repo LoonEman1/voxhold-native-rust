@@ -446,7 +446,10 @@ fn decoded_frames_are_converted_only_for_requests_and_viewport_changes() {
     let mut requests = 0u32;
 
     // The first picture moves the surface from 0x0 to the player size, so it
-    // is prepared even before the first request.
+    // is prepared even before the first request. A fresh engine (including a
+    // replacement one) starts at the same (0,0) baseline: its first frame is a
+    // surface change, not a bound violation. It is also the only picture the
+    // player can show before its first `take_frame`.
     assert!(video.publish_i420(I420Buffer::new_black(640, 360)));
     events.push(Event::Frame);
     viewport_changes += 1;

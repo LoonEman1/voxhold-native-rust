@@ -417,6 +417,38 @@ struct Live {
     updates: Arc<Updates>,
 }
 
+/// One drain batch's claim on the player's last-value picture request. Taking
+/// it clears the shared flag, so a burst of polls cannot grow the work; if the
+/// batch ends without a successful read (no engine, or a signaling, statistics
+/// or audio update that never touched the decoder), `Drop` puts the claim
+/// back. The flag is never cleared again after the swap: a request that
+/// arrived during the batch must survive it.
+struct FrameClaim {
+    flag: Arc<AtomicBool>,
+    pending: bool,
+}
+
+impl FrameClaim {
+    fn take(flag: Arc<AtomicBool>) -> Self {
+        Self {
+            pending: flag.swap(false, Ordering::SeqCst),
+            flag,
+        }
+    }
+
+    fn pending(&mut self) -> &mut bool {
+        &mut self.pending
+    }
+}
+
+impl Drop for FrameClaim {
+    fn drop(&mut self) {
+        if self.pending {
+            self.flag.store(true, Ordering::SeqCst);
+        }
+    }
+}
+
 impl Live {
     async fn send(
         &mut self,
@@ -513,8 +545,9 @@ impl Live {
         let (width, height) = self.viewport;
         // One request allows one prepared picture per drain batch. Events
         // (signaling, stats, audio) do not consume it, so a request that
-        // arrives between two decodes is still served by this batch.
-        let mut request = self.frame_request.swap(false, Ordering::SeqCst);
+        // arrives between two decodes is still served by this batch. An
+        // unspent claim returns to the shared flag when it is dropped.
+        let mut request = FrameClaim::take(self.frame_request.clone());
         let mut result = Ok(true);
         for _ in 0..FRAMES_PER_TICK {
             let update = {
@@ -522,7 +555,7 @@ impl Live {
                 let Some(engine) = stream.as_mut() else {
                     break;
                 };
-                engine.poll(render, width, height, &mut request)
+                engine.poll(render, width, height, request.pending())
             };
             let Some(update) = update else {
                 break;
@@ -562,11 +595,9 @@ impl Live {
                 }
             }
         }
-        // The batch may have ended on signaling or an audio update without
-        // touching the decoder. Do not lose the player's request then.
-        if request {
-            self.frame_request.store(true, Ordering::SeqCst);
-        }
+        // `request` returns an unspent claim to `frame_request` on drop; the
+        // batch may have ended on signaling or an audio update without
+        // touching the decoder.
         result
     }
 

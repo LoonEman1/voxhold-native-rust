@@ -98,8 +98,6 @@ impl VideoStore {
         if output.len() < len {
             return -(len as isize);
         }
-        #[cfg(test)]
-        self.conversions.fetch_add(1, Ordering::Relaxed);
 
         let converted;
         let source = if let Some(buffer) = source.as_i420() {
@@ -124,6 +122,10 @@ impl VideoStore {
             }
             bgra(scaled, output, width, height);
         }
+        // Count only a picture that really reached the output buffer: a
+        // rejected read or a failed scale is not a conversion.
+        #[cfg(test)]
+        self.conversions.fetch_add(1, Ordering::Relaxed);
         request.sequence = frame.sequence;
         request.width = width;
         request.height = height;

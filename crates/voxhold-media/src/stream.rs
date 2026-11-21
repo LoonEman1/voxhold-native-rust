@@ -7,8 +7,9 @@ use std::time::Duration;
 /// An engine event that belongs to the current attempt. Signaling is returned
 /// without request ids; `viewer` stamps the attempt's ids.
 pub enum EngineUpdate {
-    /// A fresh RTP frame was decoded and prepared for the player. Only this
-    /// update confirms the connection and ends recovery.
+    /// A fresh RTP frame was decoded and prepared for the player. It confirms
+    /// the connection and ends recovery exactly like `Decoded`; of the two,
+    /// only `Frame` carries a newly prepared picture.
     Frame,
     /// A fresh RTP frame was decoded but the player did not ask for a picture,
     /// so only the last prepared frame stayed in the surface. It confirms the
@@ -52,7 +53,9 @@ pub struct StreamViewer {
     output_working: bool,
     /// Viewport applied to the last decoded read. A different size re-reads
     /// the still-current frame so a static stream repaints at the new texture
-    /// size instead of waiting for another RTP frame.
+    /// size instead of waiting for another RTP frame. It starts at `(0, 0)`,
+    /// so the first frame of a freshly started engine is always a surface
+    /// change: the starting picture is prepared without a player request.
     viewport: (u32, u32),
     /// Viewer attempt this engine was created for. Every statistics report is
     /// stamped with it so the state machine can reject a late report of a
@@ -252,6 +255,11 @@ impl StreamViewer {
     /// connection-confirming `Frame`. The read is size- and sequence-aware, so
     /// an unchanged picture reports nothing and the caller settles instead of
     /// polling in a loop.
+    ///
+    /// The first frame of an engine reads even without a `request`: `viewport`
+    /// starts at `(0, 0)`, so the starting surface is a real size change. That
+    /// one conversion is what shows a picture before the player's first
+    /// `take_frame`; it is a surface change, not a bound violation.
     ///
     /// `request` is a last-value flag owned by the player: it is cleared here
     /// once this poll used it for a read, so one `take_frame` prepares at most

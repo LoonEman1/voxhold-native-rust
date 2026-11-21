@@ -111,12 +111,19 @@ pub(super) struct UpdateUi {
     pub phase: UpdatePhase,
     pub verified: Option<VerifiedManifest>,
     pub declined: Option<semver::Version>,
+    /// Stored switches plus the skipped version, written as one document.
+    pub prefs: UpdatePrefs,
     /// Invalidates late check/download answers.
     pub generation: u64,
     pub cancel: Option<CancelToken>,
     pub cancelling: bool,
+    /// The version this process already auto-downloaded once.
+    pub auto_started: Option<String>,
+    /// The version whose automatic download the user cancelled this run.
+    pub auto_suppressed: Option<String>,
     pub panel_open: bool,
     pub hover: bool,
+    pub prefs_error: Option<String>,
     pub prefs_path: Option<PathBuf>,
     pub install_dir: PathBuf,
     pub exe_name: String,
@@ -151,16 +158,21 @@ impl UpdateUi {
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| "Voxhold.exe".into());
         let prefs_path = update::prefs_path();
-        let declined = update::load_prefs(prefs_path.as_deref()).declined();
+        let prefs = update::load_prefs(prefs_path.as_deref());
+        let declined = prefs.declined();
         Self {
             phase: UpdatePhase::Idle,
             verified: None,
             declined,
+            prefs,
             generation: 0,
             cancel: None,
             cancelling: false,
+            auto_started: None,
+            auto_suppressed: None,
             panel_open: false,
             hover: false,
+            prefs_error: None,
             prefs_path,
             install_dir,
             exe_name,
@@ -217,10 +229,10 @@ impl Voxhold {
                 .await;
             let _ = this.update(cx, |view, cx| view.apply_startup_scan(scan, cx));
             executor.timer(START_DELAY).await;
-            let _ = this.update(cx, |view, cx| view.check_updates(false, cx));
+            let _ = this.update(cx, |view, cx| view.check_updates(cx));
             loop {
                 executor.timer(CHECK_INTERVAL).await;
-                let _ = this.update(cx, |view, cx| view.check_updates(false, cx));
+                let _ = this.update(cx, |view, cx| view.check_updates(cx));
             }
         }));
 
@@ -230,7 +242,8 @@ impl Voxhold {
             executor.timer(SECOND_CLEANUP_DELAY).await;
             let Ok((root, ready, active)) = this.update(cx, |view, _| {
                 let active = match &view.update.phase {
-                    UpdatePhase::Downloading { version, .. } => Some(version.clone()),
+                    UpdatePhase::Downloading { version, .. }
+                    | UpdatePhase::Preparing { version } => Some(version.clone()),
                     _ => None,
                 };
                 (
@@ -277,7 +290,9 @@ impl Voxhold {
         if let Some(staged) = scan.ready {
             if matches!(
                 &self.update.phase,
-                UpdatePhase::Downloading { .. } | UpdatePhase::Installing
+                UpdatePhase::Downloading { .. }
+                    | UpdatePhase::Preparing { .. }
+                    | UpdatePhase::Installing
             ) {
                 return;
             }
@@ -297,11 +312,19 @@ impl Voxhold {
         }
     }
 
-    /// Fetch and verify the signed manifest.
-    pub(super) fn check_updates(&mut self, manual: bool, cx: &mut Context<Self>) {
+    /// Fetch and verify the signed manifest, one check at a time.
+    ///
+    /// Both the 3 s / 6 h clock and the manual button call this entry point.
+    /// An in-flight check or download is never duplicated: a second call
+    /// leaves the visible phase untouched so the panel keeps showing it.
+    pub(super) fn check_updates(&mut self, cx: &mut Context<Self>) {
         if matches!(
             &self.update.phase,
-            UpdatePhase::Downloading { .. } | UpdatePhase::Ready { .. } | UpdatePhase::Installing
+            UpdatePhase::Checking
+                | UpdatePhase::Downloading { .. }
+                | UpdatePhase::Preparing { .. }
+                | UpdatePhase::Ready { .. }
+                | UpdatePhase::Installing
         ) {
             return;
         }
@@ -312,9 +335,6 @@ impl Voxhold {
                 ..
             }
         ) {
-            return;
-        }
-        if matches!(&self.update.phase, UpdatePhase::Checking) && !manual {
             return;
         }
         let (manifest_url, signature_url) = match update::update_urls() {
@@ -387,7 +407,29 @@ impl Voxhold {
                 ) {
                     Ok(phase) => {
                         self.update.verified = Some(manifest);
+                        let auto = match &phase {
+                            UpdatePhase::Available { version, .. }
+                                if update::should_auto_download(
+                                    &self.update.prefs,
+                                    version,
+                                    self.update.declined.as_ref(),
+                                    self.update.auto_suppressed.as_deref(),
+                                    self.update.auto_started.as_deref(),
+                                ) =>
+                            {
+                                self.update.auto_started = Some(version.clone());
+                                true
+                            }
+                            _ => false,
+                        };
                         self.update.phase = phase;
+                        if auto {
+                            // The same `stage_update` path as the manual
+                            // button: delta selection, hash checks and the
+                            // fallback to the full package are not duplicated.
+                            self.start_download(cx);
+                            return;
+                        }
                     }
                     Err(error) => {
                         self.update.phase = UpdatePhase::Error {
@@ -521,6 +563,14 @@ impl Voxhold {
             return false;
         };
         let (next_downloaded, next_total) = progress.snapshot();
+        if update::download_complete(next_downloaded, next_total) {
+            // Every byte is on disk; hashing and unpacking still take time.
+            self.update.phase = UpdatePhase::Preparing {
+                version: version.clone(),
+            };
+            cx.notify();
+            return true;
+        }
         if next_downloaded == *downloaded && next_total == *total {
             return true;
         }
@@ -534,7 +584,12 @@ impl Voxhold {
         true
     }
 
-    fn finish_download(&mut self, generation: u64, outcome: StageOutcome, cx: &mut Context<Self>) {
+    pub(super) fn finish_download(
+        &mut self,
+        generation: u64,
+        outcome: StageOutcome,
+        cx: &mut Context<Self>,
+    ) {
         if generation != self.update.generation {
             return;
         }
@@ -577,8 +632,15 @@ impl Voxhold {
     }
 
     /// Ask the library to stop and remove the partial staging directory.
+    ///
+    /// The cancelled version is remembered for the rest of this process: the
+    /// 6 h clock must not start the same automatic download again. The manual
+    /// button stays available and is not affected.
     pub(super) fn cancel_download(&mut self, cx: &mut Context<Self>) {
         if let Some(cancel) = &self.update.cancel {
+            if let UpdatePhase::Downloading { version, .. } = &self.update.phase {
+                self.update.auto_suppressed = Some(version.clone());
+            }
             cancel.cancel();
             self.update.cancelling = true;
             cx.notify();
@@ -595,18 +657,46 @@ impl Voxhold {
         else {
             return;
         };
-        let mut prefs = UpdatePrefs {
-            declined_version: Some(version.to_string()),
-        };
+        let mut prefs = self.update.prefs.clone();
         prefs.set_declined(&version);
-        if let Err(_) = update::save_prefs(self.update.prefs_path.as_deref(), &prefs) {
+        if update::save_prefs(self.update.prefs_path.as_deref(), &prefs).is_err() {
             self.update.phase = UpdatePhase::Error {
                 message: "Не удалось сохранить выбор версии.".into(),
                 retry: RetryKind::Check,
             };
         } else {
+            self.update.prefs = prefs;
             self.update.declined = Some(version);
             self.update.phase = UpdatePhase::UpToDate;
+        }
+        cx.notify();
+    }
+
+    /// Flip the background download switch and write the whole document.
+    pub(super) fn toggle_auto_download(&mut self, cx: &mut Context<Self>) {
+        let mut prefs = self.update.prefs.clone();
+        prefs.auto_download = !prefs.auto_download;
+        self.persist_prefs(prefs, cx);
+    }
+
+    /// Flip the install-on-next-start switch and write the whole document.
+    pub(super) fn toggle_install_on_next_start(&mut self, cx: &mut Context<Self>) {
+        let mut prefs = self.update.prefs.clone();
+        prefs.install_on_next_start = !prefs.install_on_next_start;
+        self.persist_prefs(prefs, cx);
+    }
+
+    /// Save preferences without losing the skipped version or the other switch.
+    fn persist_prefs(&mut self, prefs: UpdatePrefs, cx: &mut Context<Self>) {
+        match update::save_prefs(self.update.prefs_path.as_deref(), &prefs) {
+            Ok(()) => {
+                self.update.declined = prefs.declined();
+                self.update.prefs = prefs;
+                self.update.prefs_error = None;
+            }
+            Err(_) => {
+                self.update.prefs_error = Some("Не удалось сохранить настройки обновлений.".into())
+            }
         }
         cx.notify();
     }
@@ -618,7 +708,7 @@ impl Voxhold {
             _ => return,
         };
         match retry {
-            RetryKind::Check => self.check_updates(true, cx),
+            RetryKind::Check => self.check_updates(cx),
             RetryKind::Download => self.start_download(cx),
             RetryKind::Install => self.install_ready(window, cx),
         }
@@ -739,56 +829,31 @@ impl Voxhold {
     }
 
     pub(super) fn open_update_panel(&mut self, cx: &mut Context<Self>) {
+        // Opening the popup only shows the process-wide state. The 3 s / 6 h
+        // clock already owns checking; the panel never starts another timer
+        // or an implicit check.
         self.update.panel_open = true;
         self.update.hover = false;
-        if matches!(
-            &self.update.phase,
-            UpdatePhase::Idle | UpdatePhase::UpToDate
-        ) || matches!(
-            &self.update.phase,
-            UpdatePhase::Error {
-                retry: RetryKind::Check,
-                ..
-            }
-        ) {
-            self.check_updates(true, cx);
-        }
         cx.notify();
     }
 
-    /// Close the popup. A pending check belongs to the closed surface; a
-    /// download is an explicit operation and keeps running.
+    /// Close the popup. Checks and downloads belong to the process, not to
+    /// this surface, so closing it changes nothing else.
     pub(super) fn close_update_panel(&mut self, cx: &mut Context<Self>) {
         self.update.panel_open = false;
         self.update.hover = false;
-        if matches!(&self.update.phase, UpdatePhase::Checking) {
-            if let Some(cancel) = &self.update.cancel {
-                cancel.cancel();
-            }
-            self.update.cancel = None;
-            self.update.generation = self.update.generation.wrapping_add(1);
-            self.update.phase = UpdatePhase::Idle;
-        }
         cx.notify();
     }
 
-    /// A logout or a lost session invalidates every in-flight answer.
+    /// A logout only hides the popup.
+    ///
+    /// The update lifecycle is process-wide: a background download and a
+    /// staged package must survive a session change. The generation still
+    /// discards late answers of a newer manual check, but logout must not
+    /// invalidate it.
     pub(super) fn end_update_session(&mut self) {
-        self.update.generation = self.update.generation.wrapping_add(1);
-        if let Some(cancel) = &self.update.cancel {
-            cancel.cancel();
-        }
-        self.update.cancel = None;
-        self.update.cancelling = false;
-        self.update.progress = None;
         self.update.panel_open = false;
         self.update.hover = false;
-        if matches!(
-            &self.update.phase,
-            UpdatePhase::Checking | UpdatePhase::Downloading { .. } | UpdatePhase::Installing
-        ) {
-            self.update.phase = UpdatePhase::Idle;
-        }
     }
 
     pub(crate) fn report_handshake_failure(&mut self, message: String) {
@@ -820,4 +885,22 @@ fn packaged_exe_name(app_dir: &Path, running: &str) -> Option<String> {
         return Some(PACKAGE_EXE_NAME.to_string());
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_process_checks_after_three_seconds_and_then_every_six_hours() {
+        assert_eq!(START_DELAY, Duration::from_secs(3));
+        assert_eq!(CHECK_INTERVAL, Duration::from_secs(6 * 60 * 60));
+    }
+
+    #[test]
+    fn a_full_progress_reaches_preparing_and_zero_total_does_not() {
+        assert!(!update::download_complete(0, 0));
+        assert!(!update::download_complete(512, 1024));
+        assert!(update::download_complete(1024, 1024));
+    }
 }

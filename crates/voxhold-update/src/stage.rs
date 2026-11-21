@@ -170,7 +170,7 @@ async fn stage_inner(request: &StageRequest<'_>) -> Result<Option<StagedUpdate>>
     let base = base_package(request).await;
     let mut delta_reason = None;
     if let Some((base, delta)) = base {
-        match stage_delta(request, &staging, &base, delta).await {
+        match stage_delta(request, &staging, base, delta).await {
             Ok(()) => {
                 return ready(request, version, staging, StageMethod::Delta, None).map(Some);
             }
@@ -214,7 +214,7 @@ async fn base_package(
 async fn stage_delta(
     request: &StageRequest<'_>,
     staging: &Path,
-    base: &PackedPackage,
+    base: PackedPackage,
     delta: crate::manifest::DeltaEntry,
 ) -> Result<()> {
     let delta_path = staging.join(DELTA_FILE);
@@ -245,8 +245,9 @@ async fn stage_delta(
     let bytes = tokio::fs::read(&delta_path)
         .await
         .map_err(|error| UpdateError::io(&delta_path, error))?;
-    let base_bytes = base.bytes.clone();
-    let target = tokio::task::spawn_blocking(move || crate::delta::apply(&base_bytes, &bytes))
+    // The base package is moved into the blocking task instead of being
+    // cloned: the archive is the largest buffer in the delta path.
+    let target = tokio::task::spawn_blocking(move || crate::delta::apply(&base.bytes, &bytes))
         .await
         .map_err(|error| UpdateError::Apply(format!("delta task failed: {error}")))??;
     if package::sha256_hex(&target) != request.manifest.full.package_sha256 {
@@ -256,7 +257,7 @@ async fn stage_delta(
     tokio::fs::write(&package_path, &target)
         .await
         .map_err(|error| UpdateError::io(&package_path, error))?;
-    unpack_to(staging, target, &request.manifest.version).await
+    unpack_bytes_to(staging, target, &request.manifest.version).await
 }
 
 async fn stage_full(request: &StageRequest<'_>, staging: &Path) -> Result<()> {
@@ -285,17 +286,42 @@ async fn stage_full(request: &StageRequest<'_>, staging: &Path) -> Result<()> {
     if outcome.sha256 != request.manifest.full.package_sha256 {
         return Err(UpdateError::HashMismatch { path: package_path });
     }
-    let bytes = tokio::fs::read(&package_path)
+    // Re-check the archive digest on the file itself and unpack straight from
+    // disk. The ZIP never has to sit in memory as one `Vec`.
+    let digest_path = package_path.clone();
+    let digest = tokio::task::spawn_blocking(move || package::sha256_file(&digest_path))
         .await
-        .map_err(|error| UpdateError::io(&package_path, error))?;
-    unpack_to(staging, bytes, &request.manifest.version).await
+        .map_err(|error| UpdateError::Apply(format!("hash task failed: {error}")))??;
+    if digest != request.manifest.full.package_sha256 {
+        return Err(UpdateError::HashMismatch { path: package_path });
+    }
+    unpack_file_to(staging, &package_path, &request.manifest.version).await
 }
 
-async fn unpack_to(staging: &Path, bytes: Vec<u8>, version: &str) -> Result<()> {
+async fn unpack_bytes_to(staging: &Path, bytes: Vec<u8>, version: &str) -> Result<()> {
     let app = staging.join(APP_DIR);
     let version = version.to_owned();
     tokio::task::spawn_blocking(move || {
         let index = package::unpack(&bytes, &app)?;
+        if index.version != version {
+            return Err(UpdateError::InvalidPackage(format!(
+                "package version {} does not match manifest version {version}",
+                index.version
+            )));
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|error| UpdateError::Apply(format!("unpack task failed: {error}")))??;
+    Ok(())
+}
+
+async fn unpack_file_to(staging: &Path, archive: &Path, version: &str) -> Result<()> {
+    let app = staging.join(APP_DIR);
+    let archive = archive.to_path_buf();
+    let version = version.to_owned();
+    tokio::task::spawn_blocking(move || {
+        let index = package::unpack_file(&archive, &app)?;
         if index.version != version {
             return Err(UpdateError::InvalidPackage(format!(
                 "package version {} does not match manifest version {version}",

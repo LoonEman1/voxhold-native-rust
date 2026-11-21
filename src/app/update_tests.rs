@@ -11,7 +11,8 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use voxhold_update::download::CancelToken;
 use voxhold_update::error::UpdateError;
-use voxhold_update::stage::{StageMethod, StagedUpdate};
+use voxhold_update::manifest::{FullPackage, Manifest, SetupPackage, VerifiedManifest};
+use voxhold_update::stage::{StageMethod, StageOutcome, StagedUpdate};
 
 fn draw(visual: &mut VisualTestContext) {
     visual.update(|window, app| {
@@ -59,6 +60,8 @@ fn make_app(cx: &mut TestAppContext) -> (gpui::WindowHandle<Root>, Entity<Voxhol
             view.self_user_id = 1;
             view.update.root_override = Some(app_dir.join("updates"));
             view.update.prefs_path = Some(app_dir.join("update-prefs.json"));
+            view.update.prefs = update::UpdatePrefs::default();
+            view.update.declined = None;
             view.update.install_dir = app_dir.join("install");
             view.update.exe_name = "Voxhold.exe".into();
             view
@@ -96,6 +99,37 @@ fn long_notes() -> String {
         .map(|line| format!("Строка {line}: исправления, улучшения и подробности выпуска."))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// A manifest signed with a throw-away Ed25519 key. No network is involved:
+/// the test only needs the real `VerifiedManifest` value.
+fn verified_manifest(version: &str) -> VerifiedManifest {
+    let (private, public) = voxhold_update::verify::generate_keypair().unwrap();
+    let manifest = Manifest {
+        schema: 1,
+        channel: update::CHANNEL.into(),
+        version: version.into(),
+        min_windows: "10.0.19041".into(),
+        published_at: "2026-11-19T12:00:00Z".into(),
+        notes: "Заметки".into(),
+        authenticode: false,
+        full: FullPackage {
+            url: "https://example.invalid/full.zip".into(),
+            size: 10,
+            sha256: "a".repeat(64),
+            package_sha256: "a".repeat(64),
+        },
+        setup: SetupPackage {
+            url: "https://example.invalid/Setup.exe".into(),
+            size: 10,
+            sha256: "b".repeat(64),
+        },
+        deltas: Vec::new(),
+    };
+    let bytes = manifest.to_json();
+    let signature = voxhold_update::verify::sign_bytes(&private, &bytes).unwrap();
+    let key = voxhold_update::verify::UpdatePublicKey::from_base64(&public).unwrap();
+    voxhold_update::verify::verify_and_parse(&key, &bytes, &signature).unwrap()
 }
 
 #[gpui::test]
@@ -156,6 +190,12 @@ async fn the_panel_renders_every_state_in_both_themes(cx: &mut TestAppContext) {
             &["update-progress", "update-percent", "update-cancel"],
         ),
         (
+            UpdatePhase::Preparing {
+                version: "0.2.0".into(),
+            },
+            &[],
+        ),
+        (
             UpdatePhase::Ready {
                 version: "0.2.0".into(),
                 staged: staged.clone(),
@@ -191,6 +231,12 @@ async fn the_panel_renders_every_state_in_both_themes(cx: &mut TestAppContext) {
                 visual.debug_bounds("update-panel").is_some(),
                 "{phase:?} must paint the panel"
             );
+            for selector in ["update-auto-download", "update-install-next"] {
+                assert!(
+                    visual.debug_bounds(selector).is_some(),
+                    "{phase:?} is missing {selector}"
+                );
+            }
             for selector in *selectors {
                 assert!(
                     visual.debug_bounds(selector).is_some(),
@@ -358,6 +404,177 @@ async fn skipping_a_version_persists_the_choice(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn a_background_check_respects_the_switch_and_the_cancel_suppression(
+    cx: &mut TestAppContext,
+) {
+    cx.update(|cx| gpui_component::init(cx));
+    let (window, view, _dir) = make_app(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
+
+    // The switch off leaves the version visible but does not download it.
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            v.update.prefs.auto_download = false;
+            v.update.phase = UpdatePhase::Checking;
+            let generation = v.update.generation;
+            v.finish_check(generation, Ok(verified_manifest("9.9.9")), cx);
+        });
+        let _ = window;
+    });
+    view.read_with(&*visual, |v, _| {
+        assert!(matches!(
+            &v.update.phase,
+            UpdatePhase::Available { version, .. } if version == "9.9.9"
+        ));
+        assert!(v.update.auto_started.is_none());
+    });
+
+    // The switch on, but this process already suppressed the version.
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            v.update.prefs.auto_download = true;
+            v.update.auto_suppressed = Some("9.9.9".into());
+            v.update.phase = UpdatePhase::Checking;
+            let generation = v.update.generation;
+            v.finish_check(generation, Ok(verified_manifest("9.9.9")), cx);
+        });
+        let _ = window;
+    });
+    view.read_with(&*visual, |v, _| {
+        assert!(matches!(
+            &v.update.phase,
+            UpdatePhase::Available { version, .. } if version == "9.9.9"
+        ));
+        assert!(v.update.auto_started.is_none());
+    });
+}
+
+#[gpui::test]
+async fn a_logout_and_a_closed_panel_keep_the_download(cx: &mut TestAppContext) {
+    cx.update(|cx| gpui_component::init(cx));
+    let (window, view, dir) = make_app(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
+    let token = CancelToken::new();
+    let generation = 5;
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            v.update.phase = UpdatePhase::Downloading {
+                version: "0.2.0".into(),
+                downloaded: 10,
+                total: 100,
+            };
+            v.update.cancel = Some(token.clone());
+            v.update.generation = generation;
+            v.update.panel_open = true;
+            cx.notify();
+        });
+        let _ = window;
+    });
+
+    visual.update(|window, app| {
+        view.update(app, |v, cx| v.close_update_panel(cx));
+        let _ = window;
+    });
+    view.read_with(&*visual, |v, _| {
+        assert!(!token.is_cancelled(), "closing the panel is not a cancel");
+        assert!(matches!(v.update.phase, UpdatePhase::Downloading { .. }));
+        assert_eq!(v.update.generation, generation);
+        assert!(!v.update.panel_open);
+    });
+
+    visual.update(|window, app| {
+        view.update(app, |v, _| v.end_update_session());
+        let _ = window;
+    });
+    view.read_with(&*visual, |v, _| {
+        assert!(!token.is_cancelled(), "logout is not a cancel");
+        assert!(matches!(v.update.phase, UpdatePhase::Downloading { .. }));
+        assert_eq!(v.update.generation, generation);
+        assert!(!v.update.panel_open);
+    });
+
+    // A ready package found before the logout also survives the session.
+    let staged = staged_update(&dir);
+    visual.update(|window, app| {
+        view.update(app, |v, _| {
+            v.update.phase = UpdatePhase::Ready {
+                version: "9.9.9".into(),
+                staged: staged.clone(),
+            };
+            v.end_update_session();
+        });
+        let _ = window;
+    });
+    view.read_with(&*visual, |v, _| {
+        assert!(matches!(v.update.phase, UpdatePhase::Ready { .. }));
+    });
+}
+
+#[gpui::test]
+async fn the_preference_switches_persist_and_keep_the_skipped_version(cx: &mut TestAppContext) {
+    cx.update(|cx| gpui_component::init(cx));
+    let (window, view, _dir) = make_app(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            v.update.prefs.set_declined(&semver::Version::new(0, 2, 0));
+            v.update.declined = v.update.prefs.declined();
+            update::save_prefs(v.update.prefs_path.as_deref(), &v.update.prefs).unwrap();
+            v.update.phase = UpdatePhase::UpToDate;
+            v.update.panel_open = true;
+            cx.notify();
+        });
+        let _ = window;
+    });
+    draw(&mut visual);
+    let auto = center(&mut visual, "update-auto-download");
+    click(&mut visual, auto);
+    view.read_with(&*visual, |v, _| {
+        assert!(!v.update.prefs.auto_download);
+        assert!(v.update.prefs.install_on_next_start);
+        assert_eq!(v.update.declined, Some(semver::Version::new(0, 2, 0)));
+        let saved = update::load_prefs(v.update.prefs_path.as_deref());
+        assert!(!saved.auto_download);
+        assert!(saved.install_on_next_start);
+        assert_eq!(saved.declined(), Some(semver::Version::new(0, 2, 0)));
+    });
+
+    let install = center(&mut visual, "update-install-next");
+    click(&mut visual, install);
+    view.read_with(&*visual, |v, _| {
+        assert!(!v.update.prefs.auto_download);
+        assert!(!v.update.prefs.install_on_next_start);
+        let saved = update::load_prefs(v.update.prefs_path.as_deref());
+        assert!(!saved.auto_download);
+        assert!(!saved.install_on_next_start);
+        assert_eq!(saved.declined(), Some(semver::Version::new(0, 2, 0)));
+    });
+}
+
+#[gpui::test]
+async fn a_logout_does_not_invalidate_a_manual_check(cx: &mut TestAppContext) {
+    cx.update(|cx| gpui_component::init(cx));
+    let (window, view, _dir) = make_app(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            v.update.phase = UpdatePhase::Checking;
+            v.update.generation = 3;
+            v.update.prefs.auto_download = false;
+            v.end_update_session();
+            v.finish_check(3, Ok(verified_manifest("9.9.9")), cx);
+        });
+        let _ = window;
+    });
+    view.read_with(&*visual, |v, _| {
+        assert!(matches!(
+            &v.update.phase,
+            UpdatePhase::Available { version, .. } if version == "9.9.9"
+        ));
+    });
+}
+
+#[gpui::test]
 async fn cancelling_a_download_sets_the_token(cx: &mut TestAppContext) {
     cx.update(|cx| gpui_component::init(cx));
     let (window, view, _dir) = make_app(cx);
@@ -382,6 +599,47 @@ async fn cancelling_a_download_sets_the_token(cx: &mut TestAppContext) {
     view.read_with(&*visual, |v, _| {
         assert!(v.update.cancel.as_ref().unwrap().is_cancelled());
         assert!(v.update.cancelling);
+        assert_eq!(v.update.auto_suppressed.as_deref(), Some("0.2.0"));
+    });
+}
+
+#[gpui::test]
+async fn a_cancelled_download_returns_to_available_without_a_new_auto_start(
+    cx: &mut TestAppContext,
+) {
+    cx.update(|cx| gpui_component::init(cx));
+    let (window, view, _dir) = make_app(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
+    let token = CancelToken::new();
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            v.update.verified = Some(verified_manifest("9.9.9"));
+            v.update.phase = UpdatePhase::Downloading {
+                version: "9.9.9".into(),
+                downloaded: 10,
+                total: 100,
+            };
+            v.update.cancel = Some(token.clone());
+            v.update.generation = 4;
+            v.cancel_download(cx);
+            v.finish_download(4, StageOutcome::Failed(UpdateError::Cancelled), cx);
+        });
+        let _ = window;
+    });
+    view.read_with(&*visual, |v, _| {
+        assert!(matches!(
+            &v.update.phase,
+            UpdatePhase::Available { version, .. } if version == "9.9.9"
+        ));
+        assert_eq!(v.update.auto_suppressed.as_deref(), Some("9.9.9"));
+        // A later check must not start this version again automatically.
+        assert!(!update::should_auto_download(
+            &v.update.prefs,
+            "9.9.9",
+            v.update.declined.as_ref(),
+            v.update.auto_suppressed.as_deref(),
+            v.update.auto_started.as_deref(),
+        ));
     });
 }
 

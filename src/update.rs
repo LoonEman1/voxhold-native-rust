@@ -92,11 +92,36 @@ pub fn prefs_path() -> Option<PathBuf> {
     Some(base.join("Voxhold").join(PREFS_FILE))
 }
 
-/// Stored update preferences. Only a manually skipped version is kept.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+fn default_true() -> bool {
+    true
+}
+
+/// Stored update preferences: the skipped version and the two background
+/// switches.
+///
+/// The file is shared by every process build, so a missing field is not an
+/// error: an older `update-prefs.json` that only carried `declined_version`
+/// reads both switches as `true`. `Default` is written out explicitly instead
+/// of derived, because a derived `bool` default would silently turn the
+/// background features off.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UpdatePrefs {
     #[serde(default)]
     pub declined_version: Option<String>,
+    #[serde(default = "default_true")]
+    pub auto_download: bool,
+    #[serde(default = "default_true")]
+    pub install_on_next_start: bool,
+}
+
+impl Default for UpdatePrefs {
+    fn default() -> Self {
+        Self {
+            declined_version: None,
+            auto_download: default_true(),
+            install_on_next_start: default_true(),
+        }
+    }
 }
 
 impl UpdatePrefs {
@@ -166,6 +191,10 @@ pub enum UpdatePhase {
         downloaded: u64,
         total: u64,
     },
+    /// The download finished and the archive is being verified and unpacked.
+    Preparing {
+        version: String,
+    },
     Ready {
         version: String,
         staged: StagedUpdate,
@@ -183,7 +212,9 @@ impl UpdatePhase {
         match self {
             Self::Idle | Self::UpToDate | Self::Checking => "icons/refresh.svg",
             Self::Available { .. } => "icons/down.svg",
-            Self::Downloading { .. } | Self::Installing => "icons/refresh.svg",
+            Self::Downloading { .. } | Self::Preparing { .. } | Self::Installing => {
+                "icons/refresh.svg"
+            }
             Self::Ready { .. } => "icons/check.svg",
             Self::Error { .. } => "icons/close.svg",
         }
@@ -201,6 +232,7 @@ impl UpdatePhase {
                 downloaded,
                 total,
             } => format!("Загружаем {version} · {}%", percent(*downloaded, *total)),
+            Self::Preparing { version } => format!("Готовим {version} к установке"),
             Self::Ready { version, .. } => format!("Версия {version} готова к установке"),
             Self::Error { .. } => "Ошибка обновления".into(),
             Self::Installing => "Устанавливаем обновление…".into(),
@@ -222,6 +254,51 @@ pub fn percent(downloaded: u64, total: u64) -> u8 {
         return 0;
     }
     ((downloaded.min(total) as u128 * 100) / total as u128).min(100) as u8
+}
+
+/// True once every expected byte of the download has been reported.
+///
+/// The caller switches to [`UpdatePhase::Preparing`] on this condition; the
+/// archive is still being hashed and unpacked at that point.
+pub fn download_complete(downloaded: u64, total: u64) -> bool {
+    total > 0 && downloaded >= total
+}
+
+/// Whether a successful background check may start the download itself.
+///
+/// Auto-download is skipped when the switch is off, when the version is the
+/// one the user skipped, and when this process already started (or the user
+/// cancelled) that version. A manual button never uses this decision.
+pub fn should_auto_download(
+    prefs: &UpdatePrefs,
+    version: &str,
+    declined: Option<&Version>,
+    suppressed: Option<&str>,
+    auto_started: Option<&str>,
+) -> bool {
+    if !prefs.auto_download {
+        return false;
+    }
+    let Ok(candidate) = Version::parse(version) else {
+        return false;
+    };
+    if declined.is_some_and(|value| value == &candidate) {
+        return false;
+    }
+    if suppressed == Some(version) || auto_started == Some(version) {
+        return false;
+    }
+    true
+}
+
+/// Text under a ready version. It only promises an automatic install when the
+/// user left the switch on.
+pub fn ready_note(install_on_next_start: bool) -> &'static str {
+    if install_on_next_start {
+        "Установится при следующем запуске"
+    } else {
+        "Готово к установке"
+    }
 }
 
 /// Compare a verified manifest with the installed version.
@@ -520,28 +597,6 @@ mod tests {
     }
 
     #[test]
-    fn preferences_round_trip_atomically() {
-        let dir = std::env::temp_dir().join(format!(
-            "voxhold-update-prefs-{}-{}",
-            std::process::id(),
-            uuid::Uuid::new_v4()
-        ));
-        let path = dir.join(PREFS_FILE);
-        let mut prefs = UpdatePrefs::default();
-        prefs.set_declined(&Version::new(0, 2, 0));
-        save_prefs(Some(&path), &prefs).unwrap();
-        let loaded = load_prefs(Some(&path));
-        assert_eq!(loaded, prefs);
-        assert_eq!(loaded.declined(), Some(Version::new(0, 2, 0)));
-        assert!(load_prefs(Some(&dir.join("missing.json")))
-            .declined()
-            .is_none());
-        std::fs::write(&path, b"not json").unwrap();
-        assert!(load_prefs(Some(&path)).declined().is_none());
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
     fn offers_only_a_newer_version_and_respects_dismissal() {
         let current = Version::new(0, 1, 0);
         let phase = evaluate_manifest(&manifest("0.2.0"), &current, None, None).unwrap();
@@ -806,3 +861,7 @@ mod tests {
         std::fs::remove_dir_all(&temp).ok();
     }
 }
+
+#[cfg(test)]
+#[path = "update_prefs_tests.rs"]
+mod update_prefs_tests;

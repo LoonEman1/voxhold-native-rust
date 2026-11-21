@@ -9,6 +9,7 @@
 //! cannot apply them.
 
 use super::*;
+use gpui::ScrollHandle;
 use voxhold_media::publisher::{
     Codec, Phase, Preset, PublishRequest, Quality, QualityChange, QualityOutcome, Resolution,
     Sharing, AUDIO_BITRATES, MAX_CHANNEL_PUBLISHERS,
@@ -47,8 +48,15 @@ pub(super) const SCREEN_THUMBNAIL_WIDTH: u32 = 320;
 pub(super) const MAX_SCREEN_PREVIEWS: usize = 64;
 /// Hard bound of all BGRA bytes kept for picker previews.
 pub(super) const MAX_SCREEN_PREVIEW_BYTES: usize = 16 * 1024 * 1024;
-/// A picture that does not fit the cache still gets an honest card note.
-pub(super) const PREVIEW_MEMORY_REASON: &str = "Предпросмотр недоступен: превышен лимит памяти.";
+/// Height of the scrolling picker list. The visibility range must match the
+/// dialog's `#share-sources`, so both use this value.
+pub(super) const SOURCE_LIST_HEIGHT: f32 = 236.0;
+/// Height of one picker card, unchanged from the painted layout.
+pub(super) const SOURCE_CARD_HEIGHT: f32 = 124.0;
+/// Gap between two card rows and between two cards of one row.
+pub(super) const SOURCE_ROW_GAP: f32 = 8.0;
+/// Vertical distance from one row to the next.
+pub(super) const SOURCE_ROW_HEIGHT: f32 = SOURCE_CARD_HEIGHT + SOURCE_ROW_GAP;
 
 /// One cached card picture. `bytes` is the BGRA source size, so the budget
 /// stays comparable across sessions.
@@ -145,11 +153,41 @@ pub(super) struct ScreenShareUi {
     pub(super) preview_epoch: u64,
     /// BGRA bytes currently owned by `previews`.
     pub(super) preview_bytes: usize,
+    /// Insertion order of `previews`. The oldest picture that is neither
+    /// visible nor in flight is evicted first when a card needs room.
+    pub(super) preview_order: VecDeque<SourceIdentity>,
+    /// Surfaces whose real frame did not fit even after eviction. Not a card
+    /// failure: they are retried once a snapshot or tab describes them again.
+    pub(super) preview_unfit: HashSet<SourceIdentity>,
     /// Pictures dropped by the count or byte bound, kept for diagnostics/tests.
     pub(super) preview_rejected: u32,
     /// Cards painted by the last frame, so a layout test can prove one card per
     /// source without relying on a single `debug_selector`.
     pub(super) preview_cards: usize,
+    /// Identities inside the picker viewport plus one row of margin above and
+    /// below, in visual order. Captures claim only these rows. Empty means no
+    /// measurable rows yet (the first frame, a restart dialog or an empty
+    /// list): the batch then claims only the small bootstrap set.
+    pub(super) visible_previews: Vec<SourceIdentity>,
+    /// Scratch list of the per-frame visibility computation. The `Vec` itself
+    /// is reused, but each identity is cloned: a monitor identity owns its
+    /// device string, so a scroll still copies those strings instead of
+    /// allocating a brand-new list.
+    visible_scratch: Vec<SourceIdentity>,
+    /// Category that `visible_previews` describes. A list of another category
+    /// is ignored instead of capturing the hidden tab.
+    pub(super) visible_kind: SourceKind,
+    /// Scroll top observed by the last painted frame, used to notice a scroll
+    /// without comparing the whole identity list.
+    visible_scroll: f32,
+    /// Requests the dialog deferred for the rows of the last painted frame.
+    /// Test-only: it proves a scroll asks once, not once per repaint.
+    #[cfg(test)]
+    pub(super) preview_deferrals: u32,
+    /// Scroll state of `#share-sources`. The dialog tracks it so the picker
+    /// knows which rows are visible; tests drive the same handle through a
+    /// wheel event.
+    pub(super) scroll: ScrollHandle,
     /// Pictures really handed to `Window::drop_image`. Test-only: it proves
     /// that a replaced or cleared preview left the sprite atlas instead of
     /// being only removed from a collection.
@@ -203,8 +241,17 @@ impl Default for ScreenShareUi {
             preview_batching: false,
             preview_epoch: 0,
             preview_bytes: 0,
+            preview_order: VecDeque::new(),
+            preview_unfit: HashSet::new(),
             preview_rejected: 0,
             preview_cards: 0,
+            visible_previews: Vec::new(),
+            visible_scratch: Vec::new(),
+            visible_kind: SourceKind::Monitor,
+            visible_scroll: 0.0,
+            #[cfg(test)]
+            preview_deferrals: 0,
+            scroll: ScrollHandle::new(),
             #[cfg(test)]
             released_images: 0,
             #[cfg(test)]
@@ -802,6 +849,11 @@ impl VoicePanel {
         self.screen
             .preview_pending
             .retain(|id| selection::identity_kind(id) == kind);
+        // A surface whose frame could not fit before gets another chance in
+        // the category the user really asked for now.
+        self.screen
+            .preview_unfit
+            .retain(|id| selection::identity_kind(id) != kind);
         self.request_screen_previews(window, cx);
         cx.notify();
     }

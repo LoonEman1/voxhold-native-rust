@@ -839,7 +839,7 @@ mod tests {
     }
 
     #[test]
-    fn unpack_file_verified_rejects_a_mismatched_digest() {
+    fn unpack_file_verified_rejects_a_mismatched_digest_and_keeps_existing_files() {
         let temp = tempfile::tempdir().unwrap();
         let source = temp.path().join("source");
         sample_dir(&source);
@@ -847,23 +847,30 @@ mod tests {
         let archive = temp.path().join("package.zip");
         fs::write(&archive, &packed.bytes).unwrap();
         let installed = temp.path().join("installed");
+        fs::create_dir_all(&installed).unwrap();
+        let marker = installed.join("user-notes.txt");
+        fs::write(&marker, b"keep me").unwrap();
 
         // The digest of another file must not admit this archive, and the
-        // rejected attempt must leave no payload behind.
+        // rejected attempt must not touch the existing installation.
         assert!(matches!(
             unpack_file_verified(&archive, &installed, &sha256_hex(b"another archive")),
             Err(UpdateError::HashMismatch { .. })
         ));
+        assert_eq!(fs::read(&marker).unwrap(), b"keep me");
         assert!(!installed.join("Voxhold.exe").exists());
         assert!(temporary_files(&installed).is_empty());
 
-        // Hashing and unpacking share one opened handle.
+        // Hashing and unpacking share one opened handle; a matching digest
+        // still unpacks into the directory that already holds user files.
         let index = unpack_file_verified(&archive, &installed, &packed.sha256).unwrap();
         assert_eq!(index, packed.index);
         assert_eq!(
             fs::read(installed.join("Voxhold.exe")).unwrap(),
             b"binary payload"
         );
+        assert_eq!(fs::read(&marker).unwrap(), b"keep me");
+        assert!(temporary_files(&installed).is_empty());
     }
 
     fn temporary_files(dir: &Path) -> Vec<PathBuf> {

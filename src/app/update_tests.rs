@@ -1,7 +1,7 @@
 //! Update integration tests: state mapping, popup layout, cancellation and the
 //! helper launch seam. No test performs a real network request.
 
-use super::update_ops::{LaunchRequest, ProgressCounters, UpdateLauncher};
+use super::update_ops::{phase_counter, LaunchRequest, ProgressCounters, UpdateLauncher};
 use super::*;
 use crate::update::{self, RetryKind, UpdatePhase};
 use gpui::{px, size, Modifiers, TestAppContext, VisualTestContext};
@@ -645,16 +645,23 @@ async fn cancelling_while_preparing_also_works_and_suppresses_the_version(cx: &m
 }
 
 #[gpui::test]
-async fn a_full_fallback_returns_the_poller_to_downloading(cx: &mut TestAppContext) {
+async fn a_full_fallback_replaces_the_delta_total_and_keeps_the_poller_alive(
+    cx: &mut TestAppContext,
+) {
     cx.update(|cx| gpui_component::init(cx));
     let (window, view, dir) = make_app(cx);
     let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
-    let progress = Arc::new(ProgressCounters::new(4_000));
+    // The delta is still downloading and already reported its own total.
+    let progress = Arc::new(ProgressCounters::new(771));
+    progress.set(512, Some(771));
+    let report = phase_counter(progress.clone());
     let generation = 11;
     visual.update(|window, app| {
         view.update(app, |v, _| {
-            v.update.phase = UpdatePhase::Preparing {
+            v.update.phase = UpdatePhase::Downloading {
                 version: "0.2.0".into(),
+                downloaded: 512,
+                total: 771,
             };
             v.update.generation = generation;
             v.update.progress = Some(progress.clone());
@@ -662,9 +669,9 @@ async fn a_full_fallback_returns_the_poller_to_downloading(cx: &mut TestAppConte
         let _ = window;
     });
 
-    // The delta failed and the full package started: fresh counters with the
-    // full total must bring the panel back to percentages.
-    progress.restart(4_000);
+    // The delta failed and staging reports the full package through the same
+    // callback `start_download` hands to `stage_update`.
+    report(StagePhase::Downloading { total: 4_000 });
     let mut keep = false;
     visual.update(|window, app| {
         view.update(app, |v, cx| {
@@ -672,15 +679,15 @@ async fn a_full_fallback_returns_the_poller_to_downloading(cx: &mut TestAppConte
         });
         let _ = window;
     });
-    assert!(keep, "the poller must stay alive through Preparing");
+    assert!(keep, "the poller must stay alive through the fallback");
     view.read_with(&*visual, |v, _| match &v.update.phase {
         UpdatePhase::Downloading {
             downloaded,
             total,
             version,
         } => {
-            assert_eq!(*downloaded, 0);
-            assert_eq!(*total, 4_000);
+            assert_eq!(*downloaded, 0, "the full package restarts at zero");
+            assert_eq!(*total, 4_000, "the delta total must be replaced");
             assert_eq!(version, "0.2.0");
         }
         other => panic!("expected Downloading, got {other:?}"),
@@ -705,10 +712,10 @@ async fn a_full_fallback_returns_the_poller_to_downloading(cx: &mut TestAppConte
         ));
     });
 
-    // Staging reports Preparing again once the full body is on disk, and the
+    // The full body is on disk and staging starts hashing and unpacking; the
     // poller waits for the result instead of dropping the interval.
     progress.set(4_000, Some(4_000));
-    progress.set_phase(StagePhase::Preparing);
+    report(StagePhase::Preparing);
     visual.update(|window, app| {
         view.update(app, |v, cx| {
             keep = v.poll_progress(generation, &progress, cx)

@@ -268,17 +268,6 @@ pub fn percent(downloaded: u64, total: u64) -> u8 {
     ((downloaded.min(total) as u128 * 100) / total as u128).min(100) as u8
 }
 
-/// True once every expected byte of the download has been reported.
-///
-/// The controller takes the visible phase from [`voxhold_update::stage::StagePhase`]
-/// instead of guessing it from these totals, because a failed delta restarts
-/// the download with a new total. The threshold stays here for the progress
-/// tests. A zero total is never complete.
-#[cfg(test)]
-pub fn download_complete(downloaded: u64, total: u64) -> bool {
-    total > 0 && downloaded >= total
-}
-
 /// Whether a successful background check may start the download itself.
 ///
 /// Auto-download is skipped when the switch is off, when the version is the

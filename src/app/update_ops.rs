@@ -18,7 +18,7 @@ use voxhold_update::error::UpdateError;
 use voxhold_update::manifest::{VerifiedManifest, WindowsVersion};
 use voxhold_update::package::read_package_json_from_dir;
 use voxhold_update::stage::{
-    stage_update, updates_root, StageOutcome, StagePhase, StageRequest, StagedUpdate,
+    stage_update, updates_root, PhaseFn, StageOutcome, StagePhase, StageRequest, StagedUpdate,
 };
 use voxhold_update::verify::embedded_public_key;
 
@@ -142,6 +142,15 @@ impl ProgressCounters {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
+}
+
+/// Phase callback for staging: it owns the counters the poller reads.
+/// Staging announces every transition; no counters are inferred here.
+pub(super) fn phase_counter(progress: Arc<ProgressCounters>) -> PhaseFn {
+    Arc::new(move |phase| match phase {
+        StagePhase::Downloading { total } => progress.restart(total),
+        StagePhase::Preparing => progress.set_phase(StagePhase::Preparing),
+    })
 }
 
 /// Controller state owned by `Voxhold`.
@@ -568,14 +577,7 @@ impl Voxhold {
                         progress: Some(Arc::new(move |downloaded, total| {
                             progress.set(downloaded, total);
                         })),
-                        phase: Some(Arc::new(move |phase| match phase {
-                            // A failed delta restarts the whole download; the
-                            // new total must replace the delta counters.
-                            StagePhase::Downloading { total } => phase_progress.restart(total),
-                            StagePhase::Preparing => {
-                                phase_progress.set_phase(StagePhase::Preparing)
-                            }
-                        })),
+                        phase: Some(phase_counter(phase_progress)),
                     })
                     .await
                 })
@@ -983,9 +985,15 @@ mod tests {
     }
 
     #[test]
-    fn a_full_progress_reaches_preparing_and_zero_total_does_not() {
-        assert!(!update::download_complete(0, 0));
-        assert!(!update::download_complete(512, 1024));
-        assert!(update::download_complete(1024, 1024));
+    fn the_phase_callback_restarts_and_reaches_preparing() {
+        let progress = Arc::new(ProgressCounters::new(771));
+        let report = phase_counter(progress.clone());
+        progress.set(512, Some(771));
+        report(StagePhase::Preparing);
+        assert_eq!(progress.phase(), StagePhase::Preparing);
+        assert_eq!(progress.snapshot(), (512, 771));
+        report(StagePhase::Downloading { total: 4_000 });
+        assert_eq!(progress.phase(), StagePhase::Downloading { total: 4_000 });
+        assert_eq!(progress.snapshot(), (0, 4_000));
     }
 }

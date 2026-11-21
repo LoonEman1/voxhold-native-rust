@@ -152,15 +152,6 @@ fn auto_download_is_decided_once_per_version() {
 }
 
 #[test]
-fn a_finished_download_moves_to_preparing() {
-    assert!(!download_complete(0, 100));
-    assert!(!download_complete(99, 100));
-    assert!(download_complete(100, 100));
-    assert!(download_complete(150, 100));
-    assert!(!download_complete(0, 0));
-}
-
-#[test]
 fn a_ready_note_follows_the_install_switch() {
     assert_eq!(ready_note(true), "Установится при следующем запуске");
     assert_eq!(ready_note(false), "Готово к установке");

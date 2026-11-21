@@ -220,7 +220,8 @@ jobs:
           $manifestArgs = @(
             'manifest', '--full', $full, '--setup', $setup,
             '--version', $env:VERSION, '--notes-file', $notesFile, '--out', 'dist',
-            '--base-url', "https://github.com/LoonEman1/voxhold-native-rust/releases/download/$env:TAG"
+            '--base-url', "https://github.com/LoonEman1/voxhold-native-rust/releases/download/$env:TAG",
+            '--delta-base-url', 'https://github.com/LoonEman1/voxhold-native-rust/releases/download/beta'
           )
           $verifyArgs = @(
             'verify', '--manifest', 'dist/latest.json', '--sig', 'dist/latest.json.sig',

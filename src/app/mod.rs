@@ -405,6 +405,12 @@ pub(crate) struct Voxhold {
     /// The window was hidden by the close button, not merely minimized. Only
     /// this state may be brought back automatically after a tray failure.
     hidden_to_tray: bool,
+    /// A tray failure blocked the close hook. The visible exit path is driven
+    /// by this flag, not by a comparison with one error text: any later error
+    /// must not take the button away.
+    tray_close_blocked: bool,
+    /// Tray-specific banner text, kept apart from `error` and `auth.status`.
+    tray_notice: String,
     /// Personal "Сообщения" mode. The server/channel context is kept in
     /// `personal_return` so "К каналам" can restore it when still permitted.
     personal_mode: bool,
@@ -841,6 +847,8 @@ impl Voxhold {
             notifications_entry_focus: cx.focus_handle(),
             window_active: true,
             hidden_to_tray: false,
+            tray_close_blocked: false,
+            tray_notice: String::new(),
             personal_mode: false,
             personal_return: None,
             pending_return_channel: None,
@@ -962,7 +970,9 @@ impl Voxhold {
             pending_anchor: None,
             deleted_ids: Default::default(),
             _activation_subscription: cx.observe_window_activation(window, |s, window, cx| {
-                s.window_active = window.is_window_active();
+                // A hidden window still receives `WM_ACTIVATE` when the tray
+                // menu calls `SetForegroundWindow`, but it must stay silent.
+                s.window_activation_changed(window.is_window_active());
                 s.sync_system_theme(window, cx);
                 cx.notify();
             }),

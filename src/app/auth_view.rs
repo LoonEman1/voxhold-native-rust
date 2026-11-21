@@ -27,10 +27,31 @@ impl Voxhold {
                 div()
                     .flex_1()
                     .min_w(px(0.))
-                    .truncate()
-                    .text_size(px(13.))
-                    .text_color(ink(p.error_text))
-                    .child(self.auth.status.clone()),
+                    .flex()
+                    .flex_col()
+                    .justify_center()
+                    .when(!self.auth.status.is_empty(), |column| {
+                        column.child(
+                            div()
+                                .truncate()
+                                .text_size(px(13.))
+                                .text_color(ink(p.error_text))
+                                .child(self.auth.status.clone()),
+                        )
+                    })
+                    // The tray failure is its own line: it never replaces the
+                    // login error above it.
+                    .when(self.tray_close_blocked, |column| {
+                        column.child(
+                            div()
+                                .id("auth-tray-error")
+                                .debug_selector(|| "auth-tray-error".into())
+                                .truncate()
+                                .text_size(px(12.))
+                                .text_color(ink(p.error_text))
+                                .child(self.tray_error_text().to_string()),
+                        )
+                    }),
             );
         // A transient automatic failure keeps the record, so the same login
         // can be retried without retyping the address. The link only appears
@@ -496,7 +517,12 @@ impl Voxhold {
         let (vw, vh) = self.viewport;
         let p = self.palette;
         let instance = self.auth.is_instance();
-        let l = auth::layout_auth(vw, vh, instance, !self.auth.status.is_empty());
+        let l = auth::layout_auth(
+            vw,
+            vh,
+            instance,
+            !self.auth.status.is_empty() || self.tray_close_blocked,
+        );
         let compact = vw <= 760.0;
         let background = self.auth_background(vw.round() as u32, vh.round() as u32);
         let mut root = div()
@@ -911,7 +937,7 @@ impl Voxhold {
                     "Войти в Voxhold".to_string()
                 }),
         );
-        if !self.auth.status.is_empty() {
+        if !self.auth.status.is_empty() || self.tray_close_blocked {
             root = root.child(self.auth_error_row(l.error, cx));
         }
         root.into_any_element()

@@ -187,6 +187,10 @@ impl Drop for IconHandle {
 #[derive(Debug, Default)]
 pub struct TrayIcon {
     registered: bool,
+    /// Whether the window procedure that owns the tray callback is live. A
+    /// balloon must never create the icon on its own when the close hook could
+    /// not work; that would hide the window with no way back.
+    proc_available: bool,
     /// Loaded once and reused by every `register`/`restore`, so an Explorer
     /// restart does not leak a new `HICON` and does not touch the disk again.
     icon: Option<IconHandle>,
@@ -277,11 +281,24 @@ impl TrayIcon {
         self.registered
     }
 
+    /// Record whether `SetWindowSubclass` succeeded. The installer calls this
+    /// before registering the permanent icon; the balloon fallback below reads
+    /// it so a failed subclass never produces an orphaned tray entry.
+    pub fn set_proc_available(&mut self, available: bool) {
+        self.proc_available = available;
+    }
+
     /// Show a balloon through the already registered icon (`NIF_INFO` +
-    /// `NIM_MODIFY`). If the icon is missing, it is registered first; the
-    /// notification never deletes it afterwards.
+    /// `NIM_MODIFY`). A missing icon is registered only when the window
+    /// procedure is known to be live; otherwise the call fails without
+    /// creating a tray entry whose clicks would go nowhere.
     pub fn notification(&mut self, hwnd: isize, title: &str, message: &str) -> Result<(), String> {
         if !self.registered {
+            if !self.proc_available {
+                return Err(
+                    "Не удалось показать системное уведомление: значок Voxhold недоступен.".into(),
+                );
+            }
             self.register(hwnd)?;
         }
         if hwnd == 0 {
@@ -712,6 +729,21 @@ mod tests {
         let mut tray = TrayIcon::default();
         tray.register(1).unwrap();
         assert!(tray.notification(1, "title", "body").is_ok());
+        assert_eq!(tray.test_balloon_calls, 1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_balloon_does_not_register_without_a_live_window_proc() {
+        let mut tray = TrayIcon::default();
+        tray.set_test_add_result(true);
+        assert!(tray.notification(1, "title", "body").is_err());
+        assert_eq!(tray.test_add_calls, 0);
+        assert!(!tray.is_registered());
+
+        tray.set_proc_available(true);
+        assert!(tray.notification(1, "title", "body").is_ok());
+        assert_eq!(tray.test_add_calls, 1);
         assert_eq!(tray.test_balloon_calls, 1);
     }
 

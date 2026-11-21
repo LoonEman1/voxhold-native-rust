@@ -11,6 +11,8 @@
 use super::*;
 use crate::notifications::TrayIcon;
 use crate::notifications::TRAY_CALLBACK_MESSAGE;
+#[cfg(windows)]
+use std::sync::atomic::AtomicIsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
@@ -141,7 +143,11 @@ impl Voxhold {
             // The icon must not appear until the window procedure is live:
             // otherwise the cross would hide the window with no way back.
             let proc_installed = install_window_proc(hwnd);
+            self.notification_tray.set_proc_available(proc_installed);
             register_tray_after_proc(&mut self.notification_tray, hwnd, proc_installed);
+            if self.notification_tray.is_registered() {
+                self.clear_tray_error();
+            }
             let _ = channel();
             if self.tray_task.is_none() {
                 if let Some(mut receiver) = take_receiver() {
@@ -177,6 +183,9 @@ impl Voxhold {
                     // Keep one failure path for a failed Explorer restart and
                     // any future caller that reports it directly.
                     self.tray_action(TrayAction::RestoreFailed, window, cx);
+                } else {
+                    self.clear_tray_error();
+                    cx.notify();
                 }
             }
             TrayAction::RestoreFailed => self.tray_restore_failed(window, cx),
@@ -204,10 +213,36 @@ impl Voxhold {
         }
     }
 
-    /// The banner shows a normal exit button only for this specific failure, so
-    /// the user is not trapped in a window whose close hook is blocked.
+    /// The banner shows a normal exit button whenever the close button is
+    /// blocked, not only for one exact error text: another message must not
+    /// hide the only way out of a window whose close hook cannot hide it.
     pub(super) fn tray_exit_offered(&self) -> bool {
-        self.error == TRAY_CLOSE_ERROR
+        self.tray_close_blocked
+    }
+
+    /// The tray banner text, independent of the general `error` field.
+    pub(super) fn tray_error_text(&self) -> &str {
+        if self.tray_notice.is_empty() {
+            TRAY_CLOSE_ERROR
+        } else {
+            &self.tray_notice
+        }
+    }
+
+    /// `WM_ACTIVATE` from `SetForegroundWindow` on a hidden window does not
+    /// make it visible. Notifications and read marks must keep using the
+    /// hidden state, otherwise the tray menu silences the app until it is
+    /// opened again.
+    pub(super) fn window_activation_changed(&mut self, window_is_active: bool) {
+        self.window_active = !self.hidden_to_tray && window_is_active;
+    }
+
+    fn clear_tray_error(&mut self) {
+        if !self.tray_notice.is_empty() && self.error == self.tray_notice {
+            self.error.clear();
+        }
+        self.tray_notice.clear();
+        self.tray_close_blocked = false;
     }
 
     fn hide_to_tray(&mut self, window: &Window, cx: &mut Context<Self>) {
@@ -218,6 +253,9 @@ impl Voxhold {
         // so this flag, not `Window::is_window_active`, is the source of truth.
         self.window_active = false;
         self.hidden_to_tray = true;
+        // The icon is live (this path is only reached for a registered tray),
+        // so no tray error can still be blocking the close hook.
+        self.clear_tray_error();
         // A hidden window gets no activation event: release a held PTT now so
         // the microphone cannot stay open behind the tray.
         #[cfg(feature = "voxhold-media")]
@@ -242,6 +280,9 @@ impl Voxhold {
         }
         self.hidden_to_tray = false;
         self.window_active = true;
+        // The menu or the window is visible again, so the tray works; a stale
+        // registration error must not keep the redundant exit banner around.
+        self.clear_tray_error();
         cx.notify();
     }
 
@@ -259,7 +300,11 @@ impl Voxhold {
 
     fn report_tray_error(&mut self, message: &str, cx: &mut Context<Self>) {
         self.error = message.to_string();
-        self.auth.status = message.to_string();
+        // Kept separately from the general error and from `auth.status`: a
+        // later message must not hide the banner or the exit button, and a
+        // login error must stay the login error.
+        self.tray_notice = message.to_string();
+        self.tray_close_blocked = true;
         cx.notify();
     }
 
@@ -365,11 +410,49 @@ struct Point {
 }
 
 #[cfg(windows)]
-static PROC_INSTALLED: AtomicBool = AtomicBool::new(false);
+static PROC_HWND: AtomicIsize = AtomicIsize::new(0);
 
-/// Returns whether the window procedure is (now) installed. The icon is only
-/// registered on success; a dead subclass would make the cross hide the window
-/// with no way to bring it back.
+/// Whether this exact HWND still needs `SetWindowSubclass`. A single global
+/// flag would skip installation for a second window and would be cleared by
+/// the destruction of an unrelated HWND.
+#[cfg(windows)]
+fn proc_slot_needs_install(slot: Option<isize>, hwnd: isize) -> bool {
+    slot != Some(hwnd)
+}
+
+#[cfg(windows)]
+fn proc_slot_after_destroy(slot: Option<isize>, hwnd: isize) -> Option<isize> {
+    if slot == Some(hwnd) {
+        None
+    } else {
+        slot
+    }
+}
+
+#[cfg(windows)]
+fn stored_proc_hwnd() -> Option<isize> {
+    let hwnd = PROC_HWND.load(Ordering::SeqCst);
+    (hwnd != 0).then_some(hwnd)
+}
+
+#[cfg(windows)]
+fn store_proc_hwnd(hwnd: isize) {
+    PROC_HWND.store(hwnd, Ordering::SeqCst);
+}
+
+#[cfg(windows)]
+fn clear_proc_hwnd(hwnd: isize) {
+    let current = stored_proc_hwnd();
+    if proc_slot_after_destroy(current, hwnd) == current {
+        // Destruction of another HWND must not forget our subclass.
+        return;
+    }
+    let _ = PROC_HWND.compare_exchange(hwnd, 0, Ordering::SeqCst, Ordering::SeqCst);
+}
+
+/// Returns whether the window procedure is (now) installed for this HWND. The
+/// icon is only registered on success; a dead subclass would make the cross
+/// hide the window with no way to bring it back.
 #[cfg(windows)]
 fn install_window_proc(hwnd: isize) -> bool {
     if hwnd == 0 {
@@ -382,15 +465,15 @@ fn install_window_proc(hwnd: isize) -> bool {
     }
     #[cfg(not(test))]
     {
-        if PROC_INSTALLED.swap(true, Ordering::SeqCst) {
+        if !proc_slot_needs_install(stored_proc_hwnd(), hwnd) {
             return true;
         }
         unsafe {
             if SetWindowSubclass(hwnd.null(), Some(tray_proc), SUBCLASS_ID, 0) == 0 {
-                PROC_INSTALLED.store(false, Ordering::SeqCst);
                 return false;
             }
         }
+        store_proc_hwnd(hwnd);
         true
     }
 }
@@ -452,7 +535,10 @@ unsafe extern "system" fn tray_proc(
         // `WM_RBUTTONUP` with no point, so `GetCursorPos` remains the fallback.
         let code = (lparam as usize) & 0xffff;
         if code == WM_CONTEXTMENU {
-            unsafe { show_menu(hwnd, Some(point_from_wparam(wparam))) };
+            // A keyboard invocation packs (-1, -1): neither half is a screen
+            // point, so fall back to the cursor or the icon position.
+            let point = menu_point(wparam, unsafe { cursor_position() });
+            unsafe { show_menu(hwnd, Some(point)) };
         } else if code == WM_RBUTTONUP {
             unsafe { show_menu(hwnd, None) };
         } else if let Some(action) = callback_action(lparam) {
@@ -471,18 +557,36 @@ unsafe extern "system" fn tray_proc(
         unsafe {
             let _ = RemoveWindowSubclass(hwnd, Some(tray_proc), SUBCLASS_ID);
         }
-        PROC_INSTALLED.store(false, Ordering::SeqCst);
+        clear_proc_hwnd(hwnd as isize);
     }
     unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) }
 }
 
 /// Screen point packed into `wParam` by shell notification version 4:
-/// `LOWORD` is x, `HIWORD` is y, both signed 16-bit values.
+/// `LOWORD` is x, `HIWORD` is y, both signed 16-bit values. A keyboard
+/// invocation sends `0xFFFF_FFFF` (packed (-1, -1)), which is not a point.
 #[cfg(windows)]
-fn point_from_wparam(wparam: usize) -> (i32, i32) {
+fn point_from_wparam(wparam: usize) -> Option<(i32, i32)> {
+    if (wparam & 0xffff) == 0xffff || wparam as i32 == -1 {
+        return None;
+    }
     let x = (wparam & 0xffff) as u16 as i16 as i32;
     let y = ((wparam >> 16) & 0xffff) as u16 as i16 as i32;
-    (x, y)
+    Some((x, y))
+}
+
+/// The context-menu point: the shell point when it is usable, otherwise the
+/// current cursor position (the icon for a keyboard invocation).
+#[cfg(windows)]
+fn menu_point(wparam: usize, cursor: (i32, i32)) -> (i32, i32) {
+    point_from_wparam(wparam).unwrap_or(cursor)
+}
+
+#[cfg(windows)]
+unsafe fn cursor_position() -> (i32, i32) {
+    let mut point = Point { x: 0, y: 0 };
+    let _ = unsafe { GetCursorPos(&mut point) };
+    (point.x, point.y)
 }
 
 #[cfg(windows)]
@@ -614,10 +718,15 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
     #[test]
-    fn a_tray_icon_type_is_available_for_the_close_decision() {
-        let tray = TrayIcon::default();
-        assert!(!tray.is_registered());
+    fn a_window_proc_is_tracked_per_hwnd() {
+        assert!(proc_slot_needs_install(None, 1));
+        assert!(!proc_slot_needs_install(Some(1), 1));
+        assert!(proc_slot_needs_install(Some(1), 2));
+        assert_eq!(proc_slot_after_destroy(Some(1), 2), Some(1));
+        assert_eq!(proc_slot_after_destroy(Some(1), 1), None);
+        assert_eq!(proc_slot_after_destroy(None, 1), None);
     }
 
     #[cfg(windows)]
@@ -642,12 +751,22 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn version_four_packs_the_screen_point_into_wparam() {
-        assert_eq!(point_from_wparam((300 << 16) | 200), (200, 300));
+        assert_eq!(point_from_wparam((300 << 16) | 200), Some((200, 300)));
         // Negative screen coordinates fit the signed 16-bit halves.
         assert_eq!(
             point_from_wparam(((-40_i32 as u16 as usize) << 16) | (-5_i32 as u16 as usize)),
-            (-5, -40)
+            Some((-5, -40))
         );
-        assert_eq!(point_from_wparam(0), (0, 0));
+        assert_eq!(point_from_wparam(0), Some((0, 0)));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_keyboard_context_menu_falls_back_to_the_cursor() {
+        // WM_CONTEXTMENU from the keyboard packs (-1, -1), not a screen point.
+        assert_eq!(point_from_wparam(0xffff_ffff), None);
+        assert_eq!(point_from_wparam(0x0000_ffff), None);
+        assert_eq!(menu_point(0xffff_ffff, (640, 480)), (640, 480));
+        assert_eq!(menu_point((300 << 16) | 200, (640, 480)), (200, 300));
     }
 }

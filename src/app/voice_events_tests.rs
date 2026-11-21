@@ -165,6 +165,56 @@ async fn a_room_stream_outside_a_call_ticks_the_live_clock_once_per_second(
     });
 }
 
+/// The same painted foreign stream in a minimized window draws no `M:SS`, so
+/// the one-second clock must stay asleep; activating the window brings the
+/// label and its tick back.
+#[gpui::test]
+async fn a_minimized_idle_room_stream_does_not_tick_until_the_window_is_activated(
+    cx: &mut TestAppContext,
+) {
+    let (mut visual, _view, voice) = fixture_with(cx, None, false);
+    visual.update(|_window, app| {
+        voice.update(app, |panel, _| {
+            panel.set_room_state(7, Vec::new(), vec![publication(7, "alice", 1)]);
+            panel.test_set_minimized(Some(true));
+        });
+    });
+    draw(&mut visual);
+    let executor = executor(&mut visual);
+    reset_polls(&mut visual, &voice);
+    advance(&mut visual, &executor, 1_000);
+    assert_eq!(
+        poll_count(&visual, &voice),
+        0,
+        "a minimized window hides the stream label and must not poll"
+    );
+    voice.read_with(&*visual, |panel, _| {
+        assert_eq!(
+            panel.test_live_clock_second(),
+            None,
+            "the hidden label never recorded a second"
+        );
+    });
+
+    visual.update(|_window, app| {
+        voice.update(app, |panel, _| {
+            panel.test_set_minimized(Some(false));
+            panel.test_window_activated();
+        });
+    });
+    visual.run_until_parked();
+    assert!(
+        poll_count(&visual, &voice) >= 1,
+        "window activation wakes the painted stream label"
+    );
+    voice.read_with(&*visual, |panel, _| {
+        assert!(
+            panel.test_live_clock_second().is_some(),
+            "the activation poll recorded the on-air second"
+        );
+    });
+}
+
 /// The same idle room without a running stream has nothing to repaint, so the
 /// clock stays asleep even though the room pane is painted.
 #[gpui::test]

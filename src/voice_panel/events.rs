@@ -103,14 +103,14 @@ pub(super) fn spawn(
 
 /// The one-second live clock. A call without a handle still ticks the clock,
 /// and so does a painted room list with a running stream; an idle panel does
-/// not poll at all.
+/// not poll at all, and a minimized window drops the stream reason.
 pub(super) fn spawn_clock(window: &mut Window, cx: &mut Context<VoicePanel>) {
     let executor = cx.background_executor().clone();
     cx.spawn_in(window, async move |this, cx| loop {
         executor.timer(CLOCK_INTERVAL).await;
         let Some(entity) = this.upgrade() else { break };
         let updated = entity.update_in(cx, |panel, window, cx| {
-            if panel.live_clock_due() {
+            if panel.live_clock_due(window) {
                 panel.poll(window, cx);
             }
         });

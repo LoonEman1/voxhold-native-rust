@@ -60,9 +60,13 @@ impl VoicePanel {
 
     /// Whether the one-second tick has a reason to poll: a call, an open
     /// handle, or a painted room list with a running foreign stream. Without
-    /// any of them an idle panel must not poll.
-    pub(super) fn live_clock_due(&self) -> bool {
-        self.call_active() || self.handle.is_some() || self.room_stream_clock()
+    /// any of them an idle panel must not poll. Only the stream label is gated
+    /// by the window: a minimized window draws no `M:SS`, while a call or an
+    /// open handle still needs its clock.
+    pub(super) fn live_clock_due(&self, window: &Window) -> bool {
+        self.call_active()
+            || self.handle.is_some()
+            || (!self.window_minimized(window) && self.room_stream_clock())
     }
 
     pub(super) fn live_clock_changed(&mut self) -> bool {

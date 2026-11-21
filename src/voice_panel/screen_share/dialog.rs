@@ -368,17 +368,22 @@ impl VoicePanel {
         // unavailable explicit choice keeps its reason until the user changes
         // it. The full four-item list with per-codec reasons is the next slice.
         let codec_intent = self.screen.codec;
-        let codec_resolution = CodecSnapshot::current().resolve(codec_intent, CodecRole::Sender);
+        let codec_resolution = self.codec_resolution();
         let codec_label = match &codec_resolution {
             Ok(codec) => match codec_intent {
                 CodecIntent::Auto => format!("Автоматически · {}", codec.label()),
                 CodecIntent::Explicit(_) => codec.label().to_owned(),
             },
-            Err(_) => "Нет доступного кодека".to_owned(),
+            Err(_) => "Нет доступного SDR-кодека".to_owned(),
         };
+        // gpui exposes painted bounds, not text; the selector carries the exact
+        // line so a UI test asserts what the dialog says, not only its slot.
+        let codec_label_selector = format!("share-codec-label:{codec_label}");
+        let codec_refused = codec_resolution.is_err();
         let codec_reason = codec_resolution
             .err()
-            .map(|error| error.reason().to_owned());
+            .unwrap_or_else(|| "SDR · серверная передача".to_owned());
+        let codec_reason_selector = format!("share-codec-reason:{codec_reason}");
         let bitrate = format!(
             "{},{:01} Мбит/с",
             self.screen.bitrate_kbps / 1000,
@@ -590,22 +595,21 @@ impl VoicePanel {
                             .text_color(rgb(c.muted))
                             .child("Кодек"),
                     )
-                    .child(div().text_size(px(12.)).child(codec_label))
                     .child(
                         div()
+                            .debug_selector(move || codec_label_selector.clone().into())
+                            .text_size(px(12.))
+                            .child(codec_label),
+                    )
+                    .child(
+                        div()
+                            .debug_selector(move || codec_reason_selector.clone().into())
                             .flex_1()
                             .min_w(px(0.))
                             .text_size(px(10.))
-                            .text_color(rgb(if codec_reason.is_some() {
-                                c.danger
-                            } else {
-                                c.muted
-                            }))
+                            .text_color(rgb(if codec_refused { c.danger } else { c.muted }))
                             .truncate()
-                            .child(
-                                codec_reason
-                                    .unwrap_or_else(|| "SDR · серверная передача".to_owned()),
-                            ),
+                            .child(codec_reason),
                     ),
             );
 

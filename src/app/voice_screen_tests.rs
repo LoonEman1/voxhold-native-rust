@@ -410,6 +410,18 @@ async fn the_live_quality_dialog_warns_and_restarts_with_the_new_values(cx: &mut
             panel.test_open_screen_settings(source(), sharing, window, cx);
             assert!(panel.screen_share_open(), "the live dialog opened");
             assert!(panel.test_screen_restart());
+            // The fixture confirms the codec the picker's intent resolves to,
+            // and the dialog locks to that concrete value instead of a fixed
+            // substitute for this build.
+            let confirmed = panel
+                .test_screen_sharing()
+                .confirmed
+                .expect("the live attempt is confirmed");
+            assert_eq!(
+                panel.test_screen_codec_intent(),
+                voxhold_media::publisher::CodecIntent::Explicit(confirmed.codec)
+            );
+            assert_eq!(panel.test_screen_request().codec, confirmed.codec);
             assert!(
                 panel.test_restart_warning().is_some(),
                 "a live change must warn about the restart"

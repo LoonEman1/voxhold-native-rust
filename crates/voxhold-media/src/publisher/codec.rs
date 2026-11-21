@@ -91,13 +91,6 @@ impl CodecIntent {
             Self::Explicit(codec) => codec.label(),
         }
     }
-
-    pub const fn codec(self) -> Option<Codec> {
-        match self {
-            Self::Auto => None,
-            Self::Explicit(codec) => Some(codec),
-        }
-    }
 }
 
 /// Which side of the SFU the capability question belongs to: a publisher
@@ -129,7 +122,7 @@ impl VideoCodecCapability {
 /// The raw question asked of the WebRTC build. Kept explicit so a fake matrix
 /// can replace the real probe without touching the resolution rules.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct CodecProbe {
+pub(crate) struct CodecProbe {
     /// Codecs advertised by `video_encoder_codecs(Software)`.
     pub encoders: Vec<Codec>,
     /// `get_rtp_sender_capabilities(Video)`.
@@ -141,7 +134,7 @@ pub struct CodecProbe {
 impl CodecProbe {
     /// Probe the pinned build. The encoder question uses the software backend
     /// on purpose: the picker of this stage publishes CPU frames only.
-    pub fn probe() -> Self {
+    pub(crate) fn probe() -> Self {
         let factory = PeerConnectionFactory::default();
         let encoders = factory
             .video_encoder_codecs(VideoEncoderBackend::Software)
@@ -210,10 +203,6 @@ impl CodecAvailability {
         }
     }
 
-    pub const fn codec(&self) -> Codec {
-        self.codec
-    }
-
     /// The checked SDR profile of an available codec. `None` when unavailable.
     pub const fn profile(&self) -> Option<SdrProfile> {
         self.profile
@@ -277,7 +266,7 @@ impl CodecSnapshot {
 
     /// Build a snapshot from a probe. Every codec is described in
     /// [`Codec::ALL`] order on both sides.
-    pub fn from_probe(generation: u64, probe: &CodecProbe) -> Self {
+    pub(crate) fn from_probe(generation: u64, probe: &CodecProbe) -> Self {
         let mut sender = Vec::with_capacity(Codec::ALL.len());
         let mut receiver = Vec::with_capacity(Codec::ALL.len());
         for codec in Codec::ALL {
@@ -343,7 +332,7 @@ impl CodecSnapshot {
                 codec: None,
                 reason: match role {
                     CodecRole::Sender => {
-                        "В этой сборке нет доступного SDR-кодекa для публикации.".to_owned()
+                        "В этой сборке нет доступного SDR-кодека для публикации.".to_owned()
                     }
                     CodecRole::Receiver => {
                         "В этой сборке нет декодера ни одного SDR-кодека трансляции.".to_owned()
@@ -457,15 +446,6 @@ pub enum SdrProfile {
 }
 
 impl SdrProfile {
-    pub const fn codec(self) -> Codec {
-        match self {
-            Self::H264 { .. } => Codec::H264,
-            Self::Vp8 => Codec::Vp8,
-            Self::Vp9 => Codec::Vp9,
-            Self::Av1 => Codec::Av1,
-        }
-    }
-
     /// Lower value wins when a build advertises more than one SDR variant.
     const fn priority(self) -> u8 {
         match self {
@@ -505,15 +485,6 @@ pub enum H264Baseline {
     /// `4200xx`: legacy Baseline-compatible clients. A separate payload, never
     /// interchangeable with `42e0xx`.
     Legacy,
-}
-
-impl H264Baseline {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Constrained => "Constrained Baseline",
-            Self::Legacy => "Baseline (legacy)",
-        }
-    }
 }
 
 /// Why an FMTP line does not describe an SDR payload.
@@ -560,6 +531,11 @@ impl std::error::Error for ProfileRejection {}
 
 /// Tolerant FMTP parser: keys and values are case-insensitive, whitespace
 /// around separators is ignored and parameter order does not matter.
+///
+/// A repeated key keeps the last value. The pinned backend reads the first
+/// occurrence; browsers emit every parameter once in a normal SDP, so the two
+/// readings only differ on an input outside that contract. The fixture in
+/// `tests.rs` pins the choice.
 pub fn parse_fmtp(fmtp: Option<&str>) -> BTreeMap<String, String> {
     let mut parameters = BTreeMap::new();
     let Some(fmtp) = fmtp else {

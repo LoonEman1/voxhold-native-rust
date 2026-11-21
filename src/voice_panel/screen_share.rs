@@ -12,8 +12,8 @@
 use super::*;
 use gpui::ScrollHandle;
 use voxhold_media::publisher::{
-    CodecIntent, CodecRole, CodecSnapshot, Phase, Preset, PublishRequest, Quality, QualityChange,
-    QualityOutcome, Resolution, Sharing, AUDIO_BITRATES, MAX_CHANNEL_PUBLISHERS,
+    Codec, CodecIntent, CodecRole, CodecSnapshot, Phase, Preset, PublishRequest, Quality,
+    QualityChange, QualityOutcome, Resolution, Sharing, AUDIO_BITRATES, MAX_CHANNEL_PUBLISHERS,
 };
 use voxhold_media::screen_capture::{
     self, PreviewFrame, ScreenSource, SourceId, SourceIdentity, SourceKind, ThumbnailError,
@@ -559,7 +559,7 @@ impl VoicePanel {
             return Err("Захват экрана недоступен на этом устройстве.");
         }
         if !CodecSnapshot::current().sender_available() {
-            return Err("В этой сборке нет подтверждённого кодека трансляции.");
+            return Err("В этой сборке нет доступного SDR-кодека для публикации.");
         }
         if matches!(
             self.screen.sharing.phase,
@@ -878,6 +878,18 @@ impl VoicePanel {
         cx.notify();
     }
 
+    /// Resolve the dialog's codec intent against the sender probe. The refusal
+    /// is the ready user-facing reason the dialog paints and Start reports.
+    pub(super) fn codec_resolution(&self) -> Result<Codec, String> {
+        #[cfg(test)]
+        if let Some(reason) = &self.test_codec_error {
+            return Err(reason.clone());
+        }
+        CodecSnapshot::current()
+            .resolve(self.screen.codec, CodecRole::Sender)
+            .map_err(|rejection| rejection.reason().to_owned())
+    }
+
     /// Start waits for the endpoint probe: committing earlier would publish
     /// video without the requested system audio. A normal Start needs its id
     /// in the snapshot; a restart needs the confirmed live identity.
@@ -891,9 +903,7 @@ impl VoicePanel {
             && !self.screen.busy
             && !self.screen.preflight
             && !self.screen.sharing.preflighting
-            && CodecSnapshot::current()
-                .resolve(self.screen.codec, CodecRole::Sender)
-                .is_ok()
+            && self.codec_resolution().is_ok()
             && self.screen.audio_availability.is_some()
             && (!self.screen.restart || self.screen.sharing.phase == Phase::Live)
     }
@@ -972,10 +982,10 @@ impl VoicePanel {
             }
             source
         };
-        let codec = match CodecSnapshot::current().resolve(self.screen.codec, CodecRole::Sender) {
+        let codec = match self.codec_resolution() {
             Ok(codec) => codec,
-            Err(rejection) => {
-                self.screen.error = rejection.reason().to_owned();
+            Err(reason) => {
+                self.screen.error = reason;
                 cx.notify();
                 return;
             }

@@ -200,7 +200,10 @@ impl HistoryRows {
         if !self.stale(&input) {
             return false;
         }
-        let refresh = self.dirty;
+        // A changed attachment epoch means the body of one or more rows may
+        // have changed without a revision bump (a server-side tombstone), so
+        // the old `Arc<Message>` cannot be reused by identity alone.
+        let refresh = self.dirty || self.attachment_epoch != input.attachment_epoch;
         self.rebuild(&input, refresh);
         true
     }
@@ -216,6 +219,17 @@ impl HistoryRows {
     /// Force the next [`Self::prepare`] to rebuild. Used when the view cleared
     /// its key mirror on a message replacement that may keep the same stamps.
     pub(super) fn invalidate(&mut self) {
+        self.dirty = true;
+    }
+
+    /// Drop every prepared row and cache input. Used by the paths that clear or
+    /// replace the confirmed messages (logout, session/chat switch, access
+    /// reset): the cached rows hold `Arc<Message>` bodies, including private
+    /// message text, and must not outlive the screen that owned them. The next
+    /// [`Self::prepare`] always rebuilds, so a later chat cannot reuse a stale
+    /// row even when its identity stamps happen to match.
+    pub(super) fn reset(&mut self) {
+        *self = Self::default();
         self.dirty = true;
     }
 
@@ -423,6 +437,19 @@ impl HistoryRows {
         {
             self.rebuilds += 1;
         }
+    }
+}
+
+impl Voxhold {
+    /// Drop the prepared rows together with their key mirror. Every path that
+    /// clears or replaces the confirmed messages calls this, so a signed-out
+    /// account cannot keep cached row copies (message bodies included) alive
+    /// until a history render that never comes, and a switched chat never
+    /// receives a stale row. The cache also invalidates itself, so a future
+    /// caller cannot skip the rebuild by keeping the same lengths.
+    pub(super) fn reset_history_cache(&mut self) {
+        self.history_keys.clear();
+        self.history_rows.reset();
     }
 }
 
@@ -641,5 +668,56 @@ mod tests {
         cache.invalidate();
         assert!(cache.prepare(fixture.input()));
         assert!(cache.row(0).unwrap().message.attachments[0].deleted);
+    }
+
+    #[test]
+    fn an_attachment_epoch_refreshes_the_row_body_without_a_revision_bump() {
+        let mut fixture = Fixture::new();
+        let mut cache = HistoryRows::default();
+        assert!(cache.prepare(fixture.input()));
+
+        fixture.messages[0]
+            .attachments
+            .push(voxhold_api::Attachment {
+                id: "a".repeat(32),
+                filename: "photo.png".into(),
+                mime_type: "image/png".into(),
+                ..Default::default()
+            });
+        fixture.attachment_epoch = 1;
+        assert!(cache.prepare(fixture.input()));
+        assert_eq!(
+            cache.row(0).unwrap().message.attachments.len(),
+            1,
+            "the new attachment is not hidden behind a reused body"
+        );
+
+        fixture.messages[0].attachments[0].deleted = true;
+        fixture.attachment_epoch = 2;
+        assert!(cache.prepare(fixture.input()));
+        assert!(
+            cache.row(0).unwrap().message.attachments[0].deleted,
+            "a tombstone without a revision bump reaches the prepared row"
+        );
+        assert_eq!(cache.keys()[0].6, 2);
+    }
+
+    #[test]
+    fn reset_drops_rows_and_the_next_prepare_rebuilds() {
+        let mut fixture = Fixture::new();
+        let mut cache = HistoryRows::default();
+        assert!(cache.prepare(fixture.input()));
+        assert_eq!(cache.len(), 40);
+
+        cache.reset();
+        assert_eq!(cache.len(), 0);
+        assert!(cache.row(0).is_none(), "no cached row survives the reset");
+
+        // The reset is also an explicit invalidation: even the same input
+        // rebuilds instead of leaving the cache empty or reusing the dropped
+        // rows.
+        assert!(cache.prepare(fixture.input()));
+        assert_eq!(cache.len(), 40);
+        assert_eq!(cache.row(0).unwrap().message.content, "row 1");
     }
 }

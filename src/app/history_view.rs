@@ -589,6 +589,8 @@ impl Voxhold {
                 });
             }
             for (file_index, file) in message.attachments.iter().enumerate() {
+                let attachment_id = message.id;
+                let state = if file.deleted { "deleted" } else { "live" };
                 let (width, height) = history::attachment_size(
                     file.width,
                     file.height,
@@ -627,6 +629,9 @@ impl Voxhold {
                         });
                     body = body.child(
                         div()
+                            .debug_selector(move || {
+                                format!("attachment-{attachment_id}-{file_index}-{state}").into()
+                            })
                             .w(px(width))
                             .mb(px(4.))
                             .flex()
@@ -644,6 +649,9 @@ impl Voxhold {
                 } else {
                     body = body.child(
                         div()
+                            .debug_selector(move || {
+                                format!("attachment-{attachment_id}-{file_index}-{state}").into()
+                            })
                             .flex()
                             .items_center()
                             .gap_2()

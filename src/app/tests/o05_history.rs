@@ -12,6 +12,17 @@ fn draw(visual: &mut VisualTestContext, view: &Entity<Voxhold>) {
     });
 }
 
+/// Like [`draw`], but refreshes the window and settles the frame so the new
+/// tree is painted before `debug_bounds` is read.
+fn redraw(visual: &mut VisualTestContext, view: &Entity<Voxhold>) {
+    visual.update(|window, app| {
+        view.update(app, |_, cx| cx.notify());
+        window.refresh();
+        window.draw(app).clear();
+    });
+    visual.run_until_parked();
+}
+
 #[gpui::test]
 async fn history_rows_rebuild_only_when_their_inputs_change(cx: &mut TestAppContext) {
     cx.update(|cx| gpui_component::init(cx));
@@ -148,5 +159,132 @@ async fn prepending_older_rows_keeps_the_anchor_and_painted_read(cx: &mut TestAp
     assert_eq!(
         painted_after, painted_before,
         "the same visible rows are still painted after the prepend"
+    );
+}
+
+/// O05 review: the prepared rows hold `Arc<Message>` bodies, so a logout must
+/// drop them together with `messages`/`history_keys` instead of waiting for a
+/// history render that never runs. A later render must rebuild from scratch.
+#[gpui::test]
+async fn logout_releases_the_prepared_rows_and_the_next_render_rebuilds(cx: &mut TestAppContext) {
+    cx.update(|cx| gpui_component::init(cx));
+    let (window, view) = add_auth_window(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.update(|_, app| {
+        view.update(app, |v, _| {
+            writable_workspace(v);
+            for id in 1..=20 {
+                v.apply_realtime_event("message.created", &message_json(id, id, "private text"));
+            }
+        });
+    });
+    draw(&mut visual, &view);
+    assert_eq!(view.read_with(&*visual, |v, _| v.history_rows.len()), 20);
+
+    // One cached row keeps its body in an `Arc`. The view alone owns it, so a
+    // test clone raises the count to two until the cache is dropped.
+    let held = view.read_with(&*visual, |v, _| {
+        v.history_rows
+            .row(0)
+            .map(|row| row.message.clone())
+            .expect("the first row is cached")
+    });
+    assert_eq!(std::sync::Arc::strong_count(&held), 2);
+
+    visual.update(|window, app| {
+        view.update(app, |v, cx| v.logout(window, cx));
+    });
+    visual.run_until_parked();
+
+    view.read_with(&*visual, |v, _| {
+        assert!(v.messages.is_empty());
+        assert!(v.history_keys.is_empty());
+        assert_eq!(v.history_rows.len(), 0, "logout drops every prepared row");
+    });
+    assert_eq!(
+        std::sync::Arc::strong_count(&held),
+        1,
+        "the cached message body is released by logout"
+    );
+    drop(held);
+
+    // Re-entering a workspace must refill the cache, not leave it reset.
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            writable_workspace(v);
+            v.apply_realtime_event("message.created", &message_json(1, 1, "after logout"));
+            let chat = crate::layout::Rect::new(0., 0., 800., 600.);
+            let _ = v.render_history(window, cx, chat, false, false);
+        });
+    });
+    view.read_with(&*visual, |v, _| {
+        assert_eq!(v.history_rows.len(), 1);
+        assert_eq!(
+            v.history_rows
+                .row(0)
+                .map(|row| row.message.content.as_str()),
+            Some("after logout")
+        );
+    });
+}
+
+/// O05 review: the attachment tombstone must reach the next drawn row, not
+/// only the message vector. `attachment_epoch` forces the cache rebuild and
+/// the deleted picture falls back to the "Вложение удалено" row.
+#[gpui::test]
+async fn an_attachment_tombstone_reaches_the_drawn_row(cx: &mut TestAppContext) {
+    cx.update(|cx| gpui_component::init(cx));
+    let (window, view) = add_auth_window(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    let id = "b".repeat(32);
+    visual.update(|_, app| {
+        view.update(app, |v, _| {
+            writable_workspace(v);
+            let mut dto = message_json(1, 1, "файл");
+            dto["attachments"] = serde_json::json!([{
+                "id": id.clone(),
+                "filename": "photo.png",
+                "mime_type": "image/png",
+                "size_bytes": 12,
+                "width": 10,
+                "height": 10,
+                "deleted": false
+            }]);
+            v.apply_realtime_event("message.created", &dto);
+        });
+    });
+    redraw(&mut visual, &view);
+    assert!(
+        visual.debug_bounds("attachment-1-0-live").is_some(),
+        "the live picture is drawn before the tombstone"
+    );
+    let built = view.read_with(&*visual, |v, _| v.history_rows.rebuild_count());
+
+    visual.update(|_, app| {
+        view.update(app, |v, _| {
+            let effect = v.apply_realtime_event(
+                "attachments.changed",
+                &serde_json::json!({"channel_id": 7, "attachment_ids": [id.clone()]}),
+            );
+            assert_eq!(effect.attachments, vec![id.clone()]);
+        });
+    });
+    redraw(&mut visual, &view);
+
+    let rebuilt = view.read_with(&*visual, |v, _| v.history_rows.rebuild_count());
+    assert!(
+        rebuilt > built,
+        "the attachment epoch must rebuild the prepared row"
+    );
+    let (deleted, label) = view.read_with(&*visual, |v, _| {
+        let row = v.history_rows.row(0).expect("the row is still cached");
+        let file = &row.message.attachments[0];
+        (file.deleted, crate::history::attachment_label(file))
+    });
+    assert!(deleted);
+    assert_eq!(label, "Вложение удалено");
+    assert!(
+        visual.debug_bounds("attachment-1-0-deleted").is_some(),
+        "the next frame draws the tombstoned file row instead of the picture"
     );
 }

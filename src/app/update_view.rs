@@ -370,6 +370,7 @@ impl Voxhold {
             panel = panel.child(
                 div()
                     .id("update-prefs-error")
+                    .debug_selector(|| "update-prefs-error".into())
                     .text_size(px(11.))
                     .text_color(ink(p.danger))
                     .child(error.clone()),

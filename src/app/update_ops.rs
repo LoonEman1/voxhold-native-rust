@@ -164,10 +164,10 @@ pub(super) struct UpdateUi {
     pub generation: u64,
     pub cancel: Option<CancelToken>,
     pub cancelling: bool,
-    /// The version this process already auto-downloaded once.
-    pub auto_started: Option<String>,
-    /// The version whose automatic download the user cancelled this run.
-    pub auto_suppressed: Option<String>,
+    /// Versions this process already auto-downloaded once.
+    pub auto_started: update::VersionSet,
+    /// Versions whose automatic download the user cancelled this run.
+    pub auto_suppressed: update::VersionSet,
     pub panel_open: bool,
     pub hover: bool,
     pub prefs_error: Option<String>,
@@ -220,8 +220,8 @@ impl UpdateUi {
             generation: 0,
             cancel: None,
             cancelling: false,
-            auto_started: None,
-            auto_suppressed: None,
+            auto_started: update::VersionSet::new(),
+            auto_suppressed: update::VersionSet::new(),
             panel_open: false,
             hover: false,
             prefs_error: None,
@@ -467,11 +467,11 @@ impl Voxhold {
                                     &self.update.prefs,
                                     version,
                                     self.update.declined.as_ref(),
-                                    self.update.auto_suppressed.as_deref(),
-                                    self.update.auto_started.as_deref(),
+                                    &self.update.auto_suppressed,
+                                    &self.update.auto_started,
                                 ) =>
                             {
-                                self.update.auto_started = Some(version.clone());
+                                self.update.auto_started.insert(version.clone());
                                 true
                             }
                             _ => false,
@@ -693,14 +693,14 @@ impl Voxhold {
     ///
     /// This works while a body is downloading and while a finished body is
     /// being hashed/unpacked: a failed delta fallback still owns the cancel
-    /// token during its full re-download. The cancelled version is remembered
-    /// for the rest of this process: the 6 h clock must not start the same
-    /// automatic download again. The manual button stays available and is not
-    /// affected.
+    /// token during its full re-download. Cancelled versions are remembered in
+    /// a process-wide set: the 6 h clock must not start the same automatic
+    /// download again, and a newer cancel keeps the older memory. The manual
+    /// button stays available and is not affected.
     pub(super) fn cancel_download(&mut self, cx: &mut Context<Self>) {
         if let Some(cancel) = &self.update.cancel {
             if let Some(version) = self.update.phase.downloading_version() {
-                self.update.auto_suppressed = Some(version.to_string());
+                self.update.auto_suppressed.insert(version.to_string());
             }
             cancel.cancel();
             self.update.cancelling = true;
@@ -728,6 +728,7 @@ impl Voxhold {
         } else {
             self.update.prefs = prefs;
             self.update.declined = Some(version);
+            self.update.prefs_error = None;
             self.update.phase = UpdatePhase::UpToDate;
         }
         cx.notify();

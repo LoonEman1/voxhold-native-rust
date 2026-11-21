@@ -112,29 +112,32 @@ fn explicit_false_switches_survive_a_reload() {
 #[test]
 fn auto_download_is_decided_once_per_version() {
     let prefs = UpdatePrefs::default();
-    assert!(should_auto_download(&prefs, "0.2.0", None, None, None));
+    let none = VersionSet::new();
+    let suppressed_020: VersionSet = ["0.2.0".to_string()].into();
+    let started_020: VersionSet = ["0.2.0".to_string()].into();
+    assert!(should_auto_download(&prefs, "0.2.0", None, &none, &none));
     // The user cancelled this version in this run.
     assert!(!should_auto_download(
         &prefs,
         "0.2.0",
         None,
-        Some("0.2.0"),
-        None
+        &suppressed_020,
+        &none
     ));
     assert!(should_auto_download(
         &prefs,
         "0.3.0",
         None,
-        Some("0.2.0"),
-        None
+        &suppressed_020,
+        &none
     ));
     // The automatic start already happened for this version.
     assert!(!should_auto_download(
         &prefs,
         "0.2.0",
         None,
-        None,
-        Some("0.2.0")
+        &none,
+        &started_020
     ));
     // A skipped version is never downloaded automatically.
     let declined = Version::new(0, 2, 0);
@@ -142,13 +145,13 @@ fn auto_download_is_decided_once_per_version() {
         &prefs,
         "0.2.0",
         Some(&declined),
-        None,
-        None
+        &none,
+        &none
     ));
     // The switch off wins over everything.
     let mut off = prefs.clone();
     off.auto_download = false;
-    assert!(!should_auto_download(&off, "0.2.0", None, None, None));
+    assert!(!should_auto_download(&off, "0.2.0", None, &none, &none));
 }
 
 #[test]

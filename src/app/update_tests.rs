@@ -15,7 +15,7 @@ use voxhold_update::error::UpdateError;
 use voxhold_update::manifest::{FullPackage, Manifest, SetupPackage, VerifiedManifest};
 use voxhold_update::stage::{StageMethod, StageOutcome, StagePhase, StagedUpdate};
 
-fn draw(visual: &mut VisualTestContext) {
+pub(super) fn draw(visual: &mut VisualTestContext) {
     visual.update(|window, app| {
         window.refresh();
         window.draw(app).clear();
@@ -39,7 +39,9 @@ fn click(visual: &mut VisualTestContext, position: gpui::Point<gpui::Pixels>) {
     draw(visual);
 }
 
-fn make_app(cx: &mut TestAppContext) -> (gpui::WindowHandle<Root>, Entity<Voxhold>, PathBuf) {
+pub(super) fn make_app(
+    cx: &mut TestAppContext,
+) -> (gpui::WindowHandle<Root>, Entity<Voxhold>, PathBuf) {
     let dir = std::env::temp_dir().join(format!(
         "voxhold-update-ui-{}-{}",
         std::process::id(),
@@ -104,7 +106,7 @@ fn long_notes() -> String {
 
 /// A manifest signed with a throw-away Ed25519 key. No network is involved:
 /// the test only needs the real `VerifiedManifest` value.
-fn verified_manifest(version: &str) -> VerifiedManifest {
+pub(super) fn verified_manifest(version: &str) -> VerifiedManifest {
     let (private, public) = voxhold_update::verify::generate_keypair().unwrap();
     let manifest = Manifest {
         schema: 1,
@@ -419,7 +421,7 @@ async fn a_background_check_respects_the_switch_and_the_cancel_suppression(
 ) {
     cx.update(|cx| gpui_component::init(cx));
     let (window, view, _dir) = make_app(cx);
-    let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
+    let visual = VisualTestContext::from_window(window.into(), cx).into_mut();
 
     // The switch off leaves the version visible but does not download it.
     visual.update(|window, app| {
@@ -436,14 +438,14 @@ async fn a_background_check_respects_the_switch_and_the_cancel_suppression(
             &v.update.phase,
             UpdatePhase::Available { version, .. } if version == "9.9.9"
         ));
-        assert!(v.update.auto_started.is_none());
+        assert!(v.update.auto_started.is_empty());
     });
 
     // The switch on, but this process already suppressed the version.
     visual.update(|window, app| {
         view.update(app, |v, cx| {
             v.update.prefs.auto_download = true;
-            v.update.auto_suppressed = Some("9.9.9".into());
+            v.update.auto_suppressed.insert("9.9.9".into());
             v.update.phase = UpdatePhase::Checking;
             let generation = v.update.generation;
             v.finish_check(generation, Ok(verified_manifest("9.9.9")), cx);
@@ -455,7 +457,7 @@ async fn a_background_check_respects_the_switch_and_the_cancel_suppression(
             &v.update.phase,
             UpdatePhase::Available { version, .. } if version == "9.9.9"
         ));
-        assert!(v.update.auto_started.is_none());
+        assert!(v.update.auto_started.is_empty());
     });
 }
 
@@ -463,7 +465,7 @@ async fn a_background_check_respects_the_switch_and_the_cancel_suppression(
 async fn a_logout_and_a_closed_panel_keep_the_download(cx: &mut TestAppContext) {
     cx.update(|cx| gpui_component::init(cx));
     let (window, view, dir) = make_app(cx);
-    let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
+    let visual = VisualTestContext::from_window(window.into(), cx).into_mut();
     let token = CancelToken::new();
     let generation = 5;
     visual.update(|window, app| {
@@ -565,7 +567,7 @@ async fn the_preference_switches_persist_and_keep_the_skipped_version(cx: &mut T
 async fn a_logout_does_not_invalidate_a_manual_check(cx: &mut TestAppContext) {
     cx.update(|cx| gpui_component::init(cx));
     let (window, view, _dir) = make_app(cx);
-    let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
+    let visual = VisualTestContext::from_window(window.into(), cx).into_mut();
     visual.update(|window, app| {
         view.update(app, |v, cx| {
             v.update.phase = UpdatePhase::Checking;
@@ -609,7 +611,7 @@ async fn cancelling_a_download_sets_the_token(cx: &mut TestAppContext) {
     view.read_with(&*visual, |v, _| {
         assert!(v.update.cancel.as_ref().unwrap().is_cancelled());
         assert!(v.update.cancelling);
-        assert_eq!(v.update.auto_suppressed.as_deref(), Some("0.2.0"));
+        assert!(v.update.auto_suppressed.contains("0.2.0"));
     });
 }
 
@@ -636,9 +638,8 @@ async fn cancelling_while_preparing_also_works_and_suppresses_the_version(cx: &m
     view.read_with(&*visual, |v, _| {
         assert!(token.is_cancelled(), "Preparing owns the cancel token");
         assert!(v.update.cancelling);
-        assert_eq!(
-            v.update.auto_suppressed.as_deref(),
-            Some("0.2.0"),
+        assert!(
+            v.update.auto_suppressed.contains("0.2.0"),
             "a cancel in Preparing must suppress the automatic retry"
         );
     });
@@ -650,7 +651,7 @@ async fn a_full_fallback_replaces_the_delta_total_and_keeps_the_poller_alive(
 ) {
     cx.update(|cx| gpui_component::init(cx));
     let (window, view, dir) = make_app(cx);
-    let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
+    let visual = VisualTestContext::from_window(window.into(), cx).into_mut();
     // The delta is still downloading and already reported its own total.
     let progress = Arc::new(ProgressCounters::new(771));
     progress.set(512, Some(771));
@@ -751,7 +752,7 @@ async fn a_full_fallback_replaces_the_delta_total_and_keeps_the_poller_alive(
 async fn a_check_starts_the_automatic_download_exactly_once(cx: &mut TestAppContext) {
     cx.update(|cx| gpui_component::init(cx));
     let (window, view, _dir) = make_app(cx);
-    let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
+    let visual = VisualTestContext::from_window(window.into(), cx).into_mut();
     visual.update(|window, app| {
         view.update(app, |v, cx| {
             v.update.prefs.auto_download = true;
@@ -770,7 +771,7 @@ async fn a_check_starts_the_automatic_download_exactly_once(cx: &mut TestAppCont
             "the first check starts one download"
         );
         assert!(matches!(v.update.phase, UpdatePhase::Downloading { .. }));
-        assert_eq!(v.update.auto_started.as_deref(), Some("9.9.9"));
+        assert!(v.update.auto_started.contains("9.9.9"));
     });
 
     // The next check sees the same version, remembers the automatic start and
@@ -801,7 +802,7 @@ async fn a_cancelled_download_returns_to_available_without_a_new_auto_start(
 ) {
     cx.update(|cx| gpui_component::init(cx));
     let (window, view, _dir) = make_app(cx);
-    let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
+    let visual = VisualTestContext::from_window(window.into(), cx).into_mut();
     let token = CancelToken::new();
     visual.update(|window, app| {
         view.update(app, |v, cx| {
@@ -823,14 +824,14 @@ async fn a_cancelled_download_returns_to_available_without_a_new_auto_start(
             &v.update.phase,
             UpdatePhase::Available { version, .. } if version == "9.9.9"
         ));
-        assert_eq!(v.update.auto_suppressed.as_deref(), Some("9.9.9"));
+        assert!(v.update.auto_suppressed.contains("9.9.9"));
         // A later check must not start this version again automatically.
         assert!(!update::should_auto_download(
             &v.update.prefs,
             "9.9.9",
             v.update.declined.as_ref(),
-            v.update.auto_suppressed.as_deref(),
-            v.update.auto_started.as_deref(),
+            &v.update.auto_suppressed,
+            &v.update.auto_started,
         ));
     });
 }

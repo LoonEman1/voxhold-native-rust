@@ -59,6 +59,8 @@ mod thread_ops;
 pub(crate) mod ui;
 mod update_ops;
 #[cfg(test)]
+mod update_state_tests;
+#[cfg(test)]
 mod update_tests;
 mod update_view;
 #[cfg(all(feature = "voxhold-media", test))]

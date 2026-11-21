@@ -6,6 +6,7 @@
 //! version plus the `auto_download` and `install_on_next_start` switches),
 //! startup cleanup/ready detection and short user-facing errors.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use semver::Version;
@@ -268,17 +269,22 @@ pub fn percent(downloaded: u64, total: u64) -> u8 {
     ((downloaded.min(total) as u128 * 100) / total as u128).min(100) as u8
 }
 
+/// Versions remembered for the whole process: auto-started or user-cancelled.
+pub type VersionSet = BTreeSet<String>;
+
 /// Whether a successful background check may start the download itself.
 ///
 /// Auto-download is skipped when the switch is off, when the version is the
 /// one the user skipped, and when this process already started (or the user
-/// cancelled) that version. A manual button never uses this decision.
+/// cancelled) that version. A manual button never uses this decision. Both
+/// sets live as long as the process, so re-offering an older version later
+/// does not start it again and cancelling a newer one does not forget it.
 pub fn should_auto_download(
     prefs: &UpdatePrefs,
     version: &str,
     declined: Option<&Version>,
-    suppressed: Option<&str>,
-    auto_started: Option<&str>,
+    suppressed: &VersionSet,
+    auto_started: &VersionSet,
 ) -> bool {
     if !prefs.auto_download {
         return false;
@@ -289,7 +295,7 @@ pub fn should_auto_download(
     if declined.is_some_and(|value| value == &candidate) {
         return false;
     }
-    if suppressed == Some(version) || auto_started == Some(version) {
+    if suppressed.contains(version) || auto_started.contains(version) {
         return false;
     }
     true

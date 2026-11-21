@@ -14,7 +14,10 @@
 //! - the frame callback converts BGRA to I420, directly through libyuv when
 //!   the picture is not rescaled and with a scalar box filter otherwise (the
 //!   raw frame is only valid during the callback) and stores only the newest
-//!   image. A slower consumer drops frames instead of growing a queue.
+//!   image. A slower consumer drops frames instead of growing a queue. The
+//!   local preview is a second, throttled copy that is only prepared while the
+//!   on-air card asks for it ([`PreviewDemand`], [`PreviewThrottle`]); the
+//!   published I420 frame and its rate never depend on it.
 //! - [`PreviewStore`] keeps one small BGRA picture for the local on-air card.
 //!   It is bounded by [`MAX_PREVIEW_BYTES`] and never grows while idle.
 //! - [`capture_thumbnail`] grabs one bounded BGRA picture for the picker grid.
@@ -38,8 +41,12 @@ use libwebrtc::{
     native::yuv_helper::argb_to_i420,
     video_frame::{I420Buffer, VideoBuffer},
 };
+use tokio::sync::Notify;
 
+mod preview_demand;
 mod topology;
+
+pub use preview_demand::{PREVIEW_INTERVAL, PreviewDemand, PreviewThrottle};
 
 #[cfg_attr(not(windows), allow(unused_imports))]
 pub(crate) use topology::{
@@ -408,9 +415,21 @@ pub struct PreviewStore {
     latest: Mutex<Option<PreviewFrame>>,
     published: AtomicU64,
     rejected: AtomicU64,
+    /// Wake of the panel that owns this store. `None` for a store built by a
+    /// test or by a publisher double without a UI.
+    wake: Option<Arc<Notify>>,
 }
 
 impl PreviewStore {
+    /// A store that wakes `wake` when it accepts a picture. The voice handle
+    /// shares the panel's wake with the capture thread through this.
+    pub fn with_wake(wake: Arc<Notify>) -> Self {
+        Self {
+            wake: Some(wake),
+            ..Self::default()
+        }
+    }
+
     /// Replace the stored picture. A picture above the memory bound is
     /// rejected; the previous one stays until the next acceptable frame.
     pub fn publish(&self, frame: PreviewFrame) -> bool {
@@ -429,7 +448,13 @@ impl PreviewStore {
             return false;
         };
         *slot = Some(frame);
+        drop(slot);
         self.published.fetch_add(1, Ordering::Relaxed);
+        // The card takes the picture only when the panel polls; the ready
+        // preview is exactly one of the events that must wake it.
+        if let Some(wake) = &self.wake {
+            wake.notify_one();
+        }
         true
     }
 
@@ -477,12 +502,14 @@ impl ScreenCapture {
     /// `target` is the selected quality box; the real picture keeps the source
     /// aspect ratio inside that box and is always even-sized for I420. `fps`
     /// paces the pull loop so a 30 FPS publication does not convert twice as
-    /// many frames as it sends.
+    /// many frames as it sends. `demand` decides whether a local preview is
+    /// prepared at all; it never changes the published stream.
     pub fn start(
         source: ScreenSource,
         target: (u32, u32),
         fps: u32,
         latest: Arc<LatestImage>,
+        demand: Arc<PreviewDemand>,
     ) -> Result<Self, &'static str> {
         capability()?;
         let stop = Arc::new(AtomicBool::new(false));
@@ -503,6 +530,7 @@ impl ScreenCapture {
                     worker_latest,
                     worker_stop,
                     worker_failure,
+                    demand,
                     ready_tx,
                 );
                 #[cfg(not(windows))]
@@ -514,6 +542,7 @@ impl ScreenCapture {
                         &worker_latest,
                         &worker_stop,
                         &worker_failure,
+                        &demand,
                     );
                     let _ = ready_tx.send(Err("Захват экрана поддерживается только в Windows."));
                 }

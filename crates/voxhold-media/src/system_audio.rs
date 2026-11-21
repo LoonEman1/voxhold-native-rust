@@ -73,7 +73,9 @@ pub struct AudioDeviceInfo {
 /// What the user asked the system-audio track to cover. The engine resolves it
 /// to a concrete [`CaptureScope`] off the UI thread, right before the capture
 /// starts, so a stale picker never captures another process.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Deserialize, serde::Serialize,
+)]
 pub enum AudioScope {
     /// The whole default render endpoint. This is the explicit
     /// "everything on the device" choice, never a silent fallback.

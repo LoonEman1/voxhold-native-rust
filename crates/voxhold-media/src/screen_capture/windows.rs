@@ -18,11 +18,6 @@ use libwebrtc::desktop_capturer::{
 use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
 
-/// Time between `capture_frame` calls. The capturer is pulled, so its call
-/// rate is the capture frame rate; frames above the encoder rate are
-/// dropped by [`LatestImage`].
-const MAX_FPS: u32 = 60;
-
 pub(super) fn capturer_available() -> bool {
     let options = DesktopCapturerOptions::new(DesktopCaptureSourceType::Window);
     DesktopCapturer::new(options).is_some()
@@ -343,6 +338,7 @@ pub(super) fn run(
     latest: Arc<LatestImage>,
     stop: Arc<AtomicBool>,
     failure: Arc<Mutex<Option<CaptureFailure>>>,
+    demand: Arc<PreviewDemand>,
     ready: Sender<Result<(), &'static str>>,
 ) {
     let mut options = DesktopCapturerOptions::new(source_type(source.kind));
@@ -385,6 +381,11 @@ pub(super) fn run(
     }
     let converter_latest = latest.clone();
     let converter_failure = failure.clone();
+    // The preview is paced here, on the capture thread. The published stream
+    // keeps its target, fps and I420 conversion; only the extra BGRA copy for
+    // the local card is gated.
+    let mut throttle = PreviewThrottle::default();
+    let preview_demand = demand;
     capturer.start_capture(Some(selected), move |result| match result {
         Ok(frame) => {
             let (width, height) = (frame.width().max(0) as u32, frame.height().max(0) as u32);
@@ -394,7 +395,10 @@ pub(super) fn run(
             }
             let mut buffer = I420Buffer::new(output.0, output.1);
             if convert_bgra_to_i420(frame.data(), width, height, frame.stride(), &mut buffer) {
-                let preview = preview_from_i420(&buffer, MAX_PREVIEW_WIDTH);
+                let picture = throttle
+                    .poll(Instant::now(), &preview_demand)
+                    .and_then(|max_width| preview_from_i420(&buffer, max_width));
+                let preview = preview_demand.published_preview(picture);
                 converter_latest.publish(CapturedImage {
                     width: output.0,
                     height: output.1,
@@ -417,18 +421,21 @@ pub(super) fn run(
         }
     });
     let _ = ready.send(Ok(()));
-    let paced = fps.clamp(1, MAX_FPS);
-    let interval = Duration::from_micros(1_000_000 / u64::from(paced));
+    let interval = Duration::from_secs(1) / fps.clamp(1, crate::publisher::MAX_SCREEN_FPS);
+    let mut deadline = Instant::now();
     while !stop.load(Ordering::SeqCst) {
         if let Ok(slot) = failure.lock() {
             if matches!(*slot, Some(CaptureFailure::Permanent)) {
                 break;
             }
         }
-        let began = Instant::now();
         capturer.capture_frame();
-        if let Some(delay) = interval.checked_sub(began.elapsed()) {
+        deadline += interval;
+        let now = Instant::now();
+        if let Some(delay) = deadline.checked_duration_since(now) {
             std::thread::sleep(delay);
+        } else if now.duration_since(deadline) >= interval {
+            deadline = now;
         }
     }
 }

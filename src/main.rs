@@ -44,6 +44,8 @@ mod voice_panel;
 mod voice_room;
 mod voice_settings;
 mod window_chrome;
+#[cfg(feature = "voxhold-media")]
+mod window_state;
 
 use gpui::{px, size, App, AppContext, Application, Bounds, WindowBounds, WindowOptions};
 use gpui_component::Root;

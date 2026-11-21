@@ -40,7 +40,8 @@ fn frame_outcomes(
     now: Instant,
 ) -> Vec<ViewerOutcome> {
     let slot = Mutex::new(None);
-    match super::super::engine::apply_engine_update(&slot, render, viewer, update, now) {
+    let wake = tokio::sync::Notify::new();
+    match super::super::engine::apply_engine_update(&slot, render, viewer, update, now, &wake) {
         super::super::engine::EngineEffect::Outcomes(outcomes) => outcomes,
         _ => panic!("a picture update never reports an audio-output result"),
     }
@@ -525,6 +526,7 @@ fn a_decode_without_a_request_is_not_lost_for_the_next_take_frame() {
     let (mut engine, _commands, events, video) = StreamViewer::detached_for_tests();
     let mut render = VideoFrame::default();
     let slot = Mutex::new(None);
+    let wake = tokio::sync::Notify::new();
 
     // The first picture is prepared, published and taken by the UI.
     assert!(video.publish_i420(I420Buffer::new_black(320, 180)));
@@ -535,7 +537,14 @@ fn a_decode_without_a_request_is_not_lost_for_the_next_take_frame() {
         Some(EngineUpdate::Frame)
     ));
     assert!(matches!(
-        apply_engine_update(&slot, &mut render, &mut viewer, EngineUpdate::Frame, now),
+        apply_engine_update(
+            &slot,
+            &mut render,
+            &mut viewer,
+            EngineUpdate::Frame,
+            now,
+            &wake
+        ),
         EngineEffect::Outcomes(_)
     ));
     assert!(
@@ -552,9 +561,14 @@ fn a_decode_without_a_request_is_not_lost_for_the_next_take_frame() {
         Some(EngineUpdate::Decoded)
     ));
     assert_eq!(video.conversions(), 1, "no picture was prepared");
-    let EngineEffect::Outcomes(outcomes) =
-        apply_engine_update(&slot, &mut render, &mut viewer, EngineUpdate::Decoded, now)
-    else {
+    let EngineEffect::Outcomes(outcomes) = apply_engine_update(
+        &slot,
+        &mut render,
+        &mut viewer,
+        EngineUpdate::Decoded,
+        now,
+        &wake,
+    ) else {
         panic!("a decode update is never an audio-output result");
     };
     assert!(outcomes.is_empty(), "the decode only confirmed progress");
@@ -571,7 +585,14 @@ fn a_decode_without_a_request_is_not_lost_for_the_next_take_frame() {
         Some(EngineUpdate::Repaint)
     ));
     assert_eq!(video.conversions(), 2);
-    let _ = apply_engine_update(&slot, &mut render, &mut viewer, EngineUpdate::Repaint, now);
+    let _ = apply_engine_update(
+        &slot,
+        &mut render,
+        &mut viewer,
+        EngineUpdate::Repaint,
+        now,
+        &wake,
+    );
     let frame = slot
         .lock()
         .unwrap()

@@ -771,9 +771,15 @@ fn a_cached_repaint_does_not_confirm_a_recovering_stream() {
     // Exactly what `drain_viewer` does for the cached update: publish the
     // picture without any viewer transition.
     let slot = Mutex::new(None);
-    let EngineEffect::Outcomes(outcomes) =
-        apply_engine_update(&slot, &mut render, &mut viewer, EngineUpdate::Repaint, now)
-    else {
+    let wake = tokio::sync::Notify::new();
+    let EngineEffect::Outcomes(outcomes) = apply_engine_update(
+        &slot,
+        &mut render,
+        &mut viewer,
+        EngineUpdate::Repaint,
+        now,
+        &wake,
+    ) else {
         panic!("a repaint is a picture update, not an audio-output result");
     };
     assert!(
@@ -923,4 +929,53 @@ fn a_pending_viewer_switch_is_left_before_the_screen_publication() {
     // Once the leave is acknowledged the publication starts.
     let left = publisher.viewer_left(now + Duration::from_millis(50));
     assert!(matches!(left[0], PublisherOutcome::StartEngine { .. }));
+}
+
+/// The card's demand is only atomics, and `shown` follows the real take.
+#[test]
+fn the_preview_demand_and_the_shown_counter_belong_to_the_handle() {
+    let handle = VoiceHandle::detached_for_tests();
+    assert_eq!(handle.screen_preview_stats(), (0, 0));
+    assert!(!handle.screen_preview_demand_for_tests().is_enabled());
+
+    handle.set_screen_preview_demand(Some(320));
+    let demand = handle.screen_preview_demand_for_tests();
+    assert!(demand.is_enabled());
+    assert_eq!(demand.width(), 320);
+    assert!(handle.take_screen_frame().is_none(), "no picture yet");
+    assert_eq!(handle.screen_preview_stats().1, 0);
+
+    handle.push_screen_preview_for_tests(crate::screen_capture::PreviewFrame {
+        width: 2,
+        height: 2,
+        bgra: vec![0x30; 2 * 2 * 4],
+    });
+    let frame = handle.take_screen_frame().expect("the stored picture");
+    assert_eq!((frame.width, frame.height), (2, 2));
+    assert_eq!(handle.screen_preview_stats(), (0, 1));
+    assert!(
+        handle.take_screen_frame().is_none(),
+        "the slot holds one picture only"
+    );
+    assert_eq!(handle.screen_preview_stats().1, 1);
+
+    // A frame drained while no card paints is not a shown picture.
+    handle.push_screen_preview_for_tests(crate::screen_capture::PreviewFrame {
+        width: 2,
+        height: 2,
+        bgra: vec![0x30; 2 * 2 * 4],
+    });
+    assert!(
+        handle.discard_screen_frame(),
+        "the pending picture is drained"
+    );
+    assert_eq!(
+        handle.screen_preview_stats(),
+        (0, 1),
+        "a discarded frame is not counted as shown"
+    );
+    assert!(!handle.discard_screen_frame(), "the slot is empty again");
+
+    handle.set_screen_preview_demand(None);
+    assert!(!handle.screen_preview_demand_for_tests().is_enabled());
 }

@@ -11,14 +11,15 @@ use crate::voice_room::{
     TOOLBAR_ACTIONS, VOICE_ACTIONS,
 };
 use gpui::{
-    div, img, prelude::*, px, rgb, Context, FocusHandle, MouseButton, RenderImage, ScrollHandle,
-    Subscription, Window,
+    div, img, prelude::*, px, rgb, Context, FocusHandle, MouseButton, RenderImage, Subscription,
+    Window,
 };
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     sync::Arc,
-    time::Duration,
+    time::Instant,
 };
+use tokio::sync::Notify;
 use voxhold_api::Client;
 use voxhold_media::{
     controller::{AppliedAudio, Participant, Publication},
@@ -139,6 +140,12 @@ pub struct VoicePanel {
     can_stream: bool,
     /// Screen-share picker, on-air card and preview.
     screen: ScreenShareUi,
+    stream_preferences: screen_share::StreamPrefsStore,
+    /// Rect of the visible on-air card painted by the last frame. The preview
+    /// demand of the media capture is computed from it on the 100 ms poll, the
+    /// same cadence at which the card takes a frame. `None` while the card is
+    /// not painted or is scrolled completely out of the room viewport.
+    screen_card_rect: Option<Rect>,
     /// Monotonic id of the newest screen-audio probe. A slower, older probe
     /// must not overwrite the availability of a newer dialog.
     screen_audio_probe: u64,
@@ -146,6 +153,16 @@ pub struct VoicePanel {
     /// room roster and the call worker's roster/streams stay hidden until the
     /// fresh channel list confirms access again.
     access_confirmed: bool,
+    /// One wake for the whole panel lifetime. Handles receive a clone on
+    /// join, so replacing the handle never drops a pending wake.
+    wake: Arc<Notify>,
+    /// Epoch of the running 100 ms player ticker. A new watch starts one and
+    /// closing the player stops the previous one at its next tick.
+    frame_ticker: u64,
+    /// Executor clock of the last taken player picture. Event wakes may not
+    /// take a newer frame before this deadline, so the redraw stays at the
+    /// previous ~10 frames/s.
+    last_frame_at: Option<Instant>,
     frame: Option<Arc<RenderImage>>,
     stream_status: String,
     stream_error: String,
@@ -228,6 +245,25 @@ pub struct VoicePanel {
                 + Sync,
         >,
     >,
+    /// Player pictures really handed to `Window::drop_image`. Test-only: it
+    /// proves that a replaced or closed incoming frame left the sprite atlas.
+    #[cfg(test)]
+    player_images_released: u32,
+    /// Image id that stood in `frame` when the player released a picture.
+    /// Test-only: it proves the slot already pointed at the replacement.
+    #[cfg(test)]
+    last_release_slot_image: Option<u64>,
+    /// Number of `poll` calls. Test-only: an idle panel must not poll.
+    #[cfg(test)]
+    polls: u32,
+    /// Event tasks still running. Test-only: releasing an idle panel must end
+    /// the parked task instead of leaving it for the app lifetime.
+    #[cfg(test)]
+    event_tasks: events::EventTasks,
+    /// Test override of the platform minimize state. A GPUI test window has
+    /// no platform handle, so `window_state::is_minimized` always says false.
+    #[cfg(test)]
+    test_minimized: Option<bool>,
 }
 
 impl VoicePanel {
@@ -242,22 +278,12 @@ impl VoicePanel {
         let focus = cx.focus_handle();
         let blur = cx.on_blur(&focus, window, |panel, _, _| panel.release_push_to_talk());
         let activation = cx.observe_window_activation(window, |panel, window, _| {
-            if !window.is_window_active() {
-                panel.release_push_to_talk();
-            }
+            panel.window_activation(window.is_window_active());
         });
-        let executor = cx.background_executor().clone();
-        cx.spawn_in(window, async move |this, cx| loop {
-            executor.timer(Duration::from_millis(100)).await;
-            let Some(entity) = this.upgrade() else { break };
-            if entity
-                .update_in(cx, |panel, window, cx| panel.poll(window, cx))
-                .is_err()
-            {
-                break;
-            }
-        })
-        .detach();
+        let wake = Arc::new(Notify::new());
+        let event_tasks = events::EventTasks::default();
+        events::spawn(wake.clone(), event_tasks.clone(), window, cx);
+        events::spawn_clock(window, cx);
         let controls = Controls {
             muted: true,
             ..Controls::default()
@@ -307,8 +333,13 @@ impl VoicePanel {
             live_clock_second: None,
             can_stream: false,
             screen: ScreenShareUi::default(),
+            stream_preferences: screen_share::StreamPrefsStore::default(),
+            screen_card_rect: None,
             screen_audio_probe: 0,
             access_confirmed: true,
+            wake,
+            frame_ticker: 0,
+            last_frame_at: None,
             frame: None,
             stream_status: String::new(),
             stream_error: String::new(),
@@ -354,6 +385,16 @@ impl VoicePanel {
             test_audio_probe: None,
             #[cfg(test)]
             test_preview_provider: None,
+            #[cfg(test)]
+            player_images_released: 0,
+            #[cfg(test)]
+            last_release_slot_image: None,
+            #[cfg(test)]
+            polls: 0,
+            #[cfg(test)]
+            event_tasks,
+            #[cfg(test)]
+            test_minimized: None,
         }
     }
 
@@ -588,7 +629,7 @@ impl VoicePanel {
 
     /// Join the displayed room. Joining another room leaves the current call
     /// first, so no audio or video stays on the old lease.
-    pub fn join(&mut self, cx: &mut Context<Self>) {
+    pub fn join(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.access_confirmed {
             self.error = "Права на голосовой канал ещё не подтверждены.".into();
             cx.notify();
@@ -610,7 +651,7 @@ impl VoicePanel {
             return;
         }
         if self.handle.is_some() && self.call_channel != self.room {
-            self.leave_call(cx);
+            self.leave_call(window, cx);
         }
         if self.handle.is_some() {
             return;
@@ -622,10 +663,11 @@ impl VoicePanel {
             self.controls.clone(),
             self.self_muted,
             self.rotation_in_flight,
+            self.wake.clone(),
         ) {
             Ok(handle) => {
                 self.call_channel = self.room;
-                self.install_handle(handle, cx);
+                self.install_handle(handle, window, cx);
             }
             Err(error) => self.error = error,
         }
@@ -635,7 +677,7 @@ impl VoicePanel {
     /// Adopt the one worker of this call. The rotation gate is already armed by
     /// `VoiceHandle::join_with_rotation` before its thread starts, so a call
     /// joined during a refresh never authorizes with the revoked token.
-    fn install_handle(&mut self, handle: VoiceHandle, cx: &mut Context<Self>) {
+    fn install_handle(&mut self, handle: VoiceHandle, window: &mut Window, cx: &mut Context<Self>) {
         self.attempt = handle.attempt();
         self.handle = Some(handle);
         self.begin_attempt();
@@ -645,14 +687,17 @@ impl VoicePanel {
         self.clear_speaking(cx);
         self.tracks.clear();
         self.local_mutes.clear();
-        self.close_player();
+        self.close_player(window);
         self.refresh_capture();
         self.notify_call_changed(cx);
+        // A fresh handle changes the poll gate (clock tick) and may already
+        // hold the first updates; do not wait for the next deadline.
+        self.wake.notify_one();
     }
 
     pub fn leave_in_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.exit_fullscreen(window);
-        self.leave_call(cx);
+        self.leave_call(window, cx);
     }
 
     /// Install a client that already carries a rotated token. The active
@@ -685,7 +730,7 @@ impl VoicePanel {
 
     /// Normal leave: stream session and voice session are both released and
     /// the room falls back to the join button.
-    pub fn leave_call(&mut self, cx: &mut Context<Self>) {
+    pub fn leave_call(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.sidebar_watch = None;
         if let Some(handle) = &self.handle {
             if let Some(selection) = self.watching_selection {
@@ -694,8 +739,8 @@ impl VoicePanel {
             handle.leave();
         }
         self.handle.take();
-        self.close_player();
-        self.reset_screen();
+        self.close_player(window);
+        self.reset_screen(window);
         self.call_channel = 0;
         // A failed refresh or an explicit leave ends the flight without a
         // `token_rotated`; the next call must not inherit a stale gate.
@@ -720,6 +765,9 @@ impl VoicePanel {
         self.tracks.clear();
         self.local_mutes.clear();
         self.streams.clear();
+        // The handle is gone: the clock tick stops polling and a pending
+        // wake must not leave a stale unpainted call state behind.
+        self.wake.notify_one();
         cx.notify();
     }
 
@@ -727,7 +775,7 @@ impl VoicePanel {
     /// and close the player without keeping a stale frame.
     pub fn abandon(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.exit_fullscreen(window);
-        self.leave_call(cx);
+        self.leave_call(window, cx);
         self.room_roster.clear();
     }
 
@@ -898,7 +946,7 @@ impl VoicePanel {
 
     /// Start watching the selected publication. The runtime leaves the previous
     /// attempt and waits for its acknowledgement.
-    pub fn watch(&mut self, publication: Publication, cx: &mut Context<Self>) {
+    pub fn watch(&mut self, publication: Publication, window: &mut Window, cx: &mut Context<Self>) {
         self.sidebar_watch = None;
         if !self.access_confirmed
             || self.call_channel == 0
@@ -912,30 +960,39 @@ impl VoicePanel {
         self.stream_error.clear();
         self.stream_status = "Подключение…".into();
         self.stream_connected = false;
-        self.frame = None;
+        self.clear_player_frame(window);
         self.watching = Some(publication.clone());
         self.watching_selection = Some(selection);
         self.stream_muted = false;
+        self.last_frame_at = None;
+        // One ticker belongs to one player. A repeated watch replaces it; the
+        // old task sees the moved epoch and stops at its next wake.
+        self.frame_ticker = self.frame_ticker.wrapping_add(1);
+        events::spawn_frames(self.frame_ticker, window, cx);
         if let Some(handle) = &self.handle {
             handle.watch_stream(selection, publication);
         }
+        self.wake.notify_one();
         cx.notify();
     }
 
-    pub fn leave_stream(&mut self, cx: &mut Context<Self>) {
+    pub fn leave_stream(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let selection = self.stream_selection;
         if let Some(handle) = &self.handle {
             handle.leave_stream(selection);
         }
         self.watching_selection = None;
-        self.close_player();
+        self.close_player(window);
         cx.notify();
     }
 
-    fn close_player(&mut self) {
-        self.frame = None;
+    fn close_player(&mut self, window: &mut Window) {
+        self.clear_player_frame(window);
         self.watching = None;
         self.watching_selection = None;
+        // Stop the 100 ms player ticker: the next watch starts a new one.
+        self.frame_ticker = self.frame_ticker.wrapping_add(1);
+        self.last_frame_at = None;
         self.player_open = false;
         // The next player may be served by another handle; its first viewport
         // must reach that worker even if the size matches the closed player.
@@ -952,7 +1009,7 @@ impl VoicePanel {
         if self.player_fullscreen || self.owns_fullscreen {
             self.exit_fullscreen(window);
         }
-        self.close_player();
+        self.close_player(window);
     }
 
     pub fn toggle_stream_mute(&mut self, cx: &mut Context<Self>) {
@@ -1023,44 +1080,6 @@ impl VoicePanel {
     #[cfg(test)]
     pub fn watching(&self) -> Option<&Publication> {
         self.watching.as_ref()
-    }
-
-    fn poll(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.sync_viewport();
-        let preview_changed = self.take_screen_preview();
-        let clock_changed = self.live_clock_changed();
-        let Some(handle) = &self.handle else {
-            if preview_changed || clock_changed {
-                cx.notify();
-            }
-            return;
-        };
-        let mut changed = preview_changed || clock_changed;
-        let mut updates = Vec::new();
-        while let Some(update) = handle.try_update() {
-            updates.push(update);
-        }
-        let frame = handle.take_frame();
-        for update in updates {
-            changed |= self.apply_update(update, window, cx);
-        }
-        self.watch_after_join(cx);
-        if let Some(frame) = frame {
-            if self.watching_selection != Some(frame.selection) {
-                // A frame that was already in the last-value slot when the
-                // user switched selections belongs to the old player.
-            } else if let Some(buffer) =
-                image::RgbaImage::from_raw(frame.width, frame.height, frame.bgra)
-            {
-                self.frame = Some(Arc::new(RenderImage::new(smallvec::smallvec![
-                    image::Frame::new(buffer)
-                ])));
-                changed = true;
-            }
-        }
-        if changed {
-            cx.notify();
-        }
     }
 
     /// Test hook: install a confirmed call without opening a socket, so the
@@ -1150,10 +1169,13 @@ impl VoicePanel {
 mod colors;
 mod controls;
 mod cues;
+mod events;
 mod focus;
 mod player;
+mod player_frame;
 mod screen_share;
 use screen_share::ScreenShareUi;
+pub(crate) use screen_share::StreamPrefsStore;
 mod sidebar;
 #[cfg(test)]
 mod test_support;

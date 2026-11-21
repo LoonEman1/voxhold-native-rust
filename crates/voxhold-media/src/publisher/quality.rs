@@ -4,20 +4,34 @@
 
 use super::PublishRequest;
 
-/// Resolution choices of the SDR publisher, matching the web dialog. Defined
-/// beside [`Quality`] so the state machine stays inside the file-size budget.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// Resolution limits for an SDR publication. Capture preserves the source
+/// aspect ratio and never scales above its actual frame.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub enum Resolution {
     #[default]
     P720,
     P1080,
+    P1440,
+    P2160,
+    Native,
 }
 
 impl Resolution {
+    pub const OPTIONS: [Self; 5] = [
+        Self::P720,
+        Self::P1080,
+        Self::P1440,
+        Self::P2160,
+        Self::Native,
+    ];
+
     pub fn size(self) -> (u32, u32) {
         match self {
             Self::P720 => (1280, 720),
             Self::P1080 => (1920, 1080),
+            Self::P1440 => (2560, 1440),
+            Self::P2160 => (3840, 2160),
+            Self::Native => (4096, 2304),
         }
     }
 
@@ -25,6 +39,9 @@ impl Resolution {
         match self {
             Self::P720 => "1280 × 720",
             Self::P1080 => "1920 × 1080",
+            Self::P1440 => "2560 × 1440",
+            Self::P2160 => "3840 × 2160",
+            Self::Native => "Как у источника",
         }
     }
 
@@ -32,9 +49,59 @@ impl Resolution {
         match self {
             Self::P720 => "720p",
             Self::P1080 => "1080p",
+            Self::P1440 => "1440p",
+            Self::P2160 => "2160p",
+            Self::Native => "native",
+        }
+    }
+
+    pub fn available_for(self, source: Option<(u32, u32)>) -> bool {
+        if self == Self::Native {
+            return true;
+        }
+        let Some((width, height)) = source.filter(|&(width, height)| width > 0 && height > 0)
+        else {
+            return matches!(self, Self::P720 | Self::P1080);
+        };
+        let (long, short) = self.size();
+        width.max(height) >= long && width.min(height) >= short
+    }
+
+    /// Choose a smaller preset for a smaller source without changing the saved
+    /// preference. Native is the only option for a source smaller than 720p.
+    pub fn for_source(self, source: Option<(u32, u32)>) -> Self {
+        if self.available_for(source) {
+            return self;
+        }
+        Self::OPTIONS
+            .into_iter()
+            .rev()
+            .find(|&resolution| resolution != Self::Native && resolution.available_for(source))
+            .unwrap_or(Self::Native)
+    }
+
+    fn capture_target(self, width: u32, height: u32) -> (u32, u32) {
+        let (long, short) = self.size();
+        if width > 0 && height > width {
+            (short, long)
+        } else {
+            (long, short)
+        }
+    }
+
+    pub fn capture_size(self, width: u32, height: u32) -> (u32, u32) {
+        let (max_width, max_height) = self.capture_target(width, height);
+        if width < 2 || height < 2 {
+            (max_width, max_height)
+        } else {
+            crate::screen_capture::fit_even(width, height, max_width, max_height)
         }
     }
 }
+
+/// Capture rate targets offered by the native picker.
+pub const MAX_SCREEN_FPS: u32 = 180;
+pub const SCREEN_FRAME_RATES: [u32; 6] = [30, 60, 90, 120, 144, MAX_SCREEN_FPS];
 
 /// Opus bitrate choices of the web dialog. The backend accepts 32–510 kbit/s,
 /// but the client shows the same six values as the web form.
@@ -50,9 +117,10 @@ pub fn normalize_audio_bitrate(value: u32) -> u32 {
         .unwrap_or(128)
 }
 
-/// What the picker sends to the engine. Values are clamped to the web ranges:
-/// 0,5–16 Мбит/с in 0,1 steps, 30/60 FPS and the six Opus bitrate choices.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// What the picker sends to the engine: an SDR capture limit, a frame-rate
+/// target, and bounded video and audio bitrates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(default)]
 pub struct Quality {
     pub resolution: Resolution,
     pub fps: u32,
@@ -79,7 +147,11 @@ impl Default for Quality {
 impl Quality {
     pub fn clamped(self) -> Self {
         Self {
-            fps: if self.fps >= 60 { 60 } else { 30 },
+            fps: SCREEN_FRAME_RATES
+                .into_iter()
+                .rev()
+                .find(|&fps| fps <= self.fps)
+                .unwrap_or(SCREEN_FRAME_RATES[0]),
             bitrate_kbps: (self.bitrate_kbps.clamp(500, 16_000) / 100) * 100,
             audio_bitrate_kbps: normalize_audio_bitrate(self.audio_bitrate_kbps),
             ..self
@@ -229,6 +301,18 @@ impl QualityStatus {
 }
 
 impl PublishRequest {
+    pub(super) fn capture_target(&self) -> (u32, u32) {
+        self.quality
+            .resolution
+            .capture_target(self.source.width, self.source.height)
+    }
+
+    pub(super) fn capture_size(&self) -> (u32, u32) {
+        self.quality
+            .resolution
+            .capture_size(self.source.width, self.source.height)
+    }
+
     /// Classify the difference against the live request. The source identity,
     /// not its display title, decides whether the same capture can continue.
     pub fn change_to(&self, next: &Self) -> QualityChange {

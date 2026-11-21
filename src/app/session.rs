@@ -345,7 +345,7 @@ impl Voxhold {
         self.channels.clear();
         self.members.clear();
         self.messages.clear();
-        self.history_keys.clear();
+        self.reset_history_cache();
         self.deleted_ids.clear();
         self.pending_anchor = None;
         self.history_list.reset(0);

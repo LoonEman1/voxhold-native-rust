@@ -939,6 +939,7 @@ mod cf_04_forward_key;
 mod cf_05_search_cancel;
 mod cf_06_history_gap;
 mod cf_07_edit_text;
+mod chat_controls;
 mod fixes;
 mod followup;
 mod followup2;

@@ -127,15 +127,8 @@ impl VoicePanel {
         let watching = self.watching.as_ref().is_some_and(|current| {
             current.publisher_connection_id == publication.publisher_connection_id
         });
-        let status = if active {
-            format!(
-                "{} · {} смотрят",
-                publication.codec.to_uppercase(),
-                publication.viewer_count
-            )
-        } else {
-            "Подключитесь к каналу для просмотра".into()
-        };
+        let status = voice_room::live_metadata(publication, voice_room::now_millis());
+        let status_selector = status.clone();
         let publication = publication.clone();
         let focus = &self.stream_focus[index.min(self.stream_focus.len() - 1)];
         let mut card = div()
@@ -187,7 +180,9 @@ impl VoicePanel {
                     .left(px(14.))
                     .top(px(rect.h - 72.))
                     .w(px(rect.w - 28.))
-                    .text_size(px(11.))
+                    .debug_selector(move || format!("stream-metadata:{status_selector}").into())
+                    .truncate()
+                    .text_size(px(12.))
                     .text_color(rgb(c.muted))
                     .child(status),
             );
@@ -256,11 +251,8 @@ impl VoicePanel {
             && !participant.reconnecting
             && !participant.self_mute
             && !participant.server_mute
-            && self
-                .speaking
-                .get(&participant.connection_id)
-                .copied()
-                .unwrap_or(false);
+            && !participant.self_deaf
+            && self.speaking(&participant.connection_id);
         let muted = participant.self_mute
             || participant.server_mute
             || self.local_mutes.contains(&participant.connection_id);
@@ -277,7 +269,28 @@ impl VoicePanel {
         } else {
             c.accent_text
         };
+        let user_id = participant.user_id;
         let mut card = div()
+            .id(("voice-room-member", slot as u64))
+            .debug_selector(move || format!("voice-room-member-{user_id}").into())
+            .on_click(cx.listener(move |_, event: &gpui::ClickEvent, _, cx| {
+                cx.emit(ParticipantClick {
+                    user_id,
+                    position: event.position(),
+                    menu: false,
+                });
+            }))
+            .on_mouse_down(
+                gpui::MouseButton::Right,
+                cx.listener(move |_, event: &gpui::MouseDownEvent, _, cx| {
+                    cx.emit(ParticipantClick {
+                        user_id,
+                        position: event.position,
+                        menu: true,
+                    });
+                    cx.stop_propagation();
+                }),
+            )
             .absolute()
             .left(px(rect.x))
             .top(px(rect.y))

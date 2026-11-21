@@ -23,8 +23,8 @@ pub(super) const REOPEN_DELAY: Duration = Duration::from_millis(300);
 /// the budget again.
 pub(super) const STABLE_WINDOW: Duration = Duration::from_secs(2);
 /// A gap between answered polls means the thread was blocked, and time it did
-/// not observe must not count as healthy. The capture loop polls a few
-/// milliseconds apart (`POLL` is 5 ms, blocks are 10 ms) and a blocking WASAPI
+/// not observe must not count as healthy. The capture loop waits at most
+/// 20 ms for the next packet and a blocking WASAPI
 /// call normally returns far below this bound, so 500 ms is conservative: a
 /// client that answers as rarely as every 900 ms cannot accumulate a streak,
 /// while a silent endpoint still answers `GetNextPacketSize() == 0` on every
@@ -479,7 +479,9 @@ mod tests {
             |_scope| Ok(FakeDevice(info("endpoint-a"))),
             move |shared, _device| {
                 if sessions_in.fetch_add(1, Ordering::SeqCst) == 0 {
-                    push_block(shared, vec![7_i16; BLOCK_SAMPLES]);
+                    for _ in 0..crate::system_audio::RESERVE_BLOCKS {
+                        push_block(shared, vec![7_i16; BLOCK_SAMPLES]);
+                    }
                     SessionEnd::Reopen {
                         stable: false,
                         message: "Устройство вывода изменилось.".into(),

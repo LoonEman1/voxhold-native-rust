@@ -111,7 +111,7 @@ impl Voxhold {
         let focused = enabled && focus.is_focused(window);
         // Arrow keys and Home/End reach the row through the dialog ring, so it
         // is a Tab stop like every button. A disabled row is neither.
-        if enabled {
+        if enabled && self.active_settings.is_some() {
             self.settings_ring.push((focus.clone(), None));
             self.settings_slider_focus
                 .push((key.clone(), focus.clone()));

@@ -85,7 +85,7 @@ impl Voxhold {
             .unwrap_or_default()
     }
 
-    fn voice_stream_list(
+    pub(super) fn voice_stream_list(
         &self,
         server: i64,
         channel: i64,
@@ -104,8 +104,36 @@ impl Voxhold {
         self.voice_roster(self.server, channel).len()
     }
 
+    #[cfg(test)]
     pub(super) fn voice_has_stream(&self, channel: i64) -> bool {
         !self.voice_stream_list(self.server, channel).is_empty()
+    }
+
+    pub(super) fn watch_sidebar_stream(
+        &mut self,
+        channel: i64,
+        publication: &voxhold_media::controller::Publication,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(current) = self
+            .voice_stream_list(self.server, channel)
+            .into_iter()
+            .find(|item| item.publisher_connection_id == publication.publisher_connection_id)
+        else {
+            return;
+        };
+        if self.channel != channel {
+            self.select_channel(channel, window, cx);
+        }
+        if self.voice_room_visible()
+            && self.channel == channel
+            && current.publisher_user_id != self.self_user_id
+        {
+            if let Some(panel) = &self.voice {
+                panel.update(cx, |panel, cx| panel.watch_from_sidebar(current, cx));
+            }
+        }
     }
 
     /// Display a voice channel's room. The call panel entity is reused so the
@@ -218,6 +246,17 @@ impl Voxhold {
                     });
                 }));
             });
+            cx.subscribe(
+                &panel,
+                |view, _, event: &voice_panel::ParticipantClick, cx| {
+                    if event.menu {
+                        view.open_voice_member_menu(event.user_id, event.position, cx);
+                    } else {
+                        view.open_member_profile(event.user_id, event.position, cx);
+                    }
+                },
+            )
+            .detach();
             self.voice = Some(panel);
             self.install_voice_call_handler(cx);
         }
@@ -573,6 +612,7 @@ impl Voxhold {
             || self.show_search
             || self.message_menu.is_some()
             || self.member_menu.is_some()
+            || self.channel_menu.is_some()
             || self.forward.is_some()
             || self
                 .voice

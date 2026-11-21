@@ -52,10 +52,10 @@ pub const CHANNELS: u32 = 2;
 pub const BLOCK_FRAMES: u32 = SAMPLE_RATE / 100;
 /// Interleaved i16 samples of one block.
 pub const BLOCK_SAMPLES: usize = BLOCK_FRAMES as usize * CHANNELS as usize;
-pub const BLOCK_INTERVAL: Duration = Duration::from_millis(10);
-/// Four blocks (40 ms) bound the latency and absorb a scheduling hiccup. The
-/// queue drops its oldest block instead of growing.
-pub const MAX_QUEUE_BLOCKS: usize = 4;
+/// The capture reserve starts after three consecutive 10 ms blocks. Six
+/// blocks cap the queue when the device delivers several packets in one wake.
+const RESERVE_BLOCKS: usize = 3;
+pub const MAX_QUEUE_BLOCKS: usize = 6;
 
 const READY_TIMEOUT: Duration = Duration::from_secs(3);
 const STOP_TIMEOUT: Duration = Duration::from_secs(2);
@@ -154,7 +154,7 @@ pub trait AudioProducer: Send {
 }
 
 struct Shared {
-    blocks: Mutex<VecDeque<Vec<i16>>>,
+    queue: Mutex<BlockQueue>,
     stop: AtomicBool,
     failed: Mutex<Option<String>>,
     dropped: AtomicU64,
@@ -164,7 +164,7 @@ struct Shared {
 impl Default for Shared {
     fn default() -> Self {
         Self {
-            blocks: Mutex::new(VecDeque::with_capacity(MAX_QUEUE_BLOCKS)),
+            queue: Mutex::new(BlockQueue::default()),
             stop: AtomicBool::new(false),
             failed: Mutex::new(None),
             dropped: AtomicU64::new(0),
@@ -205,10 +205,25 @@ impl Shared {
     /// block queue. The dropped PCM still counts in the publisher's statistics,
     /// just like a block evicted by [`push_block`].
     fn clear_audio(&self) {
-        if let Ok(mut queue) = self.blocks.lock() {
-            let cleared = queue.len() as u64;
-            queue.clear();
+        if let Ok(mut queue) = self.queue.lock() {
+            let cleared = queue.blocks.len() as u64;
+            queue.blocks.clear();
+            queue.playing = false;
             self.dropped.fetch_add(cleared, Ordering::Relaxed);
+        }
+    }
+}
+
+struct BlockQueue {
+    blocks: VecDeque<Vec<i16>>,
+    playing: bool,
+}
+
+impl Default for BlockQueue {
+    fn default() -> Self {
+        Self {
+            blocks: VecDeque::with_capacity(MAX_QUEUE_BLOCKS),
+            playing: false,
         }
     }
 }
@@ -216,18 +231,24 @@ impl Shared {
 /// Keep only the newest blocks. A slow encoder loses old audio instead of
 /// delaying the whole publication.
 fn push_block(shared: &Shared, block: Vec<i16>) {
-    let Ok(mut queue) = shared.blocks.lock() else {
+    let Ok(mut queue) = shared.queue.lock() else {
         return;
     };
-    if queue.len() >= MAX_QUEUE_BLOCKS {
-        queue.pop_front();
+    if queue.blocks.len() == MAX_QUEUE_BLOCKS {
+        queue.blocks.pop_front();
         shared.dropped.fetch_add(1, Ordering::Relaxed);
     }
-    queue.push_back(block);
+    queue.blocks.push_back(block);
 }
 
 fn next_block(shared: &Shared) -> Option<Vec<i16>> {
-    shared.blocks.lock().ok()?.pop_front()
+    let mut queue = shared.queue.lock().ok()?;
+    if !queue.playing && queue.blocks.len() < RESERVE_BLOCKS {
+        return None;
+    }
+    let block = queue.blocks.pop_front();
+    queue.playing = block.is_some();
+    block
 }
 
 /// Reassembles converted WASAPI packets into exactly [`BLOCK_SAMPLES`]
@@ -442,7 +463,7 @@ mod tests {
         assert_eq!(
             shared.dropped.load(Ordering::Relaxed),
             MAX_QUEUE_BLOCKS as u64,
-            "publication statistics must report the cleared ~40 ms"
+            "publication statistics must report the cleared capture blocks"
         );
 
         // Clearing an empty queue changes nothing and does not count.
@@ -451,6 +472,45 @@ mod tests {
             shared.dropped.load(Ordering::Relaxed),
             MAX_QUEUE_BLOCKS as u64
         );
+    }
+
+    #[test]
+    fn bursts_can_be_drained_on_the_send_clock_without_inserting_gaps() {
+        let shared = Shared::default();
+        let mut sequence = 0;
+        for tick in 0..300 {
+            // Deliver a 20 ms packet every two ticks, with a late delivery
+            // followed by a catch-up packet every few cycles.
+            let packets = match tick {
+                0 => 2,
+                value if value % 10 == 4 => 0,
+                value if value % 10 == 6 => 2,
+                value if value % 2 == 0 => 1,
+                _ => 0,
+            };
+            for _ in 0..packets * 2 {
+                push_block(&shared, vec![sequence; BLOCK_SAMPLES]);
+                sequence += 1;
+            }
+            assert_eq!(next_block(&shared).unwrap()[0], tick as i16);
+        }
+        assert_eq!(shared.dropped.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn a_capture_gap_requires_a_new_reserve_before_resuming() {
+        let shared = Shared::default();
+        for _ in 0..RESERVE_BLOCKS - 1 {
+            push_block(&shared, vec![1; BLOCK_SAMPLES]);
+            assert!(next_block(&shared).is_none());
+        }
+        push_block(&shared, vec![2; BLOCK_SAMPLES]);
+        assert_eq!(next_block(&shared).unwrap()[0], 1);
+        assert_eq!(next_block(&shared).unwrap()[0], 1);
+        assert_eq!(next_block(&shared).unwrap()[0], 2);
+        assert!(next_block(&shared).is_none());
+        push_block(&shared, vec![3; BLOCK_SAMPLES]);
+        assert!(next_block(&shared).is_none());
     }
 
     #[test]
@@ -657,23 +717,32 @@ mod wasapi_manual {
         wav
     }
 
-    fn collect(capture: &mut SystemAudio, millis: u64) -> (u64, i32) {
+    // A distinctive narrow-band probe can be checked even when other apps
+    // are playing. Peak amplitude alone would mistake their sound for echo.
+    const TEST_TONE_HZ: f64 = 1_277.;
+
+    fn collect(capture: &mut SystemAudio, millis: u64) -> (u64, i32, f64) {
         let deadline = Instant::now() + Duration::from_millis(millis);
         let (mut blocks, mut peak) = (0_u64, 0_i32);
+        let (mut sine, mut cosine, mut frames) = (0.0_f64, 0.0_f64, 0_u64);
+        let step = std::f64::consts::TAU * TEST_TONE_HZ / f64::from(SAMPLE_RATE);
         while Instant::now() < deadline {
             if let Some(block) = capture.next_block() {
                 blocks += 1;
-                peak = peak.max(
-                    block
-                        .iter()
-                        .map(|sample| i32::from(*sample).abs())
-                        .max()
-                        .unwrap_or(0),
-                );
+                for stereo in block.chunks_exact(CHANNELS as usize) {
+                    peak = peak
+                        .max(i32::from(stereo[0]).abs())
+                        .max(i32::from(stereo[1]).abs());
+                    let phase = step * frames as f64;
+                    sine += f64::from(stereo[0]) * phase.sin();
+                    cosine += f64::from(stereo[0]) * phase.cos();
+                    frames += 1;
+                }
             }
             thread::sleep(Duration::from_millis(5));
         }
-        (blocks, peak)
+        let amplitude = 2.0 * sine.hypot(cosine) / frames.max(1) as f64;
+        (blocks, peak, amplitude)
     }
 
     #[test]
@@ -688,10 +757,10 @@ mod wasapi_manual {
         if let Some(opened) = capture.device() {
             println!("wasapi: opened {}", opened.format);
         }
-        let (baseline_blocks, baseline_peak) = collect(&mut capture, 400);
+        let (baseline_blocks, baseline_peak, _) = collect(&mut capture, 400);
         println!("wasapi: baseline blocks={baseline_blocks} peak={baseline_peak}");
 
-        let wav = wav_tone(440.0, 1000);
+        let wav = wav_tone(TEST_TONE_HZ, 1000);
         let played = unsafe {
             PlaySoundW(
                 PCWSTR(wav.as_ptr().cast()),
@@ -700,9 +769,9 @@ mod wasapi_manual {
             )
         };
         println!("wasapi: PlaySoundW played={}", played.as_bool());
-        let (blocks, peak) = collect(&mut capture, 1200);
+        let (blocks, peak, amplitude) = collect(&mut capture, 1200);
         println!(
-            "wasapi: tone blocks={blocks} peak={peak} dropped={} failure={:?}",
+            "wasapi: tone blocks={blocks} peak={peak} tone={amplitude:.1} dropped={} failure={:?}",
             capture.dropped(),
             capture.failure()
         );
@@ -711,7 +780,7 @@ mod wasapi_manual {
         assert!(played.as_bool(), "winmm did not accept the in-memory WAV");
         assert!(blocks > 0, "loopback delivered no block during the tone");
         assert!(
-            peak > 500,
+            amplitude > 500.,
             "loopback delivered silence (peak {peak}); check the default output device"
         );
     }
@@ -732,10 +801,10 @@ mod wasapi_manual {
                 opened.label, opened.format
             );
         }
-        let (baseline_blocks, baseline_peak) = collect(&mut capture, 400);
+        let (baseline_blocks, baseline_peak, _) = collect(&mut capture, 400);
         println!("wasapi: process baseline blocks={baseline_blocks} peak={baseline_peak}");
 
-        let wav = wav_tone(440.0, 1000);
+        let wav = wav_tone(TEST_TONE_HZ, 1000);
         let played = unsafe {
             PlaySoundW(
                 PCWSTR(wav.as_ptr().cast()),
@@ -743,9 +812,9 @@ mod wasapi_manual {
                 SND_MEMORY | SND_ASYNC | SND_NODEFAULT,
             )
         };
-        let (blocks, peak) = collect(&mut capture, 1200);
+        let (blocks, peak, amplitude) = collect(&mut capture, 1200);
         println!(
-            "wasapi: process tone blocks={blocks} peak={peak} dropped={} failure={:?}",
+            "wasapi: process tone blocks={blocks} peak={peak} tone={amplitude:.1} dropped={} failure={:?}",
             capture.dropped(),
             capture.failure()
         );
@@ -756,7 +825,7 @@ mod wasapi_manual {
             "process loopback delivered no block during the tone"
         );
         assert!(
-            peak > 500,
+            amplitude > 500.,
             "process loopback did not carry this process's own tone (peak {peak}); \
              record the host Windows version and HRESULT instead of falling back"
         );
@@ -770,10 +839,10 @@ mod wasapi_manual {
         let pid = std::process::id();
         let mut capture = SystemAudio::start(CaptureScope::ExcludeProcess { pid })
             .expect("process loopback EXCLUDE this process");
-        let (baseline_blocks, baseline_peak) = collect(&mut capture, 400);
+        let (baseline_blocks, baseline_peak, _) = collect(&mut capture, 400);
         println!("wasapi: exclude baseline blocks={baseline_blocks} peak={baseline_peak}");
 
-        let wav = wav_tone(440.0, 1000);
+        let wav = wav_tone(TEST_TONE_HZ, 1000);
         let played = unsafe {
             PlaySoundW(
                 PCWSTR(wav.as_ptr().cast()),
@@ -781,9 +850,9 @@ mod wasapi_manual {
                 SND_MEMORY | SND_ASYNC | SND_NODEFAULT,
             )
         };
-        let (blocks, peak) = collect(&mut capture, 1200);
+        let (blocks, peak, amplitude) = collect(&mut capture, 1200);
         println!(
-            "wasapi: exclude tone blocks={blocks} peak={peak} dropped={} failure={:?}",
+            "wasapi: exclude tone blocks={blocks} peak={peak} tone={amplitude:.1} dropped={} failure={:?}",
             capture.dropped(),
             capture.failure()
         );
@@ -791,8 +860,8 @@ mod wasapi_manual {
         assert!(played.as_bool(), "winmm did not accept the in-memory WAV");
         assert!(blocks > 0, "the exclude stream must still deliver silence");
         assert!(
-            peak < 500,
-            "the exclude scope carried this process's own tone (peak {peak}); \
+            amplitude < 500.,
+            "the exclude scope carried this process's own tone (amplitude {amplitude:.1}); \
              this is the defect the scope must prevent"
         );
     }

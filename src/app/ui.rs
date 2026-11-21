@@ -61,5 +61,35 @@ pub(crate) fn channel_icon(kind: &str, color: gpui::Rgba) -> AnyElement {
         "news" => "icons/news.svg",
         _ => "icons/hash.svg",
     };
-    icon(resource, 15., color)
+    icon(resource, 17., color)
+}
+
+pub(super) fn avatar(
+    image: Option<std::sync::Arc<gpui::RenderImage>>,
+    name: &str,
+    size: f32,
+) -> AnyElement {
+    let circle = div()
+        .size(px(size))
+        .flex_shrink_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded_full()
+        .overflow_hidden();
+    if let Some(image) = image {
+        circle.child(
+            gpui::img(image)
+                .size_full()
+                .object_fit(gpui::ObjectFit::Cover),
+        )
+    } else {
+        circle
+            .bg(ink(crate::members::avatar_color(name)))
+            .text_color(ink(0x151510))
+            .text_size(px(if size >= 30. { 13. } else { 10. }))
+            .font_weight(gpui::FontWeight::BOLD)
+            .child(crate::members::initials(name))
+    }
+    .into_any_element()
 }

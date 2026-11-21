@@ -48,12 +48,11 @@ impl Voxhold {
             }))
             .on_click(cx.listener(|view, _, _, cx| view.toggle_update_panel(cx)))
             .child(icon(icon_path, 16., ink(color)))
-            .when(hovered, |element| {
-                element.child(
+            .when(hovered && !self.update.panel_open, |element| {
+                element.child(gpui::deferred(
                     div()
                         .id("update-tooltip")
                         .debug_selector(|| "update-tooltip".into())
-                        .occlude()
                         .absolute()
                         .top(px(28.))
                         .right(px(0.))
@@ -64,10 +63,11 @@ impl Voxhold {
                         .bg(ink(p.surface))
                         .border_1()
                         .border_color(ink(p.line))
-                        .text_size(px(11.))
-                        .text_color(ink(p.muted))
+                        .text_size(px(12.))
+                        .line_height(px(17.))
+                        .text_color(ink(p.fg))
                         .child(tooltip),
-                )
+                ))
             })
             .into_any_element()
     }

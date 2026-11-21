@@ -5,6 +5,7 @@ impl Voxhold {
     pub(super) fn dismiss_overlays(&mut self, cx: &mut Context<Self>) {
         self.message_menu = None;
         self.member_menu = None;
+        self.channel_menu = None;
         // A pending forward keeps its modal and its per-recipient keys.
         if !self.forward_is_sending() {
             self.forward = None;
@@ -181,12 +182,29 @@ impl Voxhold {
                 } else {
                     action.id()
                 };
+                let glyph = match action {
+                    Action::Discuss => "icons/chat.svg",
+                    Action::Reply => "icons/reply.svg",
+                    Action::Edit => "icons/edit.svg",
+                    Action::Pin | Action::Unpin => "icons/pin.svg",
+                    Action::Copy => "icons/copy.svg",
+                    Action::Save => "icons/bookmark.svg",
+                    Action::Forward => "icons/forward.svg",
+                    Action::Delete => "icons/trash.svg",
+                    Action::Block => "icons/lock.svg",
+                };
                 panel = panel.child(
                     div()
                         .id(gpui::ElementId::Name(
                             format!("menu-action-{}", action.id()).into(),
                         ))
-                        .h(px(30.))
+                        .h(px(32.))
+                        .gap(px(9.))
+                        .child(icon(
+                            glyph,
+                            16.,
+                            ink(if danger { p.danger } else { p.muted }),
+                        ))
                         .px(px(8.))
                         .flex()
                         .items_center()

@@ -570,9 +570,10 @@ fn silence_keeps_the_audio_track_flowing() {
 
 #[test]
 fn a_missing_block_becomes_exactly_one_960_sample_silent_frame() {
-    use super::audio::{AudioCounters, frame_for};
+    use super::audio::{AudioCounters, ProgramAudio};
     let counters = AudioCounters::default();
-    let frame = frame_for(None, &counters);
+    let mut program = ProgramAudio::default();
+    let frame = program.next(None, 0, &counters);
     assert_eq!(frame.data.len(), BLOCK_SAMPLES, "exactly one 10 ms block");
     assert_eq!(frame.data.len(), 960);
     assert_eq!(frame.samples_per_channel, BLOCK_FRAMES);
@@ -585,14 +586,15 @@ fn a_missing_block_becomes_exactly_one_960_sample_silent_frame() {
 
     // A short block is not padded with old data and is still mapped to one
     // silent frame; a full block passes through and does not count.
-    let short = frame_for(Some(vec![9; BLOCK_SAMPLES - 2]), &counters);
+    let short = program.next(Some(vec![9; BLOCK_SAMPLES - 2]), 0, &counters);
     assert_eq!(short.data.len(), 960);
     assert!(short.data.iter().all(|sample| *sample == 0));
     assert_eq!(counters.silent.load(Ordering::Relaxed), 2);
 
-    let real = frame_for(Some(vec![9; BLOCK_SAMPLES]), &counters);
+    let real = program.next(Some(vec![9; BLOCK_SAMPLES]), 0, &counters);
     assert_eq!(real.data.len(), 960);
-    assert_eq!(real.data[0], 9);
+    assert_eq!(real.data[0], 0);
+    assert_eq!(real.data[BLOCK_SAMPLES - 1], 9);
     assert_eq!(counters.silent.load(Ordering::Relaxed), 2);
 }
 

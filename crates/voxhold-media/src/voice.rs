@@ -54,7 +54,7 @@ use crate::mixer::Source;
 const ICE_CAPACITY: usize = 64;
 const COMPLETED_UFRAG_CAPACITY: usize = 16;
 const SIGNAL_TIMEOUT: Duration = Duration::from_secs(8);
-const SPEAKING_THRESHOLD: f64 = 0.018;
+pub(crate) const SPEAKING_THRESHOLD: f64 = 0.018;
 /// A recovery attempt is only cleared after this much uninterrupted capture.
 /// One delivered block is not proof that a driver recovered.
 const INPUT_STABLE_CAPTURE: Duration = Duration::from_secs(5);

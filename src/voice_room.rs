@@ -546,3 +546,38 @@ pub fn player_status(status: &str, error: &str, has_frame: bool, connected: bool
 
 #[cfg(test)]
 mod tests;
+#[cfg(feature = "voxhold-media")]
+pub(crate) fn now_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_millis() as i64)
+}
+
+#[cfg(feature = "voxhold-media")]
+pub(crate) fn live_metadata(
+    stream: &voxhold_media::controller::Publication,
+    now_ms: i64,
+) -> String {
+    let count = stream.viewer_count.max(0);
+    let viewers = if count == 0 {
+        "Пока без зрителей".to_owned()
+    } else {
+        let word = match (count % 100, count % 10) {
+            (11..=14, _) => "зрителей",
+            (_, 1) => "зритель",
+            (_, 2..=4) => "зрителя",
+            _ => "зрителей",
+        };
+        format!("{count} {word}")
+    };
+    if stream.started_at_ms <= 0 {
+        return viewers;
+    }
+    let elapsed = now_ms.saturating_sub(stream.started_at_ms).max(0) / 1000;
+    let (h, m, s) = (elapsed / 3600, elapsed / 60 % 60, elapsed % 60);
+    if h == 0 {
+        format!("{viewers} · {m}:{s:02}")
+    } else {
+        format!("{viewers} · {h}:{m:02}:{s:02}")
+    }
+}

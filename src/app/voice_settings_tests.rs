@@ -668,7 +668,11 @@ async fn the_in_call_meter_applies_the_input_gain_and_mute(cx: &mut TestAppConte
     let (mut visual, view, voice) = voice_call(cx);
     visual.update(|window, app| {
         voice.update(app, |panel, cx| {
-            panel.test_apply_update(VoiceUpdate::LocalLevel(0.5), window, cx);
+            let update = VoiceUpdate::LocalLevel {
+                level: 0.5,
+                speaking: false,
+            };
+            panel.test_apply_update(update, window, cx);
         });
         view.update(app, |v, cx| {
             use personal_settings::Action;

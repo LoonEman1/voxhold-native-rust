@@ -323,7 +323,7 @@ impl Voxhold {
         let focus = state.read(cx).focus_handle(cx);
         self.settings_ring.push((focus, None));
         TextInput::new(state)
-            .font_family("Inter")
+            .font_family(theme::UI_FONT)
             .text_size(px(14.))
             .into_any_element()
     }

@@ -158,7 +158,7 @@ impl Voxhold {
         }
         cx.notify();
     }
-    fn can_manage_channel_now(&self) -> bool {
+    pub(super) fn can_manage_channel_now(&self) -> bool {
         self.servers
             .iter()
             .find(|server| server.id == self.server)

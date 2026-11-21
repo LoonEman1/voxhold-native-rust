@@ -36,6 +36,7 @@ impl VoicePanel {
                 self.controls.muted = true;
                 self.sync_output_gain();
                 self.release_push_to_talk();
+                self.clear_speaking(cx);
             }
             VoiceUpdate::Connected => {
                 if self.phase != CallPhase::Connected {
@@ -83,11 +84,8 @@ impl VoicePanel {
             VoiceUpdate::Speaking(speaking) => {
                 repaint = self.set_speaking(speaking, cx);
             }
-            VoiceUpdate::LocalLevel(level) => {
-                // Repaint the meter only for a visible step, not for every
-                // 20 Hz sample of the capture track.
-                repaint = (self.local_level - level).abs() > 0.04;
-                self.local_level = level;
+            VoiceUpdate::LocalLevel { level, speaking } => {
+                repaint = self.update_local_level(level, speaking, cx);
             }
             VoiceUpdate::Tracks(tracks) => self.tracks = tracks,
             VoiceUpdate::Streams(streams) => {
@@ -201,6 +199,24 @@ impl VoicePanel {
                 self.streams.clear();
             }
             VoiceUpdate::ScreenShare(_) | VoiceUpdate::ScreenSources { .. } => {}
+        }
+        repaint
+    }
+
+    pub(super) fn notify_speaking_changed(&self, cx: &mut gpui::App) {
+        if let Some(handler) = &self.speaking_handler {
+            handler(cx);
+        }
+    }
+
+    fn update_local_level(&mut self, level: f64, speaking: bool, cx: &mut Context<Self>) -> bool {
+        let speaking = speaking && self.phase == CallPhase::Connected && !self.controls.muted;
+        let changed = self.local_speaking != speaking;
+        let repaint = changed || (self.local_level - level).abs() > 0.04;
+        self.local_speaking = speaking;
+        self.local_level = level;
+        if changed {
+            self.notify_speaking_changed(cx);
         }
         repaint
     }

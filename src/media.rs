@@ -20,6 +20,7 @@ use crate::draft::ChatKey;
 /// Go `thumbnailBudget`.
 pub const THUMB_BUDGET: usize = 16 << 20;
 /// Go `previewImageBudget`.
+pub const PREVIEW_IMAGE: (u32, u32) = (192, 108);
 pub const PREVIEW_IMAGE_BUDGET: usize = 4 << 20;
 /// Go `thumbnailBucket`.
 pub const THUMB_BUCKET: u32 = 16;
@@ -244,7 +245,7 @@ pub struct Media {
     pub previews: HashMap<String, PreviewEntry>,
     pub preview_order: VecDeque<String>,
     pub preview_images: ImageCache<String>,
-    pub preview_pending: HashSet<String>,
+    pub preview_pending: HashMap<String, uuid::Uuid>,
     pub preview_failures: HashMap<String, (Instant, bool)>,
     pub viewer: Option<Viewer>,
     pub viewer_seq: u64,
@@ -263,7 +264,7 @@ impl Default for Media {
             previews: HashMap::new(),
             preview_order: VecDeque::new(),
             preview_images: ImageCache::new(PREVIEW_IMAGE_BUDGET),
-            preview_pending: HashSet::new(),
+            preview_pending: HashMap::new(),
             preview_failures: HashMap::new(),
             viewer: None,
             viewer_seq: 0,
@@ -443,6 +444,12 @@ impl Media {
         } else {
             preview.title.clone()
         };
+        let site = if site == title || site == host {
+            String::new()
+        } else {
+            site
+        };
+        let host = if host == title { String::new() } else { host };
         [site, title, preview.description.clone(), host]
     }
 }
@@ -691,9 +698,9 @@ mod tests {
             ..Default::default()
         };
         let labels = Media::preview_labels("https://example.com/a", &preview);
-        assert_eq!(labels[0], "example.com");
+        assert_eq!(labels[0], "");
         assert_eq!(labels[1], "example.com");
         assert_eq!(labels[2], "Описание");
-        assert_eq!(labels[3], "example.com");
+        assert_eq!(labels[3], "");
     }
 }

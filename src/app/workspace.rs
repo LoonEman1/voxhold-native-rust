@@ -58,13 +58,13 @@ impl Voxhold {
         self.close_thread(window, cx);
         self.message_menu = None;
         self.member_menu = None;
+        self.channel_menu = None;
         self.forward = None;
         self.close_edit();
         self.confirm_delete = None;
         self.action_requests.clear();
         self.selected_messages.clear();
         self.highlighted_message = None;
-        self.hovered_action = None;
         self.composer
             .update(cx, |input, cx| input.set_value("", window, cx));
         #[cfg(feature = "voxhold-media")]
@@ -229,13 +229,13 @@ impl Voxhold {
         self.close_thread(window, cx);
         self.message_menu = None;
         self.member_menu = None;
+        self.channel_menu = None;
         self.forward = None;
         self.close_edit();
         self.confirm_delete = None;
         self.action_requests.clear();
         self.selected_messages.clear();
         self.highlighted_message = None;
-        self.hovered_action = None;
         let draft = self
             .drafts
             .borrow()
@@ -245,6 +245,7 @@ impl Voxhold {
         self.channel = id;
         self.composer_error.clear();
         self.close_viewer(window);
+        self.media.preview_pending.clear();
         self.preview_wakeup = None;
         self.preview_wake_at = None;
         let writable = self.channel_chat_writable(id);
@@ -454,7 +455,6 @@ impl Voxhold {
         self.action_requests.clear();
         self.selected_messages.clear();
         self.highlighted_message = None;
-        self.hovered_action = None;
         if let Some(attachments) = &self.attachments {
             attachments.update(cx, |a, cx| a.set_scope(None, false, cx));
         }
@@ -530,7 +530,20 @@ impl Voxhold {
                         // A notification form follows the account, not the
                         // administration role, but it still needs a readable
                         // text/news channel. Revoking access closes it.
-                        s.close_stale_settings(server, s.channel, window, cx);
+                        let scoped_channel =
+                            if s.active_settings == Some(SettingsKind::ChannelNotifications) {
+                                s.channel_notifications.as_ref().map(|panel| panel.channel)
+                            } else if s.active_settings == Some(SettingsKind::Channel) {
+                                s.channel_settings.as_ref().map(|panel| panel.channel)
+                            } else {
+                                None
+                            };
+                        s.close_stale_settings(
+                            server,
+                            scoped_channel.unwrap_or(s.channel),
+                            window,
+                            cx,
+                        );
                         let channel_missing = s
                             .channel_settings
                             .as_ref()

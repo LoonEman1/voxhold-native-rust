@@ -749,7 +749,7 @@ async fn run(
                 },
                 SAMPLE_RATE,
                 CHANNELS,
-                200,
+                audio::SOURCE_QUEUE_MS,
             );
             let track = factory.create_audio_track("voxhold-system-audio", audio_source.clone());
             let sender = match peer.add_track(MediaStreamTrack::Audio(track), &["voxhold-screen"]) {

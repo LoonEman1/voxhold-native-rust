@@ -464,7 +464,19 @@ where
 {
     Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
 }
-macro_rules! dto { ($name:ident { $($field:ident : $ty:ty),* $(,)? }) => { #[derive(Debug, Clone, Default, Serialize, Deserialize)] #[serde(default)] pub struct $name { $(#[serde(default, deserialize_with="null_default")] pub $field:$ty),* } }; }
+macro_rules! dto {
+    ($name:ident { $($(#[$attr:meta])* $field:ident : $ty:ty),* $(,)? }) => {
+        #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+        #[serde(default)]
+        pub struct $name {
+            $(
+                $(#[$attr])*
+                #[serde(default, deserialize_with = "null_default")]
+                pub $field: $ty
+            ),*
+        }
+    };
+}
 dto!(Server {
     id: i64,
     name: String,
@@ -506,7 +518,42 @@ dto!(Attachment {
     height: i32,
     deleted: bool
 });
-dto!(Message { id:i64, channel_id:i64, conversation_id:i64, content:String, author:Author, created_at:i64, edited_at:Option<i64>, revision:i64, comment_count:i64, thread_root_id:Option<i64>, client_message_id:String, reply:Option<MessageReference>, forward:Option<MessageReference>, reactions:Vec<Reaction>, reactions_revision:i64, attachments:Vec<Attachment>, poll:Value });
+// Channel forwards can return the Go domain struct directly. Its top-level
+// field names differ from the regular message DTO, while nested data agrees.
+dto!(Message {
+    #[serde(alias = "ID")]
+    id: i64,
+    #[serde(alias = "ChannelID")]
+    channel_id: i64,
+    conversation_id: i64,
+    #[serde(alias = "Content")]
+    content: String,
+    #[serde(alias = "Author")]
+    author: Author,
+    #[serde(alias = "CreatedAt")]
+    created_at: i64,
+    #[serde(alias = "EditedAt")]
+    edited_at: Option<i64>,
+    #[serde(alias = "Revision")]
+    revision: i64,
+    #[serde(alias = "CommentCount")]
+    comment_count: i64,
+    #[serde(alias = "ThreadRootID")]
+    thread_root_id: Option<i64>,
+    #[serde(alias = "ClientMessageID")]
+    client_message_id: String,
+    #[serde(alias = "Reply")]
+    reply: Option<MessageReference>,
+    #[serde(alias = "Forward")]
+    forward: Option<MessageReference>,
+    #[serde(alias = "Reactions")]
+    reactions: Vec<Reaction>,
+    #[serde(alias = "ReactionsRevision")]
+    reactions_revision: i64,
+    #[serde(alias = "Attachments")]
+    attachments: Vec<Attachment>,
+    poll: Value,
+});
 dto!(Pagination { next_before_id:Option<i64>, has_more:bool });
 dto!(MessagePage { messages:Vec<Message>, pagination:Pagination });
 dto!(Member { avatar_version:Option<String>, country_code:Option<String>, user_id:i64, username:String, role:String, last_seen_at:Option<i64> });
@@ -965,6 +1012,25 @@ impl VoiceSocket {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn parses_the_channel_forward_response_from_the_community_endpoint() {
+        let message: Message = serde_json::from_value(serde_json::json!({
+            "ID": 8, "ChannelID": 2, "Content": "body",
+            "Author": {"user_id": 5, "username": "tester"},
+            "Forward": {"author": {"user_id": 7, "username": "source"}, "created_at": 1},
+            "Attachments": null, "Reactions": null, "Revision": 3
+        }))
+        .unwrap();
+        assert_eq!(
+            (message.id, message.channel_id, message.revision),
+            (8, 2, 3)
+        );
+        assert_eq!(message.content, "body");
+        assert_eq!(message.author.user_id, 5);
+        assert_eq!(message.forward.unwrap().author.user_id, 7);
+        assert!(message.attachments.is_empty());
+    }
+
     use super::*;
 
     #[test]

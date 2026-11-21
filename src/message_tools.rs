@@ -100,28 +100,20 @@ impl Action {
 }
 
 /// Go `history_actions.go::drawActions`: the thread row only exposes "more".
-pub fn hover_actions(
-    permissions: MessagePermissions,
-    conversation: bool,
-    in_thread: bool,
-) -> Vec<HoverAction> {
+pub fn hover_actions(permissions: MessagePermissions, in_thread: bool) -> Vec<HoverAction> {
     if in_thread {
         return vec![HoverAction::More];
     }
-    let mut buttons: Vec<HoverAction> = HOVER_REACTIONS
-        .into_iter()
-        .map(HoverAction::Quick)
-        .collect();
+    let mut buttons = Vec::new();
     if permissions.react {
+        buttons.extend(HOVER_REACTIONS.into_iter().map(HoverAction::Quick));
         buttons.push(HoverAction::Picker);
     }
-    if !conversation {
-        if permissions.reply {
-            buttons.push(HoverAction::Reply);
-        }
-        if permissions.forward {
-            buttons.push(HoverAction::Forward);
-        }
+    if permissions.reply {
+        buttons.push(HoverAction::Reply);
+    }
+    if permissions.forward {
+        buttons.push(HoverAction::Forward);
     }
     buttons.push(HoverAction::More);
     buttons
@@ -374,7 +366,7 @@ mod tests {
             forward: true,
             ..Default::default()
         };
-        let buttons = hover_actions(permissions, false, false);
+        let buttons = hover_actions(permissions, false);
         assert_eq!(
             buttons,
             [
@@ -386,17 +378,11 @@ mod tests {
                 HoverAction::More,
             ]
         );
+        assert_eq!(hover_actions(permissions, true), [HoverAction::More]);
         assert_eq!(
-            hover_actions(permissions, true, false),
-            [
-                HoverAction::Quick("🤣"),
-                HoverAction::Quick("❤️"),
-                HoverAction::Quick("👍"),
-                HoverAction::Picker,
-                HoverAction::More,
-            ]
+            hover_actions(MessagePermissions::default(), false),
+            [HoverAction::More]
         );
-        assert_eq!(hover_actions(permissions, false, true), [HoverAction::More]);
     }
 
     #[test]

@@ -109,6 +109,17 @@ impl Voxhold {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.open_settings_for_channel(kind, self.channel, entry, window, cx);
+    }
+
+    pub(super) fn open_settings_for_channel(
+        &mut self,
+        kind: SettingsKind,
+        channel_id: i64,
+        entry: FocusHandle,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.active_settings == Some(kind) {
             return;
         }
@@ -156,7 +167,7 @@ impl Voxhold {
                 let Some(channel) = self
                     .channels
                     .iter()
-                    .find(|channel| channel.id == self.channel)
+                    .find(|channel| channel.id == channel_id)
                     .cloned()
                 else {
                     self.active_settings = None;
@@ -188,7 +199,7 @@ impl Voxhold {
                 let Some(channel) = self
                     .channels
                     .iter()
-                    .find(|channel| channel.id == self.channel && channel.has_history())
+                    .find(|channel| channel.id == channel_id && channel.has_history())
                     .cloned()
                 else {
                     self.active_settings = None;

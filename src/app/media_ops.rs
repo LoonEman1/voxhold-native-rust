@@ -13,7 +13,6 @@ use voxhold_api::Attachment;
 /// Go `previewConcurrency`; a message with two links never floods the queue.
 const PREVIEW_CONCURRENCY: usize = 3;
 /// Preview card picture, Go `scaleToFit(img, 98, 76)`.
-const PREVIEW_IMAGE: (u32, u32) = (98, 76);
 
 /// Resize a server thumbnail into the requested 16 px bucket and convert it to
 /// the BGRA surface GPUI uploads.
@@ -111,7 +110,7 @@ impl Voxhold {
     ) {
         let now = Instant::now();
         if self.media.preview_entry(&href).is_some()
-            || self.media.preview_pending.contains(&href)
+            || self.media.preview_pending.contains_key(&href)
             || self.media.preview_pending.len() >= PREVIEW_CONCURRENCY
             || self.media.preview_blocked(&href, now)
             || self.media.preview_permanent_failure(&href)
@@ -124,17 +123,11 @@ impl Voxhold {
         let access = self.access_generation;
         let requested = href.clone();
         let runtime = self.runtime.clone();
-        self.media.preview_pending.insert(href.clone());
+        let request = uuid::Uuid::new_v4();
+        self.media.preview_pending.insert(href.clone(), request);
         let task = cx.background_spawn(async move {
             runtime.block_on(async move {
-                let mut meta = client
-                    .link_preview(&requested)
-                    .await
-                    .map_err(|error| error.status())?;
-                // The server echoes the clicked URL; anything else is stale.
-                if meta.url != requested {
-                    meta = Default::default();
-                }
+                let meta = super::preview_ops::load_preview(&client, &requested).await?;
                 let image = if meta.image_path.is_empty() {
                     None
                 } else {
@@ -142,7 +135,9 @@ impl Voxhold {
                         .link_preview_image(&meta.image_path)
                         .await
                         .ok()
-                        .map(|image| thumbnail_frame(image, PREVIEW_IMAGE.0, PREVIEW_IMAGE.1))
+                        .map(|image| {
+                            thumbnail_frame(image, media::PREVIEW_IMAGE.0, media::PREVIEW_IMAGE.1)
+                        })
                 };
                 Ok::<_, Option<u16>>((meta, image))
             })
@@ -150,6 +145,9 @@ impl Voxhold {
         cx.spawn_in(window, async move |this, window| {
             let result = task.await;
             let _ = this.update_in(window, |s, window, cx| {
+                if s.media.preview_pending.get(&href) != Some(&request) {
+                    return;
+                }
                 s.media.preview_pending.remove(&href);
                 if s.access_generation != access {
                     return;

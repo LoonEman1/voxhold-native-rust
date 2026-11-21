@@ -169,6 +169,7 @@ impl Voxhold {
         self.show_search = false;
         self.message_menu = None;
         self.member_menu = None;
+        self.channel_menu = None;
         self.forward = None;
         self.close_edit();
         self.confirm_delete = None;
@@ -176,7 +177,6 @@ impl Voxhold {
         self.selected_messages.clear();
         self.highlighted_message = None;
         self.hovered_message = 0;
-        self.hovered_action = None;
         self.messages.clear();
         self.history_keys.clear();
         self.history_list = Self::new_history_list(ListAlignment::Bottom, cx);

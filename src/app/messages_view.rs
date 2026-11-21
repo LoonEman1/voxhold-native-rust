@@ -464,7 +464,7 @@ impl Voxhold {
                     .child(icon("icons/hash.svg", 14., ink(p.muted)))
                     .child("Вернуться в сообщество"),
             )
-            .child(self.account_footer(cx))
+            .child(self.account_footer(window, cx))
             .into_any_element()
     }
 

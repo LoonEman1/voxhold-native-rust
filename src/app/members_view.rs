@@ -1,9 +1,10 @@
 use super::*;
 
+use super::context_menus::{context_item, context_menu, context_separator};
 use crate::members::{
     avatar_color, avatar_frame, initials, presence_label, role, Roster, AVATAR_CONCURRENCY,
 };
-use gpui::{AnyElement, Context, Window};
+use gpui::{AnyElement, Context, Pixels, Point, Window};
 
 impl Voxhold {
     pub(super) fn reset_roster(&mut self, window: &mut Window) {
@@ -58,6 +59,28 @@ impl Voxhold {
         })
         .detach();
         cx.notify();
+    }
+
+    pub(super) fn member_avatar(
+        &mut self,
+        user_id: i64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<std::sync::Arc<gpui::RenderImage>> {
+        let version = self
+            .members
+            .iter()
+            .find(|member| member.user_id == user_id)?
+            .avatar_version
+            .clone()
+            .filter(|version| !version.is_empty())?;
+        let key = (user_id, version.clone());
+        if let Some((image, used)) = self.roster.avatars.get_mut(&key) {
+            *used = std::time::Instant::now();
+            return Some(image.clone());
+        }
+        self.request_avatar(user_id, version, window, cx);
+        None
     }
 
     pub(super) fn request_avatar(
@@ -378,6 +401,7 @@ impl Voxhold {
                 rows = rows.child(
                     div()
                         .id(("member", member.user_id as u64))
+                        .debug_selector(move || format!("member-row-{menu_x}").into())
                         .h(px(72.))
                         .px_2()
                         .flex()
@@ -387,25 +411,26 @@ impl Voxhold {
                         .track_focus(&row_focus)
                         .tab_index(0)
                         .on_key_down(cx.listener(move |s, event: &gpui::KeyDownEvent, _, cx| {
-                            if event.keystroke.key == "enter" || event.keystroke.key == "space" {
-                                let x = (s.viewport.0 - 290.).max(12.);
-                                s.open_member_menu(menu_x, x, 180., cx);
+                            let key = &event.keystroke;
+                            let position =
+                                gpui::point(px((s.viewport.0 - 290.).max(12.)), px(180.));
+                            if key.key == "enter" || key.key == "space" {
+                                s.open_member_profile(menu_x, position, cx);
+                            } else if key.key == "context_menu"
+                                || (key.key == "f10" && key.modifiers.shift)
+                            {
+                                s.open_member_menu(menu_x, position, false, cx);
+                                cx.stop_propagation();
                             }
                         }))
                         .on_click(cx.listener(move |s, event: &gpui::ClickEvent, _, cx| {
-                            let position = event.position();
-                            s.open_member_menu(menu_x, position.x.into(), position.y.into(), cx);
+                            s.open_member_profile(menu_x, event.position(), cx);
                         }))
                         .on_mouse_down(
                             MouseButton::Right,
                             cx.listener(move |s, event: &gpui::MouseDownEvent, _, cx| {
-                                let position = event.position;
-                                s.open_member_menu(
-                                    menu_x,
-                                    position.x.into(),
-                                    position.y.into(),
-                                    cx,
-                                );
+                                s.open_member_menu(menu_x, event.position, false, cx);
+                                cx.stop_propagation();
                             }),
                         )
                         .child(
@@ -462,20 +487,94 @@ impl Voxhold {
         panel.child(rows).into_any_element()
     }
 
-    fn open_member_menu(&mut self, user_id: i64, x: f32, y: f32, cx: &mut Context<Self>) {
-        if self.members.iter().all(|member| member.user_id != user_id) {
+    pub(super) fn open_member_menu(
+        &mut self,
+        user_id: i64,
+        position: Point<Pixels>,
+        voice: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let known = self.member_action_allowed(crate::settings::MemberAction::ViewProfile, user_id);
+        if user_id <= 0 || self.access_pending || (!voice && user_id != self.self_user_id && !known)
+        {
             return;
         }
         self.message_menu = None;
-        self.forward = None;
+        self.channel_menu = None;
         self.member_menu = Some(MemberMenu {
             user_id,
-            x,
-            y,
-            profile: false,
+            x: position.x.into(),
+            y: position.y.into(),
+            profile: None,
+            profile_result: None,
+            voice,
             confirm_block: false,
             confirm_ban: false,
         });
+        cx.notify();
+    }
+
+    #[cfg(feature = "voxhold-media")]
+    pub(super) fn open_voice_member_menu(
+        &mut self,
+        user_id: i64,
+        position: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.voice_rooms.iter().any(|(&(server, channel), people)| {
+            self.voice_channel_visible(server, channel)
+                && people.iter().any(|person| person.user_id == user_id)
+        }) {
+            self.open_member_menu(user_id, position, true, cx);
+        }
+    }
+
+    pub(super) fn open_member_profile(
+        &mut self,
+        user_id: i64,
+        position: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_member_menu(user_id, position, false, cx);
+        if self
+            .member_menu
+            .as_ref()
+            .is_some_and(|menu| menu.user_id == user_id)
+        {
+            self.load_member_profile(cx);
+        }
+    }
+
+    fn load_member_profile(&mut self, cx: &mut Context<Self>) {
+        let (Some(menu), Some(client)) = (&mut self.member_menu, self.client.clone()) else {
+            return;
+        };
+        let user_id = menu.user_id;
+        let request = uuid::Uuid::new_v4();
+        menu.profile = Some(request);
+        menu.profile_result = None;
+        let runtime = self.runtime.clone();
+        let session = self.session_generation;
+        let task =
+            cx.background_spawn(async move { runtime.block_on(client.user_profile(user_id)) });
+        cx.spawn(async move |this, cx| {
+            let result = task.await.map_err(|error| error.to_string());
+            if let Some(view) = this.upgrade() {
+                let _ = view.update(cx, |s, cx| {
+                    if s.session_generation == session {
+                        if let Some(menu) = s
+                            .member_menu
+                            .as_mut()
+                            .filter(|menu| menu.profile == Some(request))
+                        {
+                            menu.profile_result = Some(result);
+                            cx.notify();
+                        }
+                    }
+                });
+            }
+        })
+        .detach();
         cx.notify();
     }
 
@@ -658,76 +757,82 @@ impl Voxhold {
         cx.notify();
     }
 
-    pub(super) fn member_menu_overlay(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+    pub(super) fn member_menu_overlay(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
         let menu = self.member_menu.clone()?;
-        let member = self.member_snapshot(menu.user_id)?;
-        let target = crate::settings::Role::parse(&member.role);
+        let member = self.member_snapshot(menu.user_id);
+        let name = member
+            .as_ref()
+            .map(|member| member.username.clone())
+            .unwrap_or_else(|| {
+                if menu.user_id == self.self_user_id {
+                    self.auth.username.clone()
+                } else {
+                    format!("Участник {}", menu.user_id)
+                }
+            });
+        let target = crate::settings::Role::parse(
+            member
+                .as_ref()
+                .map_or("member", |member| member.role.as_str()),
+        );
         let p = self.palette;
-        let x = menu.x.clamp(12., (self.viewport.0 - 280.).max(12.));
-        let y = menu.y.clamp(12., (self.viewport.1 - 300.).max(12.));
-        let mut panel = div()
-            .id("member-menu")
-            .absolute()
-            .left(px(x))
-            .top(px(y))
-            .w(px(268.))
-            .occlude()
-            .rounded(px(10.))
-            .shadow_lg()
-            .border_1()
-            .border_color(ink(p.line))
-            .bg(ink(p.surface))
-            .text_color(ink(p.fg))
-            .p_2()
-            .flex()
-            .flex_col()
-            .gap_1()
-            .text_size(px(12.))
-            .child(
+        let position = gpui::point(px(menu.x), px(menu.y));
+        let mut panel = context_menu("member-menu", &name, position, self.viewport, 245., p);
+        if menu.profile.is_some() {
+            let image = self.member_avatar(menu.user_id, window, cx);
+            let name = match &menu.profile_result {
+                Some(Ok(profile)) => &profile.username,
+                _ => &name,
+            };
+            panel = panel.child(
                 div()
-                    .font_weight(gpui::FontWeight::BOLD)
-                    .truncate()
-                    .child(member.username.clone()),
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .p_2()
+                    .child(super::ui::avatar(image, name, 40.))
+                    .child(
+                        div()
+                            .min_w(px(0.))
+                            .flex()
+                            .flex_col()
+                            .child(div().truncate().child(name.clone()))
+                            .child(div().text_color(ink(p.muted)).child(target.label())),
+                    ),
             );
-        if menu.profile {
-            panel = panel
-                .child(div().text_color(ink(p.muted)).child(target.label()))
-                .child(
-                    div()
-                        .id("member-menu-back")
-                        .cursor_pointer()
-                        .text_color(ink(p.muted))
-                        .on_click(cx.listener(|s, _, _, cx| {
-                            if let Some(menu) = s.member_menu.as_mut() {
-                                menu.profile = false;
-                            }
-                            cx.notify();
-                        }))
-                        .child("Назад"),
-                );
+            panel = match menu.profile_result {
+                Some(Ok(profile)) => panel
+                    .when(!profile.about.is_empty(), |panel| {
+                        panel.child(div().p_2().child(profile.about))
+                    })
+                    .when_some(profile.country_code, |panel, country| {
+                        panel.child(div().p_2().text_color(ink(p.muted)).child(country))
+                    }),
+                Some(Err(error)) => panel.child(div().p_2().text_color(ink(p.danger)).child(error)),
+                None => panel.child(div().p_2().text_color(ink(p.muted)).child("Загрузка…")),
+            };
             return Some(panel.into_any_element());
         }
-        debug_assert!(
-            self.member_action_allowed(crate::settings::MemberAction::ViewProfile, menu.user_id)
-        );
         panel = panel.child(
-            div()
-                .id("member-profile")
-                .cursor_pointer()
-                .on_click(cx.listener(|s, _, _, cx| {
-                    if let Some(menu) = s.member_menu.as_mut() {
-                        menu.profile = true;
-                    }
-                    cx.notify();
-                }))
-                .child("Просмотреть профиль"),
+            context_item(
+                "member-profile",
+                "Просмотреть профиль",
+                "icons/people.svg",
+                false,
+                p,
+            )
+            .on_click(cx.listener(|s, _, _, cx| s.load_member_profile(cx))),
         );
         let other =
             self.member_action_allowed(crate::settings::MemberAction::BlockMessages, menu.user_id);
         if other {
             if menu.confirm_block {
                 panel = panel
-                    .child(format!("Заблокировать {}?", member.username))
+                    .child(format!("Заблокировать {name}?"))
                     .child(
                         div()
                             .id("member-block-confirm")
@@ -753,21 +858,30 @@ impl Voxhold {
                     );
             } else {
                 panel = panel.child(
-                    div()
-                        .id("member-block")
-                        .cursor_pointer()
-                        .on_click(cx.listener(|s, _, _, cx| {
-                            if let Some(menu) = s.member_menu.as_mut() {
-                                menu.confirm_block = true;
-                            }
-                            cx.notify();
-                        }))
-                        .child("Заблокировать личные сообщения"),
+                    context_item(
+                        "member-block",
+                        "Заблокировать личные сообщения",
+                        "icons/lock.svg",
+                        false,
+                        p,
+                    )
+                    .on_click(cx.listener(|s, _, _, cx| {
+                        if let Some(menu) = s.member_menu.as_mut() {
+                            menu.confirm_block = true;
+                        }
+                        cx.notify();
+                    })),
                 );
             }
         }
         if self.member_action_allowed(crate::settings::MemberAction::SetRole, menu.user_id) {
-            panel = panel.child(div().text_color(ink(p.muted)).child("Роль"));
+            let mut roles = div()
+                .h(px(36.))
+                .flex()
+                .items_center()
+                .gap_1()
+                .px(px(9.))
+                .child(div().flex_1().text_color(ink(p.muted)).child("Роль"));
             for (role, selected) in crate::settings::role_choices(target) {
                 let label = if role == crate::settings::Role::Admin {
                     "Админ"
@@ -776,16 +890,17 @@ impl Voxhold {
                 };
                 let button = div()
                     .id(("member-role", role as u64))
-                    .px_1()
+                    .px(px(6.))
                     .py(px(3.))
                     .rounded(px(5.))
-                    .when(selected, |row| row.bg(ink(p.selection)))
+                    .bg(ink(if selected { p.lime } else { p.selection }))
+                    .text_color(ink(if selected { 0x17170f } else { p.fg }))
                     .child(if selected {
                         format!("✓ {label}")
                     } else {
                         label.to_owned()
                     });
-                panel = panel.child(if selected {
+                roles = roles.child(if selected {
                     button
                 } else {
                     let value = role.as_str();
@@ -796,11 +911,12 @@ impl Voxhold {
                     )
                 });
             }
+            panel = panel.child(roles);
         }
         if self.member_action_allowed(crate::settings::MemberAction::Ban, menu.user_id) {
             if menu.confirm_ban {
                 panel = panel
-                    .child(format!("Забанить {}?", member.username))
+                    .child(format!("Забанить {name}?"))
                     .child(
                         div()
                             .id("member-ban-confirm")
@@ -826,19 +942,46 @@ impl Voxhold {
                     );
             } else {
                 panel = panel.child(
-                    div()
-                        .id("member-ban")
-                        .cursor_pointer()
-                        .text_color(ink(p.danger))
-                        .on_click(cx.listener(|s, _, _, cx| {
-                            if let Some(menu) = s.member_menu.as_mut() {
-                                menu.confirm_ban = true;
-                            }
-                            cx.notify();
-                        }))
-                        .child("Забанить на инстансе"),
+                    context_item(
+                        "member-ban",
+                        "Забанить на инстансе",
+                        "icons/warning.svg",
+                        true,
+                        p,
+                    )
+                    .on_click(cx.listener(|s, _, _, cx| {
+                        if let Some(menu) = s.member_menu.as_mut() {
+                            menu.confirm_ban = true;
+                        }
+                        cx.notify();
+                    })),
                 );
             }
+        }
+        if menu.voice && menu.user_id != self.self_user_id {
+            let volume = self
+                .voice_settings
+                .prefs
+                .user_volumes
+                .get(&menu.user_id)
+                .copied()
+                .unwrap_or(100);
+            panel = panel
+                .child(context_separator(p))
+                .child(self.settings_slider(
+                    "member-volume",
+                    "Громкость",
+                    volume,
+                    200,
+                    move |value| {
+                        SettingsAct::Personal(personal_settings::Action::SetVoiceUserVolume(
+                            menu.user_id,
+                            value,
+                        ))
+                    },
+                    window,
+                    cx,
+                ));
         }
         Some(panel.into_any_element())
     }

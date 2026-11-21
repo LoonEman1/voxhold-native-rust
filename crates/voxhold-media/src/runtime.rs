@@ -403,7 +403,7 @@ struct Live {
     screen_preview: Arc<crate::screen_capture::PreviewStore>,
     render: VideoFrame,
     viewport: (u32, u32),
-    local_level: Option<f64>,
+    local_level: Option<(f64, bool)>,
     frame: Arc<Mutex<Option<StreamFrame>>>,
     updates: Arc<Updates>,
 }
@@ -484,14 +484,17 @@ impl Live {
                 self.updates
                     .push(VoiceUpdate::Tracks(controller.connections_with_audio()));
             }
-            if let Some(last) = self.local_level {
-                if (last - controller.local_level).abs() > 0.005 {
-                    self.local_level = Some(controller.local_level);
-                    self.updates
-                        .push(VoiceUpdate::LocalLevel(controller.local_level));
-                }
-            } else {
-                self.local_level = Some(controller.local_level);
+            let level = controller.local_level;
+            let speaking = controller.local_speaking();
+            if self
+                .local_level
+                .is_none_or(|(previous_level, previous_speaking)| {
+                    previous_speaking != speaking || (previous_level - level).abs() > 0.005
+                })
+            {
+                self.local_level = Some((level, speaking));
+                self.updates
+                    .push(VoiceUpdate::LocalLevel { level, speaking });
             }
         }
         Ok(true)

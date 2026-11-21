@@ -96,7 +96,7 @@ impl Voxhold {
                 div().w_full().px(px(14.)).child(
                     TextInput::new(entity)
                         .text_size(px(if compact { 17. } else { 16. }))
-                        .font_family("Inter")
+                        .font_family(theme::UI_FONT)
                         .text_color(ink(p.fg))
                         .bg(gpui::transparent_black())
                         .bordered(false)
@@ -486,7 +486,7 @@ impl Voxhold {
         let mut root = div()
             .relative()
             .size_full()
-            .font_family("Inter")
+            .font_family(theme::UI_FONT)
             .text_color(ink(p.fg))
             .bg(ink(p.page_base))
             .child(

@@ -284,6 +284,14 @@ impl Client {
     pub async fn profile(&self) -> Result<Profile> {
         self.request(Method::GET, "/api/v1/me/profile", None).await
     }
+    pub async fn user_profile(&self, user_id: i64) -> Result<Profile> {
+        self.request(
+            Method::GET,
+            &format!("/api/v1/users/{user_id}/profile"),
+            None,
+        )
+        .await
+    }
     pub async fn update_profile(&self, about: &str, country: &str) -> Result<Profile> {
         self.request(
             Method::PATCH,

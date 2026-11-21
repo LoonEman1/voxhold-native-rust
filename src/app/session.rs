@@ -395,8 +395,9 @@ impl Voxhold {
         self.pending_jump = None;
         self.history_reset_pending = false;
         self.hovered_message = 0;
-        self.hovered_action = None;
         self.message_menu = None;
+        self.member_menu = None;
+        self.channel_menu = None;
         self.forward = None;
         self.close_edit();
         self.confirm_delete = None;

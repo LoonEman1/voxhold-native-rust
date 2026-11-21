@@ -317,10 +317,11 @@ pub(crate) struct Voxhold {
     /// The generation captured by the in-flight cleanup. A new login means the
     /// close-time retry is stale and must not erase that login.
     cleanup_epoch: u64,
+    /// The generation the in-flight cleanup claimed on disk, shared with the
+    /// close-time fallback. Zero until that claim lands.
+    cleanup_claim: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// The cleanup failed and «Повторить очистку» is offered.
     cleanup_retry: bool,
-    /// Even the suppression marker could not be written.
-    cleanup_unconfirmed: bool,
     /// First Tab stop of the neutral start surface.
     restore_cancel_focus: FocusHandle,
     /// The cancel action received the initial focus once.
@@ -781,8 +782,8 @@ impl Voxhold {
             migration_pending: false,
             cleanup_pending: false,
             cleanup_epoch: 0,
+            cleanup_claim: Default::default(),
             cleanup_retry: false,
-            cleanup_unconfirmed: false,
             restore_cancel_focus: cx.focus_handle(),
             restore_focus_done: false,
             self_user_id: 0,

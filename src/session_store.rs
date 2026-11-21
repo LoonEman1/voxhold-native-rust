@@ -19,9 +19,11 @@
 //! it, so two windows or two processes cannot drop each other's records. The
 //! generation is stored on disk and checked under the lock: a write that
 //! captures an older generation is refused with [`StoreError::Stale`] instead of
-//! reviving or deleting the session that replaced it. Loading is bounded
-//! (256 KiB, 16 records) and every record and target is validated before it is
-//! returned.
+//! reviving or deleting the session that replaced it. A new login also claims
+//! its generation on disk under the same locks, so two processes starting from
+//! one file never share a number. An automatic delete is scoped to the token of
+//! the session that ended. Loading is bounded (256 KiB, 16 records) and every
+//! record and target is validated before it is returned.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -232,17 +234,52 @@ impl SessionStore {
         self.epoch.fetch_add(1, Ordering::SeqCst) + 1
     }
 
-    /// Start a new login. The next generation is above both the in-process one
-    /// and the one on disk, so a save queued before another process logged out
-    /// can never be mistaken for this login.
+    /// Start a new login: claim the next generation above every one this
+    /// process or the file has seen, under both locks, and write the claim to
+    /// disk. Two processes that open the same file therefore never receive the
+    /// same number, so a delete or a cleanup from one of them cannot pass the
+    /// generation check of a record the other one saved afterwards.
+    ///
+    /// A value this process already raised in memory (the login barrier of
+    /// [`bump_epoch`](Self::bump_epoch)) is kept, so the save that follows the
+    /// claim with the returned value is accepted. The claim reads, decrypts and
+    /// rewrites the file; it must run on a background executor, never on the
+    /// UI thread.
     pub fn begin_login(&self) -> u64 {
-        let disk = self
-            .read_state_synced()
-            .map(|state| state.generation)
-            .unwrap_or(0);
-        let next = self.epoch().max(disk).saturating_add(1).max(1);
-        self.epoch.store(next, Ordering::SeqCst);
-        next
+        let Some(path) = &self.path else {
+            return self.bump_epoch();
+        };
+        let _local = self
+            .lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Ok(_named) = NamedLock::acquire() else {
+            // The file is held by another process: a strictly newer in-process
+            // generation still invalidates every queued write.
+            return self.bump_epoch();
+        };
+        let mut state = match read_state(path) {
+            Ok(state) => state,
+            // A claim may replace a damaged file, exactly like a manual save.
+            Err(StoreError::Corrupt) => StoreState::default(),
+            Err(_) => return self.bump_epoch(),
+        };
+        let disk = state.generation;
+        let claim = self.epoch().max(disk);
+        // Strictly above the file, and never below the in-process barrier.
+        let claim = if claim <= disk {
+            disk.saturating_add(1)
+        } else {
+            claim
+        };
+        state.generation = claim;
+        if write_state_file(path, &state).is_err() {
+            return self.bump_epoch();
+        }
+        self.sync_epoch(claim);
+        // A concurrent barrier of this process may already be above the claim;
+        // the caller must use that newer value for its own write.
+        self.epoch()
     }
 
     /// `%APPDATA%\Voxhold\sessions.bin`, with the same fallbacks as the other
@@ -258,7 +295,6 @@ impl SessionStore {
     /// One snapshot: records, the pointer, the disk generation and the format.
     /// The in-process generation is raised to the disk one, so the caller can
     /// use [`epoch`](Self::epoch) for the next write.
-    #[allow(dead_code)]
     pub fn state(&self) -> Result<StoreState, StoreError> {
         self.read_state_synced()
     }
@@ -270,8 +306,11 @@ impl SessionStore {
     /// the origin is expired: the newest stale one is then handed back so the
     /// caller can delete it. This keeps a dead newer record from hiding an
     /// older token that still works.
-    #[allow(dead_code)]
-    pub fn load_for_origin(
+    ///
+    /// Only the tests read a record directly; the application goes through
+    /// [`plan_auto_login`](Self::plan_auto_login).
+    #[cfg(test)]
+    pub(crate) fn load_for_origin(
         &self,
         origin: &str,
         now: i64,
@@ -292,8 +331,11 @@ impl SessionStore {
         Ok(matching.into_iter().max_by_key(|record| record.saved_at))
     }
 
-    #[allow(dead_code)]
-    pub fn load_all(&self) -> Result<Vec<RememberedSession>, StoreError> {
+    /// Every stored record. It exists for the tests: the application reads the
+    /// store only through [`plan_auto_login`](Self::plan_auto_login) and the
+    /// single-target snapshot from [`state`](Self::state).
+    #[cfg(test)]
+    pub(crate) fn load_all(&self) -> Result<Vec<RememberedSession>, StoreError> {
         Ok(self.read_state_synced()?.records)
     }
 
@@ -417,27 +459,44 @@ impl SessionStore {
         .map(|_| ())
     }
 
-    /// Drop the record for `(origin, account)` and the target when it names the
-    /// same identity. Account comparison ignores case; the origin is exact.
+    /// Drop the record for `(origin, account)` only when it still carries
+    /// `token`, and the target when it names the same identity. Account
+    /// comparison ignores case; the origin is exact.
+    ///
+    /// The token check keeps a session that just ended from deleting a newer
+    /// login of the same account: another window or process that saved after
+    /// this session started stored a different token, so the record and its
+    /// target stay. A record that is already gone is not touched either.
     pub fn delete(
         &self,
         origin: &str,
         account: &str,
+        token: &str,
         expected_epoch: u64,
     ) -> Result<(), StoreError> {
         self.mutate(expected_epoch, false, |state| {
-            let before = state.records.len();
-            state
-                .records
-                .retain(|current| !same_key(current, origin, account));
-            let removed = state.records.len() != before;
-            let target_matches = state.target.as_ref().is_some_and(|target| {
-                target.origin == origin && accounts_match(&target.account, account)
+            let mut removed_user = None;
+            state.records.retain(|current| {
+                if same_key(current, origin, account) && current.token == token {
+                    removed_user = Some(current.user_id);
+                    false
+                } else {
+                    true
+                }
+            });
+            // Only the target that names the removed record goes away; a newer
+            // login of the same account may own the pointer now.
+            let target_matches = removed_user.is_some_and(|user_id| {
+                state.target.as_ref().is_some_and(|target| {
+                    target.origin == origin
+                        && target.user_id == user_id
+                        && accounts_match(&target.account, account)
+                })
             });
             if target_matches {
                 state.target = None;
             }
-            removed || target_matches
+            removed_user.is_some()
         })
         .map(|_| ())
     }
@@ -599,6 +658,14 @@ impl SessionStore {
     fn sync_epoch(&self, generation: u64) {
         self.epoch.fetch_max(generation, Ordering::SeqCst);
     }
+
+    /// Test helper: whether another thread currently holds this store's
+    /// in-process mutex, i.e. an operation of this store is waiting for the
+    /// file and a second one would wait behind it.
+    #[cfg(test)]
+    pub(crate) fn local_lock_is_held(&self) -> bool {
+        self.lock.try_lock().is_err()
+    }
 }
 
 fn same_key(record: &RememberedSession, origin: &str, account: &str) -> bool {
@@ -742,6 +809,22 @@ pub(crate) fn write_legacy_file(path: &Path, records: &[RememberedSession]) {
 pub(crate) fn write_state_file_for_test(path: &Path, state: &StoreState) {
     std::fs::create_dir_all(path.parent().unwrap()).expect("dir");
     write_state_file(path, state).expect("write state");
+}
+
+/// Test helper: hold the cross-process mutex on another thread for `duration`
+/// and signal when it is held. A store operation of this process then waits on
+/// it exactly like behind a second process.
+#[cfg(all(test, windows))]
+pub(crate) fn hold_named_lock_for(
+    duration: std::time::Duration,
+) -> (std::sync::mpsc::Receiver<()>, std::thread::JoinHandle<()>) {
+    let (ready, acquired) = std::sync::mpsc::channel();
+    let handle = std::thread::spawn(move || {
+        let _lock = NamedLock::acquire().expect("named session lock");
+        let _ = ready.send(());
+        std::thread::sleep(duration);
+    });
+    (acquired, handle)
 }
 
 /// `CryptProtectData` for the current user, with fixed entropy and no UI.

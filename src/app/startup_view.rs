@@ -172,12 +172,17 @@ impl Voxhold {
             let weak = cx.entity().downgrade();
             window.on_next_frame(move |window, cx| {
                 if let Some(view) = weak.upgrade() {
-                    view.update(cx, |s, _cx| {
-                        s.restore_cancel_focus.focus(window);
-                    });
+                    view.update(cx, |s, _cx| s.focus_start_action(window));
                 }
             });
         }
         root.into_any_element()
+    }
+
+    /// The first focus of the neutral surface. It runs on the frame after the
+    /// action is mounted, so the handle already has a painted node. The test
+    /// platform never runs frame callbacks, so its test calls this directly.
+    pub(super) fn focus_start_action(&mut self, window: &mut Window) {
+        self.restore_cancel_focus.focus(window);
     }
 }

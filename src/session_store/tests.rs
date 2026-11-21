@@ -29,8 +29,13 @@ fn save_now(store: &SessionStore, record: &RememberedSession) -> Result<(), Stor
     store.save(record, store.epoch())
 }
 
-fn delete_now(store: &SessionStore, origin: &str, account: &str) -> Result<(), StoreError> {
-    store.delete(origin, account, store.epoch())
+fn delete_now(
+    store: &SessionStore,
+    origin: &str,
+    account: &str,
+    token: &str,
+) -> Result<(), StoreError> {
+    store.delete(origin, account, token, store.epoch())
 }
 
 fn load(store: &SessionStore, origin: &str) -> Result<Option<RememberedSession>, StoreError> {
@@ -265,7 +270,7 @@ fn the_account_ignores_case_and_save_replaces_the_same_key() {
     assert_eq!(all.len(), 1, "one record per origin and account");
     assert_eq!(all[0].token, "token-2");
 
-    delete_now(&store, "https://chat.example.org", "NEVA").unwrap();
+    delete_now(&store, "https://chat.example.org", "NEVA", "token-2").unwrap();
     assert!(store.load_all().unwrap().is_empty());
     std::fs::remove_dir_all(dir).unwrap();
 }
@@ -304,7 +309,7 @@ fn expiry_is_visible_so_the_caller_can_delete_the_record() {
     let loaded = store.load_all().unwrap();
     assert!(loaded[0].is_expired(101));
     assert!(!loaded[0].is_expired(99));
-    delete_now(&store, &saved.origin, &saved.account).unwrap();
+    delete_now(&store, &saved.origin, &saved.account, &saved.token).unwrap();
     assert!(store.load_all().unwrap().is_empty());
     std::fs::remove_dir_all(dir).unwrap();
 }
@@ -415,7 +420,8 @@ fn a_late_save_after_a_logout_does_not_resurrect_the_record() {
         scope.spawn(move || {
             start.wait();
             let epoch = out.bump_epoch();
-            out.delete(&saved.origin, &saved.account, epoch).unwrap();
+            out.delete(&saved.origin, &saved.account, &saved.token, epoch)
+                .unwrap();
         });
     });
     assert!(
@@ -441,7 +447,7 @@ fn a_late_delete_does_not_remove_a_new_record() {
         let start = &barrier;
         scope.spawn(move || {
             start.wait();
-            let _ = late.delete("https://chat.example.org", "neva", old_epoch);
+            let _ = late.delete("https://chat.example.org", "neva", "token-1", old_epoch);
         });
         let fresh = store.clone();
         scope.spawn(move || {
@@ -518,7 +524,7 @@ fn a_stale_generation_is_an_explicit_error() {
         Err(StoreError::Stale)
     );
     assert_eq!(
-        store.delete("https://chat.example.org", "neva", old_epoch),
+        store.delete("https://chat.example.org", "neva", "token-1", old_epoch),
         Err(StoreError::Stale)
     );
     assert_eq!(
@@ -551,19 +557,16 @@ fn two_threads_saving_and_deleting_keep_every_other_record() {
                 // file cap, so a lost cross-thread record would show as eight.
                 for index in 0..16 {
                     let account = format!("user-{worker}-{index}");
+                    let token = format!("token-{worker}-{index}");
                     store
                         .save(
-                            &record(
-                                "https://chat.example.org",
-                                &account,
-                                &format!("token-{worker}-{index}"),
-                            ),
+                            &record("https://chat.example.org", &account, &token),
                             store.epoch(),
                         )
                         .unwrap();
                     if index % 2 == 0 {
                         store
-                            .delete("https://chat.example.org", &account, store.epoch())
+                            .delete("https://chat.example.org", &account, &token, store.epoch())
                             .unwrap();
                     }
                 }

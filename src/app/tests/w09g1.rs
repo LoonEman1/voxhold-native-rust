@@ -172,8 +172,9 @@ fn settled_startup(visual: &mut VisualTestContext, view: &Entity<Voxhold>) {
     wait_for(visual, view, |v| !v.startup_restoring);
 }
 
-/// No address, login or password surface may have been painted at any point
-/// observed by `debug_bounds` (it accumulates across draws).
+/// A surface may not be painted *in the frame that `debug_bounds` observed*:
+/// in gpui 0.2.2 it only reports the last rendered frame, so every stage draws
+/// first and then checks.
 fn assert_no_form_painted(visual: &mut VisualTestContext) {
     for selector in [
         "auth-instance-field",
@@ -268,7 +269,17 @@ async fn a01_cold_start_restores_without_any_form_frame(cx: &mut TestAppContext)
         profiles[0].header("authorization"),
         Some("Bearer token-stored")
     );
-    assert!(ws_requests(&server) >= 1, "the account socket is started");
+    // One account socket, opened by the only accepted startup intent.
+    let mut sockets = ws_requests(&server);
+    for _ in 0..200 {
+        if sockets > 0 {
+            break;
+        }
+        visual.run_until_parked();
+        std::thread::sleep(Duration::from_millis(5));
+        sockets = ws_requests(&server);
+    }
+    assert_eq!(sockets, 1, "exactly one account socket is opened");
     std::fs::remove_dir_all(dir).unwrap();
 }
 
@@ -299,6 +310,65 @@ async fn a01_the_start_action_is_keyboard_accessible(cx: &mut TestAppContext) {
             && v.auth.screen == auth::AuthScreen::Instance),
         "Enter on the focused start action selects the instance"
     );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// A01: the start action is the first focus target of the neutral surface and
+/// answers Space without a manual focus call. The test platform never runs
+/// `on_next_frame` callbacks, so the state marker that arms the first focus is
+/// checked directly and the same method the callback calls applies it.
+#[gpui::test]
+async fn a01_the_start_action_holds_the_first_focus_and_answers_space(cx: &mut TestAppContext) {
+    cx.update(|cx| gpui_component::init(cx));
+    let dir = scratch("a01-first-focus");
+    let (window, view) = open(cx, "", &dir);
+    let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
+    visual.run_until_parked();
+    // The empty store settled on the manual form. Show the neutral surface for
+    // the one keyboard check; no request is left pending.
+    visual.update(|window, app| {
+        view.update(app, |v, _| {
+            v.startup_restoring = true;
+            v.restore_focus_done = false;
+            v.auth.screen = auth::AuthScreen::Login;
+            v.auth.auto_login = true;
+        });
+    });
+    draw(&mut visual);
+    view.read_with(&*visual, |v, _| {
+        assert!(v.startup_restoring);
+        assert!(v.restore_focus_done, "the first focus was armed once");
+    });
+    let cancel = view.read_with(&*visual, |v, _| v.restore_cancel_focus.clone());
+    // The frame callback of the shipped window does exactly this.
+    visual.update(|window, app| {
+        view.update(app, |v, _| v.focus_start_action(window));
+    });
+    visual.update(|window, app| {
+        assert_eq!(
+            window.focused(app),
+            Some(cancel.clone()),
+            "the start action owns the first focus"
+        );
+    });
+    // It is the only action of the surface, so Tab cannot move focus away.
+    visual.simulate_keystrokes("tab");
+    visual.update(|window, app| {
+        assert_eq!(
+            window.focused(app),
+            Some(cancel),
+            "Tab keeps the only action of the surface"
+        );
+    });
+    visual.simulate_keystrokes("space");
+    assert!(
+        view.read_with(&*visual, |v, _| !v.startup_restoring
+            && v.auth.screen == auth::AuthScreen::Instance),
+        "Space on the focused start action selects the instance"
+    );
+    visual.update(|window, _app| window.remove_window());
+    visual.run_until_parked();
+    drop(view);
     std::fs::remove_dir_all(dir).unwrap();
 }
 
@@ -561,7 +631,7 @@ async fn a09_a_second_process_wins_the_generation_race(cx: &mut TestAppContext) 
         Err(crate::session_store::StoreError::Stale)
     );
     assert_eq!(
-        writer.delete(&old.origin, &old.account, old_epoch),
+        writer.delete(&old.origin, &old.account, &old.token, old_epoch),
         Err(crate::session_store::StoreError::Stale)
     );
     // A new login in the second instance is the only record the next start
@@ -602,39 +672,79 @@ async fn a10_a_damaged_blob_stays_manual_and_a_refused_cleanup_recovers(cx: &mut
     std::fs::remove_dir_all(dir).unwrap();
 }
 
-/// A09: a logout in another process between the request and its answer makes
-/// the answer stale; the message form opens and the newer generation stays.
+/// P3: installing a session performs no file or DPAPI work on the UI thread.
+/// Another store waits for the cross-process mutex while holding the in-process
+/// one; the sign-in still returns at once.
+#[cfg(windows)]
 #[gpui::test]
-async fn a09_a_logout_in_another_process_skips_the_late_answer(cx: &mut TestAppContext) {
+async fn a_sign_in_never_waits_for_the_protected_store(cx: &mut TestAppContext) {
+    use std::time::Instant;
+
     cx.update(|cx| gpui_component::init(cx));
-    let server = TestServer::spawn_routed(vec![
-        Reply::new(200, &profile_body(7, "neva")).with_delay(Duration::from_millis(500)),
-        Reply::new(200, servers_body()),
-    ]);
-    let dir = scratch("a09-race");
+    let server = TestServer::spawn(Vec::new());
+    let dir = scratch("p3-ui-lock");
     let session_store = store(&dir);
     save(
         &session_store,
-        &record(&server.base, "neva", 7, "token-old", 3_600),
+        &record(&server.base, "neva", 7, "token-1", 3_600),
     );
-    let path = dir.join("sessions.bin");
-    let other = std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(100));
-        let second = SessionStore::new(Some(path));
-        second.clear_all(second.epoch()).unwrap()
-    });
-    let (window, view) = open(cx, "", &dir);
+    let (window, view) = open(cx, &server.base, &dir);
     let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
-    wait_for(&mut visual, &view, |v| {
-        !v.auth.auto_login && !v.startup_restoring
+    visual.run_until_parked();
+    settled_startup(&mut visual, &view);
+
+    // A second process holds the named mutex; a background write of this store
+    // then waits for it while holding the in-process mutex.
+    let (ready, holder) = crate::session_store::hold_named_lock_for(Duration::from_millis(3_000));
+    ready
+        .recv_timeout(Duration::from_secs(2))
+        .expect("the second process holds the lock");
+    let writer = session_store.clone();
+    let blocked = std::thread::spawn(move || {
+        let late = record("https://chat.example.org", "probe", 9, "token-probe", 3_600);
+        let _ = writer.save(&late, writer.epoch());
     });
-    let generation = other.join().unwrap();
-    assert!(generation > 0);
-    view.read_with(&*visual, |v, _| {
-        assert!(v.session.is_none(), "the late answer is not applied");
-        assert_eq!(v.auth.screen, auth::AuthScreen::Instance);
+    let mut owned = false;
+    for _ in 0..400 {
+        if session_store.local_lock_is_held() {
+            owned = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        owned,
+        "the background write owns the in-process lock and waits for the file"
+    );
+
+    let client = Client::new(&server.base).expect("origin");
+    let session = Session::new(
+        server.base.clone(),
+        7,
+        "neva".into(),
+        "token-1".into(),
+        now_unix() + 3_600,
+    )
+    .expect("session");
+    let started = Instant::now();
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            v.enter_workspace(client, Vec::new(), session, window, cx)
+        });
     });
-    assert!(session_store.state().unwrap().records.is_empty());
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_millis(1_000),
+        "the UI thread waited {elapsed:?} for the protected store"
+    );
+    assert!(view.read_with(&*visual, |v, _| v.session.is_some()));
+
+    // The queued write finishes once the other process releases the file.
+    blocked.join().expect("the background write finishes");
+    holder.join().expect("the lock holder finishes");
+    visual.update(|window, _app| window.remove_window());
+    visual.run_until_parked();
+    drop(view);
     std::fs::remove_dir_all(dir).unwrap();
 }
 
@@ -736,3 +846,4 @@ async fn a11_close_completes_a_pending_logout_cleanup(cx: &mut TestAppContext) {
 }
 
 mod login_flow_tests;
+mod race_tests;

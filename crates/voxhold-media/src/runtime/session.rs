@@ -92,6 +92,7 @@ async fn run_session(
         screen_demand,
         render: VideoFrame::default(),
         viewport: requests.viewport(),
+        frame_request: requests.frame_request.clone(),
         local_level: None,
         frame,
         updates,

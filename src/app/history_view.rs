@@ -31,28 +31,53 @@ impl Voxhold {
                 .map(|channel| channel.kind.as_str())
                 .unwrap_or("")
         };
-        let meta = history::row_meta(&self.messages, channel_kind, self.unread_after);
-        let keys: Vec<HistoryKey> = self
-            .messages
+        let selected = self.channels.iter().find(|c| c.id == self.channel);
+        let conversation = self.conversation.is_some();
+        let readable = conversation || self.channel_chat_readable(self.channel);
+        let role = self
+            .servers
             .iter()
-            .zip(&meta)
-            .map(|(message, meta)| {
-                (
-                    message.id,
-                    message.revision,
-                    message.reactions_revision,
-                    meta.date.clone().unwrap_or_default(),
-                    meta.grouped,
-                    meta.unread,
-                    self.attachment_epoch,
-                )
-            })
-            .collect();
-        if keys != self.history_keys {
+            .find(|s| s.id == self.server)
+            .map(|s| s.role.as_str())
+            .unwrap_or_default();
+        // Only a changed input rebuilds the prepared rows. A plain repaint
+        // reuses them, and the list closure clones one row `Arc` instead of
+        // the whole window. A path that cleared the key mirror (context
+        // replacement, chat switch) forces a rebuild: its rows may keep the
+        // same identity stamps while their attachments changed.
+        if self.history_keys.len() != self.history_rows.len() {
+            self.history_rows.invalidate();
+        }
+        let rebuilt = self.history_rows.prepare(history_rows::HistoryInput {
+            messages: &self.messages,
+            channel_kind,
+            unread_after: self.unread_after,
+            conversation,
+            channel: selected,
+            self_user_id: self.self_user_id,
+            role,
+            reads: &self.reads,
+            members: &self.members,
+            selected: &self.selected_messages,
+            pinned: &self.pinned_ids,
+            highlighted: self.highlighted_message.map(|(id, _)| id),
+            editing: self.editing,
+            edit_open_seq: self.edit_open_seq,
+            edit_error: self.edit_error.as_ref(),
+            action_error: self.action_error.as_ref(),
+            confirm_delete: self.confirm_delete,
+            menu: self
+                .message_menu
+                .as_ref()
+                .map(|menu| (menu.message_id, menu.confirm_delete)),
+            attachment_epoch: self.attachment_epoch,
+        });
+        if rebuilt || self.history_keys.len() != self.history_rows.len() {
+            let keys = self.history_rows.keys();
             let prefix = self
                 .history_keys
                 .iter()
-                .zip(&keys)
+                .zip(keys)
                 .take_while(|(a, b)| a == b)
                 .count();
             let suffix = self.history_keys[prefix..]
@@ -65,7 +90,8 @@ impl Voxhold {
                 prefix..self.history_keys.len() - suffix,
                 keys.len() - prefix - suffix,
             );
-            self.history_keys = keys;
+            self.history_keys.clear();
+            self.history_keys.extend_from_slice(keys);
         }
         // A prepend keeps `(message_id, offset_in_row)` under the pointer. The
         // list count was just spliced, so the target index is in range.
@@ -77,15 +103,6 @@ impl Voxhold {
                 });
             }
         }
-        let selected = self.channels.iter().find(|c| c.id == self.channel).cloned();
-        let conversation = self.conversation.is_some();
-        let readable = conversation || self.channel_chat_readable(self.channel);
-        let role = self
-            .servers
-            .iter()
-            .find(|s| s.id == self.server)
-            .map(|s| s.role.clone())
-            .unwrap_or_default();
         // Avatars are requested only for the neighbourhood of the viewport. The
         // member list carries the version; the cache is shared with the rail.
         let count = self.messages.len();
@@ -173,91 +190,12 @@ impl Voxhold {
             avatar_by_user.insert((*user_id, version.clone()), image.clone());
             *used = std::time::Instant::now();
         }
-        let member_info: std::collections::HashMap<i64, (String, Option<String>)> = self
+        let member_info: std::collections::HashMap<i64, Option<String>> = self
             .members
             .iter()
-            .map(|member| {
-                (
-                    member.user_id,
-                    (member.role.clone(), member.avatar_version.clone()),
-                )
-            })
+            .map(|member| (member.user_id, member.avatar_version.clone()))
             .collect();
-        let rows: Vec<_> =
-            self.messages
-                .iter()
-                .zip(meta)
-                .map(|(message, meta)| {
-                    let own = self.self_user_id > 0 && self.self_user_id == message.author.user_id;
-                    let permissions = message_tools::permissions_for(
-                        self.self_user_id,
-                        &role,
-                        selected.as_ref(),
-                        message,
-                        conversation,
-                    );
-                    let read_by_other = self
-                        .reads
-                        .iter()
-                        .any(|(user, last)| *user != self.self_user_id && *last >= message.id);
-                    let (role_label, avatar) = member_info
-                        .get(&message.author.user_id)
-                        .cloned()
-                        .map(|(role, version)| {
-                            let avatar = version.as_ref().and_then(|version| {
-                                avatar_by_user
-                                    .get(&(message.author.user_id, version.clone()))
-                                    .cloned()
-                            });
-                            (role, avatar)
-                        })
-                        .unwrap_or_default();
-                    let selected_row = self.selected_messages.contains(&message.id);
-                    let pinned = self.pinned_ids.contains(&message.id);
-                    let highlighted = self
-                        .highlighted_message
-                        .is_some_and(|(id, _)| id == message.id);
-                    let editing = self.editing == Some(message.id);
-                    let delete_confirm = self.confirm_delete == Some(message.id)
-                        || self.message_menu.as_ref().is_some_and(|menu| {
-                            menu.message_id == message.id && menu.confirm_delete
-                        });
-                    let error = {
-                        let edit_error = self
-                            .edit_error
-                            .as_ref()
-                            .filter(|(row, open, _)| {
-                                *row == message.id && *open == self.edit_open_seq && editing
-                            })
-                            .map(|(_, _, error)| error.clone())
-                            .unwrap_or_default();
-                        if edit_error.is_empty() {
-                            self.action_error
-                                .as_ref()
-                                .filter(|(id, _)| *id == message.id)
-                                .map(|(_, error)| error.clone())
-                                .unwrap_or_default()
-                        } else {
-                            edit_error
-                        }
-                    };
-                    (
-                        message.clone(),
-                        permissions,
-                        meta,
-                        read_by_other,
-                        own,
-                        role_label,
-                        avatar,
-                        selected_row,
-                        pinned,
-                        highlighted,
-                        editing,
-                        delete_confirm,
-                        error,
-                    )
-                })
-                .collect();
+        let rows = self.history_rows.snapshot();
         let weak = cx.entity().downgrade();
         self.painted_read = Default::default();
         let painted_read = self.painted_read.clone();
@@ -268,21 +206,31 @@ impl Voxhold {
         let thumbs_for_rows = thumbs;
         let previews_for_rows = previews;
         let history_list = list(self.history_list.clone(), move |index, _, _cx| {
-            let (
-                message,
-                permissions,
-                meta,
-                read_by_other,
-                own,
-                role,
-                avatar,
-                selected_row,
-                pinned,
-                highlighted,
-                editing,
-                delete_confirm,
-                action_error,
-            ) = rows[index].clone();
+            // One `Arc` per visible row: the stable row data was prepared by
+            // the cache, so a frame never clones the whole history window.
+            let Some(row) = rows.get(index).cloned() else {
+                return div().into_any_element();
+            };
+            let message = row.message.as_ref();
+            let meta = &row.meta;
+            let permissions = row.permissions;
+            let read_by_other = row.read_by_other;
+            let own = row.own;
+            let selected_row = row.selected;
+            let pinned = row.pinned;
+            let highlighted = row.highlighted;
+            let editing = row.editing;
+            let delete_confirm = row.delete_confirm;
+            let action_error = &row.error;
+            let avatar = member_info
+                .get(&message.author.user_id)
+                .and_then(|version| version.as_ref())
+                .and_then(|version| {
+                    avatar_by_user
+                        .get(&(message.author.user_id, version.clone()))
+                        .cloned()
+                });
+            let role = row.role.as_str();
             let id = message.id;
             let painted_read = painted_read.clone();
             let weak = weak.clone();
@@ -292,9 +240,9 @@ impl Voxhold {
             let weak_quote = weak.clone();
             let weak_reaction = weak.clone();
             let weak_media = weak.clone();
-            let role_color = history::role_color(&role, p.light);
+            let role_color = history::role_color(role, p.light);
             let time = history::format_time(message.created_at);
-            let quote = history::quote_labels(&message);
+            let quote = history::quote_labels(message);
             let quote_target = message
                 .reply
                 .as_ref()
@@ -408,7 +356,7 @@ impl Voxhold {
                         .text_size(px(11.))
                         .font_weight(gpui::FontWeight::BOLD)
                         .text_color(ink(role_color))
-                        .child(history::role_label(&role, true)),
+                        .child(history::role_label(role, true)),
                 );
             if own {
                 head = head.child(
@@ -899,7 +847,7 @@ impl Voxhold {
                         .pb(px(4.))
                         .text_size(px(11.))
                         .text_color(ink(p.danger))
-                        .child(action_error),
+                        .child(action_error.clone()),
                 );
             }
             if own {

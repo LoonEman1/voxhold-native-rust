@@ -5,7 +5,7 @@ use super::add_auth_window;
 use super::*;
 use std::time::Duration;
 
-fn png_bytes(width: u32, height: u32) -> Vec<u8> {
+pub(super) fn png_bytes(width: u32, height: u32) -> Vec<u8> {
     let mut out = std::io::Cursor::new(Vec::new());
     image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
         width,
@@ -17,7 +17,7 @@ fn png_bytes(width: u32, height: u32) -> Vec<u8> {
     out.into_inner()
 }
 
-fn image_attachment() -> voxhold_api::Attachment {
+pub(super) fn image_attachment() -> voxhold_api::Attachment {
     voxhold_api::Attachment {
         id: "a".repeat(32),
         filename: "photo.png".into(),
@@ -625,27 +625,38 @@ fn thumbnail_frame_scales_the_borrowed_original_without_a_full_size_copy() {
     use crate::app::media_ops::{scale_probe, thumbnail_frame};
     use image::GenericImageView;
 
+    // 4000×3000 is large enough that a source-sized RGBA copy (48 MB,
+    // 12 M pixels) is unmistakably bigger than the 120×90 target, so the
+    // probe's `oversized` flag catches one if the pass ever allocates it.
+    //
+    // Limitation: the probe only sees the buffers this module reports. A copy
+    // made inside `image` without passing through `note_scale_buffer` is not
+    // observable without a global allocator. The structural guarantee that
+    // remains is the signature: `thumbnail_frame` takes `&DynamicImage` and
+    // the viewer path never clones the original (it is shared as an `Arc`).
     let source = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
-        1200,
-        900,
+        4000,
+        3000,
         image::Rgba([10, 200, 30, 255]),
     ));
-    let source_bytes = source.as_bytes().len();
     scale_probe::reset();
     let (frame, bytes) = thumbnail_frame(&source, 120, 90);
     assert_eq!(frame.buffer().dimensions(), (120, 90));
     assert_eq!(bytes, 120 * 90 * 4);
-    assert!(
-        scale_probe::peak_bytes() < source_bytes,
-        "a source-sized RGBA copy would materialise {source_bytes} B"
-    );
+    // The source is read in place at its real size...
+    assert_eq!(scale_probe::source_pixels(), 4000 * 3000);
+    // ...while every allocated buffer stays at the target.
     assert_eq!(
-        scale_probe::peak_bytes(),
-        bytes,
+        scale_probe::peak_pixels(),
+        120 * 90,
         "the pass only materialises target-sized buffers"
     );
+    assert!(
+        !scale_probe::oversized(),
+        "an allocated buffer larger than the target would be a source-sized copy"
+    );
     // The shared original is untouched and still usable after the pass.
-    assert_eq!(source.dimensions(), (1200, 900));
+    assert_eq!(source.dimensions(), (4000, 3000));
     assert_eq!(source.get_pixel(0, 0).0, [10, 200, 30, 255]);
     // The frame is BGRA: green stays in the middle, red and blue swap.
     assert_eq!(frame.buffer().get_pixel(60, 45).0, [30, 200, 10, 255]);
@@ -665,7 +676,8 @@ fn scaled_frames_keep_proportions_and_channels_on_odd_and_tiny_sources() {
     assert_eq!(frame.buffer().dimensions(), (8, 2));
     assert_eq!(bytes, 8 * 2 * 4);
     assert_eq!(frame.buffer().get_pixel(4, 1).0, [120, 5, 250, 255]);
-    assert_eq!(scale_probe::peak_bytes(), bytes);
+    assert_eq!(scale_probe::peak_pixels(), 8 * 2);
+    assert!(!scale_probe::oversized());
 
     // A two-pixel source still yields at least a 1×1 surface, and a zero box
     // is clamped instead of producing an empty texture.
@@ -678,6 +690,44 @@ fn scaled_frames_keep_proportions_and_channels_on_odd_and_tiny_sources() {
     assert_eq!(frame.buffer().dimensions(), (1, 1));
     assert_eq!(bytes, 4);
     assert_eq!(frame.buffer().get_pixel(0, 0).0, [3, 2, 1, 200]);
+}
+
+#[test]
+fn sixteen_bit_sources_keep_size_channels_and_bgra_order() {
+    use crate::app::media_ops::{scale_probe, thumbnail_frame};
+
+    // The resample keeps the 16-bit channel layout and only the final,
+    // target-sized buffer is converted to 8-bit RGBA. A 16-bit surface has two
+    // bytes per channel, so its intermediate buffer is larger in bytes than
+    // the 8-bit result while still having exactly the target pixel count.
+    // Values are u16::MAX/0, which map to 255/0 without rounding, so the BGRA
+    // assertion is exact; a mid-range value could differ by one between the
+    // old and new paths and is deliberately avoided here.
+    let rgb = image::DynamicImage::ImageRgb16(image::ImageBuffer::from_pixel(
+        40,
+        10,
+        image::Rgb([u16::MAX, 0, 0]),
+    ));
+    scale_probe::reset();
+    let (frame, bytes) = thumbnail_frame(&rgb, 8, 2);
+    assert_eq!(frame.buffer().dimensions(), (8, 2));
+    assert_eq!(bytes, 8 * 2 * 4);
+    assert_eq!(frame.buffer().get_pixel(4, 1).0, [0, 0, 255, 255]);
+    assert_eq!(scale_probe::source_pixels(), 40 * 10);
+    assert_eq!(scale_probe::peak_pixels(), 8 * 2);
+    assert!(!scale_probe::oversized());
+
+    let rgba = image::DynamicImage::ImageRgba16(image::ImageBuffer::from_pixel(
+        40,
+        10,
+        image::Rgba([u16::MAX, 0, 0, u16::MAX]),
+    ));
+    scale_probe::reset();
+    let (frame, bytes) = thumbnail_frame(&rgba, 8, 2);
+    assert_eq!(frame.buffer().dimensions(), (8, 2));
+    assert_eq!(bytes, 8 * 2 * 4);
+    assert_eq!(frame.buffer().get_pixel(0, 0).0, [0, 0, 255, 255]);
+    assert!(!scale_probe::oversized());
 }
 
 #[gpui::test]
@@ -785,50 +835,4 @@ async fn dragging_the_window_keeps_one_rescale_pass_and_lands_on_the_last_box(
     visual.update(|window, app| {
         view.update(app, |v, _| v.close_viewer(window));
     });
-}
-
-#[gpui::test]
-async fn closing_the_viewer_releases_its_surface_and_decoded_source(cx: &mut TestAppContext) {
-    cx.update(|cx| gpui_component::init(cx));
-    let (window, view) = add_auth_window(cx);
-    let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
-    let mut source = None;
-    let mut surface = None;
-    visual.update(|window, app| {
-        view.update(app, |v, cx| {
-            v.server = 1;
-            v.channel = 7;
-            let decoded = std::sync::Arc::new(image::DynamicImage::ImageRgba8(
-                image::RgbaImage::new(64, 48),
-            ));
-            let frame = image::Frame::new(image::RgbaImage::new(64, 48));
-            let render = std::sync::Arc::new(gpui::RenderImage::new(smallvec::smallvec![frame]));
-            source = Some(std::sync::Arc::downgrade(&decoded));
-            surface = Some(std::sync::Arc::downgrade(&render));
-            v.media.viewer = Some(crate::media::Viewer::new(crate::media::ViewerKey {
-                chat: v.chat_key(),
-                access: v.access_generation,
-                message_id: 5,
-                attachment_id: "d".repeat(32),
-                open_id: 1,
-            }));
-            let viewer = v.media.viewer.as_mut().unwrap();
-            viewer.loading = false;
-            viewer.source = Some(decoded);
-            viewer.image = Some(render);
-            viewer.render_box = (64, 48);
-            viewer.target_box = (64, 48);
-            v.close_viewer(window);
-            assert!(v.media.viewer.is_none());
-            cx.notify();
-        });
-    });
-    assert!(
-        source.expect("source").upgrade().is_none(),
-        "the decoded original is released on close"
-    );
-    assert!(
-        surface.expect("surface").upgrade().is_none(),
-        "the GPU surface is released on close"
-    );
 }

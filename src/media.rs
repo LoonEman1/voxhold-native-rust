@@ -227,6 +227,9 @@ pub struct Viewer {
     pub target_box: (u32, u32),
     pub rescaling: bool,
     pub task: Option<gpui::Task<()>>,
+    /// The single running rescale pass. Dropping it cancels the pass, so a
+    /// closed or replaced viewer never leaves two resizes on one source.
+    pub scale_task: Option<gpui::Task<()>>,
 }
 
 impl Viewer {
@@ -241,6 +244,7 @@ impl Viewer {
             target_box: (0, 0),
             rescaling: false,
             task: None,
+            scale_task: None,
         }
     }
 

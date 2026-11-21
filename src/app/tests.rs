@@ -945,6 +945,7 @@ mod followup;
 mod followup2;
 mod instance_tests;
 mod media;
+mod media_viewer;
 mod r04;
 mod remember_tests;
 mod review;

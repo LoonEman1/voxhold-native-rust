@@ -23,19 +23,25 @@ pub(crate) fn thumbnail_frame(
     height: u32,
 ) -> (image::Frame, usize) {
     let (width, height) = (width.max(1), height.max(1));
+    // Record the borrowed input with its real size. It is read in place and
+    // never materialised as a copy; the probe call documents that and lets the
+    // O06 test compare the source against the buffers the pass allocates.
+    note_scale_buffer(pixels(image.width(), image.height()), false);
+    #[cfg(test)]
+    scale_probe::expect_target(pixels(width, height));
     // Scale first: the only pixel buffer this path materialises is the
     // target-sized one. A source-sized `to_rgba8()` copy never exists (O06).
     // `imageops::resize` still allocates its own f32 scratch of
     // source_width × target_height, exactly as the previous path did; what
     // disappears is the source-sized RGBA copy before the resample.
     let resized = image.resize_exact(width, height, image::imageops::FilterType::CatmullRom);
-    note_scale_buffer(resized.as_bytes().len());
+    note_scale_buffer(pixels(resized.width(), resized.height()), true);
     let rgba = match resized {
         // The common RGBA path moves the buffer instead of copying it.
         image::DynamicImage::ImageRgba8(rgba) => rgba,
         other => other.to_rgba8(),
     };
-    note_scale_buffer(rgba.as_raw().len());
+    note_scale_buffer(pixels(rgba.width(), rgba.height()), true);
     let bytes = rgba.width() as usize * rgba.height() as usize * 4;
     (
         members::avatar_frame(image::DynamicImage::ImageRgba8(rgba)),
@@ -43,22 +49,49 @@ pub(crate) fn thumbnail_frame(
     )
 }
 
-/// Test seam for O06: records the largest pixel buffer `thumbnail_frame`
-/// itself materialises on this thread (the resized image and the RGBA result).
-/// The viewer test asserts it stays at the target size, i.e. no
-/// decoded-source-sized RGBA copy is made. The resampler's internal f32 scratch
-/// lives inside `image` and is not counted; it is the same in both paths.
+fn pixels(width: u32, height: u32) -> usize {
+    width as usize * height as usize
+}
+
+/// Test seam for O06: records the pixel buffers the scale path touches on this
+/// thread. The borrowed input is reported with `copied = false`; every buffer
+/// `thumbnail_frame` allocates is reported with `copied = true`. Any allocated
+/// buffer with more pixels than the requested target sets `oversized`, i.e. a
+/// decoded-source-sized copy exists again.
+///
+/// Limitation: this only sees buffers the module itself reports. A copy made
+/// inside `image` without passing through `note_scale_buffer` would be
+/// invisible without a global allocator; the viewer path therefore keeps the
+/// source behind `&DynamicImage` and never clones it.
 #[cfg(test)]
 pub(crate) mod scale_probe {
     use std::cell::Cell;
 
     thread_local! {
         static PEAK: Cell<usize> = const { Cell::new(0) };
+        static SOURCE: Cell<usize> = const { Cell::new(0) };
+        static TARGET: Cell<usize> = const { Cell::new(usize::MAX) };
+        static OVERSIZED: Cell<bool> = const { Cell::new(false) };
         static PASSES: Cell<usize> = const { Cell::new(0) };
+        static INSTALLED: Cell<usize> = const { Cell::new(0) };
     }
 
-    pub(super) fn observe(bytes: usize) {
-        PEAK.with(|peak| peak.set(peak.get().max(bytes)));
+    /// Start a pass for one target surface; allocations are compared against
+    /// its pixel count.
+    pub(super) fn expect_target(pixels: usize) {
+        TARGET.with(|target| target.set(pixels));
+        OVERSIZED.with(|flag| flag.set(false));
+    }
+
+    pub(super) fn observe(pixels: usize, copied: bool) {
+        if copied {
+            PEAK.with(|peak| peak.set(peak.get().max(pixels)));
+            if pixels > TARGET.with(Cell::get) {
+                OVERSIZED.with(|flag| flag.set(true));
+            }
+        } else {
+            SOURCE.with(|source| source.set(source.get().max(pixels)));
+        }
     }
 
     /// Count one started background rescale pass on this thread, so a test can
@@ -67,28 +100,92 @@ pub(crate) mod scale_probe {
         PASSES.with(|passes| passes.set(passes.get() + 1));
     }
 
-    /// Largest buffer observed since the last `reset`, in bytes.
-    pub(crate) fn peak_bytes() -> usize {
+    /// Count a pass that reached its UI half. A pass whose handle was dropped
+    /// is cancelled and never installs a frame, so this counter stays put.
+    pub(super) fn install() {
+        INSTALLED.with(|installed| installed.set(installed.get() + 1));
+    }
+
+    /// Largest allocated buffer since the last `reset`, in pixels.
+    pub(crate) fn peak_pixels() -> usize {
         PEAK.with(Cell::get)
+    }
+
+    /// Largest borrowed input since the last `reset`, in pixels.
+    pub(crate) fn source_pixels() -> usize {
+        SOURCE.with(Cell::get)
+    }
+
+    pub(crate) fn oversized() -> bool {
+        OVERSIZED.with(Cell::get)
     }
 
     pub(crate) fn passes() -> usize {
         PASSES.with(Cell::get)
     }
 
+    pub(crate) fn installed() -> usize {
+        INSTALLED.with(Cell::get)
+    }
+
     pub(crate) fn reset() {
         PEAK.with(|peak| peak.set(0));
+        SOURCE.with(|source| source.set(0));
+        TARGET.with(|target| target.set(usize::MAX));
+        OVERSIZED.with(|flag| flag.set(false));
         PASSES.with(|passes| passes.set(0));
+        INSTALLED.with(|installed| installed.set(0));
+    }
+}
+
+/// Test seam for O06: counts the GPU images the viewer path released through
+/// `Window::drop_image`. Dropping our `Arc` alone would make a close test pass
+/// even if the renderer never learned about the surface, so the close test
+/// asserts this counter in addition to the refcount.
+#[cfg(test)]
+pub(crate) mod image_probe {
+    use std::cell::Cell;
+
+    thread_local! {
+        static DROPS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(super) fn dropped() {
+        DROPS.with(|drops| drops.set(drops.get() + 1));
+    }
+
+    pub(crate) fn drops() -> usize {
+        DROPS.with(Cell::get)
+    }
+
+    pub(crate) fn reset() {
+        DROPS.with(|drops| drops.set(0));
     }
 }
 
 #[cfg(test)]
-fn note_scale_buffer(bytes: usize) {
-    scale_probe::observe(bytes);
+fn note_scale_buffer(pixels: usize, copied: bool) {
+    scale_probe::observe(pixels, copied);
 }
 
 #[cfg(not(test))]
-fn note_scale_buffer(_bytes: usize) {}
+fn note_scale_buffer(_pixels: usize, _copied: bool) {}
+
+#[cfg(test)]
+fn note_scale_installed() {
+    scale_probe::install();
+}
+
+#[cfg(not(test))]
+fn note_scale_installed() {}
+
+#[cfg(test)]
+fn note_dropped_image() {
+    image_probe::dropped();
+}
+
+#[cfg(not(test))]
+fn note_dropped_image() {}
 
 impl Voxhold {
     /// Request one chat thumbnail. Three reads at a time, a failed key waits
@@ -427,14 +524,19 @@ impl Voxhold {
         cx.notify();
     }
 
-    /// Close the viewer and release its GPU surface. Idempotent; also aborts
-    /// the pending content request.
+    /// Close the viewer and release its GPU surface. Idempotent; dropping the
+    /// stored handles also aborts the pending content request and a running
+    /// rescale pass, so neither can install a frame into the next viewer.
     pub(super) fn close_viewer(&mut self, window: &mut Window) {
         let Some(mut viewer) = self.media.viewer.take() else {
             return;
         };
         viewer.task.take();
+        // Dropping the scale handle cancels the background pass; the decoded
+        // original it borrowed is released with the cancelled future.
+        viewer.scale_task.take();
         if let Some(image) = viewer.image.take() {
+            note_dropped_image();
             let _ = window.drop_image(image);
         }
         viewer.source = None;
@@ -477,12 +579,21 @@ impl Voxhold {
         let Some(open_id) = self.media.viewer.as_ref().map(|viewer| viewer.key.open_id) else {
             return;
         };
+        // One pass at a time: dropping the previous handle cancels an older
+        // background resize, so the stale pass cannot keep the decoded
+        // original alive next to the new one.
+        if let Some(viewer) = self.media.viewer.as_mut() {
+            viewer.scale_task = None;
+        }
         #[cfg(test)]
         scale_probe::pass();
         let task = cx.background_spawn(async move { thumbnail_frame(&source, target.0, target.1) });
-        cx.spawn_in(window, async move |this, window| {
+        let handle = cx.spawn_in(window, async move |this, window| {
             let (frame, _bytes) = task.await;
             let _ = this.update_in(window, |s, window, cx| {
+                // A cancelled pass is dropped before this point and never
+                // reaches the UI half.
+                note_scale_installed();
                 let Some(viewer) = s.media.viewer.as_mut() else {
                     return;
                 };
@@ -491,6 +602,7 @@ impl Voxhold {
                 }
                 let next = Arc::new(gpui::RenderImage::new(smallvec::smallvec![frame]));
                 if let Some(previous) = std::mem::replace(&mut viewer.image, Some(next)) {
+                    note_dropped_image();
                     let _ = window.drop_image(previous);
                 }
                 let follow_up = viewer.finish_scale(target);
@@ -500,8 +612,12 @@ impl Voxhold {
                     s.start_viewer_scale(target, source, window, cx);
                 }
             });
-        })
-        .detach();
+        });
+        if let Some(viewer) = self.media.viewer.as_mut() {
+            if viewer.key.open_id == open_id {
+                viewer.scale_task = Some(handle);
+            }
+        }
     }
 
     /// Close the viewer and release every cached private picture. Used when

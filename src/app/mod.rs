@@ -86,6 +86,8 @@ mod voice_screen_preview_tests;
 mod voice_screen_restart_tests;
 #[cfg(test)]
 mod voice_screen_tests;
+#[cfg(test)]
+mod voice_screen_visible_tests;
 mod voice_settings_ops;
 #[cfg(test)]
 mod voice_settings_tests;

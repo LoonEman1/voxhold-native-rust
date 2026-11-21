@@ -34,6 +34,14 @@ impl ScreenShareUi {
         self.preview_bytes = 0;
         self.preview_rejected = 0;
         self.preview_cards = 0;
+        // The next picker starts at the top of its own list: a scroll offset
+        // or visibility list of the previous dialog must not choose its
+        // captures.
+        self.visible_previews.clear();
+        self.visible_scratch.clear();
+        self.visible_scroll = 0.0;
+        self.preview_card_width = 0.0;
+        self.scroll = ScrollHandle::new();
     }
 
     /// Release one GPUI image from the sprite atlas. Every replaced or removed
@@ -96,10 +104,19 @@ impl ScreenShareUi {
         }
     }
 
-    /// Claim the next visible source that still needs a picture, marking it
-    /// pending. `None` means the batch has no work left for this epoch and
-    /// category. Called before every capture, so a row added while the batch
-    /// waits on a capture is picked up without starting a second batch.
+    /// Claim the next source that still needs a picture, marking it pending.
+    /// `None` means the batch has no work left for this epoch and category.
+    ///
+    /// The visible rows of the last painted frame come first, in visual order,
+    /// so the cards the user actually looks at get their picture without
+    /// waiting for the whole tab. Off-screen rows follow only while the cache
+    /// has room for one more estimated frame: a full cache must not start a
+    /// capturer and a Windows enumeration for a card that could never keep its
+    /// picture. An empty visibility list keeps the plain snapshot order, which
+    /// is the first-frame, restart and empty-list behaviour.
+    ///
+    /// Called before every capture, so a row that became visible while the
+    /// batch waits on a capture is picked up without starting a second batch.
     pub(super) fn take_next_preview_source(
         &mut self,
         epoch: u64,
@@ -109,26 +126,136 @@ impl ScreenShareUi {
             return None;
         }
         let source = self
-            .snapshot(kind)
-            .iter()
-            .filter(|source| {
-                let Some(identity) = source.identity() else {
-                    return false;
-                };
-                !self.previews.contains_key(&identity)
-                    && !self.preview_failures.contains_key(&identity)
-                    && !self.preview_pending.contains(&identity)
-            })
-            // A duplicated identity is ambiguous and can never be accepted by
-            // `finish_preview`, so it is not captured at all.
-            .find(|source| {
-                source
-                    .identity()
-                    .is_some_and(|identity| self.source_for_identity(&identity).is_some())
-            })?
-            .clone();
+            .visible_preview_source(kind)
+            .or_else(|| self.remaining_preview_source(kind))?;
         self.preview_pending.insert(source.identity()?);
         Some(source)
+    }
+
+    /// One visible, uncached source, in the order the grid paints it. A
+    /// duplicated identity is ambiguous and can never be accepted by
+    /// `finish_preview`, so it is skipped instead of captured.
+    fn visible_preview_source(&self, kind: SourceKind) -> Option<ScreenSource> {
+        if self.visible_kind != kind {
+            return None;
+        }
+        for identity in &self.visible_previews {
+            let mut matches = self
+                .snapshot(kind)
+                .iter()
+                .filter(|source| source.identity().as_ref() == Some(identity));
+            let Some(source) = matches.next() else {
+                continue;
+            };
+            if matches.next().is_some() {
+                continue;
+            }
+            if self.preview_source_ready(source) {
+                return Some(source.clone());
+            }
+        }
+        None
+    }
+
+    /// The first off-screen source that still needs a picture, but only while
+    /// the cache could keep one more frame.
+    fn remaining_preview_source(&self, kind: SourceKind) -> Option<ScreenSource> {
+        if !self.preview_has_room() {
+            return None;
+        }
+        self.snapshot(kind)
+            .iter()
+            .filter(|source| {
+                !(self.visible_kind == kind
+                    && source
+                        .identity()
+                        .is_some_and(|identity| self.visible_previews.contains(&identity)))
+            })
+            .find(|source| self.preview_source_ready(source))
+            .cloned()
+    }
+
+    /// Whether one capture of this surface can still be claimed: not cached,
+    /// not failed, not in flight and unambiguous in the current snapshot.
+    fn preview_source_ready(&self, source: &ScreenSource) -> bool {
+        let Some(identity) = source.identity() else {
+            return false;
+        };
+        !self.previews.contains_key(&identity)
+            && !self.preview_failures.contains_key(&identity)
+            && !self.preview_pending.contains(&identity)
+            && self.source_for_identity(&identity).is_some()
+    }
+
+    /// Whether the cache has room for one more picture at the size the picker
+    /// paints. The estimate is the frame the card needs (`card² × 9/16 × 4`),
+    /// capped by the whole byte bound. A visible card is still captured near
+    /// the bound: its result is either kept or gets the honest memory note.
+    fn preview_has_room(&self) -> bool {
+        self.previews.len() < MAX_SCREEN_PREVIEWS
+            && MAX_SCREEN_PREVIEW_BYTES.saturating_sub(self.preview_bytes)
+                >= self.preview_frame_estimate()
+    }
+
+    /// Conservative BGRA size of one card picture. Before the first frame the
+    /// capture width is used, so the gate never trusts a zero card width.
+    fn preview_frame_estimate(&self) -> usize {
+        let width = if self.preview_card_width > 0.0 {
+            self.preview_card_width
+        } else {
+            SCREEN_THUMBNAIL_WIDTH as f32
+        };
+        let bytes = (f64::from(width) * f64::from(width) * 9.0 / 16.0 * 4.0).ceil();
+        (bytes as usize).min(MAX_SCREEN_PREVIEW_BYTES)
+    }
+
+    /// Recompute the visible rows from the scroll handle of the last painted
+    /// frame. The identity list is swapped into place through a reused buffer,
+    /// so neither a scroll nor a repaint allocates a new list. Returns whether
+    /// the scroll top moved since the previous frame; the dialog then asks for
+    /// previews once, and the batch guard keeps that from starting a second
+    /// capture beside a running one.
+    pub(super) fn sync_visible_previews(
+        &mut self,
+        sources: &[ScreenSource],
+        columns: usize,
+        card_width: f32,
+    ) -> bool {
+        self.preview_card_width = card_width;
+        // A scroll offset is zero at the top and negative further down.
+        let scroll_top = (-f32::from(self.scroll.offset().y)).max(0.0);
+        let scrolled = (scroll_top - self.visible_scroll).abs() > 0.5;
+        self.visible_scroll = scroll_top;
+        self.visible_scratch.clear();
+        if self.restart || columns == 0 || sources.is_empty() {
+            self.visible_previews.clear();
+            self.visible_kind = self.kind;
+            return scrolled;
+        }
+        let rows = sources.len().div_ceil(columns);
+        let Some((start, end)) =
+            visible_row_range(scroll_top, SOURCE_LIST_HEIGHT, SOURCE_ROW_HEIGHT, rows)
+        else {
+            self.visible_previews.clear();
+            self.visible_kind = self.kind;
+            return scrolled;
+        };
+        for row in start..end {
+            for column in 0..columns {
+                if let Some(identity) = sources
+                    .get(row * columns + column)
+                    .and_then(ScreenSource::identity)
+                {
+                    self.visible_scratch.push(identity);
+                }
+            }
+        }
+        if self.visible_kind != self.kind || self.visible_scratch != self.visible_previews {
+            self.visible_kind = self.kind;
+            std::mem::swap(&mut self.visible_previews, &mut self.visible_scratch);
+        }
+        self.visible_scratch.clear();
+        scrolled
     }
 
     /// Release the batch guard at the end of a batch. A stale batch (its epoch
@@ -275,14 +402,68 @@ fn preview_render_image(frame: PreviewFrame) -> Option<Arc<RenderImage>> {
     ])))
 }
 
+/// Half-open row range `[start, end)` that a viewport covers at `scroll_top`,
+/// widened by one row above and below so a small scroll already has its
+/// pictures. `None` means the layout is unknown (no rows, no viewport, a zero
+/// row height or a non-finite value): the caller then keeps the plain
+/// snapshot order instead of guessing.
+///
+/// `scroll_top` is the positive distance from the top of the content; the
+/// GPUI scroll handle stores the same distance negated.
+pub(super) fn visible_row_range(
+    scroll_top: f32,
+    viewport_height: f32,
+    row_height: f32,
+    row_count: usize,
+) -> Option<(usize, usize)> {
+    if row_count == 0 || !(viewport_height > 0.0) || !(row_height > 0.0) {
+        return None;
+    }
+    if !scroll_top.is_finite() || !viewport_height.is_finite() || !row_height.is_finite() {
+        return None;
+    }
+    let top = scroll_top.max(0.0) / row_height;
+    let top = top.floor() as usize;
+    if top >= row_count {
+        // Overscroll: the last row is still the one the user looks at.
+        return Some((row_count - 1, row_count));
+    }
+    let bottom = ((scroll_top.max(0.0) + viewport_height) / row_height).ceil() as usize;
+    let bottom = bottom.clamp(top + 1, row_count);
+    let start = top.saturating_sub(1);
+    let end = (bottom + 1).min(row_count);
+    Some((start, end))
+}
+
+/// Test seams of the visible-area picker. They expose only what a UI test
+/// needs to drive the real render path: the identity list the last frame
+/// computed. The scroll itself is a wheel event on `#share-sources`.
+#[cfg(test)]
+impl VoicePanel {
+    /// Identities the last painted frame treats as visible, in visual order.
+    pub(crate) fn test_visible_screen_previews(&self) -> Vec<SourceId> {
+        self.screen
+            .visible_previews
+            .iter()
+            .filter_map(|identity| {
+                self.screen
+                    .source_for_identity(identity)
+                    .map(ScreenSource::source_id)
+            })
+            .collect()
+    }
+}
+
 impl VoicePanel {
     /// Start background thumbnail generation for the visible category.
     ///
     /// Cached and pending ids are skipped. At most one batch, and inside it at
     /// most one capture, runs at a time. A request made while the batch is
-    /// active only returns: the running batch re-reads the visible snapshot
-    /// before every capture and re-requests pending work when it ends, so a
-    /// source that appeared mid-batch is still captured, just not concurrently.
+    /// active only returns: the running batch re-reads the visible rows before
+    /// every capture and re-requests pending work when it ends, so a source
+    /// that appeared mid-batch (or scrolled into view) is still captured, just
+    /// not concurrently. The visible rows come first and the rest only while
+    /// the cache has room for one more picture.
     /// Before every source the batch re-checks that the same picker, epoch and
     /// category are still current, so a closed dialog or a tab switch never
     /// starts another capture. The capture itself is bounded by the media layer
@@ -432,6 +613,88 @@ mod tests {
             cached_bytes(blue),
             [blue, blue].concat(),
             "pure blue must not reach the card as red"
+        );
+    }
+
+    /// The viewport covers whole and partial rows plus one row of margin on
+    /// each side. The picker must never claim a row's picture just because it
+    /// is the next one in the snapshot.
+    #[test]
+    fn the_visible_row_range_covers_the_viewport_and_one_margin_row() {
+        // 236 px viewport, 132 px rows: rows 0 and 1 are on screen (row 1 is
+        // cut), row 2 is the lower margin.
+        assert_eq!(
+            visible_row_range(0.0, SOURCE_LIST_HEIGHT, SOURCE_ROW_HEIGHT, 12),
+            Some((0, 3))
+        );
+        // Two rows down: one margin above, rows 2 and 3 on screen, one below.
+        assert_eq!(
+            visible_row_range(
+                2.0 * SOURCE_ROW_HEIGHT,
+                SOURCE_LIST_HEIGHT,
+                SOURCE_ROW_HEIGHT,
+                12
+            ),
+            Some((1, 5))
+        );
+        // A single row is both the viewport and its own margin.
+        assert_eq!(
+            visible_row_range(0.0, SOURCE_LIST_HEIGHT, SOURCE_ROW_HEIGHT, 1),
+            Some((0, 1))
+        );
+        // The end of the list stops at the last row instead of running over.
+        let rows = 12_u32;
+        let content = (rows - 1) as f32 * SOURCE_ROW_HEIGHT + SOURCE_CARD_HEIGHT;
+        let max_offset = content - SOURCE_LIST_HEIGHT;
+        assert_eq!(
+            visible_row_range(
+                max_offset,
+                SOURCE_LIST_HEIGHT,
+                SOURCE_ROW_HEIGHT,
+                rows as usize
+            ),
+            Some((9, 12))
+        );
+        // Overscroll past the end still names the last row.
+        assert_eq!(
+            visible_row_range(9999.0, SOURCE_LIST_HEIGHT, SOURCE_ROW_HEIGHT, 12),
+            Some((11, 12))
+        );
+        // An overscrolled (negative) offset is the top, not a wrapped index.
+        assert_eq!(
+            visible_row_range(-50.0, SOURCE_LIST_HEIGHT, SOURCE_ROW_HEIGHT, 12),
+            Some((0, 3))
+        );
+    }
+
+    /// No layout means no visibility claim: the batch keeps the snapshot
+    /// order, which is the first-frame and restart behaviour.
+    #[test]
+    fn an_unknown_layout_has_no_visible_range() {
+        assert_eq!(
+            visible_row_range(0.0, SOURCE_LIST_HEIGHT, SOURCE_ROW_HEIGHT, 0),
+            None,
+            "an empty picker has no rows to prioritise"
+        );
+        assert_eq!(
+            visible_row_range(0.0, 0.0, SOURCE_ROW_HEIGHT, 12),
+            None,
+            "a zero-height viewport is unknown"
+        );
+        assert_eq!(
+            visible_row_range(0.0, SOURCE_LIST_HEIGHT, 0.0, 12),
+            None,
+            "a zero-height row is unknown"
+        );
+        assert_eq!(
+            visible_row_range(f32::NAN, SOURCE_LIST_HEIGHT, SOURCE_ROW_HEIGHT, 12),
+            None,
+            "a non-finite offset is unknown"
+        );
+        assert_eq!(
+            visible_row_range(0.0, f32::INFINITY, SOURCE_ROW_HEIGHT, 12),
+            None,
+            "a non-finite viewport is unknown"
         );
     }
 }

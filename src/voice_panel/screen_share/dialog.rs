@@ -199,7 +199,7 @@ impl VoicePanel {
             .id(Self::source_element_id(source))
             .debug_selector(move || card_selector.clone())
             .w(px(card_width))
-            .h(px(124.))
+            .h(px(SOURCE_CARD_HEIGHT))
             .flex_shrink_0()
             .relative()
             .overflow_hidden()
@@ -293,22 +293,29 @@ impl VoicePanel {
         // shrink; the grid scrolls inside the same picker height as before.
         let columns = if width >= 560.0 { 2 } else { 1 };
         let inner_width = (width - 36.0).max(120.0);
-        let gap = 8.0_f32;
+        let gap = SOURCE_ROW_GAP;
         let card_width = if columns == 2 {
             (inner_width - gap) / 2.0
         } else {
             inner_width
         };
+        let scroll = self.screen.scroll.clone();
         let mut list = div()
             .id("share-sources")
             .debug_selector(|| "share-sources".into())
-            .h(px(236.))
+            .h(px(SOURCE_LIST_HEIGHT))
             .w_full()
             .overflow_y_scroll()
+            // The picker reads the offset to know which rows are on screen.
+            .track_scroll(&scroll)
             .flex()
             .flex_col()
             .gap(px(gap));
+        let mut scrolled = false;
         if self.screen.restart {
+            // No picker grid exists here; the locked card is the only picture
+            // and it comes from the confirmed live source.
+            self.screen.sync_visible_previews(&[], columns, card_width);
             // Locked context: only the confirmed live source is painted, and
             // it is inert. It is not part of the focus ring, so neither Tab
             // nor a click can move the restart onto another cached source.
@@ -322,6 +329,11 @@ impl VoicePanel {
             }
         } else {
             let sources: Vec<ScreenSource> = self.screen.sources().to_vec();
+            // The rows of this frame decide which thumbnails the batch claims
+            // first, so a scrolled list no longer waits for the whole tab.
+            scrolled = self
+                .screen
+                .sync_visible_previews(&sources, columns, card_width);
             let selected = self.screen.selected;
             self.screen.preview_cards = sources.len();
             if sources.is_empty() {
@@ -378,6 +390,18 @@ impl VoicePanel {
                 }
                 list = list.child(grid_row);
             }
+        }
+        // A wheel or scrollbar move happens outside the request points of the
+        // picker, so the frame asks once for the rows that just became
+        // visible. The request itself is guarded: a running batch keeps its
+        // single capture and picks the new rows up at its next claim.
+        if scrolled && !self.screen.visible_previews.is_empty() {
+            let entity = cx.entity();
+            window.defer(cx, move |window, cx| {
+                let _ = entity.update(cx, |panel, cx| {
+                    panel.request_screen_previews(window, cx);
+                });
+            });
         }
 
         // Quality: only values the SDR publication applies.

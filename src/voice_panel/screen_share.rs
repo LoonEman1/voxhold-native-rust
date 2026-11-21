@@ -9,6 +9,7 @@
 //! cannot apply them.
 
 use super::*;
+use gpui::ScrollHandle;
 use voxhold_media::publisher::{
     Codec, Phase, Preset, PublishRequest, Quality, QualityChange, QualityOutcome, Resolution,
     Sharing, AUDIO_BITRATES, MAX_CHANNEL_PUBLISHERS,
@@ -49,6 +50,15 @@ pub(super) const MAX_SCREEN_PREVIEWS: usize = 64;
 pub(super) const MAX_SCREEN_PREVIEW_BYTES: usize = 16 * 1024 * 1024;
 /// A picture that does not fit the cache still gets an honest card note.
 pub(super) const PREVIEW_MEMORY_REASON: &str = "Предпросмотр недоступен: превышен лимит памяти.";
+/// Height of the scrolling picker list. The visibility range must match the
+/// dialog's `#share-sources`, so both use this value.
+pub(super) const SOURCE_LIST_HEIGHT: f32 = 236.0;
+/// Height of one picker card, unchanged from the painted layout.
+pub(super) const SOURCE_CARD_HEIGHT: f32 = 124.0;
+/// Gap between two card rows and between two cards of one row.
+pub(super) const SOURCE_ROW_GAP: f32 = 8.0;
+/// Vertical distance from one row to the next.
+pub(super) const SOURCE_ROW_HEIGHT: f32 = SOURCE_CARD_HEIGHT + SOURCE_ROW_GAP;
 
 /// One cached card picture. `bytes` is the BGRA source size, so the budget
 /// stays comparable across sessions.
@@ -150,6 +160,27 @@ pub(super) struct ScreenShareUi {
     /// Cards painted by the last frame, so a layout test can prove one card per
     /// source without relying on a single `debug_selector`.
     pub(super) preview_cards: usize,
+    /// Identities inside the picker viewport plus one row of margin above and
+    /// below, in visual order. Captures claim these before any off-screen row.
+    /// Empty means there are no measurable rows (restart dialog or an empty
+    /// list): the batch then keeps the snapshot order instead of guessing.
+    pub(super) visible_previews: Vec<SourceIdentity>,
+    /// Scratch list of the per-frame visibility computation. Reused, so a
+    /// scrolled picker does not allocate a new list on every frame.
+    visible_scratch: Vec<SourceIdentity>,
+    /// Category that `visible_previews` describes. A list of another category
+    /// is ignored instead of capturing the hidden tab.
+    pub(super) visible_kind: SourceKind,
+    /// Scroll top observed by the last painted frame, used to notice a scroll
+    /// without comparing the whole identity list.
+    visible_scroll: f32,
+    /// Card width of the last painted grid, used for the conservative frame
+    /// estimate of the cache gate. Zero before the first frame.
+    pub(super) preview_card_width: f32,
+    /// Scroll state of `#share-sources`. The dialog tracks it so the picker
+    /// knows which rows are visible; tests drive the same handle through a
+    /// wheel event.
+    pub(super) scroll: ScrollHandle,
     /// Pictures really handed to `Window::drop_image`. Test-only: it proves
     /// that a replaced or cleared preview left the sprite atlas instead of
     /// being only removed from a collection.
@@ -205,6 +236,12 @@ impl Default for ScreenShareUi {
             preview_bytes: 0,
             preview_rejected: 0,
             preview_cards: 0,
+            visible_previews: Vec::new(),
+            visible_scratch: Vec::new(),
+            visible_kind: SourceKind::Monitor,
+            visible_scroll: 0.0,
+            preview_card_width: 0.0,
+            scroll: ScrollHandle::new(),
             #[cfg(test)]
             released_images: 0,
             #[cfg(test)]

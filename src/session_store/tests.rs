@@ -658,6 +658,37 @@ fn a_disabled_store_is_a_quiet_no_op() {
 }
 
 #[test]
+fn an_unchecked_login_clears_this_account_and_the_active_target() {
+    let (dir, path) = scratch("forget");
+    let store = SessionStore::new(Some(path));
+    let first = record("https://chat.example.org", "neva", "token-1");
+    let second = record("https://chat.example.org", "bob", "token-2");
+    save_now(&store, &first).unwrap();
+    save_now(&store, &second).unwrap();
+    assert_eq!(
+        store.state().unwrap().target.map(|target| target.account),
+        Some("bob".into())
+    );
+
+    // bob signs in without the box: his record and the active target go, while
+    // neva's record stays for a later explicit choice.
+    store
+        .forget(&second.origin, &second.account, store.epoch())
+        .unwrap();
+    let state = store.state().unwrap();
+    assert_eq!(state.records, vec![first]);
+    assert!(state.target.is_none());
+    assert_eq!(
+        store
+            .plan_auto_login(crate::auth_session::now_unix(), None, true)
+            .unwrap(),
+        AutoLogin::Manual,
+        "the new format never searches records after an explicit forget"
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn debug_output_never_prints_the_token() {
     let saved = record("https://chat.example.org", "neva", "token-secret");
     let debug = format!("{saved:?}");
@@ -665,3 +696,5 @@ fn debug_output_never_prints_the_token() {
     assert!(!debug.contains("token-secret"), "{debug}");
     assert!(debug.contains("neva"), "{debug}");
 }
+
+mod target_tests;

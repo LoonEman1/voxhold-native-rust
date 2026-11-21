@@ -454,15 +454,13 @@ async fn logout_keeps_the_remember_box_on_the_address_step(cx: &mut TestAppConte
         view.read_with(&*visual, |v, _| (v.auth.screen, v.auth.remember_instance));
     assert_eq!(
         screen,
-        auth::AuthScreen::Login,
-        "logout shows the login step"
+        auth::AuthScreen::Instance,
+        "logout returns to the address step"
     );
-    assert!(remember, "logout must keep the saved choice");
+    assert!(remember, "logout must keep the saved address choice");
 
-    // «Назад» returns to the address step with the same checked box.
-    visual.update(|window, app| {
-        view.update(app, |v, cx| v.back_to_instance(window, cx));
-    });
+    // The address step is the first manual surface; the confirmed origin and
+    // the checked box are still there.
     draw(&mut visual);
     let (screen, origin) = view.read_with(&*visual, |v, _| (v.auth.screen, v.auth.origin.clone()));
     assert_eq!(screen, auth::AuthScreen::Instance);

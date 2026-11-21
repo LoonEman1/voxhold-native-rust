@@ -53,8 +53,15 @@ fn make_app(cx: &mut TestAppContext) -> (gpui::WindowHandle<Root>, Entity<Voxhol
     let app_dir = dir.clone();
     let window = cx.add_window(move |window, cx| {
         let view = cx.new(|cx| {
-            let mut view =
-                Voxhold::new(window, cx, "", Some(shell), Some(instance), Some(sessions));
+            let mut view = Voxhold::new_with_startup(
+                window,
+                cx,
+                "",
+                Some(shell),
+                Some(instance),
+                Some(sessions),
+                false,
+            );
             view.client = Some(voxhold_api::Client::new("http://127.0.0.1:1").unwrap());
             view.self_user_id = 1;
             view.update.root_override = Some(app_dir.join("updates"));

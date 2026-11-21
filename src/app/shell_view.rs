@@ -204,10 +204,18 @@ impl Render for Voxhold {
                 }));
         }
         if self.client.is_none() {
+            if self.startup_restoring {
+                // The one startup check owns the first frames; neither the
+                // address nor the login form is painted until it settles or
+                // the user cancels it.
+                return root
+                    .child(self.render_startup(window, cx))
+                    .into_any_element();
+            }
             if !self.initial_focus_done {
                 self.initial_focus_done = true;
-                // Focus after the first frame so the field's focus handle is
-                // mounted, matching the Go `RequestFocus(user)` call.
+                // Focus after the first manual frame so the field's focus handle
+                // is mounted, matching the Go `RequestFocus(user)` call.
                 let weak = cx.entity().downgrade();
                 window.on_next_frame(move |window, cx| {
                     if let Some(view) = weak.upgrade() {

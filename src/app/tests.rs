@@ -39,13 +39,17 @@ fn add_auth_window(cx: &mut TestAppContext) -> (gpui::WindowHandle<Root>, Entity
         std::process::id(),
         uuid::Uuid::new_v4()
     ));
-    add_auth_window_with(
+    let opened = add_auth_window_with(
         cx,
         "",
         dir.join("workspace-layout.json"),
         dir.join("instance.json"),
         dir.join("sessions.bin"),
-    )
+    );
+    // These tests exercise the manual form; the one startup read has nothing
+    // to restore and settles before they interact.
+    cx.run_until_parked();
+    opened
 }
 
 fn focus_field(
@@ -951,3 +955,4 @@ mod review;
 mod w08a;
 mod w08a_p2;
 mod w08a_p2_b;
+mod w09g1;

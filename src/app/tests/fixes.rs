@@ -845,8 +845,8 @@ async fn reconnect_batch_refreshes_the_open_conversation(cx: &mut TestAppContext
     })
     .to_string();
     let server = TestServer::spawn(vec![
-        Reply::new(200, "{\"conversations\":[]}"),
-        Reply::new(200, &page),
+        Reply::new(200, "{\"conversations\":[]}").with_path("/api/v1/me/conversations"),
+        Reply::new(200, &page).with_path("/api/v1/conversations/5/messages"),
     ]);
     let (tx, rx) = std::sync::mpsc::sync_channel(8);
     tx.send(voxhold_api::RealtimeEvent {

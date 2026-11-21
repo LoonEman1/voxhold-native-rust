@@ -33,9 +33,22 @@ impl Voxhold {
                     .child(self.auth.status.clone()),
             );
         // A transient automatic failure keeps the record, so the same login
-        // can be retried without retyping the address. The link only appears
-        // for the short transient text, which still fits the row.
-        if self.auth.auto_retry && self.auto_record.is_some() {
+        // can be retried without retyping the address. A failed logout cleanup
+        // offers the same kind of one-click local retry.
+        if self.cleanup_retry {
+            row = row.child(
+                div()
+                    .id("auth-cleanup-retry")
+                    .debug_selector(|| "auth-cleanup-retry".into())
+                    .flex_none()
+                    .text_size(px(12.))
+                    .font_weight(gpui::FontWeight::BOLD)
+                    .text_color(ink(p.lime))
+                    .cursor_pointer()
+                    .on_click(cx.listener(|s, _, window, cx| s.retry_cleanup(window, cx)))
+                    .child("Повторить очистку"),
+            );
+        } else if self.auth.auto_retry && self.auto_record.is_some() {
             row = row.child(
                 div()
                     .id("auth-retry-login")
@@ -57,11 +70,13 @@ impl Voxhold {
         entity: &Entity<InputState>,
         rect: layout::Rect,
         compact: bool,
+        selector: &'static str,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let p = self.palette;
         div()
             .absolute()
+            .debug_selector(move || selector.into())
             .left(px(rect.x))
             .top(px(rect.y))
             .w(px(rect.w))
@@ -742,7 +757,7 @@ impl Voxhold {
         }
         if instance {
             let field = self.instance.clone();
-            root = root.child(self.auth_field(&field, l.user, compact, cx));
+            root = root.child(self.auth_field(&field, l.user, compact, "auth-instance-field", cx));
             // A separate checkbox under the address field. It owns only the
             // preference; the origin is written after the form is confirmed.
             let checked = self.auth.remember_instance;
@@ -795,8 +810,15 @@ impl Voxhold {
         } else {
             let username = self.username.clone();
             let password = self.password.clone();
-            root = root.child(self.auth_field(&username, l.user, compact, cx));
-            root = root.child(self.auth_field(&password, l.password, compact, cx));
+            root =
+                root.child(self.auth_field(&username, l.user, compact, "auth-username-field", cx));
+            root = root.child(self.auth_field(
+                &password,
+                l.password,
+                compact,
+                "auth-password-field",
+                cx,
+            ));
             // «Запомнить вход» lives on the password label row so the login
             // card keeps the reference geometry. Both the 18 px box and the
             // caption toggle the same preference.

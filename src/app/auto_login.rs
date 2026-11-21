@@ -1,23 +1,38 @@
-//! The «Запомнить вход» flow: checking a stored session after the address is
-//! confirmed, retrying a transient failure, saving a manual login and keeping
-//! the record current through token rotation.
+//! The cold-start restoration and the «Запомнить вход» flow: checking the
+//! protected store once per launch, restoring the named target, retrying a
+//! transient failure, saving a manual login and keeping the record current
+//! through token rotation.
 //!
 //! Every disk or network step runs on the background executor. The UI thread
 //! only applies an answer that still belongs to the current attempt: a late
 //! answer from an older address, a manual login, a logout or a toggled box is
-//! dropped by `auto_attempt` and `session_epoch`.
+//! dropped by `auto_attempt`, the selected origin and the store generation.
+
+use std::time::{Duration, Instant};
 
 use super::*;
 use crate::auth_session::{now_unix, Session};
-use crate::session_store::{accounts_match, RememberedSession, SessionStore, StoreError};
+use crate::session_store::{
+    accounts_match, AutoLogin, RememberedSession, SessionStore, StoreError,
+};
+
+/// The whole restoration attempt, including decrypting the store and both
+/// requests, is bounded by this budget. `Client` also has an 8 s per-request
+/// timeout, so two requests can never stretch the startup surface past it.
+pub(super) const STARTUP_BUDGET: Duration = Duration::from_secs(8);
 
 /// A short text that fits the error row next to the «Повторить вход» link.
 const TRANSIENT_REASON: &str = "Нет связи.";
 const EXPIRED_REASON: &str = "Сессия истекла. Войдите снова.";
 const WRONG_USER_REASON: &str = "Сохранённый вход другого аккаунта.";
 const FAILED_REASON: &str = "Не удалось восстановить вход.";
+const AMBIGUOUS_REASON: &str = "Выберите инстанс вручную.";
 const SAVE_ERROR: &str = "Не удалось сохранить вход: нет доступа.";
 pub(super) const DELETE_ERROR: &str = "Не удалось удалить сохранённый вход.";
+/// The cleanup of every remembered login failed; the retry link is shown.
+pub(super) const CLEAR_ERROR: &str = "Не удалось удалить сохранённые входы";
+/// The disk refused even the marker that would suppress the next start.
+pub(super) const CLEAR_UNCONFIRMED: &str = "Очистка для следующего запуска не подтверждена.";
 
 /// The answer of the one background network step.
 pub(super) enum AutoNetwork {
@@ -30,6 +45,9 @@ pub(super) enum AutoNetwork {
     Unauthorized,
     /// The record belongs to another user; it was deleted.
     WrongUser,
+    /// Another process advanced the store generation while this answer was on
+    /// the wire; the result is not applied.
+    Stale,
     /// The record is kept and the card offers «Повторить».
     Retry {
         record: RememberedSession,
@@ -43,61 +61,133 @@ pub(super) enum AutoNetwork {
 }
 
 impl Voxhold {
-    /// Start checking the store for the confirmed origin. Phase one only reads
-    /// and decrypts the file, so the checkbox can show the found record before
-    /// the network request starts.
-    pub(super) fn begin_auto_login(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// Start the one startup check that runs before the first manual form is
+    /// shown. `explicit_origin` is the canonical `-server` target or the
+    /// confirmed «Запомнить адрес» value, if any. The address form is only
+    /// rendered after this attempt settles or the user cancels it.
+    pub(super) fn begin_startup_restore(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        explicit_origin: Option<String>,
+        allow_profile_single: bool,
+        disabled: bool,
+    ) {
+        if self.startup_checked {
+            return;
+        }
+        self.startup_checked = true;
+        self.startup_restoring = true;
+        self.startup_deadline = Instant::now() + self.startup_budget;
         self.auto_attempt = self.auto_attempt.wrapping_add(1);
         let attempt = self.auto_attempt;
+        self.auto_epoch = self.session_store.epoch();
         self.auth.auto_login = true;
         self.auth.auto_retry = false;
         self.auth.remember_login = false;
         self.auto_record = None;
-        let origin = self.auth.origin.clone();
+        if self.auto_blocked || disabled {
+            self.startup_manual(attempt, "");
+            return;
+        }
         let store = self.session_store.clone();
         let rt = self.runtime.clone();
+        let budget = self.startup_budget;
         let task = cx.background_spawn(async move {
-            rt.block_on(async move { store.load_for_origin(&origin, now_unix()) })
+            rt.block_on(async move {
+                // The decryption and the file read are blocking; the shared
+                // budget still bounds the whole attempt.
+                let plan = tokio::task::spawn_blocking(move || {
+                    store.plan_auto_login(
+                        now_unix(),
+                        explicit_origin.as_deref(),
+                        allow_profile_single,
+                    )
+                });
+                match tokio::time::timeout(budget, plan).await {
+                    Ok(Ok(result)) => result,
+                    // A held lock or an unreadable store is a manual start.
+                    _ => Err(StoreError::Lock),
+                }
+            })
         });
         cx.spawn_in(window, async move |this, window| {
             let result = task.await;
             let _ = this.update_in(window, |s, window, cx| {
-                s.finish_auto_load(attempt, result, window, cx)
+                s.finish_startup_load(attempt, result, window, cx)
             });
         })
         .detach();
     }
 
-    fn finish_auto_load(
+    fn finish_startup_load(
         &mut self,
         attempt: u64,
-        result: Result<Option<RememberedSession>, crate::session_store::StoreError>,
+        result: Result<AutoLogin, StoreError>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.auto_still_owns(attempt) {
+        if !self.startup_still_owns(attempt) {
             return;
         }
-        self.auth.auto_login = false;
         match result {
-            // A missing, unreadable or foreign blob is a manual login. A save
-            // after that login may replace a damaged file.
-            Ok(None) | Err(_) => {
-                self.auth.remember_login = false;
-                self.auto_record = None;
-            }
-            Ok(Some(record)) if record.is_expired(now_unix()) => {
-                // A stale record is useless; drop it before the user types.
-                self.forget_record(record.origin.clone(), record.account.clone(), window, cx);
-                self.auth.remember_login = false;
-                self.auto_record = None;
-            }
-            Ok(Some(record)) => {
+            // A present target (or one unambiguous legacy record) starts the
+            // network step while the neutral surface stays on screen.
+            Ok(AutoLogin::Ready { record, legacy }) => {
+                self.migration_pending = legacy;
+                self.auth.screen = auth::AuthScreen::Login;
+                self.auth.origin = record.origin.clone();
                 self.auth.remember_login = true;
                 self.auto_record = Some(record.clone());
-                self.start_auto_network(attempt, record, window, cx);
+                let deadline = self.startup_deadline;
+                self.start_auto_network(attempt, record, deadline, window, cx);
+            }
+            Ok(AutoLogin::Ambiguous) => {
+                self.startup_manual(attempt, AMBIGUOUS_REASON);
+            }
+            // A missing, unreadable, blocked or explicitly targetless store is
+            // a manual start. No older record is searched.
+            Ok(AutoLogin::Manual) | Err(_) => {
+                self.startup_manual(attempt, "");
             }
         }
+        cx.notify();
+    }
+
+    /// Leave the neutral start surface for the address form. The attempt id is
+    /// kept, so a late store or network answer for it is ignored.
+    fn startup_manual(&mut self, attempt: u64, status: &str) {
+        if self.auto_attempt != attempt || self.session.is_some() {
+            return;
+        }
+        self.startup_restoring = false;
+        self.auth.auto_login = false;
+        self.auth.auto_retry = false;
+        self.auth.remember_login = false;
+        self.auth.screen = auth::AuthScreen::Instance;
+        self.auth.status = status.to_string();
+        self.auto_record = None;
+        self.migration_pending = false;
+        // The first manual surface takes focus on its first frame.
+        self.initial_focus_done = false;
+    }
+
+    /// «Выбрать инстанс» on the neutral surface. It cancels the attempt even
+    /// when the store read or the network answer is still in flight.
+    pub(super) fn cancel_startup_restore(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.auto_attempt = self.auto_attempt.wrapping_add(1);
+        self.startup_restoring = false;
+        self.auth.auto_login = false;
+        self.auth.auto_retry = false;
+        self.auth.remember_login = false;
+        self.auth.screen = auth::AuthScreen::Instance;
+        self.auth.status.clear();
+        self.auto_record = None;
+        self.migration_pending = false;
+        self.instance.update(cx, |input, cx| {
+            input.set_value(self.auth.origin.clone(), window, cx);
+        });
+        self.initial_focus_done = false;
         cx.notify();
     }
 
@@ -106,25 +196,44 @@ impl Voxhold {
         &mut self,
         attempt: u64,
         record: RememberedSession,
+        deadline: Instant,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if record.is_expired(now_unix()) {
-            self.forget_record(record.origin.clone(), record.account.clone(), window, cx);
-            self.auth.auto_login = false;
-            self.auth.remember_login = false;
-            self.auto_record = None;
-            cx.notify();
+            self.forget_record(record.origin.clone(), record.account.clone(), cx);
+            self.auto_expired(attempt, cx);
             return;
         }
         self.auth.auto_login = true;
         self.auth.auto_retry = false;
         self.auth.remember_login = true;
         self.auto_record = Some(record.clone());
+        self.auto_epoch = self.session_store.epoch();
         let store = self.session_store.clone();
         let rt = self.runtime.clone();
         let task = cx.background_spawn(async move {
-            rt.block_on(async move { auto_network(&store, record).await })
+            rt.block_on(async move {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return AutoNetwork::Retry {
+                        record,
+                        reason: TRANSIENT_REASON.into(),
+                    };
+                }
+                match tokio::time::timeout(
+                    remaining,
+                    auto_network(&store, record.clone(), deadline),
+                )
+                .await
+                {
+                    Ok(result) => result,
+                    Err(_) => AutoNetwork::Retry {
+                        record,
+                        reason: TRANSIENT_REASON.into(),
+                    },
+                }
+            })
         });
         cx.spawn_in(window, async move |this, window| {
             let result = task.await;
@@ -157,22 +266,56 @@ impl Voxhold {
                 if !self.auth.remember_login {
                     return;
                 }
+                // The server expiry is re-checked after the request: the stored
+                // record may have expired while profile and servers were on
+                // the wire.
+                if session.is_expired(now_unix()) {
+                    self.forget_record(
+                        session.origin().to_owned(),
+                        session.username().to_owned(),
+                        cx,
+                    );
+                    self.auto_expired(attempt, cx);
+                    return;
+                }
+                if client.origin() != session.origin() {
+                    return;
+                }
                 self.auth.auto_retry = false;
+                let attempted = self.auto_record.clone();
                 self.auto_record = None;
                 self.last_stored_token = Some(session.token().to_owned());
+                let migration = std::mem::take(&mut self.migration_pending);
+                self.startup_restoring = false;
                 self.enter_workspace(client, servers, session, window, cx);
+                if migration {
+                    if let Some(record) = attempted {
+                        self.persist_migrated_target(record, window, cx);
+                    }
+                }
             }
             AutoNetwork::Unauthorized => {
+                self.delete_attempted_record(cx);
                 self.auth.remember_login = false;
                 self.auth.auto_retry = false;
                 self.auto_record = None;
+                self.startup_restoring = false;
                 self.auth.status = EXPIRED_REASON.into();
+                self.initial_focus_done = false;
             }
             AutoNetwork::WrongUser => {
+                self.delete_attempted_record(cx);
                 self.auth.remember_login = false;
                 self.auth.auto_retry = false;
                 self.auto_record = None;
+                self.startup_restoring = false;
                 self.auth.status = WRONG_USER_REASON.into();
+                self.initial_focus_done = false;
+            }
+            // A logout in another process owns the store generation now. The
+            // network answer must not enter the workspace or write the record.
+            AutoNetwork::Stale => {
+                self.startup_manual(attempt, "");
             }
             AutoNetwork::Retry { record, reason } => {
                 // The record is still valid; a network outage must not force
@@ -181,21 +324,45 @@ impl Voxhold {
                 self.auth.auto_retry = true;
                 self.auto_record = Some(record);
                 self.auth.status = reason;
+                self.startup_restoring = false;
+                self.initial_focus_done = false;
             }
             AutoNetwork::Manual { record, reason } => {
                 self.auth.remember_login = true;
                 self.auth.auto_retry = false;
                 self.auto_record = Some(record);
                 self.auth.status = reason;
+                self.startup_restoring = false;
+                self.initial_focus_done = false;
             }
         }
         cx.notify();
     }
 
+    fn auto_expired(&mut self, attempt: u64, cx: &mut Context<Self>) {
+        if self.auto_attempt != attempt {
+            return;
+        }
+        self.auth.auto_login = false;
+        self.auth.remember_login = false;
+        self.auth.auto_retry = false;
+        self.auto_record = None;
+        self.startup_restoring = false;
+        self.auth.status = EXPIRED_REASON.into();
+        self.initial_focus_done = false;
+        cx.notify();
+    }
+
     /// «Повторить» on the login card. It reuses the kept record, so the
-    /// confirmed address is not asked for again.
+    /// confirmed address is not asked for again. Exactly one new attempt is
+    /// started for the original target.
     pub(super) fn retry_auto_login(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.auth.screen != auth::AuthScreen::Login || self.session.is_some() || self.auth.busy {
+        if self.auth.screen != auth::AuthScreen::Login
+            || self.session.is_some()
+            || self.auth.busy
+            || self.auth.auto_login
+            || self.startup_restoring
+        {
             return;
         }
         let Some(record) = self.auto_record.clone() else {
@@ -206,13 +373,15 @@ impl Voxhold {
         }
         self.auto_attempt = self.auto_attempt.wrapping_add(1);
         let attempt = self.auto_attempt;
-        self.start_auto_network(attempt, record, window, cx);
+        let deadline = Instant::now() + self.startup_budget;
+        self.start_auto_network(attempt, record, deadline, window, cx);
         cx.notify();
     }
 
-    /// After a manual login: write the record when the box is checked, otherwise
-    /// remove any record for the same origin and account. The flag is read when
-    /// the answer arrives, so toggling the box during the request decides.
+    /// After a manual login: write the record and the one target when the box
+    /// is checked, otherwise remove any record for the same origin and account
+    /// and the target when it pointed there. The flag is read when the answer
+    /// arrives, so toggling the box during the request decides.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn remember_manual_login(
         &mut self,
@@ -247,7 +416,7 @@ impl Voxhold {
                         Err(error) => Err(error),
                     }
                 } else {
-                    match store.delete(&origin, &account, expected_epoch) {
+                    match store.forget(&origin, &account, expected_epoch) {
                         Ok(()) | Err(StoreError::Stale) => Ok(None),
                         Err(error) => Err(error),
                     }
@@ -264,6 +433,14 @@ impl Voxhold {
                     Ok(Some(token)) => {
                         s.last_stored_token = Some(token);
                         s.remember_error.clear();
+                        // A new remembered login supersedes a failed logout
+                        // cleanup and its suppression marker.
+                        s.auto_blocked = false;
+                        s.cleanup_retry = false;
+                        s.cleanup_unconfirmed = false;
+                        if s.auth.status.starts_with(CLEAR_ERROR) {
+                            s.auth.status.clear();
+                        }
                     }
                     Ok(None) => s.remember_error.clear(),
                     Err(_) => {
@@ -320,7 +497,7 @@ impl Voxhold {
                     expected_epoch,
                 ) {
                     Ok(updated) => updated,
-                    // A logout or a new login owns the file now.
+                    // A logout, a cleanup or a new login owns the file now.
                     Err(_) => false,
                 }
             })
@@ -341,55 +518,86 @@ impl Voxhold {
     }
 
     /// Delete the record of the session that just ended. `None` (no session)
-    /// is a no-op; the delete itself is local, so it also works offline. A
-    /// failure is retried once and then shown, never dropped.
+    /// is a no-op; the delete itself is local, so it also works offline.
     pub(super) fn forget_stored(
         &self,
         stored: Option<(String, String)>,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if let Some((origin, account)) = stored {
-            self.forget_record(origin, account, window, cx);
+            self.forget_record(origin, account, cx);
         }
     }
 
-    fn forget_record(
-        &self,
-        origin: String,
-        account: String,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub(super) fn forget_record(&self, origin: String, account: String, cx: &mut Context<Self>) {
         let store = self.session_store.clone();
         let expected_epoch = store.epoch();
-        let session_epoch = self.session_epoch;
+        cx.background_spawn(async move {
+            // One retry for a briefly held lock; the visible result is handled
+            // by the caller that owns the screen.
+            let result = store.delete(&origin, &account, expected_epoch);
+            if matches!(result, Err(StoreError::Lock) | Err(StoreError::Io)) {
+                let _ = store.delete(&origin, &account, expected_epoch);
+            }
+        })
+        .detach();
+    }
+
+    /// Remove every remembered login and the target of this Windows profile in
+    /// one atomic operation, then report whether the disk accepted it.
+    pub(super) fn clear_saved_logins(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.cleanup_pending {
+            return;
+        }
+        self.cleanup_pending = true;
+        self.cleanup_retry = false;
+        let expected_epoch = self.session_store.epoch();
+        self.cleanup_epoch = expected_epoch;
+        let store = self.session_store.clone();
         let rt = self.runtime.clone();
         let task = cx.background_spawn(async move {
             rt.block_on(async move {
-                let mut result = store.delete(&origin, &account, expected_epoch);
-                if matches!(result, Err(StoreError::Lock) | Err(StoreError::Io)) {
-                    result = store.delete(&origin, &account, expected_epoch);
-                }
-                result
+                let result = store.clear_all(expected_epoch);
+                // If the records could not be removed, try to leave a marker
+                // that suppresses the next automatic restoration.
+                let blocked = result.is_err() && store.block_restore(expected_epoch).is_ok();
+                (result, blocked)
             })
         });
         cx.spawn_in(window, async move |this, window| {
-            let result = task.await;
+            let (result, blocked) = task.await;
             let _ = this.update_in(window, |s, _window, cx| {
-                // A new login owns the screen now; its state must not receive
-                // an error from the session that ended before it.
-                if s.session_epoch != session_epoch {
-                    return;
-                }
-                if result.is_ok() || result == Err(StoreError::Stale) {
-                    return;
-                }
-                let message = DELETE_ERROR.to_string();
-                if s.session.is_none() {
-                    s.auth.status = message;
-                } else {
-                    s.remember_error = message;
+                s.cleanup_pending = false;
+                match result {
+                    // Another process already moved the generation on; its
+                    // newer login or logout owns the file.
+                    Ok(_) | Err(StoreError::Stale) => {
+                        s.auto_blocked = false;
+                        s.cleanup_retry = false;
+                        s.cleanup_unconfirmed = false;
+                        if s.session.is_none() && s.auth.status.starts_with(CLEAR_ERROR) {
+                            s.auth.status.clear();
+                        }
+                    }
+                    Err(_) => {
+                        s.auto_blocked = true;
+                        s.cleanup_retry = true;
+                        s.cleanup_unconfirmed = !blocked;
+                        let message = if blocked {
+                            CLEAR_ERROR.to_string()
+                        } else {
+                            format!("{CLEAR_ERROR}. {CLEAR_UNCONFIRMED}")
+                        };
+                        if s.session.is_none() {
+                            s.auth.status = message;
+                        } else {
+                            // The user already started a new session; keep the
+                            // failure visible in the workspace notice instead
+                            // of the auth form.
+                            s.remember_error = message;
+                        }
+                    }
                 }
                 cx.notify();
             });
@@ -397,23 +605,99 @@ impl Voxhold {
         .detach();
     }
 
+    /// «Повторить очистку» after a failed logout cleanup.
+    pub(super) fn retry_cleanup(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.cleanup_retry || self.cleanup_pending || self.session.is_some() {
+            return;
+        }
+        self.auth.status.clear();
+        self.clear_saved_logins(window, cx);
+        cx.notify();
+    }
+
+    /// Synchronous last attempt used when the window closes while the cleanup
+    /// is still queued. The result cannot be shown any more, so the marker is
+    /// the explicit fallback.
+    pub(super) fn finish_pending_cleanup(&mut self) {
+        if !self.cleanup_pending {
+            return;
+        }
+        self.cleanup_pending = false;
+        // The captured generation, not the current one: a login that already
+        // started supersedes this cleanup and must survive the close.
+        let expected = self.cleanup_epoch;
+        match self.session_store.clear_all(expected) {
+            Ok(_) | Err(StoreError::Stale) => {}
+            Err(_) => {
+                let _ = self.session_store.block_restore(expected);
+            }
+        }
+    }
+
+    fn persist_migrated_target(
+        &mut self,
+        record: RememberedSession,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let store = self.session_store.clone();
+        let expected_epoch = self.session_store.epoch();
+        let rt = self.runtime.clone();
+        let task = cx.background_spawn(async move {
+            rt.block_on(async move { store.set_target(&record, expected_epoch) })
+        });
+        cx.spawn_in(window, async move |this, window| {
+            let result = task.await;
+            let _ = this.update_in(window, |s, _window, cx| {
+                if s.session.is_none() {
+                    return;
+                }
+                if result.is_err() && result != Err(StoreError::Stale) {
+                    s.remember_error = SAVE_ERROR.to_string();
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn delete_attempted_record(&mut self, cx: &mut Context<Self>) {
+        if let Some(record) = self.auto_record.clone() {
+            self.forget_record(record.origin, record.account, cx);
+        }
+    }
+
+    fn startup_still_owns(&self, attempt: u64) -> bool {
+        // The store read is read-only and may legitimately raise the in-process
+        // generation to the disk one; the write barrier is captured again in
+        // `start_auto_network`.
+        self.auto_attempt == attempt && self.session.is_none() && self.startup_restoring
+    }
+
     fn auto_still_owns(&self, attempt: u64) -> bool {
         self.auto_attempt == attempt
             && self.auth.screen == auth::AuthScreen::Login
             && self.session.is_none()
             && !self.auth.busy
+            && self.auto_epoch == self.session_store.epoch()
     }
 }
 
 /// The background network step. Nothing here touches GPUI state; only the
 /// final enum crosses back to the UI thread.
-async fn auto_network(store: &SessionStore, record: RememberedSession) -> AutoNetwork {
+async fn auto_network(
+    store: &SessionStore,
+    record: RememberedSession,
+    deadline: Instant,
+) -> AutoNetwork {
     // Every delete in this attempt belongs to the generation that started it;
     // a logout that bumps the generation makes a late delete harmless.
     let expected_epoch = store.epoch();
     let mut client = match Client::new(&record.origin) {
-        Ok(client) => client,
-        Err(_) => {
+        // The canonical origin must round-trip exactly before a Bearer token
+        // is attached; this also checks scheme, host and port.
+        Ok(client) if client.origin() == record.origin => client,
+        _ => {
             return AutoNetwork::Manual {
                 record,
                 reason: FAILED_REASON.into(),
@@ -421,18 +705,42 @@ async fn auto_network(store: &SessionStore, record: RememberedSession) -> AutoNe
         }
     };
     client.set_token(record.token.clone());
-    let profile = match client.profile().await {
+    let profile = match request_with_deadline(deadline, client.profile()).await {
         Ok(profile) => profile,
         Err(error) => return auto_error(store, &record, &error, expected_epoch),
     };
-    let servers = match client.servers().await {
-        Ok(servers) => servers,
-        Err(error) => return auto_error(store, &record, &error, expected_epoch),
-    };
+    // The expiry is checked again after each wire trip; a token that ran out
+    // while the request was in flight is not used for the next one.
+    if record.is_expired(now_unix()) {
+        let _ = store.delete(&record.origin, &record.account, expected_epoch);
+        return AutoNetwork::Unauthorized;
+    }
+    if store
+        .state()
+        .is_ok_and(|state| state.generation > expected_epoch)
+    {
+        // Another window or process logged out (or started a new generation)
+        // while this answer was on the wire.
+        return AutoNetwork::Stale;
+    }
     if profile.user_id != record.user_id || !accounts_match(&record.account, &profile.username) {
         // A record that now answers as another user is not this login.
         let _ = store.delete(&record.origin, &record.account, expected_epoch);
         return AutoNetwork::WrongUser;
+    }
+    let servers = match request_with_deadline(deadline, client.servers()).await {
+        Ok(servers) => servers,
+        Err(error) => return auto_error(store, &record, &error, expected_epoch),
+    };
+    if record.is_expired(now_unix()) {
+        let _ = store.delete(&record.origin, &record.account, expected_epoch);
+        return AutoNetwork::Unauthorized;
+    }
+    if store
+        .state()
+        .is_ok_and(|state| state.generation > expected_epoch)
+    {
+        return AutoNetwork::Stale;
     }
     let Some(session) = Session::new(
         record.origin.clone(),
@@ -450,6 +758,22 @@ async fn auto_network(store: &SessionStore, record: RememberedSession) -> AutoNe
         client,
         servers,
         session,
+    }
+}
+
+/// Await one request only while the shared startup budget allows it. A timeout
+/// is the same transient reason as a dropped connection.
+async fn request_with_deadline<T>(
+    deadline: Instant,
+    request: impl std::future::Future<Output = voxhold_api::Result<T>>,
+) -> voxhold_api::Result<T> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(voxhold_api::Error::Network);
+    }
+    match tokio::time::timeout(remaining, request).await {
+        Ok(result) => result,
+        Err(_) => Err(voxhold_api::Error::Network),
     }
 }
 

@@ -97,7 +97,7 @@ impl Voxhold {
             search.update(cx, |panel, cx| panel.set_scope(self.server, 0, cx));
         }
         self.messages.clear();
-        self.history_keys.clear();
+        self.reset_history_cache();
         self.history_list = Self::new_history_list(ListAlignment::Bottom, cx);
         self.scrollbar_drag = None;
         self.before = None;

@@ -232,6 +232,10 @@ pub struct VoicePanel {
     /// proves that a replaced or closed incoming frame left the sprite atlas.
     #[cfg(test)]
     player_images_released: u32,
+    /// Image id that stood in `frame` when the player released a picture.
+    /// Test-only: it proves the slot already pointed at the replacement.
+    #[cfg(test)]
+    last_release_slot_image: Option<u64>,
 }
 
 impl VoicePanel {
@@ -360,6 +364,8 @@ impl VoicePanel {
             test_preview_provider: None,
             #[cfg(test)]
             player_images_released: 0,
+            #[cfg(test)]
+            last_release_slot_image: None,
         }
     }
 
@@ -961,32 +967,6 @@ impl VoicePanel {
         self.close_player(window);
     }
 
-    /// Release the incoming player picture, if one is held. The slot is empty
-    /// before `drop_image` runs, so a frame that is still painted this tick
-    /// keeps its own `Arc` and is never invalidated under the renderer.
-    fn clear_player_frame(&mut self, window: &mut Window) {
-        if let Some(previous) = self.frame.take() {
-            self.release_player_image(window, previous);
-        }
-    }
-
-    /// Install the newest decoded frame and release the previous one only
-    /// after the slot already points at the new picture.
-    fn set_player_frame(&mut self, window: &mut Window, image: Arc<RenderImage>) {
-        let previous = self.frame.replace(image);
-        if let Some(previous) = previous {
-            self.release_player_image(window, previous);
-        }
-    }
-
-    fn release_player_image(&mut self, window: &mut Window, image: Arc<RenderImage>) {
-        let _ = window.drop_image(image);
-        #[cfg(test)]
-        {
-            self.player_images_released = self.player_images_released.saturating_add(1);
-        }
-    }
-
     pub fn toggle_stream_mute(&mut self, cx: &mut Context<Self>) {
         let Some(selection) = self.watching_selection else {
             return;
@@ -1185,6 +1165,7 @@ mod controls;
 mod cues;
 mod focus;
 mod player;
+mod player_frame;
 mod screen_share;
 use screen_share::ScreenShareUi;
 mod sidebar;

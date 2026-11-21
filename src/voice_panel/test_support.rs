@@ -84,32 +84,31 @@ impl VoicePanel {
 
     /// Open the picker without the OS capture gate and with a fixed list, so
     /// the keyboard and cancel paths are testable on any host.
-    pub fn test_open_screen_picker(&mut self, source: ScreenSource) {
+    pub fn test_open_screen_picker(&mut self, window: &mut Window, source: ScreenSource) {
         let kind = source.kind;
         let id = source.source_id();
-        self.test_open_screen_picker_with(kind, vec![source.clone()], Some(id));
+        self.test_open_screen_picker_with(window, kind, vec![source.clone()], Some(id));
     }
 
     /// Open the picker with a controlled list and an optional selection, so
     /// reorder/invalid-refresh cases use the same state as the worker answer.
     pub fn test_open_screen_picker_with(
         &mut self,
+        window: &mut Window,
         kind: SourceKind,
         sources: Vec<ScreenSource>,
         selected: Option<SourceId>,
     ) {
         self.test_share_gate = Some(Ok(()));
-        // A test picker is a new session too: the preview epoch moves so a
-        // result from the previous picker can never match it again.
-        let epoch = self.screen.preview_epoch.wrapping_add(1);
-        #[cfg(test)]
+        // A test picker is a new session too: release the previous picker's
+        // pictures through the production path (epoch move + drop_image), then
+        // reset the rest of the dialog state.
+        self.screen.clear_previews(window);
+        let epoch = self.screen.preview_epoch;
         let released_images = self.screen.released_images;
         self.screen = ScreenShareUi::default();
         self.screen.preview_epoch = epoch;
-        #[cfg(test)]
-        {
-            self.screen.released_images = released_images;
-        }
+        self.screen.released_images = released_images;
         self.screen.open = true;
         self.screen.picker = 7;
         self.screen.kind = kind;
@@ -162,8 +161,8 @@ impl VoicePanel {
 
     /// Select a source and close the picker surface, so a test can exercise
     /// the publish/stop handoff without the dialog taking keyboard focus.
-    pub fn test_prepare_screen_publish(&mut self, source: ScreenSource) {
-        self.test_open_screen_picker(source);
+    pub fn test_prepare_screen_publish(&mut self, window: &mut Window, source: ScreenSource) {
+        self.test_open_screen_picker(window, source);
         self.screen.open = false;
     }
 
@@ -449,7 +448,7 @@ impl VoicePanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.test_open_screen_picker(source.clone());
+        self.test_open_screen_picker(window, source.clone());
         let mut sharing = sharing;
         // The media layer fills `confirmed` when the attempt goes Live. Tests
         // that only describe the live snapshot get the same seam here.
@@ -754,6 +753,18 @@ impl VoicePanel {
     /// Image id of the incoming player frame, if it holds one.
     pub fn test_player_frame_image_id(&self) -> Option<usize> {
         self.frame.as_ref().map(|image| image.id.0)
+    }
+
+    /// Image id that stood in the on-air slot when the picker last released a
+    /// picture. `None` there means the slot was already empty.
+    pub fn test_screen_release_slot_image_id(&self) -> Option<u64> {
+        self.screen.last_release_slot_image
+    }
+
+    /// Image id that stood in the player slot when the last frame was
+    /// released. `None` there means the slot was already empty.
+    pub fn test_player_release_slot_image_id(&self) -> Option<u64> {
+        self.last_release_slot_image
     }
 
     /// Install an on-air picture through the production setter, so a test can

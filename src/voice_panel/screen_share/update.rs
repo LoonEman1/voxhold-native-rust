@@ -137,8 +137,10 @@ impl VoicePanel {
                                 "Соединение было восстановлено, выберите экран снова.".into();
                         }
                     }
-                }
-                if phase == Phase::Idle && previous != Phase::Idle {
+                    // Every Idle snapshot drops the on-air picture. The state
+                    // updates are coalesced, so `previous` being Idle does not
+                    // prove that no card is held: Stop may have released the
+                    // thumbnails while this update still carried the card.
                     self.screen.clear_preview(window);
                 }
                 // The gate can change without a picker click: the attempt is

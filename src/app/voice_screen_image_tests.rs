@@ -5,6 +5,7 @@
 use super::voice_screen_tests::{draw, monitor};
 use gpui::{RenderImage, TestAppContext};
 use std::sync::Arc;
+use voxhold_media::publisher::Sharing;
 use voxhold_media::screen_capture::SourceKind;
 
 /// One small GPUI picture with a real image id, so the slot can be checked
@@ -47,6 +48,11 @@ async fn a_replaced_screen_preview_frame_is_released(cx: &mut TestAppContext) {
                 "the slot points at the new frame before the old one is released"
             );
             assert_eq!(
+                panel.test_screen_release_slot_image_id(),
+                Some(second_id as u64),
+                "the slot already held the replacement when the old frame was dropped"
+            );
+            assert_eq!(
                 panel.test_screen_images_released(),
                 1,
                 "the replaced preview frame must be released from the atlas"
@@ -64,7 +70,12 @@ async fn a_replaced_thumbnail_is_released(cx: &mut TestAppContext) {
     let source = monitor(3, "Экран A", 1920, 1080);
     visual.update(|window, app| {
         voice.update(app, |panel, _| {
-            panel.test_open_screen_picker_with(SourceKind::Monitor, vec![source.clone()], None);
+            panel.test_open_screen_picker_with(
+                window,
+                SourceKind::Monitor,
+                vec![source.clone()],
+                None,
+            );
             assert!(panel.test_inject_screen_preview(window, &source, 8, 8));
             assert_eq!(panel.test_screen_images_released(), 0);
 
@@ -93,6 +104,7 @@ async fn stop_releases_the_picker_thumbnail_cache(cx: &mut TestAppContext) {
     visual.update(|window, app| {
         voice.update(app, |panel, cx| {
             panel.test_open_screen_picker_with(
+                window,
                 SourceKind::Monitor,
                 vec![source.clone(), other.clone()],
                 None,
@@ -125,7 +137,12 @@ async fn closing_the_picker_releases_the_thumbnail_cache(cx: &mut TestAppContext
     let source = monitor(3, "Экран A", 1920, 1080);
     visual.update(|window, app| {
         voice.update(app, |panel, cx| {
-            panel.test_open_screen_picker_with(SourceKind::Monitor, vec![source.clone()], None);
+            panel.test_open_screen_picker_with(
+                window,
+                SourceKind::Monitor,
+                vec![source.clone()],
+                None,
+            );
             assert!(panel.test_inject_screen_preview(window, &source, 8, 8));
             panel.test_close_screen_share(window, cx);
             assert_eq!(panel.test_screen_preview_counts(), (0, 0));
@@ -145,6 +162,7 @@ async fn a_removed_source_preview_is_released(cx: &mut TestAppContext) {
     visual.update(|window, app| {
         voice.update(app, |panel, _| {
             panel.test_open_screen_picker_with(
+                window,
                 SourceKind::Monitor,
                 vec![kept.clone(), gone.clone()],
                 None,
@@ -183,6 +201,11 @@ async fn a_replaced_player_frame_is_released(cx: &mut TestAppContext) {
             panel.test_set_player_frame(window, second);
             assert_eq!(panel.test_player_frame_image_id(), Some(second_id));
             assert_eq!(
+                panel.test_player_release_slot_image_id(),
+                Some(second_id as u64),
+                "the slot already held the replacement when the old frame was dropped"
+            );
+            assert_eq!(
                 panel.test_player_images_released(),
                 1,
                 "the replaced player frame must reach Window::drop_image"
@@ -216,7 +239,12 @@ async fn resetting_the_share_releases_every_held_image(cx: &mut TestAppContext) 
     let source = monitor(3, "Экран A", 1920, 1080);
     visual.update(|window, app| {
         voice.update(app, |panel, cx| {
-            panel.test_open_screen_picker_with(SourceKind::Monitor, vec![source.clone()], None);
+            panel.test_open_screen_picker_with(
+                window,
+                SourceKind::Monitor,
+                vec![source.clone()],
+                None,
+            );
             panel.test_set_screen_preview(window, plate(2, 2, [0x11, 0x22, 0x33, 0xff]));
             assert!(panel.test_inject_screen_preview(window, &source, 8, 8));
             panel.test_set_player_frame(window, plate(4, 4, [0x44, 0x55, 0x66, 0xff]));
@@ -254,7 +282,12 @@ async fn a_lost_call_releases_the_preview_and_player_images(cx: &mut TestAppCont
     let source = monitor(3, "Экран A", 1920, 1080);
     visual.update(|window, app| {
         voice.update(app, |panel, cx| {
-            panel.test_open_screen_picker_with(SourceKind::Monitor, vec![source.clone()], None);
+            panel.test_open_screen_picker_with(
+                window,
+                SourceKind::Monitor,
+                vec![source.clone()],
+                None,
+            );
             panel.test_set_screen_preview(window, plate(2, 2, [0x12, 0x23, 0x34, 0xff]));
             assert!(panel.test_inject_screen_preview(window, &source, 8, 8));
             panel.test_set_player_frame(window, plate(4, 4, [0x45, 0x56, 0x67, 0xff]));
@@ -268,6 +301,121 @@ async fn a_lost_call_releases_the_preview_and_player_images(cx: &mut TestAppCont
             assert_eq!(panel.test_player_frame_image_id(), None);
             assert_eq!(panel.test_screen_images_released(), 2);
             assert_eq!(panel.test_player_images_released(), 1);
+        });
+    });
+}
+
+/// Stop releases the on-air picture that a frame already showed, so a stopped
+/// stream cannot keep its texture until an Idle snapshot arrives.
+#[gpui::test]
+async fn stop_releases_the_shown_preview_card(cx: &mut TestAppContext) {
+    let (mut visual, _view, voice) = super::voice_tests::fixture(cx);
+    draw(&mut visual);
+    let source = monitor(3, "Экран A", 1920, 1080);
+    visual.update(|window, app| {
+        voice.update(app, |panel, cx| {
+            panel.test_open_screen_picker_with(
+                window,
+                SourceKind::Monitor,
+                vec![source.clone()],
+                None,
+            );
+            assert!(panel.test_inject_screen_preview(window, &source, 8, 8));
+            panel.test_set_screen_preview(window, plate(2, 2, [0x01, 0x02, 0x03, 0xff]));
+            assert_eq!(panel.test_screen_images_released(), 0);
+
+            panel.test_stop_screen_share(window, cx);
+            assert_eq!(
+                panel.test_screen_preview_image_id(),
+                None,
+                "Stop drops the card that was already shown"
+            );
+            assert_eq!(
+                panel.test_screen_images_released(),
+                2,
+                "Stop releases both the card and the cached thumbnail"
+            );
+        });
+    });
+}
+
+/// A coalesced Idle snapshot releases a shown card even when the previous
+/// snapshot was already Idle: Stop and the phase answer may arrive merged.
+#[gpui::test]
+async fn an_idle_update_releases_a_shown_preview_card(cx: &mut TestAppContext) {
+    let (mut visual, _view, voice) = super::voice_tests::fixture(cx);
+    draw(&mut visual);
+    visual.update(|window, app| {
+        voice.update(app, |panel, _| {
+            assert!(
+                panel.test_apply_screen_sharing(window, Sharing::default()),
+                "an Idle snapshot still repaints"
+            );
+            panel.test_set_screen_preview(window, plate(2, 2, [0x04, 0x05, 0x06, 0xff]));
+            assert_eq!(panel.test_screen_images_released(), 0);
+
+            assert!(panel.test_apply_screen_sharing(window, Sharing::default()));
+            assert_eq!(
+                panel.test_screen_preview_image_id(),
+                None,
+                "an Idle snapshot releases the card even after an Idle one"
+            );
+            assert_eq!(panel.test_screen_images_released(), 1);
+        });
+    });
+}
+
+/// Repeated Stop and reset calls are idempotent: each removed picture is
+/// released exactly once, and a later preview gets a fresh image.
+#[gpui::test]
+async fn repeated_stop_and_reset_release_each_picture_once(cx: &mut TestAppContext) {
+    let (mut visual, _view, voice) = super::voice_tests::fixture(cx);
+    draw(&mut visual);
+    let first = plate(2, 2, [0x0a, 0x0b, 0x0c, 0xff]);
+    let first_id = first.id.0;
+    visual.update(|window, app| {
+        voice.update(app, |panel, cx| {
+            panel.test_open_screen_picker_with(window, SourceKind::Monitor, Vec::new(), None);
+            panel.test_set_screen_preview(window, first);
+            assert_eq!(panel.test_screen_preview_image_id(), Some(first_id));
+
+            panel.test_stop_screen_share(window, cx);
+            assert_eq!(panel.test_screen_images_released(), 1);
+            assert_eq!(panel.test_screen_preview_image_id(), None);
+            // A repeated Stop has nothing left and must not panic.
+            panel.test_stop_screen_share(window, cx);
+            assert_eq!(
+                panel.test_screen_images_released(),
+                1,
+                "the second Stop releases nothing"
+            );
+            panel.test_reset_screen(window);
+            assert_eq!(
+                panel.test_screen_images_released(),
+                1,
+                "reset after Stop releases nothing"
+            );
+            panel.test_reset_screen(window);
+            assert_eq!(
+                panel.test_screen_images_released(),
+                1,
+                "a repeated reset releases nothing"
+            );
+
+            let second = plate(2, 2, [0x0d, 0x0e, 0x0f, 0xff]);
+            let second_id = second.id.0;
+            assert_ne!(second_id, first_id, "the new preview is a new texture");
+            panel.test_set_screen_preview(window, second);
+            assert_eq!(
+                panel.test_screen_preview_image_id(),
+                Some(second_id),
+                "a new preview is installed after the resets"
+            );
+            assert_eq!(
+                panel.test_screen_images_released(),
+                1,
+                "filling the empty slot replaces nothing"
+            );
         });
     });
 }

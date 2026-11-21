@@ -155,6 +155,11 @@ pub(super) struct ScreenShareUi {
     /// being only removed from a collection.
     #[cfg(test)]
     pub(super) released_images: u32,
+    /// Image id that stood in `preview` when `release_image` last ran.
+    /// Test-only: it proves the slot already pointed at the replacement when
+    /// the old picture was handed to `Window::drop_image`.
+    #[cfg(test)]
+    pub(super) last_release_slot_image: Option<u64>,
     pub(super) ring: Vec<(FocusHandle, ShareKey)>,
     /// Set once the dialog focused its first ring element. The flag is reset
     /// with the dialog, so a repaint never steals focus back from the user.
@@ -202,6 +207,8 @@ impl Default for ScreenShareUi {
             preview_cards: 0,
             #[cfg(test)]
             released_images: 0,
+            #[cfg(test)]
+            last_release_slot_image: None,
             ring: Vec::new(),
             focus_placed: false,
         }
@@ -956,6 +963,10 @@ impl VoicePanel {
         }
         // A stop ends the picker session: no capture may start another card.
         self.screen.clear_previews(window);
+        // The on-air card may already hold the last shown frame, and the phase
+        // update can arrive coalesced with the stop. Release the picture here
+        // as well instead of relying on that update.
+        self.screen.clear_preview(window);
         cx.notify();
     }
 
@@ -1004,8 +1015,11 @@ impl VoicePanel {
     }
 
     /// Take the newest local preview for the on-air card. The previous picture
-    /// is released only after the slot already points at the new frame, so the
-    /// image of the current frame is never dropped before it is replaced.
+    /// is released only after the slot already points at the new frame. The
+    /// protection does not come from the old `Arc`: `drop_image` removes the
+    /// atlas entry regardless of other owners. It comes from the replacement
+    /// running in the poll before the next repaint, so the renderer never
+    /// paints a picture whose entry was already dropped.
     pub(super) fn take_screen_preview(&mut self, window: &mut Window) -> bool {
         let Some(frame) = self
             .handle

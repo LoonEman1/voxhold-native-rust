@@ -20,7 +20,7 @@ impl ScreenShareUi {
     /// batch guard is released here as well: the epoch check in the old batch
     /// stops it from touching a newer session's flag. Cached pictures are
     /// removed from the sprite atlas, never just forgotten.
-    pub(super) fn clear_previews(&mut self, window: &mut Window) {
+    pub(in crate::voice_panel) fn clear_previews(&mut self, window: &mut Window) {
         self.preview_epoch = self.preview_epoch.wrapping_add(1);
         let images: Vec<Arc<RenderImage>> = self
             .previews
@@ -43,6 +43,9 @@ impl ScreenShareUi {
         let _ = window.drop_image(image);
         #[cfg(test)]
         {
+            // Read at the exact moment of the drop, so a test observes the
+            // slot the renderer would see, not just the order of two calls.
+            self.last_release_slot_image = self.preview.as_ref().map(|image| image.id.0 as u64);
             self.released_images = self.released_images.saturating_add(1);
         }
     }
@@ -366,7 +369,7 @@ impl VoicePanel {
                     .ok()
                     .flatten();
             }
-            let _ = this.update_in(cx, |panel, window, cx| {
+            let applied = this.update_in(cx, |panel, window, cx| {
                 // Only this batch's epoch may release the flag: a newer picker
                 // or dialog already reset it, and a late end must not clear a
                 // batch that session started.
@@ -380,6 +383,18 @@ impl VoicePanel {
                     panel.request_screen_previews(window, cx);
                 }
             });
+            if applied.is_err() {
+                // The window may close between the last capture and this end
+                // of the batch. The entity can still be updated without one,
+                // so release the guard and the pending ids there: a stuck
+                // `preview_batching` would keep this panel from ever capturing
+                // again. No picture is touched, so no window is needed.
+                let _ = this.update(cx, |panel, _| {
+                    if panel.screen.end_preview_batch(epoch) {
+                        panel.screen.preview_pending.clear();
+                    }
+                });
+            }
         })
         .detach();
     }

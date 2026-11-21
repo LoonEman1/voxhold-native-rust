@@ -79,10 +79,10 @@ pub(super) fn open_picker(
     visual: &mut gpui::VisualTestContext,
     voice: &gpui::Entity<crate::voice_panel::VoicePanel>,
 ) {
-    visual.update(|_window, app| {
+    visual.update(|window, app| {
         voice.update(app, |panel, _| {
             panel.test_attach_detached_handle();
-            panel.test_open_screen_picker(source());
+            panel.test_open_screen_picker(window, source());
         });
     });
     // The focus request is deferred to the frame callback; the second draw
@@ -98,10 +98,10 @@ pub(super) fn open_picker_with(
     kind: SourceKind,
     sources: Vec<ScreenSource>,
 ) {
-    visual.update(|_window, app| {
+    visual.update(|window, app| {
         voice.update(app, |panel, _| {
             panel.test_attach_detached_handle();
-            panel.test_open_screen_picker_with(kind, sources, None);
+            panel.test_open_screen_picker_with(window, kind, sources, None);
         });
     });
     draw(visual);
@@ -792,7 +792,7 @@ async fn sharing_and_stopping_leave_the_microphone_gate_and_ptt_untouched(cx: &m
             panel.set_push_to_talk(true);
             panel.set_push_to_talk_held(true);
             assert!(panel.test_ptt_held(), "the microphone is transmitting");
-            panel.test_prepare_screen_publish(source());
+            panel.test_prepare_screen_publish(window, source());
             assert!(
                 panel.test_ptt_held(),
                 "preparing the source must not release push-to-talk"
@@ -1057,6 +1057,7 @@ async fn a_duplicate_source_id_is_never_selected_or_published(cx: &mut TestAppCo
             // The selection is still held by identity, as after a click on the
             // row before the duplicated snapshot arrived.
             panel.test_open_screen_picker_with(
+                window,
                 SourceKind::Monitor,
                 vec![first.clone(), duplicate.clone()],
                 Some(id),

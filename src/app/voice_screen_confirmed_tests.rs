@@ -62,6 +62,7 @@ fn open_dialog(
     panel.test_attach_detached_handle();
     panel.test_set_audio_probe(Arc::new(|| Ok(device())));
     panel.test_open_screen_picker_with(
+        window,
         sharing
             .confirmed
             .as_ref()
@@ -432,7 +433,7 @@ async fn an_ordinary_picker_never_sends_a_stale_confirmed_source(cx: &mut TestAp
             // A previous publication left its confirmed configuration behind
             // while a new picker is open. The picker sends the row it selects,
             // never that leftover live source.
-            panel.test_open_screen_picker(picked.clone());
+            panel.test_open_screen_picker(window, picked.clone());
             panel.test_set_screen_confirmed_source(live_source.clone());
             panel.test_select_screen_source(picked.clone(), cx);
             assert_eq!(

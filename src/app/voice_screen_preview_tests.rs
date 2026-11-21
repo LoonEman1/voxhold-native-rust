@@ -152,6 +152,7 @@ async fn a_selected_card_paints_its_thumbnail_and_badge(cx: &mut TestAppContext)
         voice.update(app, |panel, _| {
             panel.test_attach_detached_handle();
             panel.test_open_screen_picker_with(
+                window,
                 SourceKind::Monitor,
                 vec![selected.clone()],
                 Some(id),
@@ -192,10 +193,11 @@ async fn a_failed_preview_does_not_change_the_selected_id_or_startable_source(
     draw(&mut visual);
     let selected = monitor(3, "Экран A", 1920, 1080);
     let id = selected.source_id();
-    visual.update(|_window, app| {
+    visual.update(|window, app| {
         voice.update(app, |panel, _| {
             panel.test_attach_detached_handle();
             panel.test_open_screen_picker_with(
+                window,
                 SourceKind::Monitor,
                 vec![selected.clone()],
                 Some(id),
@@ -331,7 +333,7 @@ async fn the_preview_cache_enforces_its_count_and_byte_bounds(cx: &mut TestAppCo
     let (visual, _view, voice) = super::voice_tests::fixture(cx);
     visual.update(|window, app| {
         voice.update(app, |panel, _| {
-            panel.test_open_screen_picker_with(SourceKind::Monitor, Vec::new(), None);
+            panel.test_open_screen_picker_with(window, SourceKind::Monitor, Vec::new(), None);
             let (max_count, max_bytes) = panel.test_screen_preview_bounds();
             for index in 0..(max_count + 5) {
                 let source = monitor(10_000 + index as u64, "Экран", 8, 8);
@@ -344,7 +346,7 @@ async fn the_preview_cache_enforces_its_count_and_byte_bounds(cx: &mut TestAppCo
 
             // A fresh picker starts at zero and the byte bound rejects before
             // the count bound for large thumbnails.
-            panel.test_open_screen_picker_with(SourceKind::Monitor, Vec::new(), None);
+            panel.test_open_screen_picker_with(window, SourceKind::Monitor, Vec::new(), None);
             assert_eq!(panel.test_screen_preview_counts(), (0, 0));
             for index in 0..(max_count + 5) {
                 let source = monitor(20_000 + index as u64, "Экран", 320, 320);
@@ -488,7 +490,7 @@ async fn replacing_a_preview_does_not_inflate_the_byte_budget(cx: &mut TestAppCo
     let (visual, _view, voice) = super::voice_tests::fixture(cx);
     visual.update(|window, app| {
         voice.update(app, |panel, _| {
-            panel.test_open_screen_picker_with(SourceKind::Monitor, Vec::new(), None);
+            panel.test_open_screen_picker_with(window, SourceKind::Monitor, Vec::new(), None);
             let source = monitor(3, "Экран A", 1920, 1080);
             assert!(panel.test_inject_screen_preview(window, &source, 8, 8));
             assert_eq!(
@@ -574,10 +576,15 @@ async fn only_the_visible_category_is_queued_for_previews(cx: &mut TestAppContex
     draw(&mut visual);
     let visible = monitor(3, "Экран A", 1920, 1080);
     let hidden = window(11, "Документ");
-    visual.update(|_window, app| {
+    visual.update(|window, app| {
         voice.update(app, |panel, _| {
             panel.test_attach_detached_handle();
-            panel.test_open_screen_picker_with(SourceKind::Monitor, vec![visible.clone()], None);
+            panel.test_open_screen_picker_with(
+                window,
+                SourceKind::Monitor,
+                vec![visible.clone()],
+                None,
+            );
             panel
                 .test_replace_screen_list_without_refresh(SourceKind::Window, vec![hidden.clone()]);
         });

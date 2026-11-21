@@ -58,7 +58,7 @@ fn open_restart(
     cx: &mut gpui::Context<crate::voice_panel::VoicePanel>,
 ) {
     panel.test_attach_detached_handle();
-    panel.test_open_screen_picker_with(SourceKind::Window, snapshot, None);
+    panel.test_open_screen_picker_with(window, SourceKind::Window, snapshot, None);
     panel.test_set_screen_sharing(live_sharing());
     panel.test_set_screen_confirmed_source(live);
     panel.test_open_live_screen_settings(window, cx);
@@ -74,7 +74,7 @@ async fn a_live_window_restart_binds_to_the_confirmed_source_with_an_empty_list(
     visual.update(|window, app| {
         voice.update(app, |panel, cx| {
             panel.test_attach_detached_handle();
-            panel.test_open_screen_picker_with(SourceKind::Window, Vec::new(), None);
+            panel.test_open_screen_picker_with(window, SourceKind::Window, Vec::new(), None);
             // The live dialog repeats the endpoint probe; Start must wait.
             panel.test_set_screen_audio_pending(Arc::new(|| {
                 std::thread::sleep(Duration::from_millis(150));
@@ -146,7 +146,12 @@ async fn a_live_window_restart_binds_to_the_confirmed_source_with_an_empty_list(
     let replacement = monitor(5, "Экран B", 2560, 1440);
     visual.update(|window, app| {
         voice.update(app, |panel, cx| {
-            panel.test_open_screen_picker_with(SourceKind::Monitor, vec![removed.clone()], None);
+            panel.test_open_screen_picker_with(
+                window,
+                SourceKind::Monitor,
+                vec![removed.clone()],
+                None,
+            );
             panel.test_select_screen_source(removed, cx);
             panel.test_replace_screen_list_without_refresh(SourceKind::Monitor, vec![replacement]);
             assert!(!panel.test_can_start(), "the id is no longer in the list");
@@ -516,7 +521,7 @@ pub(super) fn open_quality_dialog(
 ) {
     panel.test_attach_detached_handle();
     panel.test_set_audio_probe(Arc::new(|| Ok(device())));
-    panel.test_open_screen_picker_with(live_source.kind, Vec::new(), None);
+    panel.test_open_screen_picker_with(window, live_source.kind, Vec::new(), None);
     panel.test_set_screen_sharing(sharing_with(quality, audio));
     panel.test_set_screen_confirmed_request(PublishRequest {
         source: live_source,

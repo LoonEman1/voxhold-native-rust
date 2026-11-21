@@ -177,7 +177,9 @@ impl VoicePanel {
                         .justify_center()
                         .cursor_pointer()
                         .track_focus(&quality_focus)
-                        .on_click(cx.listener(|panel, _, _, cx| panel.open_screen_settings(cx)))
+                        .on_click(cx.listener(|panel, _, window, cx| {
+                            panel.open_screen_settings(window, cx)
+                        }))
                         .child("Качество"),
                 );
             }
@@ -198,7 +200,9 @@ impl VoicePanel {
                     .justify_center()
                     .cursor_pointer()
                     .track_focus(&stop_focus)
-                    .on_click(cx.listener(|panel, _, _, cx| panel.stop_screen_share(cx)))
+                    .on_click(
+                        cx.listener(|panel, _, window, cx| panel.stop_screen_share(window, cx)),
+                    )
                     .child("Завершить"),
             );
             card = card.child(actions);

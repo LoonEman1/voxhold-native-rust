@@ -150,6 +150,11 @@ pub(super) struct ScreenShareUi {
     /// Cards painted by the last frame, so a layout test can prove one card per
     /// source without relying on a single `debug_selector`.
     pub(super) preview_cards: usize,
+    /// Pictures really handed to `Window::drop_image`. Test-only: it proves
+    /// that a replaced or cleared preview left the sprite atlas instead of
+    /// being only removed from a collection.
+    #[cfg(test)]
+    pub(super) released_images: u32,
     pub(super) ring: Vec<(FocusHandle, ShareKey)>,
     /// Set once the dialog focused its first ring element. The flag is reset
     /// with the dialog, so a repaint never steals focus back from the user.
@@ -195,6 +200,8 @@ impl Default for ScreenShareUi {
             preview_bytes: 0,
             preview_rejected: 0,
             preview_cards: 0,
+            #[cfg(test)]
+            released_images: 0,
             ring: Vec::new(),
             focus_placed: false,
         }
@@ -502,7 +509,7 @@ impl VoicePanel {
         Ok(())
     }
 
-    pub(super) fn open_screen_share(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn open_screen_share(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.share_gate().is_err() {
             return;
         }
@@ -523,7 +530,7 @@ impl VoicePanel {
         self.screen.monitor_error.clear();
         self.screen.window_error.clear();
         // A new epoch: a capture of the previous dialog is ignored.
-        self.screen.clear_previews();
+        self.screen.clear_previews(window);
         // A fresh publication starts without system sound, and the previous
         // picker's probe answer must not leak in: Start stays locked until
         // the new probe settles and offers the safe default scope.
@@ -537,13 +544,13 @@ impl VoicePanel {
         }
         self.sync_screen_access();
         self.request_screen_sources(cx);
-        self.request_screen_previews(cx);
+        self.request_screen_previews(window, cx);
         cx.notify();
     }
 
     /// Open the quality dialog from the live card. The source is locked; the
     /// backend only applies the change through a stop and a new start.
-    pub(super) fn open_screen_settings(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn open_screen_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.screen.sharing.phase != Phase::Live {
             return;
         }
@@ -572,7 +579,7 @@ impl VoicePanel {
         self.screen.bind_confirmed_live_source();
         // A restart has no picker: release every thumbnail and bump the epoch
         // so an earlier picker capture cannot land in this dialog.
-        self.screen.clear_previews();
+        self.screen.clear_previews(window);
         self.screen.open = true;
         self.screen.busy = false;
         self.screen.preflight = false;
@@ -625,7 +632,7 @@ impl VoicePanel {
     /// the viewer alone. After Start (Escape, backdrop or a repeated close) it
     /// is a stop intent: the attempt already committed, so exactly one
     /// `stream.stop` is sent and the capture is released.
-    pub(super) fn close_screen_share(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn close_screen_share(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.screen.open {
             return;
         }
@@ -674,7 +681,7 @@ impl VoicePanel {
         self.screen.windows.clear();
         // Closing cancels the preview batch: the epoch moves, so a late answer
         // is ignored, and the pictures/titles are released immediately.
-        self.screen.clear_previews();
+        self.screen.clear_previews(window);
         self.screen.focus_placed = false;
         if let Some(handle) = &self.handle {
             if committed {
@@ -701,7 +708,7 @@ impl VoicePanel {
         self.screen.window_generation = handle.screen_sources(SourceKind::Window);
     }
 
-    pub(super) fn refresh_screen_sources(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn refresh_screen_sources(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // A restart is source-locked: the enumeration cannot change it.
         if self.screen.restart {
             return;
@@ -729,7 +736,7 @@ impl VoicePanel {
         self.screen
             .preview_failures
             .retain(|id, _| selection::identity_kind(id) != kind);
-        self.request_screen_previews(cx);
+        self.request_screen_previews(window, cx);
         cx.notify();
     }
 
@@ -759,7 +766,12 @@ impl VoicePanel {
     }
 
     /// Switch the picker category; a selection of the other one is dropped.
-    pub(super) fn change_share_kind(&mut self, kind: SourceKind, cx: &mut Context<Self>) {
+    pub(super) fn change_share_kind(
+        &mut self,
+        kind: SourceKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         // A restart is source-locked, so the category cannot change.
         if self.screen.restart {
             return;
@@ -783,7 +795,7 @@ impl VoicePanel {
         self.screen
             .preview_pending
             .retain(|id| selection::identity_kind(id) == kind);
-        self.request_screen_previews(cx);
+        self.request_screen_previews(window, cx);
         cx.notify();
     }
 
@@ -805,7 +817,7 @@ impl VoicePanel {
             && (!self.screen.restart || self.screen.sharing.phase == Phase::Live)
     }
 
-    pub(super) fn start_screen_share(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn start_screen_share(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.screen.busy {
             return;
         }
@@ -844,7 +856,7 @@ impl VoicePanel {
                 self.screen.open = false;
                 self.screen.restart = false;
                 self.screen.focus_placed = false;
-                self.screen.clear_previews();
+                self.screen.clear_previews(window);
                 cx.notify();
                 return;
             }
@@ -938,12 +950,12 @@ impl VoicePanel {
         cx.notify();
     }
 
-    pub(super) fn stop_screen_share(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn stop_screen_share(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(handle) = &self.handle {
             handle.stop_screen_share();
         }
         // A stop ends the picker session: no capture may start another card.
-        self.screen.clear_previews();
+        self.screen.clear_previews(window);
         cx.notify();
     }
 
@@ -991,8 +1003,10 @@ impl VoicePanel {
         cx.notify();
     }
 
-    /// Take the newest local preview for the on-air card.
-    pub(super) fn take_screen_preview(&mut self) -> bool {
+    /// Take the newest local preview for the on-air card. The previous picture
+    /// is released only after the slot already points at the new frame, so the
+    /// image of the current frame is never dropped before it is replaced.
+    pub(super) fn take_screen_preview(&mut self, window: &mut Window) -> bool {
         let Some(frame) = self
             .handle
             .as_ref()
@@ -1003,20 +1017,27 @@ impl VoicePanel {
         let Some(buffer) = image::RgbaImage::from_raw(frame.width, frame.height, frame.bgra) else {
             return false;
         };
-        self.screen.preview = Some(Arc::new(RenderImage::new(smallvec::smallvec![
-            image::Frame::new(buffer)
-        ])));
+        let image = Arc::new(RenderImage::new(smallvec::smallvec![image::Frame::new(
+            buffer
+        )]));
+        self.screen.set_preview(window, image);
         true
     }
 
     /// Forget every screen-share surface: leaving the call or a revoked
     /// session must not keep a card, a picker or a stale preview.
-    pub(super) fn reset_screen(&mut self) {
+    pub(super) fn reset_screen(&mut self, window: &mut Window) {
         // The epoch must not fall back to a value an in-flight capture of the
         // discarded dialog already holds.
-        let epoch = self.screen.preview_epoch.wrapping_add(1);
+        let mut old = std::mem::take(&mut self.screen);
+        let epoch = old.preview_epoch.wrapping_add(1);
+        old.release_all_images(window);
         self.screen = ScreenShareUi::default();
         self.screen.preview_epoch = epoch;
+        #[cfg(test)]
+        {
+            self.screen.released_images = old.released_images;
+        }
     }
 
     fn share_focus(&self, index: usize) -> FocusHandle {
@@ -1072,9 +1093,9 @@ impl VoicePanel {
             .text_color(rgb(color))
             .when(enabled, |button| button.cursor_pointer())
             .track_focus(&self.screen_focus[1])
-            .on_click(cx.listener(|panel, _, _, cx| {
+            .on_click(cx.listener(|panel, _, window, cx| {
                 if panel.share_gate().is_ok() {
-                    panel.open_screen_share(cx);
+                    panel.open_screen_share(window, cx);
                 }
             }))
             .child(super::view::vector_icon(

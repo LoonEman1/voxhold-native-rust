@@ -131,7 +131,9 @@ impl Voxhold {
             && current.publisher_user_id != self.self_user_id
         {
             if let Some(panel) = &self.voice {
-                panel.update(cx, |panel, cx| panel.watch_from_sidebar(current, cx));
+                panel.update(cx, |panel, cx| {
+                    panel.watch_from_sidebar(current, window, cx)
+                });
             }
         }
     }

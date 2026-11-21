@@ -77,6 +77,8 @@ mod voice_screen_confirmed_tests;
 #[cfg(test)]
 mod voice_screen_identity_tests;
 #[cfg(test)]
+mod voice_screen_image_tests;
+#[cfg(test)]
 mod voice_screen_operation_tests;
 #[cfg(test)]
 mod voice_screen_preview_tests;

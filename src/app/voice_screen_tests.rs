@@ -391,7 +391,7 @@ async fn the_live_quality_dialog_warns_and_restarts_with_the_new_values(cx: &mut
     use voxhold_media::publisher::{Phase, Preset, Quality, Resolution, Sharing};
     let (mut visual, _view, voice) = super::voice_tests::fixture(cx);
     draw(&mut visual);
-    visual.update(|_window, app| {
+    visual.update(|window, app| {
         voice.update(app, |panel, cx| {
             panel.test_attach_detached_handle();
             let sharing = Sharing {
@@ -406,7 +406,7 @@ async fn the_live_quality_dialog_warns_and_restarts_with_the_new_values(cx: &mut
                 has_audio: true,
                 ..Sharing::default()
             };
-            panel.test_open_screen_settings(source(), sharing, cx);
+            panel.test_open_screen_settings(source(), sharing, window, cx);
             assert!(panel.screen_share_open(), "the live dialog opened");
             assert!(panel.test_screen_restart());
             assert!(
@@ -455,7 +455,7 @@ async fn closing_the_live_quality_dialog_keeps_the_stream(cx: &mut TestAppContex
     use voxhold_media::publisher::{Phase, Quality, Sharing};
     let (mut visual, _view, voice) = super::voice_tests::fixture(cx);
     draw(&mut visual);
-    visual.update(|_window, app| {
+    visual.update(|window, app| {
         voice.update(app, |panel, cx| {
             panel.test_attach_detached_handle();
             panel.test_open_screen_settings(
@@ -467,6 +467,7 @@ async fn closing_the_live_quality_dialog_keeps_the_stream(cx: &mut TestAppContex
                     has_audio: true,
                     ..Sharing::default()
                 },
+                window,
                 cx,
             );
             assert!(panel.screen_share_open());
@@ -577,7 +578,7 @@ async fn the_endpoint_probe_never_blocks_the_screen_share_click(cx: &mut TestApp
     let (mut visual, _view, voice) = super::voice_tests::fixture(cx);
     let entered = Arc::new(AtomicBool::new(false));
     let flag = entered.clone();
-    visual.update(|_window, app| {
+    visual.update(|window, app| {
         voice.update(app, |panel, cx| {
             panel.test_attach_detached_handle();
             panel.test_set_share_gate(Ok(()));
@@ -593,7 +594,7 @@ async fn the_endpoint_probe_never_blocks_the_screen_share_click(cx: &mut TestApp
                 })
             }));
             let started = Instant::now();
-            panel.test_open_screen_share(cx);
+            panel.test_open_screen_share(window, cx);
             let elapsed = started.elapsed();
             assert!(panel.screen_share_open(), "the picker opened");
             assert!(
@@ -637,7 +638,7 @@ async fn a_pending_audio_probe_blocks_start_and_never_publishes_video_only(
 
     // The answer is still pending: a Start here would publish video with
     // `audio == false` although the user asked for system sound.
-    visual.update(|_window, app| {
+    visual.update(|window, app| {
         voice.update(app, |panel, cx| {
             panel.test_attach_detached_handle();
             panel.test_set_share_gate(Ok(()));
@@ -645,7 +646,7 @@ async fn a_pending_audio_probe_blocks_start_and_never_publishes_video_only(
                 std::thread::sleep(Duration::from_millis(250));
                 Ok(device())
             }));
-            panel.test_open_screen_share(cx);
+            panel.test_open_screen_share(window, cx);
             panel.test_select_screen_source(source(), cx);
             assert!(panel.test_audio_pending());
             let opened = panel.test_take_screen_commands();
@@ -655,7 +656,7 @@ async fn a_pending_audio_probe_blocks_start_and_never_publishes_video_only(
                 !panel.test_can_start(),
                 "Start must wait for the endpoint probe"
             );
-            panel.test_start_screen_share(cx);
+            panel.test_start_screen_share(window, cx);
             assert!(
                 panel.test_take_screen_commands().is_empty(),
                 "a pending probe must not commit a video-only publication"
@@ -667,14 +668,14 @@ async fn a_pending_audio_probe_blocks_start_and_never_publishes_video_only(
 
     wait_for(&mut visual, &voice, |panel| !panel.test_audio_pending());
 
-    visual.update(|_window, app| {
+    visual.update(|window, app| {
         voice.update(app, |panel, cx| {
             assert_eq!(panel.test_audio_toggle_label(), "Выключен");
             // Audio is off by default now; enabling it is an explicit choice.
             panel.test_toggle_system_audio(cx);
             assert_eq!(panel.test_audio_toggle_label(), "Включён");
             assert!(panel.test_can_start());
-            panel.test_start_screen_share(cx);
+            panel.test_start_screen_share(window, cx);
             let commands = panel.test_take_screen_commands();
             assert_eq!(commands.len(), 1, "one publish intent: {commands:?}");
             assert_eq!(commands[0].0, "publish");
@@ -687,13 +688,13 @@ async fn a_pending_audio_probe_blocks_start_and_never_publishes_video_only(
 
     // Reopen with a probe that fails: the picker must stay honest about the
     // missing track and still publish without audio.
-    visual.update(|_window, app| {
+    visual.update(|window, app| {
         voice.update(app, |panel, cx| {
             panel.test_set_audio_probe(Arc::new(|| {
                 std::thread::sleep(Duration::from_millis(250));
                 Err("Нет устройства вывода".to_owned())
             }));
-            panel.test_open_screen_share(cx);
+            panel.test_open_screen_share(window, cx);
             panel.test_select_screen_source(source(), cx);
             assert!(panel.test_audio_pending());
             let opened = panel.test_take_screen_commands();
@@ -704,7 +705,7 @@ async fn a_pending_audio_probe_blocks_start_and_never_publishes_video_only(
                 !panel.test_can_start(),
                 "a repeated probe blocks Start until it answers"
             );
-            panel.test_start_screen_share(cx);
+            panel.test_start_screen_share(window, cx);
             assert!(
                 panel.test_take_screen_commands().is_empty(),
                 "a pending re-probe must not commit"
@@ -714,7 +715,7 @@ async fn a_pending_audio_probe_blocks_start_and_never_publishes_video_only(
 
     wait_for(&mut visual, &voice, |panel| !panel.test_audio_pending());
 
-    visual.update(|_window, app| {
+    visual.update(|window, app| {
         voice.update(app, |panel, cx| {
             assert!(
                 panel.test_audio_status().contains("Нет устройства вывода"),
@@ -726,7 +727,7 @@ async fn a_pending_audio_probe_blocks_start_and_never_publishes_video_only(
                 panel.test_can_start(),
                 "Start is allowed without audio after a failed probe"
             );
-            panel.test_start_screen_share(cx);
+            panel.test_start_screen_share(window, cx);
             let commands = panel.test_take_screen_commands();
             assert_eq!(commands.len(), 1, "one publish intent: {commands:?}");
             assert_eq!(commands[0].0, "publish");
@@ -781,7 +782,7 @@ async fn the_quality_action_is_rendered_only_while_the_stream_is_live(cx: &mut T
 async fn sharing_and_stopping_leave_the_microphone_gate_and_ptt_untouched(cx: &mut TestAppContext) {
     let (mut visual, _view, voice) = super::voice_tests::fixture(cx);
     draw(&mut visual);
-    visual.update(|_window, app| {
+    visual.update(|window, app| {
         voice.update(app, |panel, cx| {
             panel.test_attach_detached_handle();
             panel.set_stream_permission(true);
@@ -798,7 +799,7 @@ async fn sharing_and_stopping_leave_the_microphone_gate_and_ptt_untouched(cx: &m
             );
             // Drain the control snapshot caused by enabling push-to-talk.
             let _ = panel.test_take_audio_snapshot();
-            panel.test_start_screen_share(cx);
+            panel.test_start_screen_share(window, cx);
             assert!(
                 panel.test_ptt_held(),
                 "the publish handler itself must not release push-to-talk"
@@ -821,8 +822,8 @@ async fn sharing_and_stopping_leave_the_microphone_gate_and_ptt_untouched(cx: &m
         });
     });
 
-    visual.update(|_window, app| {
-        voice.update(app, |panel, cx| panel.test_stop_screen_share(cx));
+    visual.update(|window, app| {
+        voice.update(app, |panel, cx| panel.test_stop_screen_share(window, cx));
     });
     let commands = visual
         .update(|_window, app| voice.update(app, |panel, _| panel.test_take_screen_commands()));
@@ -846,7 +847,7 @@ async fn switching_tabs_drops_a_selection_from_the_hidden_category(cx: &mut Test
     let (mut visual, _view, voice) = super::voice_tests::fixture(cx);
     draw(&mut visual);
     open_picker(&mut visual, &voice);
-    visual.update(|_window, app| {
+    visual.update(|window, app| {
         voice.update(app, |panel, cx| {
             assert_eq!(
                 panel.test_selected_source_id(),
@@ -856,24 +857,24 @@ async fn switching_tabs_drops_a_selection_from_the_hidden_category(cx: &mut Test
             assert!(panel.test_can_start());
 
             // A monitor hidden by the «Окна» tab must not stay startable.
-            panel.test_switch_share_kind(SourceKind::Window, cx);
+            panel.test_switch_share_kind(SourceKind::Window, window, cx);
             assert_eq!(
                 panel.test_selected_source_id(),
                 None,
                 "a hidden-category selection must be dropped"
             );
             assert!(!panel.test_can_start(), "Start is disabled without a row");
-            panel.test_start_screen_share(cx);
+            panel.test_start_screen_share(window, cx);
             assert!(
                 panel.test_take_screen_commands().is_empty(),
                 "no publish command for an invisible selection"
             );
 
             // Switching back must not silently restore the old monitor.
-            panel.test_switch_share_kind(SourceKind::Monitor, cx);
+            panel.test_switch_share_kind(SourceKind::Monitor, window, cx);
             assert_eq!(panel.test_selected_source_id(), None);
             assert!(!panel.test_can_start());
-            panel.test_start_screen_share(cx);
+            panel.test_start_screen_share(window, cx);
             assert!(
                 panel.test_take_screen_commands().is_empty(),
                 "the old selection must stay explicit"
@@ -895,11 +896,12 @@ async fn a_reordered_snapshot_keeps_the_id_and_uses_the_current_row(cx: &mut Tes
         SourceKind::Monitor,
         vec![first.clone(), second.clone()],
     );
-    visual.update(|_window, app| {
+    visual.update(|window, app| {
         voice.update(app, |panel, cx| {
             panel.test_select_screen_source(first.clone(), cx);
             // The capturer reorders and renames the entry; only the id binds.
             panel.test_apply_screen_sources(
+                window,
                 SourceKind::Monitor,
                 vec![second.clone(), renamed.clone()],
             );
@@ -919,11 +921,12 @@ async fn a_reordered_snapshot_keeps_the_id_and_uses_the_current_row(cx: &mut Tes
             assert_eq!((selected.width, selected.height), (1280, 720));
 
             panel.test_apply_screen_sources(
+                window,
                 SourceKind::Monitor,
                 vec![renamed.clone(), second.clone()],
             );
             assert!(panel.test_can_start());
-            panel.test_start_screen_share(cx);
+            panel.test_start_screen_share(window, cx);
             let commands = panel.test_take_screen_commands();
             assert_eq!(commands, vec![("publish", 7)]);
             let request = panel.test_screen_request();
@@ -942,9 +945,9 @@ async fn a_closed_window_or_unplugged_monitor_drops_the_selection_on_refresh(
     let (mut visual, _view, voice) = super::voice_tests::fixture(cx);
     draw(&mut visual);
     open_picker(&mut visual, &voice);
-    visual.update(|_window, app| {
+    visual.update(|window, app| {
         voice.update(app, |panel, cx| {
-            panel.test_apply_screen_sources(SourceKind::Monitor, Vec::new());
+            panel.test_apply_screen_sources(window, SourceKind::Monitor, Vec::new());
             assert_eq!(panel.test_selected_source_id(), None, "the monitor is gone");
             assert!(!panel.test_can_start());
             assert!(
@@ -952,7 +955,7 @@ async fn a_closed_window_or_unplugged_monitor_drops_the_selection_on_refresh(
                 "the refresh explains the loss: {}",
                 panel.test_screen_error()
             );
-            panel.test_start_screen_share(cx);
+            panel.test_start_screen_share(window, cx);
             assert!(panel.test_take_screen_commands().is_empty());
         });
     });
@@ -964,13 +967,13 @@ async fn a_closed_window_or_unplugged_monitor_drops_the_selection_on_refresh(
         SourceKind::Window,
         vec![visible.clone()],
     );
-    visual.update(|_window, app| {
+    visual.update(|window, app| {
         voice.update(app, |panel, cx| {
             panel.test_select_screen_source(visible.clone(), cx);
-            panel.test_apply_screen_sources(SourceKind::Window, Vec::new());
+            panel.test_apply_screen_sources(window, SourceKind::Window, Vec::new());
             assert_eq!(panel.test_selected_source_id(), None, "the window closed");
             assert!(!panel.test_can_start());
-            panel.test_start_screen_share(cx);
+            panel.test_start_screen_share(window, cx);
             assert!(panel.test_take_screen_commands().is_empty());
         });
     });
@@ -988,14 +991,14 @@ async fn start_with_a_removed_source_is_refused_before_the_refresh(cx: &mut Test
         SourceKind::Monitor,
         vec![selected.clone()],
     );
-    visual.update(|_window, app| {
+    visual.update(|window, app| {
         voice.update(app, |panel, cx| {
             panel.test_select_screen_source(selected.clone(), cx);
             // The list changed but the refresh answer is not applied yet.
             panel.test_replace_screen_list_without_refresh(SourceKind::Monitor, vec![replacement]);
             assert_eq!(panel.test_selected_source_id(), Some(selected.source_id()));
             assert!(!panel.test_can_start(), "the id is not in the list");
-            panel.test_start_screen_share(cx);
+            panel.test_start_screen_share(window, cx);
             assert!(
                 panel.test_take_screen_commands().is_empty(),
                 "a stale selection must never reach the worker"
@@ -1015,19 +1018,22 @@ async fn the_accepted_publish_update_closes_the_committed_picker(cx: &mut TestAp
     let (mut visual, _view, voice) = super::voice_tests::fixture(cx);
     draw(&mut visual);
     open_picker(&mut visual, &voice);
-    visual.update(|_window, app| {
+    visual.update(|window, app| {
         voice.update(app, |panel, cx| {
             assert!(panel.test_can_start());
-            panel.test_start_screen_share(cx);
+            panel.test_start_screen_share(window, cx);
             assert!(panel.screen_share_busy(), "the attempt is committed");
             let commands = panel.test_take_screen_commands();
             assert_eq!(commands, vec![("publish", 7)]);
 
-            assert!(panel.test_apply_screen_sharing(Sharing {
-                phase: Phase::Publishing,
-                live: false,
-                ..Sharing::default()
-            }));
+            assert!(panel.test_apply_screen_sharing(
+                window,
+                Sharing {
+                    phase: Phase::Publishing,
+                    live: false,
+                    ..Sharing::default()
+                }
+            ));
             assert!(
                 !panel.screen_share_open(),
                 "the accepted publish closes the committed picker"
@@ -1044,7 +1050,7 @@ async fn a_duplicate_source_id_is_never_selected_or_published(cx: &mut TestAppCo
     let first = monitor(3, "Экран A", 1920, 1080);
     let duplicate = monitor(3, "Экран A · дубль", 1920, 1080);
     let id = first.source_id();
-    visual.update(|_window, app| {
+    visual.update(|window, app| {
         voice.update(app, |panel, cx| {
             panel.test_attach_detached_handle();
             // A normal worker answer may describe the same (kind,id) twice.
@@ -1060,7 +1066,7 @@ async fn a_duplicate_source_id_is_never_selected_or_published(cx: &mut TestAppCo
                 !panel.test_can_start(),
                 "an ambiguous identity cannot be started"
             );
-            panel.test_start_screen_share(cx);
+            panel.test_start_screen_share(window, cx);
             assert!(
                 panel.test_take_screen_commands().is_empty(),
                 "a duplicated id must never reach the worker"
@@ -1073,7 +1079,7 @@ async fn a_duplicate_source_id_is_never_selected_or_published(cx: &mut TestAppCo
 
             // The worker repeats the same duplicated answer: the selection is
             // invalidated through `retain_selection`, not silently repaired.
-            panel.test_apply_screen_sources(SourceKind::Monitor, vec![first, duplicate]);
+            panel.test_apply_screen_sources(window, SourceKind::Monitor, vec![first, duplicate]);
             assert_eq!(
                 panel.test_selected_source_id(),
                 None,
@@ -1092,7 +1098,7 @@ async fn the_panel_pushes_gate_changes_while_the_picker_is_open(cx: &mut TestApp
         voice.update(app, |panel, cx| {
             panel.test_attach_detached_handle();
             panel.test_set_share_gate(Ok(()));
-            panel.test_open_screen_share(cx);
+            panel.test_open_screen_share(window, cx);
             assert_eq!(
                 panel.test_take_screen_access(),
                 Some((false, true)),
@@ -1143,9 +1149,10 @@ async fn keyboard_focus_follows_the_source_id_across_a_reorder(cx: &mut TestAppC
         Some("Source(monitor:3)".to_owned())
     );
 
-    visual.update(|_window, app| {
+    visual.update(|window, app| {
         voice.update(app, |panel, _| {
             panel.test_apply_screen_sources(
+                window,
                 SourceKind::Monitor,
                 vec![second.clone(), first.clone()],
             );

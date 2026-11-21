@@ -23,11 +23,11 @@ async fn a_fast_preflight_failure_through_the_update_queue_unblocks_the_dialog(
     let (mut visual, _view, voice) = super::voice_tests::fixture(cx);
     draw(&mut visual);
     let live = window(11, "Документ");
-    visual.update(|_window, app| {
+    visual.update(|window, app| {
         voice.update(app, |panel, cx| {
-            open_quality_dialog(panel, live.clone(), Quality::default(), false, cx);
+            open_quality_dialog(panel, live.clone(), Quality::default(), false, window, cx);
             panel.test_set_screen_resolution(voxhold_media::publisher::Resolution::P720, cx);
-            panel.test_start_screen_share(cx);
+            panel.test_start_screen_share(window, cx);
             let op = panel
                 .test_pending_quality_op()
                 .expect("the restart carries an operation id");
@@ -50,7 +50,7 @@ async fn a_fast_preflight_failure_through_the_update_queue_unblocks_the_dialog(
             );
 
             // One poll plus the UI application, exactly as the panel loop does.
-            assert!(panel.test_apply_screen_sharing(queued));
+            assert!(panel.test_apply_screen_sharing(window, queued));
             assert!(
                 !panel.screen_share_busy(),
                 "a failure without an observed preflight must still clear busy"
@@ -64,7 +64,7 @@ async fn a_fast_preflight_failure_through_the_update_queue_unblocks_the_dialog(
             assert_eq!(panel.test_screen_phase(), Phase::Live);
             assert!(panel.test_can_start(), "the user may try again");
 
-            panel.test_start_screen_share(cx);
+            panel.test_start_screen_share(window, cx);
             let retry = panel
                 .test_pending_quality_op()
                 .expect("the retry carries an operation id");
@@ -91,11 +91,11 @@ async fn a_late_failure_of_an_earlier_operation_does_not_touch_the_new_dialog(
     let (mut visual, _view, voice) = super::voice_tests::fixture(cx);
     draw(&mut visual);
     let live = window(11, "Документ");
-    visual.update(|_window, app| {
+    visual.update(|window, app| {
         voice.update(app, |panel, cx| {
-            open_quality_dialog(panel, live.clone(), Quality::default(), false, cx);
+            open_quality_dialog(panel, live.clone(), Quality::default(), false, window, cx);
             panel.test_set_screen_resolution(voxhold_media::publisher::Resolution::P720, cx);
-            panel.test_start_screen_share(cx);
+            panel.test_start_screen_share(window, cx);
             let first_op = panel
                 .test_pending_quality_op()
                 .expect("the first restart has an operation id");
@@ -103,14 +103,14 @@ async fn a_late_failure_of_an_earlier_operation_does_not_touch_the_new_dialog(
                 panel.test_take_screen_commands(),
                 vec![("restart", first_op)]
             );
-            assert!(panel.test_apply_screen_sharing(failed_preflight(
-                first_op,
-                "Первая проверка не открылась.",
-            )));
+            assert!(panel.test_apply_screen_sharing(
+                window,
+                failed_preflight(first_op, "Первая проверка не открылась.",)
+            ));
             assert!(!panel.screen_share_busy());
 
             // The user corrects the settings and applies again.
-            panel.test_start_screen_share(cx);
+            panel.test_start_screen_share(window, cx);
             let second_op = panel
                 .test_pending_quality_op()
                 .expect("the second restart has an operation id");
@@ -122,10 +122,10 @@ async fn a_late_failure_of_an_earlier_operation_does_not_touch_the_new_dialog(
 
             // The old failure arrives after the new Apply. It belongs to the
             // old operation and must not touch this dialog or the stream.
-            assert!(panel.test_apply_screen_sharing(failed_preflight(
-                first_op,
-                "Первая проверка не открылась.",
-            )));
+            assert!(panel.test_apply_screen_sharing(
+                window,
+                failed_preflight(first_op, "Первая проверка не открылась.",)
+            ));
             assert!(panel.screen_share_open(), "the new dialog stays open");
             assert!(
                 panel.screen_share_busy(),
@@ -153,25 +153,27 @@ async fn a_late_failure_after_closing_the_dialog_is_ignored(cx: &mut TestAppCont
     let (mut visual, _view, voice) = super::voice_tests::fixture(cx);
     draw(&mut visual);
     let live = window(11, "Документ");
-    visual.update(|_window, app| {
+    visual.update(|window, app| {
         voice.update(app, |panel, cx| {
-            open_quality_dialog(panel, live.clone(), Quality::default(), false, cx);
+            open_quality_dialog(panel, live.clone(), Quality::default(), false, window, cx);
             panel.test_set_screen_resolution(voxhold_media::publisher::Resolution::P720, cx);
-            panel.test_start_screen_share(cx);
+            panel.test_start_screen_share(window, cx);
             let op = panel
                 .test_pending_quality_op()
                 .expect("the restart has an operation id");
             assert_eq!(panel.test_take_screen_commands(), vec![("restart", op)]);
 
-            panel.test_close_screen_share(cx);
+            panel.test_close_screen_share(window, cx);
             assert_eq!(
                 panel.test_take_screen_commands(),
                 vec![("cancel-restart", op)],
                 "closing before the confirmation cancels the preflight"
             );
 
-            assert!(panel
-                .test_apply_screen_sharing(failed_preflight(op, "Новая настройка не открылась.",)));
+            assert!(panel.test_apply_screen_sharing(
+                window,
+                failed_preflight(op, "Новая настройка не открылась.",)
+            ));
             assert!(!panel.screen_share_open(), "the dialog must not reopen");
             assert!(!panel.screen_share_busy(), "busy must not change");
             assert_eq!(panel.test_pending_quality_op(), None);
@@ -196,31 +198,31 @@ async fn two_sequential_operations_keep_their_own_results(cx: &mut TestAppContex
     let (mut visual, _view, voice) = super::voice_tests::fixture(cx);
     draw(&mut visual);
     let live = window(11, "Документ");
-    visual.update(|_window, app| {
+    visual.update(|window, app| {
         voice.update(app, |panel, cx| {
-            open_quality_dialog(panel, live.clone(), Quality::default(), false, cx);
+            open_quality_dialog(panel, live.clone(), Quality::default(), false, window, cx);
             panel.test_set_screen_resolution(voxhold_media::publisher::Resolution::P720, cx);
-            panel.test_start_screen_share(cx);
+            panel.test_start_screen_share(window, cx);
             let first_op = panel.test_pending_quality_op().expect("first operation");
-            assert!(panel.test_apply_screen_sharing(failed_preflight(
-                first_op,
-                "Первая проверка не открылась.",
-            )));
+            assert!(panel.test_apply_screen_sharing(
+                window,
+                failed_preflight(first_op, "Первая проверка не открылась.",)
+            ));
 
-            panel.test_start_screen_share(cx);
+            panel.test_start_screen_share(window, cx);
             let second_op = panel.test_pending_quality_op().expect("second operation");
             // The old result reappears before the new one.
-            assert!(panel.test_apply_screen_sharing(failed_preflight(
-                first_op,
-                "Первая проверка не открылась.",
-            )));
+            assert!(panel.test_apply_screen_sharing(
+                window,
+                failed_preflight(first_op, "Первая проверка не открылась.",)
+            ));
             assert!(panel.screen_share_busy());
             assert_eq!(panel.test_pending_quality_op(), Some(second_op));
 
-            assert!(panel.test_apply_screen_sharing(failed_preflight(
-                second_op,
-                "Вторая проверка не открылась.",
-            )));
+            assert!(panel.test_apply_screen_sharing(
+                window,
+                failed_preflight(second_op, "Вторая проверка не открылась.",)
+            ));
             assert!(!panel.screen_share_busy(), "the second result is handled");
             assert_eq!(panel.test_pending_quality_op(), None);
             assert!(panel.screen_share_open());
@@ -242,20 +244,20 @@ async fn a_cancelled_preflight_with_a_reason_is_shown_in_the_dialog(cx: &mut Tes
     let (mut visual, _view, voice) = super::voice_tests::fixture(cx);
     draw(&mut visual);
     let live = window(11, "Документ");
-    visual.update(|_window, app| {
+    visual.update(|window, app| {
         voice.update(app, |panel, cx| {
-            open_quality_dialog(panel, live.clone(), Quality::default(), false, cx);
+            open_quality_dialog(panel, live.clone(), Quality::default(), false, window, cx);
             panel.test_set_screen_resolution(voxhold_media::publisher::Resolution::P720, cx);
-            panel.test_start_screen_share(cx);
+            panel.test_start_screen_share(window, cx);
             let op = panel.test_pending_quality_op().expect("operation id");
             assert_eq!(panel.test_take_screen_commands(), vec![("restart", op)]);
-            assert!(panel.test_apply_screen_sharing(preflighting(op)));
+            assert!(panel.test_apply_screen_sharing(window, preflighting(op)));
             assert!(panel.screen_share_open());
 
             // A revoked permission or a lost device keeps the reason in the
             // snapshot; the open dialog must show it instead of staying mute.
             let reason = "Разрешение на трансляцию отозвано.";
-            assert!(panel.test_apply_screen_sharing(cancelled_preflight(op, Some(reason))));
+            assert!(panel.test_apply_screen_sharing(window, cancelled_preflight(op, Some(reason))));
             assert!(
                 panel.screen_share_open(),
                 "the dialog stays open to explain the cancellation"
@@ -275,9 +277,9 @@ async fn a_cancelled_preflight_with_a_reason_is_shown_in_the_dialog(cx: &mut Tes
 
             // The user closing the dialog reports no reason: Start cleared the
             // previous answer and the cancelled snapshot adds no new error.
-            panel.test_start_screen_share(cx);
+            panel.test_start_screen_share(window, cx);
             let next = panel.test_pending_quality_op().expect("operation id");
-            assert!(panel.test_apply_screen_sharing(cancelled_preflight(next, None)));
+            assert!(panel.test_apply_screen_sharing(window, cancelled_preflight(next, None)));
             assert!(panel.screen_share_open());
             assert!(!panel.screen_share_busy());
             assert_eq!(panel.test_pending_quality_op(), None);
@@ -327,18 +329,18 @@ async fn a_live_bitrate_stays_applying_until_the_engine_confirms_it(cx: &mut Tes
     let (mut visual, _view, voice) = super::voice_tests::fixture(cx);
     draw(&mut visual);
     let live = window(11, "Документ");
-    visual.update(|_window, app| {
+    visual.update(|window, app| {
         voice.update(app, |panel, cx| {
-            open_quality_dialog(panel, live.clone(), Quality::default(), false, cx);
+            open_quality_dialog(panel, live.clone(), Quality::default(), false, window, cx);
             panel.test_change_screen_bitrate(200, cx);
-            panel.test_start_screen_share(cx);
+            panel.test_start_screen_share(window, cx);
             let op = panel
                 .test_pending_quality_op()
                 .expect("the bitrate change carries an operation id");
             assert_eq!(panel.test_take_screen_commands(), vec![("bitrate", op)]);
 
             let applying = bitrate_sharing(Quality::default(), op, QualityOutcome::Applying, None);
-            assert!(panel.test_apply_screen_sharing(applying));
+            assert!(panel.test_apply_screen_sharing(window, applying));
             assert!(
                 panel.screen_share_open(),
                 "the dialog must stay open while the limit is applied"
@@ -377,24 +379,24 @@ async fn an_applying_live_bitrate_cannot_be_closed_until_the_engine_answers(
     let (mut visual, _view, voice) = super::voice_tests::fixture(cx);
     draw(&mut visual);
     let live = window(11, "Документ");
-    visual.update(|_window, app| {
+    visual.update(|window, app| {
         voice.update(app, |panel, cx| {
-            open_quality_dialog(panel, live.clone(), Quality::default(), false, cx);
+            open_quality_dialog(panel, live.clone(), Quality::default(), false, window, cx);
             panel.test_change_screen_bitrate(200, cx);
-            panel.test_start_screen_share(cx);
+            panel.test_start_screen_share(window, cx);
             let op = panel
                 .test_pending_quality_op()
                 .expect("the bitrate change carries an operation id");
             assert_eq!(panel.test_take_screen_commands(), vec![("bitrate", op)]);
 
             let applying = bitrate_sharing(Quality::default(), op, QualityOutcome::Applying, None);
-            assert!(panel.test_apply_screen_sharing(applying));
+            assert!(panel.test_apply_screen_sharing(window, applying));
             assert!(panel.screen_share_open());
             assert!(panel.screen_share_busy());
             assert_eq!(panel.test_pending_quality_op(), Some(op));
 
             // Escape, the backdrop and Cancel all use this close intent.
-            panel.test_close_screen_share(cx);
+            panel.test_close_screen_share(window, cx);
             assert!(
                 panel.screen_share_open(),
                 "an applying change must not close the dialog"
@@ -418,12 +420,12 @@ async fn an_applying_live_bitrate_cannot_be_closed_until_the_engine_answers(
                 QualityOutcome::Failed(message.into()),
                 Some(message),
             );
-            assert!(panel.test_apply_screen_sharing(failed));
+            assert!(panel.test_apply_screen_sharing(window, failed));
             assert!(panel.screen_share_open());
             assert!(!panel.screen_share_busy());
             assert_eq!(panel.test_pending_quality_op(), None);
 
-            panel.test_close_screen_share(cx);
+            panel.test_close_screen_share(window, cx);
             assert!(
                 !panel.screen_share_open(),
                 "a refused change may be closed like before"
@@ -442,11 +444,11 @@ async fn an_applied_live_bitrate_closes_the_dialog(cx: &mut TestAppContext) {
     let (mut visual, _view, voice) = super::voice_tests::fixture(cx);
     draw(&mut visual);
     let live = window(11, "Документ");
-    visual.update(|_window, app| {
+    visual.update(|window, app| {
         voice.update(app, |panel, cx| {
-            open_quality_dialog(panel, live.clone(), Quality::default(), false, cx);
+            open_quality_dialog(panel, live.clone(), Quality::default(), false, window, cx);
             panel.test_change_screen_bitrate(200, cx);
-            panel.test_start_screen_share(cx);
+            panel.test_start_screen_share(window, cx);
             let op = panel
                 .test_pending_quality_op()
                 .expect("the bitrate change carries an operation id");
@@ -457,7 +459,7 @@ async fn an_applied_live_bitrate_closes_the_dialog(cx: &mut TestAppContext) {
                 ..Quality::default()
             };
             let applied = bitrate_sharing(changed, op, QualityOutcome::Applied, None);
-            assert!(panel.test_apply_screen_sharing(applied));
+            assert!(panel.test_apply_screen_sharing(window, applied));
             assert!(
                 !panel.screen_share_open(),
                 "a verified change closes the dialog"
@@ -487,11 +489,11 @@ async fn a_refused_live_bitrate_shows_the_error_and_the_confirmed_value(cx: &mut
     let (mut visual, _view, voice) = super::voice_tests::fixture(cx);
     draw(&mut visual);
     let live = window(11, "Документ");
-    visual.update(|_window, app| {
+    visual.update(|window, app| {
         voice.update(app, |panel, cx| {
-            open_quality_dialog(panel, live.clone(), Quality::default(), false, cx);
+            open_quality_dialog(panel, live.clone(), Quality::default(), false, window, cx);
             panel.test_change_screen_bitrate(200, cx);
-            panel.test_start_screen_share(cx);
+            panel.test_start_screen_share(window, cx);
             let op = panel
                 .test_pending_quality_op()
                 .expect("the bitrate change carries an operation id");
@@ -504,7 +506,7 @@ async fn a_refused_live_bitrate_shows_the_error_and_the_confirmed_value(cx: &mut
                 QualityOutcome::Failed(message.into()),
                 Some(message),
             );
-            assert!(panel.test_apply_screen_sharing(failed));
+            assert!(panel.test_apply_screen_sharing(window, failed));
             assert!(
                 panel.screen_share_open(),
                 "the failed dialog stays open for a retry"
@@ -534,7 +536,7 @@ async fn a_refused_live_bitrate_shows_the_error_and_the_confirmed_value(cx: &mut
             // The dialog shows the confirmed limit again; the user dials the
             // refused value once more and the retry is a new operation.
             panel.test_change_screen_bitrate(200, cx);
-            panel.test_start_screen_share(cx);
+            panel.test_start_screen_share(window, cx);
             let retry = panel
                 .test_pending_quality_op()
                 .expect("the retry carries an operation id");
@@ -554,11 +556,11 @@ async fn a_committed_restart_closes_the_dialog_and_clears_busy(cx: &mut TestAppC
     let (mut visual, _view, voice) = super::voice_tests::fixture(cx);
     draw(&mut visual);
     let live = window(11, "Документ");
-    visual.update(|_window, app| {
+    visual.update(|window, app| {
         voice.update(app, |panel, cx| {
-            open_quality_dialog(panel, live.clone(), Quality::default(), false, cx);
+            open_quality_dialog(panel, live.clone(), Quality::default(), false, window, cx);
             panel.test_set_screen_resolution(voxhold_media::publisher::Resolution::P720, cx);
-            panel.test_start_screen_share(cx);
+            panel.test_start_screen_share(window, cx);
             let op = panel.test_pending_quality_op().expect("operation id");
 
             let committed = Sharing {
@@ -570,7 +572,7 @@ async fn a_committed_restart_closes_the_dialog_and_clears_busy(cx: &mut TestAppC
                 has_audio: false,
                 ..Sharing::default()
             };
-            assert!(panel.test_apply_screen_sharing(committed));
+            assert!(panel.test_apply_screen_sharing(window, committed));
             assert!(!panel.screen_share_open(), "the dialog closes on commit");
             assert!(!panel.screen_share_busy());
             assert_eq!(panel.test_pending_quality_op(), None);

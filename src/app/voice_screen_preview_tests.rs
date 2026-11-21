@@ -148,7 +148,7 @@ async fn a_selected_card_paints_its_thumbnail_and_badge(cx: &mut TestAppContext)
     draw(&mut visual);
     let selected = monitor(3, "Экран A", 1920, 1080);
     let id = selected.source_id();
-    visual.update(|_window, app| {
+    visual.update(|window, app| {
         voice.update(app, |panel, _| {
             panel.test_attach_detached_handle();
             panel.test_open_screen_picker_with(
@@ -156,7 +156,7 @@ async fn a_selected_card_paints_its_thumbnail_and_badge(cx: &mut TestAppContext)
                 vec![selected.clone()],
                 Some(id),
             );
-            assert!(panel.test_inject_screen_preview(&selected, 32, 18));
+            assert!(panel.test_inject_screen_preview(window, &selected, 32, 18));
         });
     });
     draw(&mut visual);
@@ -222,9 +222,9 @@ async fn a_failed_preview_does_not_change_the_selected_id_or_startable_source(
         assert_eq!(panel.test_selected_source_id(), Some(id));
     });
 
-    visual.update(|_window, app| {
+    visual.update(|window, app| {
         voice.update(app, |panel, cx| {
-            panel.test_start_screen_share(cx);
+            panel.test_start_screen_share(window, cx);
             assert_eq!(panel.test_take_screen_commands(), vec![("publish", 7)]);
             assert_eq!(panel.test_screen_request().source, selected);
         });
@@ -232,9 +232,9 @@ async fn a_failed_preview_does_not_change_the_selected_id_or_startable_source(
 
     // The window closes before the next refresh: the card's failure message is
     // irrelevant now, and the absent id invalidates the selection.
-    visual.update(|_window, app| {
+    visual.update(|window, app| {
         voice.update(app, |panel, _| {
-            panel.test_apply_screen_sources(SourceKind::Monitor, Vec::new());
+            panel.test_apply_screen_sources(window, SourceKind::Monitor, Vec::new());
             assert_eq!(panel.test_selected_source_id(), None);
             assert!(!panel.test_can_start());
             assert!(
@@ -259,14 +259,14 @@ async fn a_late_preview_from_a_closed_picker_is_ignored(cx: &mut TestAppContext)
         vec![source.clone()],
     );
     let old_epoch = voice.read_with(&*visual, |panel, _| panel.test_preview_epoch());
-    visual.update(|_window, app| {
+    visual.update(|window, app| {
         voice.update(app, |panel, _| {
-            assert!(panel.test_inject_screen_preview(&source, 8, 8));
+            assert!(panel.test_inject_screen_preview(window, &source, 8, 8));
             assert_eq!(panel.test_screen_preview_counts().0, 1);
         });
     });
-    visual.update(|_window, app| {
-        voice.update(app, |panel, cx| panel.test_close_screen_share(cx));
+    visual.update(|window, app| {
+        voice.update(app, |panel, cx| panel.test_close_screen_share(window, cx));
     });
     voice.read_with(&*visual, |panel, _| {
         assert!(!panel.screen_share_open());
@@ -274,10 +274,10 @@ async fn a_late_preview_from_a_closed_picker_is_ignored(cx: &mut TestAppContext)
         assert_eq!(panel.test_screen_preview_counts(), (0, 0));
         assert_eq!(panel.test_screen_preview_pending(), 0);
     });
-    visual.update(|_window, app| {
+    visual.update(|window, app| {
         voice.update(app, |panel, _| {
             assert!(
-                !panel.test_deliver_screen_preview(old_epoch, &source, true),
+                !panel.test_deliver_screen_preview(window, old_epoch, &source, true),
                 "a result of the closed picker is ignored"
             );
             assert_eq!(panel.test_screen_preview_counts(), (0, 0));
@@ -293,12 +293,12 @@ async fn a_late_preview_from_a_closed_picker_is_ignored(cx: &mut TestAppContext)
     );
     let new_epoch = voice.read_with(&*visual, |panel, _| panel.test_preview_epoch());
     assert_ne!(new_epoch, old_epoch);
-    visual.update(|_window, app| {
+    visual.update(|window, app| {
         voice.update(app, |panel, _| {
             assert_eq!(panel.test_screen_preview_counts(), (0, 0));
-            assert!(!panel.test_deliver_screen_preview(old_epoch, &source, true));
+            assert!(!panel.test_deliver_screen_preview(window, old_epoch, &source, true));
             assert_eq!(panel.test_screen_preview_counts(), (0, 0));
-            assert!(panel.test_deliver_screen_preview(new_epoch, &source, true));
+            assert!(panel.test_deliver_screen_preview(window, new_epoch, &source, true));
             assert_eq!(panel.test_screen_preview_counts().0, 1);
         });
     });
@@ -314,12 +314,12 @@ async fn a_preview_for_an_id_outside_the_snapshot_is_ignored(cx: &mut TestAppCon
     let new = monitor(5, "Экран B", 2560, 1440);
     open_picker_with(&mut visual, &voice, SourceKind::Monitor, vec![old.clone()]);
     let epoch = voice.read_with(&*visual, |panel, _| panel.test_preview_epoch());
-    visual.update(|_window, app| {
+    visual.update(|window, app| {
         voice.update(app, |panel, _| {
-            panel.test_apply_screen_sources(SourceKind::Monitor, vec![new.clone()]);
-            assert!(!panel.test_deliver_screen_preview(epoch, &old, true));
+            panel.test_apply_screen_sources(window, SourceKind::Monitor, vec![new.clone()]);
+            assert!(!panel.test_deliver_screen_preview(window, epoch, &old, true));
             assert_eq!(panel.test_screen_preview_counts(), (0, 0));
-            assert!(panel.test_deliver_screen_preview(epoch, &new, true));
+            assert!(panel.test_deliver_screen_preview(window, epoch, &new, true));
             assert_eq!(panel.test_screen_preview_counts().0, 1);
         });
     });
@@ -329,13 +329,13 @@ async fn a_preview_for_an_id_outside_the_snapshot_is_ignored(cx: &mut TestAppCon
 #[gpui::test]
 async fn the_preview_cache_enforces_its_count_and_byte_bounds(cx: &mut TestAppContext) {
     let (visual, _view, voice) = super::voice_tests::fixture(cx);
-    visual.update(|_window, app| {
+    visual.update(|window, app| {
         voice.update(app, |panel, _| {
             panel.test_open_screen_picker_with(SourceKind::Monitor, Vec::new(), None);
             let (max_count, max_bytes) = panel.test_screen_preview_bounds();
             for index in 0..(max_count + 5) {
                 let source = monitor(10_000 + index as u64, "Экран", 8, 8);
-                panel.test_inject_screen_preview(&source, 8, 8);
+                panel.test_inject_screen_preview(window, &source, 8, 8);
             }
             let (count, bytes) = panel.test_screen_preview_counts();
             assert_eq!(count, max_count, "the count bound is exact");
@@ -348,7 +348,7 @@ async fn the_preview_cache_enforces_its_count_and_byte_bounds(cx: &mut TestAppCo
             assert_eq!(panel.test_screen_preview_counts(), (0, 0));
             for index in 0..(max_count + 5) {
                 let source = monitor(20_000 + index as u64, "Экран", 320, 320);
-                panel.test_inject_screen_preview(&source, 320, 320);
+                panel.test_inject_screen_preview(window, &source, 320, 320);
             }
             let (count, bytes) = panel.test_screen_preview_counts();
             assert!(count < max_count, "the byte bound bound the cache first");
@@ -377,11 +377,11 @@ async fn a_session_end_clears_the_preview_cache_and_moves_the_epoch(cx: &mut Tes
         vec![source.clone()],
     );
     let before_stop = voice.read_with(&*visual, |panel, _| panel.test_preview_epoch());
-    visual.update(|_window, app| {
+    visual.update(|window, app| {
         voice.update(app, |panel, cx| {
-            assert!(panel.test_inject_screen_preview(&source, 8, 8));
+            assert!(panel.test_inject_screen_preview(window, &source, 8, 8));
             assert_eq!(panel.test_screen_preview_counts(), (1, bytes));
-            panel.test_stop_screen_share(cx);
+            panel.test_stop_screen_share(window, cx);
             assert_ne!(
                 panel.test_preview_epoch(),
                 before_stop,
@@ -405,16 +405,16 @@ async fn a_session_end_clears_the_preview_cache_and_moves_the_epoch(cx: &mut Tes
         vec![source.clone()],
     );
     let before_restart = voice.read_with(&*visual, |panel, _| panel.test_preview_epoch());
-    visual.update(|_window, app| {
+    visual.update(|window, app| {
         voice.update(app, |panel, cx| {
-            assert!(panel.test_inject_screen_preview(&source, 8, 8));
+            assert!(panel.test_inject_screen_preview(window, &source, 8, 8));
             panel.test_set_screen_sharing(Sharing {
                 phase: Phase::Live,
                 live: true,
                 ..Sharing::default()
             });
             panel.test_set_screen_confirmed_source(source.clone());
-            panel.test_open_live_screen_settings(cx);
+            panel.test_open_live_screen_settings(window, cx);
             assert!(panel.test_screen_restart(), "the restart dialog opened");
             assert_ne!(
                 panel.test_preview_epoch(),
@@ -428,14 +428,17 @@ async fn a_session_end_clears_the_preview_cache_and_moves_the_epoch(cx: &mut Tes
 
     // A Failed answer closes the attempt and clears whatever the dialog held.
     let before_failed = voice.read_with(&*visual, |panel, _| panel.test_preview_epoch());
-    visual.update(|_window, app| {
+    visual.update(|window, app| {
         voice.update(app, |panel, _| {
-            assert!(panel.test_inject_screen_preview(&source, 8, 8));
-            assert!(panel.test_apply_screen_sharing(Sharing {
-                phase: Phase::Failed,
-                error: Some("Захват запрещён.".into()),
-                ..Sharing::default()
-            }));
+            assert!(panel.test_inject_screen_preview(window, &source, 8, 8));
+            assert!(panel.test_apply_screen_sharing(
+                window,
+                Sharing {
+                    phase: Phase::Failed,
+                    error: Some("Захват запрещён.".into()),
+                    ..Sharing::default()
+                }
+            ));
             assert_ne!(
                 panel.test_preview_epoch(),
                 before_failed,
@@ -455,13 +458,16 @@ async fn a_session_end_clears_the_preview_cache_and_moves_the_epoch(cx: &mut Tes
         vec![source.clone()],
     );
     let before_publishing = voice.read_with(&*visual, |panel, _| panel.test_preview_epoch());
-    visual.update(|_window, app| {
+    visual.update(|window, app| {
         voice.update(app, |panel, _| {
-            assert!(panel.test_inject_screen_preview(&source, 8, 8));
-            assert!(panel.test_apply_screen_sharing(Sharing {
-                phase: Phase::Publishing,
-                ..Sharing::default()
-            }));
+            assert!(panel.test_inject_screen_preview(window, &source, 8, 8));
+            assert!(panel.test_apply_screen_sharing(
+                window,
+                Sharing {
+                    phase: Phase::Publishing,
+                    ..Sharing::default()
+                }
+            ));
             assert!(!panel.screen_share_open());
             assert_ne!(
                 panel.test_preview_epoch(),
@@ -480,18 +486,18 @@ async fn a_session_end_clears_the_preview_cache_and_moves_the_epoch(cx: &mut Tes
 #[gpui::test]
 async fn replacing_a_preview_does_not_inflate_the_byte_budget(cx: &mut TestAppContext) {
     let (visual, _view, voice) = super::voice_tests::fixture(cx);
-    visual.update(|_window, app| {
+    visual.update(|window, app| {
         voice.update(app, |panel, _| {
             panel.test_open_screen_picker_with(SourceKind::Monitor, Vec::new(), None);
             let source = monitor(3, "Экран A", 1920, 1080);
-            assert!(panel.test_inject_screen_preview(&source, 8, 8));
+            assert!(panel.test_inject_screen_preview(window, &source, 8, 8));
             assert_eq!(
                 panel.test_screen_preview_counts(),
                 (1, 8 * 8 * 4),
                 "the first frame is counted once"
             );
             // The same id with a bigger frame replaces the old entry.
-            assert!(panel.test_inject_screen_preview(&source, 16, 16));
+            assert!(panel.test_inject_screen_preview(window, &source, 16, 16));
             assert_eq!(
                 panel.test_screen_preview_counts(),
                 (1, 16 * 16 * 4),
@@ -501,7 +507,7 @@ async fn replacing_a_preview_does_not_inflate_the_byte_budget(cx: &mut TestAppCo
             // replacement did not leave a stale copy in the byte budget.
             let other = monitor(5, "Экран B", 2560, 1440);
             assert!(
-                panel.test_inject_screen_preview(&other, 320, 320),
+                panel.test_inject_screen_preview(window, &other, 320, 320),
                 "the budget was not inflated by the replacement"
             );
             assert_eq!(
@@ -527,9 +533,9 @@ async fn refresh_retries_a_failed_preview_without_repeating_a_cached_card(cx: &m
         SourceKind::Monitor,
         vec![cached.clone(), failed.clone()],
     );
-    visual.update(|_window, app| {
+    visual.update(|window, app| {
         voice.update(app, |panel, _| {
-            panel.test_inject_screen_preview(&cached, 8, 8);
+            panel.test_inject_screen_preview(window, &cached, 8, 8);
             panel.test_inject_screen_preview_error(&failed, "Предпросмотр не получен.");
             assert!(panel
                 .test_screen_preview_error(failed.source_id())
@@ -543,8 +549,10 @@ async fn refresh_retries_a_failed_preview_without_repeating_a_cached_card(cx: &m
             }));
         });
     });
-    visual.update(|_window, app| {
-        voice.update(app, |panel, cx| panel.test_refresh_screen_sources(cx));
+    visual.update(|window, app| {
+        voice.update(app, |panel, cx| {
+            panel.test_refresh_screen_sources(window, cx)
+        });
     });
     wait_for(&mut visual, &voice, |panel| {
         panel.test_screen_preview_counts().0 == 2
@@ -590,8 +598,10 @@ async fn only_the_visible_category_is_queued_for_previews(cx: &mut TestAppContex
             }));
         });
     });
-    visual.update(|_window, app| {
-        voice.update(app, |panel, cx| panel.test_refresh_screen_sources(cx));
+    visual.update(|window, app| {
+        voice.update(app, |panel, cx| {
+            panel.test_refresh_screen_sources(window, cx)
+        });
     });
     wait_for(&mut visual, &voice, |panel| {
         panel.test_screen_preview_counts().0 == 1
@@ -602,9 +612,9 @@ async fn only_the_visible_category_is_queued_for_previews(cx: &mut TestAppContex
         "the hidden window category was not captured"
     );
 
-    visual.update(|_window, app| {
+    visual.update(|window, app| {
         voice.update(app, |panel, cx| {
-            panel.test_switch_share_kind(SourceKind::Window, cx)
+            panel.test_switch_share_kind(SourceKind::Window, window, cx)
         });
     });
     wait_for(&mut visual, &voice, |panel| {
@@ -645,9 +655,9 @@ async fn a_second_preview_request_joins_the_running_batch(cx: &mut TestAppContex
             panel.test_set_preview_provider(seen.provider())
         });
     });
-    visual.update(|_window, app| {
+    visual.update(|window, app| {
         voice.update(app, |panel, cx| {
-            panel.test_request_screen_previews(cx);
+            panel.test_request_screen_previews(window, cx);
             assert!(
                 panel.test_preview_batch_active(),
                 "the first request claimed the picker"
@@ -663,13 +673,14 @@ async fn a_second_preview_request_joins_the_running_batch(cx: &mut TestAppContex
     // A source-list update calls the production request again. It must only
     // record the new row: queueing it here would start a second batch beside
     // the one that already owns the picker.
-    visual.update(|_window, app| {
+    visual.update(|window, app| {
         voice.update(app, |panel, cx| {
             panel.test_apply_screen_sources(
+                window,
                 SourceKind::Monitor,
                 vec![first.clone(), second.clone()],
             );
-            panel.test_request_screen_previews(cx);
+            panel.test_request_screen_previews(window, cx);
             assert!(
                 panel.test_preview_batch_active(),
                 "the guard still belongs to the first batch"
@@ -731,16 +742,16 @@ async fn a_late_preview_batch_cannot_clear_a_newer_batch(cx: &mut TestAppContext
         });
     });
     let old_epoch = voice.read_with(&*visual, |panel, _| panel.test_preview_epoch());
-    visual.update(|_window, app| {
+    visual.update(|window, app| {
         voice.update(app, |panel, cx| {
-            panel.test_request_screen_previews(cx);
+            panel.test_request_screen_previews(window, cx);
             assert!(panel.test_preview_batch_active());
         });
     });
 
-    visual.update(|_window, app| {
+    visual.update(|window, app| {
         voice.update(app, |panel, cx| {
-            panel.test_close_screen_share(cx);
+            panel.test_close_screen_share(window, cx);
             assert!(!panel.screen_share_open());
             assert!(
                 !panel.test_preview_batch_active(),
@@ -759,9 +770,9 @@ async fn a_late_preview_batch_cannot_clear_a_newer_batch(cx: &mut TestAppContext
     );
     let new_epoch = voice.read_with(&*visual, |panel, _| panel.test_preview_epoch());
     assert_ne!(new_epoch, old_epoch, "a new picker has a new epoch");
-    visual.update(|_window, app| {
+    visual.update(|window, app| {
         voice.update(app, |panel, cx| {
-            panel.test_request_screen_previews(cx);
+            panel.test_request_screen_previews(window, cx);
             assert!(panel.test_preview_batch_active());
         });
     });

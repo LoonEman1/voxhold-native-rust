@@ -18,16 +18,79 @@ impl ScreenShareUi {
     /// Start a new preview session: the epoch moves, so every capture still in
     /// flight is ignored, and no picture of the previous picker survives. The
     /// batch guard is released here as well: the epoch check in the old batch
-    /// stops it from touching a newer session's flag.
-    pub(super) fn clear_previews(&mut self) {
+    /// stops it from touching a newer session's flag. Cached pictures are
+    /// removed from the sprite atlas, never just forgotten.
+    pub(super) fn clear_previews(&mut self, window: &mut Window) {
         self.preview_epoch = self.preview_epoch.wrapping_add(1);
-        self.previews.clear();
+        let images: Vec<Arc<RenderImage>> = self
+            .previews
+            .drain()
+            .map(|(_, thumb)| thumb.image)
+            .collect();
+        self.release_images(window, images);
         self.preview_failures.clear();
         self.preview_pending.clear();
         self.preview_batching = false;
         self.preview_bytes = 0;
         self.preview_rejected = 0;
         self.preview_cards = 0;
+    }
+
+    /// Release one GPUI image from the sprite atlas. Every replaced or removed
+    /// preview passes through here, so the test-only counter proves that the
+    /// texture was really released and not merely dropped from a collection.
+    pub(super) fn release_image(&mut self, window: &mut Window, image: Arc<RenderImage>) {
+        let _ = window.drop_image(image);
+        #[cfg(test)]
+        {
+            self.released_images = self.released_images.saturating_add(1);
+        }
+    }
+
+    fn release_images(
+        &mut self,
+        window: &mut Window,
+        images: impl IntoIterator<Item = Arc<RenderImage>>,
+    ) {
+        for image in images {
+            self.release_image(window, image);
+        }
+    }
+
+    /// Release every picture this picker owns: the on-air preview card and all
+    /// cached thumbnails. Used when the whole share state is reset.
+    pub(super) fn release_all_images(&mut self, window: &mut Window) {
+        let card = self.preview.take();
+        let previews: Vec<Arc<RenderImage>> = self
+            .previews
+            .drain()
+            .map(|(_, thumb)| thumb.image)
+            .collect();
+        if let Some(card) = card {
+            self.release_image(window, card);
+        }
+        self.release_images(window, previews);
+        self.preview_bytes = 0;
+    }
+
+    /// Replace the on-air card picture, releasing the previous one only after
+    /// the slot already points at the new image.
+    pub(in crate::voice_panel) fn set_preview(
+        &mut self,
+        window: &mut Window,
+        image: Arc<RenderImage>,
+    ) {
+        let previous = self.preview.replace(image);
+        if let Some(previous) = previous {
+            self.release_image(window, previous);
+        }
+    }
+
+    /// Drop the on-air card picture, if any.
+    pub(super) fn clear_preview(&mut self, window: &mut Window) {
+        if let Some(previous) = self.preview.take() {
+            self.release_image(window, previous);
+        }
     }
 
     /// Claim the next visible source that still needs a picture, marking it
@@ -79,7 +142,12 @@ impl ScreenShareUi {
 
     /// Add one picture to the bounded cache. A picture over the width, count
     /// or byte bound is counted as rejected and never queued.
-    pub(crate) fn insert_preview(&mut self, identity: SourceIdentity, frame: PreviewFrame) -> bool {
+    pub(crate) fn insert_preview(
+        &mut self,
+        window: &mut Window,
+        identity: SourceIdentity,
+        frame: PreviewFrame,
+    ) -> bool {
         if frame.width == 0
             || frame.height == 0
             || frame.width > SCREEN_THUMBNAIL_WIDTH
@@ -106,8 +174,12 @@ impl ScreenShareUi {
             return false;
         };
         self.preview_bytes = self.preview_bytes.saturating_sub(existing) + bytes;
-        self.previews
+        let previous = self
+            .previews
             .insert(identity.clone(), PreviewThumb { image, bytes });
+        if let Some(previous) = previous {
+            self.release_image(window, previous.image);
+        }
         self.preview_failures.remove(&identity);
         self.preview_pending.remove(&identity);
         true
@@ -123,6 +195,7 @@ impl ScreenShareUi {
     /// snapshot is ignored and never inserted.
     pub(crate) fn finish_preview(
         &mut self,
+        window: &mut Window,
         epoch: u64,
         identity: SourceIdentity,
         result: Result<PreviewFrame, ThumbnailError>,
@@ -140,7 +213,7 @@ impl ScreenShareUi {
         }
         match result {
             Ok(frame) => {
-                if !self.insert_preview(identity.clone(), frame) {
+                if !self.insert_preview(window, identity.clone(), frame) {
                     self.insert_preview_failure(identity, PREVIEW_MEMORY_REASON.to_owned());
                 }
             }
@@ -153,7 +226,12 @@ impl ScreenShareUi {
     /// snapshot of a kind no longer offers. A duplicated identity is
     /// ambiguous, so it is dropped as well; the next answer may describe it
     /// unambiguously again.
-    pub(super) fn retain_preview_snapshot(&mut self, kind: SourceKind, sources: &[ScreenSource]) {
+    pub(super) fn retain_preview_snapshot(
+        &mut self,
+        window: &mut Window,
+        kind: SourceKind,
+        sources: &[ScreenSource],
+    ) {
         let present = |identity: &SourceIdentity| {
             identity_kind(identity) == kind
                 && sources
@@ -168,11 +246,14 @@ impl ScreenShareUi {
             .filter(|identity| identity_kind(identity) == kind && !present(identity))
             .cloned()
             .collect();
+        let mut removed = Vec::new();
         for identity in gone {
             if let Some(thumb) = self.previews.remove(&identity) {
                 self.preview_bytes = self.preview_bytes.saturating_sub(thumb.bytes);
+                removed.push(thumb.image);
             }
         }
+        self.release_images(window, removed);
         self.preview_failures
             .retain(|identity, _| identity_kind(identity) != kind || present(identity));
         self.preview_pending
@@ -204,7 +285,7 @@ impl VoicePanel {
     /// starts another capture. The capture itself is bounded by the media layer
     /// and runs on the background executor, never on the UI thread or the voice
     /// worker.
-    pub(crate) fn request_screen_previews(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn request_screen_previews(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.screen.open || self.screen.restart {
             return;
         }
@@ -226,7 +307,10 @@ impl VoicePanel {
         };
         self.screen.preview_batching = true;
         cx.notify();
-        cx.spawn(async move |this, cx| {
+        // `spawn_in` keeps the window available for the whole batch, so both a
+        // replaced thumbnail and a re-request at the end can release textures
+        // through the window that actually owns the sprite atlas.
+        cx.spawn_in(window, async move |this, cx| {
             let mut next = Some(first);
             while let Some(source) = next {
                 let Some(identity) = source.identity() else {
@@ -235,7 +319,7 @@ impl VoicePanel {
                 #[cfg(test)]
                 let provider = provider.clone();
                 let keep = this
-                    .update(cx, |panel, _| {
+                    .update_in(cx, |panel, _, _| {
                         panel.screen.open
                             && !panel.screen.restart
                             && panel.screen.preview_epoch == epoch
@@ -256,7 +340,7 @@ impl VoicePanel {
                 });
                 let result = task.await;
                 let alive = this
-                    .update(cx, |panel, _| {
+                    .update_in(cx, |panel, _, _| {
                         panel.screen.open
                             && !panel.screen.restart
                             && panel.screen.preview_epoch == epoch
@@ -266,23 +350,23 @@ impl VoicePanel {
                 if !alive {
                     break;
                 }
-                let _ = this.update(cx, |panel, cx| {
+                let _ = this.update_in(cx, |panel, window, cx| {
                     // A vanished id is ignored but does not stop the rest of
                     // the batch; only an epoch/category change above does.
-                    if panel.screen.finish_preview(epoch, identity, result) {
+                    if panel.screen.finish_preview(window, epoch, identity, result) {
                         cx.notify();
                     }
                 });
                 // The next claim re-checks the session, so a row added while
                 // this capture ran joins the same batch.
                 next = this
-                    .update(cx, |panel, _| {
+                    .update_in(cx, |panel, _, _| {
                         panel.screen.take_next_preview_source(epoch, kind)
                     })
                     .ok()
                     .flatten();
             }
-            let _ = this.update(cx, |panel, cx| {
+            let _ = this.update_in(cx, |panel, window, cx| {
                 // Only this batch's epoch may release the flag: a newer picker
                 // or dialog already reset it, and a late end must not clear a
                 // batch that session started.
@@ -293,7 +377,7 @@ impl VoicePanel {
                 // that was answered by the guard: all of them are picked up
                 // here, on the current category.
                 if panel.screen.open && !panel.screen.restart {
-                    panel.request_screen_previews(cx);
+                    panel.request_screen_previews(window, cx);
                 }
             });
         })
@@ -308,19 +392,13 @@ mod tests {
     /// The bytes GPUI actually receives for one cached card. `RenderImage`
     /// exposes its frame buffer as-is, so this is the atlas input.
     fn cached_bytes(color: [u8; 4]) -> Vec<u8> {
-        let mut screen = ScreenShareUi::default();
-        let id = SourceIdentity::Window(7);
         let frame = PreviewFrame {
             width: 2,
             height: 1,
             bgra: [color, color].concat(),
         };
-        assert!(
-            screen.insert_preview(id.clone(), frame),
-            "the picture fits the cache"
-        );
-        let thumb = screen.previews.get(&id).expect("the picture is cached");
-        thumb.image.as_bytes(0).expect("one frame").to_vec()
+        let image = preview_render_image(frame).expect("the picture is valid");
+        image.as_bytes(0).expect("one frame").to_vec()
     }
 
     /// A red plate must stay red and a blue plate blue. The media layer hands

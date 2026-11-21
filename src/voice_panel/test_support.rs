@@ -27,10 +27,10 @@ impl VoicePanel {
     /// Join with the real adoption path and the panel's rotation latch, but
     /// with a detached worker so no socket is opened. This is exactly what
     /// `VoicePanel::join` hands to the worker when a refresh is in flight.
-    pub fn test_join_detached(&mut self, cx: &mut Context<Self>) {
+    pub fn test_join_detached(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let handle = VoiceHandle::detached_for_tests_with_rotation(self.rotation_in_flight);
         self.call_channel = self.room;
-        self.install_handle(handle, cx);
+        self.install_handle(handle, window, cx);
     }
 
     /// The identity of the installed worker, so a test can prove a session
@@ -102,8 +102,14 @@ impl VoicePanel {
         // A test picker is a new session too: the preview epoch moves so a
         // result from the previous picker can never match it again.
         let epoch = self.screen.preview_epoch.wrapping_add(1);
+        #[cfg(test)]
+        let released_images = self.screen.released_images;
         self.screen = ScreenShareUi::default();
         self.screen.preview_epoch = epoch;
+        #[cfg(test)]
+        {
+            self.screen.released_images = released_images;
+        }
         self.screen.open = true;
         self.screen.picker = 7;
         self.screen.kind = kind;
@@ -145,13 +151,13 @@ impl VoicePanel {
     }
 
     /// Production path of the «Экран» click, for the non-blocking probe test.
-    pub fn test_open_screen_share(&mut self, cx: &mut Context<Self>) {
-        self.open_screen_share(cx);
+    pub fn test_open_screen_share(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_screen_share(window, cx);
     }
 
     /// The publish intent without the picker keyboard path.
-    pub fn test_start_screen_share(&mut self, cx: &mut Context<Self>) {
-        self.start_screen_share(cx);
+    pub fn test_start_screen_share(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.start_screen_share(window, cx);
     }
 
     /// Select a source and close the picker surface, so a test can exercise
@@ -162,8 +168,8 @@ impl VoicePanel {
     }
 
     /// The stop intent, exactly as the on-air card sends it.
-    pub fn test_stop_screen_share(&mut self, cx: &mut Context<Self>) {
-        self.stop_screen_share(cx);
+    pub fn test_stop_screen_share(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.stop_screen_share(window, cx);
     }
 
     /// Install a probe with controlled timing. It runs on the same background
@@ -222,18 +228,23 @@ impl VoicePanel {
     }
 
     /// The close intent shared by Cancel, Escape and the backdrop.
-    pub fn test_close_screen_share(&mut self, cx: &mut Context<Self>) {
-        self.close_screen_share(cx);
+    pub fn test_close_screen_share(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_screen_share(window, cx);
     }
 
     /// Switch the picker category exactly like the tab action does.
-    pub fn test_switch_share_kind(&mut self, kind: SourceKind, cx: &mut Context<Self>) {
-        self.change_share_kind(kind, cx);
+    pub fn test_switch_share_kind(
+        &mut self,
+        kind: SourceKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.change_share_kind(kind, window, cx);
     }
 
     /// Run the picker refresh exactly like the «Обновить» action does.
-    pub fn test_refresh_screen_sources(&mut self, cx: &mut Context<Self>) {
-        self.refresh_screen_sources(cx);
+    pub fn test_refresh_screen_sources(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.refresh_screen_sources(window, cx);
     }
 
     /// The source request generations, used to observe that refresh was inert.
@@ -257,6 +268,7 @@ impl VoicePanel {
     /// result would insert it. No capture stack is involved.
     pub fn test_inject_screen_preview(
         &mut self,
+        window: &mut Window,
         source: &ScreenSource,
         width: u32,
         height: u32,
@@ -269,7 +281,7 @@ impl VoicePanel {
         let Some(identity) = source.identity() else {
             return false;
         };
-        self.screen.insert_preview(identity, frame)
+        self.screen.insert_preview(window, identity, frame)
     }
 
     /// Inject a preview failure for one card without touching the selection.
@@ -283,8 +295,8 @@ impl VoicePanel {
 
     /// Run the production preview request against the current picker state, so
     /// a test can model a refresh or a source-list update at an exact moment.
-    pub fn test_request_screen_previews(&mut self, cx: &mut Context<Self>) {
-        self.request_screen_previews(cx);
+    pub fn test_request_screen_previews(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.request_screen_previews(window, cx);
     }
 
     /// Whether a preview batch is marked active for the open picker.
@@ -303,6 +315,7 @@ impl VoicePanel {
     /// a capture that was in flight when the snapshot changed.
     pub fn test_deliver_screen_preview(
         &mut self,
+        window: &mut Window,
         epoch: u64,
         source: &ScreenSource,
         ok: bool,
@@ -320,7 +333,7 @@ impl VoicePanel {
         } else {
             Err(ThumbnailError::Timeout)
         };
-        self.screen.finish_preview(epoch, identity, result)
+        self.screen.finish_preview(window, epoch, identity, result)
     }
 
     /// The current preview session epoch.
@@ -384,17 +397,25 @@ impl VoicePanel {
 
     /// Feed a source answer exactly as the media worker does, including the
     /// generation check and the refresh invalidation.
-    pub fn test_apply_screen_sources(&mut self, kind: SourceKind, sources: Vec<ScreenSource>) {
+    pub fn test_apply_screen_sources(
+        &mut self,
+        window: &mut Window,
+        kind: SourceKind,
+        sources: Vec<ScreenSource>,
+    ) {
         let generation = match kind {
             SourceKind::Monitor => self.screen.monitor_generation + 1,
             SourceKind::Window => self.screen.window_generation + 1,
         };
-        self.apply_screen_update(VoiceUpdate::ScreenSources {
-            generation,
-            kind,
-            sources,
-            error: None,
-        });
+        self.apply_screen_update(
+            VoiceUpdate::ScreenSources {
+                generation,
+                kind,
+                sources,
+                error: None,
+            },
+            window,
+        );
     }
 
     /// Replace the cached list without the refresh invalidation, to model a
@@ -425,6 +446,7 @@ impl VoicePanel {
         &mut self,
         source: ScreenSource,
         sharing: Sharing,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.test_open_screen_picker(source.clone());
@@ -446,16 +468,16 @@ impl VoicePanel {
         // normal gate answers "already live". The restart path must pass that
         // one reason without opening a second publication.
         self.test_share_gate = Some(Err("Трансляция уже идёт."));
-        self.open_screen_settings(cx);
+        self.open_screen_settings(window, cx);
     }
 
     /// Open the live quality dialog exactly like the on-air card does, on the
     /// state a test set up itself. The picker snapshot is not touched.
-    pub fn test_open_live_screen_settings(&mut self, cx: &mut Context<Self>) {
+    pub fn test_open_live_screen_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // The live card reaches this dialog while the publication is Live, so
         // the normal gate answers "already live".
         self.test_share_gate = Some(Err("Трансляция уже идёт."));
-        self.open_screen_settings(cx);
+        self.open_screen_settings(window, cx);
     }
 
     /// Record the accepted attempt exactly as the media layer does when it
@@ -658,8 +680,8 @@ impl VoicePanel {
 
     /// Apply a screen-share runtime update exactly as the publisher emits it
     /// (including the live stats sample every second).
-    pub fn test_apply_screen_sharing(&mut self, sharing: Sharing) -> bool {
-        self.apply_screen_update(VoiceUpdate::ScreenShare(sharing))
+    pub fn test_apply_screen_sharing(&mut self, window: &mut Window, sharing: Sharing) -> bool {
+        self.apply_screen_update(VoiceUpdate::ScreenShare(sharing), window)
     }
 
     /// Put one screen snapshot into the real coalescing queue, exactly as the
@@ -712,5 +734,47 @@ impl VoicePanel {
             .iter()
             .find(|participant| participant.connection_id == connection)
             .cloned()
+    }
+
+    /// Pictures handed to `Window::drop_image` from the picker/on-air cache.
+    pub fn test_screen_images_released(&self) -> u32 {
+        self.screen.released_images
+    }
+
+    /// Incoming player pictures handed to `Window::drop_image`.
+    pub fn test_player_images_released(&self) -> u32 {
+        self.player_images_released
+    }
+
+    /// Image id of the on-air card picture, if it holds one.
+    pub fn test_screen_preview_image_id(&self) -> Option<usize> {
+        self.screen.preview.as_ref().map(|image| image.id.0)
+    }
+
+    /// Image id of the incoming player frame, if it holds one.
+    pub fn test_player_frame_image_id(&self) -> Option<usize> {
+        self.frame.as_ref().map(|image| image.id.0)
+    }
+
+    /// Install an on-air picture through the production setter, so a test can
+    /// observe the replace/release rule without a capture stack.
+    pub fn test_set_screen_preview(&mut self, window: &mut Window, image: Arc<RenderImage>) {
+        self.screen.set_preview(window, image);
+    }
+
+    /// Install an incoming player frame through the production setter.
+    pub fn test_set_player_frame(&mut self, window: &mut Window, image: Arc<RenderImage>) {
+        self.set_player_frame(window, image);
+    }
+
+    /// The production player close path: leave the stream and release its
+    /// last frame.
+    pub fn test_leave_stream(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.leave_stream(window, cx);
+    }
+
+    /// The production reset path shared by leaving the call and a lost call.
+    pub fn test_reset_screen(&mut self, window: &mut Window) {
+        self.reset_screen(window);
     }
 }

@@ -228,6 +228,10 @@ pub struct VoicePanel {
                 + Sync,
         >,
     >,
+    /// Player pictures really handed to `Window::drop_image`. Test-only: it
+    /// proves that a replaced or closed incoming frame left the sprite atlas.
+    #[cfg(test)]
+    player_images_released: u32,
 }
 
 impl VoicePanel {
@@ -354,6 +358,8 @@ impl VoicePanel {
             test_audio_probe: None,
             #[cfg(test)]
             test_preview_provider: None,
+            #[cfg(test)]
+            player_images_released: 0,
         }
     }
 
@@ -588,7 +594,7 @@ impl VoicePanel {
 
     /// Join the displayed room. Joining another room leaves the current call
     /// first, so no audio or video stays on the old lease.
-    pub fn join(&mut self, cx: &mut Context<Self>) {
+    pub fn join(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.access_confirmed {
             self.error = "Права на голосовой канал ещё не подтверждены.".into();
             cx.notify();
@@ -610,7 +616,7 @@ impl VoicePanel {
             return;
         }
         if self.handle.is_some() && self.call_channel != self.room {
-            self.leave_call(cx);
+            self.leave_call(window, cx);
         }
         if self.handle.is_some() {
             return;
@@ -625,7 +631,7 @@ impl VoicePanel {
         ) {
             Ok(handle) => {
                 self.call_channel = self.room;
-                self.install_handle(handle, cx);
+                self.install_handle(handle, window, cx);
             }
             Err(error) => self.error = error,
         }
@@ -635,7 +641,7 @@ impl VoicePanel {
     /// Adopt the one worker of this call. The rotation gate is already armed by
     /// `VoiceHandle::join_with_rotation` before its thread starts, so a call
     /// joined during a refresh never authorizes with the revoked token.
-    fn install_handle(&mut self, handle: VoiceHandle, cx: &mut Context<Self>) {
+    fn install_handle(&mut self, handle: VoiceHandle, window: &mut Window, cx: &mut Context<Self>) {
         self.attempt = handle.attempt();
         self.handle = Some(handle);
         self.begin_attempt();
@@ -645,14 +651,14 @@ impl VoicePanel {
         self.clear_speaking(cx);
         self.tracks.clear();
         self.local_mutes.clear();
-        self.close_player();
+        self.close_player(window);
         self.refresh_capture();
         self.notify_call_changed(cx);
     }
 
     pub fn leave_in_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.exit_fullscreen(window);
-        self.leave_call(cx);
+        self.leave_call(window, cx);
     }
 
     /// Install a client that already carries a rotated token. The active
@@ -685,7 +691,7 @@ impl VoicePanel {
 
     /// Normal leave: stream session and voice session are both released and
     /// the room falls back to the join button.
-    pub fn leave_call(&mut self, cx: &mut Context<Self>) {
+    pub fn leave_call(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.sidebar_watch = None;
         if let Some(handle) = &self.handle {
             if let Some(selection) = self.watching_selection {
@@ -694,8 +700,8 @@ impl VoicePanel {
             handle.leave();
         }
         self.handle.take();
-        self.close_player();
-        self.reset_screen();
+        self.close_player(window);
+        self.reset_screen(window);
         self.call_channel = 0;
         // A failed refresh or an explicit leave ends the flight without a
         // `token_rotated`; the next call must not inherit a stale gate.
@@ -727,7 +733,7 @@ impl VoicePanel {
     /// and close the player without keeping a stale frame.
     pub fn abandon(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.exit_fullscreen(window);
-        self.leave_call(cx);
+        self.leave_call(window, cx);
         self.room_roster.clear();
     }
 
@@ -898,7 +904,7 @@ impl VoicePanel {
 
     /// Start watching the selected publication. The runtime leaves the previous
     /// attempt and waits for its acknowledgement.
-    pub fn watch(&mut self, publication: Publication, cx: &mut Context<Self>) {
+    pub fn watch(&mut self, publication: Publication, window: &mut Window, cx: &mut Context<Self>) {
         self.sidebar_watch = None;
         if !self.access_confirmed
             || self.call_channel == 0
@@ -912,7 +918,7 @@ impl VoicePanel {
         self.stream_error.clear();
         self.stream_status = "Подключение…".into();
         self.stream_connected = false;
-        self.frame = None;
+        self.clear_player_frame(window);
         self.watching = Some(publication.clone());
         self.watching_selection = Some(selection);
         self.stream_muted = false;
@@ -922,18 +928,18 @@ impl VoicePanel {
         cx.notify();
     }
 
-    pub fn leave_stream(&mut self, cx: &mut Context<Self>) {
+    pub fn leave_stream(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let selection = self.stream_selection;
         if let Some(handle) = &self.handle {
             handle.leave_stream(selection);
         }
         self.watching_selection = None;
-        self.close_player();
+        self.close_player(window);
         cx.notify();
     }
 
-    fn close_player(&mut self) {
-        self.frame = None;
+    fn close_player(&mut self, window: &mut Window) {
+        self.clear_player_frame(window);
         self.watching = None;
         self.watching_selection = None;
         self.player_open = false;
@@ -952,7 +958,33 @@ impl VoicePanel {
         if self.player_fullscreen || self.owns_fullscreen {
             self.exit_fullscreen(window);
         }
-        self.close_player();
+        self.close_player(window);
+    }
+
+    /// Release the incoming player picture, if one is held. The slot is empty
+    /// before `drop_image` runs, so a frame that is still painted this tick
+    /// keeps its own `Arc` and is never invalidated under the renderer.
+    fn clear_player_frame(&mut self, window: &mut Window) {
+        if let Some(previous) = self.frame.take() {
+            self.release_player_image(window, previous);
+        }
+    }
+
+    /// Install the newest decoded frame and release the previous one only
+    /// after the slot already points at the new picture.
+    fn set_player_frame(&mut self, window: &mut Window, image: Arc<RenderImage>) {
+        let previous = self.frame.replace(image);
+        if let Some(previous) = previous {
+            self.release_player_image(window, previous);
+        }
+    }
+
+    fn release_player_image(&mut self, window: &mut Window, image: Arc<RenderImage>) {
+        let _ = window.drop_image(image);
+        #[cfg(test)]
+        {
+            self.player_images_released = self.player_images_released.saturating_add(1);
+        }
     }
 
     pub fn toggle_stream_mute(&mut self, cx: &mut Context<Self>) {
@@ -1027,7 +1059,7 @@ impl VoicePanel {
 
     fn poll(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.sync_viewport();
-        let preview_changed = self.take_screen_preview();
+        let preview_changed = self.take_screen_preview(window);
         let clock_changed = self.live_clock_changed();
         let Some(handle) = &self.handle else {
             if preview_changed || clock_changed {
@@ -1044,7 +1076,7 @@ impl VoicePanel {
         for update in updates {
             changed |= self.apply_update(update, window, cx);
         }
-        self.watch_after_join(cx);
+        self.watch_after_join(window, cx);
         if let Some(frame) = frame {
             if self.watching_selection != Some(frame.selection) {
                 // A frame that was already in the last-value slot when the
@@ -1052,9 +1084,10 @@ impl VoicePanel {
             } else if let Some(buffer) =
                 image::RgbaImage::from_raw(frame.width, frame.height, frame.bgra)
             {
-                self.frame = Some(Arc::new(RenderImage::new(smallvec::smallvec![
-                    image::Frame::new(buffer)
-                ])));
+                let image = Arc::new(RenderImage::new(smallvec::smallvec![image::Frame::new(
+                    buffer
+                )]));
+                self.set_player_frame(window, image);
                 changed = true;
             }
         }

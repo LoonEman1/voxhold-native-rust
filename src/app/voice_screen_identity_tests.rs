@@ -18,11 +18,11 @@ async fn a_monitor_id_that_now_names_another_display_is_refused(cx: &mut TestApp
         SourceKind::Monitor,
         vec![selected.clone()],
     );
-    visual.update(|_window, app| {
+    visual.update(|window, app| {
         voice.update(app, |panel, cx| {
             panel.test_select_screen_source(selected.clone(), cx);
-            assert!(panel.test_inject_screen_preview(&selected, 8, 8));
-            panel.test_apply_screen_sources(SourceKind::Monitor, vec![intruder.clone()]);
+            assert!(panel.test_inject_screen_preview(window, &selected, 8, 8));
+            panel.test_apply_screen_sources(window, SourceKind::Monitor, vec![intruder.clone()]);
             assert_eq!(
                 panel.test_selected_source_id(),
                 None,
@@ -34,7 +34,7 @@ async fn a_monitor_id_that_now_names_another_display_is_refused(cx: &mut TestApp
                 "the preview of the old display must be released"
             );
             assert!(!panel.test_can_start());
-            panel.test_start_screen_share(cx);
+            panel.test_start_screen_share(window, cx);
             assert!(
                 panel.test_take_screen_commands().is_empty(),
                 "stream.start must never be sent for the other display"
@@ -55,11 +55,12 @@ async fn a_reordered_capturer_starts_the_same_display_under_its_new_id(cx: &mut 
         SourceKind::Monitor,
         vec![selected.clone(), other.clone()],
     );
-    visual.update(|_window, app| {
+    visual.update(|window, app| {
         voice.update(app, |panel, cx| {
             panel.test_select_screen_source(selected.clone(), cx);
             // The capturer swapped the numbers: A is now id 1, B is id 0.
             panel.test_apply_screen_sources(
+                window,
                 SourceKind::Monitor,
                 vec![
                     monitor_on(0, 6, "Экран B", 2560, 1440),
@@ -72,7 +73,7 @@ async fn a_reordered_capturer_starts_the_same_display_under_its_new_id(cx: &mut 
                 "the choice follows the display, not the number"
             );
             assert!(panel.test_can_start());
-            panel.test_start_screen_share(cx);
+            panel.test_start_screen_share(window, cx);
             assert_eq!(
                 panel.test_take_screen_commands(),
                 vec![("publish", 7)],

@@ -80,9 +80,9 @@ impl VoicePanel {
             .justify_center()
             .track_focus(&focus);
         if enabled {
-            button = button
-                .cursor_pointer()
-                .on_click(cx.listener(move |panel, _, _, cx| panel.activate_share(key, cx)));
+            button = button.cursor_pointer().on_click(
+                cx.listener(move |panel, _, window, cx| panel.activate_share(key, window, cx)),
+            );
         }
         button.child(label).into_any_element()
     }
@@ -678,9 +678,11 @@ impl VoicePanel {
                     // preflight is the exception: closing it only cancels the
                     // preflight and leaves the live stream running.
                     .when(cancel_active, |button| {
-                        button
-                            .cursor_pointer()
-                            .on_click(cx.listener(|panel, _, _, cx| panel.close_screen_share(cx)))
+                        button.cursor_pointer().on_click(
+                            cx.listener(|panel, _, window, cx| {
+                                panel.close_screen_share(window, cx)
+                            }),
+                        )
                     })
                     .child("Отмена"),
             )
@@ -698,7 +700,9 @@ impl VoicePanel {
                     .items_center()
                     .when(can_start, |button| button.cursor_pointer())
                     .track_focus(&start_focus)
-                    .on_click(cx.listener(|panel, _, _, cx| panel.start_screen_share(cx)))
+                    .on_click(
+                        cx.listener(|panel, _, window, cx| panel.start_screen_share(window, cx)),
+                    )
                     .child(start_label),
             );
 
@@ -736,7 +740,7 @@ impl VoicePanel {
             .capture_key_down(
                 cx.listener(|panel, event: &gpui::KeyDownEvent, window, cx| {
                     if event.keystroke.key == "escape" {
-                        panel.close_screen_share(cx);
+                        panel.close_screen_share(window, cx);
                         cx.stop_propagation();
                         return;
                     }
@@ -803,17 +807,17 @@ impl VoicePanel {
                 .bg(gpui::rgba(0x000000b0))
                 .on_mouse_down(
                     MouseButton::Left,
-                    cx.listener(|panel, _, _, cx| panel.close_screen_share(cx)),
+                    cx.listener(|panel, _, window, cx| panel.close_screen_share(window, cx)),
                 )
                 .child(card)
                 .into_any_element(),
         )
     }
-    fn activate_share(&mut self, key: ShareKey, cx: &mut Context<Self>) {
+    fn activate_share(&mut self, key: ShareKey, window: &mut Window, cx: &mut Context<Self>) {
         match key {
-            ShareKey::Monitors => self.change_share_kind(SourceKind::Monitor, cx),
-            ShareKey::Windows => self.change_share_kind(SourceKind::Window, cx),
-            ShareKey::Refresh => self.refresh_screen_sources(cx),
+            ShareKey::Monitors => self.change_share_kind(SourceKind::Monitor, window, cx),
+            ShareKey::Windows => self.change_share_kind(SourceKind::Window, window, cx),
+            ShareKey::Refresh => self.refresh_screen_sources(window, cx),
             ShareKey::Resolution(resolution) => {
                 self.screen.resolution = resolution;
                 cx.notify();
@@ -833,10 +837,10 @@ impl VoicePanel {
                 // The committed attempt is stopped by Escape/backdrop; the
                 // Cancel button itself is unavailable while busy.
                 if !self.screen.busy {
-                    self.close_screen_share(cx);
+                    self.close_screen_share(window, cx);
                 }
             }
-            ShareKey::Start => self.start_screen_share(cx),
+            ShareKey::Start => self.start_screen_share(window, cx),
             ShareKey::Source(id) => {
                 // The row is selected by its stable identity, so Enter on a
                 // focused row still selects it after the list is reordered.
@@ -873,7 +877,7 @@ impl VoicePanel {
             .find(|(handle, _)| handle.is_focused(window))
             .map(|(_, key)| *key);
         if let Some(key) = key {
-            self.activate_share(key, cx);
+            self.activate_share(key, window, cx);
         }
     }
 
@@ -889,7 +893,7 @@ impl VoicePanel {
     ) -> bool {
         match key {
             "escape" => {
-                self.close_screen_share(cx);
+                self.close_screen_share(window, cx);
                 true
             }
             "tab" => {

@@ -410,7 +410,7 @@ impl VoicePanel {
                     .justify_center()
                     .cursor_pointer()
                     .track_focus(&self.player_actions[2])
-                    .on_click(cx.listener(|panel, _, _, cx| panel.leave_stream(cx)))
+                    .on_click(cx.listener(|panel, _, window, cx| panel.leave_stream(window, cx)))
                     .child(img("icons/close.svg").w(px(13.)).h(px(13.))),
             )
             .child(

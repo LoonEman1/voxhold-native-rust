@@ -15,7 +15,7 @@ fn draw(visual: &mut VisualTestContext) {
 }
 
 fn allow_chat(view: &Entity<Voxhold>, visual: &mut VisualTestContext, channels: &[i64]) {
-    visual.update(|_window, app| {
+    visual.update(|window, app| {
         view.update(app, |v, cx| {
             for channel in channels {
                 if let Some(row) = v.channels.iter_mut().find(|row| row.id == *channel) {
@@ -32,7 +32,7 @@ async fn opening_the_room_chat_does_not_join_a_call(cx: &mut TestAppContext) {
     let (mut visual, view, voice) = fixture(cx);
     // This room is not connected; the panel only displays it.
     visual.update(|window, app| {
-        voice.update(app, |panel, cx| panel.leave_call(cx));
+        voice.update(app, |panel, cx| panel.leave_call(window, cx));
         let _ = window;
     });
     allow_chat(&view, visual, &[7]);

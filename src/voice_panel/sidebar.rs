@@ -1,20 +1,25 @@
 use super::*;
 
 impl VoicePanel {
-    pub(crate) fn watch_from_sidebar(&mut self, publication: Publication, cx: &mut Context<Self>) {
+    pub(crate) fn watch_from_sidebar(
+        &mut self,
+        publication: Publication,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if !self.access_confirmed || publication.channel_id != self.room {
             return;
         }
-        self.join(cx);
+        self.join(window, cx);
         if self.call_channel == self.room && self.handle.is_some() {
             self.sidebar_watch = Some(publication);
             if self.room_painted {
-                self.watch_after_join(cx);
+                self.watch_after_join(window, cx);
             }
         }
     }
 
-    pub(super) fn watch_after_join(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn watch_after_join(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.access_confirmed
             || !self.room_painted
             || matches!(self.phase, CallPhase::Idle | CallPhase::Failed)
@@ -32,7 +37,7 @@ impl VoicePanel {
                 .find(|item| item.publisher_connection_id == pending.publisher_connection_id)
                 .cloned();
             if let Some(publication) = publication {
-                self.watch(publication, cx);
+                self.watch(publication, window, cx);
             } else if !self
                 .room_streams
                 .iter()

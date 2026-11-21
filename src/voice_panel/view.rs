@@ -229,9 +229,9 @@ impl VoicePanel {
                     .justify_center()
                     .cursor_pointer()
                     .track_focus(focus)
-                    .on_click(
-                        cx.listener(move |panel, _, _, cx| panel.watch(publication.clone(), cx)),
-                    )
+                    .on_click(cx.listener(move |panel, _, window, cx| {
+                        panel.watch(publication.clone(), window, cx)
+                    }))
                     .child("Смотреть"),
             );
         }
@@ -725,7 +725,7 @@ impl VoicePanel {
                     .justify_center()
                     .cursor_pointer()
                     .track_focus(&self.join_focus)
-                    .on_click(cx.listener(|panel, _, _, cx| panel.join(cx)))
+                    .on_click(cx.listener(|panel, _, window, cx| panel.join(window, cx)))
                     .child("Подключиться"),
             );
         }

@@ -3,6 +3,7 @@
 //! The state, the gate and the on-air card stay in screen_share.rs; this
 //! file only paints the picker and routes its keyboard actions.
 
+use super::picker::*;
 use super::*;
 use crate::theme;
 use voxhold_media::publisher::{Codec, Preset, Resolution};
@@ -87,155 +88,6 @@ impl VoicePanel {
         button.child(label).into_any_element()
     }
 
-    /// One picker card. The root id, the click and the focus handle all use the
-    /// stable `kind + id`, never a grid position, so a reorder keeps both the
-    /// selection and the keyboard focus on the same source.
-    fn source_card(
-        &self,
-        source: &ScreenSource,
-        id: SourceId,
-        selected: bool,
-        enabled: bool,
-        focus: Option<FocusHandle>,
-        card_width: f32,
-        locked: bool,
-        cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
-        let c = self.colors();
-        let key = ScreenShareUi::source_kind_name(id);
-        let identity = source.identity();
-        let thumb = identity
-            .as_ref()
-            .and_then(|identity| self.screen.previews.get(identity));
-        let failure = identity
-            .as_ref()
-            .and_then(|identity| self.screen.preview_failures.get(identity));
-        let size = if source.width > 0 && source.height > 0 {
-            format!("{}×{}", source.width, source.height)
-        } else {
-            "Размер неизвестен".into()
-        };
-        let card_selector = format!("share-source-card-{key}-{}", id.id);
-        let thumb_selector = format!("share-thumb-{key}-{}", id.id);
-        let placeholder_selector = format!("share-thumb-placeholder-{key}-{}", id.id);
-        let error_selector = format!("share-thumb-error-{key}-{}", id.id);
-        let selected_selector = format!("share-selected-{key}-{}", id.id);
-
-        let mut picture = div()
-            .w_full()
-            .h(px(70.))
-            .flex_shrink_0()
-            .overflow_hidden()
-            .bg(rgb(0x080808))
-            .flex()
-            .items_center()
-            .justify_center();
-        if let Some(thumb) = thumb {
-            picture = picture.child(
-                div()
-                    .debug_selector(move || thumb_selector.clone())
-                    .w_full()
-                    .h_full()
-                    .child(
-                        img(thumb.image.clone())
-                            .w_full()
-                            .h_full()
-                            .object_fit(gpui::ObjectFit::Contain),
-                    ),
-            );
-        } else if failure.is_some() {
-            picture = picture.child(
-                div()
-                    .debug_selector(move || error_selector.clone())
-                    .text_size(px(10.))
-                    .text_color(rgb(c.danger))
-                    .child("Превью недоступно"),
-            );
-        } else {
-            picture = picture.child(
-                div()
-                    .debug_selector(move || placeholder_selector.clone())
-                    .text_size(px(10.))
-                    .text_color(rgb(c.muted))
-                    .child(if locked {
-                        "Текущий источник"
-                    } else {
-                        "Превью…"
-                    }),
-            );
-        }
-
-        let mut footer = div()
-            .flex()
-            .flex_col()
-            .gap(px(1.))
-            .p(px(6.))
-            .min_w(px(0.))
-            .child(
-                div()
-                    .text_size(px(11.))
-                    .font_weight(gpui::FontWeight::BOLD)
-                    .truncate()
-                    .child(source.title.clone()),
-            )
-            .child(
-                div()
-                    .text_size(px(9.))
-                    .text_color(rgb(c.muted))
-                    .truncate()
-                    .child(size),
-            );
-        if let Some(message) = failure {
-            footer = footer.child(
-                div()
-                    .text_size(px(9.))
-                    .text_color(rgb(c.danger))
-                    .truncate()
-                    .child(message.clone()),
-            );
-        }
-
-        let mut card = div()
-            .id(Self::source_element_id(source))
-            .debug_selector(move || card_selector.clone())
-            .w(px(card_width))
-            .h(px(124.))
-            .flex_shrink_0()
-            .relative()
-            .overflow_hidden()
-            .rounded(px(9.))
-            .border_1()
-            .border_color(rgb(if selected { c.accent_text } else { c.line }))
-            .bg(rgb(if selected { c.avatar_bg } else { c.surface }))
-            .flex()
-            .flex_col();
-        if let Some(focus) = focus {
-            card = card.track_focus(&focus);
-        }
-        if enabled {
-            card = card
-                .cursor_pointer()
-                .on_click(cx.listener(move |panel, _, _, cx| panel.select_screen_source(id, cx)));
-        }
-        if selected {
-            card = card.child(
-                div()
-                    .debug_selector(move || selected_selector.clone())
-                    .absolute()
-                    .top(px(5.))
-                    .right(px(5.))
-                    .px(px(5.))
-                    .py(px(1.))
-                    .rounded(px(4.))
-                    .bg(rgb(c.accent))
-                    .text_color(rgb(c.ink))
-                    .text_size(px(8.))
-                    .child("ВЫБРАНО"),
-            );
-        }
-        card.child(picture).child(footer).into_any_element()
-    }
-
     /// The full-window picker. `None` when it is closed.
     pub fn screen_share_overlay(
         &mut self,
@@ -289,79 +141,111 @@ impl VoicePanel {
                 .child(self.choice("Обновить", false, refresh_focus, ShareKey::Refresh, cx));
         }
 
-        // Two cards per row at the dialog's normal width, one when it has to
-        // shrink; the grid scrolls inside the same picker height as before.
-        let columns = if width >= 560.0 { 2 } else { 1 };
-        let inner_width = (width - 36.0).max(120.0);
-        let gap = 8.0_f32;
-        let card_width = if columns == 2 {
-            (inner_width - gap) / 2.0
+        // Columns follow the measured inner width minus the scrollbar reserve:
+        // GPUI only reserves layout space for a scrollbar, the bar itself is
+        // painted below, so the cards must not extend under it. The modal
+        // border is part of its box and is subtracted as well.
+        let inner_width = (width - PICKER_PADDING * 2. - CARD_BORDER * 2.).max(120.0);
+        let content_width = (inner_width - LIST_SCROLLBAR).max(1.0);
+        let columns = picker_columns(content_width);
+        let card_width = card_width(columns, content_width);
+        // The physical card width decides the thumbnail request. Moving the
+        // picker to a 125/150% monitor starts a new preview generation.
+        let requested = thumbnail_request_width(card_width, window.scale_factor());
+        self.set_thumbnail_width(requested, cx);
+        self.screen.preview_columns = columns;
+        if self.screen.preview_cards > 0 {
+            let top = self.screen.list_scroll.top_item();
+            let bottom = self.screen.list_scroll.bottom_item();
+            self.set_preview_viewport(columns, top.min(bottom), bottom, cx);
         } else {
-            inner_width
+            self.screen.visible_rows = None;
+        }
+
+        let restart_live = self.screen.restart_source().cloned();
+        let sources: Vec<ScreenSource> = if self.screen.restart {
+            restart_live.iter().cloned().collect()
+        } else {
+            self.screen.sources().to_vec()
         };
+        // The second row on the base screenshot was clipped by the list
+        // viewport, which was fixed at 236 px; the cards themselves were
+        // complete but small. The viewport height is now derived from the
+        // dialog, rows past it scroll inside this separate element, and the
+        // bar is painted from the real scroll state.
+        let empty = sources.is_empty();
         let mut list = div()
             .id("share-sources")
             .debug_selector(|| "share-sources".into())
-            .h(px(236.))
             .w_full()
-            .overflow_y_scroll()
-            .flex()
-            .flex_col()
-            .gap(px(gap));
-        if self.screen.restart {
-            // Locked context: only the confirmed live source is painted, and
-            // it is inert. It is not part of the focus ring, so neither Tab
-            // nor a click can move the restart onto another cached source.
-            if let Some(live) = self.screen.restart_source().cloned() {
-                let id = live.source_id();
-                self.screen.preview_cards = 1;
-                list = list
-                    .child(self.source_card(&live, id, true, false, None, card_width, true, cx));
+            .flex_shrink_0()
+            .relative();
+        if empty {
+            // An empty grid must not reserve the height of a row it does not
+            // have. The message is its own small block.
+            let text = if self.screen.restart {
+                "Текущий источник недоступен.".to_owned()
+            } else if self.screen.loading() {
+                "Ищем источники…".to_owned()
+            } else if !self.screen.error().is_empty() {
+                self.screen.error().to_owned()
             } else {
-                self.screen.preview_cards = 0;
-            }
+                "Источников нет. Обновите список.".to_owned()
+            };
+            self.screen.preview_cards = 0;
+            list = list.child(
+                div()
+                    .debug_selector(|| "share-sources-empty".into())
+                    .p(px(10.))
+                    .text_size(px(12.))
+                    .text_color(rgb(c.muted))
+                    .child(text),
+            );
         } else {
-            let sources: Vec<ScreenSource> = self.screen.sources().to_vec();
-            let selected = self.screen.selected;
             self.screen.preview_cards = sources.len();
-            if sources.is_empty() {
-                let text = if self.screen.loading() {
-                    "Ищем источники…"
-                } else if !self.screen.error().is_empty() {
-                    self.screen.error()
-                } else {
-                    "Источников нет. Обновите список."
-                };
-                list = list.child(
-                    div()
-                        .p(px(10.))
-                        .text_size(px(12.))
-                        .text_color(rgb(c.muted))
-                        .child(text.to_owned()),
-                );
-            }
+            let viewport_height = list_height(height);
+            let mut grid = div()
+                .id("share-sources-scroll")
+                .w_full()
+                .h_full()
+                .flex()
+                .flex_col()
+                .gap(px(PICKER_GAP))
+                .overflow_y_scroll()
+                .scrollbar_width(px(LIST_SCROLLBAR))
+                .track_scroll(&self.screen.list_scroll.clone());
+            let selected = self.screen.selected;
             let mut rows: Vec<Vec<gpui::AnyElement>> = Vec::new();
             let mut current: Vec<gpui::AnyElement> = Vec::new();
             for source in sources.iter() {
                 let id = source.source_id();
-                // Focus belongs to the surface, not to the grid position or
-                // the capturer number: the keyed handle survives a reorder.
-                let focus = window
-                    .use_keyed_state(Self::source_element_id(source), cx, |_, cx| {
-                        cx.focus_handle()
-                    })
-                    .read(cx)
-                    .clone();
-                ring.push((focus.clone(), ShareKey::Source(id)));
-                let is_selected = selected == Some(id);
+                // Locked context: only the confirmed live source is painted,
+                // and it is inert. A restart is not part of the focus ring, so
+                // neither Tab nor a click can move it onto another cached
+                // source.
+                let (focus, is_selected, enabled, locked) = if self.screen.restart {
+                    (None, true, false, true)
+                } else {
+                    // Focus belongs to the surface, not to the grid position
+                    // or the capturer number: the keyed handle survives a
+                    // reorder.
+                    let focus = window
+                        .use_keyed_state(Self::source_element_id(source), cx, |_, cx| {
+                            cx.focus_handle()
+                        })
+                        .read(cx)
+                        .clone();
+                    ring.push((focus.clone(), ShareKey::Source(id)));
+                    (Some(focus), selected == Some(id), true, false)
+                };
                 current.push(self.source_card(
                     source,
                     id,
                     is_selected,
-                    true,
-                    Some(focus),
+                    enabled,
+                    focus,
                     card_width,
-                    false,
+                    locked,
                     cx,
                 ));
                 if current.len() == columns {
@@ -372,11 +256,46 @@ impl VoicePanel {
                 rows.push(current);
             }
             for cards in rows {
-                let mut grid_row = div().flex().items_start().gap(px(gap));
+                let mut grid_row = div().flex().items_start().gap(px(PICKER_GAP)).w_full();
                 for card in cards {
                     grid_row = grid_row.child(card);
                 }
-                list = list.child(grid_row);
+                grid = grid.child(grid_row);
+            }
+            list = list.h(px(viewport_height)).child(grid);
+            // The reserved 8 px is only layout space in GPUI. Paint the
+            // visible bar over the right edge of the viewport from the same
+            // handle that scrolls the grid: the thumb follows `offset()` and
+            // disappears when there is nothing to scroll.
+            let max_scroll: f32 = self.screen.list_scroll.max_offset().height.into();
+            if max_scroll > 0.5 {
+                let offset: f32 = (-self.screen.list_scroll.offset().y).into();
+                let content = viewport_height + max_scroll;
+                let thumb_h = (viewport_height * viewport_height / content)
+                    .max(28.)
+                    .min(viewport_height);
+                let progress = (offset / max_scroll).clamp(0., 1.);
+                let thumb_top = (viewport_height - thumb_h) * progress;
+                list = list.child(
+                    div()
+                        .debug_selector(|| "share-sources-scrollbar".into())
+                        .absolute()
+                        .top(px(0.))
+                        .right(px(0.))
+                        .w(px(LIST_SCROLLBAR))
+                        .h(px(viewport_height))
+                        .child(
+                            div()
+                                .debug_selector(|| "share-sources-scrollbar-thumb".into())
+                                .absolute()
+                                .right(px(1.))
+                                .top(px(thumb_top))
+                                .w(px(LIST_SCROLLBAR - 2.))
+                                .h(px(thumb_h))
+                                .rounded(px(3.))
+                                .bg(rgb(c.muted)),
+                        ),
+                );
             }
         }
 
@@ -427,7 +346,7 @@ impl VoicePanel {
         let quality_row = div()
             .flex()
             .flex_col()
-            .gap_2()
+            .gap_1()
             .child(
                 div()
                     .flex()
@@ -590,6 +509,7 @@ impl VoicePanel {
             })
             .child(
                 div()
+                    .debug_selector(|| "share-codec".into())
                     .flex()
                     .items_center()
                     .gap_2()
@@ -651,7 +571,9 @@ impl VoicePanel {
             Some(self.screen.error.clone())
         };
         let actions = div()
+            .debug_selector(|| "share-actions".into())
             .flex()
+            .flex_shrink_0()
             .items_center()
             .justify_end()
             .gap_2()
@@ -701,6 +623,22 @@ impl VoicePanel {
                     .on_click(cx.listener(|panel, _, _, cx| panel.start_screen_share(cx)))
                     .child(start_label),
             );
+
+        // The settings keep their own scroll region: a compact window shrinks
+        // this block instead of pushing the Cancel/Start row out of the modal.
+        let settings = div()
+            .id("share-settings")
+            .debug_selector(|| "share-settings".into())
+            .w_full()
+            .flex_1()
+            .min_h(px(0.))
+            .overflow_y_scroll()
+            .scrollbar_width(px(6.))
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(preset_row)
+            .child(quality_row);
 
         self.screen.ring = ring;
         // The modal must own the keyboard from its first frame; otherwise the
@@ -772,8 +710,7 @@ impl VoicePanel {
             )
             .child(tabs)
             .child(list)
-            .child(preset_row)
-            .child(quality_row);
+            .child(settings);
         if let Some(warning) = self.screen.restart_warning() {
             card = card.child(
                 div()
@@ -860,7 +797,20 @@ impl VoicePanel {
             (None, false) => 0,
             (None, true) => self.screen.ring.len() - 1,
         };
-        let handle = self.screen.ring[next].0.clone();
+        let (handle, key) = self.screen.ring[next].clone();
+        // Focus must be visible, not merely set: a keyboard walk to the last
+        // source scrolls its whole grid row into the separate list viewport.
+        if let ShareKey::Source(id) = key {
+            if let Some(index) = self
+                .screen
+                .sources()
+                .iter()
+                .position(|source| source.source_id() == id)
+            {
+                let columns = self.screen.preview_columns.max(1);
+                self.screen.list_scroll.scroll_to_item(index / columns);
+            }
+        }
         window.focus(&handle);
         cx.notify();
     }

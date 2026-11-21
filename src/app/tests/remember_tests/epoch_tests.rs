@@ -82,9 +82,11 @@ async fn a_failed_logout_delete_is_visible_and_keeps_the_record(cx: &mut TestApp
             v.logout(window, cx);
         });
     });
-    // One retry, then the login screen names the failure.
+    // One retry, then the address screen names the failure.
     wait_for(&mut visual, &view, |v| {
-        v.auth.status == crate::app::auto_login::DELETE_ERROR
+        v.auth
+            .status
+            .starts_with(crate::app::auto_login::CLEAR_ERROR)
     });
     assert!(
         !store.load_all().unwrap().is_empty(),
@@ -95,12 +97,31 @@ async fn a_failed_logout_delete_is_visible_and_keeps_the_record(cx: &mut TestApp
         visual.debug_bounds("auth-retry-login").is_none(),
         "the delete error is not a retry of the login"
     );
+    assert!(
+        visual.debug_bounds("auth-cleanup-retry").is_some(),
+        "the failed cleanup offers a local retry"
+    );
+    assert_eq!(
+        view.read_with(&*visual, |v, _| v.auth.screen),
+        crate::auth::AuthScreen::Instance
+    );
 
     // The notice itself must stay readable rather than be swallowed.
-    assert_eq!(
-        view.read_with(&*visual, |v, _| v.auth.status.clone()),
-        crate::app::auto_login::DELETE_ERROR
-    );
+    assert!(view
+        .read_with(&*visual, |v, _| v.auth.status.clone())
+        .starts_with(crate::app::auto_login::CLEAR_ERROR));
     drop(guard);
+    // The retry runs on the now writable disk and finishes the cleanup.
+    visual.update(|window, app| {
+        view.update(app, |v, cx| v.retry_cleanup(window, cx));
+    });
+    wait_store(&mut visual, &store, |store| {
+        store.load_all().unwrap().is_empty()
+    });
+    wait_for(&mut visual, &view, |v| !v.cleanup_retry);
+    view.read_with(&*visual, |v, _| {
+        assert!(v.auth.status.is_empty());
+        assert!(!v.auto_blocked);
+    });
     std::fs::remove_dir_all(dir).unwrap();
 }

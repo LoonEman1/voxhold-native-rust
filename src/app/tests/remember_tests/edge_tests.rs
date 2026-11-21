@@ -39,7 +39,7 @@ fn submit_and_toggle(visual: &mut VisualTestContext, view: &Entity<Voxhold>, rem
 }
 
 #[gpui::test]
-async fn an_expired_newest_record_does_not_hide_a_valid_older_one(cx: &mut TestAppContext) {
+async fn an_expired_target_does_not_fall_back_to_the_older_account(cx: &mut TestAppContext) {
     cx.update(|cx| gpui_component::init(cx));
     let server = TestServer::spawn(vec![
         Reply::new(200, &profile_body(7, "neva")),
@@ -52,20 +52,25 @@ async fn an_expired_newest_record_does_not_hide_a_valid_older_one(cx: &mut TestA
     let mut expired = record(&server.base, "bob", 9, "token-expired", -10);
     expired.saved_at = now_unix();
     store.save_now(&valid).unwrap();
+    // The newest save becomes «the» target, so the expired account is checked
+    // and removed instead of searching older accounts.
     store.save_now(&expired).unwrap();
 
     let (window, view) = open(cx, "", &dir);
     let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
     visual.run_until_parked();
-    confirm(&mut visual, &view, &server.base);
-    wait_for(&mut visual, &view, |v| v.session.is_some());
-    assert_eq!(
-        view.read_with(&*visual, |v, _| v
-            .session
-            .as_ref()
-            .map(|s| s.token().to_owned())),
-        Some("token-valid".into())
+    settled_auto(&mut visual, &view);
+    assert!(
+        view.read_with(&*visual, |v, _| v.session.is_none()),
+        "an expired target is not restored"
     );
+    assert!(
+        server.requests().is_empty(),
+        "an expired target sends no request"
+    );
+    let state = store.state().unwrap();
+    assert_eq!(state.records, vec![valid]);
+    assert!(state.target.is_none());
     std::fs::remove_dir_all(dir).unwrap();
 }
 
@@ -84,7 +89,6 @@ async fn a_cyrillic_account_matches_in_another_case(cx: &mut TestAppContext) {
     let (window, view) = open(cx, "", &dir);
     let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
     visual.run_until_parked();
-    confirm(&mut visual, &view, &server.base);
     wait_for(&mut visual, &view, |v| v.session.is_some());
     assert_eq!(
         view.read_with(&*visual, |v, _| v

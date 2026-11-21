@@ -201,7 +201,7 @@ async fn a_stored_session_enters_without_a_password(cx: &mut TestAppContext) {
     let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
     visual.run_until_parked();
 
-    confirm(&mut visual, &view, &server.base);
+    // No manual address step: the one startup check restores the target.
     wait_for(&mut visual, &view, |v| v.session.is_some());
 
     let (origin, user_id, token) = view.read_with(&*visual, |v, _| {
@@ -246,7 +246,6 @@ async fn a_401_deletes_the_record_and_asks_for_the_password(cx: &mut TestAppCont
     let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
     visual.run_until_parked();
 
-    confirm(&mut visual, &view, &server.base);
     wait_for(&mut visual, &view, |v| {
         !v.auth.auto_login && v.auth.status.contains("Сессия истекла")
     });
@@ -256,7 +255,9 @@ async fn a_401_deletes_the_record_and_asks_for_the_password(cx: &mut TestAppCont
         assert!(v.client.is_none());
         assert!(!v.auth.remember_login);
     });
-    assert!(store.load_now(&server.base).unwrap().is_none());
+    let state = store.state().unwrap();
+    assert!(state.records.is_empty(), "the refused record is deleted");
+    assert!(state.target.is_none(), "its target is deleted too");
     std::fs::remove_dir_all(dir).unwrap();
 }
 
@@ -277,7 +278,6 @@ async fn a_network_failure_keeps_the_record_and_retry_signs_in(cx: &mut TestAppC
     let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
     visual.run_until_parked();
 
-    confirm(&mut visual, &view, &server.base);
     wait_for(&mut visual, &view, |v| {
         v.auth.auto_retry && v.auth.status == "Нет связи."
     });
@@ -326,7 +326,6 @@ async fn a_record_for_another_user_is_deleted(cx: &mut TestAppContext) {
     let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
     visual.run_until_parked();
 
-    confirm(&mut visual, &view, &server.base);
     wait_for(&mut visual, &view, |v| {
         !v.auth.auto_login && v.auth.status.contains("другого аккаунта")
     });
@@ -410,7 +409,6 @@ async fn an_expired_record_is_deleted_without_a_request(cx: &mut TestAppContext)
     let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
     visual.run_until_parked();
 
-    confirm(&mut visual, &view, &server.base);
     settled_auto(&mut visual, &view);
     wait_store(&mut visual, &store, |store| {
         store.load_all().unwrap().is_empty()
@@ -492,7 +490,6 @@ async fn an_unchecked_manual_login_removes_a_matching_record(cx: &mut TestAppCon
     let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
     visual.run_until_parked();
 
-    confirm(&mut visual, &view, &server.base);
     // The automatic attempt hit a transient failure and kept the record.
     wait_for(&mut visual, &view, |v| v.auth.auto_retry);
     // The box is checked for the kept record; uncheck it before signing in.
@@ -641,7 +638,11 @@ async fn logout_deletes_the_record_even_without_the_server(cx: &mut TestAppConte
     });
     view.read_with(&*visual, |v, _| {
         assert!(v.session.is_none());
-        assert_eq!(v.auth.screen, auth::AuthScreen::Login);
+        assert_eq!(
+            v.auth.screen,
+            auth::AuthScreen::Instance,
+            "logout returns to the address step"
+        );
         assert!(!v.auth.remember_login);
     });
     std::fs::remove_dir_all(dir).unwrap();
@@ -679,13 +680,18 @@ async fn a_damaged_blob_falls_back_to_the_password_and_can_be_repaired(cx: &mut 
     let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
     visual.run_until_parked();
 
-    confirm(&mut visual, &view, &server.base);
     settled_auto(&mut visual, &view);
     view.read_with(&*visual, |v, _| {
         assert!(v.session.is_none());
         assert!(!v.auth.remember_login);
+        assert_eq!(v.auth.screen, auth::AuthScreen::Instance);
     });
-
+    assert!(
+        server.requests().is_empty(),
+        "a store that cannot be decrypted sends no Bearer"
+    );
+    // A damaged store opens the address form; the manual login may repair it.
+    confirm(&mut visual, &view, &server.base);
     toggle(&mut visual, "auth-remember-login");
     type_credentials(&mut visual, &view, "neva", "password123");
     wait_for(&mut visual, &view, |v| v.session.is_some());
@@ -704,7 +710,7 @@ async fn a_damaged_blob_falls_back_to_the_password_and_can_be_repaired(cx: &mut 
 async fn two_origins_never_exchange_their_bearer(cx: &mut TestAppContext) {
     cx.update(|cx| gpui_component::init(cx));
     let first = TestServer::spawn(vec![
-        Reply::new(200, &profile_body(7, "neva")),
+        Reply::new(200, &login_body(7, "neva", "token-first")),
         Reply::new(200, servers_body()),
     ]);
     let second = TestServer::spawn(vec![
@@ -738,16 +744,30 @@ async fn two_origins_never_exchange_their_bearer(cx: &mut TestAppContext) {
         "the first origin was never confirmed"
     );
 
-    // Switch to the first origin: the stored token signs in there.
+    // Switch to the first origin. The explicit logout removed the remembered
+    // login of the profile, so this is a normal manual login on the other port.
     visual.update(|window, app| {
         view.update(app, |v, cx| v.logout(window, cx));
     });
     visual.run_until_parked();
+    wait_store(&mut visual, &store, |store| {
+        store
+            .state()
+            .map(|state| state.records.is_empty() && state.target.is_none())
+            .unwrap_or(false)
+    });
+    assert!(
+        store.state().unwrap().records.is_empty(),
+        "the explicit logout cleared every remembered login"
+    );
+    assert!(store.state().unwrap().target.is_none());
     visual.update(|window, app| {
         view.update(app, |v, cx| v.back_to_instance(window, cx));
     });
     visual.run_until_parked();
     confirm(&mut visual, &view, &first.base);
+    settled_auto(&mut visual, &view);
+    type_credentials(&mut visual, &view, "neva", "password123");
     wait_for(&mut visual, &view, |v| v.session.is_some());
     assert_eq!(
         view.read_with(&*visual, |v, _| v

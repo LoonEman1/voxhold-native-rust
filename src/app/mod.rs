@@ -17,6 +17,7 @@ mod hotkey_tests;
 #[cfg(feature = "voxhold-media")]
 mod hotkeys;
 mod inbox_ops;
+mod lifecycle;
 mod media_ops;
 mod members_view;
 mod messages_creator;
@@ -53,6 +54,7 @@ mod settings_view;
 mod settings_voice_shortcuts;
 mod settings_voice_view;
 mod shell_view;
+mod startup_view;
 #[cfg(test)]
 mod tests;
 mod theme_ops;
@@ -292,6 +294,37 @@ pub(crate) struct Voxhold {
     remember_error: String,
     /// The kept record that «Повторить» uses without asking for the address.
     auto_record: Option<session_store::RememberedSession>,
+    /// Store generation captured when the current automatic attempt started.
+    /// A result from an older generation is never applied or written.
+    auto_epoch: u64,
+    /// A failed logout cleanup suppresses automatic restore in this process
+    /// until the retry succeeds.
+    auto_blocked: bool,
+    /// The explicit startup phase: the neutral «Восстанавливаем вход…»
+    /// surface is shown before any address or credential field.
+    startup_restoring: bool,
+    /// The startup store check runs exactly once per process.
+    startup_checked: bool,
+    /// The whole restoration attempt ends at this instant.
+    startup_deadline: std::time::Instant,
+    /// `STARTUP_BUDGET`; a test may shorten it to exercise the timeout.
+    startup_budget: std::time::Duration,
+    /// The chosen legacy record still has to be written as the target after
+    /// the first successful restoration.
+    migration_pending: bool,
+    /// Local cleanup is in flight; closing the window completes it.
+    cleanup_pending: bool,
+    /// The generation captured by the in-flight cleanup. A new login means the
+    /// close-time retry is stale and must not erase that login.
+    cleanup_epoch: u64,
+    /// The cleanup failed and «Повторить очистку» is offered.
+    cleanup_retry: bool,
+    /// Even the suppression marker could not be written.
+    cleanup_unconfirmed: bool,
+    /// First Tab stop of the neutral start surface.
+    restore_cancel_focus: FocusHandle,
+    /// The cancel action received the initial focus once.
+    restore_focus_done: bool,
     self_user_id: i64,
     search: Option<Entity<search::SearchPanel>>,
     show_search: bool,
@@ -586,58 +619,7 @@ pub(crate) struct Voxhold {
     _appearance_subscription: gpui::Subscription,
 }
 
-impl Drop for Voxhold {
-    fn drop(&mut self) {
-        // The window is going away, so the debounced voice save will never get
-        // its timer: write the newest snapshot now (atomic, one small file).
-        self.voice_settings.flush();
-        // Closing the window ends the local work but is not a logout: no
-        // server revocation is sent, and the session is simply dropped. The
-        // sends and timers that belong to the window are cancelled with it.
-        for (_, pending) in self.pending_sends.drain() {
-            pending.abort.abort();
-        }
-        self.unconfirmed_sends.clear();
-        self.stop_session_clock();
-        self.stop_realtime();
-    }
-}
-
 impl Voxhold {
-    fn stop_realtime(&mut self) {
-        if let Some(task) = self.event_task.take() {
-            task.abort();
-        }
-        self.events = None;
-        self.event_subscription = None;
-        self.realtime_generation = self.realtime_generation.wrapping_add(1);
-        // The retry status belongs to the socket that just ended. Replacing the
-        // shared link drops the old task's handle: its later writes cannot
-        // repaint the banner in a new session.
-        self.realtime_link = None;
-        self.realtime_reconnecting = false;
-        self.online_by_server.clear();
-    }
-
-    fn new_history_list(alignment: ListAlignment, cx: &Context<Self>) -> ListState {
-        let history_list = ListState::new(0, alignment, px(400.));
-        let weak = cx.entity().downgrade();
-        history_list.set_scroll_handler(move |_, window, cx| {
-            if let Some(view) = weak.upgrade() {
-                view.update(cx, |s, cx| {
-                    // The list is mutably borrowed while this callback runs, so
-                    // never touch `ListState` here. Both follow-ups recompute
-                    // their range from a later frame.
-                    s.scroll_epoch = s.scroll_epoch.wrapping_add(1);
-                    if !s.loading_older && !s.older_scheduled && s.has_more {
-                        s.schedule_older_check(window, cx);
-                    }
-                });
-            }
-        });
-        history_list
-    }
-
     pub(super) fn new(
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -645,6 +627,29 @@ impl Voxhold {
         shell_path: Option<std::path::PathBuf>,
         instance_path: Option<std::path::PathBuf>,
         session_path: Option<std::path::PathBuf>,
+    ) -> Self {
+        Self::new_with_startup(
+            window,
+            cx,
+            prefill,
+            shell_path,
+            instance_path,
+            session_path,
+            true,
+        )
+    }
+
+    /// `start_restore == false` is used by fixtures that install a signed-in
+    /// client immediately; they must not spawn the cold-start check or draw an
+    /// extra auth frame before the workspace.
+    pub(super) fn new_with_startup(
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        prefill: &str,
+        shell_path: Option<std::path::PathBuf>,
+        instance_path: Option<std::path::PathBuf>,
+        session_path: Option<std::path::PathBuf>,
+        start_restore: bool,
     ) -> Self {
         #[cfg(feature = "voxhold-media")]
         cx.bind_keys([
@@ -687,6 +692,25 @@ impl Voxhold {
         } else {
             (String::new(), false)
         };
+        // The one startup check may only use the exact target the operator
+        // named: `-server` wins, then the confirmed «Запомнить адрес» value.
+        // Without either, the old format may still offer a single profile-wide
+        // record; the new format never searches when its target is absent.
+        let cli_origin = if prefill.is_empty() {
+            None
+        } else {
+            instance_prefs::canonical_origin(prefill)
+        };
+        let saved_origin = saved_instance
+            .instance
+            .clone()
+            .filter(|_| saved_instance.remember);
+        let cli_invalid = !prefill.is_empty() && cli_origin.is_none();
+        let startup_origin = cli_origin.or(saved_origin);
+        let allow_profile_single = prefill.is_empty();
+        // An explicit but invalid `-server` must never fall back to a stored
+        // target: the operator asked for this address, and the form shows it.
+        let startup_disabled = cli_invalid;
         let recent_reactions = reactions::SharedRecents::default();
         let reaction_picker =
             cx.new(|cx| reactions::ReactionPicker::new(recent_reactions.clone(), window, cx));
@@ -720,7 +744,7 @@ impl Voxhold {
         #[cfg(feature = "voxhold-media")]
         let stream_preferences =
             crate::voice_panel::StreamPrefsStore::with_layout(shell_path.as_deref());
-        let view = Self {
+        let mut view = Self {
             runtime: std::sync::Arc::new(tokio::runtime::Runtime::new().expect("Tokio runtime")),
             instance: cx.new(|cx| {
                 InputState::new(window, cx)
@@ -748,6 +772,19 @@ impl Voxhold {
             last_stored_token: None,
             remember_error: String::new(),
             auto_record: None,
+            auto_epoch: 0,
+            auto_blocked: false,
+            startup_restoring: start_restore,
+            startup_checked: !start_restore,
+            startup_deadline: std::time::Instant::now(),
+            startup_budget: auto_login::STARTUP_BUDGET,
+            migration_pending: false,
+            cleanup_pending: false,
+            cleanup_epoch: 0,
+            cleanup_retry: false,
+            cleanup_unconfirmed: false,
+            restore_cancel_focus: cx.focus_handle(),
+            restore_focus_done: false,
             self_user_id: 0,
             search: None,
             show_search: false,
@@ -957,6 +994,17 @@ impl Voxhold {
         gpui_component::Theme::global_mut(cx).font_family = theme::UI_FONT.into();
         window_chrome::apply(window, view.palette.light);
         Self::bind_composer_keys(cx);
+        // The explicit startup phase: the store is read and the target is
+        // checked once, before the first frame can paint a manual form.
+        if start_restore {
+            view.begin_startup_restore(
+                window,
+                cx,
+                startup_origin,
+                allow_profile_single,
+                startup_disabled,
+            );
+        }
         view
     }
 }

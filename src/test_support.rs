@@ -270,16 +270,27 @@ pub struct TestServer {
 
 impl TestServer {
     pub fn spawn(replies: Vec<Reply>) -> Self {
-        Self::start(replies, false)
+        Self::start(replies, false, false)
     }
 
     /// Thread-per-connection server for tests that must hold two requests at
     /// the same time. `spawn` keeps the deterministic single-threaded order.
     pub fn spawn_concurrent(replies: Vec<Reply>) -> Self {
-        Self::start(replies, true)
+        Self::start(replies, true, false)
     }
 
-    fn start(replies: Vec<Reply>, concurrent: bool) -> Self {
+    /// A server whose path-routed replies are never stolen by an unrelated
+    /// request. The request gets the `500` fallback instead, which keeps the
+    /// startup/workspace traffic from consuming a fixture answer.
+    pub fn spawn_routed(replies: Vec<Reply>) -> Self {
+        Self::start(replies, false, true)
+    }
+
+    pub fn spawn_concurrent_routed(replies: Vec<Reply>) -> Self {
+        Self::start(replies, true, true)
+    }
+
+    fn start(replies: Vec<Reply>, concurrent: bool, strict: bool) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
         let base = format!("http://{}", listener.local_addr().unwrap());
         let requests = Arc::new(Mutex::new(Vec::new()));
@@ -314,9 +325,13 @@ impl TestServer {
                         .iter()
                         .enumerate()
                         .position(|(index, reply)| !used[index] && reply.path.is_none());
-                    let index = routed
-                        .or(fallback)
-                        .or_else(|| used.iter().position(|used| !*used));
+                    let index = routed.or(fallback).or_else(|| {
+                        if strict {
+                            None
+                        } else {
+                            used.iter().position(|used| !*used)
+                        }
+                    });
                     match index {
                         Some(index) => {
                             used[index] = true;

@@ -25,8 +25,15 @@ pub(super) fn make_app(
     let captured = slot.clone();
     let window = cx.add_window(move |window, cx| {
         let view = cx.new(|cx| {
-            let mut view =
-                Voxhold::new(window, cx, "", Some(shell), Some(instance), Some(sessions));
+            let mut view = Voxhold::new_with_startup(
+                window,
+                cx,
+                "",
+                Some(shell),
+                Some(instance),
+                Some(sessions),
+                false,
+            );
             view.client = Some(client);
             view.self_user_id = 1;
             view.servers = vec![voxhold_api::Server {

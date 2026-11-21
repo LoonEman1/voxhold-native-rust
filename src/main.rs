@@ -150,6 +150,10 @@ fn main() {
                     window_min_size: Some(size(px(320.), px(360.))),
                     ..Default::default()
                 },
+                // `Voxhold::new` owns the explicit «Восстановление входа»
+                // phase and starts it before the root's first frame. The
+                // update handshake still runs immediately after the window
+                // and the view exist.
                 move |window, cx| {
                     let view = cx.new(|cx| {
                         Voxhold::new(

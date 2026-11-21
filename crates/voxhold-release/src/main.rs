@@ -9,7 +9,7 @@
 //! delta   --base <zip> --target <zip> --out <delta.zip>
 //! manifest --full <zip> --setup <exe> --version <v> --notes-file <file> --out <dir>
 //!          [--channel beta] [--base-url <url>] [--min-windows 10.0.19041]
-//!          [--published-at <rfc3339>] [--delta <delta.zip>]...
+//!          [--published-at <rfc3339>] [--delta <delta.zip>]... [--delta-base-url <url>]
 //!          [--authenticode] [--key-file <pkcs8.b64>]
 //! verify  --manifest <latest.json> --sig <latest.json.sig>
 //!          [--pubkey <base64>] [--pubkey-file <file>]
@@ -207,6 +207,11 @@ fn manifest(options: &Options) -> Result<(), String> {
         None => format_rfc3339(now_seconds()),
     };
     let base = base_url(options)?;
+    let delta_base = options.optional("delta-base-url").map(str::trim);
+    if let Some(url) = delta_base {
+        validate_update_url(url)
+            .map_err(|error| format!("invalid --delta-base-url: {}", error.code()))?;
+    }
 
     let full_bytes =
         std::fs::read(&full_path).map_err(|error| format!("{}: {error}", full_path.display()))?;
@@ -236,8 +241,18 @@ fn manifest(options: &Options) -> Result<(), String> {
                 "delta {path} does not reproduce the portable package for {version}"
             ));
         }
+        let (delta_base, filename) = match delta_base {
+            Some(url) => (
+                url,
+                format!("VoxHold-delta-{}-to-{version}.zip", delta.from_version),
+            ),
+            None => (
+                base.as_str(),
+                format!("VoxHold-delta-{}.zip", delta.from_version),
+            ),
+        };
         deltas.push(DeltaEntry {
-            url: asset_url(&base, &format!("VoxHold-delta-{}.zip", delta.from_version))?,
+            url: asset_url(delta_base, &filename)?,
             from_version: delta.from_version,
             from_package_sha256: delta.base_package_sha256,
             size: bytes.len() as u64,
@@ -448,7 +463,29 @@ mod tests {
         std::fs::create_dir_all(&payload).unwrap();
         std::fs::write(payload.join("Voxhold.exe"), b"binary").unwrap();
         let full = temp.path().join("VoxHold-portable.zip");
-        std::fs::write(&full, package::pack(&payload, "0.2.0").unwrap()).unwrap();
+        let delta = temp.path().join("delta.zip");
+        let base_payload = temp.path().join("base");
+        std::fs::create_dir_all(&base_payload).unwrap();
+        std::fs::write(base_payload.join("Voxhold.exe"), b"old binary").unwrap();
+        let noise: Vec<u8> = (0_u32..64 * 1024)
+            .scan(1_u32, |state, _| {
+                *state ^= *state << 13;
+                *state ^= *state >> 17;
+                *state ^= *state << 5;
+                Some(*state as u8)
+            })
+            .collect();
+        std::fs::write(payload.join("shared.bin"), &noise).unwrap();
+        std::fs::write(base_payload.join("shared.bin"), &noise).unwrap();
+        let base = package::pack(&base_payload, "0.1.0").unwrap();
+        let target = package::pack(&payload, "0.2.0").unwrap();
+        std::fs::write(&full, &target).unwrap();
+        std::fs::write(
+            &delta,
+            voxhold_update::delta::create(&base, &target).unwrap(),
+        )
+        .unwrap();
+
         let setup = temp.path().join("VoxHold-Setup.exe");
         std::fs::write(&setup, b"setup").unwrap();
         let notes = temp.path().join("notes.md");
@@ -472,6 +509,10 @@ mod tests {
             out.to_string_lossy().into_owned(),
             "--base-url".into(),
             "http://127.0.0.1:8123".into(),
+            "--delta-base-url".into(),
+            "http://127.0.0.1:8123/beta/".into(),
+            "--delta".into(),
+            delta.to_string_lossy().into_owned(),
             "--key-file".into(),
             key_file.to_string_lossy().into_owned(),
         ])
@@ -489,6 +530,11 @@ mod tests {
         assert_eq!(
             manifest.setup.url,
             "http://127.0.0.1:8123/VoxHold-Setup.exe"
+        );
+        assert_eq!(manifest.deltas.len(), 1);
+        assert_eq!(
+            manifest.deltas[0].url,
+            "http://127.0.0.1:8123/beta/VoxHold-delta-0.1.0-to-0.2.0.zip"
         );
     }
 }

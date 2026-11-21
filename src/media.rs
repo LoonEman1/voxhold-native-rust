@@ -39,6 +39,9 @@ pub const VIEWER_MAX_EDGE: u32 = 8192;
 pub const VIEWER_MAX_PIXELS: u64 = 40_000_000;
 /// Go `imageViewerArea`.
 pub const VIEWER_AREA: f32 = 0.8;
+/// A requested box closer than this to the displayed one is not rescaled, so a
+/// one-pixel window drag does not rebuild the surface.
+pub const VIEWER_SCALE_TOLERANCE: u32 = 16;
 
 /// Go `bucketSize`: one-pixel resizes reuse the same decoded variant.
 pub fn bucket(value: f32) -> u32 {
@@ -214,10 +217,14 @@ pub struct Viewer {
     pub loading: bool,
     pub error: String,
     pub image: Option<Arc<RenderImage>>,
-    /// Decoded original kept to rescale the single surface on resize.
+    /// Decoded original kept in a single `Arc` to rescale the surface; the
+    /// scaling pass borrows it instead of copying the pixels.
     pub source: Option<Arc<image::DynamicImage>>,
     /// Size in logical pixels of the current GPU surface.
     pub render_box: (u32, u32),
+    /// Last geometry the window asked for. While `rescaling` it is the only
+    /// size the single follow-up pass may use.
+    pub target_box: (u32, u32),
     pub rescaling: bool,
     pub task: Option<gpui::Task<()>>,
 }
@@ -231,9 +238,42 @@ impl Viewer {
             image: None,
             source: None,
             render_box: (0, 0),
+            target_box: (0, 0),
             rescaling: false,
             task: None,
         }
+    }
+
+    /// Whether two boxes are close enough that a rescale pass is wasted work.
+    fn close(first: (u32, u32), second: (u32, u32)) -> bool {
+        first.0.abs_diff(second.0) <= VIEWER_SCALE_TOLERANCE
+            && first.1.abs_diff(second.1) <= VIEWER_SCALE_TOLERANCE
+    }
+
+    /// Remember the geometry the window wants and report the box a new
+    /// background pass must produce. While a pass is running the request is
+    /// only stored, so a window drag starts at most one follow-up pass for the
+    /// newest geometry instead of one pass per resize event.
+    pub fn request_scale(&mut self, target: (u32, u32)) -> Option<(u32, u32)> {
+        self.target_box = target;
+        if self.rescaling || self.source.is_none() || Self::close(target, self.render_box) {
+            return None;
+        }
+        self.rescaling = true;
+        Some(target)
+    }
+
+    /// Install the geometry of a finished pass. Returns the single follow-up
+    /// target when the window asked for a newer size while that pass ran; an
+    /// outdated pass is never allowed to schedule more than one successor.
+    pub fn finish_scale(&mut self, completed: (u32, u32)) -> Option<(u32, u32)> {
+        self.render_box = completed;
+        self.rescaling = false;
+        if self.source.is_none() || Self::close(self.target_box, completed) {
+            return None;
+        }
+        self.rescaling = true;
+        Some(self.target_box)
     }
 }
 
@@ -687,6 +727,70 @@ mod tests {
         assert_eq!(fit_size((4000, 2000), (1024., 720.)), (1024, 512));
         assert_eq!(fit_size((100, 1000), (1024., 720.)), (72, 720));
         assert_eq!(fit_size((0, 0), (10., 10.)), (1, 1));
+    }
+
+    fn viewer_with_source(width: u32, height: u32) -> Viewer {
+        let mut viewer = Viewer::new(ViewerKey {
+            chat: ChatKey::channel(1, 7),
+            access: 1,
+            message_id: 5,
+            attachment_id: "a".repeat(32),
+            open_id: 1,
+        });
+        viewer.loading = false;
+        viewer.source = Some(Arc::new(image::DynamicImage::ImageRgba8(
+            image::RgbaImage::new(width, height),
+        )));
+        viewer.render_box = (width, height);
+        viewer.target_box = (width, height);
+        viewer
+    }
+
+    #[test]
+    fn a_drag_queues_one_follow_up_pass_and_ends_on_the_last_geometry() {
+        let mut viewer = viewer_with_source(1000, 750);
+        let mut started = Vec::new();
+        // The first resize starts a pass.
+        started.extend(viewer.request_scale((800, 600)));
+        assert!(viewer.rescaling);
+        // The rest of the drag only updates the remembered geometry.
+        for target in [(700, 525), (600, 450), (500, 375), (400, 300)] {
+            assert_eq!(viewer.request_scale(target), None);
+            assert!(viewer.rescaling, "the running pass is still the only one");
+        }
+        assert_eq!(started, vec![(800, 600)]);
+
+        // The running pass finishes for the old box: exactly one follow-up for
+        // the newest geometry, never one per resize event.
+        let follow_up = viewer.finish_scale((800, 600));
+        assert_eq!(follow_up, Some((400, 300)));
+        assert_eq!(viewer.render_box, (800, 600));
+        assert!(viewer.rescaling);
+        assert!(viewer.request_scale((450, 340)).is_none());
+        assert_eq!(viewer.finish_scale((400, 300)), Some((450, 340)));
+        assert_eq!(viewer.finish_scale((450, 340)), None);
+        assert!(!viewer.rescaling);
+        assert_eq!(viewer.render_box, (450, 340), "the last geometry wins");
+        assert_eq!(viewer.target_box, (450, 340));
+    }
+
+    #[test]
+    fn a_one_pixel_drag_does_not_rebuild_the_surface() {
+        let mut viewer = viewer_with_source(1000, 750);
+        assert_eq!(viewer.request_scale((990, 742)), None);
+        assert!(!viewer.rescaling);
+        assert_eq!(viewer.request_scale((1016, 750)), None);
+        assert!(!viewer.rescaling, "the 16 px tolerance still holds");
+        assert_eq!(viewer.request_scale((1017, 766)), Some((1017, 766)));
+        assert!(viewer.rescaling);
+    }
+
+    #[test]
+    fn a_viewer_without_a_source_never_starts_a_pass() {
+        let mut viewer = viewer_with_source(100, 100);
+        viewer.source = None;
+        assert_eq!(viewer.request_scale((10, 10)), None);
+        assert!(!viewer.rescaling);
     }
 
     #[test]

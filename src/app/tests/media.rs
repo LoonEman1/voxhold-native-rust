@@ -619,3 +619,216 @@ async fn access_change_releases_cached_media(cx: &mut TestAppContext) {
         });
     });
 }
+
+#[test]
+fn thumbnail_frame_scales_the_borrowed_original_without_a_full_size_copy() {
+    use crate::app::media_ops::{scale_probe, thumbnail_frame};
+    use image::GenericImageView;
+
+    let source = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+        1200,
+        900,
+        image::Rgba([10, 200, 30, 255]),
+    ));
+    let source_bytes = source.as_bytes().len();
+    scale_probe::reset();
+    let (frame, bytes) = thumbnail_frame(&source, 120, 90);
+    assert_eq!(frame.buffer().dimensions(), (120, 90));
+    assert_eq!(bytes, 120 * 90 * 4);
+    assert!(
+        scale_probe::peak_bytes() < source_bytes,
+        "a source-sized RGBA copy would materialise {source_bytes} B"
+    );
+    assert_eq!(
+        scale_probe::peak_bytes(),
+        bytes,
+        "the pass only materialises target-sized buffers"
+    );
+    // The shared original is untouched and still usable after the pass.
+    assert_eq!(source.dimensions(), (1200, 900));
+    assert_eq!(source.get_pixel(0, 0).0, [10, 200, 30, 255]);
+    // The frame is BGRA: green stays in the middle, red and blue swap.
+    assert_eq!(frame.buffer().get_pixel(60, 45).0, [30, 200, 10, 255]);
+}
+
+#[test]
+fn scaled_frames_keep_proportions_and_channels_on_odd_and_tiny_sources() {
+    use crate::app::media_ops::{scale_probe, thumbnail_frame};
+
+    let wide = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+        40,
+        10,
+        image::Rgb([250, 5, 120]),
+    ));
+    scale_probe::reset();
+    let (frame, bytes) = thumbnail_frame(&wide, 8, 2);
+    assert_eq!(frame.buffer().dimensions(), (8, 2));
+    assert_eq!(bytes, 8 * 2 * 4);
+    assert_eq!(frame.buffer().get_pixel(4, 1).0, [120, 5, 250, 255]);
+    assert_eq!(scale_probe::peak_bytes(), bytes);
+
+    // A two-pixel source still yields at least a 1×1 surface, and a zero box
+    // is clamped instead of producing an empty texture.
+    let tiny = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+        2,
+        3,
+        image::Rgba([1, 2, 3, 200]),
+    ));
+    let (frame, bytes) = thumbnail_frame(&tiny, 0, 0);
+    assert_eq!(frame.buffer().dimensions(), (1, 1));
+    assert_eq!(bytes, 4);
+    assert_eq!(frame.buffer().get_pixel(0, 0).0, [3, 2, 1, 200]);
+}
+
+#[gpui::test]
+async fn dragging_the_window_keeps_one_rescale_pass_and_lands_on_the_last_box(
+    cx: &mut TestAppContext,
+) {
+    use crate::app::media_ops::scale_probe;
+
+    cx.update(|cx| gpui_component::init(cx));
+    let (window, view) = add_auth_window(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
+    let server = crate::test_support::TestServer::spawn(vec![crate::test_support::Reply::image(
+        200,
+        png_bytes(1600, 1200),
+    )]);
+    // The frame loop re-asserts the real window viewport, so the drag ends by
+    // releasing the window at its own size.
+    let real = visual.update(|window, _| {
+        let size = window.viewport_size();
+        let width: f32 = size.width.into();
+        let height: f32 = size.height.into();
+        (width, height)
+    });
+    let initial = crate::media::fit_size((1600, 1200), crate::media::viewer_area(real));
+    visual.update(|_, app| {
+        view.update(app, |v, _| {
+            v.client = Some(Client::new(&server.base).unwrap());
+            v.server = 1;
+            v.channel = 7;
+            v.viewport = real;
+        });
+    });
+    let file = image_attachment();
+    visual.update(|window, app| {
+        view.update(app, |v, cx| v.open_viewer(5, &file, window, cx));
+    });
+    let mut opened = false;
+    for _ in 0..400 {
+        visual.run_until_parked();
+        opened = view.read_with(&*visual, |v, _| {
+            v.media
+                .viewer
+                .as_ref()
+                .is_some_and(|viewer| viewer.image.is_some() && !viewer.loading)
+        });
+        if opened {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(opened, "the picture opens before the drag");
+    view.read_with(&*visual, |v, _| {
+        assert_eq!(v.media.viewer.as_ref().unwrap().render_box, initial);
+    });
+
+    scale_probe::reset();
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            for viewport in [(1000., 700.), (900., 650.), (800., 600.), (700., 550.)] {
+                v.viewport = viewport;
+                v.ensure_viewer_scale(window, cx);
+            }
+            let viewer = v.media.viewer.as_ref().unwrap();
+            assert!(viewer.rescaling, "the first pass is still running");
+            assert_eq!(
+                scale_probe::passes(),
+                1,
+                "a drag queues no extra pass behind the running one"
+            );
+            assert_eq!(viewer.target_box, (560, 420), "the newest box is kept");
+            // Releasing the window at its own size is one more request, still
+            // without a second background pass.
+            v.viewport = real;
+            v.ensure_viewer_scale(window, cx);
+            assert_eq!(scale_probe::passes(), 1);
+            assert_eq!(v.media.viewer.as_ref().unwrap().target_box, initial);
+        });
+    });
+
+    let mut settled = false;
+    for _ in 0..400 {
+        visual.run_until_parked();
+        settled = view.read_with(&*visual, |v, _| {
+            v.media
+                .viewer
+                .as_ref()
+                .is_some_and(|viewer| !viewer.rescaling && viewer.render_box == initial)
+        });
+        if settled {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(settled, "the viewer lands on the last requested geometry");
+    view.read_with(&*visual, |v, _| {
+        let viewer = v.media.viewer.as_ref().unwrap();
+        assert_eq!(viewer.render_box, initial);
+        assert!(viewer.image.is_some());
+        assert_eq!(
+            scale_probe::passes(),
+            2,
+            "exactly one follow-up pass for the last geometry"
+        );
+    });
+    visual.update(|window, app| {
+        view.update(app, |v, _| v.close_viewer(window));
+    });
+}
+
+#[gpui::test]
+async fn closing_the_viewer_releases_its_surface_and_decoded_source(cx: &mut TestAppContext) {
+    cx.update(|cx| gpui_component::init(cx));
+    let (window, view) = add_auth_window(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
+    let mut source = None;
+    let mut surface = None;
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            v.server = 1;
+            v.channel = 7;
+            let decoded = std::sync::Arc::new(image::DynamicImage::ImageRgba8(
+                image::RgbaImage::new(64, 48),
+            ));
+            let frame = image::Frame::new(image::RgbaImage::new(64, 48));
+            let render = std::sync::Arc::new(gpui::RenderImage::new(smallvec::smallvec![frame]));
+            source = Some(std::sync::Arc::downgrade(&decoded));
+            surface = Some(std::sync::Arc::downgrade(&render));
+            v.media.viewer = Some(crate::media::Viewer::new(crate::media::ViewerKey {
+                chat: v.chat_key(),
+                access: v.access_generation,
+                message_id: 5,
+                attachment_id: "d".repeat(32),
+                open_id: 1,
+            }));
+            let viewer = v.media.viewer.as_mut().unwrap();
+            viewer.loading = false;
+            viewer.source = Some(decoded);
+            viewer.image = Some(render);
+            viewer.render_box = (64, 48);
+            viewer.target_box = (64, 48);
+            v.close_viewer(window);
+            assert!(v.media.viewer.is_none());
+            cx.notify();
+        });
+    });
+    assert!(
+        source.expect("source").upgrade().is_none(),
+        "the decoded original is released on close"
+    );
+    assert!(
+        surface.expect("surface").upgrade().is_none(),
+        "the GPU surface is released on close"
+    );
+}

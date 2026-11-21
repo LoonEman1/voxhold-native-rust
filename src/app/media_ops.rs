@@ -14,25 +14,81 @@ use voxhold_api::Attachment;
 const PREVIEW_CONCURRENCY: usize = 3;
 /// Preview card picture, Go `scaleToFit(img, 98, 76)`.
 
-/// Resize a server thumbnail into the requested 16 px bucket and convert it to
-/// the BGRA surface GPUI uploads.
+/// Resize a borrowed server thumbnail into the requested 16 px bucket and
+/// convert it to the BGRA surface GPUI uploads. The original is only read, so
+/// the caller keeps ownership of its pixels.
 pub(crate) fn thumbnail_frame(
-    image: image::DynamicImage,
+    image: &image::DynamicImage,
     width: u32,
     height: u32,
 ) -> (image::Frame, usize) {
-    let rgba = image::imageops::resize(
-        &image.to_rgba8(),
-        width.max(1),
-        height.max(1),
-        image::imageops::FilterType::CatmullRom,
-    );
+    let (width, height) = (width.max(1), height.max(1));
+    // Scale first: the only pixel buffer this path materialises is the
+    // target-sized one. A source-sized `to_rgba8()` copy never exists (O06).
+    // `imageops::resize` still allocates its own f32 scratch of
+    // source_width × target_height, exactly as the previous path did; what
+    // disappears is the source-sized RGBA copy before the resample.
+    let resized = image.resize_exact(width, height, image::imageops::FilterType::CatmullRom);
+    note_scale_buffer(resized.as_bytes().len());
+    let rgba = match resized {
+        // The common RGBA path moves the buffer instead of copying it.
+        image::DynamicImage::ImageRgba8(rgba) => rgba,
+        other => other.to_rgba8(),
+    };
+    note_scale_buffer(rgba.as_raw().len());
     let bytes = rgba.width() as usize * rgba.height() as usize * 4;
     (
         members::avatar_frame(image::DynamicImage::ImageRgba8(rgba)),
         bytes,
     )
 }
+
+/// Test seam for O06: records the largest pixel buffer `thumbnail_frame`
+/// itself materialises on this thread (the resized image and the RGBA result).
+/// The viewer test asserts it stays at the target size, i.e. no
+/// decoded-source-sized RGBA copy is made. The resampler's internal f32 scratch
+/// lives inside `image` and is not counted; it is the same in both paths.
+#[cfg(test)]
+pub(crate) mod scale_probe {
+    use std::cell::Cell;
+
+    thread_local! {
+        static PEAK: Cell<usize> = const { Cell::new(0) };
+        static PASSES: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(super) fn observe(bytes: usize) {
+        PEAK.with(|peak| peak.set(peak.get().max(bytes)));
+    }
+
+    /// Count one started background rescale pass on this thread, so a test can
+    /// prove a drag queues at most one pass behind the running one.
+    pub(super) fn pass() {
+        PASSES.with(|passes| passes.set(passes.get() + 1));
+    }
+
+    /// Largest buffer observed since the last `reset`, in bytes.
+    pub(crate) fn peak_bytes() -> usize {
+        PEAK.with(Cell::get)
+    }
+
+    pub(crate) fn passes() -> usize {
+        PASSES.with(Cell::get)
+    }
+
+    pub(crate) fn reset() {
+        PEAK.with(|peak| peak.set(0));
+        PASSES.with(|passes| passes.set(0));
+    }
+}
+
+#[cfg(test)]
+fn note_scale_buffer(bytes: usize) {
+    scale_probe::observe(bytes);
+}
+
+#[cfg(not(test))]
+fn note_scale_buffer(_bytes: usize) {}
 
 impl Voxhold {
     /// Request one chat thumbnail. Three reads at a time, a failed key waits
@@ -63,7 +119,7 @@ impl Voxhold {
         let task = cx.background_spawn(async move {
             runtime.block_on(async move {
                 let image = client.attachment_thumbnail(&id).await?;
-                Ok::<_, voxhold_api::Error>(thumbnail_frame(image, width, height))
+                Ok::<_, voxhold_api::Error>(thumbnail_frame(&image, width, height))
             })
         });
         cx.spawn_in(window, async move |this, window| {
@@ -136,7 +192,7 @@ impl Voxhold {
                         .await
                         .ok()
                         .map(|image| {
-                            thumbnail_frame(image, media::PREVIEW_IMAGE.0, media::PREVIEW_IMAGE.1)
+                            thumbnail_frame(&image, media::PREVIEW_IMAGE.0, media::PREVIEW_IMAGE.1)
                         })
                 };
                 Ok::<_, Option<u16>>((meta, image))
@@ -335,7 +391,10 @@ impl Voxhold {
                     ));
                 }
                 let target = media::fit_size((source.width(), source.height()), area);
-                let (frame, bytes) = thumbnail_frame(source.clone(), target.0, target.1);
+                // The pass borrows the one shared original: opening copies the
+                // `Arc` pointer, never the decoded pixels (O06).
+                let source = Arc::new(source);
+                let (frame, bytes) = thumbnail_frame(&source, target.0, target.1);
                 Ok::<_, voxhold_api::Error>((source, frame, bytes, target))
             })
         });
@@ -353,8 +412,9 @@ impl Voxhold {
                     Ok((source, frame, _bytes, target)) => {
                         viewer.image =
                             Some(Arc::new(gpui::RenderImage::new(smallvec::smallvec![frame])));
-                        viewer.source = Some(Arc::new(source));
+                        viewer.source = Some(source);
                         viewer.render_box = target;
+                        viewer.target_box = target;
                     }
                     Err(error) => viewer.error = draft::describe_error(&error),
                 }
@@ -381,7 +441,9 @@ impl Voxhold {
     }
 
     /// Rescale the single viewer surface when the window changes, keeping the
-    /// decoded source and the 80% fit.
+    /// decoded source and the 80% fit. Only one background pass runs at a
+    /// time; a drag updates the remembered geometry and the running pass
+    /// starts exactly one follow-up for the newest box.
     pub(super) fn ensure_viewer_scale(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(viewer) = self.media.viewer.as_ref() else {
             return;
@@ -389,27 +451,35 @@ impl Voxhold {
         let Some(source) = viewer.source.clone() else {
             return;
         };
-        if viewer.rescaling {
-            return;
-        }
         let target = media::fit_size(
             (source.width(), source.height()),
             media::viewer_area(self.viewport),
         );
-        let current = viewer.render_box;
-        if (i64::from(target.0) - i64::from(current.0)).abs() <= 16
-            && (i64::from(target.1) - i64::from(current.1)).abs() <= 16
-        {
+        let Some(viewer) = self.media.viewer.as_mut() else {
             return;
-        }
-        let open_id = viewer.key.open_id;
-        if let Some(viewer) = self.media.viewer.as_mut() {
-            viewer.rescaling = true;
-        }
-        let task =
-            cx.background_spawn(
-                async move { thumbnail_frame((*source).clone(), target.0, target.1) },
-            );
+        };
+        let Some(target) = viewer.request_scale(target) else {
+            return;
+        };
+        self.start_viewer_scale(target, source, window, cx);
+    }
+
+    /// One background pass for one requested surface size. It borrows the
+    /// shared original and returns only the frame; the caller installs it and
+    /// asks the viewer state machine for a single follow-up.
+    fn start_viewer_scale(
+        &mut self,
+        target: (u32, u32),
+        source: Arc<image::DynamicImage>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(open_id) = self.media.viewer.as_ref().map(|viewer| viewer.key.open_id) else {
+            return;
+        };
+        #[cfg(test)]
+        scale_probe::pass();
+        let task = cx.background_spawn(async move { thumbnail_frame(&source, target.0, target.1) });
         cx.spawn_in(window, async move |this, window| {
             let (frame, _bytes) = task.await;
             let _ = this.update_in(window, |s, window, cx| {
@@ -419,13 +489,16 @@ impl Voxhold {
                 if viewer.key.open_id != open_id {
                     return;
                 }
-                viewer.rescaling = false;
                 let next = Arc::new(gpui::RenderImage::new(smallvec::smallvec![frame]));
                 if let Some(previous) = std::mem::replace(&mut viewer.image, Some(next)) {
                     let _ = window.drop_image(previous);
                 }
-                viewer.render_box = target;
+                let follow_up = viewer.finish_scale(target);
+                let source = follow_up.and_then(|_| viewer.source.clone());
                 cx.notify();
+                if let (Some(target), Some(source)) = (follow_up, source) {
+                    s.start_viewer_scale(target, source, window, cx);
+                }
             });
         })
         .detach();

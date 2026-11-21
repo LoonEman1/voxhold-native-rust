@@ -6935,6 +6935,7 @@ dependencies = [
 name = "voxhold-native-rust"
 version = "0.2.0"
 dependencies = [
+ "embed-resource",
  "gpui",
  "gpui-component",
  "image",

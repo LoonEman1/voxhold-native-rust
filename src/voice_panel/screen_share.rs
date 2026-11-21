@@ -585,7 +585,6 @@ impl VoicePanel {
         self.screen.windows.clear();
         self.screen.monitor_error.clear();
         self.screen.window_error.clear();
-        // A new epoch: a capture of the previous dialog is ignored.
         // A new epoch: a capture of the previous dialog is ignored, and the
         // pictures it owned leave the sprite atlas.
         self.screen.clear_previews(window);
@@ -1078,13 +1077,12 @@ impl VoicePanel {
     /// Forget every screen-share surface: leaving the call or a revoked
     /// session must not keep a card, a picker or a stale preview.
     pub(super) fn reset_screen(&mut self, window: &mut Window) {
-        // The epoch must not fall back to a value an in-flight capture of the
-        // discarded dialog already holds.
+        // A new picker must wait for a capture already running in the old
+        // epoch; its result will be discarded after it releases the latch.
         let mut old = std::mem::take(&mut self.screen);
-        let epoch = old.preview_epoch.wrapping_add(1);
+        self.screen.preview_epoch = old.preview_epoch.wrapping_add(1);
+        self.screen.preview_in_flight = old.preview_in_flight;
         old.release_all_images(window);
-        self.screen = ScreenShareUi::default();
-        self.screen.preview_epoch = epoch;
         #[cfg(test)]
         {
             self.screen.released_images = old.released_images;

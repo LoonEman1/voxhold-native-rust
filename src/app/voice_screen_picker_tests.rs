@@ -322,6 +322,14 @@ async fn the_card_text_block_is_measured_from_the_card_width(cx: &mut TestAppCon
                 vec![short.clone(), long.clone(), unknown.clone()],
                 None,
             );
+        });
+    });
+    // The first layout adopts the painted rows; the note is injected after it,
+    // because a memory refusal written while the rows are unknown is retried
+    // there by design.
+    draw(&mut visual);
+    visual.update(|_window, app| {
+        voice.update(app, |panel, _| {
             panel.test_inject_screen_preview_error(
                 &long,
                 "Предпросмотр недоступен: превышен лимит памяти.",
@@ -587,9 +595,9 @@ async fn reopening_the_picker_resets_the_grid_scroll(cx: &mut TestAppContext) {
 }
 
 /// P05: a DPI/width change must not start a second capture while the previous
-/// one is still in flight. The generation request waits for the capture latch
-/// and captures once after it is released; the provider's concurrency peak
-/// stays at one.
+/// one is still in flight. The generation request waits for the capture latch;
+/// the running batch's own end then starts the generation at the new width
+/// without any test request. The provider's concurrency peak stays at one.
 #[gpui::test]
 async fn a_width_change_never_runs_two_captures_at_once(cx: &mut TestAppContext) {
     use std::sync::atomic::AtomicUsize;
@@ -622,6 +630,15 @@ async fn a_width_change_never_runs_two_captures_at_once(cx: &mut TestAppContext)
         });
     }
 
+    // The production batch owns the picker but is still queued: its end is what
+    // must re-request the generation after the width change.
+    visual.update(|window, app| {
+        voice.update(app, |panel, cx| {
+            panel.test_request_screen_previews(window, cx);
+            assert!(panel.test_preview_batch_active());
+        });
+    });
+
     // Model a capture that already reached the provider but has not returned,
     // as during a DPI move. The new width may not start a second one.
     visual.update(|window, app| {
@@ -629,6 +646,10 @@ async fn a_width_change_never_runs_two_captures_at_once(cx: &mut TestAppContext)
             panel.test_set_preview_capture_in_flight(true);
             panel.test_force_preview_width(288);
             panel.test_set_preview_width(window, 432, cx);
+            assert!(
+                panel.test_preview_capture_in_flight(),
+                "the width change keeps waiting for the old capture"
+            );
             assert!(
                 !panel.test_preview_batch_active(),
                 "no batch may start beside the in-flight capture"
@@ -645,14 +666,88 @@ async fn a_width_change_never_runs_two_captures_at_once(cx: &mut TestAppContext)
         });
     });
 
-    // The old capture returns: its batch releases the latch and the current
-    // generation captures at the new width exactly once.
+    // The old capture returns: the queued batch ends, releases the latch and
+    // requests the generation at the new width. No test code asks for previews.
+    visual.update(|_window, app| {
+        voice.update(app, |panel, _| {
+            panel.test_set_preview_capture_in_flight(false)
+        });
+    });
+    wait_for(&mut visual, &voice, |panel| {
+        panel.test_screen_preview_counts().0 == 1
+            && panel.test_screen_preview_pending() == 0
+            && !panel.test_preview_batch_active()
+            && !panel.test_preview_capture_in_flight()
+    });
+    assert_eq!(peak.load(Ordering::SeqCst), 1, "captures never overlapped");
+    assert_eq!(
+        seen.attempts().len(),
+        1,
+        "the generation captured the card exactly once"
+    );
+    let final_width = voice.read_with(&*visual, |panel, _| panel.test_screen_preview_width());
+    assert!(
+        final_width >= 432,
+        "the generation kept the sharper request width: {final_width}"
+    );
+}
+
+/// P05: closing the picker while a capture is in flight and opening it again
+/// must start the new generation from the old batch's own end. Both the close
+/// and the reopen request are blocked by the latch, so without that end the
+/// cards of the reopened picker would stay empty.
+#[gpui::test]
+async fn reopening_during_an_in_flight_capture_starts_the_new_generation(cx: &mut TestAppContext) {
+    let (mut visual, _view, voice) = super::voice_tests::fixture_with(cx, Some(1400.), true);
+    draw(&mut visual);
+    let source = monitor(3, "Экран A", 1920, 1080);
+    open_picker_with(
+        &mut visual,
+        &voice,
+        SourceKind::Monitor,
+        vec![source.clone()],
+    );
+    let seen = RecordingPreview::default();
+    visual.update(|_window, app| {
+        voice.update(app, |panel, _| {
+            panel.test_set_preview_provider(seen.provider())
+        });
+    });
+    // A production refresh starts the batch; it is queued, not running yet.
     visual.update(|window, app| {
         voice.update(app, |panel, cx| {
-            panel.test_set_preview_capture_in_flight(false);
-            panel.test_request_screen_previews(window, cx);
+            panel.test_refresh_screen_sources(window, cx);
             assert!(panel.test_preview_batch_active());
-            assert_eq!(panel.test_screen_preview_pending(), 1);
+        });
+    });
+    let old_epoch = voice.read_with(&*visual, |panel, _| panel.test_preview_epoch());
+
+    // The capture of that batch is in flight when the picker closes and opens
+    // again: the reopen request may not start a second capture.
+    visual.update(|window, app| {
+        voice.update(app, |panel, cx| {
+            panel.test_set_preview_capture_in_flight(true);
+            panel.test_close_screen_share(window, cx);
+            panel.test_open_screen_share(window, cx);
+            panel.test_apply_screen_sources(window, SourceKind::Monitor, vec![source.clone()]);
+            assert!(panel.screen_share_open());
+            assert!(panel.test_preview_capture_in_flight());
+            assert!(
+                !panel.test_preview_batch_active(),
+                "the reopen request waits for the in-flight capture"
+            );
+            assert_eq!(panel.test_screen_preview_pending(), 0);
+            assert!(seen.attempts().is_empty(), "no capture started yet");
+        });
+    });
+    let new_epoch = voice.read_with(&*visual, |panel, _| panel.test_preview_epoch());
+    assert_ne!(new_epoch, old_epoch, "the reopen moved the epoch");
+
+    // The old capture returns and its batch ends: that end starts the new
+    // generation for the reopened picker, without any test request.
+    visual.update(|_window, app| {
+        voice.update(app, |panel, _| {
+            panel.test_set_preview_capture_in_flight(false)
         });
     });
     wait_for(&mut visual, &voice, |panel| {
@@ -660,11 +755,16 @@ async fn a_width_change_never_runs_two_captures_at_once(cx: &mut TestAppContext)
             && panel.test_screen_preview_pending() == 0
             && !panel.test_preview_batch_active()
     });
-    assert_eq!(peak.load(Ordering::SeqCst), 1, "captures never overlapped");
-    let final_width = voice.read_with(&*visual, |panel, _| panel.test_screen_preview_width());
-    assert!(
-        final_width >= 432,
-        "the generation kept the sharper request width: {final_width}"
+    assert_eq!(
+        seen.attempts(),
+        vec!["monitor:3".to_owned()],
+        "only the reopened picker captured the card"
+    );
+    assert_eq!(
+        voice.read_with(&*visual, |panel, _| panel
+            .test_screen_preview_error(source.source_id())),
+        None,
+        "the new generation filled the card instead of a memory note"
     );
 }
 

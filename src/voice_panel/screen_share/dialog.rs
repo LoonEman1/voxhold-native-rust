@@ -153,7 +153,6 @@ impl VoicePanel {
         // picker to a 125/150% monitor starts a new preview generation.
         let requested = thumbnail_request_width(card_width, window.scale_factor());
         self.set_thumbnail_width(requested, window, cx);
-        self.screen.preview_columns = columns;
 
         let restart_live = self.screen.restart_source().cloned();
         let sources: Vec<ScreenSource> = if self.screen.restart {
@@ -167,6 +166,7 @@ impl VoicePanel {
         let mut rows_changed = false;
         if sources.is_empty() {
             self.screen.visible_rows = None;
+            self.screen.preview_columns = columns;
         } else {
             let top = self.screen.list_scroll.top_item();
             let bottom = self.screen.list_scroll.bottom_item();

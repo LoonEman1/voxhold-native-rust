@@ -751,7 +751,7 @@ async fn a_late_preview_batch_cannot_clear_a_newer_batch(cx: &mut TestAppContext
     let old_epoch = voice.read_with(&*visual, |panel, _| panel.test_preview_epoch());
     visual.update(|window, app| {
         voice.update(app, |panel, cx| {
-            panel.test_request_screen_previews(window, cx);
+            panel.test_refresh_screen_sources(window, cx);
             assert!(panel.test_preview_batch_active());
         });
     });
@@ -768,9 +768,9 @@ async fn a_late_preview_batch_cannot_clear_a_newer_batch(cx: &mut TestAppContext
         });
     });
 
-    // A new picker starts its own batch before the old task ever ran. No draw
-    // here: a paint would run that batch to completion and release the guard
-    // the stale end is supposed to leave alone.
+    // A refresh of the new picker starts its own batch before the old task ever
+    // ran. No draw here: a paint would run that batch to completion and release
+    // the guard the stale end is supposed to leave alone.
     visual.update(|window, app| {
         voice.update(app, |panel, _| {
             panel.test_attach_detached_handle();
@@ -786,7 +786,7 @@ async fn a_late_preview_batch_cannot_clear_a_newer_batch(cx: &mut TestAppContext
     assert_ne!(new_epoch, old_epoch, "a new picker has a new epoch");
     visual.update(|window, app| {
         voice.update(app, |panel, cx| {
-            panel.test_request_screen_previews(window, cx);
+            panel.test_refresh_screen_sources(window, cx);
             assert!(panel.test_preview_batch_active());
         });
     });

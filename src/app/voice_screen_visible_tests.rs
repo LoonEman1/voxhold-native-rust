@@ -289,6 +289,87 @@ async fn a_full_cache_evicts_off_screen_pictures_for_the_visible_cards(cx: &mut 
     });
 }
 
+/// P05/O09: a memory note written while the grid had no measured rows is not
+/// sticky. A tab switch drops the rows, so the bootstrap batch of the return can
+/// evict a top-row picture before the grid is measured. The first layout must
+/// drop that note and request the card again, while the note of a card that is
+/// still off screen stays.
+#[gpui::test]
+async fn the_first_layout_retries_a_visible_memory_refusal(cx: &mut TestAppContext) {
+    let (mut visual, _view, voice) = super::voice_tests::fixture_with(cx, Some(1400.), true);
+    draw(&mut visual);
+    let sources: Vec<ScreenSource> = (0..12)
+        .map(|index| monitor(3 + index * 2, "Экран", 1920, 1080))
+        .collect();
+    let top = sources[0].source_id();
+    let far = sources[11].source_id();
+    open_picker_with(&mut visual, &voice, SourceKind::Monitor, sources.clone());
+    visual.update(|window, app| {
+        voice.update(app, |panel, cx| {
+            // Switching tabs drops the measured rows. Both return requests run
+            // without a provider, so no batch starts before the layout.
+            panel.test_switch_share_kind(SourceKind::Window, window, cx);
+            panel.test_switch_share_kind(SourceKind::Monitor, window, cx);
+            assert!(panel.test_screen_visible_rows().is_none());
+            panel.test_set_preview_provider(Recording::default().provider());
+            // The note a bootstrap batch writes for a top-row picture it
+            // evicted before the grid was measured.
+            let reason = panel.test_preview_memory_reason();
+            panel.test_inject_screen_preview_error(&sources[0], reason);
+            panel.test_inject_screen_preview_error(&sources[11], reason);
+        });
+    });
+    // The first layout clears the visible note and requests the card again.
+    draw(&mut visual);
+    let reason = voice.read_with(&*visual, |panel, _| panel.test_preview_memory_reason());
+    voice.read_with(&*visual, |panel, _| {
+        assert_eq!(
+            panel.test_screen_preview_error(top),
+            None,
+            "the first layout dropped the sticky memory note"
+        );
+        assert_eq!(
+            panel.test_screen_preview_error(far).as_deref(),
+            Some(reason),
+            "a card that is still off screen keeps its note"
+        );
+    });
+    wait_for(&mut visual, &voice, |panel| {
+        panel.test_screen_has_preview(top)
+    });
+}
+
+#[gpui::test]
+async fn widening_the_grid_retries_a_newly_visible_card_in_the_same_row(cx: &mut TestAppContext) {
+    let (mut visual, _view, voice) = super::voice_tests::fixture_with(cx, Some(1400.), true);
+    draw(&mut visual);
+    let first = monitor(3, "Экран A", 1920, 1080);
+    let second = monitor(5, "Экран B", 1920, 1080);
+    open_picker_with(
+        &mut visual,
+        &voice,
+        SourceKind::Monitor,
+        vec![first, second.clone()],
+    );
+    visual.update(|window, app| {
+        voice.update(app, |panel, cx| {
+            panel.test_set_preview_viewport(1, 0, 0, window, cx);
+            let reason = panel.test_preview_memory_reason();
+            panel.test_inject_screen_preview_error(&second, reason);
+            panel.test_set_preview_provider(Recording::default().provider());
+            panel.test_set_preview_viewport(2, 0, 0, window, cx);
+            assert_eq!(
+                panel.test_screen_preview_error(second.source_id()),
+                None,
+                "the second card moved into view when the first row gained a column"
+            );
+        });
+    });
+    wait_for(&mut visual, &voice, |panel| {
+        panel.test_screen_has_preview(second.source_id())
+    });
+}
+
 /// The byte half of the same gate: 41 pictures still fit the count bound but
 /// leave less than one estimated frame. The oldest off-screen frames are
 /// evicted for the visible cards; the byte bound itself still holds.

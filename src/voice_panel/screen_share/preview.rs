@@ -186,78 +186,58 @@ impl ScreenShareUi {
         }
     }
 
-    /// Row of a source in the current category, used to rank visibility and
-    /// cache eviction.
-    fn preview_row(&self, identity: &SourceIdentity) -> Option<usize> {
-        let index = self
-            .snapshot(self.kind)
+    fn preview_index(&self, identity: &SourceIdentity) -> Option<usize> {
+        self.snapshot(self.kind)
             .iter()
-            .position(|source| source.identity().as_ref() == Some(identity))?;
-        Some(index / self.preview_columns.max(1))
+            .position(|source| source.identity().as_ref() == Some(identity))
     }
 
-    /// Whether the card is inside the last painted grid viewport. Before the
-    /// first layout there is no visible row to protect, so a picture of a
-    /// category the dialog has not painted yet (a tab switch) may be evicted.
+    /// Only the painted cards of the current category are protected from eviction.
     fn preview_is_visible(&self, identity: &SourceIdentity) -> bool {
         let Some((top, bottom)) = self.visible_rows else {
             return false;
         };
-        self.preview_row(identity)
-            .is_some_and(|row| row >= top && row <= bottom)
+        self.preview_index(identity)
+            .map(|index| index / self.preview_columns)
+            .is_some_and(|row| (top..=bottom).contains(&row))
     }
 
-    /// Whether the card moved into the painted rows since the previous frame.
-    /// Such a card is retried: a budget refusal from its hidden time is no
-    /// longer true.
-    fn row_newly_visible(
-        &self,
-        identity: &SourceIdentity,
-        previous: (usize, usize),
-        next: (usize, usize),
-    ) -> bool {
-        self.preview_row(identity).is_some_and(|row| {
-            row >= next.0 && row <= next.1 && (row < previous.0 || row > previous.1)
-        })
-    }
-
-    /// Adopt the rows of the last painted viewport. A card that comes back
-    /// into view after a memory refusal is cleared and retried at once: its
-    /// earlier failure was about the export budget, not about the surface.
-    /// A frame that did not fit (`preview_unfit`) gets the same second chance.
-    /// Returns whether the rows changed, so the dialog asks for previews once
-    /// and a plain repaint asks nothing.
+    /// Retry budget refusals for newly visible cards, including on the first
+    /// layout and when a different number of columns exposes new cards.
     pub(super) fn set_visible_rows(&mut self, columns: usize, top: usize, bottom: usize) -> bool {
-        self.preview_columns = columns.max(1);
+        let columns = columns.max(1);
+        let previous_columns = std::mem::replace(&mut self.preview_columns, columns);
         let next = (top.min(bottom), bottom.max(top));
-        let previous = self.visible_rows;
-        self.visible_rows = Some(next);
-        let Some((old_top, old_bottom)) = previous else {
-            // The first layout decides visibility; the bootstrap set already
-            // asked for the top rows.
-            return false;
-        };
-        if previous == Some(next) {
+        let previous = self.visible_rows.replace(next);
+        if previous == Some(next) && previous_columns == columns {
             return false;
         }
-        let retry: Vec<SourceIdentity> = self
+
+        let indices = |columns, (top, bottom)| top * columns..(bottom + 1) * columns;
+        let next = indices(columns, next);
+        let previous = previous.map(|rows| indices(previous_columns, rows));
+        let newly_visible = |identity: &SourceIdentity| {
+            self.preview_index(identity).is_some_and(|index| {
+                next.contains(&index) && previous.as_ref().is_none_or(|old| !old.contains(&index))
+            })
+        };
+        let retry: Vec<_> = self
             .preview_failures
             .iter()
             .filter(|(identity, reason)| {
-                **reason == PREVIEW_MEMORY_REASON
-                    && self.row_newly_visible(identity, (old_top, old_bottom), next)
+                **reason == PREVIEW_MEMORY_REASON && newly_visible(identity)
             })
             .map(|(identity, _)| identity.clone())
+            .collect();
+        let unfit: Vec<_> = self
+            .preview_unfit
+            .iter()
+            .filter(|identity| newly_visible(identity))
+            .cloned()
             .collect();
         for identity in retry {
             self.preview_failures.remove(&identity);
         }
-        let unfit: Vec<SourceIdentity> = self
-            .preview_unfit
-            .iter()
-            .filter(|identity| self.row_newly_visible(identity, (old_top, old_bottom), next))
-            .cloned()
-            .collect();
         for identity in unfit {
             self.preview_unfit.remove(&identity);
         }
@@ -355,8 +335,9 @@ impl ScreenShareUi {
 
     /// Release the batch guard at the end of a batch. A stale batch (its epoch
     /// was superseded by a closed picker, a stop or a newer session) must not
-    /// clear a flag that now belongs to a newer batch. Returns whether the
-    /// caller owns the guard and should re-request pending work.
+    /// clear a flag that now belongs to a newer batch. Returns whether this
+    /// epoch owned the guard. The caller still re-requests pending work: a
+    /// generation that waited for the capture latch never got a batch.
     pub(crate) fn end_preview_batch(&mut self, epoch: u64) -> bool {
         if self.preview_epoch != epoch {
             return false;
@@ -752,22 +733,23 @@ impl VoicePanel {
                 };
                 #[cfg(test)]
                 let provider = provider.clone();
-                let keep = this
+                let started = this
                     .update_in(cx, |panel, _, _| {
-                        panel.screen.open
+                        let current = panel.screen.open
                             && !panel.screen.restart
                             && panel.screen.preview_epoch == epoch
                             && panel.screen.kind == kind
                             && panel.screen.preview_pending.contains(&identity)
-                            && panel.screen.source_for_identity(&identity).is_some()
+                            && panel.screen.source_for_identity(&identity).is_some();
+                        if current {
+                            panel.screen.preview_in_flight = true;
+                        }
+                        current
                     })
                     .unwrap_or(false);
-                if !keep {
+                if !started {
                     break;
                 }
-                let _ = this.update_in(cx, |panel, _, _| {
-                    panel.screen.preview_in_flight = true;
-                });
                 let task = cx.background_spawn(async move {
                     #[cfg(test)]
                     if let Some(provider) = provider {
@@ -779,7 +761,7 @@ impl VoicePanel {
                 // Release the capture latch before any epoch check: another
                 // generation is allowed to start only after this capture has
                 // really returned.
-                let _ = this.update_in(cx, |panel, _, _| {
+                let _ = this.update(cx, |panel, _| {
                     panel.screen.preview_in_flight = false;
                 });
                 let alive = this
@@ -812,10 +794,11 @@ impl VoicePanel {
             let applied = this.update_in(cx, |panel, window, cx| {
                 // Only this batch's epoch may release the flag: a newer picker
                 // or dialog already reset it, and a late end must not clear a
-                // batch that session started.
-                if !panel.screen.end_preview_batch(epoch) {
-                    return;
-                }
+                // batch that session started. The request is made either way: a
+                // generation that waited for the capture latch (a DPI or width
+                // change) has no batch of its own, and the guard still keeps a
+                // running batch from starting a second one.
+                panel.screen.end_preview_batch(epoch);
                 // Rows added after the last claim, a refresh or a generation
                 // that waited for this capture: all of them are picked up
                 // here, on the current category.
@@ -832,7 +815,6 @@ impl VoicePanel {
                 let _ = this.update(cx, |panel, _| {
                     if panel.screen.end_preview_batch(epoch) {
                         panel.screen.preview_pending.clear();
-                        panel.screen.preview_in_flight = false;
                     }
                 });
             }

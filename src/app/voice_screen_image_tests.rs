@@ -250,8 +250,13 @@ async fn resetting_the_share_releases_every_held_image(cx: &mut TestAppContext) 
             panel.test_set_player_frame(window, plate(4, 4, [0x44, 0x55, 0x66, 0xff]));
             assert_eq!(panel.test_screen_images_released(), 0);
             assert_eq!(panel.test_player_images_released(), 0);
+            panel.test_set_preview_capture_in_flight(true);
 
             panel.test_reset_screen(window);
+            assert!(
+                panel.test_preview_capture_in_flight(),
+                "the next picker must wait for the capture that survived this reset"
+            );
             assert_eq!(panel.test_screen_preview_image_id(), None);
             assert_eq!(panel.test_screen_preview_counts(), (0, 0));
             assert_eq!(

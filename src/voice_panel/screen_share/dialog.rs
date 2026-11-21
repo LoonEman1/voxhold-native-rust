@@ -6,7 +6,9 @@
 use super::picker::*;
 use super::*;
 use crate::theme;
-use voxhold_media::publisher::{Codec, Preset, Resolution, SCREEN_FRAME_RATES};
+use voxhold_media::publisher::{
+    CodecIntent, CodecRole, CodecSnapshot, Preset, Resolution, SCREEN_FRAME_RATES,
+};
 use voxhold_media::screen_capture::ScreenSource;
 
 impl ScreenShareUi {
@@ -361,7 +363,22 @@ impl VoicePanel {
 
         // Quality: only values the SDR publication applies.
         let q = self.screen.quality();
-        let codec = Codec::available();
+        // The picker offers the website's «Автоматически» first. The concrete
+        // codec is what the current sender snapshot resolves right now; an
+        // unavailable explicit choice keeps its reason until the user changes
+        // it. The full four-item list with per-codec reasons is the next slice.
+        let codec_intent = self.screen.codec;
+        let codec_resolution = CodecSnapshot::current().resolve(codec_intent, CodecRole::Sender);
+        let codec_label = match &codec_resolution {
+            Ok(codec) => match codec_intent {
+                CodecIntent::Auto => format!("Автоматически · {}", codec.label()),
+                CodecIntent::Explicit(_) => codec.label().to_owned(),
+            },
+            Err(_) => "Нет доступного кодека".to_owned(),
+        };
+        let codec_reason = codec_resolution
+            .err()
+            .map(|error| error.reason().to_owned());
         let bitrate = format!(
             "{},{:01} Мбит/с",
             self.screen.bitrate_kbps / 1000,
@@ -573,19 +590,22 @@ impl VoicePanel {
                             .text_color(rgb(c.muted))
                             .child("Кодек"),
                     )
-                    .child(
-                        div().text_size(px(12.)).child(
-                            codec
-                                .first()
-                                .map(|codec| codec.label())
-                                .unwrap_or("нет подтверждённого"),
-                        ),
-                    )
+                    .child(div().text_size(px(12.)).child(codec_label))
                     .child(
                         div()
+                            .flex_1()
+                            .min_w(px(0.))
                             .text_size(px(10.))
-                            .text_color(rgb(c.muted))
-                            .child("SDR · серверная передача"),
+                            .text_color(rgb(if codec_reason.is_some() {
+                                c.danger
+                            } else {
+                                c.muted
+                            }))
+                            .truncate()
+                            .child(
+                                codec_reason
+                                    .unwrap_or_else(|| "SDR · серверная передача".to_owned()),
+                            ),
                     ),
             );
 

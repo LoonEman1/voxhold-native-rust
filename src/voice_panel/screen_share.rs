@@ -148,6 +148,11 @@ pub(super) struct ScreenShareUi {
     /// picks up newly visible rows at its next safe point and re-requests at
     /// its end.
     pub(super) preview_batching: bool,
+    /// A background capture really runs right now. Unlike [`Self::preview_batching`]
+    /// this latch is not released by a new epoch: replacing the preview
+    /// generation must wait until the old capture returns, so two captures can
+    /// never overlap after a DPI or width change.
+    pub(super) preview_in_flight: bool,
     /// Session epoch of the open picker. Closing it, a stop, a restart or a new
     /// picker bumps this value; a late capture result is then ignored and no
     /// further source is started.
@@ -212,6 +217,7 @@ impl Default for ScreenShareUi {
             preview_failures: HashMap::new(),
             preview_pending: HashSet::new(),
             preview_batching: false,
+            preview_in_flight: false,
             preview_epoch: 0,
             preview_bytes: 0,
             preview_rejected: 0,
@@ -549,6 +555,10 @@ impl VoicePanel {
         self.screen.window_error.clear();
         // A new epoch: a capture of the previous dialog is ignored.
         self.screen.clear_previews();
+        // A reopened picker starts at the top of its grid: the scroll handle
+        // belongs to the previous dialog and is recreated, not reused.
+        self.screen.list_scroll = ScrollHandle::new();
+        self.screen.visible_rows = None;
         // A fresh publication starts without system sound, and the previous
         // picker's probe answer must not leak in: Start stays locked until
         // the new probe settles and offers the safe default scope.

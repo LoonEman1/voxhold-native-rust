@@ -448,11 +448,15 @@ fn padded_bgra_previews_keep_the_frame_geometry_and_all_four_edges() {
             yellow[1] > 150 && yellow[2] > 150,
             "bottom edge: {yellow:?}"
         );
+        // The row padding is magenta (0xEE, 0x00, 0xEE) with alpha 0x7F. A
+        // leaked pixel keeps that exact signature; the frame itself only uses
+        // red, green, blue, yellow and black, so a magenta family check
+        // catches a partial copy as well.
         assert!(
             !preview
                 .bgra
                 .chunks_exact(4)
-                .any(|pixel| pixel == [0xEE, 0x00, 0xEE, 255]),
+                .any(|pixel| pixel[0] >= 0xE0 && pixel[1] <= 0x20 && pixel[2] >= 0xE0),
             "row padding leaked into the preview"
         );
     }

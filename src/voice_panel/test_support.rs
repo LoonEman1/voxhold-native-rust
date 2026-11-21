@@ -290,16 +290,34 @@ impl VoicePanel {
     }
 
     /// Model the visible grid rows of the last layout, so a test can observe
-    /// that captures prioritize the cards on screen.
-    pub fn test_set_preview_viewport(&mut self, columns: usize, top: usize, bottom: usize) {
-        self.screen.preview_columns = columns.max(1);
-        self.screen.visible_rows = Some((top, bottom));
+    /// that captures prioritize the cards on screen and that a card returning
+    /// to the viewport retries a memory refusal.
+    pub fn test_set_preview_viewport(
+        &mut self,
+        columns: usize,
+        top: usize,
+        bottom: usize,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_preview_viewport(columns, top, bottom, cx);
     }
 
     /// Vertical scroll range of the source grid. A positive value proves the
-    /// separate viewport really scrolls (and therefore paints a scrollbar).
+    /// separate viewport really scrolls; the painted bar is asserted separately
+    /// through its `share-sources-scrollbar` bounds.
     pub fn test_screen_list_scrollable(&self) -> f32 {
         f32::from(self.screen.list_scroll.max_offset().height)
+    }
+
+    /// Current vertical scroll offset of the source grid, as a positive
+    /// distance from the top.
+    pub fn test_screen_list_offset(&self) -> f32 {
+        (-f32::from(self.screen.list_scroll.offset().y)).max(0.)
+    }
+
+    /// The grid rows the last frame considered visible.
+    pub fn test_screen_visible_rows(&self) -> Option<(usize, usize)> {
+        self.screen.visible_rows
     }
 
     /// Inject a preview failure for one card without touching the selection.
@@ -320,6 +338,18 @@ impl VoicePanel {
     /// Whether a preview batch is marked active for the open picker.
     pub fn test_preview_batch_active(&self) -> bool {
         self.screen.preview_batching
+    }
+
+    /// Whether a background capture is really running. A new generation waits
+    /// for this latch instead of overlapping the old capture.
+    pub fn test_preview_capture_in_flight(&self) -> bool {
+        self.screen.preview_in_flight
+    }
+
+    /// Model the background capture latch while a provider is still working,
+    /// without blocking the test dispatcher inside the provider.
+    pub fn test_set_preview_capture_in_flight(&mut self, in_flight: bool) {
+        self.screen.preview_in_flight = in_flight;
     }
 
     /// Apply the end-of-batch guard rule for an explicit epoch, so a test can
@@ -398,6 +428,11 @@ impl VoicePanel {
             super::screen_share::MAX_SCREEN_PREVIEWS,
             super::screen_share::MAX_SCREEN_PREVIEW_BYTES,
         )
+    }
+
+    /// The exact card note for a picture that did not fit the export budget.
+    pub fn test_preview_memory_reason(&self) -> &'static str {
+        super::screen_share::PREVIEW_MEMORY_REASON
     }
 
     /// Number of rows cached for a category. A restart must not add the

@@ -1,11 +1,19 @@
 //! Pickable source card and the pure geometry of the picker grid.
 //!
 //! The picture slot is deliberately independent of the text footer and of the
-//! scroll viewport. GPUI derives an image's aspect ratio from its intrinsic
-//! size (`gpui::elements::img` sets `style.aspect_ratio`), so a percentage
-//! sized `img` inside a short slot can lay out taller than the slot and be
-//! cropped by its mask. This module therefore computes the slot and the
-//! painted image size explicitly and paints exactly one centred image.
+//! scroll viewport. Measured facts about the old layout:
+//!
+//! * A `Contain` image does not crop its texture: the base screenshot showed a
+//!   *whole* frame of about 124×70 logical pixels, i.e. the slot was simply
+//!   small (the card was 124 px wide), not clipped at its edges.
+//! * The "cut" second row on that screenshot came from the list viewport,
+//!   which was fixed at 236 px and hid the bottom row.
+//! * A percentage-sized `img` still has its intrinsic aspect ratio, so the
+//!   painted bounds were not the measured slot and could not be asserted.
+//!
+//! This module therefore computes the slot and the painted image size
+//! explicitly (`min(slot_w / frame_w, slot_h / frame_h)`, no upscale inside
+//! the slot) and paints exactly one centred image inside a definite box.
 
 use super::*;
 use voxhold_media::screen_capture::MAX_THUMBNAIL_WIDTH;
@@ -14,6 +22,9 @@ use voxhold_media::screen_capture::MAX_THUMBNAIL_WIDTH;
 pub(super) const PICKER_PADDING: f32 = 18.;
 /// Gap between cards and between grid rows.
 pub(super) const PICKER_GAP: f32 = 8.;
+/// The list reserves this width for its scrollbar. GPUI only reserves the
+/// layout space; the bar itself is painted from `list_scroll` state.
+pub(super) const LIST_SCROLLBAR: f32 = 8.;
 /// A card is not narrower than this at the two-column threshold.
 pub(super) const CARD_MIN_WIDTH: f32 = 260.;
 /// One card border; the picture slot uses the inner width.
@@ -26,8 +37,10 @@ pub(super) const SLOT_MAX_HEIGHT: f32 = 160.;
 pub(super) const CARD_FOOTER_HEIGHT: f32 = 46.;
 /// The same footer with the two-line preview reason.
 pub(super) const CARD_FOOTER_FAILURE_HEIGHT: f32 = 74.;
-/// The grid is a separate scroll area with this preferred height.
-pub(super) const LIST_MAX_HEIGHT: f32 = 280.;
+/// The grid is a separate scroll area with this preferred height. It still
+/// shows one whole normal card (slot + footer), while the settings block below
+/// keeps the «Кодек» line visible at the standard 660 px dialog.
+pub(super) const LIST_MAX_HEIGHT: f32 = 220.;
 /// At a very small window the grid still scrolls instead of disappearing.
 pub(super) const LIST_MIN_HEIGHT: f32 = 80.;
 /// Everything in the dialog except the source grid: padding, header, tabs,
@@ -36,7 +49,9 @@ pub(super) const LIST_MIN_HEIGHT: f32 = 80.;
 /// compact window.
 pub(super) const DIALOG_CHROME: f32 = 390.;
 
-/// One card width for the available inner width, never below one column.
+/// One card width for the list's content width (the inner dialog width minus
+/// [`LIST_SCROLLBAR`]). The caller subtracts the reserved scrollbar once, so
+/// the cards never extend under the painted bar.
 pub(super) fn picker_columns(inner_width: f32) -> usize {
     if inner_width >= CARD_MIN_WIDTH * 2. + PICKER_GAP {
         2
@@ -185,9 +200,11 @@ impl VoicePanel {
                 slot = slot.child(
                     img(thumb.image.clone())
                         .debug_selector(move || thumb_selector.clone())
-                        // Explicit final size: `Contain` inside an
-                        // intrinsically aspect-sized img used to be larger
-                        // than the slot and lost its edges to the mask.
+                        // Explicit final size: a percentage-sized img still
+                        // derives an intrinsic aspect ratio, so its painted
+                        // bounds were not the measured slot. The base defect
+                        // was a small card (~124×70), not a cropped texture:
+                        // `Contain` never cut the frame.
                         .w(px(image_w))
                         .h(px(image_h))
                         .object_fit(gpui::ObjectFit::Contain),
@@ -331,9 +348,10 @@ mod tests {
     fn the_column_threshold_is_derived_from_a_measurable_card_width() {
         assert_eq!(picker_columns(2. * CARD_MIN_WIDTH + PICKER_GAP - 1.), 1);
         assert_eq!(picker_columns(2. * CARD_MIN_WIDTH + PICKER_GAP), 2);
-        assert_eq!(picker_columns(584.), 2);
+        // A 620 px dialog: 584 px minus border, then minus the scrollbar.
+        assert_eq!(picker_columns(582. - LIST_SCROLLBAR), 2);
         assert_eq!(picker_columns(482.), 1);
-        assert!((card_width(2, 584.) - 288.).abs() < 0.01);
+        assert!((card_width(2, 582. - LIST_SCROLLBAR) - 283.).abs() < 0.01);
         assert!((card_width(1, 482.) - 482.).abs() < 0.01);
     }
 
@@ -371,12 +389,13 @@ mod tests {
 
     #[test]
     fn a_compact_dialog_keeps_a_scrolling_grid_and_the_action_row() {
-        assert_eq!(list_height(660.), 660. - DIALOG_CHROME);
+        assert_eq!(list_height(660.), LIST_MAX_HEIGHT);
+        assert_eq!(list_height(600.), 600. - DIALOG_CHROME);
         assert_eq!(list_height(320.), LIST_MIN_HEIGHT);
-        let card = card_height(288., true);
+        let card = card_height(card_width(2, 582. - LIST_SCROLLBAR), false);
         assert!(
             list_height(660.) >= card,
-            "a normal picker shows a whole card, including its error line"
+            "a normal picker shows a whole card; the error footer scrolls"
         );
     }
 }

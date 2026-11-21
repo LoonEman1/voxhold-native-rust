@@ -751,21 +751,19 @@ async fn a_late_preview_batch_cannot_clear_a_newer_batch(cx: &mut TestAppContext
         });
     });
 
-    // A new picker starts its own batch before the old task ever ran.
-    open_picker_with(
-        &mut visual,
-        &voice,
-        SourceKind::Monitor,
-        vec![source.clone()],
-    );
-    let new_epoch = voice.read_with(&*visual, |panel, _| panel.test_preview_epoch());
-    assert_ne!(new_epoch, old_epoch, "a new picker has a new epoch");
+    // A new picker starts its own batch before the old task ever ran. The
+    // open and the request share one update, so no queued task can run
+    // between them; a capture that was already in flight would still hold the
+    // latch and make the next request wait.
     visual.update(|_window, app| {
         voice.update(app, |panel, cx| {
+            panel.test_open_screen_picker_with(SourceKind::Monitor, vec![source.clone()], None);
             panel.test_request_screen_previews(cx);
             assert!(panel.test_preview_batch_active());
         });
     });
+    let new_epoch = voice.read_with(&*visual, |panel, _| panel.test_preview_epoch());
+    assert_ne!(new_epoch, old_epoch, "a new picker has a new epoch");
 
     visual.update(|_window, app| {
         voice.update(app, |panel, _| {

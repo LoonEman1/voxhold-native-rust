@@ -141,12 +141,14 @@ impl VoicePanel {
                 .child(self.choice("Обновить", false, refresh_focus, ShareKey::Refresh, cx));
         }
 
-        // Columns follow the measured inner width: two normal cards or one
-        // wider card. The picture slot, the text footer and the scroll
-        // viewport have separate sizes on purpose.
-        let inner_width = (width - PICKER_PADDING * 2.).max(120.0);
-        let columns = picker_columns(inner_width);
-        let card_width = card_width(columns, inner_width);
+        // Columns follow the measured inner width minus the scrollbar reserve:
+        // GPUI only reserves layout space for a scrollbar, the bar itself is
+        // painted below, so the cards must not extend under it. The modal
+        // border is part of its box and is subtracted as well.
+        let inner_width = (width - PICKER_PADDING * 2. - CARD_BORDER * 2.).max(120.0);
+        let content_width = (inner_width - LIST_SCROLLBAR).max(1.0);
+        let columns = picker_columns(content_width);
+        let card_width = card_width(columns, content_width);
         // The physical card width decides the thumbnail request. Moving the
         // picker to a 125/150% monitor starts a new preview generation.
         let requested = thumbnail_request_width(card_width, window.scale_factor());
@@ -155,7 +157,7 @@ impl VoicePanel {
         if self.screen.preview_cards > 0 {
             let top = self.screen.list_scroll.top_item();
             let bottom = self.screen.list_scroll.bottom_item();
-            self.screen.visible_rows = Some((top.min(bottom), bottom));
+            self.set_preview_viewport(columns, top.min(bottom), bottom, cx);
         } else {
             self.screen.visible_rows = None;
         }
@@ -166,19 +168,18 @@ impl VoicePanel {
         } else {
             self.screen.sources().to_vec()
         };
-        // The screenshot's second row was not a card-mask artefact: two 124 px
-        // cards plus the 8 px gap need 256 px, while the old fixed `236 px`
-        // list clipped the bottom row. The viewport height is now derived from
-        // the dialog, and rows past it scroll inside this separate element.
+        // The second row on the base screenshot was clipped by the list
+        // viewport, which was fixed at 236 px; the cards themselves were
+        // complete but small. The viewport height is now derived from the
+        // dialog, rows past it scroll inside this separate element, and the
+        // bar is painted from the real scroll state.
         let empty = sources.is_empty();
         let mut list = div()
             .id("share-sources")
             .debug_selector(|| "share-sources".into())
             .w_full()
-            .flex()
-            .flex_col()
-            .gap(px(PICKER_GAP))
-            .flex_shrink_0();
+            .flex_shrink_0()
+            .relative();
         if empty {
             // An empty grid must not reserve the height of a row it does not
             // have. The message is its own small block.
@@ -202,10 +203,16 @@ impl VoicePanel {
             );
         } else {
             self.screen.preview_cards = sources.len();
-            list = list
-                .h(px(list_height(height)))
+            let viewport_height = list_height(height);
+            let mut grid = div()
+                .id("share-sources-scroll")
+                .w_full()
+                .h_full()
+                .flex()
+                .flex_col()
+                .gap(px(PICKER_GAP))
                 .overflow_y_scroll()
-                .scrollbar_width(px(8.))
+                .scrollbar_width(px(LIST_SCROLLBAR))
                 .track_scroll(&self.screen.list_scroll.clone());
             let selected = self.screen.selected;
             let mut rows: Vec<Vec<gpui::AnyElement>> = Vec::new();
@@ -253,7 +260,42 @@ impl VoicePanel {
                 for card in cards {
                     grid_row = grid_row.child(card);
                 }
-                list = list.child(grid_row);
+                grid = grid.child(grid_row);
+            }
+            list = list.h(px(viewport_height)).child(grid);
+            // The reserved 8 px is only layout space in GPUI. Paint the
+            // visible bar over the right edge of the viewport from the same
+            // handle that scrolls the grid: the thumb follows `offset()` and
+            // disappears when there is nothing to scroll.
+            let max_scroll: f32 = self.screen.list_scroll.max_offset().height.into();
+            if max_scroll > 0.5 {
+                let offset: f32 = (-self.screen.list_scroll.offset().y).into();
+                let content = viewport_height + max_scroll;
+                let thumb_h = (viewport_height * viewport_height / content)
+                    .max(28.)
+                    .min(viewport_height);
+                let progress = (offset / max_scroll).clamp(0., 1.);
+                let thumb_top = (viewport_height - thumb_h) * progress;
+                list = list.child(
+                    div()
+                        .debug_selector(|| "share-sources-scrollbar".into())
+                        .absolute()
+                        .top(px(0.))
+                        .right(px(0.))
+                        .w(px(LIST_SCROLLBAR))
+                        .h(px(viewport_height))
+                        .child(
+                            div()
+                                .debug_selector(|| "share-sources-scrollbar-thumb".into())
+                                .absolute()
+                                .right(px(1.))
+                                .top(px(thumb_top))
+                                .w(px(LIST_SCROLLBAR - 2.))
+                                .h(px(thumb_h))
+                                .rounded(px(3.))
+                                .bg(rgb(c.muted)),
+                        ),
+                );
             }
         }
 
@@ -304,7 +346,7 @@ impl VoicePanel {
         let quality_row = div()
             .flex()
             .flex_col()
-            .gap_2()
+            .gap_1()
             .child(
                 div()
                     .flex()
@@ -467,6 +509,7 @@ impl VoicePanel {
             })
             .child(
                 div()
+                    .debug_selector(|| "share-codec".into())
                     .flex()
                     .items_center()
                     .gap_2()
@@ -593,7 +636,7 @@ impl VoicePanel {
             .scrollbar_width(px(6.))
             .flex()
             .flex_col()
-            .gap_3()
+            .gap_2()
             .child(preset_row)
             .child(quality_row);
 

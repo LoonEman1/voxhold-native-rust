@@ -18,7 +18,10 @@ impl ScreenShareUi {
     /// Start a new preview session: the epoch moves, so every capture still in
     /// flight is ignored, and no picture of the previous picker survives. The
     /// batch guard is released here as well: the epoch check in the old batch
-    /// stops it from touching a newer session's flag.
+    /// stops it from touching a newer session's flag. The in-flight latch is
+    /// deliberately kept: a capture that already runs must return before the
+    /// next generation starts one, otherwise two captures overlap after a DPI
+    /// or width change.
     pub(super) fn clear_previews(&mut self) {
         self.preview_epoch = self.preview_epoch.wrapping_add(1);
         self.previews.clear();
@@ -109,15 +112,54 @@ impl ScreenShareUi {
             .is_some_and(|row| row >= top && row <= bottom)
     }
 
+    /// Adopt the rows of the last painted viewport and retry the cards that
+    /// just came back on screen with only a memory refusal. Such a card had no
+    /// chance to load while it was hidden; once it is visible again the next
+    /// capture may win the budget. Returns whether any refusal was cleared.
+    pub(super) fn set_visible_rows(&mut self, columns: usize, top: usize, bottom: usize) -> bool {
+        self.preview_columns = columns.max(1);
+        let next = (top.min(bottom), bottom.max(top));
+        let previous = self.visible_rows;
+        self.visible_rows = Some(next);
+        let Some((old_top, old_bottom)) = previous else {
+            // The first layout decides visibility; no card was hidden before.
+            return false;
+        };
+        if previous == Some(next) {
+            return false;
+        }
+        let retry: Vec<SourceIdentity> = self
+            .preview_failures
+            .iter()
+            .filter(|(identity, reason)| {
+                **reason == PREVIEW_MEMORY_REASON
+                    && self.preview_row(identity).is_some_and(|row| {
+                        let newly_visible = row >= next.0 && row <= next.1;
+                        let was_visible = row >= old_top && row <= old_bottom;
+                        newly_visible && !was_visible
+                    })
+            })
+            .map(|(identity, _)| identity.clone())
+            .collect();
+        let retried = !retry.is_empty();
+        for identity in retry {
+            self.preview_failures.remove(&identity);
+        }
+        retried
+    }
+
     /// Make room for a visible card by releasing cached pictures that are
     /// scrolled out of view, farthest first. The released card gets the honest
     /// memory reason and is retried by the next refresh. Only a visible card
     /// may evict anything; a hidden frame that does not fit is rejected
-    /// without disturbing what the user is looking at.
+    /// without disturbing what the user is looking at. The selected source is
+    /// never a victim: losing the chosen card would leave the dialog showing
+    /// "превышен лимит памяти" for the surface it is about to publish.
     fn evict_hidden_previews(&mut self, identity: &SourceIdentity, existing: usize, bytes: usize) {
         if !self.preview_is_visible(identity) {
             return;
         }
+        let selected = self.selected_identity.clone();
         let grows_count = usize::from(existing == 0);
         let over = |previews: &HashMap<SourceIdentity, PreviewThumb>, total: usize| -> bool {
             previews.len() + grows_count > MAX_SCREEN_PREVIEWS
@@ -130,6 +172,7 @@ impl ScreenShareUi {
             .previews
             .iter()
             .filter(|(candidate, _)| *candidate != identity)
+            .filter(|(candidate, _)| selected.as_ref() != Some(*candidate))
             .filter(|(candidate, _)| !self.preview_is_visible(candidate))
             .map(|(candidate, thumb)| {
                 (
@@ -320,6 +363,21 @@ impl VoicePanel {
         self.request_screen_previews(cx);
     }
 
+    /// Adopt the visible grid rows of the current frame. A card that comes
+    /// back into view after a memory refusal is retried at once: its failure
+    /// was about the export budget, not about the surface.
+    pub(in crate::voice_panel) fn set_preview_viewport(
+        &mut self,
+        columns: usize,
+        top: usize,
+        bottom: usize,
+        cx: &mut Context<Self>,
+    ) {
+        if self.screen.set_visible_rows(columns, top, bottom) {
+            self.request_screen_previews(cx);
+        }
+    }
+
     /// Start background thumbnail generation for the visible category.
     ///
     /// Cached and pending ids are skipped. At most one batch, and inside it at
@@ -344,7 +402,7 @@ impl VoicePanel {
         if provider.is_none() {
             return;
         }
-        if self.screen.preview_batching {
+        if self.screen.preview_batching || self.screen.preview_in_flight {
             return;
         }
         let kind = self.screen.kind;
@@ -376,6 +434,9 @@ impl VoicePanel {
                 if !keep {
                     break;
                 }
+                let _ = this.update(cx, |panel, _| {
+                    panel.screen.preview_in_flight = true;
+                });
                 let task = cx.background_spawn(async move {
                     #[cfg(test)]
                     if let Some(provider) = provider {
@@ -384,6 +445,12 @@ impl VoicePanel {
                     screen_capture::capture_thumbnail(&source, width)
                 });
                 let result = task.await;
+                // Release the capture latch before any epoch check: another
+                // generation is allowed to start only after this capture has
+                // really returned.
+                let _ = this.update(cx, |panel, _| {
+                    panel.screen.preview_in_flight = false;
+                });
                 let alive = this
                     .update(cx, |panel, _| {
                         panel.screen.open
@@ -412,15 +479,15 @@ impl VoicePanel {
                     .flatten();
             }
             let _ = this.update(cx, |panel, cx| {
-                // Only this batch's epoch may release the flag: a newer picker
-                // or dialog already reset it, and a late end must not clear a
-                // batch that session started.
-                if !panel.screen.end_preview_batch(epoch) {
-                    return;
-                }
-                // Rows added after the last claim, a refresh or a tab switch
-                // that was answered by the guard: all of them are picked up
-                // here, on the current category.
+                // Only this batch's epoch may release the batch flag: a newer
+                // picker or dialog already reset it, and a late end must not
+                // clear a batch that session started. The in-flight latch is
+                // already released above, so a newer generation can still start
+                // its own batch even when this epoch is stale.
+                panel.screen.end_preview_batch(epoch);
+                // Rows added after the last claim, a refresh, a tab switch or a
+                // generation that waited for this capture: all of them are
+                // picked up here, on the current category.
                 if panel.screen.open && !panel.screen.restart {
                     panel.request_screen_previews(cx);
                 }

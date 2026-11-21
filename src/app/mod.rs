@@ -57,6 +57,10 @@ mod shell_view;
 mod tests;
 mod theme_ops;
 mod thread_ops;
+// The Win32 plumbing below is intentionally unreachable in tests: each entry
+// point has a `cfg(test)` seam, so dead-code analysis would flag the real API
+// calls even though they are exercised in production.
+#[cfg_attr(test, allow(dead_code))]
 mod tray;
 pub(crate) mod ui;
 mod update_install;
@@ -398,6 +402,9 @@ pub(crate) struct Voxhold {
     #[cfg(test)]
     notifications_entry_focus: FocusHandle,
     window_active: bool,
+    /// The window was hidden by the close button, not merely minimized. Only
+    /// this state may be brought back automatically after a tray failure.
+    hidden_to_tray: bool,
     /// Personal "Сообщения" mode. The server/channel context is kept in
     /// `personal_return` so "К каналам" can restore it when still permitted.
     personal_mode: bool,
@@ -833,6 +840,7 @@ impl Voxhold {
             #[cfg(test)]
             notifications_entry_focus: cx.focus_handle(),
             window_active: true,
+            hidden_to_tray: false,
             personal_mode: false,
             personal_return: None,
             pending_return_channel: None,

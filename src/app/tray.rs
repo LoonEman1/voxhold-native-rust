@@ -9,7 +9,6 @@
 //! Win32 window procedure, the context menu and the hide/show decisions.
 
 use super::*;
-#[cfg(test)]
 use crate::notifications::TrayIcon;
 use crate::notifications::TRAY_CALLBACK_MESSAGE;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -63,6 +62,12 @@ pub(crate) fn callback_action(lparam: isize) -> Option<TrayAction> {
     }
 }
 
+/// A visible, active window must not be re-shown or focused again; a hidden or
+/// minimized one is brought forward.
+pub(crate) fn needs_show(hidden_to_tray: bool, window_active: bool) -> bool {
+    hidden_to_tray || !window_active
+}
+
 pub(crate) fn menu_action(command: usize) -> Option<TrayAction> {
     match command {
         MENU_OPEN => Some(TrayAction::Open),
@@ -95,12 +100,26 @@ fn post(action: TrayAction) {
     }
 }
 
+/// Short close message. The window stays open, so the banner also offers the
+/// normal exit path instead of trapping the user in an app whose tray is dead.
+pub(super) const TRAY_CLOSE_ERROR: &str =
+    "Не удалось убрать окно в трей: значок Voxhold недоступен.";
+
 /// The GPUI test window is not backed by a platform window, so asking for its
-/// raw handle would panic. Production paths always go through the real HWND.
+/// raw handle would panic. Every Win32 call in this module and in the tray
+/// notification adapter is replaced by a seam under `cfg(test)`, so a fake
+/// handle is enough and no real shell/window API runs in tests.
+#[cfg(test)]
+pub(super) const TEST_WINDOW_HANDLE: isize = 1;
+
 fn window_hwnd(window: &Window) -> isize {
-    if cfg!(test) {
-        0
-    } else {
+    #[cfg(test)]
+    {
+        let _ = window;
+        TEST_WINDOW_HANDLE
+    }
+    #[cfg(not(test))]
+    {
         super::personal_ops::hwnd(window)
     }
 }
@@ -119,8 +138,10 @@ impl Voxhold {
             if hwnd == 0 {
                 return;
             }
-            let _ = self.notification_tray.register(hwnd);
-            install_window_proc(hwnd);
+            // The icon must not appear until the window procedure is live:
+            // otherwise the cross would hide the window with no way back.
+            let proc_installed = install_window_proc(hwnd);
+            register_tray_after_proc(&mut self.notification_tray, hwnd, proc_installed);
             let _ = channel();
             if self.tray_task.is_none() {
                 if let Some(mut receiver) = take_receiver() {
@@ -162,8 +183,9 @@ impl Voxhold {
         }
     }
 
-    /// The window close button: hide to the tray when the icon is registered,
-    /// otherwise let the normal close happen and report why it could not hide.
+    /// The window close button: hide to the tray when the icon is registered.
+    /// A failed registration keeps the window visible and explains why; GPUI
+    /// must not close it, because the error frame would never be painted.
     pub(super) fn should_close_window(
         &mut self,
         window: &mut Window,
@@ -176,38 +198,57 @@ impl Voxhold {
             }
             CloseDecision::Close => true,
             CloseDecision::CloseWithError => {
-                self.report_tray_error(
-                    "Не удалось убрать окно в трей: значок Voxhold недоступен.",
-                    cx,
-                );
-                true
+                self.report_tray_error(TRAY_CLOSE_ERROR, cx);
+                false
             }
         }
+    }
+
+    /// The banner shows a normal exit button only for this specific failure, so
+    /// the user is not trapped in a window whose close hook is blocked.
+    pub(super) fn tray_exit_offered(&self) -> bool {
+        self.error == TRAY_CLOSE_ERROR
     }
 
     fn hide_to_tray(&mut self, window: &Window, cx: &mut Context<Self>) {
         let hwnd = window_hwnd(window);
         hide_window(hwnd);
         // The window is no longer active, so notifications must not be
-        // suppressed while it is hidden.
+        // suppressed while it is hidden. `SW_HIDE` does not send `WM_ACTIVATE`,
+        // so this flag, not `Window::is_window_active`, is the source of truth.
         self.window_active = false;
+        self.hidden_to_tray = true;
+        // A hidden window gets no activation event: release a held PTT now so
+        // the microphone cannot stay open behind the tray.
+        #[cfg(feature = "voxhold-media")]
+        if let Some(voice) = self.voice.clone() {
+            voice.update(cx, |panel, _| panel.release_push_to_talk());
+        }
         cx.notify();
     }
 
     /// Bring back the same HWND. `SW_SHOW` keeps the previous position and
-    /// maximized state; a minimized window is restored first.
+    /// maximized state; a minimized window is restored first. Calling this for
+    /// an already visible and active window is a no-op, so a duplicate tray
+    /// click cannot pull focus from another application.
     pub(super) fn show_main_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !needs_show(self.hidden_to_tray, self.window_active) {
+            return;
+        }
         let hwnd = window_hwnd(window);
         show_window(hwnd);
         if !cfg!(test) {
             window.activate_window();
         }
+        self.hidden_to_tray = false;
         self.window_active = true;
         cx.notify();
     }
 
     fn tray_restore_failed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.quitting {
+        // Explorer restart failure while the window is visible must not steal
+        // focus; only a genuinely hidden window comes back.
+        if !self.quitting && self.hidden_to_tray {
             self.show_main_window(window, cx);
         }
         self.report_tray_error(
@@ -326,20 +367,53 @@ struct Point {
 #[cfg(windows)]
 static PROC_INSTALLED: AtomicBool = AtomicBool::new(false);
 
+/// Returns whether the window procedure is (now) installed. The icon is only
+/// registered on success; a dead subclass would make the cross hide the window
+/// with no way to bring it back.
 #[cfg(windows)]
-fn install_window_proc(hwnd: isize) {
-    if cfg!(test) || hwnd == 0 || PROC_INSTALLED.swap(true, Ordering::SeqCst) {
-        return;
+fn install_window_proc(hwnd: isize) -> bool {
+    if hwnd == 0 {
+        return false;
     }
-    unsafe {
-        if SetWindowSubclass(hwnd.null(), Some(tray_proc), SUBCLASS_ID, 0) == 0 {
-            PROC_INSTALLED.store(false, Ordering::SeqCst);
+    #[cfg(test)]
+    {
+        // Tests never call the real `SetWindowSubclass`.
+        return true;
+    }
+    #[cfg(not(test))]
+    {
+        if PROC_INSTALLED.swap(true, Ordering::SeqCst) {
+            return true;
         }
+        unsafe {
+            if SetWindowSubclass(hwnd.null(), Some(tray_proc), SUBCLASS_ID, 0) == 0 {
+                PROC_INSTALLED.store(false, Ordering::SeqCst);
+                return false;
+            }
+        }
+        true
     }
 }
 
 #[cfg(not(windows))]
-fn install_window_proc(_hwnd: isize) {}
+fn install_window_proc(_hwnd: isize) -> bool {
+    false
+}
+
+/// Register the permanent icon only when the window procedure is live. On a
+/// failure any stale icon is removed as well, so `is_registered` stays false
+/// and the close hook reports the error instead of hiding.
+#[cfg(windows)]
+fn register_tray_after_proc(tray: &mut TrayIcon, hwnd: isize, proc_installed: bool) {
+    if !proc_installed || hwnd == 0 {
+        tray.unregister(hwnd);
+        return;
+    }
+    let _ = tray.register(hwnd);
+}
+
+#[cfg(not(windows))]
+fn register_tray_after_proc(_tray: &mut crate::notifications::TrayIcon, _hwnd: isize, _ok: bool) {}
 
 #[cfg(windows)]
 fn taskbar_created_message() -> u32 {
@@ -373,13 +447,16 @@ unsafe extern "system" fn tray_proc(
     _data: usize,
 ) -> isize {
     if msg == TRAY_CALLBACK_MESSAGE {
-        match (lparam as usize) & 0xffff {
-            WM_RBUTTONUP | WM_CONTEXTMENU => unsafe { show_menu(hwnd) },
-            _ => {
-                if let Some(action) = callback_action(lparam) {
-                    post(action);
-                }
-            }
+        // Version 4 keeps the notification code in the low word of `lParam`
+        // and carries the screen point in `wParam`; older shell versions send
+        // `WM_RBUTTONUP` with no point, so `GetCursorPos` remains the fallback.
+        let code = (lparam as usize) & 0xffff;
+        if code == WM_CONTEXTMENU {
+            unsafe { show_menu(hwnd, Some(point_from_wparam(wparam))) };
+        } else if code == WM_RBUTTONUP {
+            unsafe { show_menu(hwnd, None) };
+        } else if let Some(action) = callback_action(lparam) {
+            post(action);
         }
         return 0;
     }
@@ -399,8 +476,17 @@ unsafe extern "system" fn tray_proc(
     unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) }
 }
 
+/// Screen point packed into `wParam` by shell notification version 4:
+/// `LOWORD` is x, `HIWORD` is y, both signed 16-bit values.
 #[cfg(windows)]
-unsafe fn show_menu(hwnd: *mut core::ffi::c_void) {
+fn point_from_wparam(wparam: usize) -> (i32, i32) {
+    let x = (wparam & 0xffff) as u16 as i16 as i32;
+    let y = ((wparam >> 16) & 0xffff) as u16 as i16 as i32;
+    (x, y)
+}
+
+#[cfg(windows)]
+unsafe fn show_menu(hwnd: *mut core::ffi::c_void, requested: Option<(i32, i32)>) {
     if MENU_ACTIVE.swap(true, Ordering::SeqCst) {
         // TrackPopupMenu dispatches messages; never open a nested menu from
         // inside the previous one.
@@ -418,7 +504,12 @@ unsafe fn show_menu(hwnd: *mut core::ffi::c_void) {
         let _ = AppendMenuW(menu, 0x800, 0, std::ptr::null()); // MF_SEPARATOR
         let _ = AppendMenuW(menu, 0, MENU_EXIT, exit.as_ptr());
         let mut point = Point { x: 0, y: 0 };
-        let _ = GetCursorPos(&mut point);
+        if let Some((x, y)) = requested {
+            point.x = x;
+            point.y = y;
+        } else {
+            let _ = GetCursorPos(&mut point);
+        }
         let _ = SetForegroundWindow(hwnd);
         let command = TrackPopupMenu(
             menu,
@@ -527,5 +618,36 @@ mod tests {
     fn a_tray_icon_type_is_available_for_the_close_decision() {
         let tray = TrayIcon::default();
         assert!(!tray.is_registered());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_failed_window_proc_does_not_register_the_icon() {
+        let mut tray = TrayIcon::default();
+        tray.set_test_add_result(true);
+        register_tray_after_proc(&mut tray, 1, false);
+        assert!(!tray.is_registered());
+        register_tray_after_proc(&mut tray, 1, true);
+        assert!(tray.is_registered());
+    }
+
+    #[test]
+    fn a_visible_active_window_is_not_shown_again() {
+        assert!(!needs_show(false, true));
+        assert!(needs_show(false, false));
+        assert!(needs_show(true, false));
+        assert!(needs_show(true, true));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn version_four_packs_the_screen_point_into_wparam() {
+        assert_eq!(point_from_wparam((300 << 16) | 200), (200, 300));
+        // Negative screen coordinates fit the signed 16-bit halves.
+        assert_eq!(
+            point_from_wparam(((-40_i32 as u16 as usize) << 16) | (-5_i32 as u16 as usize)),
+            (-5, -40)
+        );
+        assert_eq!(point_from_wparam(0), (0, 0));
     }
 }

@@ -73,7 +73,9 @@ impl Voxhold {
         cx: &mut Context<Self>,
     ) {
         let conversation = self.in_conversation();
-        if !window.is_window_active()
+        // `SW_HIDE` leaves `Window::is_window_active` on its last `WM_ACTIVATE`
+        // value, so the tracked flag is the only reliable visibility signal.
+        if !self.window_active
             || self.read_pending
             // The loaded window ends before the live tail. A read mark taken
             // from it would be cumulative up to the old right edge and would

@@ -694,14 +694,31 @@ impl Render for Voxhold {
             );
         }
         if !self.error.is_empty() {
-            chat = chat.child(
-                div()
-                    .px(px(16.))
-                    .pb(px(6.))
-                    .text_size(px(12.))
-                    .text_color(ink(p.danger))
-                    .child(self.error.clone()),
-            );
+            let mut error = div()
+                .px(px(16.))
+                .pb(px(6.))
+                .flex()
+                .items_center()
+                .gap_2()
+                .text_size(px(12.))
+                .text_color(ink(p.danger))
+                .child(self.error.clone());
+            // The tray failure blocks the close button, so it must offer the
+            // same single quit path from the visible banner.
+            if self.tray_exit_offered() {
+                error = error.child(
+                    div()
+                        .id("tray-exit")
+                        .debug_selector(|| "tray-exit".into())
+                        .flex_none()
+                        .font_weight(gpui::FontWeight::BOLD)
+                        .text_color(ink(p.lime))
+                        .cursor_pointer()
+                        .on_click(cx.listener(|s, _, window, cx| s.quit_from_tray(window, cx)))
+                        .child("Выйти из Voxhold"),
+                );
+            }
+            chat = chat.child(error);
         }
         if readable && !thread_active && !voice_room {
             if let Some(attachments) = &self.attachments {

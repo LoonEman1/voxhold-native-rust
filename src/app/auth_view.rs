@@ -49,6 +49,22 @@ impl Voxhold {
                     .child("Повторить вход"),
             );
         }
+        // A failed tray registration blocks the close button on this surface
+        // too; the banner keeps the normal exit available.
+        if self.tray_exit_offered() {
+            row = row.child(
+                div()
+                    .id("auth-tray-exit")
+                    .debug_selector(|| "auth-tray-exit".into())
+                    .flex_none()
+                    .text_size(px(12.))
+                    .font_weight(gpui::FontWeight::BOLD)
+                    .text_color(ink(p.lime))
+                    .cursor_pointer()
+                    .child("Выйти из Voxhold")
+                    .on_click(cx.listener(|s, _, window, cx| s.quit_from_tray(window, cx))),
+            );
+        }
         row.into_any_element()
     }
 

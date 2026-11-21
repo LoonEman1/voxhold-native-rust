@@ -137,11 +137,45 @@ pub(crate) const TRAY_CALLBACK_MESSAGE: u32 = 0x8000 + 145;
 const NIF_MESSAGE: u32 = 0x0000_0001;
 const NIF_ICON: u32 = 0x0000_0002;
 const NIF_TIP: u32 = 0x0000_0004;
+#[cfg_attr(test, allow(dead_code))]
 const NIF_INFO: u32 = 0x0000_0010;
 #[cfg_attr(test, allow(dead_code))]
 const NIM_ADD: u32 = 0;
+#[cfg_attr(test, allow(dead_code))]
 const NIM_MODIFY: u32 = 1;
+#[cfg_attr(test, allow(dead_code))]
 const NIM_DELETE: u32 = 2;
+#[cfg_attr(test, allow(dead_code))]
+const NIM_SETVERSION: u32 = 4;
+/// `NOTIFYICON_VERSION_4`: the shell reports `NIN_SELECT`/`NIN_KEYSELECT` and
+/// puts the icon id in the high word of `lParam` and the screen point in
+/// `wParam`. Without this call keyboard activation never reaches the window.
+#[cfg_attr(test, allow(dead_code))]
+const NOTIFYICON_VERSION_4: u32 = 4;
+
+/// A loaded `HICON`. Resource icons are shared by the system and must never be
+/// destroyed; an icon loaded from `assets/voxhold.ico` belongs to this process
+/// and is released when the cache is replaced or dropped.
+#[cfg(windows)]
+#[derive(Debug)]
+struct IconHandle {
+    handle: isize,
+    /// Tests never destroy icons, so the flag is only read in the real build.
+    #[cfg_attr(test, allow(dead_code))]
+    owned: bool,
+}
+
+#[cfg(windows)]
+impl Drop for IconHandle {
+    fn drop(&mut self) {
+        #[cfg(not(test))]
+        if self.owned && self.handle != 0 {
+            unsafe {
+                DestroyIcon(self.handle as *mut core::ffi::c_void);
+            }
+        }
+    }
+}
 
 /// The permanent Voxhold icon in the Windows notification area.
 ///
@@ -153,11 +187,22 @@ const NIM_DELETE: u32 = 2;
 #[derive(Debug, Default)]
 pub struct TrayIcon {
     registered: bool,
+    /// Loaded once and reused by every `register`/`restore`, so an Explorer
+    /// restart does not leak a new `HICON` and does not touch the disk again.
+    icon: Option<IconHandle>,
     /// Test seam: count and outcome of registration without Shell_NotifyIcon.
     #[cfg(test)]
     test_add_calls: u32,
     #[cfg(test)]
     test_add_result: Option<bool>,
+    #[cfg(test)]
+    test_delete_calls: u32,
+    #[cfg(test)]
+    test_version_calls: u32,
+    #[cfg(test)]
+    test_balloon_calls: u32,
+    #[cfg(test)]
+    test_icon_loads: u32,
 }
 
 #[cfg(windows)]
@@ -172,11 +217,13 @@ impl TrayIcon {
         if hwnd == 0 {
             return Err("Не удалось добавить значок Voxhold в системный трей.".into());
         }
+        let icon = self.icon();
         let mut data = tray_data(hwnd);
-        fill_registration(&mut data);
+        fill_registration(&mut data, icon);
         if !self.add_icon(hwnd, &mut data) {
             return Err("Не удалось добавить значок Voxhold в системный трей.".into());
         }
+        self.apply_version(hwnd);
         self.registered = true;
         Ok(())
     }
@@ -190,11 +237,13 @@ impl TrayIcon {
             return Err("Не удалось восстановить значок Voxhold в системном трее.".into());
         }
         self.registered = false;
+        let icon = self.icon();
         let mut data = tray_data(hwnd);
-        fill_registration(&mut data);
+        fill_registration(&mut data, icon);
         if !self.add_icon(hwnd, &mut data) {
             return Err("Не удалось восстановить значок Voxhold в системном трее.".into());
         }
+        self.apply_version(hwnd);
         self.registered = true;
         Ok(())
     }
@@ -204,13 +253,24 @@ impl TrayIcon {
     pub fn unregister(&mut self, hwnd: isize) {
         let was_registered = self.registered;
         self.registered = false;
+        // A removed icon cannot be reused; an owned file icon is destroyed
+        // here. The resource icon stays shared and needs no cleanup.
+        let icon = self.icon.take();
         if !was_registered || hwnd == 0 {
             return;
         }
-        let mut data = tray_data(hwnd);
-        unsafe {
-            shell_notify_icon(NIM_DELETE, &mut data);
+        #[cfg(test)]
+        {
+            self.test_delete_calls = self.test_delete_calls.saturating_add(1);
         }
+        #[cfg(not(test))]
+        {
+            let mut data = tray_data(hwnd);
+            unsafe {
+                shell_notify_icon(NIM_DELETE, &mut data);
+            }
+        }
+        drop(icon);
     }
 
     pub fn is_registered(&self) -> bool {
@@ -227,25 +287,99 @@ impl TrayIcon {
         if hwnd == 0 {
             return Err("Не удалось показать системное уведомление.".into());
         }
-        let mut data = tray_data(hwnd);
-        data.flags = NIF_INFO;
-        data.callback = TRAY_CALLBACK_MESSAGE;
-        data.info_flags = 1 | 16 | 128; // information, silent, respect quiet time
-        fill(&mut data.title, title);
-        fill(&mut data.info, message);
-        if data.info[0] == 0 {
-            fill(&mut data.info, "Новое сообщение");
+        #[cfg(test)]
+        {
+            let _ = (title, message);
+            self.test_balloon_calls = self.test_balloon_calls.saturating_add(1);
+            return Ok(());
         }
-        if unsafe { shell_notify_icon(NIM_MODIFY, &mut data) } == 0 {
-            return Err("Не удалось показать системное уведомление.".into());
+        #[cfg(not(test))]
+        {
+            let mut data = tray_data(hwnd);
+            data.flags = NIF_INFO;
+            data.callback = TRAY_CALLBACK_MESSAGE;
+            data.info_flags = 1 | 16 | 128; // information, silent, respect quiet time
+            fill(&mut data.title, title);
+            fill(&mut data.info, message);
+            if data.info[0] == 0 {
+                fill(&mut data.info, "Новое сообщение");
+            }
+            if unsafe { shell_notify_icon(NIM_MODIFY, &mut data) } == 0 {
+                return Err("Не удалось показать системное уведомление.".into());
+            }
+            Ok(())
         }
-        Ok(())
     }
 
-    /// Test seam for the close-hook tests outside this module.
+    /// Test seams for the close-hook tests outside this module.
     #[cfg(test)]
     pub(crate) fn set_test_add_result(&mut self, result: bool) {
         self.test_add_result = Some(result);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_delete_calls(&self) -> u32 {
+        self.test_delete_calls
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_version_calls(&self) -> u32 {
+        self.test_version_calls
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_balloon_calls(&self) -> u32 {
+        self.test_balloon_calls
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_icon_loads(&self) -> u32 {
+        self.test_icon_loads
+    }
+
+    /// The icon is loaded once per process and reused after `NIM_DELETE` /
+    /// Explorer restart. A failed load leaves a null handle; the shell then
+    /// uses its own default instead of losing the whole registration.
+    fn icon(&mut self) -> isize {
+        if let Some(icon) = &self.icon {
+            return icon.handle;
+        }
+        #[cfg(test)]
+        {
+            self.test_icon_loads = self.test_icon_loads.saturating_add(1);
+            self.icon = Some(IconHandle {
+                handle: 1,
+                owned: false,
+            });
+            1
+        }
+        #[cfg(not(test))]
+        {
+            let icon = load_tray_icon();
+            let handle = icon.handle;
+            self.icon = Some(icon);
+            handle
+        }
+    }
+
+    /// Version 4 is what makes `NIN_SELECT`/`NIN_KEYSELECT` and the
+    /// `wParam` screen point available to the window procedure. A failure
+    /// keeps the legacy mouse messages working, so the registration stands.
+    fn apply_version(&mut self, hwnd: isize) {
+        #[cfg(test)]
+        {
+            let _ = hwnd;
+            self.test_version_calls = self.test_version_calls.saturating_add(1);
+        }
+        #[cfg(not(test))]
+        {
+            let mut data = tray_data(hwnd);
+            data.callback = TRAY_CALLBACK_MESSAGE;
+            data.timeout_or_version = NOTIFYICON_VERSION_4;
+            unsafe {
+                shell_notify_icon(NIM_SETVERSION, &mut data);
+            }
+        }
     }
 
     /// Update the icon first, then add it. `NIM_MODIFY` succeeds when the icon
@@ -269,10 +403,10 @@ impl TrayIcon {
 }
 
 #[cfg(windows)]
-fn fill_registration(data: &mut NotifyIconData) {
+fn fill_registration(data: &mut NotifyIconData, icon: isize) {
     data.flags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
     data.callback = TRAY_CALLBACK_MESSAGE;
-    data.icon = load_tray_icon();
+    data.icon = icon;
     fill(&mut data.tip, "Voxhold");
 }
 
@@ -344,11 +478,21 @@ fn fill(dst: &mut [u16], text: &str) {
     dst[..length].copy_from_slice(&units[..length]);
 }
 
+#[cfg(all(windows, not(test)))]
+#[link(name = "user32")]
+unsafe extern "system" {
+    fn DestroyIcon(icon: *mut core::ffi::c_void) -> i32;
+}
+
 /// The brand icon for the tray: resource id 1 from the EXE when the icon was
 /// embedded by the build, then `assets/voxhold.ico`, then the stock
 /// application icon so the tray still works before the embedding PR lands.
-#[cfg(windows)]
-fn load_tray_icon() -> isize {
+///
+/// The caller caches the returned handle. Resource icons (`LoadIconW`) are
+/// shared and `owned == false`; a file loaded with `LoadImageW` belongs to this
+/// process and is destroyed by `IconHandle`.
+#[cfg(all(windows, not(test)))]
+fn load_tray_icon() -> IconHandle {
     const IDI_APPLICATION: usize = 32512;
     const IMAGE_ICON: u32 = 1;
     const LR_LOADFROMFILE: u32 = 0x0000_0010;
@@ -373,7 +517,10 @@ fn load_tray_icon() -> isize {
         // MAKEINTRESOURCE(1): the resource id is encoded in the pointer.
         let embedded = LoadIconW(module, 1_usize as *const u16);
         if !embedded.is_null() {
-            return embedded as isize;
+            return IconHandle {
+                handle: embedded as isize,
+                owned: false,
+            };
         }
     }
     if let Some(path) = crate::window_chrome::icon_path() {
@@ -389,14 +536,21 @@ fn load_tray_icon() -> isize {
                 LR_LOADFROMFILE | LR_DEFAULTSIZE,
             );
             if !icon.is_null() {
-                return icon as isize;
+                return IconHandle {
+                    handle: icon as isize,
+                    owned: true,
+                };
             }
         }
     }
-    unsafe { LoadIconW(std::ptr::null_mut(), IDI_APPLICATION as *const u16) as isize }
+    IconHandle {
+        handle: unsafe { LoadIconW(std::ptr::null_mut(), IDI_APPLICATION as *const u16) as isize },
+        owned: false,
+    }
 }
 
 #[cfg(windows)]
+#[cfg_attr(test, allow(dead_code))]
 unsafe fn shell_notify_icon(message: u32, data: &mut NotifyIconData) -> i32 {
     #[link(name = "shell32")]
     unsafe extern "system" {
@@ -527,12 +681,38 @@ mod tests {
         assert!(tray.register(1).is_ok());
         assert!(tray.register(1).is_ok());
         assert_eq!(tray.test_add_calls, 1);
+        assert_eq!(tray.test_version_calls(), 1);
+        assert_eq!(tray.test_icon_loads(), 1);
         assert!(tray.is_registered());
         tray.unregister(1);
         assert!(!tray.is_registered());
+        assert_eq!(tray.test_delete_calls(), 1);
         // NIM_DELETE of a missing icon is not attempted again.
         tray.unregister(1);
         assert_eq!(tray.test_add_calls, 1);
+        assert_eq!(tray.test_delete_calls(), 1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn restore_reuses_the_loaded_icon_and_reapplies_version_four() {
+        let mut tray = TrayIcon::default();
+        tray.test_add_result = Some(true);
+        tray.register(1).unwrap();
+        tray.restore(1).unwrap();
+        tray.restore(1).unwrap();
+        assert_eq!(tray.test_add_calls, 3);
+        assert_eq!(tray.test_icon_loads(), 1);
+        assert_eq!(tray.test_version_calls(), 3);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_balloon_uses_the_test_seam_without_the_shell() {
+        let mut tray = TrayIcon::default();
+        tray.register(1).unwrap();
+        assert!(tray.notification(1, "title", "body").is_ok());
+        assert_eq!(tray.test_balloon_calls, 1);
     }
 
     #[cfg(windows)]

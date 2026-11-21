@@ -3,7 +3,9 @@
 use super::*;
 use crate::settings::{self, RequestToken};
 
-/// Native window handle used by the tray notification adapter.
+/// Native window handle used by the tray notification adapter. Tests replace
+/// it with a fake handle, so it is unreachable in the test build.
+#[cfg_attr(test, allow(dead_code))]
 pub(super) fn hwnd(window: &Window) -> isize {
     #[cfg(windows)]
     {

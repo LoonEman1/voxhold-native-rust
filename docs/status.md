@@ -458,6 +458,8 @@ pending POST переоткрытой ветки, пустую последню�
   дедупликация по ключу Go, повтор после неудачной доставки и сброс при
   отключении. На Windows используется тот же tray-balloon
   `Shell_NotifyIconW`, что и в Go (`NIM_ADD`/`NIM_MODIFY`/`NIM_DELETE`).
+  Постоянная иконка трея, меню и закрытие окна в трей добавлены отдельно
+  в срезе VXTRAY ниже.
 - `src/app/realtime.rs`: `presence.*`, `avatar.updated`,
   `server.member_*`, `notification.message`, `conversation.notification`,
   `conversation.call`, `community.event-reminder` и
@@ -830,3 +832,52 @@ release p50/p95 1/1 мкс. Лимитер восстанавливается с
 - Loopback теперь выполняет настоящий ICE restart через `OfferOptions { ice_restart: true }` (libwebrtc 0.4.0): ufrag меняется, mid остаётся `0`, на re-offer приходит ровно один ответ, кадры продолжают доходить до SFU. Обычный re-offer (`startRecovery`) по-прежнему не меняет ufrag и применённый битрейт.
 - Проверки: `cargo test -p voxhold-media --locked publisher` — 87 passed; `cargo test -p voxhold-media --locked` — 317 passed, 16 ignored, 0 failed; `cargo check --workspace --locked` — успешно (два прежних предупреждения: `recordings_download::id`, `set_allowed_channels`); `cargo fmt --all -- --check`; `scripts/check-file-sizes.ps1 -All` — 329 файлов в лимитах 1000/1200.
 - Не проверено: живой backend/Pion и браузерный зритель, реальный ICE restart на сетевом стенде и обрыв сети. Loopback доказывает поведение libwebrtc в процессе, но не заменяет прогон на настоящем сервере.
+
+## Срез VXTRAY: закрытие в системный трей (21 ноября 2026)
+
+Ветка `codex/tray-close`, база `origin/dev` `b4b1b01`. Исходный коммит
+`7de7964`, затем исправления по независимому ревью.
+
+- Крестик главного окна скрывает существующий HWND (`ShowWindow(SW_HIDE)`),
+  процесс, звонок, трансляция, чат и черновики продолжают работу. Кнопка
+  «Свернуть» не менялась. `src/app/tray.rs` владеет оконной процедурой
+  (`SetWindowSubclass`), меню и решениями hide/show; `src/notifications.rs`
+  владеет постоянной иконкой `TrayIcon`.
+- Иконка не зависит от настройки balloon-уведомлений: выключение уведомлений
+  не удаляет её. `TrayIcon` кэширует `HICON` и загружает его один раз;
+  file-иконка освобождается `DestroyIcon`, resource-иконка не уничтожается.
+  После успешного `NIM_ADD`/`NIM_MODIFY` вызывается
+  `NIM_SETVERSION(NOTIFYICON_VERSION_4)`, поэтому работают
+  `NIN_SELECT`/`NIN_KEYSELECT` и координаты в `wParam`. Левый клик, двойной
+  клик и клавиатурная активация показывают тот же HWND; правое меню
+  (`WM_CONTEXTMENU`) содержит «Открыть Voxhold» и «Выйти из Voxhold».
+- `TaskbarCreated` после перезапуска Проводника перерегистрирует иконку.
+  При неудаче окно возвращается только если оно было скрыто кнопкой
+  (`hidden_to_tray`); видимое окно не активируется и не крадёт фокус.
+- `window_active` — единственный источник истины для «окно видимо и на
+  переднем плане»: `Window::is_window_active()` кэширует `WM_ACTIVATE` и не
+  сбрасывается при `SW_HIDE`. Скрытое окно показывает balloon-уведомления и
+  не ставит read-отметки; PTT освобождается при скрытии.
+- Если трей недоступен, крестик не закрывает процесс: окно остаётся
+  видимым, в существующем баннере показывается ошибка и кнопка «Выйти из
+  Voxhold». Она использует тот же путь выхода, что и меню трея: остановка
+  голоса/медиа/preview, `save_shell`, `voice_settings.flush`, `NIM_DELETE`,
+  флаг `quitting` и `cx.quit()`. Установка обновления идёт через тот же
+  `finish_quit`.
+- Тестовые ветки не вызывают `Shell_NotifyIconW`, `LoadIconW`/`LoadImageW`,
+  `DestroyIcon`, `SetWindowSubclass`, `ShowWindow` и остальные Win32-вызовы:
+  считаются add/delete/version/balloon/icon-load. Покрыты закрытие в трей,
+  ошибка без трея, `quitting`, read при скрытом окне, уведомления скрытого
+  и активного окна, `TaskbarCreated` успех/неудача, возврат только скрытого
+  окна и идемпотентность `show_main_window`.
+- Проверки: `cargo metadata --no-deps --format-version 1` даёт
+  `target_directory = C:/vxt` без переопределений; `cargo check --workspace
+  --locked` успешен (два прежних предупреждения — `recordings_download::id` и
+  `search::set_allowed_channels`); `cargo test --locked --bin
+  voxhold-native-rust` — 744 passed, 1 ignored, 0 failed; `cargo fmt --all --
+  --check`; `scripts/check-file-sizes.ps1 -All` — 369 файлов в лимитах
+  1000/1200.
+
+Не проверено вручную: реальное скрытие/показ HWND, клавиатурная активация
+через version 4, контекстное меню, перезапуск Проводника и выход на рабочем
+столе Windows.

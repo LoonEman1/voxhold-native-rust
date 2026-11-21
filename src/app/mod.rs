@@ -117,7 +117,7 @@ use ui::{icon, ink};
 /// (id, body revision, reactions revision, date divider, grouped, unread,
 /// attachment epoch). The last four force a re-measure when only grouping, a
 /// divider or a server-side attachment deletion changes.
-type HistoryKey = (i64, i64, i64, String, bool, bool, u64);
+type HistoryKey = (i64, i64, i64, String, bool, bool, u64, u64);
 
 /// One in-flight send for a chat. The attempt number distinguishes two sends
 /// of the same chat; the abort handle stops the runtime task on logout. The

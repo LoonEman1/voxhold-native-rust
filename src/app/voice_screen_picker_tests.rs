@@ -440,6 +440,29 @@ async fn the_last_card_is_reachable_by_wheel_and_tab_and_actions_stay_visible(
     );
 }
 
+#[gpui::test]
+async fn tab_reaches_the_actions_after_a_long_source_list(cx: &mut TestAppContext) {
+    let (mut visual, _view, voice) = super::voice_tests::fixture_with(cx, Some(1400.), true);
+    let sources = (1..=40)
+        .map(|id| monitor(id, "Экран", 1920, 1080))
+        .collect();
+    open_picker_with(&mut visual, &voice, SourceKind::Monitor, sources);
+    for _ in 0..42 {
+        visual.simulate_keystrokes("tab");
+    }
+    assert_eq!(
+        super::voice_screen_tests::focused(&mut visual, &voice).as_deref(),
+        Some("Source(monitor:40)")
+    );
+    for _ in 0..24 {
+        visual.simulate_keystrokes("tab");
+        if super::voice_screen_tests::focused(&mut visual, &voice).as_deref() == Some("Start") {
+            return;
+        }
+    }
+    panic!("Tab never reached the start action");
+}
+
 /// P03: a scrolling grid paints a real bar from the scroll handle, inside the
 /// viewport. Reserving `scrollbar_width` alone would leave a blank 8 px strip
 /// and let the cards run under the painted thumb.

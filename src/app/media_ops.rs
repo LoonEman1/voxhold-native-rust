@@ -214,7 +214,7 @@ impl Voxhold {
     ) {
         let now = Instant::now();
         if self.media.thumb_ready(&key)
-            || self.media.thumb_building.contains(&key)
+            || self.media.thumb_building.contains_key(&key)
             || self.media.thumb_waiting.contains(&key)
             || self.media.thumb_blocked(&key.id, now)
             || self.media.is_purged(&key.id)
@@ -251,13 +251,7 @@ impl Voxhold {
         cx.spawn_in(window, async move |this, window| {
             let result = task.await;
             let _ = this.update_in(window, |s, window, cx| {
-                // Only the load that still owns the marker may free the slot
-                // and drop the waiting buckets. A late answer from a load
-                // superseded by an access reset leaves the newer marker alone;
-                // the access/purge guard below then discards its payload.
-                s.media.finish_thumb_load(&id, load);
-                if s.thumbnail_stale(access, &id) {
-                    cx.notify();
+                if !s.media.finish_thumb_load(&id, load) || s.thumbnail_stale(access, &id) {
                     return;
                 }
                 match result {
@@ -291,19 +285,18 @@ impl Voxhold {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.media.thumb_ready(&key) || self.media.thumb_building.contains(&key) {
+        if self.media.thumb_ready(&key) || self.media.thumb_building.contains_key(&key) {
             return;
         }
         let access = self.access_generation;
         let id = key.id.clone();
         let (width, height) = (key.width, key.height);
-        self.media.thumb_building.insert(key.clone());
+        let build = self.media.begin_thumb_build(&key);
         let task = cx.background_spawn(async move { thumbnail_frame(&source, width, height) });
         cx.spawn_in(window, async move |this, window| {
             let (frame, bytes) = task.await;
             let _ = this.update_in(window, |s, window, cx| {
-                s.media.thumb_building.remove(&key);
-                if s.thumbnail_stale(access, &id) {
+                if !s.media.finish_thumb_build(&key, build) || s.thumbnail_stale(access, &id) {
                     return;
                 }
                 let render = Arc::new(gpui::RenderImage::new(smallvec::smallvec![frame]));

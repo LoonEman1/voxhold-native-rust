@@ -108,8 +108,10 @@ impl VoicePanel {
         let top = area.y + (area.h - height) / 2.0;
 
         let mut ring: Vec<(FocusHandle, ShareKey)> = Vec::new();
-        let row = |panel: &Self, ring: &mut Vec<(FocusHandle, ShareKey)>, key: ShareKey| {
-            let handle = panel.share_focus(ring.len());
+        let mut control_index = 0;
+        let mut row = |panel: &Self, ring: &mut Vec<(FocusHandle, ShareKey)>, key: ShareKey| {
+            let handle = panel.share_focus(control_index);
+            control_index += 1;
             ring.push((handle.clone(), key));
             handle
         };

@@ -317,13 +317,13 @@ pub struct Media {
     /// Monotonic token source for thumbnail downloads. `clear` deliberately
     /// leaves it alone, so an answer from a load started before an access
     /// reset can never match the marker of a newer load of the same id.
-    thumb_load_seq: u64,
+    thumb_request_seq: u64,
     /// Variants a frame asked for while their id was still downloading. They
     /// are dropped from the waiting set when the source arrives and are built
     /// by the redraw, so a splitter drag cannot queue one task per bucket.
     pub thumb_waiting: HashSet<ThumbKey>,
     /// Variants whose local resize is running right now.
-    pub thumb_building: HashSet<ThumbKey>,
+    pub thumb_building: HashMap<ThumbKey, u64>,
     /// `(retry at, already failed once)` per attachment id; a repeated failure
     /// doubles the gate, so every bucket shares one retry decision.
     pub thumb_failures: HashMap<ThumbSourceKey, (Instant, bool)>,
@@ -346,9 +346,9 @@ impl Default for Media {
             thumbs: ImageCache::new(THUMB_BUDGET),
             thumb_sources: ImageCache::new(THUMB_SOURCE_BUDGET),
             thumb_loads: HashMap::new(),
-            thumb_load_seq: 0,
+            thumb_request_seq: 0,
             thumb_waiting: HashSet::new(),
-            thumb_building: HashSet::new(),
+            thumb_building: HashMap::new(),
             thumb_failures: HashMap::new(),
             previews: HashMap::new(),
             preview_order: VecDeque::new(),
@@ -426,8 +426,7 @@ impl Media {
     /// a concurrency slot is free, so this only advances the token and records
     /// the marker.
     pub fn begin_thumb_load(&mut self, key: &ThumbKey) -> u64 {
-        self.thumb_load_seq = self.thumb_load_seq.wrapping_add(1);
-        let token = self.thumb_load_seq;
+        let token = self.next_thumb_request();
         self.thumb_loads
             .insert(ThumbSourceKey(key.id.clone()), token);
         token
@@ -435,9 +434,8 @@ impl Media {
 
     /// Retire a finished download. The in-flight marker and every waiting
     /// bucket of the id are cleared only while `token` is still the current
-    /// load; a late answer from a superseded load reports `false` and leaves
-    /// the newer load's marker and waiting set untouched. Whether its payload
-    /// may be installed is still decided by the access/purge guard.
+    /// load. A superseded load leaves the newer markers untouched and must
+    /// discard its payload.
     pub fn finish_thumb_load(&mut self, id: &str, token: u64) -> bool {
         let key = ThumbSourceKey(id.to_string());
         if self.thumb_loads.get(&key).copied() != Some(token) {
@@ -446,6 +444,25 @@ impl Media {
         self.thumb_loads.remove(&key);
         self.thumb_waiting.retain(|key| key.id != id);
         true
+    }
+
+    pub fn begin_thumb_build(&mut self, key: &ThumbKey) -> u64 {
+        let token = self.next_thumb_request();
+        self.thumb_building.insert(key.clone(), token);
+        token
+    }
+
+    pub fn finish_thumb_build(&mut self, key: &ThumbKey, token: u64) -> bool {
+        if self.thumb_building.get(key).copied() != Some(token) {
+            return false;
+        }
+        self.thumb_building.remove(key);
+        true
+    }
+
+    fn next_thumb_request(&mut self) -> u64 {
+        self.thumb_request_seq = self.thumb_request_seq.wrapping_add(1);
+        self.thumb_request_seq
     }
 
     pub fn thumb_ready(&mut self, key: &ThumbKey) -> bool {
@@ -478,7 +495,7 @@ impl Media {
         drop(self.thumb_sources.remove_matching(|key| key.0 == id));
         self.thumb_loads.remove(&ThumbSourceKey(id.to_string()));
         self.thumb_waiting.retain(|key| key.id != id);
-        self.thumb_building.retain(|key| key.id != id);
+        self.thumb_building.retain(|key, _| key.id != id);
         self.thumb_failures.remove(&ThumbSourceKey(id.to_string()));
         let evicted = self.remember_purged(id);
         (images, evicted)

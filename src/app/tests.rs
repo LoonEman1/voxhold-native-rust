@@ -299,6 +299,50 @@ async fn snapshot_keeps_newer_ws_state_and_discards_absent_old_rows(cx: &mut Tes
 }
 
 #[gpui::test]
+async fn an_equal_revision_refresh_replaces_the_prepared_history_row(cx: &mut TestAppContext) {
+    cx.update(|cx| gpui_component::init(cx));
+    let (window, view) = add_auth_window(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            v.client = Some(Client::new("http://127.0.0.1:1").unwrap());
+            v.server = 1;
+            v.channel = 7;
+            v.channels.push(Channel {
+                id: 7,
+                kind: "text".into(),
+                permissions: 1,
+                ..Default::default()
+            });
+            v.apply_realtime_event("message.created", &message_json(1, 1, "first"));
+            v.apply_realtime_event("message.created", &message_json(2, 1, "second"));
+            cx.notify();
+        });
+        window.draw(app).clear();
+
+        let (before, unchanged) = {
+            let v = view.read(app);
+            assert_eq!(v.history_rows.row(0).unwrap().message.content, "first");
+            (v.history_keys[0].clone(), v.history_keys[1].clone())
+        };
+
+        view.update(app, |v, cx| {
+            v.apply_realtime_event("message.updated", &message_json(1, 1, "updated"));
+            cx.notify();
+        });
+        window.draw(app).clear();
+
+        let v = view.read(app);
+        assert_eq!(v.history_rows.row(0).unwrap().message.content, "updated");
+        assert_ne!(
+            v.history_keys[0], before,
+            "the changed row is measured again"
+        );
+        assert_eq!(v.history_keys[1], unchanged);
+    });
+}
+
+#[gpui::test]
 async fn painted_history_at_tail_reports_latest_row(cx: &mut TestAppContext) {
     cx.update(|cx| gpui_component::init(cx));
     let (window, view) = add_auth_window(cx);

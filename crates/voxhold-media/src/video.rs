@@ -395,6 +395,37 @@ mod tests {
     }
 
     #[test]
+    fn a_rejected_read_is_not_a_conversion() {
+        let store = VideoStore::default();
+        assert!(store.publish_i420(I420Buffer::new_black(320, 180)));
+        let mut request = VideoRead {
+            viewport_width: 160,
+            viewport_height: 90,
+            ..VideoRead::default()
+        };
+        // A surface one pixel row short cannot receive the fitted picture: the
+        // read is refused with the required length and nothing is converted.
+        let len = (160 * 90 * 4) as isize;
+        let mut short = vec![0; len as usize - 4];
+        assert_eq!(store.read(&mut request, &mut short), -len);
+        assert_eq!(
+            store.conversions(),
+            0,
+            "a rejected read is not a conversion"
+        );
+        assert_eq!(
+            (request.width, request.height),
+            (0, 0),
+            "no frame was claimed"
+        );
+        // The same picture in a surface of the right size is converted once,
+        // and only then does the counter move.
+        let mut output = vec![0; len as usize];
+        assert_eq!(store.read(&mut request, &mut output), len);
+        assert_eq!(store.conversions(), 1);
+    }
+
+    #[test]
     fn a_viewport_change_re_reads_the_static_frame_at_the_fitted_size() {
         let store = VideoStore::default();
         assert!(store.publish_i420(I420Buffer::new_black(320, 180)));

@@ -756,8 +756,9 @@ async fn run(
         }
         None => (None, None),
     };
-    // The codec is pinned by the backend's `SetCodecPreferences`; the answer
-    // selects the first common payload. The picker offers only verified codecs.
+    // The picker offers the codecs the capability probe reports as available.
+    // Applying `request.codec` through the sender's codec preferences and
+    // confirming it from frames and stats is the next slice (C03).
     let _ = request.codec;
 
     let pump = tokio::spawn(frame_loop(

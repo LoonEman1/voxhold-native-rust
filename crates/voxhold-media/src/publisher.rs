@@ -43,9 +43,8 @@ pub const SDR_RENDITION: &str = "sdr";
 /// picker, the request path and the viewer tests share one model.
 mod codec;
 pub use codec::{
-    Codec, CodecAvailability, CodecIntent, CodecProbe, CodecRejection, CodecRole, CodecSnapshot,
-    H264Baseline, ProfileRejection, SdrProfile, VideoCodecCapability, parse_fmtp, sdr_compatible,
-    sdr_profile,
+    Codec, CodecAvailability, CodecIntent, CodecRejection, CodecRole, CodecSnapshot, H264Baseline,
+    ProfileRejection, SdrProfile, VideoCodecCapability, parse_fmtp, sdr_compatible, sdr_profile,
 };
 
 mod bitrate;

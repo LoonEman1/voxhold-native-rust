@@ -207,6 +207,10 @@ pub struct VoicePanel {
     /// not decide whether a keyboard-path test can run.
     #[cfg(test)]
     test_share_gate: Option<Result<(), &'static str>>,
+    /// Test-only codec refusal, so the dialog's unavailable line can be painted
+    /// on a build whose probe finds all four codecs.
+    #[cfg(test)]
+    test_codec_error: Option<String>,
     /// Test-only replacement for the blocking endpoint probe. It runs on the
     /// same background task as the real one.
     #[cfg(test)]
@@ -350,6 +354,8 @@ impl VoicePanel {
             palette: crate::theme::dark_palette(),
             #[cfg(test)]
             test_share_gate: None,
+            #[cfg(test)]
+            test_codec_error: None,
             #[cfg(test)]
             test_audio_probe: None,
             #[cfg(test)]

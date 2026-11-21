@@ -2,7 +2,7 @@
 //! production file stays small and the seam is obviously not part of the UI.
 
 use super::*;
-use voxhold_media::publisher::{Confirmed, Sharing};
+use voxhold_media::publisher::{CodecIntent, Confirmed, Sharing};
 use voxhold_media::screen_capture::{
     PreviewFrame, ScreenSource, SourceId, SourceKind, ThumbnailError,
 };
@@ -503,12 +503,17 @@ impl VoicePanel {
         self.test_open_screen_picker(source.clone());
         let mut sharing = sharing;
         // The media layer fills `confirmed` when the attempt goes Live. Tests
-        // that only describe the live snapshot get the same seam here.
+        // that only describe the live snapshot get the same seam here: the
+        // confirmed codec is the one the picker's intent resolves to, never a
+        // fixed substitute for a codec this build may not publish.
         if sharing.confirmed.is_none() {
+            let codec = self
+                .codec_resolution()
+                .expect("the fixture codec must resolve");
             sharing.confirmed = Some(Confirmed {
                 attempt: sharing.attempt,
                 quality: sharing.quality.unwrap_or_default(),
-                codec: voxhold_media::publisher::Codec::Vp8,
+                codec,
                 audio: sharing.has_audio,
                 audio_scope: voxhold_media::system_audio::AudioScope::Device,
                 source,
@@ -620,12 +625,12 @@ impl VoicePanel {
         let mut request = voxhold_media::publisher::PublishRequest {
             source,
             quality: self.screen.quality(),
-            codec: voxhold_media::publisher::CodecSnapshot::current()
-                .resolve(
-                    self.screen.codec,
-                    voxhold_media::publisher::CodecRole::Sender,
-                )
-                .unwrap_or(voxhold_media::publisher::Codec::Vp8),
+            // A failed resolution is a fixture bug: production refuses to
+            // publish instead of substituting another codec, and so must a
+            // test that describes the same request.
+            codec: self
+                .codec_resolution()
+                .expect("the fixture codec must resolve"),
             audio: self.screen.audio_requested(),
             audio_scope: self.screen.audio_scope,
         };
@@ -640,6 +645,18 @@ impl VoicePanel {
             .unwrap_or(request.source.kind);
         request.audio_scope = self.screen.effective_audio_scope(kind);
         request
+    }
+
+    /// The codec intent the dialog shows: Auto on a fresh picker, the concrete
+    /// confirmed codec on a restart.
+    pub fn test_screen_codec_intent(&self) -> CodecIntent {
+        self.screen.codec
+    }
+
+    /// Model an unavailable codec without depending on the host build's probe,
+    /// so the dialog's refusal line is paintable in a UI test.
+    pub fn test_set_codec_error(&mut self, reason: &str) {
+        self.test_codec_error = Some(reason.to_owned());
     }
 
     /// The on-air sound line the card paints.

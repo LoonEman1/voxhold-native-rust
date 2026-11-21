@@ -126,6 +126,51 @@ fn auto_skips_unavailable_codecs_in_web_order() {
 }
 
 #[test]
+fn auto_skips_an_encoder_whose_sender_profile_is_not_sdr() {
+    // The build has an H.264 encoder, but the sender side declares only the
+    // Main profile: an encoder alone does not make a publishable SDR codec.
+    let probe = CodecProbe {
+        encoders: Codec::ALL.to_vec(),
+        sender: vec![
+            VideoCodecCapability::new(Codec::H264, 90_000, Some(H264_MAIN)),
+            capability(Codec::Vp8),
+        ],
+        receiver: all_capabilities(),
+    };
+    let snapshot = snapshot_of(&probe);
+    assert!(
+        snapshot
+            .resolve(CodecIntent::Explicit(Codec::H264), CodecRole::Sender)
+            .is_err(),
+        "H.264 has an encoder but no SDR sender profile"
+    );
+    assert_eq!(
+        snapshot.resolve(CodecIntent::Auto, CodecRole::Sender),
+        Ok(Codec::Vp8),
+        "Auto moves past H.264 to the next codec in the web order"
+    );
+    assert_eq!(
+        snapshot.resolve(CodecIntent::Auto, CodecRole::Receiver),
+        Ok(Codec::H264),
+        "the receiver side still lists H.264"
+    );
+}
+
+#[test]
+fn every_probe_moves_the_generation_forward() {
+    let first = CodecSnapshot::probe();
+    let second = CodecSnapshot::probe();
+    assert!(first.generation() >= 1, "a probe starts a generation");
+    assert!(
+        second.generation() > first.generation(),
+        "a second probe must not reuse the previous generation: {} then {}",
+        first.generation(),
+        second.generation()
+    );
+    assert!(CodecSnapshot::current().generation() >= 1);
+}
+
+#[test]
 fn an_empty_sender_refuses_auto_and_every_explicit_codec() {
     let empty = CodecProbe {
         encoders: Vec::new(),
@@ -138,10 +183,9 @@ fn an_empty_sender_refuses_auto_and_every_explicit_codec() {
         .resolve(CodecIntent::Auto, CodecRole::Sender)
         .expect_err("an empty sender cannot publish");
     assert_eq!(error.codec(), None);
-    assert!(
-        error.reason().contains("нет доступного"),
-        "{}",
-        error.reason()
+    assert_eq!(
+        error.reason(),
+        "В этой сборке нет доступного SDR-кодека для публикации."
     );
     for codec in Codec::ALL {
         let error = snapshot
@@ -359,6 +403,35 @@ fn h264_fmtp_ignores_case_order_spaces_and_the_level_byte() {
         ),
         Err(ProfileRejection::H264Malformed(_))
     ));
+}
+
+#[test]
+fn a_repeated_fmtp_key_keeps_the_last_value() {
+    // The parser keeps the last occurrence of a repeated key, while the pinned
+    // backend reads the first one. Browsers emit every FMTP parameter once in a
+    // normal SDP, so the two readings only differ on input outside the relay
+    // contract; this fixture pins the local choice instead of leaving it
+    // implicit.
+    assert_eq!(
+        sdr_profile(
+            Codec::H264,
+            Some("packetization-mode=1;profile-level-id=42e01f;profile-level-id=42001f"),
+        ),
+        Ok(SdrProfile::H264 {
+            baseline: H264Baseline::Legacy,
+            level: 31
+        })
+    );
+    assert_eq!(
+        parse_fmtp(Some("PROFILE-ID = 0; profile-id=2"))
+            .get("profile-id")
+            .map(String::as_str),
+        Some("2")
+    );
+    assert_eq!(
+        sdr_profile(Codec::Vp9, Some("profile-id=2;profile-id=0")),
+        Ok(SdrProfile::Vp9)
+    );
 }
 
 #[test]

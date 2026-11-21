@@ -130,52 +130,150 @@ impl NotificationCenter {
     }
 }
 
-/// One tray icon per process; `Shell_NotifyIconW` updates it in place.
+/// Callback message the window procedure receives from `Shell_NotifyIconW`.
+/// It sits in the `WM_APP` range so it cannot collide with a system message.
+pub(crate) const TRAY_CALLBACK_MESSAGE: u32 = 0x8000 + 145;
+
+const NIF_MESSAGE: u32 = 0x0000_0001;
+const NIF_ICON: u32 = 0x0000_0002;
+const NIF_TIP: u32 = 0x0000_0004;
+const NIF_INFO: u32 = 0x0000_0010;
+#[cfg_attr(test, allow(dead_code))]
+const NIM_ADD: u32 = 0;
+const NIM_MODIFY: u32 = 1;
+const NIM_DELETE: u32 = 2;
+
+/// The permanent Voxhold icon in the Windows notification area.
+///
+/// Registration is independent from balloon notifications: turning the
+/// preference off only stops `notification` from being called, it never removes
+/// the icon. The icon is registered once per window and survives as long as the
+/// process does, except for an Explorer restart, which needs `restore`.
 #[cfg(windows)]
 #[derive(Debug, Default)]
-pub struct Tray {
-    added: bool,
+pub struct TrayIcon {
+    registered: bool,
+    /// Test seam: count and outcome of registration without Shell_NotifyIcon.
+    #[cfg(test)]
+    test_add_calls: u32,
+    #[cfg(test)]
+    test_add_result: Option<bool>,
 }
 
 #[cfg(windows)]
-impl Tray {
-    pub fn show(&mut self, hwnd: isize, title: &str, message: &str) -> Result<(), String> {
+impl TrayIcon {
+    /// Add the icon for `hwnd`. Idempotent: a second call while the icon is
+    /// registered is a no-op. A zero handle is reported instead of silently
+    /// pretending that the tray works.
+    pub fn register(&mut self, hwnd: isize) -> Result<(), String> {
+        if self.registered {
+            return Ok(());
+        }
+        if hwnd == 0 {
+            return Err("Не удалось добавить значок Voxhold в системный трей.".into());
+        }
+        let mut data = tray_data(hwnd);
+        fill_registration(&mut data);
+        if !self.add_icon(hwnd, &mut data) {
+            return Err("Не удалось добавить значок Voxhold в системный трей.".into());
+        }
+        self.registered = true;
+        Ok(())
+    }
+
+    /// Re-add the icon after Explorer restarted. Unlike `register`, this always
+    /// talks to the shell because the previous registration was lost with the
+    /// old taskbar window.
+    pub fn restore(&mut self, hwnd: isize) -> Result<(), String> {
+        if hwnd == 0 {
+            self.registered = false;
+            return Err("Не удалось восстановить значок Voxhold в системном трее.".into());
+        }
+        self.registered = false;
+        let mut data = tray_data(hwnd);
+        fill_registration(&mut data);
+        if !self.add_icon(hwnd, &mut data) {
+            return Err("Не удалось восстановить значок Voxhold в системном трее.".into());
+        }
+        self.registered = true;
+        Ok(())
+    }
+
+    /// Remove the icon with `NIM_DELETE`. Safe to call twice and on a zero
+    /// handle; used by the single quit path before `cx.quit()`.
+    pub fn unregister(&mut self, hwnd: isize) {
+        let was_registered = self.registered;
+        self.registered = false;
+        if !was_registered || hwnd == 0 {
+            return;
+        }
+        let mut data = tray_data(hwnd);
+        unsafe {
+            shell_notify_icon(NIM_DELETE, &mut data);
+        }
+    }
+
+    pub fn is_registered(&self) -> bool {
+        self.registered
+    }
+
+    /// Show a balloon through the already registered icon (`NIF_INFO` +
+    /// `NIM_MODIFY`). If the icon is missing, it is registered first; the
+    /// notification never deletes it afterwards.
+    pub fn notification(&mut self, hwnd: isize, title: &str, message: &str) -> Result<(), String> {
+        if !self.registered {
+            self.register(hwnd)?;
+        }
         if hwnd == 0 {
             return Err("Не удалось показать системное уведомление.".into());
         }
         let mut data = tray_data(hwnd);
-        data.flags = 1 | 2 | 4 | 16; // callback, icon, tooltip, notification
-        data.callback = 0x8000 + 145;
-        data.icon = load_default_icon();
+        data.flags = NIF_INFO;
+        data.callback = TRAY_CALLBACK_MESSAGE;
         data.info_flags = 1 | 16 | 128; // information, silent, respect quiet time
-        fill(&mut data.tip, "Voxhold");
         fill(&mut data.title, title);
         fill(&mut data.info, message);
         if data.info[0] == 0 {
             fill(&mut data.info, "Новое сообщение");
         }
-        let ok = unsafe { shell_notify_icon(1, &mut data) } != 0; // NIM_MODIFY
-        let ok = ok || unsafe { shell_notify_icon(0, &mut data) } != 0; // NIM_ADD
-        if !ok {
+        if unsafe { shell_notify_icon(NIM_MODIFY, &mut data) } == 0 {
             return Err("Не удалось показать системное уведомление.".into());
         }
-        self.added = true;
         Ok(())
     }
 
-    pub fn clear(&mut self, hwnd: isize) {
-        if !self.added {
-            return;
+    /// Test seam for the close-hook tests outside this module.
+    #[cfg(test)]
+    pub(crate) fn set_test_add_result(&mut self, result: bool) {
+        self.test_add_result = Some(result);
+    }
+
+    /// Update the icon first, then add it. `NIM_MODIFY` succeeds when the icon
+    /// survived (a repeated registration), while a real Explorer restart lost
+    /// it and needs `NIM_ADD`.
+    fn add_icon(&mut self, hwnd: isize, data: &mut NotifyIconData) -> bool {
+        #[cfg(test)]
+        {
+            let _ = (hwnd, data);
+            self.test_add_calls = self.test_add_calls.saturating_add(1);
+            self.test_add_result.unwrap_or(true)
         }
-        self.added = false;
-        if hwnd == 0 {
-            return;
-        }
-        let mut data = tray_data(hwnd);
-        unsafe {
-            shell_notify_icon(2, &mut data); // NIM_DELETE
+        #[cfg(not(test))]
+        {
+            let _ = hwnd;
+            unsafe {
+                shell_notify_icon(NIM_MODIFY, data) != 0 || shell_notify_icon(NIM_ADD, data) != 0
+            }
         }
     }
+}
+
+#[cfg(windows)]
+fn fill_registration(data: &mut NotifyIconData) {
+    data.flags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+    data.callback = TRAY_CALLBACK_MESSAGE;
+    data.icon = load_tray_icon();
+    fill(&mut data.tip, "Voxhold");
 }
 
 #[cfg(windows)]
@@ -246,14 +344,56 @@ fn fill(dst: &mut [u16], text: &str) {
     dst[..length].copy_from_slice(&units[..length]);
 }
 
+/// The brand icon for the tray: resource id 1 from the EXE when the icon was
+/// embedded by the build, then `assets/voxhold.ico`, then the stock
+/// application icon so the tray still works before the embedding PR lands.
 #[cfg(windows)]
-fn load_default_icon() -> isize {
+fn load_tray_icon() -> isize {
     const IDI_APPLICATION: usize = 32512;
+    const IMAGE_ICON: u32 = 1;
+    const LR_LOADFROMFILE: u32 = 0x0000_0010;
+    const LR_DEFAULTSIZE: u32 = 0x0000_0040;
+
     #[link(name = "user32")]
     unsafe extern "system" {
-        fn LoadIconW(instance: isize, name: usize) -> isize;
+        fn GetModuleHandleW(name: *const u16) -> *mut core::ffi::c_void;
+        fn LoadIconW(instance: *mut core::ffi::c_void, name: *const u16) -> *mut core::ffi::c_void;
+        fn LoadImageW(
+            instance: *mut core::ffi::c_void,
+            name: *const u16,
+            kind: u32,
+            width: i32,
+            height: i32,
+            flags: u32,
+        ) -> *mut core::ffi::c_void;
     }
-    unsafe { LoadIconW(0, IDI_APPLICATION) }
+
+    unsafe {
+        let module = GetModuleHandleW(std::ptr::null());
+        // MAKEINTRESOURCE(1): the resource id is encoded in the pointer.
+        let embedded = LoadIconW(module, 1_usize as *const u16);
+        if !embedded.is_null() {
+            return embedded as isize;
+        }
+    }
+    if let Some(path) = crate::window_chrome::icon_path() {
+        use std::os::windows::ffi::OsStrExt;
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+        unsafe {
+            let icon = LoadImageW(
+                std::ptr::null_mut(),
+                wide.as_ptr(),
+                IMAGE_ICON,
+                0,
+                0,
+                LR_LOADFROMFILE | LR_DEFAULTSIZE,
+            );
+            if !icon.is_null() {
+                return icon as isize;
+            }
+        }
+    }
+    unsafe { LoadIconW(std::ptr::null_mut(), IDI_APPLICATION as *const u16) as isize }
 }
 
 #[cfg(windows)]
@@ -267,15 +407,36 @@ unsafe fn shell_notify_icon(message: u32, data: &mut NotifyIconData) -> i32 {
 
 #[cfg(not(windows))]
 #[derive(Debug, Default)]
-pub struct Tray;
+pub struct TrayIcon {
+    registered: bool,
+}
 
 #[cfg(not(windows))]
-impl Tray {
-    pub fn show(&mut self, _hwnd: isize, _title: &str, _message: &str) -> Result<(), String> {
-        Err("Системные уведомления доступны в версии для Windows.".into())
+impl TrayIcon {
+    pub fn register(&mut self, _hwnd: isize) -> Result<(), String> {
+        Err("Системный трей доступен в версии для Windows.".into())
     }
 
-    pub fn clear(&mut self, _hwnd: isize) {}
+    pub fn restore(&mut self, _hwnd: isize) -> Result<(), String> {
+        Err("Системный трей доступен в версии для Windows.".into())
+    }
+
+    pub fn unregister(&mut self, _hwnd: isize) {
+        self.registered = false;
+    }
+
+    pub fn is_registered(&self) -> bool {
+        self.registered
+    }
+
+    pub fn notification(
+        &mut self,
+        _hwnd: isize,
+        _title: &str,
+        _message: &str,
+    ) -> Result<(), String> {
+        Err("Системные уведомления доступны в версии для Windows.".into())
+    }
 }
 
 #[cfg(test)]
@@ -356,6 +517,46 @@ mod tests {
             .offer("notification.message", &message(4, "neva"), "owner", false)
             .is_some());
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn tray_registration_is_idempotent_and_removal_is_safe() {
+        let mut tray = TrayIcon::default();
+        tray.test_add_result = Some(true);
+        assert!(tray.register(1).is_ok());
+        assert!(tray.register(1).is_ok());
+        assert_eq!(tray.test_add_calls, 1);
+        assert!(tray.is_registered());
+        tray.unregister(1);
+        assert!(!tray.is_registered());
+        // NIM_DELETE of a missing icon is not attempted again.
+        tray.unregister(1);
+        assert_eq!(tray.test_add_calls, 1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_failed_restore_leaves_the_icon_unregistered() {
+        let mut tray = TrayIcon::default();
+        tray.test_add_result = Some(true);
+        assert!(tray.register(1).is_ok());
+        tray.test_add_result = Some(false);
+        assert!(tray.restore(1).is_err());
+        assert!(!tray.is_registered());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn disabling_notifications_does_not_remove_the_icon() {
+        let mut tray = TrayIcon::default();
+        tray.test_add_result = Some(true);
+        tray.register(1).unwrap();
+        let mut center = NotificationCenter::default();
+        assert!(center.set_enabled(true));
+        assert!(center.set_enabled(false));
+        assert!(!center.enabled);
+        assert!(tray.is_registered());
     }
 
     #[test]

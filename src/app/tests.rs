@@ -995,6 +995,7 @@ mod o05_history;
 mod r04;
 mod remember_tests;
 mod review;
+mod tray_tests;
 mod w08a;
 mod w08a_p2;
 mod w08a_p2_b;

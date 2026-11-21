@@ -57,6 +57,7 @@ mod shell_view;
 mod tests;
 mod theme_ops;
 mod thread_ops;
+mod tray;
 pub(crate) mod ui;
 mod update_install;
 #[cfg(test)]
@@ -362,7 +363,15 @@ pub(crate) struct Voxhold {
     #[cfg(feature = "voxhold-media")]
     stream_preferences: crate::voice_panel::StreamPrefsStore,
     notifications: crate::notifications::NotificationCenter,
-    notification_tray: crate::notifications::Tray,
+    /// The permanent notification-area icon. Balloon preferences never remove
+    /// it; only the single quit path does.
+    notification_tray: crate::notifications::TrayIcon,
+    /// One long-lived task draining `TrayAction` values from the subclass. It
+    /// waits on the channel; there is no polling timer.
+    tray_task: Option<gpui::Task<()>>,
+    /// A real process exit is in progress (`cx.quit()` or the update helper).
+    /// The close hook must return `true` instead of hiding the window.
+    quitting: bool,
     active_settings: Option<SettingsKind>,
     settings_return_focus: Option<FocusHandle>,
     settings_ring: Vec<(FocusHandle, Option<SettingsAct>)>,
@@ -806,7 +815,9 @@ impl Voxhold {
             #[cfg(feature = "voxhold-media")]
             stream_preferences,
             notifications: crate::notifications::NotificationCenter::with_path(notification_path),
-            notification_tray: crate::notifications::Tray::default(),
+            notification_tray: crate::notifications::TrayIcon::default(),
+            tray_task: None,
+            quitting: false,
             active_settings: None,
             settings_return_focus: None,
             settings_ring: Vec::new(),
@@ -957,6 +968,16 @@ impl Voxhold {
         gpui_component::Theme::global_mut(cx).font_family = theme::UI_FONT.into();
         window_chrome::apply(window, view.palette.light);
         Self::bind_composer_keys(cx);
+        // The GPUI test window is not backed by a platform window, so the
+        // close hook is installed only in the shipped application. The same
+        // guard is used by `power.rs` and `window_chrome.rs`.
+        if !cfg!(test) {
+            let weak = cx.entity().downgrade();
+            window.on_window_should_close(cx, move |window, cx| {
+                weak.update(cx, |view, cx| view.should_close_window(window, cx))
+                    .unwrap_or(true)
+            });
+        }
         view
     }
 }

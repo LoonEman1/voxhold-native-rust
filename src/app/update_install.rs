@@ -23,7 +23,9 @@ impl Voxhold {
     }
 
     /// Stop voice, media and preview work and persist the current settings.
-    fn prepare_for_install(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// Also used by the tray's «Выйти из Voxhold» item so both exits share
+    /// one cleanup path.
+    pub(super) fn prepare_for_install(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         #[cfg(feature = "voxhold-media")]
         self.abandon_voice(window, cx);
         self.stop_voice_preview();
@@ -232,7 +234,9 @@ impl Voxhold {
         if !self.update.wait_for_helper_ready {
             self.prepare_for_install(window, cx);
             self.update.quit_requested = true;
-            cx.quit();
+            // The installer exits the process; the tray close hook must not
+            // hide the window instead of letting it go.
+            self.finish_quit(window, cx);
             return;
         }
         // The helper writes the marker after it has relocated, prepared its
@@ -272,7 +276,9 @@ impl Voxhold {
         if ready.is_file() {
             self.prepare_for_install(window, cx);
             self.update.quit_requested = true;
-            cx.quit();
+            // The helper is ready to take over; remove the icon and quit
+            // through the same path as the tray's exit item.
+            self.finish_quit(window, cx);
             return true;
         }
         if expired {

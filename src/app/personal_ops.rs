@@ -631,10 +631,9 @@ impl Voxhold {
             }
             Action::ToggleNotifications => {
                 let enabled = !self.notifications.enabled;
+                // Disabling notifications only stops balloons; the permanent
+                // tray icon and the close-to-tray behaviour stay available.
                 let changed = self.notifications.set_enabled(enabled);
-                if changed && !enabled {
-                    self.notification_tray.clear(hwnd(window));
-                }
                 if let Some(panel) = &mut self.personal {
                     panel.notifications_enabled = self.notifications.enabled;
                     panel.notifications_error = if changed {

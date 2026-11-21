@@ -271,7 +271,7 @@ impl Voxhold {
             return;
         };
         let hwnd = super::personal_ops::hwnd(window);
-        match self.notification_tray.show(hwnd, &title, &body) {
+        match self.notification_tray.notification(hwnd, &title, &body) {
             Ok(()) => self.notifications.shown(&key),
             Err(error) => self.notifications.failed(error),
         }

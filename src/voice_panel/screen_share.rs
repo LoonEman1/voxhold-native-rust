@@ -1020,6 +1020,11 @@ impl VoicePanel {
     /// atlas entry regardless of other owners. It comes from the replacement
     /// running in the poll before the next repaint, so the renderer never
     /// paints a picture whose entry was already dropped.
+    ///
+    /// While no card is painted (Idle, a failed stop, a hidden phase) the
+    /// frame is taken and discarded: the media layer already counted it as
+    /// shown, and a leftover frame must not reappear when the card returns.
+    /// No `RenderImage` is created for it.
     pub(super) fn take_screen_preview(&mut self, window: &mut Window) -> bool {
         let Some(frame) = self
             .handle
@@ -1028,6 +1033,9 @@ impl VoicePanel {
         else {
             return false;
         };
+        if !self.screen_card_active() {
+            return false;
+        }
         let Some(buffer) = image::RgbaImage::from_raw(frame.width, frame.height, frame.bgra) else {
             return false;
         };

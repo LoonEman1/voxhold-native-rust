@@ -16,6 +16,7 @@ impl VoiceHandle {
             frame: Arc::new(Mutex::new(None)),
             capture: Arc::new(CaptureGate::default()),
             screen_preview: Arc::new(crate::screen_capture::PreviewStore::default()),
+            screen_demand: Arc::new(crate::screen_capture::PreviewDemand::default()),
             screen_picker: Arc::new(AtomicU64::new(1)),
             source_generation: Arc::new(AtomicU64::new(1)),
             attempt: ATTEMPT.fetch_add(1, Ordering::SeqCst),
@@ -70,6 +71,24 @@ impl VoiceHandle {
     /// The queued power transition, if the UI forwarded one.
     pub fn take_power_for_tests(&self) -> Option<bool> {
         self.requests.power.lock().ok()?.take()
+    }
+
+    /// Put one preview picture into the shared slot exactly as the publisher
+    /// worker does when the capture attaches it to a frame.
+    pub fn push_screen_preview_for_tests(&self, frame: crate::screen_capture::PreviewFrame) {
+        self.screen_preview.publish(frame);
+    }
+
+    /// The demand this handle shares with the capture thread. A test reads
+    /// `is_enabled`/`width`/counters from it without a worker.
+    pub fn screen_preview_demand_for_tests(&self) -> Arc<crate::screen_capture::PreviewDemand> {
+        self.screen_demand.clone()
+    }
+
+    /// Whether the shared preview slot still holds a picture. Read-only, so a
+    /// test can prove that a discarded frame did not stay in the slot.
+    pub fn screen_preview_pending_for_tests(&self) -> bool {
+        self.screen_preview.bytes() > 0
     }
 
     /// The newest viewport the UI requested. The slot is a last-value cell, so

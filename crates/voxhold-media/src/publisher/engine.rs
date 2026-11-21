@@ -48,7 +48,8 @@ use crate::{
         },
     },
     screen_capture::{
-        CaptureFailure, CapturedImage, LatestImage, PreviewStore, ScreenCapture, preview_from_i420,
+        CaptureFailure, CapturedImage, LatestImage, PreviewDemand, PreviewStore, ScreenCapture,
+        preview_from_i420,
     },
     system_audio::{AudioProducer, CHANNELS, SAMPLE_RATE, SystemAudio},
 };
@@ -387,6 +388,7 @@ impl PublisherEngine {
         servers: Vec<IceServer>,
         policy: String,
         preview: Arc<PreviewStore>,
+        demand: Arc<PreviewDemand>,
         cancelled: &AtomicBool,
     ) -> Result<Self, String> {
         if cancelled.load(Ordering::SeqCst) {
@@ -399,6 +401,7 @@ impl PublisherEngine {
             target,
             request.quality.fps,
             latest.clone(),
+            demand.clone(),
         )
         .map_err(str::to_owned)?;
         if cancelled.load(Ordering::SeqCst) {

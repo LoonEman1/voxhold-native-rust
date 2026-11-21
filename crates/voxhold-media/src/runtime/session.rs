@@ -12,6 +12,7 @@ async fn run_session(
     frame: Arc<Mutex<Option<StreamFrame>>>,
     capture: Arc<CaptureGate>,
     screen_preview: Arc<crate::screen_capture::PreviewStore>,
+    screen_demand: Arc<crate::screen_capture::PreviewDemand>,
 ) -> SessionEnd {
     let config = match client.webrtc_config().await {
         Ok(config) => config,
@@ -88,6 +89,7 @@ async fn run_session(
         rotation: requests.rotation.clone(),
         session_token,
         screen_preview,
+        screen_demand,
         render: VideoFrame::default(),
         viewport: requests.viewport(),
         local_level: None,
@@ -410,6 +412,7 @@ pub(super) fn run(
     frame: Arc<Mutex<Option<StreamFrame>>>,
     capture: Arc<CaptureGate>,
     screen_preview: Arc<crate::screen_capture::PreviewStore>,
+    screen_demand: Arc<crate::screen_capture::PreviewDemand>,
 ) {
     let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -452,6 +455,7 @@ pub(super) fn run(
             frame.clone(),
             capture.clone(),
             screen_preview.clone(),
+            screen_demand.clone(),
         ));
         controller.joined = false;
         // A reconnect never resumes the old capture, but a confirmed
@@ -469,6 +473,7 @@ pub(super) fn run(
             None
         };
         screen_preview.clear();
+        screen_demand.disable();
         updates.push(VoiceUpdate::ScreenShare(match &recovering {
             Some(intent) => intent.sharing.clone(),
             None => crate::publisher::Sharing::default(),

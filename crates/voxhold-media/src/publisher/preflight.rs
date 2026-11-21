@@ -19,7 +19,7 @@ use std::{
 
 use crate::{
     publisher::PublishRequest,
-    screen_capture::{CaptureFailure, LatestImage, ScreenCapture, ScreenSource},
+    screen_capture::{CaptureFailure, LatestImage, PreviewDemand, ScreenCapture, ScreenSource},
     system_audio::SystemAudio,
 };
 
@@ -74,7 +74,10 @@ pub fn run(
     budget: Duration,
 ) -> Result<PreflightReport, String> {
     run_with(request, cancelled, budget, |source, target, fps, latest| {
-        ScreenCapture::start(source, target, fps, latest)
+        // A preflight validates the device only: its temporary capture never
+        // feeds the on-air card, so the preview demand stays disabled.
+        let demand = Arc::new(PreviewDemand::default());
+        ScreenCapture::start(source, target, fps, latest, demand)
             .map_err(|error| format!("Новая настройка не открылась: {error}"))
             .map(|capture| Box::new(capture) as Box<dyn PreflightCapture>)
     })

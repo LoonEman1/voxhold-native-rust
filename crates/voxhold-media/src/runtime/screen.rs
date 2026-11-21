@@ -19,6 +19,8 @@ use crate::runtime::requests::{
 };
 use crate::screen_capture::SourceKind;
 
+mod preview;
+
 /// The newest live bitrate change that the engine worker has not accepted yet.
 ///
 /// The worker command queue is bounded and an ICE burst can fill it for a tick,
@@ -140,14 +142,6 @@ pub(super) fn deliver_bitrate(
         ),
         BitrateDelivery::Idle => Vec::new(),
     }
-}
-
-/// One preview picture for the local on-air card.
-pub struct ScreenFrame {
-    pub width: u32,
-    pub height: u32,
-    /// BGRA bytes; the panel hands them to `RenderImage` directly.
-    pub bgra: Vec<u8>,
 }
 
 impl VoiceHandle {
@@ -278,16 +272,6 @@ impl VoiceHandle {
         self.requests.wake();
         generation
     }
-
-    /// The newest local preview; only the on-air card reads it.
-    pub fn take_screen_frame(&self) -> Option<ScreenFrame> {
-        let frame = self.screen_preview.take()?;
-        Some(ScreenFrame {
-            width: frame.width,
-            height: frame.height,
-            bgra: frame.bgra,
-        })
-    }
 }
 
 impl Live {
@@ -331,6 +315,9 @@ impl Live {
                     self.bitrate.clear();
                     let _ = self.cancel_screen_prep(None);
                     self.release_engine();
+                    // No card can take a preview after a stop; the capture
+                    // thread stops converting immediately.
+                    self.screen_demand.disable();
                     self.screen_preview.clear();
                 }
                 PublisherOutcome::LeaveViewer => {
@@ -449,6 +436,7 @@ impl Live {
         let outcomes = self.publisher.abandon();
         let _ = self.apply_screen(outcomes, viewer).await?;
         self.release_engine();
+        self.screen_demand.disable();
         self.screen_preview.clear();
         Ok(())
     }
@@ -489,8 +477,10 @@ impl Live {
         let servers = self.servers.clone();
         let policy = self.policy.clone();
         let preview = self.screen_preview.clone();
+        let demand = self.screen_demand.clone();
         let prep = ScreenPrep::start(binding, Instant::now(), PREP_BUDGET, move |cancelled| {
-            let engine = PublisherEngine::start(request, servers, policy, preview, cancelled)?;
+            let engine =
+                PublisherEngine::start(request, servers, policy, preview, demand, cancelled)?;
             let has_audio = engine.has_audio();
             let audio_scope = engine.audio_scope();
             Ok((engine, has_audio, audio_scope))
@@ -723,6 +713,9 @@ impl Live {
     /// closing; the desktop capturer supports that overlap.
     fn release_engine(&mut self) {
         if let Some(previous) = self.screen.take() {
+            // The replaced capture must not convert another preview for a
+            // card that now belongs to the new attempt.
+            self.screen_demand.disable();
             release_off_loop(previous, true);
         }
     }
@@ -769,6 +762,9 @@ impl Drop for Live {
         // Capture only the confirmed on-air request. The publisher has
         // already cleared it for a user Stop/Leave or a revoked attempt.
         self.capture_publish_recovery();
+        // The session is gone; stop converting local previews before the
+        // capture thread is handed to the release worker.
+        self.screen_demand.disable();
         // The player peer is released on the same short-lived thread as a
         // publication engine: closing it must not hold the voice worker after
         // `stream.leave` was already sent.

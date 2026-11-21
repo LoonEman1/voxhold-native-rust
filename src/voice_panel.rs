@@ -139,6 +139,10 @@ pub struct VoicePanel {
     can_stream: bool,
     /// Screen-share picker, on-air card and preview.
     screen: ScreenShareUi,
+    /// Rect of the on-air card painted by the last frame. The preview demand of
+    /// the media capture is computed from it on the 100 ms poll, the same
+    /// cadence at which the card takes a frame.
+    screen_card_rect: Option<Rect>,
     /// Monotonic id of the newest screen-audio probe. A slower, older probe
     /// must not overwrite the availability of a newer dialog.
     screen_audio_probe: u64,
@@ -315,6 +319,7 @@ impl VoicePanel {
             live_clock_second: None,
             can_stream: false,
             screen: ScreenShareUi::default(),
+            screen_card_rect: None,
             screen_audio_probe: 0,
             access_confirmed: true,
             frame: None,
@@ -1039,6 +1044,10 @@ impl VoicePanel {
 
     fn poll(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.sync_viewport();
+        // The card's request is refreshed before the newest frame is taken, so
+        // a hidden or minimized card stops the conversion on the next capture
+        // tick instead of after a frame nobody paints.
+        self.sync_screen_preview_demand(window);
         let preview_changed = self.take_screen_preview(window);
         let clock_changed = self.live_clock_changed();
         let Some(handle) = &self.handle else {

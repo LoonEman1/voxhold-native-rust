@@ -901,3 +901,35 @@ fn a_pending_viewer_switch_is_left_before_the_screen_publication() {
     let left = publisher.viewer_left(now + Duration::from_millis(50));
     assert!(matches!(left[0], PublisherOutcome::StartEngine { .. }));
 }
+
+/// The card's demand is only atomics, and `shown` follows the real take.
+#[test]
+fn the_preview_demand_and_the_shown_counter_belong_to_the_handle() {
+    let handle = VoiceHandle::detached_for_tests();
+    assert_eq!(handle.screen_preview_stats(), (0, 0));
+    assert!(!handle.screen_preview_demand_for_tests().is_enabled());
+
+    handle.set_screen_preview_demand(Some(320));
+    let demand = handle.screen_preview_demand_for_tests();
+    assert!(demand.is_enabled());
+    assert_eq!(demand.width(), 320);
+    assert!(handle.take_screen_frame().is_none(), "no picture yet");
+    assert_eq!(handle.screen_preview_stats().1, 0);
+
+    handle.push_screen_preview_for_tests(crate::screen_capture::PreviewFrame {
+        width: 2,
+        height: 2,
+        bgra: vec![0x30; 2 * 2 * 4],
+    });
+    let frame = handle.take_screen_frame().expect("the stored picture");
+    assert_eq!((frame.width, frame.height), (2, 2));
+    assert_eq!(handle.screen_preview_stats(), (0, 1));
+    assert!(
+        handle.take_screen_frame().is_none(),
+        "the slot holds one picture only"
+    );
+    assert_eq!(handle.screen_preview_stats().1, 1);
+
+    handle.set_screen_preview_demand(None);
+    assert!(!handle.screen_preview_demand_for_tests().is_enabled());
+}

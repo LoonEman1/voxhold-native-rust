@@ -2,6 +2,35 @@
 //! the picker and paints the real audio scope of the running attempt.
 
 use super::*;
+use voxhold_media::screen_capture::MAX_PREVIEW_WIDTH;
+
+/// Physical width of the local preview requested by the painted card.
+///
+/// Pure, so the visibility, minimize, zero-rect and DPI rules are tested
+/// without a window. The published stream never depends on this value: the
+/// capture keeps its target, frame rate and I420 conversion, and only the
+/// extra BGRA picture for the card follows the request.
+pub(super) fn preview_request(
+    active: bool,
+    minimized: bool,
+    rect: Option<Rect>,
+    scale: f32,
+) -> Option<u32> {
+    if !active || minimized {
+        return None;
+    }
+    let rect = rect?;
+    if rect.w <= 0.0 || rect.h <= 0.0 {
+        return None;
+    }
+    // `set_scale` clamps the same way; a zero or negative scale is never
+    // treated as "smaller than a pixel".
+    let physical = (rect.w * scale.max(0.1)).ceil();
+    if !physical.is_finite() || physical < 1.0 {
+        return None;
+    }
+    Some((physical.min(MAX_PREVIEW_WIDTH as f32) as u32).clamp(2, MAX_PREVIEW_WIDTH))
+}
 
 impl VoicePanel {
     /// Whether the local on-air card takes one room slot.
@@ -10,6 +39,29 @@ impl VoicePanel {
             self.screen.sharing.phase,
             Phase::Publishing | Phase::Live | Phase::Stopping | Phase::Failed
         )
+    }
+
+    /// Hand the painted card's preview request to the media layer.
+    ///
+    /// Runs on the same 100 ms poll that takes a frame, so the request follows
+    /// the last painted card instead of a value an old frame computed. Only
+    /// atomics are written; the UI thread never waits for the capture worker,
+    /// and no command is queued. No handle means no capture and nothing to
+    /// disable.
+    pub(in crate::voice_panel) fn sync_screen_preview_demand(&self, window: &Window) {
+        let Some(handle) = &self.handle else {
+            return;
+        };
+        let request = preview_request(
+            // `room_painted` is the shell's own predicate for the voice room
+            // pane of this frame, so a card in a hidden pane requests nothing
+            // even while the publication keeps running.
+            self.room_painted && self.screen_card_active(),
+            crate::window_state::is_minimized(window),
+            self.screen_card_rect,
+            window.scale_factor(),
+        );
+        handle.set_screen_preview_demand(request);
     }
 
     /// The card that replaces the local publication in the room grid while a
@@ -24,8 +76,12 @@ impl VoicePanel {
             sharing.phase,
             Phase::Publishing | Phase::Live | Phase::Stopping | Phase::Failed
         ) {
+            self.screen_card_rect = None;
             return None;
         }
+        // The demand is computed from the rect this card is really painted at;
+        // a zero-sized card (a collapsed room pane) requests nothing.
+        self.screen_card_rect = Some(rect);
         let c = self.colors();
         let live = sharing.phase == Phase::Live;
         let status = if live {
@@ -208,5 +264,71 @@ impl VoicePanel {
             card = card.child(actions);
         }
         Some(card.into_any_element())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::preview_request;
+    use crate::voice_room::Rect;
+    use voxhold_media::screen_capture::MAX_PREVIEW_WIDTH;
+
+    fn card() -> Rect {
+        Rect::new(0.0, 0.0, 320.0, 180.0)
+    }
+
+    #[test]
+    fn a_hidden_or_idle_card_requests_nothing() {
+        assert_eq!(preview_request(false, false, Some(card()), 1.0), None);
+        assert_eq!(preview_request(false, false, None, 1.0), None);
+    }
+
+    #[test]
+    fn a_minimized_window_requests_nothing() {
+        assert_eq!(preview_request(true, true, Some(card()), 1.0), None);
+    }
+
+    #[test]
+    fn a_zero_sized_card_requests_nothing() {
+        assert_eq!(preview_request(true, false, None, 1.0), None);
+        let collapsed = Rect::new(0.0, 0.0, 0.0, 180.0);
+        assert_eq!(preview_request(true, false, Some(collapsed), 1.0), None);
+        let flat = Rect::new(0.0, 0.0, 320.0, 0.0);
+        assert_eq!(preview_request(true, false, Some(flat), 1.0), None);
+    }
+
+    #[test]
+    fn the_request_follows_the_physical_card_width() {
+        assert_eq!(
+            preview_request(true, false, Some(card()), 1.0),
+            Some(320),
+            "100% DPI asks for the logical width"
+        );
+        assert_eq!(
+            preview_request(true, false, Some(card()), 1.5),
+            Some(480),
+            "a fractional DPI is rounded up"
+        );
+        assert_eq!(preview_request(true, false, Some(card()), 1.25), Some(400));
+        // A scale below the clamp is not treated as a sub-pixel card.
+        assert_eq!(
+            preview_request(true, false, Some(Rect::new(0.0, 0.0, 3.0, 3.0)), 0.0),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn the_request_is_clamped_to_the_store_bound() {
+        let wide = Rect::new(0.0, 0.0, 4000.0, 2000.0);
+        assert_eq!(
+            preview_request(true, false, Some(wide), 2.0),
+            Some(MAX_PREVIEW_WIDTH)
+        );
+        let tiny = Rect::new(0.0, 0.0, 1.0, 1.0);
+        assert_eq!(
+            preview_request(true, false, Some(tiny), 1.0),
+            Some(2),
+            "the media layer never gets an unusable width"
+        );
     }
 }

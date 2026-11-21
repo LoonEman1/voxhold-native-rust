@@ -812,3 +812,84 @@ async fn a_late_preview_batch_cannot_clear_a_newer_batch(cx: &mut TestAppContext
         "only the current picker captured the source"
     );
 }
+
+/// An inactive phase takes the newest preview and drops it: no card picture is
+/// created and the frame does not stay in the slot for a later card.
+#[gpui::test]
+async fn an_idle_phase_discards_the_pending_preview_frame(cx: &mut TestAppContext) {
+    use voxhold_media::publisher::Phase;
+    let (mut visual, _view, voice) = super::voice_tests::fixture(cx);
+    draw(&mut visual);
+    visual.update(|window, app| {
+        voice.update(app, |panel, _| {
+            panel.test_attach_detached_handle();
+            panel.test_push_screen_preview(PreviewFrame {
+                width: 4,
+                height: 4,
+                bgra: vec![0x40; 4 * 4 * 4],
+            });
+            assert_eq!(panel.test_screen_phase(), Phase::Idle);
+            assert!(
+                !panel.test_take_screen_preview(window),
+                "an idle panel paints no card"
+            );
+            assert_eq!(
+                panel.test_screen_preview_image_id(),
+                None,
+                "no RenderImage is created for a discarded frame"
+            );
+            assert!(
+                !panel.test_screen_frame_pending(),
+                "the frame was taken, not left in the shared slot"
+            );
+            assert_eq!(
+                panel.test_screen_preview_stats().1,
+                1,
+                "the media layer counted the take"
+            );
+        });
+    });
+}
+
+/// The request follows the painted card and is released on the way back to Idle.
+#[gpui::test]
+async fn the_preview_demand_follows_the_painted_card(cx: &mut TestAppContext) {
+    use voxhold_media::publisher::{Phase, Sharing};
+    use voxhold_media::screen_capture::MAX_PREVIEW_WIDTH;
+    let (mut visual, _view, voice) = super::voice_tests::fixture_with(cx, Some(1400.), true);
+    visual.update(|_window, app| {
+        voice.update(app, |panel, _| {
+            panel.test_attach_detached_handle();
+            panel.test_set_screen_sharing(Sharing {
+                phase: Phase::Live,
+                live: true,
+                ..Sharing::default()
+            });
+        });
+    });
+    draw(&mut visual);
+    assert!(
+        visual.debug_bounds("screen-on-air").is_some(),
+        "the live card is painted"
+    );
+    visual.update(|window, app| {
+        voice.update(app, |panel, _| {
+            panel.test_sync_screen_preview_demand(window);
+            let (enabled, width) = panel.test_screen_preview_demand().expect("a handle");
+            assert!(enabled, "a painted card requests the local preview");
+            assert!(
+                (2..=MAX_PREVIEW_WIDTH).contains(&width),
+                "the physical width is bounded: {width}"
+            );
+        });
+    });
+
+    visual.update(|window, app| {
+        voice.update(app, |panel, _| {
+            panel.test_set_screen_sharing(Sharing::default());
+            panel.test_sync_screen_preview_demand(window);
+            let (enabled, _) = panel.test_screen_preview_demand().expect("a handle");
+            assert!(!enabled, "Idle drops the request");
+        });
+    });
+}

@@ -90,7 +90,7 @@ impl ScreenShareUi {
     }
 
     /// Drop the on-air card picture, if any.
-    pub(super) fn clear_preview(&mut self, window: &mut Window) {
+    pub(in crate::voice_panel) fn clear_preview(&mut self, window: &mut Window) {
         if let Some(previous) = self.preview.take() {
             self.release_image(window, previous);
         }

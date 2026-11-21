@@ -79,6 +79,9 @@ pub struct VoiceHandle {
     /// Last local preview of the screen publication. The publisher engine
     /// writes it; the on-air card takes it.
     screen_preview: Arc<crate::screen_capture::PreviewStore>,
+    /// Whether the painted on-air card asks for a preview and how wide it is.
+    /// The UI only writes atomics; the capture thread reads the newest value.
+    screen_demand: Arc<crate::screen_capture::PreviewDemand>,
     /// Ids for the picker and its listings. `u64` so a stale answer can never
     /// replace a newer one.
     screen_picker: Arc<AtomicU64>,
@@ -122,12 +125,14 @@ impl VoiceHandle {
         let capture = Arc::new(CaptureGate::default());
         let finished = Arc::new((Mutex::new(false), Condvar::new()));
         let screen_preview = Arc::new(crate::screen_capture::PreviewStore::default());
+        let screen_demand = Arc::new(crate::screen_capture::PreviewDemand::default());
         let screen_picker = Arc::new(AtomicU64::new(1));
         let source_generation = Arc::new(AtomicU64::new(1));
         let (worker_requests, worker_updates) = (requests.clone(), updates.clone());
         let (worker_frame, worker_finished) = (frame.clone(), finished.clone());
         let worker_capture = capture.clone();
         let worker_preview = screen_preview.clone();
+        let worker_demand = screen_demand.clone();
         let worker = thread::Builder::new()
             .name("voxhold-voice-session".into())
             .spawn(move || {
@@ -142,6 +147,7 @@ impl VoiceHandle {
                     worker_frame,
                     worker_capture,
                     worker_preview,
+                    worker_demand,
                 );
                 if let Ok(mut done) = worker_finished.0.lock() {
                     *done = true;
@@ -155,6 +161,7 @@ impl VoiceHandle {
             frame,
             capture,
             screen_preview,
+            screen_demand,
             screen_picker,
             source_generation,
             attempt,
@@ -305,6 +312,9 @@ impl VoiceHandle {
         // Latch first: the flag stops the worker, but the track must be silent
         // now, even while `socket.send` is still waiting.
         self.capture.latch();
+        // No card can take a preview after this point; stop converting them
+        // immediately instead of waiting for the worker to release the capture.
+        self.screen_demand.disable();
         self.requests.cancel_publish_recovery();
         self.requests.leave.store(true, Ordering::SeqCst);
         if let Ok(mut stream) = self.requests.stream.lock() {
@@ -401,6 +411,9 @@ struct Live {
     /// an old-generation close must not end the call.
     session_token: String,
     screen_preview: Arc<crate::screen_capture::PreviewStore>,
+    /// The card's preview request of this handle. Shared with the live capture
+    /// thread; this session only disables it when an attempt ends.
+    screen_demand: Arc<crate::screen_capture::PreviewDemand>,
     render: VideoFrame,
     viewport: (u32, u32),
     local_level: Option<(f64, bool)>,

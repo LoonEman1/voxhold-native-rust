@@ -102,8 +102,11 @@ impl VoicePanel {
         self.test_share_gate = Some(Ok(()));
         // A test picker is a new session too: release the previous picker's
         // pictures through the production path (epoch move + drop_image), then
-        // reset the rest of the dialog state.
+        // reset the rest of the dialog state. The on-air picture is not part of
+        // `previews`, so it needs its own release; otherwise the old card
+        // texture would be forgotten without `drop_image`.
         self.screen.clear_previews(window);
+        self.screen.clear_preview(window);
         let epoch = self.screen.preview_epoch;
         let released_images = self.screen.released_images;
         self.screen = ScreenShareUi::default();
@@ -771,6 +774,45 @@ impl VoicePanel {
     /// observe the replace/release rule without a capture stack.
     pub fn test_set_screen_preview(&mut self, window: &mut Window, image: Arc<RenderImage>) {
         self.screen.set_preview(window, image);
+    }
+
+    /// Put one picture into the detached handle exactly as the publisher worker
+    /// does when the capture attaches it to a frame.
+    pub fn test_push_screen_preview(&mut self, frame: PreviewFrame) {
+        if let Some(handle) = &self.handle {
+            handle.push_screen_preview_for_tests(frame);
+        }
+    }
+
+    /// The production take path, for the inactive-phase discard case.
+    pub fn test_take_screen_preview(&mut self, window: &mut Window) -> bool {
+        self.take_screen_preview(window)
+    }
+
+    /// `(prepared, shown)` of the shared preview demand.
+    pub fn test_screen_preview_stats(&self) -> (u64, u64) {
+        self.handle
+            .as_ref()
+            .map(VoiceHandle::screen_preview_stats)
+            .unwrap_or((0, 0))
+    }
+
+    /// `(enabled, requested width)` of the demand the card last wrote.
+    pub fn test_screen_preview_demand(&self) -> Option<(bool, u32)> {
+        let demand = self.handle.as_ref()?.screen_preview_demand_for_tests();
+        Some((demand.is_enabled(), demand.width()))
+    }
+
+    /// Whether the frame slot still holds a picture the card did not take.
+    pub fn test_screen_frame_pending(&self) -> bool {
+        self.handle
+            .as_ref()
+            .is_some_and(VoiceHandle::screen_preview_pending_for_tests)
+    }
+
+    /// Run the production demand sync for the last painted card.
+    pub fn test_sync_screen_preview_demand(&self, window: &Window) {
+        self.sync_screen_preview_demand(window);
     }
 
     /// Install an incoming player frame through the production setter.

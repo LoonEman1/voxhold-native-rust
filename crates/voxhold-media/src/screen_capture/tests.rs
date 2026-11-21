@@ -3,6 +3,7 @@
 use super::*;
 use crate::screen_capture::SourceKind;
 use libwebrtc::video_frame::VideoBuffer;
+use std::time::{Duration, Instant};
 
 fn solid(width: u32, height: u32, stride: u32, bgra: [u8; 4]) -> Vec<u8> {
     let mut bytes = vec![0_u8; stride as usize * height as usize];
@@ -277,8 +278,14 @@ fn a_real_desktop_capture_delivers_a_frame() {
     assert_eq!(other, 0, "one display cannot be offered under two ids");
 
     let latest = std::sync::Arc::new(LatestImage::default());
-    let mut capture = ScreenCapture::start(source.clone(), (1280, 720), 30, latest.clone())
-        .expect("capture start");
+    let mut capture = ScreenCapture::start(
+        source.clone(),
+        (1280, 720),
+        30,
+        latest.clone(),
+        std::sync::Arc::new(PreviewDemand::default()),
+    )
+    .expect("capture start");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     let image = loop {
         if let Some(image) = latest.take() {
@@ -453,4 +460,95 @@ fn a_monitor_source_identity_ignores_its_mutable_label() {
         ..source.clone()
     };
     assert_ne!(source.focus_key(), other.focus_key());
+}
+
+/// The capture thread prepares at most ten previews per second, whatever the
+/// capture frame rate is. A fake clock keeps the assertion exact.
+#[test]
+fn the_preview_throttle_prepares_at_most_ten_frames_per_second() {
+    let demand = PreviewDemand::default();
+    demand.request(320);
+    let mut throttle = PreviewThrottle::default();
+    let base = Instant::now();
+    let prepared = (0..60_u64)
+        .filter(|index| {
+            let now = base + Duration::from_micros(index * 16_667);
+            throttle.poll(now, &demand).is_some()
+        })
+        .count();
+    assert_eq!(prepared, 10, "one second of 60 FPS capture");
+}
+
+/// A disabled demand converts nothing and clears the pacing, so showing the
+/// card again starts with an immediate frame.
+#[test]
+fn a_disabled_demand_prepares_nothing() {
+    let demand = PreviewDemand::default();
+    let mut throttle = PreviewThrottle::default();
+    let base = Instant::now();
+    for index in 0..60_u64 {
+        let now = base + Duration::from_micros(index * 16_667);
+        assert_eq!(throttle.poll(now, &demand), None, "no request, no preview");
+    }
+    demand.request(320);
+    assert_eq!(
+        throttle.poll(base + Duration::from_secs(1), &demand),
+        Some(320)
+    );
+    demand.disable();
+    assert_eq!(throttle.poll(base + Duration::from_secs(2), &demand), None);
+    demand.request(320);
+    assert_eq!(
+        throttle.poll(base + Duration::from_secs(2), &demand),
+        Some(320),
+        "re-enabling prepares the next frame without waiting out the window"
+    );
+}
+
+/// The prepared width follows the newest request and the store bound.
+#[test]
+fn the_preview_width_follows_the_demand() {
+    let demand = PreviewDemand::default();
+    demand.request(320);
+    let mut throttle = PreviewThrottle::default();
+    let start = Instant::now();
+    assert_eq!(throttle.poll(start, &demand), Some(320));
+
+    let later = start + Duration::from_millis(100);
+    demand.request(480);
+    assert_eq!(throttle.poll(later, &demand), Some(480));
+
+    let wider = later + Duration::from_millis(100);
+    demand.request(5000);
+    assert_eq!(
+        throttle.poll(wider, &demand),
+        Some(MAX_PREVIEW_WIDTH),
+        "a card wider than the bound asks for the bound"
+    );
+
+    let tiny = wider + Duration::from_millis(100);
+    demand.request(0);
+    assert_eq!(throttle.poll(tiny, &demand), Some(2));
+}
+
+/// `prepared` counts converted pictures only; the shown counter belongs to the
+/// card's take.
+#[test]
+fn the_prepared_counter_counts_published_pictures() {
+    let demand = PreviewDemand::default();
+    assert_eq!(demand.prepared(), 0);
+    let frame = PreviewFrame {
+        width: 2,
+        height: 2,
+        bgra: vec![0x20; 2 * 2 * 4],
+    };
+    assert!(demand.published_preview(Some(frame)).is_some());
+    assert_eq!(demand.prepared(), 1);
+    assert!(demand.published_preview(None).is_none());
+    assert_eq!(demand.prepared(), 1, "a skipped frame is not prepared");
+    demand.disable();
+    let mut throttle = PreviewThrottle::default();
+    assert_eq!(throttle.poll(Instant::now(), &demand), None);
+    demand.published_preview(None);
+    assert_eq!(demand.prepared(), 1);
 }

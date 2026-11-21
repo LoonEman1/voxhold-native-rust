@@ -422,6 +422,9 @@ impl VoicePanel {
         let roster = self.visible_roster();
         let streams = self.visible_streams();
         let sharing = self.screen_card_active();
+        // The preview demand follows the card of this frame. A card that is no
+        // longer painted must not keep the request of an older paint alive.
+        self.screen_card_rect = None;
         let own_cards = usize::from(sharing);
         let count = roster.len() + streams.len() + own_cards;
         let geometry = voice_room::room_geometry(

@@ -976,8 +976,9 @@ mod tests {
         );
         assert_eq!(
             preview_frame_size(&surface(1080, 1920), SCREEN_THUMBNAIL_WIDTH),
-            (152, 270),
-            "a portrait surface is bounded by the capture height"
+            (150, 270),
+            "a portrait surface is bounded by the capture height and truncates \
+             like fit_even (270 * 1080 / 1920 = 151, rounded down to even)"
         );
         assert_eq!(
             preview_frame_size(&surface(200, 5000), SCREEN_THUMBNAIL_WIDTH),

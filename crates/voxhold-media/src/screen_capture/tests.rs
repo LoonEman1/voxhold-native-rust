@@ -126,6 +126,213 @@ fn a_downscale_preserves_the_picture_geometry() {
     );
 }
 
+/// Deterministic BGRA picture whose channels change on every pixel. The row
+/// padding is filled with garbage so a reader that follows `stride` wrong
+/// changes the result.
+fn gradient(width: u32, height: u32, stride: u32) -> Vec<u8> {
+    let mut bytes = vec![0xCD_u8; stride as usize * height as usize];
+    for y in 0..height as usize {
+        for x in 0..width as usize {
+            let at = y * stride as usize + x * 4;
+            bytes[at] = (x * 7 + y * 13) as u8; // blue
+            bytes[at + 1] = (x * 11 + y * 3 + 40) as u8; // green
+            bytes[at + 2] = (y * 17 + x * 5 + 80) as u8; // red
+            bytes[at + 3] = 255;
+        }
+    }
+    bytes
+}
+
+/// Compare the planes of two pictures, allowing fixed-point rounding noise.
+fn assert_planes_match(expected: &I420Buffer, actual: &I420Buffer, tolerance: u8) {
+    let (expected_y, expected_u, expected_v) = planes(expected);
+    let (actual_y, actual_u, actual_v) = planes(actual);
+    for (left, right) in [
+        (&expected_y, &actual_y),
+        (&expected_u, &actual_u),
+        (&expected_v, &actual_v),
+    ] {
+        assert_eq!(left.len(), right.len(), "plane sizes differ");
+        for (index, (want, got)) in left.iter().zip(right.iter()).enumerate() {
+            assert!(
+                want.abs_diff(*got) <= tolerance,
+                "plane sample {index}: expected {want}, got {got}"
+            );
+        }
+    }
+}
+
+#[test]
+fn the_exact_size_path_matches_the_scalar_box_filter() {
+    // An unchanged size now runs through libyuv. The scalar filter must give
+    // the same picture up to one step of fixed-point rounding.
+    let stride = 18 * 4 + 8;
+    for source in [
+        solid(18, 10, stride, [40, 200, 30, 255]),
+        gradient(18, 10, stride),
+    ] {
+        let mut fast = I420Buffer::new(18, 10);
+        assert!(convert_bgra_to_i420(&source, 18, 10, stride, &mut fast));
+        let mut scalar = I420Buffer::new(18, 10);
+        convert_bgra_to_i420_box(&source, 18, 10, stride, &mut scalar);
+        assert_planes_match(&scalar, &fast, 1);
+    }
+}
+
+#[test]
+fn the_exact_size_path_ignores_the_row_padding() {
+    // 4×4 picture inside 24-byte rows (16 data bytes plus 8 garbage bytes).
+    let width = 4;
+    let height = 4;
+    let stride = width * 4 + 8;
+    let source = gradient(width, height, stride);
+    let mut padded = I420Buffer::new(width, height);
+    assert!(convert_bgra_to_i420(
+        &source,
+        width,
+        height,
+        stride,
+        &mut padded
+    ));
+    // The same pixels packed without padding.
+    let packed_source = gradient(width, height, width * 4);
+    let mut tight = I420Buffer::new(width, height);
+    assert!(convert_bgra_to_i420(
+        &packed_source,
+        width,
+        height,
+        width * 4,
+        &mut tight
+    ));
+    // Identical pixels, different stride: identical planes.
+    assert_planes_match(&tight, &padded, 0);
+}
+
+#[test]
+fn a_scaled_picture_ignores_the_row_padding() {
+    // The rescaled scalar path must only read the width*4 bytes it samples;
+    // the rest of each row is noise.
+    let width = 8;
+    let height = 4;
+    let packed = width * 4;
+    let stride = packed + 12;
+    let clean = gradient(width, height, packed);
+    let padded = gradient(width, height, stride);
+    let mut a = I420Buffer::new(4, 2);
+    let mut b = I420Buffer::new(4, 2);
+    assert!(convert_bgra_to_i420(&clean, width, height, packed, &mut a));
+    assert!(convert_bgra_to_i420(&padded, width, height, stride, &mut b));
+    assert_planes_match(&a, &b, 0);
+}
+
+#[test]
+fn scaled_solid_frames_keep_their_colour_at_even_and_odd_sizes() {
+    // (source width, source height, output width, output height). The 6×4
+    // case keeps the size and takes the libyuv path; the others rescale,
+    // including an odd source, a one-row source and upscales.
+    let cases = [
+        (6, 4, 6, 4),
+        (8, 6, 4, 2),
+        (8, 6, 6, 4),
+        (7, 5, 6, 4),
+        (2, 1, 2, 2),
+        (2, 2, 8, 6),
+        (2, 1, 6, 2),
+    ];
+    // BGRA (40, 200, 30) is 30 red, 200 green, 40 blue. A solid frame has a
+    // box mean exactly equal to its pixel, so every path must reproduce this
+    // reference within one bit of fixed-point rounding: a two-unit error in
+    // the formula fails here.
+    let (want_y, want_u, want_v) = bgra_to_yuv(30, 200, 40);
+    for (width, height, out_w, out_h) in cases {
+        let stride = width * 4 + 4;
+        let source = solid(width, height, stride, [40, 200, 30, 255]);
+        let mut output = I420Buffer::new(out_w, out_h);
+        assert!(
+            convert_bgra_to_i420(&source, width, height, stride, &mut output),
+            "{width}×{height} into {out_w}×{out_h}"
+        );
+        let label = format!("{width}×{height} into {out_w}×{out_h}");
+        let (luma, u, v) = planes(&output);
+        assert!(
+            luma.iter().all(|value| value.abs_diff(want_y) <= 1),
+            "Y {label}: {luma:?}, expected {want_y} ± 1"
+        );
+        assert!(
+            u.iter().all(|value| value.abs_diff(want_u) <= 1),
+            "U {label}: {u:?}, expected {want_u} ± 1"
+        );
+        assert!(
+            v.iter().all(|value| value.abs_diff(want_v) <= 1),
+            "V {label}: {v:?}, expected {want_v} ± 1"
+        );
+    }
+}
+
+#[test]
+fn scale_bounds_cover_only_the_source_at_any_ratio() {
+    // The cached boxes of a conversion must never run past the source or be
+    // empty, including upscales where several samples share one source pixel.
+    for (source_w, source_h, out_w, out_h) in [
+        (2, 2, 8, 6),
+        (2, 1, 6, 2),
+        (8, 6, 4, 2),
+        (7, 5, 6, 4),
+        (1920, 1080, 1280, 720),
+        (4096, 2160, 2, 2),
+    ] {
+        let bounds = ScaleBounds::new(
+            (source_w, source_h),
+            (out_w, out_h),
+            ((out_w as usize).div_ceil(2), (out_h as usize).div_ceil(2)),
+        );
+        let check = |boxes: &[(u32, u32)], limit: u32, expected: usize, label: &str| {
+            assert_eq!(boxes.len(), expected, "{label}: length");
+            for &(start, end) in boxes {
+                assert!(start < end, "{label}: empty box {start}..{end}");
+                assert!(end <= limit, "{label}: past the source {end} > {limit}");
+            }
+        };
+        check(
+            bounds.luma_columns(),
+            source_w,
+            out_w as usize,
+            "luma columns",
+        );
+        check(bounds.luma_rows(), source_h, out_h as usize, "luma rows");
+        check(
+            bounds.chroma_columns(),
+            source_w,
+            (out_w as usize).div_ceil(2),
+            "chroma columns",
+        );
+        check(
+            bounds.chroma_rows(),
+            source_h,
+            (out_h as usize).div_ceil(2),
+            "chroma rows",
+        );
+    }
+}
+
+#[test]
+fn a_short_or_odd_input_is_refused_without_reading_past_it() {
+    // One byte short of `stride * height`: the libyuv call would panic, so
+    // the public entry point must refuse the buffer first.
+    let short = vec![0_u8; 8 * 4 * 4 - 1];
+    let mut output = I420Buffer::new(8, 4);
+    assert!(!convert_bgra_to_i420(&short, 8, 4, 32, &mut output));
+
+    // height = 1 is a usable source, but an odd destination is still refused.
+    let one_row = solid(2, 1, 8, [40, 200, 30, 255]);
+    let mut odd = I420Buffer::new(2, 1);
+    assert!(!convert_bgra_to_i420(&one_row, 2, 1, 8, &mut odd));
+    let mut even = I420Buffer::new(2, 2);
+    assert!(convert_bgra_to_i420(&one_row, 2, 1, 8, &mut even));
+    let (luma, _, _) = planes(&even);
+    assert!(luma.iter().all(|value| (126..=130).contains(value)));
+}
+
 #[test]
 fn fitting_keeps_the_aspect_ratio_and_never_upscales() {
     assert_eq!(fit_even(2560, 1440, 1280, 720), (1280, 720));

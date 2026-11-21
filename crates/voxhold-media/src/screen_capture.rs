@@ -11,9 +11,10 @@
 //! - [`ScreenCapture`] owns one capture thread per publishing attempt. The
 //!   capturer is created on that thread; creation failures are reported back
 //!   before `start` returns.
-//! - the frame callback converts BGRA to I420 with a box filter (the raw frame
-//!   is only valid during the callback) and stores only the newest image. A
-//!   slower consumer drops frames instead of growing a queue.
+//! - the frame callback converts BGRA to I420, directly through libyuv when
+//!   the picture is not rescaled and with a scalar box filter otherwise (the
+//!   raw frame is only valid during the callback) and stores only the newest
+//!   image. A slower consumer drops frames instead of growing a queue.
 //! - [`PreviewStore`] keeps one small BGRA picture for the local on-air card.
 //!   It is bounded by [`MAX_PREVIEW_BYTES`] and never grows while idle.
 //! - [`capture_thumbnail`] grabs one bounded BGRA picture for the picker grid.
@@ -26,13 +27,17 @@
 //! The picker therefore lists `get_source_list` itself and the local grid is
 //! the only chooser on Windows.
 
+use std::ops::Range;
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::time::Duration;
 
-use libwebrtc::video_frame::{I420Buffer, VideoBuffer};
+use libwebrtc::{
+    native::yuv_helper::argb_to_i420,
+    video_frame::{I420Buffer, VideoBuffer},
+};
 
 mod topology;
 
@@ -597,11 +602,157 @@ fn bgra_to_yuv(red: u32, green: u32, blue: u32) -> (u8, u8, u8) {
     )
 }
 
-/// Convert a BGRA picture into `output` with a box filter.
+/// Source box of every destination sample of one conversion.
+///
+/// The four axes (luma and chroma, horizontal and vertical) differ only in
+/// their count and step, so they share one allocation per call: each axis is a
+/// range in the same buffer and nothing is kept between frames. The bounds
+/// depend only on the source and destination sizes, so they are built once per
+/// conversion instead of being recomputed with 64-bit divisions inside the
+/// per-pixel loops. `step` is 1 for luma and 2 for chroma: one chroma sample
+/// spans two luma samples of the same axis.
+struct ScaleBounds {
+    boxes: Vec<(u32, u32)>,
+    luma_x: Range<usize>,
+    luma_y: Range<usize>,
+    chroma_x: Range<usize>,
+    chroma_y: Range<usize>,
+}
+
+impl ScaleBounds {
+    /// `source` is `(width, height)`, `destination` is the even output size and
+    /// `chroma` is its I420 chroma size.
+    fn new(source: (u32, u32), destination: (u32, u32), chroma: (usize, usize)) -> Self {
+        let (source_width, source_height) = source;
+        let (out_w, out_h) = destination;
+        let (chroma_width, chroma_height) = chroma;
+        let columns = out_w as usize;
+        let rows = out_h as usize;
+        let luma_x = 0..columns;
+        let luma_y = columns..columns + rows;
+        let chroma_x = luma_y.end..luma_y.end + chroma_width;
+        let chroma_y = chroma_x.end..chroma_x.end + chroma_height;
+        let mut boxes = Vec::with_capacity(chroma_y.end);
+        push_axis(&mut boxes, columns, 1, source_width, out_w);
+        push_axis(&mut boxes, rows, 1, source_height, out_h);
+        push_axis(&mut boxes, chroma_width, 2, source_width, out_w);
+        push_axis(&mut boxes, chroma_height, 2, source_height, out_h);
+        Self {
+            boxes,
+            luma_x,
+            luma_y,
+            chroma_x,
+            chroma_y,
+        }
+    }
+
+    fn luma_columns(&self) -> &[(u32, u32)] {
+        &self.boxes[self.luma_x.clone()]
+    }
+
+    fn luma_rows(&self) -> &[(u32, u32)] {
+        &self.boxes[self.luma_y.clone()]
+    }
+
+    fn chroma_columns(&self) -> &[(u32, u32)] {
+        &self.boxes[self.chroma_x.clone()]
+    }
+
+    fn chroma_rows(&self) -> &[(u32, u32)] {
+        &self.boxes[self.chroma_y.clone()]
+    }
+}
+
+/// Append one axis of non-empty source boxes, never past `source`.
+fn push_axis(boxes: &mut Vec<(u32, u32)>, count: usize, step: u64, source: u32, destination: u32) {
+    let destination = u64::from(destination);
+    for index in 0..count as u64 {
+        let from = (index * step * u64::from(source) / destination) as u32;
+        let to = (((index + 1) * step * u64::from(source) / destination) as u32)
+            .max(from + 1)
+            .min(source);
+        boxes.push((from, to));
+    }
+}
+
+/// Box-filter path for a scaled picture, used for every size change.
+///
+/// This is the reference filter: it averages the exact source rectangle of
+/// each destination sample, so the picture keeps its geometry at any ratio.
+/// The input is already validated by [`convert_bgra_to_i420`].
+fn convert_bgra_to_i420_box(
+    bgra: &[u8],
+    width: u32,
+    height: u32,
+    stride: u32,
+    output: &mut I420Buffer,
+) {
+    let (out_w, out_h) = (output.width(), output.height());
+    let (stride_y, stride_u, stride_v) = output.strides();
+    let (stride_y, stride_u, stride_v) = (stride_y as usize, stride_u as usize, stride_v as usize);
+    let bounds = ScaleBounds::new(
+        (width, height),
+        (out_w, out_h),
+        (
+            output.chroma_width() as usize,
+            output.chroma_height() as usize,
+        ),
+    );
+    let (data_y, data_u, data_v) = output.data_mut();
+    let box_mean = |x0: u32, x1: u32, y0: u32, y1: u32| -> (u32, u32, u32) {
+        let mut red = 0_u32;
+        let mut green = 0_u32;
+        let mut blue = 0_u32;
+        let mut samples = 0_u32;
+        let columns = (x1 - x0) as usize;
+        for y in y0..y1 {
+            let mut at = y as usize * stride as usize + x0 as usize * 4;
+            for _ in 0..columns {
+                // BGRA: blue, green, red, alpha.
+                blue += u32::from(bgra[at]);
+                green += u32::from(bgra[at + 1]);
+                red += u32::from(bgra[at + 2]);
+                samples += 1;
+                at += 4;
+            }
+        }
+        let samples = samples.max(1);
+        (red / samples, green / samples, blue / samples)
+    };
+    // One chroma sample covers a 2×2 block of destination luma pixels, so its
+    // source box is the union of those four boxes.
+    for (chroma_row, &(y0, y1)) in bounds.chroma_rows().iter().enumerate() {
+        for (chroma_column, &(x0, x1)) in bounds.chroma_columns().iter().enumerate() {
+            let (red, green, blue) = box_mean(x0, x1, y0, y1);
+            let (_, u, v) = bgra_to_yuv(red, green, blue);
+            data_u[chroma_row * stride_u + chroma_column] = u;
+            data_v[chroma_row * stride_v + chroma_column] = v;
+        }
+    }
+    // Luma is written per destination pixel so a non-integer scale keeps the
+    // geometry; the chroma pass above used the same source boxes.
+    for (out_row, &(y0, y1)) in bounds.luma_rows().iter().enumerate() {
+        for (out_column, &(x0, x1)) in bounds.luma_columns().iter().enumerate() {
+            let (red, green, blue) = box_mean(x0, x1, y0, y1);
+            let (y, _, _) = bgra_to_yuv(red, green, blue);
+            data_y[out_row * stride_y + out_column] = y;
+        }
+    }
+}
+
+/// Convert a BGRA picture into `output`.
 ///
 /// `output` must be sized to the wanted picture. The source may have any
 /// stride (including padding after every row) and odd sizes; the destination
 /// is I420 and therefore always even. Returns `false` on an unusable input.
+///
+/// The path follows the size:
+/// - an unchanged size is converted by libyuv (`argb_to_i420`, SIMD), which
+///   reads the BGRA bytes as its `ARGB` fourcc: on little-endian Windows that
+///   word is 0xAARRGGBB, i.e. the same B,G,R,A byte order. Its fixed-point
+///   rounding may differ from the scalar reference by up to one bit;
+/// - any size change uses the scalar box filter, which averages the exact
+///   source rectangle of every destination sample.
 pub fn convert_bgra_to_i420(
     bgra: &[u8],
     width: u32,
@@ -623,65 +774,24 @@ pub fn convert_bgra_to_i420(
     if bgra.len() < stride as usize * height as usize {
         return false;
     }
-    let (stride_y, stride_u, stride_v) = output.strides();
-    let (stride_y, stride_u, stride_v) = (stride_y as usize, stride_u as usize, stride_v as usize);
-    let chroma_width = output.chroma_width() as usize;
-    let chroma_height = output.chroma_height() as usize;
-    let (data_y, data_u, data_v) = output.data_mut();
-    let box_mean = |x0: u32, x1: u32, y0: u32, y1: u32| -> (u32, u32, u32) {
-        let mut red = 0_u32;
-        let mut green = 0_u32;
-        let mut blue = 0_u32;
-        let mut samples = 0_u32;
-        for y in y0..y1 {
-            let row = y as usize * stride as usize;
-            for x in x0..x1 {
-                let at = row + x as usize * 4;
-                // BGRA: blue, green, red, alpha.
-                blue += u32::from(bgra[at]);
-                green += u32::from(bgra[at + 1]);
-                red += u32::from(bgra[at + 2]);
-                samples += 1;
-            }
-        }
-        let samples = samples.max(1);
-        (red / samples, green / samples, blue / samples)
-    };
-    // One chroma sample covers a 2×2 block of destination luma pixels, so its
-    // source box is the union of those four boxes.
-    for chroma_y in 0..chroma_height {
-        let y0 = (chroma_y as u64 * 2 * u64::from(height) / u64::from(out_h)) as u32;
-        let y1 = (((chroma_y as u64 + 1) * 2 * u64::from(height) / u64::from(out_h)) as u32)
-            .max(y0 + 1)
-            .min(height);
-        for chroma_x in 0..chroma_width {
-            let x0 = (chroma_x as u64 * 2 * u64::from(width) / u64::from(out_w)) as u32;
-            let x1 = (((chroma_x as u64 + 1) * 2 * u64::from(width) / u64::from(out_w)) as u32)
-                .max(x0 + 1)
-                .min(width);
-            let (red, green, blue) = box_mean(x0, x1, y0, y1);
-            let (_, u, v) = bgra_to_yuv(red, green, blue);
-            data_u[chroma_y * stride_u + chroma_x] = u;
-            data_v[chroma_y * stride_v + chroma_x] = v;
-        }
+    if out_w == width && out_h == height {
+        let (stride_y, stride_u, stride_v) = output.strides();
+        let (data_y, data_u, data_v) = output.data_mut();
+        argb_to_i420(
+            bgra,
+            stride,
+            data_y,
+            stride_y,
+            data_u,
+            stride_u,
+            data_v,
+            stride_v,
+            width as i32,
+            height as i32,
+        );
+        return true;
     }
-    // Luma is written per destination pixel so a non-integer scale keeps the
-    // geometry; the chroma pass above used the same source boxes.
-    for out_y in 0..out_h {
-        let y0 = ((out_y as u64) * u64::from(height) / u64::from(out_h)) as u32;
-        let y1 = ((((out_y as u64) + 1) * u64::from(height) / u64::from(out_h)) as u32)
-            .max(y0 + 1)
-            .min(height);
-        for out_x in 0..out_w {
-            let x0 = ((out_x as u64) * u64::from(width) / u64::from(out_w)) as u32;
-            let x1 = ((((out_x as u64) + 1) * u64::from(width) / u64::from(out_w)) as u32)
-                .max(x0 + 1)
-                .min(width);
-            let (red, green, blue) = box_mean(x0, x1, y0, y1);
-            let (y, _, _) = bgra_to_yuv(red, green, blue);
-            data_y[out_y as usize * stride_y + out_x as usize] = y;
-        }
-    }
+    convert_bgra_to_i420_box(bgra, width, height, stride, output);
     true
 }
 

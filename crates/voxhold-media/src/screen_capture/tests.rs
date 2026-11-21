@@ -3,6 +3,7 @@
 use super::*;
 use crate::screen_capture::SourceKind;
 use libwebrtc::video_frame::VideoBuffer;
+use std::time::{Duration, Instant};
 
 fn solid(width: u32, height: u32, stride: u32, bgra: [u8; 4]) -> Vec<u8> {
     let mut bytes = vec![0_u8; stride as usize * height as usize];
@@ -124,6 +125,213 @@ fn a_downscale_preserves_the_picture_geometry() {
         "bottom-left is the blue half: {}",
         luma[4]
     );
+}
+
+/// Deterministic BGRA picture whose channels change on every pixel. The row
+/// padding is filled with garbage so a reader that follows `stride` wrong
+/// changes the result.
+fn gradient(width: u32, height: u32, stride: u32) -> Vec<u8> {
+    let mut bytes = vec![0xCD_u8; stride as usize * height as usize];
+    for y in 0..height as usize {
+        for x in 0..width as usize {
+            let at = y * stride as usize + x * 4;
+            bytes[at] = (x * 7 + y * 13) as u8; // blue
+            bytes[at + 1] = (x * 11 + y * 3 + 40) as u8; // green
+            bytes[at + 2] = (y * 17 + x * 5 + 80) as u8; // red
+            bytes[at + 3] = 255;
+        }
+    }
+    bytes
+}
+
+/// Compare the planes of two pictures, allowing fixed-point rounding noise.
+fn assert_planes_match(expected: &I420Buffer, actual: &I420Buffer, tolerance: u8) {
+    let (expected_y, expected_u, expected_v) = planes(expected);
+    let (actual_y, actual_u, actual_v) = planes(actual);
+    for (left, right) in [
+        (&expected_y, &actual_y),
+        (&expected_u, &actual_u),
+        (&expected_v, &actual_v),
+    ] {
+        assert_eq!(left.len(), right.len(), "plane sizes differ");
+        for (index, (want, got)) in left.iter().zip(right.iter()).enumerate() {
+            assert!(
+                want.abs_diff(*got) <= tolerance,
+                "plane sample {index}: expected {want}, got {got}"
+            );
+        }
+    }
+}
+
+#[test]
+fn the_exact_size_path_matches_the_scalar_box_filter() {
+    // An unchanged size now runs through libyuv. The scalar filter must give
+    // the same picture up to one step of fixed-point rounding.
+    let stride = 18 * 4 + 8;
+    for source in [
+        solid(18, 10, stride, [40, 200, 30, 255]),
+        gradient(18, 10, stride),
+    ] {
+        let mut fast = I420Buffer::new(18, 10);
+        assert!(convert_bgra_to_i420(&source, 18, 10, stride, &mut fast));
+        let mut scalar = I420Buffer::new(18, 10);
+        convert_bgra_to_i420_box(&source, 18, 10, stride, &mut scalar);
+        assert_planes_match(&scalar, &fast, 1);
+    }
+}
+
+#[test]
+fn the_exact_size_path_ignores_the_row_padding() {
+    // 4×4 picture inside 24-byte rows (16 data bytes plus 8 garbage bytes).
+    let width = 4;
+    let height = 4;
+    let stride = width * 4 + 8;
+    let source = gradient(width, height, stride);
+    let mut padded = I420Buffer::new(width, height);
+    assert!(convert_bgra_to_i420(
+        &source,
+        width,
+        height,
+        stride,
+        &mut padded
+    ));
+    // The same pixels packed without padding.
+    let packed_source = gradient(width, height, width * 4);
+    let mut tight = I420Buffer::new(width, height);
+    assert!(convert_bgra_to_i420(
+        &packed_source,
+        width,
+        height,
+        width * 4,
+        &mut tight
+    ));
+    // Identical pixels, different stride: identical planes.
+    assert_planes_match(&tight, &padded, 0);
+}
+
+#[test]
+fn a_scaled_picture_ignores_the_row_padding() {
+    // The rescaled scalar path must only read the width*4 bytes it samples;
+    // the rest of each row is noise.
+    let width = 8;
+    let height = 4;
+    let packed = width * 4;
+    let stride = packed + 12;
+    let clean = gradient(width, height, packed);
+    let padded = gradient(width, height, stride);
+    let mut a = I420Buffer::new(4, 2);
+    let mut b = I420Buffer::new(4, 2);
+    assert!(convert_bgra_to_i420(&clean, width, height, packed, &mut a));
+    assert!(convert_bgra_to_i420(&padded, width, height, stride, &mut b));
+    assert_planes_match(&a, &b, 0);
+}
+
+#[test]
+fn scaled_solid_frames_keep_their_colour_at_even_and_odd_sizes() {
+    // (source width, source height, output width, output height). The 6×4
+    // case keeps the size and takes the libyuv path; the others rescale,
+    // including an odd source, a one-row source and upscales.
+    let cases = [
+        (6, 4, 6, 4),
+        (8, 6, 4, 2),
+        (8, 6, 6, 4),
+        (7, 5, 6, 4),
+        (2, 1, 2, 2),
+        (2, 2, 8, 6),
+        (2, 1, 6, 2),
+    ];
+    // BGRA (40, 200, 30) is 30 red, 200 green, 40 blue. A solid frame has a
+    // box mean exactly equal to its pixel, so every path must reproduce this
+    // reference within one bit of fixed-point rounding: a two-unit error in
+    // the formula fails here.
+    let (want_y, want_u, want_v) = bgra_to_yuv(30, 200, 40);
+    for (width, height, out_w, out_h) in cases {
+        let stride = width * 4 + 4;
+        let source = solid(width, height, stride, [40, 200, 30, 255]);
+        let mut output = I420Buffer::new(out_w, out_h);
+        assert!(
+            convert_bgra_to_i420(&source, width, height, stride, &mut output),
+            "{width}×{height} into {out_w}×{out_h}"
+        );
+        let label = format!("{width}×{height} into {out_w}×{out_h}");
+        let (luma, u, v) = planes(&output);
+        assert!(
+            luma.iter().all(|value| value.abs_diff(want_y) <= 1),
+            "Y {label}: {luma:?}, expected {want_y} ± 1"
+        );
+        assert!(
+            u.iter().all(|value| value.abs_diff(want_u) <= 1),
+            "U {label}: {u:?}, expected {want_u} ± 1"
+        );
+        assert!(
+            v.iter().all(|value| value.abs_diff(want_v) <= 1),
+            "V {label}: {v:?}, expected {want_v} ± 1"
+        );
+    }
+}
+
+#[test]
+fn scale_bounds_cover_only_the_source_at_any_ratio() {
+    // The cached boxes of a conversion must never run past the source or be
+    // empty, including upscales where several samples share one source pixel.
+    for (source_w, source_h, out_w, out_h) in [
+        (2, 2, 8, 6),
+        (2, 1, 6, 2),
+        (8, 6, 4, 2),
+        (7, 5, 6, 4),
+        (1920, 1080, 1280, 720),
+        (4096, 2160, 2, 2),
+    ] {
+        let bounds = ScaleBounds::new(
+            (source_w, source_h),
+            (out_w, out_h),
+            ((out_w as usize).div_ceil(2), (out_h as usize).div_ceil(2)),
+        );
+        let check = |boxes: &[(u32, u32)], limit: u32, expected: usize, label: &str| {
+            assert_eq!(boxes.len(), expected, "{label}: length");
+            for &(start, end) in boxes {
+                assert!(start < end, "{label}: empty box {start}..{end}");
+                assert!(end <= limit, "{label}: past the source {end} > {limit}");
+            }
+        };
+        check(
+            bounds.luma_columns(),
+            source_w,
+            out_w as usize,
+            "luma columns",
+        );
+        check(bounds.luma_rows(), source_h, out_h as usize, "luma rows");
+        check(
+            bounds.chroma_columns(),
+            source_w,
+            (out_w as usize).div_ceil(2),
+            "chroma columns",
+        );
+        check(
+            bounds.chroma_rows(),
+            source_h,
+            (out_h as usize).div_ceil(2),
+            "chroma rows",
+        );
+    }
+}
+
+#[test]
+fn a_short_or_odd_input_is_refused_without_reading_past_it() {
+    // One byte short of `stride * height`: the libyuv call would panic, so
+    // the public entry point must refuse the buffer first.
+    let short = vec![0_u8; 8 * 4 * 4 - 1];
+    let mut output = I420Buffer::new(8, 4);
+    assert!(!convert_bgra_to_i420(&short, 8, 4, 32, &mut output));
+
+    // height = 1 is a usable source, but an odd destination is still refused.
+    let one_row = solid(2, 1, 8, [40, 200, 30, 255]);
+    let mut odd = I420Buffer::new(2, 1);
+    assert!(!convert_bgra_to_i420(&one_row, 2, 1, 8, &mut odd));
+    let mut even = I420Buffer::new(2, 2);
+    assert!(convert_bgra_to_i420(&one_row, 2, 1, 8, &mut even));
+    let (luma, _, _) = planes(&even);
+    assert!(luma.iter().all(|value| (126..=130).contains(value)));
 }
 
 #[test]
@@ -277,8 +485,14 @@ fn a_real_desktop_capture_delivers_a_frame() {
     assert_eq!(other, 0, "one display cannot be offered under two ids");
 
     let latest = std::sync::Arc::new(LatestImage::default());
-    let mut capture = ScreenCapture::start(source.clone(), (1280, 720), 30, latest.clone())
-        .expect("capture start");
+    let mut capture = ScreenCapture::start(
+        source.clone(),
+        (1280, 720),
+        30,
+        latest.clone(),
+        std::sync::Arc::new(PreviewDemand::default()),
+    )
+    .expect("capture start");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     let image = loop {
         if let Some(image) = latest.take() {
@@ -344,8 +558,8 @@ fn a_bgra_thumbnail_is_downscaled_to_a_bounded_picture() {
 
     // A caller cannot exceed the picker bound, and a small picture is never
     // upscaled.
-    let wide = solid(400, 8, 400 * 4, [10, 20, 30, 255]);
-    let bounded = preview_from_bgra(&wide, 400, 8, 400 * 4, 10_000).expect("bounded");
+    let wide = solid(800, 8, 800 * 4, [10, 20, 30, 255]);
+    let bounded = preview_from_bgra(&wide, 800, 8, 800 * 4, 10_000).expect("bounded");
     assert_eq!(bounded.width, MAX_THUMBNAIL_WIDTH);
     let small = preview_from_bgra(&source, 16, 8, 16 * 4, 16).expect("small");
     assert_eq!((small.width, small.height), (16, 8));
@@ -354,6 +568,121 @@ fn a_bgra_thumbnail_is_downscaled_to_a_bounded_picture() {
     assert!(preview_from_bgra(&[], 16, 8, 16 * 4, 8).is_none());
     assert!(preview_from_bgra(&source, 16, 8, 8, 8).is_none());
     assert!(preview_from_bgra(&source, 0, 8, 16 * 4, 8).is_none());
+}
+
+/// A frame with a distinct label at every edge and magenta bytes in the row
+/// padding. Any leaked padding or cropped edge is visible in the preview.
+fn marked_frame(width: u32, height: u32, stride: u32) -> Vec<u8> {
+    const RED: [u8; 4] = [0, 0, 255, 255];
+    const GREEN: [u8; 4] = [0, 255, 0, 255];
+    const BLUE: [u8; 4] = [255, 0, 0, 255];
+    const YELLOW: [u8; 4] = [0, 255, 255, 255];
+    const PADDING: [u8; 4] = [0xEE, 0x00, 0xEE, 0x7F];
+    let mut bytes = vec![0_u8; stride as usize * height as usize];
+    for y in 0..height as usize {
+        let row = y * stride as usize;
+        for x in 0..stride as usize / 4 {
+            let pixel = if x < width as usize {
+                [0, 0, 0, 255]
+            } else {
+                PADDING
+            };
+            bytes[row + x * 4..row + x * 4 + 4].copy_from_slice(&pixel);
+        }
+    }
+    let put = |bytes: &mut [u8], x: usize, y: usize, pixel: [u8; 4]| {
+        let at = y * stride as usize + x * 4;
+        bytes[at..at + 4].copy_from_slice(&pixel);
+    };
+    let band = (width.min(height) / 10).max(2) as usize;
+    for y in 0..height as usize {
+        for x in 0..band {
+            put(&mut bytes, x, y, RED);
+        }
+        for x in (width as usize - band)..width as usize {
+            put(&mut bytes, x, y, GREEN);
+        }
+    }
+    for y in 0..band {
+        for x in 0..width as usize {
+            put(&mut bytes, x, y, BLUE);
+        }
+    }
+    for y in (height as usize - band)..height as usize {
+        for x in 0..width as usize {
+            put(&mut bytes, x, y, YELLOW);
+        }
+    }
+    bytes
+}
+
+/// P01: every source aspect keeps all four marked edges through the padded
+/// BGRA path, and the row padding never enters the preview.
+#[test]
+fn padded_bgra_previews_keep_the_frame_geometry_and_all_four_edges() {
+    let aspects = [
+        (160_u32, 90_u32, 16.0 / 9.0),
+        (90, 160, 9.0 / 16.0),
+        (160, 120, 4.0 / 3.0),
+        (168, 72, 21.0 / 9.0),
+    ];
+    for (width, height, aspect) in aspects {
+        let stride = width * 4 + 13;
+        let source = marked_frame(width, height, stride);
+        let preview = preview_from_bgra(&source, width, height, stride, MAX_THUMBNAIL_WIDTH)
+            .expect("thumbnail");
+        assert_eq!(
+            (preview.width, preview.height),
+            (width, height),
+            "a frame inside the request rectangle is never upscaled"
+        );
+        assert_eq!(
+            preview.bgra.len(),
+            (width * height * 4) as usize,
+            "the preview has no row padding"
+        );
+        let ratio = f64::from(preview.width) / f64::from(preview.height);
+        assert!(
+            (ratio - aspect).abs() < 0.02,
+            "{width}×{height} became {ratio}"
+        );
+        let pixel = |x: u32, y: u32| {
+            let at = (y * preview.width + x) as usize * 4;
+            &preview.bgra[at..at + 4]
+        };
+        let (mid_x, mid_y) = (width / 2, height / 2);
+        let red = pixel(0, mid_y);
+        let green = pixel(width - 1, mid_y);
+        let blue = pixel(mid_x, 0);
+        let yellow = pixel(mid_x, height - 1);
+        assert!(red[2] > 150 && red[0] < 60, "left edge: {red:?}");
+        assert!(green[1] > 150 && green[2] < 60, "right edge: {green:?}");
+        assert!(blue[0] > 150 && blue[2] < 60, "top edge: {blue:?}");
+        assert!(
+            yellow[1] > 150 && yellow[2] > 150,
+            "bottom edge: {yellow:?}"
+        );
+        // The row padding is magenta (0xEE, 0x00, 0xEE) with alpha 0x7F. A
+        // leaked pixel keeps that exact signature; the frame itself only uses
+        // red, green, blue, yellow and black, so a magenta family check
+        // catches a partial copy as well.
+        assert!(
+            !preview
+                .bgra
+                .chunks_exact(4)
+                .any(|pixel| pixel[0] >= 0xE0 && pixel[1] <= 0x20 && pixel[2] >= 0xE0),
+            "row padding leaked into the preview"
+        );
+    }
+
+    // A tall source is bounded by the 270 px side of the request rectangle
+    // and still keeps its edges and aspect ratio.
+    let source = marked_frame(160, 400, 160 * 4 + 9);
+    let preview = preview_from_bgra(&source, 160, 400, 160 * 4 + 9, MAX_THUMBNAIL_WIDTH)
+        .expect("tall thumbnail");
+    assert!(preview.width <= MAX_THUMBNAIL_WIDTH);
+    assert_eq!(preview.height, MAX_THUMBNAIL_HEIGHT);
+    assert!((f64::from(preview.width) / f64::from(preview.height) - 0.4).abs() < 0.02);
 }
 
 /// Manual proof on a real desktop: one monitor or window delivers a thumbnail.
@@ -453,4 +782,95 @@ fn a_monitor_source_identity_ignores_its_mutable_label() {
         ..source.clone()
     };
     assert_ne!(source.focus_key(), other.focus_key());
+}
+
+/// The capture thread prepares at most ten previews per second, whatever the
+/// capture frame rate is. A fake clock keeps the assertion exact.
+#[test]
+fn the_preview_throttle_prepares_at_most_ten_frames_per_second() {
+    let demand = PreviewDemand::default();
+    demand.request(320);
+    let mut throttle = PreviewThrottle::default();
+    let base = Instant::now();
+    let prepared = (0..60_u64)
+        .filter(|index| {
+            let now = base + Duration::from_micros(index * 16_667);
+            throttle.poll(now, &demand).is_some()
+        })
+        .count();
+    assert_eq!(prepared, 10, "one second of 60 FPS capture");
+}
+
+/// A disabled demand converts nothing and clears the pacing, so showing the
+/// card again starts with an immediate frame.
+#[test]
+fn a_disabled_demand_prepares_nothing() {
+    let demand = PreviewDemand::default();
+    let mut throttle = PreviewThrottle::default();
+    let base = Instant::now();
+    for index in 0..60_u64 {
+        let now = base + Duration::from_micros(index * 16_667);
+        assert_eq!(throttle.poll(now, &demand), None, "no request, no preview");
+    }
+    demand.request(320);
+    assert_eq!(
+        throttle.poll(base + Duration::from_secs(1), &demand),
+        Some(320)
+    );
+    demand.disable();
+    assert_eq!(throttle.poll(base + Duration::from_secs(2), &demand), None);
+    demand.request(320);
+    assert_eq!(
+        throttle.poll(base + Duration::from_secs(2), &demand),
+        Some(320),
+        "re-enabling prepares the next frame without waiting out the window"
+    );
+}
+
+/// The prepared width follows the newest request and the store bound.
+#[test]
+fn the_preview_width_follows_the_demand() {
+    let demand = PreviewDemand::default();
+    demand.request(320);
+    let mut throttle = PreviewThrottle::default();
+    let start = Instant::now();
+    assert_eq!(throttle.poll(start, &demand), Some(320));
+
+    let later = start + Duration::from_millis(100);
+    demand.request(480);
+    assert_eq!(throttle.poll(later, &demand), Some(480));
+
+    let wider = later + Duration::from_millis(100);
+    demand.request(5000);
+    assert_eq!(
+        throttle.poll(wider, &demand),
+        Some(MAX_PREVIEW_WIDTH),
+        "a card wider than the bound asks for the bound"
+    );
+
+    let tiny = wider + Duration::from_millis(100);
+    demand.request(0);
+    assert_eq!(throttle.poll(tiny, &demand), Some(2));
+}
+
+/// `prepared` counts converted pictures only; the shown counter belongs to the
+/// card's take.
+#[test]
+fn the_prepared_counter_counts_published_pictures() {
+    let demand = PreviewDemand::default();
+    assert_eq!(demand.prepared(), 0);
+    let frame = PreviewFrame {
+        width: 2,
+        height: 2,
+        bgra: vec![0x20; 2 * 2 * 4],
+    };
+    assert!(demand.published_preview(Some(frame)).is_some());
+    assert_eq!(demand.prepared(), 1);
+    assert!(demand.published_preview(None).is_none());
+    assert_eq!(demand.prepared(), 1, "a skipped frame is not prepared");
+    demand.disable();
+    let mut throttle = PreviewThrottle::default();
+    assert_eq!(throttle.poll(Instant::now(), &demand), None);
+    demand.published_preview(None);
+    assert_eq!(demand.prepared(), 1);
 }

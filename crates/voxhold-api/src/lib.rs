@@ -465,7 +465,8 @@ where
     Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
 }
 macro_rules! dto {
-    ($name:ident { $($(#[$attr:meta])* $field:ident : $ty:ty),* $(,)? }) => {
+    ($(#[$dto_attr:meta])* $name:ident { $($(#[$attr:meta])* $field:ident : $ty:ty),* $(,)? }) => {
+        $(#[$dto_attr])*
         #[derive(Debug, Clone, Default, Serialize, Deserialize)]
         #[serde(default)]
         pub struct $name {
@@ -494,33 +495,46 @@ dto!(Channel {
     can_publish: bool,
     unread_count: i64
 });
-dto!(Author {
-    user_id: i64,
-    username: String
-});
-dto!(MessageReference {
-    message_id: i64,
-    author: Author,
-    content: String,
-    deleted: bool
-});
-dto!(Reaction {
-    emoji: String,
-    count: i32,
-    me: bool
-});
-dto!(Attachment {
-    id: String,
-    filename: String,
-    mime_type: String,
-    size_bytes: i64,
-    width: i32,
-    height: i32,
-    deleted: bool
-});
+dto!(
+    #[derive(PartialEq)]
+    Author {
+        user_id: i64,
+        username: String
+    }
+);
+dto!(
+    #[derive(PartialEq)]
+    MessageReference {
+        message_id: i64,
+        author: Author,
+        content: String,
+        deleted: bool
+    }
+);
+dto!(
+    #[derive(PartialEq)]
+    Reaction {
+        emoji: String,
+        count: i32,
+        me: bool
+    }
+);
+dto!(
+    #[derive(PartialEq)]
+    Attachment {
+        id: String,
+        filename: String,
+        mime_type: String,
+        size_bytes: i64,
+        width: i32,
+        height: i32,
+        deleted: bool
+    }
+);
 // Channel forwards can return the Go domain struct directly. Its top-level
 // field names differ from the regular message DTO, while nested data agrees.
-dto!(Message {
+dto!(#[derive(PartialEq)]
+Message {
     #[serde(alias = "ID")]
     id: i64,
     #[serde(alias = "ChannelID")]

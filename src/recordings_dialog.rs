@@ -226,7 +226,7 @@ pub struct DialogState {
     /// A one-shot focus move for the next rendered action ring. The handle is
     /// created during render, so an action handler cannot focus it directly.
     pub focus_request: Option<String>,
-    pub previews: ImageCache<String>,
+    pub previews: ImageCache<String, std::sync::Arc<RenderImage>>,
     pub preview_pending: HashSet<String>,
     pub preview_retry: HashMap<String, Instant>,
     pub preview_generation: u64,

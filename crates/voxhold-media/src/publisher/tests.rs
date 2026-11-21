@@ -862,6 +862,7 @@ fn a_cancelled_start_never_opens_a_capture() {
         Vec::new(),
         "all".into(),
         Arc::new(PreviewStore::default()),
+        Arc::new(crate::screen_capture::PreviewDemand::default()),
         &cancelled,
     ) {
         Ok(_) => panic!("a cancelled start must not open a device"),

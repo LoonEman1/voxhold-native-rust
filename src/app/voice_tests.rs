@@ -623,7 +623,7 @@ async fn the_room_and_player_use_the_real_layout_coordinates(cx: &mut TestAppCon
 #[gpui::test]
 async fn unconfirmed_access_hides_the_active_room_and_blocks_join(cx: &mut TestAppContext) {
     let (mut visual, view, voice) = fixture(cx);
-    visual.update(|_, app| {
+    visual.update(|_window, app| {
         voice.update(app, |panel, _| {
             panel.test_set_streams(vec![publication(7, "alice", 1)]);
         });
@@ -652,9 +652,9 @@ async fn unconfirmed_access_hides_the_active_room_and_blocks_join(cx: &mut TestA
         assert_eq!(panel.test_visible_streams_len(), 0);
         assert!(!panel.test_audio_for("alice"));
     });
-    visual.update(|_, app| {
+    visual.update(|window, app| {
         voice.update(app, |panel, cx| {
-            panel.join(cx);
+            panel.join(window, cx);
             assert!(panel.error().contains("не подтверждены"));
         });
     });
@@ -704,7 +704,7 @@ async fn ended_in_fullscreen_restores_the_window_and_closes_the_player(cx: &mut 
 #[gpui::test]
 async fn voice_participants_are_listed_under_their_channel(cx: &mut TestAppContext) {
     let (mut visual, view, _voice) = fixture(cx);
-    visual.update(|_, app| {
+    visual.update(|_window, app| {
         view.update(app, |v, cx| {
             let mut bob = participant("bob", 2);
             bob.self_mute = true;
@@ -859,7 +859,7 @@ async fn closing_the_dialog_stops_the_voice_meter(cx: &mut TestAppContext) {
 async fn the_room_keeps_the_current_palette(cx: &mut TestAppContext) {
     let (visual, view, voice) = fixture(cx);
     // A real theme switch reaches an already running panel.
-    visual.update(|_, app| {
+    visual.update(|_window, app| {
         view.update(app, |v, cx| {
             v.theme_path = None;
             v.apply_theme(crate::theme::ThemeMode::Light, cx);
@@ -887,7 +887,7 @@ async fn many_voice_members_keep_the_account_footer_visible(cx: &mut TestAppCont
     let roster: Vec<_> = (0..80)
         .map(|index| participant(&format!("member-{index}"), 100 + index))
         .collect();
-    visual.update(|_, app| {
+    visual.update(|_window, app| {
         view.update(app, |v, cx| {
             v.voice_rooms.insert((1, 7), roster);
             cx.notify();
@@ -1037,7 +1037,9 @@ async fn applied_audio_update_reaches_the_panel(cx: &mut TestAppContext) {
     );
     // Leaving the call must clear the diagnostic so a later attempt cannot
     // show the previous engine's mode.
-    voice.update(&mut *visual, |panel, cx| panel.leave_call(cx));
+    visual.update(|window, app| {
+        voice.update(app, |panel, cx| panel.leave_call(window, cx));
+    });
     voice.read_with(&*visual, |panel, _| {
         assert!(panel.applied_audio().is_none());
     });

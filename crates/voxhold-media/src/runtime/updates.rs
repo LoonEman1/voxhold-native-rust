@@ -6,8 +6,10 @@
 
 use std::{
     collections::{HashMap, VecDeque},
-    sync::Mutex,
+    sync::{Arc, Mutex},
 };
+
+use tokio::sync::Notify;
 
 use crate::{
     controller::{AppliedAudio, Participant, Publication},
@@ -118,12 +120,25 @@ impl VoiceUpdate {
 /// Coalescing update queue. Terminal updates are never merged into a snapshot.
 pub(crate) struct Updates {
     queue: Mutex<VecDeque<VoiceUpdate>>,
+    /// Wake of the panel that owns this queue. `None` for a test queue.
+    wake: Option<Arc<Notify>>,
 }
 
 impl Updates {
     pub(crate) fn new() -> Self {
         Self {
             queue: Mutex::new(VecDeque::new()),
+            wake: None,
+        }
+    }
+
+    /// A queue that wakes `wake` when an update turns it from empty into
+    /// non-empty. A burst into a queue the panel has not drained yet needs no
+    /// extra wake: the one pending wake already covers it.
+    pub(crate) fn with_wake(wake: Arc<Notify>) -> Self {
+        Self {
+            wake: Some(wake),
+            ..Self::new()
         }
     }
 
@@ -131,19 +146,26 @@ impl Updates {
         let Ok(mut queue) = self.queue.lock() else {
             return;
         };
+        let was_empty = queue.is_empty();
         if update.terminal() {
             queue.retain(|old| !old.terminal());
             queue.push_back(update);
-            return;
-        }
-        if let Some(slot) = queue.iter_mut().find(|old| old.same_slot(&update)) {
+        } else if let Some(slot) = queue.iter_mut().find(|old| old.same_slot(&update)) {
             *slot = update;
-            return;
+        } else {
+            if queue.len() >= UPDATE_CAPACITY {
+                queue.pop_front();
+            }
+            queue.push_back(update);
         }
-        if queue.len() >= UPDATE_CAPACITY {
-            queue.pop_front();
+        drop(queue);
+        // `notify_one` keeps a permit when the panel is between its poll and
+        // its wait, so an update that lands exactly in that window is not lost.
+        if was_empty {
+            if let Some(wake) = &self.wake {
+                wake.notify_one();
+            }
         }
-        queue.push_back(update);
     }
 
     pub(crate) fn poll(&self) -> Option<VoiceUpdate> {

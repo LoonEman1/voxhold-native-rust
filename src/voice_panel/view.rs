@@ -229,9 +229,9 @@ impl VoicePanel {
                     .justify_center()
                     .cursor_pointer()
                     .track_focus(focus)
-                    .on_click(
-                        cx.listener(move |panel, _, _, cx| panel.watch(publication.clone(), cx)),
-                    )
+                    .on_click(cx.listener(move |panel, _, window, cx| {
+                        panel.watch(publication.clone(), window, cx)
+                    }))
                     .child("Смотреть"),
             );
         }
@@ -422,6 +422,9 @@ impl VoicePanel {
         let roster = self.visible_roster();
         let streams = self.visible_streams();
         let sharing = self.screen_card_active();
+        // The preview demand follows the card of this frame. A card that is no
+        // longer painted must not keep the request of an older paint alive.
+        self.screen_card_rect = None;
         let own_cards = usize::from(sharing);
         let count = roster.len() + streams.len() + own_cards;
         let geometry = voice_room::room_geometry(
@@ -436,7 +439,7 @@ impl VoicePanel {
         let mut index = 0;
         if sharing {
             if let Some(rect) = geometry.cards.first() {
-                if let Some(card) = self.screen_card(*rect, cx) {
+                if let Some(card) = self.screen_card(*rect, geometry.viewport, cx) {
                     children.push(card);
                 }
             }
@@ -725,7 +728,7 @@ impl VoicePanel {
                     .justify_center()
                     .cursor_pointer()
                     .track_focus(&self.join_focus)
-                    .on_click(cx.listener(|panel, _, _, cx| panel.join(cx)))
+                    .on_click(cx.listener(|panel, _, window, cx| panel.join(window, cx)))
                     .child("Подключиться"),
             );
         }
@@ -780,8 +783,8 @@ fn initials(name: &str) -> String {
 }
 
 impl Render for VoicePanel {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let root = div()
             .id("voice-panel")
             .track_focus(&self.focus)
             .key_context("VoiceRoom")
@@ -802,6 +805,12 @@ impl Render for VoicePanel {
                 cx.stop_propagation();
             }))
             .size_full()
-            .child(self.room_body(cx))
+            .child(self.room_body(cx));
+        // The card rect of this frame is known only now. Syncing here keeps the
+        // preview demand on the painted card without the removed 100 ms poll:
+        // a card scrolled in starts, a hidden or minimized one stops, and a
+        // repaint is not needed for the atomics.
+        self.sync_screen_preview_demand(window);
+        root
     }
 }

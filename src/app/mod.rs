@@ -10,6 +10,7 @@ mod composer;
 mod context_menus;
 mod history_actions;
 mod history_ops;
+mod history_rows;
 mod history_view;
 #[cfg(all(feature = "voxhold-media", test))]
 mod hotkey_tests;
@@ -66,6 +67,8 @@ mod voice_cue_tests;
 #[cfg(test)]
 mod voice_dock_tests;
 #[cfg(test)]
+mod voice_events_tests;
+#[cfg(test)]
 mod voice_form_tests;
 #[cfg(test)]
 mod voice_gain_tests;
@@ -77,13 +80,19 @@ mod voice_screen_confirmed_tests;
 #[cfg(test)]
 mod voice_screen_identity_tests;
 #[cfg(test)]
+mod voice_screen_image_tests;
+#[cfg(test)]
 mod voice_screen_operation_tests;
+#[cfg(test)]
+mod voice_screen_picker_tests;
 #[cfg(test)]
 mod voice_screen_preview_tests;
 #[cfg(test)]
 mod voice_screen_restart_tests;
 #[cfg(test)]
 mod voice_screen_tests;
+#[cfg(test)]
+mod voice_screen_visible_tests;
 mod voice_settings_ops;
 #[cfg(test)]
 mod voice_settings_tests;
@@ -114,7 +123,7 @@ use ui::{icon, ink};
 /// (id, body revision, reactions revision, date divider, grouped, unread,
 /// attachment epoch). The last four force a re-measure when only grouping, a
 /// divider or a server-side attachment deletion changes.
-type HistoryKey = (i64, i64, i64, String, bool, bool, u64);
+type HistoryKey = (i64, i64, i64, String, bool, bool, u64, u64);
 
 /// One in-flight send for a chat. The attempt number distinguishes two sends
 /// of the same chat; the abort handle stops the runtime task on logout. The
@@ -344,6 +353,8 @@ pub(crate) struct Voxhold {
     /// with the voice panel so the red marker and label read one snapshot.
     recordings_live: std::rc::Rc<std::cell::RefCell<Option<String>>>,
     voice_settings: crate::voice_settings::VoiceSettings,
+    #[cfg(feature = "voxhold-media")]
+    stream_preferences: crate::voice_panel::StreamPrefsStore,
     notifications: crate::notifications::NotificationCenter,
     notification_tray: crate::notifications::Tray,
     active_settings: Option<SettingsKind>,
@@ -433,6 +444,8 @@ pub(crate) struct Voxhold {
     messages: Vec<Message>,
     history_list: ListState,
     history_keys: Vec<HistoryKey>,
+    /// Prepared stable row data; rebuilt only when a history input changes.
+    history_rows: history_rows::HistoryRows,
     /// Bumped when the room chat opens or closes so a read scheduled for the
     /// previous surface cannot mark anything visible.
     chat_scope_epoch: u64,
@@ -698,6 +711,9 @@ impl Voxhold {
         let voice_path = shell_path
             .as_deref()
             .map(crate::voice_settings::path_from_layout);
+        #[cfg(feature = "voxhold-media")]
+        let stream_preferences =
+            crate::voice_panel::StreamPrefsStore::with_layout(shell_path.as_deref());
         let view = Self {
             runtime: std::sync::Arc::new(tokio::runtime::Runtime::new().expect("Tokio runtime")),
             instance: cx.new(|cx| {
@@ -781,6 +797,8 @@ impl Voxhold {
             recordings_preview_aborts: Vec::new(),
             recordings_live: std::rc::Rc::new(std::cell::RefCell::new(None)),
             voice_settings: crate::voice_settings::VoiceSettings::with_path(voice_path),
+            #[cfg(feature = "voxhold-media")]
+            stream_preferences,
             notifications: crate::notifications::NotificationCenter::with_path(notification_path),
             notification_tray: crate::notifications::Tray::default(),
             active_settings: None,
@@ -835,6 +853,7 @@ impl Voxhold {
             messages: vec![],
             history_list,
             history_keys: Vec::new(),
+            history_rows: Default::default(),
             chat_scope_epoch: 0,
             before: None,
             has_more: false,

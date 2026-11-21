@@ -698,15 +698,15 @@ async fn a_rotated_token_keeps_the_voice_handle_and_does_not_rejoin(cx: &mut Tes
 #[gpui::test]
 async fn a_call_joined_during_a_refresh_defers_its_first_authorization(cx: &mut TestAppContext) {
     let (visual, _view, voice) = super::super::voice_tests::fixture(cx);
-    visual.update(|_window, app| {
+    visual.update(|window, app| {
         voice.update(app, |panel, cx| {
             // The refresh starts while the user is not in a call, so no handle
             // carried the gate.
-            panel.leave_call(cx);
+            panel.leave_call(window, cx);
             panel.begin_token_rotation();
             // The user joins before the answer arrives. The new handle must
             // inherit the panel-level latch.
-            panel.test_join_detached(cx);
+            panel.test_join_detached(window, cx);
             assert_eq!(panel.call_channel(), 7);
             assert!(panel.test_handle_attempt().is_some());
             assert!(
@@ -731,10 +731,10 @@ async fn a_call_joined_during_a_refresh_defers_its_first_authorization(cx: &mut 
     });
 
     // A call joined after the answer has no reason to wait.
-    visual.update(|_window, app| {
+    visual.update(|window, app| {
         voice.update(app, |panel, cx| {
-            panel.leave_call(cx);
-            panel.test_join_detached(cx);
+            panel.leave_call(window, cx);
+            panel.test_join_detached(window, cx);
         });
     });
     voice.read_with(&*visual, |panel, _| {

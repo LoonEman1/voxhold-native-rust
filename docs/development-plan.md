@@ -754,6 +754,8 @@ http_active,thumb_bytes,link_bytes,recording_bytes,workers,peers,live_textures
 - Подключи пресеты `Рабочий стол/Игры/Фильмы/Своё` и фактические поля режима, codec, SDR, FPS, bitrate, audio. Раздели смену параметров на runtime reconfigure и restart по реальному `stream` контракту. Расширяй existing `StreamSettingsDialog` parity, текущие настройки не обещают неподдержанный codec.
 - Проверка Native publisher ↔ browser, отсутствие эха от mic, выключение системного звука в эфире, переход между quality и отмена. Запиши кодек, фактическое качество и тайминг renegotiation.
 
+Продолжение W04a для Windows SDR — [единый план доработки трансляций экрана](screen-streaming-plan.md). Он включает исправление предпросмотра, четыре веб-кодека, аппаратное кодирование, PiP внутри Voxhold и матрицу для `W13`.
+
 ### W04b · P2P публикация
 
 1. Расширь `publisher` режимом P2P, backend relay исполняет фактический `stream.p2p_*` контракт. Один source на экран, peer на каждого разрешённого viewer с ключом connection и generation; ограничения подключения, ICE order и MID/ufrag. Не плодить capture на число подписчиков.
@@ -879,6 +881,8 @@ http_active,thumb_bytes,link_bytes,recording_bytes,workers,peers,live_textures
 4. **UI и проверка.** Замок, код безопасности, окно обновления устройства, предупреждения screen/camera/записи согласно frontend `notices.ts`. Записанная серверная копия подтверждается отдельно. Проведи vector/negative tests неверного получателя, replay/nonce, rollover, смена ключа и 2 браузера ↔ Native. На обязательной политике capture gate подтверждается реальными encoded packets, декодированным PCM и отказом получателя с неверным ключом.
 
 ### W12 · HDR, высокий FPS и PiP
+
+PiP при переходах внутри Voxhold описан в [плане доработки трансляций](screen-streaming-plan.md#4-плавающий-просмотр-и-свой-эфир-при-навигации). Учитывай этот срез при реализации режима поверх других приложений.
 
 1. Capability по реальным display/encoder/decoder и backend. Проверь Windows HDR capture, 10-bit pipeline, color primaries/range/transfer, SDR tone map. Backend `internal/streamcontract/renditions.go` и веб `hdrPipeline.ts` описывают валидные рендиции, включая SDR fallback и совместимый VP9/AV1 HDR. Одно изменение режима отдельно от поддержки новых кодеков. Проверь две поверхности HDR и SDR синтетическими плашками.
 2. Измерь 1080p60/1440p60/4K60 и высокий FPS, если его поддерживает источник, одновременный экран/3 камеры и запись+стрим. Сохрани encode/decode/render, audio drift, frame drops, queue depth, capture CPU/GPU, private bytes. Zero-copy/shared D3D texture вводи при доказанном API/fence, наличии контролируемого fallback и измеримой выгоде. Размер очереди остаётся ограниченным даже во время перегруза.

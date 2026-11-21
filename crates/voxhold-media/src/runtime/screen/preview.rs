@@ -27,15 +27,17 @@ impl VoiceHandle {
         }
     }
 
-    /// `(prepared, shown)` preview counters of this attempt. `prepared` counts
-    /// converted pictures, `shown` counts pictures the card really took.
+    /// `(prepared, shown)` preview counters since this handle was created.
+    /// `prepared` counts converted pictures, `shown` counts pictures the card
+    /// really painted. The counters are not reset between attempts: the same
+    /// handle reuses one capture-side demand, and a late callback of a stopped
+    /// attempt would make a reset of the shared atomics incorrect.
     pub fn screen_preview_stats(&self) -> (u64, u64) {
         (self.screen_demand.prepared(), self.screen_demand.shown())
     }
 
     /// The newest local preview; only the on-air card reads it. Taking a frame
-    /// counts it as shown, including the case where the caller discards it
-    /// because the card is no longer painted.
+    /// counts it as shown.
     pub fn take_screen_frame(&self) -> Option<ScreenFrame> {
         let frame = self.screen_preview.take()?;
         self.screen_demand.mark_shown();
@@ -44,5 +46,13 @@ impl VoiceHandle {
             height: frame.height,
             bgra: frame.bgra,
         })
+    }
+
+    /// Drop any pending preview without counting it as shown. The card may
+    /// stop painting between the capture tick and this poll; the slot is
+    /// emptied anyway so a stale picture cannot reappear later, but such a
+    /// frame was never shown to the user.
+    pub fn discard_screen_frame(&self) -> bool {
+        self.screen_preview.take().is_some()
     }
 }

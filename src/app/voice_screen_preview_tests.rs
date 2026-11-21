@@ -843,9 +843,9 @@ async fn an_idle_phase_discards_the_pending_preview_frame(cx: &mut TestAppContex
                 "the frame was taken, not left in the shared slot"
             );
             assert_eq!(
-                panel.test_screen_preview_stats().1,
-                1,
-                "the media layer counted the take"
+                panel.test_screen_preview_stats(),
+                (0, 0),
+                "a discarded frame is not counted as shown"
             );
         });
     });
@@ -891,5 +891,91 @@ async fn the_preview_demand_follows_the_painted_card(cx: &mut TestAppContext) {
             let (enabled, _) = panel.test_screen_preview_demand().expect("a handle");
             assert!(!enabled, "Idle drops the request");
         });
+    });
+}
+
+/// The demand is released when the on-air card is scrolled completely out of
+/// the clipped room viewport: the card still exists in the grid but no pixel of
+/// it is visible, so no preview conversion is needed.
+#[gpui::test]
+async fn a_card_scrolled_out_of_the_viewport_requests_nothing(cx: &mut TestAppContext) {
+    use voxhold_media::publisher::{Phase, Sharing};
+    let (mut visual, _view, voice) = super::voice_tests::fixture_with(cx, Some(1400.), true);
+    draw(&mut visual);
+    visual.update(|_window, app| {
+        voice.update(app, |panel, _| {
+            panel.test_attach_detached_handle();
+            panel.test_set_screen_sharing(Sharing {
+                phase: Phase::Live,
+                live: true,
+                ..Sharing::default()
+            });
+            let roster: Vec<_> = (0..24)
+                .map(|index| super::voice_tests::participant(&format!("member-{index}"), index + 2))
+                .collect();
+            panel.test_set_call(
+                7,
+                crate::voice_room::CallPhase::Connected,
+                roster,
+                Vec::new(),
+            );
+            panel.test_set_room_scroll(f32::MAX);
+        });
+    });
+    draw(&mut visual);
+    visual.update(|window, app| {
+        voice.update(app, |panel, _| {
+            panel.test_sync_screen_preview_demand(window);
+            let (enabled, _) = panel.test_screen_preview_demand().expect("a handle");
+            assert!(
+                !enabled,
+                "a card scrolled fully out of view must not request a preview"
+            );
+        });
+    });
+}
+
+/// A Stop snapshot is applied before the demand sync of the same poll. Syncing
+/// the demand first would let the still-Live phase ask for one more capture
+/// interval after the card had already gone.
+#[gpui::test]
+async fn a_poll_applied_stop_does_not_re_enable_the_preview_demand(cx: &mut TestAppContext) {
+    use voxhold_media::publisher::{Phase, Sharing};
+    let (mut visual, _view, voice) = super::voice_tests::fixture_with(cx, Some(1400.), true);
+    draw(&mut visual);
+    visual.update(|_window, app| {
+        voice.update(app, |panel, _| {
+            panel.test_attach_detached_handle();
+            panel.test_set_screen_sharing(Sharing {
+                phase: Phase::Live,
+                live: true,
+                ..Sharing::default()
+            });
+        });
+    });
+    draw(&mut visual);
+    visual.update(|window, app| {
+        voice.update(app, |panel, _| {
+            panel.test_sync_screen_preview_demand(window);
+            assert!(
+                panel.test_screen_preview_demand().expect("a handle").0,
+                "the painted live card starts the demand"
+            );
+        });
+    });
+    // The worker answer of a Stop, still queued when the poll starts.
+    voice.read_with(&*visual, |panel, _| {
+        panel.test_push_screen_sharing(Sharing::default());
+    });
+    visual.update(|window, app| {
+        voice.update(app, |panel, cx| panel.test_poll(window, cx));
+    });
+    voice.read_with(&*visual, |panel, _| {
+        assert_eq!(panel.test_screen_phase(), Phase::Idle);
+        let (enabled, _) = panel.test_screen_preview_demand().expect("a handle");
+        assert!(
+            !enabled,
+            "a stop applied in this poll must not re-enable the preview"
+        );
     });
 }

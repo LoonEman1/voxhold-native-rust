@@ -32,6 +32,19 @@ pub(super) fn preview_request(
     Some((physical.min(MAX_PREVIEW_WIDTH as f32) as u32).clamp(2, MAX_PREVIEW_WIDTH))
 }
 
+/// Whether any part of `card` lies inside the clipped room viewport.
+///
+/// The card grid is painted in an `overflow_hidden` pane that scrolls with
+/// `room_scroll`; a card scrolled completely out of that pane still exists in
+/// the geometry but the user cannot see it. The preview demand follows only a
+/// visible card. A zero-area overlap (edges merely touching) counts as hidden.
+pub(super) fn card_in_viewport(card: Rect, viewport: Rect) -> bool {
+    card.right() > viewport.x
+        && card.x < viewport.right()
+        && card.bottom() > viewport.y
+        && card.y < viewport.bottom()
+}
+
 impl VoicePanel {
     /// Whether the local on-air card takes one room slot.
     pub(in crate::voice_panel) fn screen_card_active(&self) -> bool {
@@ -69,6 +82,7 @@ impl VoicePanel {
     pub(in crate::voice_panel) fn screen_card(
         &mut self,
         rect: Rect,
+        viewport: Rect,
         cx: &mut Context<Self>,
     ) -> Option<gpui::AnyElement> {
         let sharing = self.screen.sharing.clone();
@@ -80,8 +94,10 @@ impl VoicePanel {
             return None;
         }
         // The demand is computed from the rect this card is really painted at;
-        // a zero-sized card (a collapsed room pane) requests nothing.
-        self.screen_card_rect = Some(rect);
+        // a zero-sized card (a collapsed room pane) requests nothing, and a
+        // card scrolled completely out of the viewport requests nothing until
+        // it is painted again.
+        self.screen_card_rect = card_in_viewport(rect, viewport).then_some(rect);
         let c = self.colors();
         let live = sharing.phase == Phase::Live;
         let status = if live {
@@ -269,7 +285,7 @@ impl VoicePanel {
 
 #[cfg(test)]
 mod tests {
-    use super::preview_request;
+    use super::{card_in_viewport, preview_request};
     use crate::voice_room::Rect;
     use voxhold_media::screen_capture::MAX_PREVIEW_WIDTH;
 
@@ -329,6 +345,43 @@ mod tests {
             preview_request(true, false, Some(tiny), 1.0),
             Some(2),
             "the media layer never gets an unusable width"
+        );
+    }
+
+    #[test]
+    fn a_card_outside_the_scrolled_viewport_is_hidden() {
+        let viewport = Rect::new(24.0, 46.0, 800.0, 500.0);
+        let inside = Rect::new(100.0, 100.0, 320.0, 180.0);
+        assert!(card_in_viewport(inside, viewport));
+        // Partly visible is still shown and keeps the demand.
+        assert!(card_in_viewport(
+            Rect::new(viewport.right() - 40.0, 100.0, 320.0, 180.0),
+            viewport
+        ));
+        assert!(card_in_viewport(
+            Rect::new(viewport.x, viewport.bottom() - 40.0, 320.0, 180.0),
+            viewport
+        ));
+        // Scrolled fully above, below or sideways: no pixel is visible.
+        assert!(!card_in_viewport(
+            Rect::new(100.0, viewport.y - 200.0, 320.0, 180.0),
+            viewport
+        ));
+        assert!(!card_in_viewport(
+            Rect::new(100.0, viewport.bottom(), 320.0, 180.0),
+            viewport
+        ));
+        assert!(!card_in_viewport(
+            Rect::new(viewport.right(), 100.0, 320.0, 180.0),
+            viewport
+        ));
+        assert!(!card_in_viewport(
+            Rect::new(viewport.x - 320.0, 100.0, 320.0, 180.0),
+            viewport
+        ));
+        assert!(
+            !card_in_viewport(inside, Rect::new(24.0, 46.0, 0.0, 500.0)),
+            "a collapsed pane hides every card"
         );
     }
 }

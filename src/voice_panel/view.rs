@@ -439,7 +439,7 @@ impl VoicePanel {
         let mut index = 0;
         if sharing {
             if let Some(rect) = geometry.cards.first() {
-                if let Some(card) = self.screen_card(*rect, cx) {
+                if let Some(card) = self.screen_card(*rect, geometry.viewport, cx) {
                     children.push(card);
                 }
             }

@@ -1021,21 +1021,22 @@ impl VoicePanel {
     /// running in the poll before the next repaint, so the renderer never
     /// paints a picture whose entry was already dropped.
     ///
-    /// While no card is painted (Idle, a failed stop, a hidden phase) the
-    /// frame is taken and discarded: the media layer already counted it as
-    /// shown, and a leftover frame must not reappear when the card returns.
-    /// No `RenderImage` is created for it.
+    /// While no card is painted (Idle, a failed stop, a hidden phase) or the
+    /// card is scrolled outside the room viewport, the pending frame is drained
+    /// without being counted as shown: the media layer must not report a
+    /// picture the user never saw, and a leftover frame must not reappear when
+    /// the card returns. No `RenderImage` is created for it.
     pub(super) fn take_screen_preview(&mut self, window: &mut Window) -> bool {
-        let Some(frame) = self
-            .handle
-            .as_ref()
-            .and_then(|handle| handle.take_screen_frame())
-        else {
+        let Some(handle) = &self.handle else {
             return false;
         };
-        if !self.screen_card_active() {
+        if !self.screen_card_active() || self.screen_card_rect.is_none() {
+            handle.discard_screen_frame();
             return false;
         }
+        let Some(frame) = handle.take_screen_frame() else {
+            return false;
+        };
         let Some(buffer) = image::RgbaImage::from_raw(frame.width, frame.height, frame.bgra) else {
             return false;
         };

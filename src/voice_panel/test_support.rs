@@ -789,6 +789,12 @@ impl VoicePanel {
         self.take_screen_preview(window)
     }
 
+    /// Run the production poll once, so a test covers the order of update
+    /// application, demand sync and frame take rather than just the helpers.
+    pub fn test_poll(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.poll(window, cx);
+    }
+
     /// `(prepared, shown)` of the shared preview demand.
     pub fn test_screen_preview_stats(&self) -> (u64, u64) {
         self.handle
@@ -813,6 +819,12 @@ impl VoicePanel {
     /// Run the production demand sync for the last painted card.
     pub fn test_sync_screen_preview_demand(&self, window: &Window) {
         self.sync_screen_preview_demand(window);
+    }
+
+    /// Scroll the room grid before the next paint, so a card can be moved out
+    /// of the clipped viewport without a synthetic wheel event.
+    pub fn test_set_room_scroll(&mut self, scroll: f32) {
+        self.room_scroll = scroll;
     }
 
     /// Install an incoming player frame through the production setter.

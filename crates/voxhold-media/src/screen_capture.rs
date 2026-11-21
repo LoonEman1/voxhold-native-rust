@@ -465,7 +465,8 @@ impl PreviewStore {
 /// runtime and the capture thread. Every field is an atomic: the UI thread
 /// never waits for a worker, and the capture callback reads the newest value
 /// without a lock. The counters are diagnostic only and are read through
-/// `VoiceHandle::screen_preview_stats`.
+/// `VoiceHandle::screen_preview_stats`; they cover the handle lifetime and are
+/// not reset when one publication replaces another.
 #[derive(Default)]
 pub struct PreviewDemand {
     enabled: AtomicBool,

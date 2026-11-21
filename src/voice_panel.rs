@@ -139,9 +139,10 @@ pub struct VoicePanel {
     can_stream: bool,
     /// Screen-share picker, on-air card and preview.
     screen: ScreenShareUi,
-    /// Rect of the on-air card painted by the last frame. The preview demand of
-    /// the media capture is computed from it on the 100 ms poll, the same
-    /// cadence at which the card takes a frame.
+    /// Rect of the visible on-air card painted by the last frame. The preview
+    /// demand of the media capture is computed from it on the 100 ms poll, the
+    /// same cadence at which the card takes a frame. `None` while the card is
+    /// not painted or is scrolled completely out of the room viewport.
     screen_card_rect: Option<Rect>,
     /// Monotonic id of the newest screen-audio probe. A slower, older probe
     /// must not overwrite the availability of a newer dialog.
@@ -1044,19 +1045,14 @@ impl VoicePanel {
 
     fn poll(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.sync_viewport();
-        // The card's request is refreshed before the newest frame is taken, so
-        // a hidden or minimized card stops the conversion on the next capture
-        // tick instead of after a frame nobody paints.
-        self.sync_screen_preview_demand(window);
-        let preview_changed = self.take_screen_preview(window);
         let clock_changed = self.live_clock_changed();
         let Some(handle) = &self.handle else {
-            if preview_changed || clock_changed {
+            if clock_changed {
                 cx.notify();
             }
             return;
         };
-        let mut changed = preview_changed || clock_changed;
+        let mut changed = clock_changed;
         let mut updates = Vec::new();
         while let Some(update) = handle.try_update() {
             updates.push(update);
@@ -1080,6 +1076,12 @@ impl VoicePanel {
                 changed = true;
             }
         }
+        // The demand follows the phase this poll just applied, not the one the
+        // previous frame painted. A Stop answer clears the card in the same
+        // tick; syncing before the updates would ask for one more capture
+        // interval of a preview nobody shows.
+        self.sync_screen_preview_demand(window);
+        changed |= self.take_screen_preview(window);
         if changed {
             cx.notify();
         }

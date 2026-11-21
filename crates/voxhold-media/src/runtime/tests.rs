@@ -930,6 +930,23 @@ fn the_preview_demand_and_the_shown_counter_belong_to_the_handle() {
     );
     assert_eq!(handle.screen_preview_stats().1, 1);
 
+    // A frame drained while no card paints is not a shown picture.
+    handle.push_screen_preview_for_tests(crate::screen_capture::PreviewFrame {
+        width: 2,
+        height: 2,
+        bgra: vec![0x30; 2 * 2 * 4],
+    });
+    assert!(
+        handle.discard_screen_frame(),
+        "the pending picture is drained"
+    );
+    assert_eq!(
+        handle.screen_preview_stats(),
+        (0, 1),
+        "a discarded frame is not counted as shown"
+    );
+    assert!(!handle.discard_screen_frame(), "the slot is empty again");
+
     handle.set_screen_preview_demand(None);
     assert!(!handle.screen_preview_demand_for_tests().is_enabled());
 }

@@ -272,6 +272,36 @@ impl VoicePanel {
         self.screen.insert_preview(identity, frame)
     }
 
+    /// Adopt a new physical card width exactly like the first picker frame
+    /// after a DPI or size change.
+    pub fn test_set_preview_width(&mut self, width: u32, cx: &mut Context<Self>) {
+        self.set_thumbnail_width(width, cx);
+    }
+
+    /// The request width currently derived from the card and Windows scale.
+    pub fn test_screen_preview_width(&self) -> u32 {
+        self.screen.preview_width
+    }
+
+    /// Put the request width back without a generation change, so a test can
+    /// model a picker that started at 100% and then moved to another monitor.
+    pub fn test_force_preview_width(&mut self, width: u32) {
+        self.screen.preview_width = width.clamp(2, super::screen_share::SCREEN_THUMBNAIL_WIDTH);
+    }
+
+    /// Model the visible grid rows of the last layout, so a test can observe
+    /// that captures prioritize the cards on screen.
+    pub fn test_set_preview_viewport(&mut self, columns: usize, top: usize, bottom: usize) {
+        self.screen.preview_columns = columns.max(1);
+        self.screen.visible_rows = Some((top, bottom));
+    }
+
+    /// Vertical scroll range of the source grid. A positive value proves the
+    /// separate viewport really scrolls (and therefore paints a scrollbar).
+    pub fn test_screen_list_scrollable(&self) -> f32 {
+        f32::from(self.screen.list_scroll.max_offset().height)
+    }
+
     /// Inject a preview failure for one card without touching the selection.
     pub fn test_inject_screen_preview_error(&mut self, source: &ScreenSource, message: &str) {
         let Some(identity) = source.identity() else {
@@ -352,6 +382,14 @@ impl VoicePanel {
     pub fn test_screen_preview_error(&self, id: SourceId) -> Option<String> {
         let identity = self.screen.source_for(id)?.identity()?;
         self.screen.preview_failures.get(&identity).cloned()
+    }
+
+    /// Whether one card currently owns a cached picture.
+    pub fn test_screen_has_preview(&self, id: SourceId) -> bool {
+        self.screen
+            .source_for(id)
+            .and_then(ScreenSource::identity)
+            .is_some_and(|identity| self.screen.previews.contains_key(&identity))
     }
 
     /// The hard bounds the cache enforces, for a test assertion.

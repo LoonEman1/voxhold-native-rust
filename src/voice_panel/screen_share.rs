@@ -40,9 +40,15 @@ pub(crate) const SOURCE_CHANGED_REASON: &str =
 /// It still does not allow publishing more than one stream in this stage.
 pub(crate) const MULTI_STREAMS_SUPPORTED: bool = true;
 
-/// Width requested from the media layer for one picker card. The media layer
+/// Largest thumbnail width requested from the media layer. The media layer
 /// clamps it again, so a caller cannot grow the cache.
-pub(super) const SCREEN_THUMBNAIL_WIDTH: u32 = 320;
+pub(super) const SCREEN_THUMBNAIL_WIDTH: u32 = 480;
+/// Largest thumbnail height. The pair is the `480×270` request rectangle.
+pub(super) const SCREEN_THUMBNAIL_HEIGHT: u32 = 270;
+/// Request width before the first picker frame knows the real card width and
+/// Windows scale. It matches the normal two-column card in logical pixels, so
+/// no test seam captures a 2 px placeholder.
+pub(super) const SCREEN_THUMBNAIL_DEFAULT_WIDTH: u32 = 288;
 /// Hard bound of the picker preview cache: at most 64 cards.
 pub(super) const MAX_SCREEN_PREVIEWS: usize = 64;
 /// Hard bound of all BGRA bytes kept for picker previews.
@@ -51,9 +57,12 @@ pub(super) const MAX_SCREEN_PREVIEW_BYTES: usize = 16 * 1024 * 1024;
 pub(super) const PREVIEW_MEMORY_REASON: &str = "Предпросмотр недоступен: превышен лимит памяти.";
 
 /// One cached card picture. `bytes` is the BGRA source size, so the budget
-/// stays comparable across sessions.
+/// stays comparable across sessions; `width`/`height` are the delivered frame
+/// dimensions and drive the explicit slot geometry.
 pub(super) struct PreviewThumb {
     pub(super) image: Arc<RenderImage>,
+    pub(super) width: u32,
+    pub(super) height: u32,
     pub(super) bytes: usize,
 }
 
@@ -150,6 +159,18 @@ pub(super) struct ScreenShareUi {
     /// Cards painted by the last frame, so a layout test can prove one card per
     /// source without relying on a single `debug_selector`.
     pub(super) preview_cards: usize,
+    /// Native width requested for new thumbnails, derived from the card width
+    /// and the current Windows scale. `0` before the first picker frame.
+    pub(super) preview_width: u32,
+    /// Columns of the currently painted grid. Focus scrolling maps a source
+    /// index to its grid row with this value.
+    pub(super) preview_columns: usize,
+    /// Visible grid rows of the last frame, so captures prioritize cards the
+    /// user can actually see.
+    pub(super) visible_rows: Option<(usize, usize)>,
+    /// Scroll state of the source grid; a focused row is scrolled into view
+    /// before the next paint.
+    pub(super) list_scroll: ScrollHandle,
     pub(super) ring: Vec<(FocusHandle, ShareKey)>,
     /// Set once the dialog focused its first ring element. The flag is reset
     /// with the dialog, so a repaint never steals focus back from the user.
@@ -195,6 +216,10 @@ impl Default for ScreenShareUi {
             preview_bytes: 0,
             preview_rejected: 0,
             preview_cards: 0,
+            preview_width: 0,
+            preview_columns: 2,
+            visible_rows: None,
+            list_scroll: ScrollHandle::new(),
             ring: Vec::new(),
             focus_placed: false,
         }
@@ -1096,6 +1121,7 @@ impl VoicePanel {
 mod audio_scope;
 mod card;
 mod dialog;
+mod picker;
 mod preview;
 mod selection;
 mod update;

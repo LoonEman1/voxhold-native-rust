@@ -11,8 +11,8 @@ use crate::voice_room::{
     TOOLBAR_ACTIONS, VOICE_ACTIONS,
 };
 use gpui::{
-    div, img, prelude::*, px, rgb, Context, FocusHandle, MouseButton, RenderImage, Subscription,
-    Window,
+    div, img, prelude::*, px, rgb, Context, FocusHandle, MouseButton, RenderImage, ScrollHandle,
+    Subscription, Window,
 };
 use std::{
     collections::{HashMap, HashSet},

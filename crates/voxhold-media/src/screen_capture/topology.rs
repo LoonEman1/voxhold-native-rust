@@ -370,6 +370,41 @@ mod tests {
         assert!(confirmed_mapping(&monitors, &sources).is_empty());
     }
 
+    /// P06: a display left of or above the primary monitor has negative
+    /// coordinates. Its identity still resolves and keeps the same positive
+    /// size, and moving it changes the focus key.
+    #[test]
+    fn a_display_with_negative_origin_resolves_with_its_full_size() {
+        let left = display("DISPLAY2", -1920, 1920, 1080);
+        let above = display("DISPLAY3", 0, 1920, 1080);
+        let above = MonitorIdentity {
+            bounds: rect(0, -1080, 1920, 1080),
+            work: rect(0, -1080, 1920, 1080),
+            ..above
+        };
+        let sources = [capturer(0, "DISPLAY2"), capturer(2, "DISPLAY3")];
+        let primary = display("DISPLAY1", 0, 1920, 1080);
+        assert_eq!(
+            resolve_monitor(
+                &left,
+                &[primary.clone(), left.clone(), above.clone()],
+                &sources
+            ),
+            Ok(0)
+        );
+        assert_eq!(
+            resolve_monitor(&above, &[primary, left.clone(), above.clone()], &sources),
+            Ok(2)
+        );
+        assert_eq!(left.size(), (1920, 1080));
+        assert_eq!(above.size(), (1920, 1080));
+        assert_ne!(left.focus_key(), above.focus_key());
+        assert_ne!(
+            left.focus_key(),
+            display("DISPLAY2", 0, 1920, 1080).focus_key()
+        );
+    }
+
     #[test]
     fn a_changed_display_geometry_requires_a_new_selection() {
         let a = display("DISPLAY1", 0, 1920, 1080);

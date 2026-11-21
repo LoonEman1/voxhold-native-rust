@@ -1,0 +1,457 @@
+//! Picker geometry and thumbnail-session regressions: explicit picture
+//! slots, measured text, separate scrolling, DPI generation and budget
+//! eviction. The cache/session rules themselves stay in
+//! `voice_screen_preview_tests`.
+
+use super::voice_screen_preview_tests::RecordingPreview;
+use super::voice_screen_tests::{draw, monitor, open_picker_with, wait_for};
+use gpui::TestAppContext;
+use voxhold_media::screen_capture::{ScreenSource, SourceKind};
+
+/// P05: when the byte budget is full, a card the user is looking at still wins
+/// over pictures scrolled out of view. The released card gets the honest
+/// memory reason instead of silently keeping the budget inflated.
+#[gpui::test]
+async fn a_visible_thumbnail_evicts_hidden_cards_instead_of_missing_the_budget(
+    cx: &mut TestAppContext,
+) {
+    let (mut visual, _view, voice) = super::voice_tests::fixture_with(cx, Some(1400.), true);
+    draw(&mut visual);
+    let sources: Vec<ScreenSource> = (0..40)
+        .map(|index| monitor(3 + index * 2, "Экран", 1920, 1080))
+        .collect();
+    let visible_id = sources[0].source_id();
+    let picker = sources.clone();
+    visual.update(|_window, app| {
+        voice.update(app, |panel, _| {
+            panel.test_attach_detached_handle();
+            panel.test_open_screen_picker_with(SourceKind::Monitor, picker, None);
+        });
+    });
+    draw(&mut visual);
+    visual.update(|_window, app| {
+        voice.update(app, |panel, _| {
+            // Fill the cache with off-screen rows first.
+            for source in sources.iter().skip(2) {
+                panel.test_inject_screen_preview(source, 480, 270);
+            }
+            let (_, max_bytes) = panel.test_screen_preview_bounds();
+            assert!(
+                panel.test_screen_preview_counts().1 + 480 * 270 * 4 > max_bytes,
+                "the cache is full to within one picture"
+            );
+            // The card in the visible first row must still be admitted.
+            assert!(panel.test_inject_screen_preview(&sources[0], 480, 270));
+            let (count, bytes) = panel.test_screen_preview_counts();
+            assert!(count <= 64);
+            assert!(bytes <= max_bytes, "the byte bound is still enforced");
+            assert!(
+                panel.test_screen_has_preview(visible_id),
+                "the visible card owns its picture"
+            );
+            let evicted = sources
+                .iter()
+                .skip(2)
+                .filter_map(|source| panel.test_screen_preview_error(source.source_id()))
+                .any(|reason| reason.contains("лимит памяти"));
+            assert!(evicted, "an off-screen picture was released with a reason");
+        });
+    });
+}
+
+#[derive(Clone, Copy)]
+struct Rect {
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+}
+
+impl Rect {
+    fn right(self) -> f32 {
+        self.x + self.w
+    }
+
+    fn bottom(self) -> f32 {
+        self.y + self.h
+    }
+}
+
+fn bounds(visual: &mut gpui::VisualTestContext, selector: &'static str) -> Rect {
+    let bounds = visual
+        .debug_bounds(selector)
+        .unwrap_or_else(|| panic!("{selector} is painted"));
+    Rect {
+        x: f32::from(bounds.origin.x),
+        y: f32::from(bounds.origin.y),
+        w: f32::from(bounds.size.width),
+        h: f32::from(bounds.size.height),
+    }
+}
+
+/// One picture inside its slot: same scale on both axes, fully inside the
+/// mask, margins equal on the constrained axis.
+fn assert_frame_fits_slot(
+    visual: &mut gpui::VisualTestContext,
+    key: &str,
+    id: u64,
+    frame_w: f32,
+    frame_h: f32,
+) {
+    let slot = bounds(
+        visual,
+        Box::leak(format!("share-slot-{key}-{id}").into_boxed_str()),
+    );
+    let image = bounds(
+        visual,
+        Box::leak(format!("share-thumb-{key}-{id}").into_boxed_str()),
+    );
+    let scale = (slot.w / frame_w).min(slot.h / frame_h);
+    assert!(
+        (image.w - frame_w * scale).abs() < 0.75 && (image.h - frame_h * scale).abs() < 0.75,
+        "{key}-{id}: image {}×{}, expected {}×{}",
+        image.w,
+        image.h,
+        frame_w * scale,
+        frame_h * scale
+    );
+    assert!(image.x >= slot.x - 0.25);
+    assert!(image.y >= slot.y - 0.25);
+    assert!(image.right() <= slot.right() + 0.25);
+    assert!(image.bottom() <= slot.bottom() + 0.25);
+    let left = image.x - slot.x;
+    let right = slot.w - left - image.w;
+    let top = image.y - slot.y;
+    let bottom = slot.h - top - image.h;
+    if left + right > 1. {
+        assert!(
+            (left - right).abs() < 0.75,
+            "horizontal margins {left}/{right}"
+        );
+    }
+    if top + bottom > 1. {
+        assert!(
+            (top - bottom).abs() < 0.75,
+            "vertical margins {top}/{bottom}"
+        );
+    }
+}
+
+/// P02: a 16:9, portrait and ultrawide frame are each fully visible inside an
+/// explicit slot at both the normal two-column and the narrow one-column
+/// width. The checked bounds are the painted image bounds, not the source
+/// aspect: the old percentage-sized `Contain` image was larger than its mask.
+#[gpui::test]
+async fn every_preview_aspect_keeps_all_edges_at_normal_and_narrow_widths(cx: &mut TestAppContext) {
+    let frames = [(320_u32, 180_u32), (90, 160), (420, 180)];
+    for width in [1400., 520.] {
+        let (mut visual, _view, voice) = super::voice_tests::fixture_with(cx, Some(width), true);
+        draw(&mut visual);
+        let sources = vec![
+            monitor(3, "Экран A", 1920, 1080),
+            monitor(5, "Экран B", 1080, 1920),
+            monitor(7, "Экран C", 3440, 1440),
+        ];
+        visual.update(|_window, app| {
+            voice.update(app, |panel, _| {
+                panel.test_attach_detached_handle();
+                panel.test_open_screen_picker_with(SourceKind::Monitor, sources.clone(), None);
+                for (source, (w, h)) in sources.iter().zip(frames) {
+                    assert!(panel.test_inject_screen_preview(source, w, h));
+                }
+            });
+        });
+        draw(&mut visual);
+        for (source, (w, h)) in sources.iter().zip(frames) {
+            assert_frame_fits_slot(&mut visual, "monitor", source.id, w as f32, h as f32);
+        }
+    }
+}
+
+/// P04: the title and size get the measured card width minus the footer
+/// padding. A short label is not ellipsized by a zero-width text block, the
+/// long title still truncates, and the error phrase has room for two lines.
+#[gpui::test]
+async fn the_card_text_block_is_measured_from_the_card_width(cx: &mut TestAppContext) {
+    let (mut visual, _view, voice) = super::voice_tests::fixture_with(cx, Some(1400.), true);
+    draw(&mut visual);
+    let short = monitor(3, "Экран 1", 1920, 1080);
+    let long = monitor(
+        5,
+        "Очень длинное кириллическое название окна с документом и вкладками",
+        2560,
+        1440,
+    );
+    let unknown = monitor(7, "Экран 3", 0, 0);
+    visual.update(|_window, app| {
+        voice.update(app, |panel, _| {
+            panel.test_attach_detached_handle();
+            panel.test_open_screen_picker_with(
+                SourceKind::Monitor,
+                vec![short.clone(), long.clone(), unknown.clone()],
+                None,
+            );
+            panel.test_inject_screen_preview_error(
+                &long,
+                "Предпросмотр недоступен: превышен лимит памяти.",
+            );
+        });
+    });
+    draw(&mut visual);
+    for source in [&short, &long, &unknown] {
+        let card = bounds(
+            &mut visual,
+            Box::leak(format!("share-source-card-monitor-{}", source.id).into_boxed_str()),
+        );
+        let title = bounds(
+            &mut visual,
+            Box::leak(format!("share-title-monitor-{}", source.id).into_boxed_str()),
+        );
+        let size = bounds(
+            &mut visual,
+            Box::leak(format!("share-size-monitor-{}", source.id).into_boxed_str()),
+        );
+        let inner = card.w - 2.;
+        assert!(
+            (title.w - (inner - 12.)).abs() < 0.75,
+            "title of {} uses the footer content width: {} vs {}",
+            source.id,
+            title.w,
+            inner - 12.
+        );
+        assert!((size.w - (inner - 12.)).abs() < 0.75);
+        assert!(size.y >= title.y);
+        assert!(size.bottom() <= card.bottom() + 0.25);
+    }
+
+    // The failed card paints a two-line reason inside the reserved footer.
+    let card = bounds(&mut visual, "share-source-card-monitor-5");
+    let reason = bounds(&mut visual, "share-thumb-error-line-monitor-5");
+    assert!(reason.y >= card.y);
+    assert!(reason.bottom() <= card.bottom() + 0.25);
+
+    // The full title is reachable by hover. The tooltip is a window-level view,
+    // so neither the card mask nor the scroll viewport clips it.
+    let title = bounds(&mut visual, "share-title-monitor-5");
+    let position = gpui::point(
+        gpui::px(title.x + title.w / 2.),
+        gpui::px(title.y + title.h / 2.),
+    );
+    visual.simulate_mouse_move(position, None, gpui::Modifiers::default());
+    visual
+        .executor()
+        .advance_clock(std::time::Duration::from_millis(650));
+    visual.run_until_parked();
+    draw(&mut visual);
+    assert!(
+        visual.debug_bounds("share-title-tooltip").is_some(),
+        "hover reveals the full source title"
+    );
+}
+
+/// P03/P04: several rows scroll in a separate viewport with a real scroll
+/// range; a wheel and the Tab ring both reach the last card, which is fully
+/// inside the viewport. The action row stays outside the scroll area.
+#[gpui::test]
+async fn the_last_card_is_reachable_by_wheel_and_tab_and_actions_stay_visible(
+    cx: &mut TestAppContext,
+) {
+    let (mut visual, _view, voice) = super::voice_tests::fixture_with(cx, Some(1400.), true);
+    draw(&mut visual);
+    let sources: Vec<ScreenSource> = (0..7)
+        .map(|index| monitor(3 + index * 2, "Экран", 1920, 1080))
+        .collect();
+    open_picker_with(&mut visual, &voice, SourceKind::Monitor, sources.clone());
+    let list = bounds(&mut visual, "share-sources");
+    let first = bounds(&mut visual, "share-source-card-monitor-3");
+    assert!(first.y >= list.y - 0.25);
+    assert!(
+        first.bottom() <= list.bottom() + 0.25,
+        "a normal picker shows one whole card"
+    );
+    let scrollable = voice.read_with(&*visual, |panel, _| panel.test_screen_list_scrollable());
+    assert!(
+        scrollable > 0.5,
+        "the multi-row list has a real scroll range"
+    );
+
+    let center = gpui::point(
+        gpui::px(list.x + list.w / 2.),
+        gpui::px(list.y + list.h / 2.),
+    );
+    visual.simulate_event(gpui::ScrollWheelEvent {
+        position: center,
+        // A negative Y delta moves the list towards later rows.
+        delta: gpui::ScrollDelta::Pixels(gpui::point(gpui::px(0.), gpui::px(-2000.))),
+        ..Default::default()
+    });
+    draw(&mut visual);
+    let last = bounds(&mut visual, "share-source-card-monitor-15");
+    assert!(last.y >= list.y - 0.25, "last card top");
+    assert!(
+        last.bottom() <= list.bottom() + 0.25,
+        "the last card is fully visible after the wheel"
+    );
+
+    // Reopen and walk the Tab ring. Focus must scroll the last row into view.
+    open_picker_with(&mut visual, &voice, SourceKind::Monitor, sources.clone());
+    for _ in 0..3 {
+        visual.simulate_keystrokes("tab");
+    }
+    assert_eq!(
+        super::voice_screen_tests::focused(&mut visual, &voice),
+        Some("Source(monitor:3)".to_owned())
+    );
+    for _ in 1..sources.len() {
+        visual.simulate_keystrokes("tab");
+    }
+    draw(&mut visual);
+    assert_eq!(
+        super::voice_screen_tests::focused(&mut visual, &voice),
+        Some("Source(monitor:15)".to_owned())
+    );
+    let list = bounds(&mut visual, "share-sources");
+    let last = bounds(&mut visual, "share-source-card-monitor-15");
+    assert!(
+        last.y >= list.y - 0.25 && last.bottom() <= list.bottom() + 0.25,
+        "Tab reveals the whole focused card"
+    );
+
+    for _ in 0..24 {
+        if super::voice_screen_tests::focused(&mut visual, &voice).as_deref() == Some("Start") {
+            break;
+        }
+        visual.simulate_keystrokes("tab");
+    }
+    assert_eq!(
+        super::voice_screen_tests::focused(&mut visual, &voice),
+        Some("Start".to_owned())
+    );
+    let card = bounds(&mut visual, "screen-share-card");
+    let actions = bounds(&mut visual, "share-actions");
+    assert!(
+        actions.bottom() <= card.bottom() + 0.25,
+        "the action row stays inside the modal"
+    );
+}
+
+/// P03: a small window scrolls the settings and the grid instead of pushing
+/// the Cancel/Start row below the modal.
+#[gpui::test]
+async fn a_compact_window_keeps_the_actions_inside_the_modal(cx: &mut TestAppContext) {
+    let (mut visual, _view, voice) = super::voice_tests::fixture_with(cx, Some(900.), true);
+    visual.simulate_resize(gpui::size(gpui::px(900.), gpui::px(430.)));
+    draw(&mut visual);
+    let sources: Vec<ScreenSource> = (0..6)
+        .map(|index| monitor(3 + index * 2, "Экран", 1920, 1080))
+        .collect();
+    open_picker_with(&mut visual, &voice, SourceKind::Monitor, sources);
+    let card = bounds(&mut visual, "screen-share-card");
+    let actions = bounds(&mut visual, "share-actions");
+    assert!(actions.y >= card.y, "actions stay inside the card top");
+    assert!(
+        actions.bottom() <= card.bottom() + 0.25,
+        "actions stay inside the compact card"
+    );
+    let list = bounds(&mut visual, "share-sources");
+    assert!(
+        list.bottom() <= actions.y + 0.25,
+        "the grid ends before the fixed action row"
+    );
+}
+
+/// P03: an empty category paints a message, not a grid with the height of a
+/// row it does not have, and the actions remain available.
+#[gpui::test]
+async fn an_empty_picker_does_not_reserve_the_grid_height(cx: &mut TestAppContext) {
+    let (mut visual, _view, voice) = super::voice_tests::fixture_with(cx, Some(1400.), true);
+    draw(&mut visual);
+    open_picker_with(&mut visual, &voice, SourceKind::Monitor, Vec::new());
+    let list = bounds(&mut visual, "share-sources");
+    assert!(
+        list.h < 80.,
+        "an empty category has no grid row: {}",
+        list.h
+    );
+    assert!(visual.debug_bounds("share-sources-empty").is_some());
+    assert!(visual.debug_bounds("share-actions").is_some());
+}
+
+/// P05: a larger card on a higher-DPI monitor starts a new preview
+/// generation. The old epoch is ignored, the cache is released and the next
+/// request carries the new width.
+#[gpui::test]
+async fn a_larger_thumbnail_request_starts_a_new_preview_generation(cx: &mut TestAppContext) {
+    let (mut visual, _view, voice) = super::voice_tests::fixture_with(cx, Some(1400.), true);
+    draw(&mut visual);
+    let source = monitor(3, "Экран A", 1920, 1080);
+    open_picker_with(
+        &mut visual,
+        &voice,
+        SourceKind::Monitor,
+        vec![source.clone()],
+    );
+    let old_epoch = voice.read_with(&*visual, |panel, _| panel.test_preview_epoch());
+    visual.update(|_window, app| {
+        voice.update(app, |panel, _| {
+            assert!(panel.test_inject_screen_preview(&source, 8, 8));
+            assert_eq!(panel.test_screen_preview_counts(), (1, 8 * 8 * 4));
+        });
+    });
+    let first_width = voice.read_with(&*visual, |panel, _| panel.test_screen_preview_width());
+    assert!(first_width >= 286, "the first frame measured the card");
+    visual.update(|_window, app| {
+        voice.update(app, |panel, cx| {
+            panel.test_force_preview_width(288);
+            panel.test_set_preview_width(432, cx);
+            assert_eq!(panel.test_screen_preview_width(), 432);
+            assert_ne!(
+                panel.test_preview_epoch(),
+                old_epoch,
+                "a new request moves the epoch"
+            );
+            assert_eq!(
+                panel.test_screen_preview_counts(),
+                (0, 0),
+                "the smaller cache is released"
+            );
+            assert!(
+                !panel.test_deliver_screen_preview(old_epoch, &source, true),
+                "a late frame of the old generation cannot fill the new card"
+            );
+        });
+    });
+}
+
+/// P05: the capture batch serves rows inside the last painted viewport
+/// before rows scrolled out of it.
+#[gpui::test]
+async fn visible_rows_are_captured_before_hidden_rows(cx: &mut TestAppContext) {
+    // Six cards at two columns make three rows; the 280 px viewport shows the
+    // first row and part of the second, so the third is really off screen.
+    let sources: Vec<ScreenSource> = (0..6)
+        .map(|index| monitor(3 + index * 2, "Экран", 1920, 1080))
+        .collect();
+    let (mut visual, _view, voice) = super::voice_tests::fixture_with(cx, Some(1400.), true);
+    draw(&mut visual);
+    open_picker_with(&mut visual, &voice, SourceKind::Monitor, sources.clone());
+    let seen = RecordingPreview::default();
+    visual.update(|_window, app| {
+        voice.update(app, |panel, cx| {
+            panel.test_set_preview_provider(seen.provider());
+            panel.test_request_screen_previews(cx);
+        });
+    });
+    wait_for(&mut visual, &voice, |panel| {
+        panel.test_screen_preview_counts().0 == sources.len()
+    });
+    let attempts = seen.attempts();
+    let last_two: std::collections::HashSet<_> = attempts.iter().rev().take(2).cloned().collect();
+    assert_eq!(
+        last_two,
+        ["monitor:11".to_owned(), "monitor:13".to_owned()]
+            .into_iter()
+            .collect(),
+        "the off-screen third row is captured last: {attempts:?}"
+    );
+}

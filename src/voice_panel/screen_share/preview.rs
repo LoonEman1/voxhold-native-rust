@@ -42,10 +42,13 @@ impl ScreenShareUi {
         if !self.open || self.restart || self.preview_epoch != epoch || self.kind != kind {
             return None;
         }
-        let source = self
+        let columns = self.preview_columns.max(1);
+        let visible = self.visible_rows;
+        let mut candidates: Vec<(usize, ScreenSource)> = self
             .snapshot(kind)
             .iter()
-            .filter(|source| {
+            .enumerate()
+            .filter(|(_, source)| {
                 let Some(identity) = source.identity() else {
                     return false;
                 };
@@ -55,12 +58,22 @@ impl ScreenShareUi {
             })
             // A duplicated identity is ambiguous and can never be accepted by
             // `finish_preview`, so it is not captured at all.
-            .find(|source| {
+            .filter(|(_, source)| {
                 source
                     .identity()
                     .is_some_and(|identity| self.source_for_identity(&identity).is_some())
-            })?
-            .clone();
+            })
+            .map(|(index, source)| (index, source.clone()))
+            .collect();
+        // Cards inside the last painted viewport are captured first; the rest
+        // follow in list order. Before the first layout, everything counts as
+        // visible so the original order is kept.
+        candidates.sort_by_key(|(index, _)| {
+            let row = index / columns;
+            let hidden = visible.is_some_and(|(top, bottom)| row < top || row > bottom);
+            (u8::from(hidden), *index)
+        });
+        let source = candidates.into_iter().next()?.1;
         self.preview_pending.insert(source.identity()?);
         Some(source)
     }
@@ -77,12 +90,79 @@ impl ScreenShareUi {
         true
     }
 
+    /// Row of a source in the current category, used to rank cache eviction.
+    fn preview_row(&self, identity: &SourceIdentity) -> Option<usize> {
+        let index = self
+            .snapshot(self.kind)
+            .iter()
+            .position(|source| source.identity().as_ref() == Some(identity))?;
+        Some(index / self.preview_columns.max(1))
+    }
+
+    /// Whether the card is inside the last painted grid viewport. Before the
+    /// first layout everything counts as visible, so insertion order is kept.
+    fn preview_is_visible(&self, identity: &SourceIdentity) -> bool {
+        let Some((top, bottom)) = self.visible_rows else {
+            return true;
+        };
+        self.preview_row(identity)
+            .is_some_and(|row| row >= top && row <= bottom)
+    }
+
+    /// Make room for a visible card by releasing cached pictures that are
+    /// scrolled out of view, farthest first. The released card gets the honest
+    /// memory reason and is retried by the next refresh. Only a visible card
+    /// may evict anything; a hidden frame that does not fit is rejected
+    /// without disturbing what the user is looking at.
+    fn evict_hidden_previews(&mut self, identity: &SourceIdentity, existing: usize, bytes: usize) {
+        if !self.preview_is_visible(identity) {
+            return;
+        }
+        let grows_count = usize::from(existing == 0);
+        let over = |previews: &HashMap<SourceIdentity, PreviewThumb>, total: usize| -> bool {
+            previews.len() + grows_count > MAX_SCREEN_PREVIEWS
+                || total.saturating_sub(existing) + bytes > MAX_SCREEN_PREVIEW_BYTES
+        };
+        if !over(&self.previews, self.preview_bytes) {
+            return;
+        }
+        let mut victims: Vec<(usize, SourceIdentity, usize)> = self
+            .previews
+            .iter()
+            .filter(|(candidate, _)| *candidate != identity)
+            .filter(|(candidate, _)| !self.preview_is_visible(candidate))
+            .map(|(candidate, thumb)| {
+                (
+                    self.preview_row(candidate).unwrap_or(usize::MAX),
+                    candidate.clone(),
+                    thumb.bytes,
+                )
+            })
+            .collect();
+        // Farthest row first: the cards the user is least likely to scroll to
+        // are released before a nearer one.
+        victims.sort_by(|left, right| right.0.cmp(&left.0));
+        for (_, victim, size) in victims {
+            if !over(&self.previews, self.preview_bytes) {
+                break;
+            }
+            if self.previews.remove(&victim).is_some() {
+                self.preview_bytes = self.preview_bytes.saturating_sub(size);
+                self.preview_pending.remove(&victim);
+                self.preview_failures
+                    .insert(victim, PREVIEW_MEMORY_REASON.to_owned());
+            }
+        }
+    }
+
     /// Add one picture to the bounded cache. A picture over the width, count
-    /// or byte bound is counted as rejected and never queued.
+    /// or byte bound is counted as rejected and never queued; a visible card
+    /// first releases hidden pictures that do not fit the budget.
     pub(crate) fn insert_preview(&mut self, identity: SourceIdentity, frame: PreviewFrame) -> bool {
         if frame.width == 0
             || frame.height == 0
             || frame.width > SCREEN_THUMBNAIL_WIDTH
+            || frame.height > SCREEN_THUMBNAIL_HEIGHT
             || frame.bgra.len() != frame.width as usize * frame.height as usize * 4
         {
             self.preview_rejected = self.preview_rejected.saturating_add(1);
@@ -94,6 +174,7 @@ impl ScreenShareUi {
             .get(&identity)
             .map(|thumb| thumb.bytes)
             .unwrap_or(0);
+        self.evict_hidden_previews(&identity, existing, bytes);
         let grows_count = usize::from(existing == 0);
         if self.previews.len() + grows_count > MAX_SCREEN_PREVIEWS
             || self.preview_bytes.saturating_sub(existing) + bytes > MAX_SCREEN_PREVIEW_BYTES
@@ -101,13 +182,21 @@ impl ScreenShareUi {
             self.preview_rejected = self.preview_rejected.saturating_add(1);
             return false;
         }
+        let (width, height) = (frame.width, frame.height);
         let Some(image) = preview_render_image(frame) else {
             self.preview_rejected = self.preview_rejected.saturating_add(1);
             return false;
         };
         self.preview_bytes = self.preview_bytes.saturating_sub(existing) + bytes;
-        self.previews
-            .insert(identity.clone(), PreviewThumb { image, bytes });
+        self.previews.insert(
+            identity.clone(),
+            PreviewThumb {
+                image,
+                width,
+                height,
+                bytes,
+            },
+        );
         self.preview_failures.remove(&identity);
         self.preview_pending.remove(&identity);
         true
@@ -192,6 +281,45 @@ fn preview_render_image(frame: PreviewFrame) -> Option<Arc<RenderImage>> {
 }
 
 impl VoicePanel {
+    /// Native width to request from the capturer. The first frame of a picker
+    /// has not measured its card yet, so it uses the normal two-column width
+    /// instead of the cache minimum.
+    pub(super) fn thumbnail_width(&self) -> u32 {
+        if self.screen.preview_width == 0 {
+            SCREEN_THUMBNAIL_DEFAULT_WIDTH
+        } else {
+            self.screen.preview_width
+        }
+    }
+
+    /// Adopt the physical card width of the current frame. A larger scale (a
+    /// window moved to a 125/150% monitor) starts a new preview generation:
+    /// the old pictures are released, the session epoch moves so an in-flight
+    /// capture cannot land in the new card, and the visible rows are requested
+    /// again at the sharper size. A smaller request keeps the sharper cache.
+    pub(in crate::voice_panel) fn set_thumbnail_width(
+        &mut self,
+        width: u32,
+        cx: &mut Context<Self>,
+    ) {
+        let width = width.clamp(2, SCREEN_THUMBNAIL_WIDTH);
+        if width <= self.screen.preview_width {
+            return;
+        }
+        let first_measure = self.screen.preview_width == 0;
+        self.screen.preview_width = width;
+        if first_measure {
+            // No picture can exist before the first frame, and a test seam may
+            // have injected one on purpose: keep it.
+            return;
+        }
+        if !self.screen.open || self.screen.restart {
+            return;
+        }
+        self.screen.clear_previews();
+        self.request_screen_previews(cx);
+    }
+
     /// Start background thumbnail generation for the visible category.
     ///
     /// Cached and pending ids are skipped. At most one batch, and inside it at
@@ -221,6 +349,7 @@ impl VoicePanel {
         }
         let kind = self.screen.kind;
         let epoch = self.screen.preview_epoch;
+        let width = self.thumbnail_width();
         let Some(first) = self.screen.take_next_preview_source(epoch, kind) else {
             return;
         };
@@ -252,7 +381,7 @@ impl VoicePanel {
                     if let Some(provider) = provider {
                         return provider(&source);
                     }
-                    screen_capture::capture_thumbnail(&source, SCREEN_THUMBNAIL_WIDTH)
+                    screen_capture::capture_thumbnail(&source, width)
                 });
                 let result = task.await;
                 let alive = this

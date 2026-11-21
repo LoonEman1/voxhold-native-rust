@@ -315,6 +315,16 @@ pub(super) fn monitor_descriptors() -> Vec<MonitorDescriptor> {
     list
 }
 
+/// The visible size of a Win32 rectangle. A window on a monitor left of or
+/// above the primary one has negative `left`/`top`; the size stays the same
+/// positive extent, so the picker label never becomes `0×0` for that reason.
+fn rect_size(rect: RECT) -> (u32, u32) {
+    (
+        (rect.right - rect.left).max(0) as u32,
+        (rect.bottom - rect.top).max(0) as u32,
+    )
+}
+
 fn window_size(id: u64) -> (u32, u32) {
     let mut rect = RECT::default();
     let hwnd = HWND(id as *mut _);
@@ -322,10 +332,7 @@ fn window_size(id: u64) -> (u32, u32) {
     if !ok || !unsafe { IsWindowVisible(hwnd).as_bool() } {
         return (0, 0);
     }
-    (
-        (rect.right - rect.left).max(0) as u32,
-        (rect.bottom - rect.top).max(0) as u32,
-    )
+    rect_size(rect)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -423,5 +430,38 @@ pub(super) fn run(
         if let Some(delay) = interval.checked_sub(began.elapsed()) {
             std::thread::sleep(delay);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// P06 geometry: the window size is the rectangle extent, not its origin.
+    /// A window on a monitor left of the primary one reports negative
+    /// coordinates and keeps the same positive width and height.
+    #[test]
+    fn a_window_on_a_negative_origin_keeps_its_size() {
+        let left = RECT {
+            left: -1920,
+            top: 0,
+            right: 0,
+            bottom: 1080,
+        };
+        assert_eq!(rect_size(left), (1920, 1080));
+        let above = RECT {
+            left: 0,
+            top: -1440,
+            right: 2560,
+            bottom: 0,
+        };
+        assert_eq!(rect_size(above), (2560, 1440));
+        let ordinary = RECT {
+            left: 100,
+            top: 200,
+            right: 1380,
+            bottom: 920,
+        };
+        assert_eq!(rect_size(ordinary), (1280, 720));
     }
 }

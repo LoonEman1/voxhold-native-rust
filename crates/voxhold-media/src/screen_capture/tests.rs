@@ -551,8 +551,8 @@ fn a_bgra_thumbnail_is_downscaled_to_a_bounded_picture() {
 
     // A caller cannot exceed the picker bound, and a small picture is never
     // upscaled.
-    let wide = solid(400, 8, 400 * 4, [10, 20, 30, 255]);
-    let bounded = preview_from_bgra(&wide, 400, 8, 400 * 4, 10_000).expect("bounded");
+    let wide = solid(800, 8, 800 * 4, [10, 20, 30, 255]);
+    let bounded = preview_from_bgra(&wide, 800, 8, 800 * 4, 10_000).expect("bounded");
     assert_eq!(bounded.width, MAX_THUMBNAIL_WIDTH);
     let small = preview_from_bgra(&source, 16, 8, 16 * 4, 16).expect("small");
     assert_eq!((small.width, small.height), (16, 8));
@@ -561,6 +561,121 @@ fn a_bgra_thumbnail_is_downscaled_to_a_bounded_picture() {
     assert!(preview_from_bgra(&[], 16, 8, 16 * 4, 8).is_none());
     assert!(preview_from_bgra(&source, 16, 8, 8, 8).is_none());
     assert!(preview_from_bgra(&source, 0, 8, 16 * 4, 8).is_none());
+}
+
+/// A frame with a distinct label at every edge and magenta bytes in the row
+/// padding. Any leaked padding or cropped edge is visible in the preview.
+fn marked_frame(width: u32, height: u32, stride: u32) -> Vec<u8> {
+    const RED: [u8; 4] = [0, 0, 255, 255];
+    const GREEN: [u8; 4] = [0, 255, 0, 255];
+    const BLUE: [u8; 4] = [255, 0, 0, 255];
+    const YELLOW: [u8; 4] = [0, 255, 255, 255];
+    const PADDING: [u8; 4] = [0xEE, 0x00, 0xEE, 0x7F];
+    let mut bytes = vec![0_u8; stride as usize * height as usize];
+    for y in 0..height as usize {
+        let row = y * stride as usize;
+        for x in 0..stride as usize / 4 {
+            let pixel = if x < width as usize {
+                [0, 0, 0, 255]
+            } else {
+                PADDING
+            };
+            bytes[row + x * 4..row + x * 4 + 4].copy_from_slice(&pixel);
+        }
+    }
+    let put = |bytes: &mut [u8], x: usize, y: usize, pixel: [u8; 4]| {
+        let at = y * stride as usize + x * 4;
+        bytes[at..at + 4].copy_from_slice(&pixel);
+    };
+    let band = (width.min(height) / 10).max(2) as usize;
+    for y in 0..height as usize {
+        for x in 0..band {
+            put(&mut bytes, x, y, RED);
+        }
+        for x in (width as usize - band)..width as usize {
+            put(&mut bytes, x, y, GREEN);
+        }
+    }
+    for y in 0..band {
+        for x in 0..width as usize {
+            put(&mut bytes, x, y, BLUE);
+        }
+    }
+    for y in (height as usize - band)..height as usize {
+        for x in 0..width as usize {
+            put(&mut bytes, x, y, YELLOW);
+        }
+    }
+    bytes
+}
+
+/// P01: every source aspect keeps all four marked edges through the padded
+/// BGRA path, and the row padding never enters the preview.
+#[test]
+fn padded_bgra_previews_keep_the_frame_geometry_and_all_four_edges() {
+    let aspects = [
+        (160_u32, 90_u32, 16.0 / 9.0),
+        (90, 160, 9.0 / 16.0),
+        (160, 120, 4.0 / 3.0),
+        (168, 72, 21.0 / 9.0),
+    ];
+    for (width, height, aspect) in aspects {
+        let stride = width * 4 + 13;
+        let source = marked_frame(width, height, stride);
+        let preview = preview_from_bgra(&source, width, height, stride, MAX_THUMBNAIL_WIDTH)
+            .expect("thumbnail");
+        assert_eq!(
+            (preview.width, preview.height),
+            (width, height),
+            "a frame inside the request rectangle is never upscaled"
+        );
+        assert_eq!(
+            preview.bgra.len(),
+            (width * height * 4) as usize,
+            "the preview has no row padding"
+        );
+        let ratio = f64::from(preview.width) / f64::from(preview.height);
+        assert!(
+            (ratio - aspect).abs() < 0.02,
+            "{width}×{height} became {ratio}"
+        );
+        let pixel = |x: u32, y: u32| {
+            let at = (y * preview.width + x) as usize * 4;
+            &preview.bgra[at..at + 4]
+        };
+        let (mid_x, mid_y) = (width / 2, height / 2);
+        let red = pixel(0, mid_y);
+        let green = pixel(width - 1, mid_y);
+        let blue = pixel(mid_x, 0);
+        let yellow = pixel(mid_x, height - 1);
+        assert!(red[2] > 150 && red[0] < 60, "left edge: {red:?}");
+        assert!(green[1] > 150 && green[2] < 60, "right edge: {green:?}");
+        assert!(blue[0] > 150 && blue[2] < 60, "top edge: {blue:?}");
+        assert!(
+            yellow[1] > 150 && yellow[2] > 150,
+            "bottom edge: {yellow:?}"
+        );
+        // The row padding is magenta (0xEE, 0x00, 0xEE) with alpha 0x7F. A
+        // leaked pixel keeps that exact signature; the frame itself only uses
+        // red, green, blue, yellow and black, so a magenta family check
+        // catches a partial copy as well.
+        assert!(
+            !preview
+                .bgra
+                .chunks_exact(4)
+                .any(|pixel| pixel[0] >= 0xE0 && pixel[1] <= 0x20 && pixel[2] >= 0xE0),
+            "row padding leaked into the preview"
+        );
+    }
+
+    // A tall source is bounded by the 270 px side of the request rectangle
+    // and still keeps its edges and aspect ratio.
+    let source = marked_frame(160, 400, 160 * 4 + 9);
+    let preview = preview_from_bgra(&source, 160, 400, 160 * 4 + 9, MAX_THUMBNAIL_WIDTH)
+        .expect("tall thumbnail");
+    assert!(preview.width <= MAX_THUMBNAIL_WIDTH);
+    assert_eq!(preview.height, MAX_THUMBNAIL_HEIGHT);
+    assert!((f64::from(preview.width) / f64::from(preview.height) - 0.4).abs() < 0.02);
 }
 
 /// Manual proof on a real desktop: one monitor or window delivers a thumbnail.

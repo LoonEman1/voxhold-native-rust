@@ -167,9 +167,9 @@ GPUI рисует строки по запросу, но клиент перед
 
 | PR | Ветка | Задачи | Подсистема |
 | --- | --- | --- | --- |
-| A | `codex/stream-memory-perf` | `O01` + `O02` + `O08` + `O09` | Текстуры, предпросмотр, пикер и событийный UI |
-| B | `codex/media-frame-perf` | `O03` + `O04` | Конвертация кадров захвата и просмотра |
-| C | `codex/o07-thumb-sources` | `O05` + `O06` + `O07` | История, просмотрщик и миниатюры вложений |
+| A [#46](https://github.com/LoonEman1/voxhold-native-rust/pull/46) | `codex/stream-memory-perf` | `O01` + `O02` + `O08` + `O09` | Текстуры, предпросмотр, пикер и событийный UI |
+| B [#47](https://github.com/LoonEman1/voxhold-native-rust/pull/47) | `codex/media-frame-perf` | `O03` + `O04` | Конвертация кадров захвата и просмотра |
+| C [#45](https://github.com/LoonEman1/voxhold-native-rust/pull/45) | `codex/o07-thumb-sources` | `O05` + `O06` + `O07` | История, просмотрщик и миниатюры вложений |
 
 Ветка A содержит merge `O04` из PR B как зависимость: событийное пробуждение
 (`O09`) строится на публикации готового кадра из `O04`. Вливать A после B; до

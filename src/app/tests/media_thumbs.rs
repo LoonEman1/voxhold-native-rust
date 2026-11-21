@@ -5,7 +5,9 @@
 use super::add_auth_window;
 use super::media::png_bytes;
 use super::*;
-use crate::media::{ImageCache, Media, ThumbKey, ThumbSourceKey, THUMB_SOURCE_BUDGET};
+use crate::media::{
+    ImageCache, Media, ThumbKey, ThumbSourceKey, THUMB_FAILURES, THUMB_SOURCE_BUDGET,
+};
 use crate::test_support::{Gate, Reply, TestServer};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -208,9 +210,7 @@ fn removing_an_attachment_drops_both_caches_and_its_pending_state() {
         ))),
         1024,
     );
-    media
-        .thumb_loads
-        .insert(ThumbSourceKey(id.clone()), key.clone());
+    media.begin_thumb_load(&key);
     media.thumb_waiting.insert(key.clone());
     media.thumb_building.insert(ThumbKey::new(&id, 32., 32.));
     media.thumb_retry(&id, Some(429));
@@ -308,4 +308,172 @@ async fn a_429_gate_blocks_every_bucket_of_the_same_id(cx: &mut TestAppContext) 
         "the second bucket shares the retry gate instead of retrying"
     );
     assert!(view.read_with(&*visual, |v, _| v.media.thumb_blocked(&id, Instant::now())));
+}
+
+#[gpui::test]
+async fn an_evicted_source_is_downloaded_again(cx: &mut TestAppContext) {
+    cx.update(|cx| gpui_component::init(cx));
+    let (window, view) = add_auth_window(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
+    let server = TestServer::spawn(vec![
+        Reply::image(200, png_bytes(400, 300)),
+        Reply::image(200, png_bytes(400, 300)),
+    ]);
+    connect(&mut visual, &view, &server);
+
+    let id = "f".repeat(32);
+    let key = ThumbKey::new(&id, 112., 64.);
+    assert!(request_source(&mut visual, &view, &id, key.clone()));
+    assert!(variant_ready(&mut visual, &view, &key));
+    assert_eq!(thumbnail_requests(&server), 1);
+
+    // Simulate the byte-budget LRU dropping the decoded source together with
+    // its draw variant. O07 promises reuse only "while the source is cached",
+    // so the next request must download the picture again instead of showing
+    // an empty cell.
+    visual.update(|_, app| {
+        view.update(app, |v, _| {
+            assert!(v.media.thumbs.remove(&key).is_some());
+            assert!(v
+                .media
+                .thumb_sources
+                .remove(&ThumbSourceKey(id.clone()))
+                .is_some());
+        });
+    });
+    assert!(request_source(&mut visual, &view, &id, key.clone()));
+    assert!(variant_ready(&mut visual, &view, &key));
+    assert_eq!(
+        thumbnail_requests(&server),
+        2,
+        "an evicted source has to be fetched again: {:?}",
+        server.requests()
+    );
+}
+
+#[gpui::test]
+async fn a_late_answer_does_not_release_the_newer_load_marker(cx: &mut TestAppContext) {
+    cx.update(|cx| gpui_component::init(cx));
+    let (window, view) = add_auth_window(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
+    let server = TestServer::spawn(vec![Reply::image(200, png_bytes(64, 48))]);
+    connect(&mut visual, &view, &server);
+
+    let id = "9".repeat(32);
+    let source_key = ThumbSourceKey(id.clone());
+    let key = ThumbKey::new(&id, 112., 64.);
+    // The download starts, but its answer is not polled yet: the test thread
+    // owns the executor, so the fetch only runs below.
+    request(&mut visual, &view, key.clone());
+    let stale = view
+        .read_with(&*visual, |v, _| {
+            v.media.thumb_loads.get(&source_key).copied()
+        })
+        .expect("the first load owns the marker");
+
+    // What `invalidate_access` does to media state: a new generation and an
+    // empty cache. A newer load of the same id then takes the slot. Its marker
+    // is installed directly because a second gated fetch would block this
+    // test executor inside `runtime.block_on` until the client timeout; the
+    // completion path under test is the real one from `request_thumbnail`.
+    visual.update(|window, app| {
+        view.update(app, |v, _| {
+            v.access_generation = v.access_generation.wrapping_add(1);
+            v.clear_media(window);
+            let newer = v.media.begin_thumb_load(&key);
+            assert!(newer > stale, "tokens stay monotonic across a reset");
+            v.media.thumb_waiting.insert(key.clone());
+            assert_eq!(v.media.thumb_loads.get(&source_key), Some(&newer));
+        });
+    });
+
+    for _ in 0..40 {
+        visual.run_until_parked();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    view.read_with(&*visual, |v, _| {
+        let newer = v
+            .media
+            .thumb_loads
+            .get(&source_key)
+            .copied()
+            .expect("the late answer leaves the newer marker in place");
+        assert!(newer > stale);
+        assert!(
+            v.media.thumb_waiting.contains(&key),
+            "the newer waiting bucket survives the late answer"
+        );
+        assert!(
+            v.media.thumb_sources.is_empty(),
+            "the stale payload is still dropped by the access guard"
+        );
+        assert!(
+            v.media.thumb_failures.is_empty(),
+            "the late answer does not install a retry gate for the newer load"
+        );
+    });
+    assert_eq!(thumbnail_requests(&server), 1);
+}
+
+#[test]
+fn a_superseded_load_keeps_the_newer_marker_and_waiting_buckets() {
+    let mut media = Media::default();
+    let id = "7".repeat(32);
+    let first = ThumbKey::new(&id, 112., 64.);
+    let second = ThumbKey::new(&id, 208., 96.);
+    let stale = media.begin_thumb_load(&first);
+    assert_eq!(media.thumb_loads.len(), 1);
+
+    // An access reset drops every marker, but the token keeps counting, so a
+    // later load of the same id can never reuse the old answer's token.
+    drop(media.clear());
+    let current = media.begin_thumb_load(&second);
+    assert!(
+        current > stale,
+        "tokens stay monotonic across an access reset"
+    );
+    media.thumb_waiting.insert(second.clone());
+
+    assert!(
+        !media.finish_thumb_load(&id, stale),
+        "a superseded load owns nothing"
+    );
+    assert_eq!(
+        media.thumb_loads.get(&ThumbSourceKey(id.clone())),
+        Some(&current)
+    );
+    assert!(
+        media.thumb_waiting.contains(&second),
+        "the newer waiting bucket survives the late answer"
+    );
+
+    assert!(media.finish_thumb_load(&id, current));
+    assert!(media.thumb_loads.is_empty());
+    assert!(media.thumb_waiting.is_empty());
+}
+
+#[test]
+fn the_retry_gate_map_stays_bounded() {
+    let mut media = Media::default();
+    let total = THUMB_FAILURES + 20;
+    for index in 0..total {
+        media.thumb_retry(&format!("{index:032x}"), Some(500));
+    }
+    assert_eq!(media.thumb_failures.len(), THUMB_FAILURES);
+    // The newest ids keep their gate, so a picture still on screen is not
+    // retried on every frame after a long scroll through failures.
+    let now = Instant::now();
+    for index in (total - 20)..total {
+        assert!(media.thumb_blocked(&format!("{index:032x}"), now));
+    }
+    // Overflow evicted one of the oldest gates, not a recent one.
+    assert!(
+        (0..20).any(|index| {
+            !media
+                .thumb_failures
+                .contains_key(&ThumbSourceKey(format!("{index:032x}")))
+        }),
+        "the oldest gate is the one that leaves a full map"
+    );
 }

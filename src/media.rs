@@ -20,11 +20,13 @@ use crate::draft::ChatKey;
 /// Go `thumbnailBudget`.
 pub const THUMB_BUDGET: usize = 16 << 20;
 /// Budget for decoded server thumbnails shared by every width bucket. The API
-/// decodes `/thumbnail` with a 512 px edge limit (`attachment_thumbnail`), so a
-/// full-size RGBA source is at most 1 MiB (512×512×4). 24 MiB keeps roughly two
-/// dozen of those, enough for several screens of chat pictures, and stays only
-/// 1.5× the variant budget because one source replaces every bucket of the same
-/// attachment. It is still bounded, so a long scroll never grows without limit.
+/// decodes `/thumbnail` with a 512 px edge limit (`attachment_thumbnail`), so
+/// an 8-bit RGBA source is at most 1 MiB (512×512×4) and a 16-bit RGBA one up
+/// to ~2 MiB. Accounting uses the real buffer length, so 24 MiB keeps about two
+/// dozen 8-bit sources or roughly a dozen worst-case 16-bit ones; that is still
+/// several screens of chat pictures, and it stays only 1.5× the variant budget
+/// because one source replaces every bucket of the same attachment. It is
+/// bounded, so a long scroll never grows without limit.
 pub const THUMB_SOURCE_BUDGET: usize = 24 << 20;
 /// Go `previewImageBudget`.
 pub const PREVIEW_IMAGE: (u32, u32) = (192, 108);
@@ -33,6 +35,10 @@ pub const PREVIEW_IMAGE_BUDGET: usize = 4 << 20;
 pub const THUMB_BUCKET: u32 = 16;
 /// Go `thumbnailConcurrency`.
 pub const THUMB_CONCURRENCY: usize = 3;
+/// Attachment ids whose retry gate is kept. A long scroll through failing
+/// pictures evicts the gate closest to expiry instead of growing the map; the
+/// gates of the ids still on screen stay in place.
+pub const THUMB_FAILURES: usize = 256;
 /// Go `previewEntries`.
 pub const PREVIEW_ENTRIES: usize = 128;
 /// Attachment deletion markers kept until the access scope is invalidated.
@@ -304,9 +310,14 @@ pub struct Media {
     /// One decoded server thumbnail per attachment id; every width bucket is
     /// built from it locally instead of downloading the picture again.
     pub thumb_sources: ImageCache<ThumbSourceKey, Arc<image::DynamicImage>>,
-    /// Ids with a `/thumbnail` request in flight, mapped to the variant that
-    /// started it. `THUMB_CONCURRENCY` counts these, never the draw keys.
-    pub thumb_loads: HashMap<ThumbSourceKey, ThumbKey>,
+    /// Ids with a `/thumbnail` request in flight, mapped to the token of the
+    /// current load (`begin_thumb_load`). `THUMB_CONCURRENCY` counts these,
+    /// never the draw keys.
+    pub thumb_loads: HashMap<ThumbSourceKey, u64>,
+    /// Monotonic token source for thumbnail downloads. `clear` deliberately
+    /// leaves it alone, so an answer from a load started before an access
+    /// reset can never match the marker of a newer load of the same id.
+    thumb_load_seq: u64,
     /// Variants a frame asked for while their id was still downloading. They
     /// are dropped from the waiting set when the source arrives and are built
     /// by the redraw, so a splitter drag cannot queue one task per bucket.
@@ -335,6 +346,7 @@ impl Default for Media {
             thumbs: ImageCache::new(THUMB_BUDGET),
             thumb_sources: ImageCache::new(THUMB_SOURCE_BUDGET),
             thumb_loads: HashMap::new(),
+            thumb_load_seq: 0,
             thumb_waiting: HashSet::new(),
             thumb_building: HashSet::new(),
             thumb_failures: HashMap::new(),
@@ -388,8 +400,52 @@ impl Media {
             .get(&key)
             .is_some_and(|(_, doubled)| *doubled);
         let delay = retry_delay(status, doubled);
+        if !self.thumb_failures.contains_key(&key) && self.thumb_failures.len() >= THUMB_FAILURES {
+            self.evict_thumb_failure();
+        }
         self.thumb_failures
             .insert(key, (Instant::now() + delay, true));
+    }
+
+    /// Keep the retry map bounded. The gate closest to expiry leaves first (an
+    /// already expired one when present), so the ids that are still current
+    /// keep their retry decision; only the evicted id may be requested again.
+    fn evict_thumb_failure(&mut self) {
+        let oldest = self
+            .thumb_failures
+            .iter()
+            .min_by_key(|(_, (until, _))| *until)
+            .map(|(key, _)| key.clone());
+        if let Some(key) = oldest {
+            self.thumb_failures.remove(&key);
+        }
+    }
+
+    /// Mark one attachment download as started and return its token. The
+    /// caller has already checked that no load of this id is running and that
+    /// a concurrency slot is free, so this only advances the token and records
+    /// the marker.
+    pub fn begin_thumb_load(&mut self, key: &ThumbKey) -> u64 {
+        self.thumb_load_seq = self.thumb_load_seq.wrapping_add(1);
+        let token = self.thumb_load_seq;
+        self.thumb_loads
+            .insert(ThumbSourceKey(key.id.clone()), token);
+        token
+    }
+
+    /// Retire a finished download. The in-flight marker and every waiting
+    /// bucket of the id are cleared only while `token` is still the current
+    /// load; a late answer from a superseded load reports `false` and leaves
+    /// the newer load's marker and waiting set untouched. Whether its payload
+    /// may be installed is still decided by the access/purge guard.
+    pub fn finish_thumb_load(&mut self, id: &str, token: u64) -> bool {
+        let key = ThumbSourceKey(id.to_string());
+        if self.thumb_loads.get(&key).copied() != Some(token) {
+            return false;
+        }
+        self.thumb_loads.remove(&key);
+        self.thumb_waiting.retain(|key| key.id != id);
+        true
     }
 
     pub fn thumb_ready(&mut self, key: &ThumbKey) -> bool {

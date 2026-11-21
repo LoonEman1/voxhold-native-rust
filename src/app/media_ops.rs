@@ -244,15 +244,18 @@ impl Voxhold {
         let request_id = id.clone();
         let trigger = key.clone();
         let runtime = self.runtime.clone();
-        self.media.thumb_loads.insert(source_key.clone(), key);
+        let load = self.media.begin_thumb_load(&key);
         let task = cx.background_spawn(async move {
             runtime.block_on(async move { client.attachment_thumbnail(&request_id).await })
         });
         cx.spawn_in(window, async move |this, window| {
             let result = task.await;
             let _ = this.update_in(window, |s, window, cx| {
-                s.media.thumb_loads.remove(&source_key);
-                s.media.thumb_waiting.retain(|key| key.id != id);
+                // Only the load that still owns the marker may free the slot
+                // and drop the waiting buckets. A late answer from a load
+                // superseded by an access reset leaves the newer marker alone;
+                // the access/purge guard below then discards its payload.
+                s.media.finish_thumb_load(&id, load);
                 if s.thumbnail_stale(access, &id) {
                     cx.notify();
                     return;

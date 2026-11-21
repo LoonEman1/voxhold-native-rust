@@ -5,7 +5,7 @@
 //! left.
 
 use super::*;
-use crate::media::{self, PreviewEntry, ThumbKey, Viewer, ViewerKey};
+use crate::media::{self, PreviewEntry, ThumbKey, ThumbSourceKey, Viewer, ViewerKey};
 use std::sync::Arc;
 use std::time::Instant;
 use voxhold_api::Attachment;
@@ -188,8 +188,24 @@ fn note_dropped_image() {
 fn note_dropped_image() {}
 
 impl Voxhold {
-    /// Request one chat thumbnail. Three reads at a time, a failed key waits
-    /// 15 s after `429` and 5 s otherwise (doubled after a second failure).
+    /// Whether a thumbnail may still be installed. The access scope, the
+    /// deletion tombstone and the row's own `deleted` flag all win over a
+    /// background answer, so a late picture is never resurrected.
+    fn thumbnail_stale(&self, access: u64, id: &str) -> bool {
+        self.access_generation != access
+            || self.media.is_purged(id)
+            || self.messages.iter().any(|message| {
+                message
+                    .attachments
+                    .iter()
+                    .any(|file| file.id == id && file.deleted)
+            })
+    }
+
+    /// Request one chat thumbnail. The URL depends only on the attachment id,
+    /// so at most one download per id runs; every 16 px bucket is resized
+    /// locally from the cached source. Three downloads at a time, and a failed
+    /// id waits 15 s after `429` and 5 s otherwise (doubled on a repeat).
     pub(super) fn request_thumbnail(
         &mut self,
         key: ThumbKey,
@@ -198,11 +214,26 @@ impl Voxhold {
     ) {
         let now = Instant::now();
         if self.media.thumb_ready(&key)
-            || self.media.thumb_pending.contains(&key)
-            || self.media.thumb_pending.len() >= media::THUMB_CONCURRENCY
-            || self.media.thumb_blocked(&key, now)
+            || self.media.thumb_building.contains(&key)
+            || self.media.thumb_waiting.contains(&key)
+            || self.media.thumb_blocked(&key.id, now)
             || self.media.is_purged(&key.id)
         {
+            return;
+        }
+        let source_key = ThumbSourceKey(key.id.clone());
+        // A decoded source already serves this bucket: resize here, no HTTP.
+        if let Some(source) = self.media.thumb_source(&key.id) {
+            self.build_thumbnail_variant(key, source, window, cx);
+            return;
+        }
+        if self.media.thumb_loads.contains_key(&source_key) {
+            // Same id is downloading. Remember the variant; the completion
+            // redraw asks the next frame to build it from the cached source.
+            self.media.thumb_waiting.insert(key);
+            return;
+        }
+        if self.media.thumb_loads.len() >= media::THUMB_CONCURRENCY {
             return;
         }
         let Some(client) = self.client.clone() else {
@@ -210,43 +241,71 @@ impl Voxhold {
         };
         let access = self.access_generation;
         let id = key.id.clone();
-        let (width, height) = (key.width, key.height);
+        let request_id = id.clone();
+        let trigger = key.clone();
         let runtime = self.runtime.clone();
-        self.media.thumb_pending.insert(key.clone());
+        self.media.thumb_loads.insert(source_key.clone(), key);
         let task = cx.background_spawn(async move {
-            runtime.block_on(async move {
-                let image = client.attachment_thumbnail(&id).await?;
-                Ok::<_, voxhold_api::Error>(thumbnail_frame(&image, width, height))
-            })
+            runtime.block_on(async move { client.attachment_thumbnail(&request_id).await })
         });
         cx.spawn_in(window, async move |this, window| {
             let result = task.await;
             let _ = this.update_in(window, |s, window, cx| {
-                s.media.thumb_pending.remove(&key);
-                if s.access_generation != access {
-                    return;
-                }
-                // The attachment may have been deleted while the thumbnail was
-                // in flight; do not resurrect it after the purge.
-                if s.media.is_purged(&key.id)
-                    || s.messages.iter().any(|message| {
-                        message
-                            .attachments
-                            .iter()
-                            .any(|file| file.id == key.id && file.deleted)
-                    })
-                {
+                s.media.thumb_loads.remove(&source_key);
+                s.media.thumb_waiting.retain(|key| key.id != id);
+                if s.thumbnail_stale(access, &id) {
+                    cx.notify();
                     return;
                 }
                 match result {
-                    Ok((frame, bytes)) => {
-                        let render = Arc::new(gpui::RenderImage::new(smallvec::smallvec![frame]));
-                        for evicted in s.media.thumbs.put(key.clone(), render, bytes) {
-                            let _ = window.drop_image(evicted);
-                        }
-                        s.media.thumb_succeeded(&key);
+                    Ok(image) => {
+                        let bytes = media::source_bytes(&image);
+                        let source = Arc::new(image);
+                        // A source has no GPU surface, so evicted pixels are
+                        // released by dropping the `Arc` alone.
+                        drop(s.media.thumb_sources.put(source_key, source.clone(), bytes));
+                        s.media.thumb_succeeded(&id);
+                        // Build the variant that started the download now;
+                        // the redraw builds the other visible buckets.
+                        s.build_thumbnail_variant(trigger, source, window, cx);
                     }
-                    Err(error) => s.media.thumb_retry(&key, error.status()),
+                    Err(error) => s.media.thumb_retry(&id, error.status()),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Resize one cached server thumbnail into a draw bucket in the
+    /// background. The source is shared by `Arc`, so no decoded copy is made;
+    /// only the target-sized BGRA buffer is allocated. Installing checks the
+    /// same access and deletion guards as a download answer.
+    fn build_thumbnail_variant(
+        &mut self,
+        key: ThumbKey,
+        source: Arc<image::DynamicImage>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.media.thumb_ready(&key) || self.media.thumb_building.contains(&key) {
+            return;
+        }
+        let access = self.access_generation;
+        let id = key.id.clone();
+        let (width, height) = (key.width, key.height);
+        self.media.thumb_building.insert(key.clone());
+        let task = cx.background_spawn(async move { thumbnail_frame(&source, width, height) });
+        cx.spawn_in(window, async move |this, window| {
+            let (frame, bytes) = task.await;
+            let _ = this.update_in(window, |s, window, cx| {
+                s.media.thumb_building.remove(&key);
+                if s.thumbnail_stale(access, &id) {
+                    return;
+                }
+                let render = Arc::new(gpui::RenderImage::new(smallvec::smallvec![frame]));
+                for evicted in s.media.thumbs.put(key.clone(), render, bytes) {
+                    let _ = window.drop_image(evicted);
                 }
                 cx.notify();
             });

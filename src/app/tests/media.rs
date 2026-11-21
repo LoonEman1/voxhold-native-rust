@@ -607,13 +607,26 @@ async fn access_change_releases_cached_media(cx: &mut TestAppContext) {
             v.media
                 .thumbs
                 .put(crate::media::ThumbKey::new("a", 16., 16.), render, 1024);
+            v.media.thumb_sources.put(
+                crate::media::ThumbSourceKey("a".into()),
+                std::sync::Arc::new(image::DynamicImage::ImageRgba8(image::RgbaImage::new(
+                    16, 16,
+                ))),
+                1024,
+            );
             v.media.put_preview(
                 "https://example.com/",
                 crate::media::PreviewEntry::default(),
             );
             assert!(v.media.thumbs.used_bytes() > 0);
+            assert!(v.media.thumb_sources.used_bytes() > 0);
             v.invalidate_access(window, cx);
             assert_eq!(v.media.thumbs.used_bytes(), 0);
+            assert_eq!(
+                v.media.thumb_sources.used_bytes(),
+                0,
+                "an access change releases the decoded sources too"
+            );
             assert!(v.media.previews.is_empty());
             assert!(v.media.viewer.is_none());
         });

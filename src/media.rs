@@ -19,6 +19,13 @@ use crate::draft::ChatKey;
 
 /// Go `thumbnailBudget`.
 pub const THUMB_BUDGET: usize = 16 << 20;
+/// Budget for decoded server thumbnails shared by every width bucket. The API
+/// decodes `/thumbnail` with a 512 px edge limit (`attachment_thumbnail`), so a
+/// full-size RGBA source is at most 1 MiB (512×512×4). 24 MiB keeps roughly two
+/// dozen of those, enough for several screens of chat pictures, and stays only
+/// 1.5× the variant budget because one source replaces every bucket of the same
+/// attachment. It is still bounded, so a long scroll never grows without limit.
+pub const THUMB_SOURCE_BUDGET: usize = 24 << 20;
 /// Go `previewImageBudget`.
 pub const PREVIEW_IMAGE: (u32, u32) = (192, 108);
 pub const PREVIEW_IMAGE_BUDGET: usize = 4 << 20;
@@ -49,12 +56,19 @@ pub fn bucket(value: f32) -> u32 {
     (((value + THUMB_BUCKET - 1) / THUMB_BUCKET) * THUMB_BUCKET).max(THUMB_BUCKET)
 }
 
+/// Draw key: one decoded variant per attachment and 16 px box. The server URL
+/// only depends on the id, so this key never triggers a download of its own.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ThumbKey {
     pub id: String,
     pub width: u32,
     pub height: u32,
 }
+
+/// Download key: `/api/v1/attachments/{id}/thumbnail` ignores the requested
+/// box, so one decoded source per attachment serves every draw key.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ThumbSourceKey(pub String);
 
 impl ThumbKey {
     /// Go `thumbnailSlot`: the requested box is rounded to 16 px.
@@ -83,16 +97,18 @@ impl PreviewEntry {
     }
 }
 
-/// Byte-budgeted LRU for decoded pictures. Evicted images are returned so the
-/// caller can release the GPU texture with `Window::drop_image`.
-pub struct ImageCache<K: std::hash::Hash + Eq + Clone> {
+/// Byte-budgeted LRU for decoded pictures and decoded server sources. Evicted
+/// GPU images are returned so the caller can release the texture with
+/// `Window::drop_image`; a decoded source has no GPU surface and is simply
+/// dropped.
+pub struct ImageCache<K, V> {
     budget: usize,
     used: usize,
     clock: u64,
-    entries: HashMap<K, (Arc<RenderImage>, usize, u64)>,
+    entries: HashMap<K, (V, usize, u64)>,
 }
 
-impl<K: std::hash::Hash + Eq + Clone> ImageCache<K> {
+impl<K: std::hash::Hash + Eq + Clone, V: Clone> ImageCache<K, V> {
     pub fn new(budget: usize) -> Self {
         Self {
             budget: budget.max(1),
@@ -102,7 +118,7 @@ impl<K: std::hash::Hash + Eq + Clone> ImageCache<K> {
         }
     }
 
-    pub fn get(&mut self, key: &K) -> Option<Arc<RenderImage>> {
+    pub fn get(&mut self, key: &K) -> Option<V> {
         self.clock += 1;
         let clock = self.clock;
         let entry = self.entries.get_mut(key)?;
@@ -114,7 +130,7 @@ impl<K: std::hash::Hash + Eq + Clone> ImageCache<K> {
         self.entries.contains_key(key)
     }
 
-    pub fn put(&mut self, key: K, image: Arc<RenderImage>, bytes: usize) -> Vec<Arc<RenderImage>> {
+    pub fn put(&mut self, key: K, value: V, bytes: usize) -> Vec<V> {
         let mut evicted = Vec::new();
         if bytes == 0 || bytes > self.budget {
             return evicted;
@@ -122,19 +138,19 @@ impl<K: std::hash::Hash + Eq + Clone> ImageCache<K> {
         self.clock += 1;
         if let Some((previous, size, clock)) = self.entries.get_mut(&key) {
             self.used = self.used.saturating_sub(*size).saturating_add(bytes);
-            evicted.push(std::mem::replace(previous, image));
+            evicted.push(std::mem::replace(previous, value));
             *size = bytes;
             *clock = self.clock;
         } else {
             self.clock += 1;
-            self.entries.insert(key, (image, bytes, self.clock));
+            self.entries.insert(key, (value, bytes, self.clock));
             self.used += bytes;
         }
         self.trim(&mut evicted);
         evicted
     }
 
-    fn trim(&mut self, evicted: &mut Vec<Arc<RenderImage>>) {
+    fn trim(&mut self, evicted: &mut Vec<V>) {
         while self.used > self.budget && !self.entries.is_empty() {
             let oldest = self
                 .entries
@@ -149,18 +165,15 @@ impl<K: std::hash::Hash + Eq + Clone> ImageCache<K> {
         }
     }
 
-    pub fn remove(&mut self, key: &K) -> Option<Arc<RenderImage>> {
-        let (image, size, _) = self.entries.remove(key)?;
+    pub fn remove(&mut self, key: &K) -> Option<V> {
+        let (value, size, _) = self.entries.remove(key)?;
         self.used = self.used.saturating_sub(size);
-        Some(image)
+        Some(value)
     }
 
     /// Remove every entry whose key matches, e.g. all thumbnails of one
-    /// attachment. Returns the GPU images for the caller to drop.
-    pub fn remove_matching(
-        &mut self,
-        mut matches: impl FnMut(&K) -> bool,
-    ) -> Vec<Arc<RenderImage>> {
+    /// attachment. Returns the values for the caller to release.
+    pub fn remove_matching(&mut self, mut matches: impl FnMut(&K) -> bool) -> Vec<V> {
         let keys: Vec<K> = self
             .entries
             .keys()
@@ -177,17 +190,22 @@ impl<K: std::hash::Hash + Eq + Clone> ImageCache<K> {
         removed
     }
 
-    pub fn clear(&mut self) -> Vec<Arc<RenderImage>> {
+    pub fn clear(&mut self) -> Vec<V> {
         self.used = 0;
         self.entries
             .drain()
-            .map(|(_, (image, _, _))| image)
+            .map(|(_, (value, _, _))| value)
             .collect()
     }
 
     #[allow(dead_code)] // used by tests and by the soak diagnostics
     pub fn used_bytes(&self) -> usize {
         self.used
+    }
+
+    #[allow(dead_code)] // asserted by the O07 source-budget test
+    pub fn budget(&self) -> usize {
+        self.budget
     }
 
     #[allow(dead_code)]
@@ -282,13 +300,25 @@ impl Viewer {
 }
 
 pub struct Media {
-    pub thumbs: ImageCache<ThumbKey>,
-    pub thumb_pending: HashSet<ThumbKey>,
-    /// `(retry at, already failed once)`; a repeated failure doubles the gate.
-    pub thumb_failures: HashMap<ThumbKey, (Instant, bool)>,
+    pub thumbs: ImageCache<ThumbKey, Arc<RenderImage>>,
+    /// One decoded server thumbnail per attachment id; every width bucket is
+    /// built from it locally instead of downloading the picture again.
+    pub thumb_sources: ImageCache<ThumbSourceKey, Arc<image::DynamicImage>>,
+    /// Ids with a `/thumbnail` request in flight, mapped to the variant that
+    /// started it. `THUMB_CONCURRENCY` counts these, never the draw keys.
+    pub thumb_loads: HashMap<ThumbSourceKey, ThumbKey>,
+    /// Variants a frame asked for while their id was still downloading. They
+    /// are dropped from the waiting set when the source arrives and are built
+    /// by the redraw, so a splitter drag cannot queue one task per bucket.
+    pub thumb_waiting: HashSet<ThumbKey>,
+    /// Variants whose local resize is running right now.
+    pub thumb_building: HashSet<ThumbKey>,
+    /// `(retry at, already failed once)` per attachment id; a repeated failure
+    /// doubles the gate, so every bucket shares one retry decision.
+    pub thumb_failures: HashMap<ThumbSourceKey, (Instant, bool)>,
     pub previews: HashMap<String, PreviewEntry>,
     pub preview_order: VecDeque<String>,
-    pub preview_images: ImageCache<String>,
+    pub preview_images: ImageCache<String, Arc<RenderImage>>,
     pub preview_pending: HashMap<String, uuid::Uuid>,
     pub preview_failures: HashMap<String, (Instant, bool)>,
     pub viewer: Option<Viewer>,
@@ -303,7 +333,10 @@ impl Default for Media {
     fn default() -> Self {
         Self {
             thumbs: ImageCache::new(THUMB_BUDGET),
-            thumb_pending: HashSet::new(),
+            thumb_sources: ImageCache::new(THUMB_SOURCE_BUDGET),
+            thumb_loads: HashMap::new(),
+            thumb_waiting: HashSet::new(),
+            thumb_building: HashSet::new(),
             thumb_failures: HashMap::new(),
             previews: HashMap::new(),
             preview_order: VecDeque::new(),
@@ -329,7 +362,11 @@ impl Media {
                 images.push(image);
             }
         }
-        self.thumb_pending.clear();
+        // Sources have no GPU surface; dropping the decoded pixels is enough.
+        drop(self.thumb_sources.clear());
+        self.thumb_loads.clear();
+        self.thumb_waiting.clear();
+        self.thumb_building.clear();
         self.thumb_failures.clear();
         self.previews.clear();
         self.preview_order.clear();
@@ -342,37 +379,51 @@ impl Media {
 
     /// Go `thumbnailRetryDelay`: 15 s after `429`, 5 s otherwise, doubled after
     /// a second failure.
-    pub fn thumb_retry(&mut self, key: &ThumbKey, status: Option<u16>) {
+    /// The retry gate is keyed by attachment id: a failure seen for one width
+    /// bucket blocks every other bucket of the same picture too.
+    pub fn thumb_retry(&mut self, id: &str, status: Option<u16>) {
+        let key = ThumbSourceKey(id.to_string());
         let doubled = self
             .thumb_failures
-            .get(key)
+            .get(&key)
             .is_some_and(|(_, doubled)| *doubled);
         let delay = retry_delay(status, doubled);
         self.thumb_failures
-            .insert(key.clone(), (Instant::now() + delay, true));
+            .insert(key, (Instant::now() + delay, true));
     }
 
     pub fn thumb_ready(&mut self, key: &ThumbKey) -> bool {
         self.thumbs.contains(key)
     }
 
-    pub fn thumb_blocked(&self, key: &ThumbKey, now: Instant) -> bool {
+    /// Decoded server thumbnail for this id, touching its LRU position.
+    pub fn thumb_source(&mut self, id: &str) -> Option<Arc<image::DynamicImage>> {
+        self.thumb_sources.get(&ThumbSourceKey(id.to_string()))
+    }
+
+    pub fn thumb_blocked(&self, id: &str, now: Instant) -> bool {
         self.thumb_failures
-            .get(key)
+            .get(&ThumbSourceKey(id.to_string()))
             .is_some_and(|(until, _)| now < *until)
     }
 
-    pub fn thumb_succeeded(&mut self, key: &ThumbKey) {
-        self.thumb_failures.remove(key);
+    pub fn thumb_succeeded(&mut self, id: &str) {
+        self.thumb_failures.remove(&ThumbSourceKey(id.to_string()));
     }
 
-    /// Drop every thumbnail variant of one attachment and its retry state.
-    /// The flag reports whether a deletion marker had to be evicted, which
-    /// makes any history or `/context` answer requested before it stale.
+    /// Drop the decoded source, every variant, the in-flight markers and the
+    /// retry state of one attachment. The flag reports whether a deletion
+    /// marker had to be evicted, which makes any history or `/context` answer
+    /// requested before it stale.
     pub fn remove_attachment(&mut self, id: &str) -> (Vec<Arc<RenderImage>>, bool) {
         let images = self.thumbs.remove_matching(|key| key.id == id);
-        self.thumb_pending.retain(|key| key.id != id);
-        self.thumb_failures.retain(|key, _| key.id != id);
+        // Evicted sources carry no GPU surface; the last Arc drop releases the
+        // decoded pixels, unless a local resize is still borrowing them.
+        drop(self.thumb_sources.remove_matching(|key| key.0 == id));
+        self.thumb_loads.remove(&ThumbSourceKey(id.to_string()));
+        self.thumb_waiting.retain(|key| key.id != id);
+        self.thumb_building.retain(|key| key.id != id);
+        self.thumb_failures.remove(&ThumbSourceKey(id.to_string()));
         let evicted = self.remember_purged(id);
         (images, evicted)
     }
@@ -555,6 +606,13 @@ pub fn rgba_bytes(width: u32, height: u32) -> usize {
     width as usize * height as usize * 4
 }
 
+/// Bytes held by a decoded server thumbnail. `DynamicImage` keeps one
+/// contiguous buffer, so its length is the real decoded cost in any colour
+/// layout (RGB, RGBA, 16-bit) and not an RGBA estimate.
+pub fn source_bytes(image: &image::DynamicImage) -> usize {
+    image.as_bytes().len()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -650,7 +708,7 @@ mod tests {
 
     #[test]
     fn lru_evicts_by_byte_budget_and_returns_gpu_images() {
-        let mut cache: ImageCache<i64> = ImageCache::new(1000);
+        let mut cache: ImageCache<i64, Arc<RenderImage>> = ImageCache::new(1000);
         let first = image(10, 10);
         assert!(cache.put(1, first, 400).is_empty());
         assert!(cache.put(2, image(10, 10), 400).is_empty());
@@ -669,7 +727,7 @@ mod tests {
 
     #[test]
     fn one_picture_larger_than_the_budget_is_not_cached() {
-        let mut cache: ImageCache<i64> = ImageCache::new(100);
+        let mut cache: ImageCache<i64, Arc<RenderImage>> = ImageCache::new(100);
         assert!(cache.put(1, image(10, 10), 400).is_empty());
         assert!(cache.get(&1).is_none());
     }

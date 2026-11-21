@@ -229,14 +229,21 @@ fn a_scaled_picture_ignores_the_row_padding() {
 fn scaled_solid_frames_keep_their_colour_at_even_and_odd_sizes() {
     // (source width, source height, output width, output height). The 6×4
     // case keeps the size and takes the libyuv path; the others rescale,
-    // including an odd source and a one-row source.
+    // including an odd source, a one-row source and upscales.
     let cases = [
         (6, 4, 6, 4),
         (8, 6, 4, 2),
         (8, 6, 6, 4),
         (7, 5, 6, 4),
         (2, 1, 2, 2),
+        (2, 2, 8, 6),
+        (2, 1, 6, 2),
     ];
+    // BGRA (40, 200, 30) is 30 red, 200 green, 40 blue. A solid frame has a
+    // box mean exactly equal to its pixel, so every path must reproduce this
+    // reference within one bit of fixed-point rounding: a two-unit error in
+    // the formula fails here.
+    let (want_y, want_u, want_v) = bgra_to_yuv(30, 200, 40);
     for (width, height, out_w, out_h) in cases {
         let stride = width * 4 + 4;
         let source = solid(width, height, stride, [40, 200, 30, 255]);
@@ -247,18 +254,63 @@ fn scaled_solid_frames_keep_their_colour_at_even_and_odd_sizes() {
         );
         let label = format!("{width}×{height} into {out_w}×{out_h}");
         let (luma, u, v) = planes(&output);
-        // BGRA (40, 200, 30) is Y=128, U=83, V=65 in BT.601 limited range.
         assert!(
-            luma.iter().all(|value| (126..=130).contains(value)),
-            "Y {label}: {luma:?}"
+            luma.iter().all(|value| value.abs_diff(want_y) <= 1),
+            "Y {label}: {luma:?}, expected {want_y} ± 1"
         );
         assert!(
-            u.iter().all(|value| (81..=85).contains(value)),
-            "U {label}: {u:?}"
+            u.iter().all(|value| value.abs_diff(want_u) <= 1),
+            "U {label}: {u:?}, expected {want_u} ± 1"
         );
         assert!(
-            v.iter().all(|value| (63..=67).contains(value)),
-            "V {label}: {v:?}"
+            v.iter().all(|value| value.abs_diff(want_v) <= 1),
+            "V {label}: {v:?}, expected {want_v} ± 1"
+        );
+    }
+}
+
+#[test]
+fn scale_bounds_cover_only_the_source_at_any_ratio() {
+    // The cached boxes of a conversion must never run past the source or be
+    // empty, including upscales where several samples share one source pixel.
+    for (source_w, source_h, out_w, out_h) in [
+        (2, 2, 8, 6),
+        (2, 1, 6, 2),
+        (8, 6, 4, 2),
+        (7, 5, 6, 4),
+        (1920, 1080, 1280, 720),
+        (4096, 2160, 2, 2),
+    ] {
+        let bounds = ScaleBounds::new(
+            (source_w, source_h),
+            (out_w, out_h),
+            ((out_w as usize).div_ceil(2), (out_h as usize).div_ceil(2)),
+        );
+        let check = |boxes: &[(u32, u32)], limit: u32, expected: usize, label: &str| {
+            assert_eq!(boxes.len(), expected, "{label}: length");
+            for &(start, end) in boxes {
+                assert!(start < end, "{label}: empty box {start}..{end}");
+                assert!(end <= limit, "{label}: past the source {end} > {limit}");
+            }
+        };
+        check(
+            bounds.luma_columns(),
+            source_w,
+            out_w as usize,
+            "luma columns",
+        );
+        check(bounds.luma_rows(), source_h, out_h as usize, "luma rows");
+        check(
+            bounds.chroma_columns(),
+            source_w,
+            (out_w as usize).div_ceil(2),
+            "chroma columns",
+        );
+        check(
+            bounds.chroma_rows(),
+            source_h,
+            (out_h as usize).div_ceil(2),
+            "chroma rows",
         );
     }
 }

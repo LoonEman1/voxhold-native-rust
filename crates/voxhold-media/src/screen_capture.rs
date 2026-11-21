@@ -27,6 +27,7 @@
 //! The picker therefore lists `get_source_list` itself and the local grid is
 //! the only chooser on Windows.
 
+use std::ops::Range;
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, AtomicU64, Ordering},
@@ -601,31 +602,76 @@ fn bgra_to_yuv(red: u32, green: u32, blue: u32) -> (u8, u8, u8) {
     )
 }
 
-/// Source columns or rows covered by every destination sample on one axis.
+/// Source box of every destination sample of one conversion.
 ///
-/// The bounds depend only on the source and destination sizes, so they are
-/// built once per conversion instead of being recomputed with 64-bit
-/// divisions inside the per-pixel loops. `step` is 1 for luma and 2 for
-/// chroma: one chroma sample spans two luma samples of the same axis.
+/// The four axes (luma and chroma, horizontal and vertical) differ only in
+/// their count and step, so they share one allocation per call: each axis is a
+/// range in the same buffer and nothing is kept between frames. The bounds
+/// depend only on the source and destination sizes, so they are built once per
+/// conversion instead of being recomputed with 64-bit divisions inside the
+/// per-pixel loops. `step` is 1 for luma and 2 for chroma: one chroma sample
+/// spans two luma samples of the same axis.
 struct ScaleBounds {
-    start: Vec<u32>,
-    end: Vec<u32>,
+    boxes: Vec<(u32, u32)>,
+    luma_x: Range<usize>,
+    luma_y: Range<usize>,
+    chroma_x: Range<usize>,
+    chroma_y: Range<usize>,
 }
 
 impl ScaleBounds {
-    fn new(count: usize, step: u64, source: u32, destination: u32) -> Self {
-        let mut start = Vec::with_capacity(count);
-        let mut end = Vec::with_capacity(count);
-        let destination = u64::from(destination);
-        for index in 0..count as u64 {
-            let from = (index * step * u64::from(source) / destination) as u32;
-            let to = (((index + 1) * step * u64::from(source) / destination) as u32)
-                .max(from + 1)
-                .min(source);
-            start.push(from);
-            end.push(to);
+    /// `source` is `(width, height)`, `destination` is the even output size and
+    /// `chroma` is its I420 chroma size.
+    fn new(source: (u32, u32), destination: (u32, u32), chroma: (usize, usize)) -> Self {
+        let (source_width, source_height) = source;
+        let (out_w, out_h) = destination;
+        let (chroma_width, chroma_height) = chroma;
+        let columns = out_w as usize;
+        let rows = out_h as usize;
+        let luma_x = 0..columns;
+        let luma_y = columns..columns + rows;
+        let chroma_x = luma_y.end..luma_y.end + chroma_width;
+        let chroma_y = chroma_x.end..chroma_x.end + chroma_height;
+        let mut boxes = Vec::with_capacity(chroma_y.end);
+        push_axis(&mut boxes, columns, 1, source_width, out_w);
+        push_axis(&mut boxes, rows, 1, source_height, out_h);
+        push_axis(&mut boxes, chroma_width, 2, source_width, out_w);
+        push_axis(&mut boxes, chroma_height, 2, source_height, out_h);
+        Self {
+            boxes,
+            luma_x,
+            luma_y,
+            chroma_x,
+            chroma_y,
         }
-        Self { start, end }
+    }
+
+    fn luma_columns(&self) -> &[(u32, u32)] {
+        &self.boxes[self.luma_x.clone()]
+    }
+
+    fn luma_rows(&self) -> &[(u32, u32)] {
+        &self.boxes[self.luma_y.clone()]
+    }
+
+    fn chroma_columns(&self) -> &[(u32, u32)] {
+        &self.boxes[self.chroma_x.clone()]
+    }
+
+    fn chroma_rows(&self) -> &[(u32, u32)] {
+        &self.boxes[self.chroma_y.clone()]
+    }
+}
+
+/// Append one axis of non-empty source boxes, never past `source`.
+fn push_axis(boxes: &mut Vec<(u32, u32)>, count: usize, step: u64, source: u32, destination: u32) {
+    let destination = u64::from(destination);
+    for index in 0..count as u64 {
+        let from = (index * step * u64::from(source) / destination) as u32;
+        let to = (((index + 1) * step * u64::from(source) / destination) as u32)
+            .max(from + 1)
+            .min(source);
+        boxes.push((from, to));
     }
 }
 
@@ -644,12 +690,14 @@ fn convert_bgra_to_i420_box(
     let (out_w, out_h) = (output.width(), output.height());
     let (stride_y, stride_u, stride_v) = output.strides();
     let (stride_y, stride_u, stride_v) = (stride_y as usize, stride_u as usize, stride_v as usize);
-    let chroma_width = output.chroma_width() as usize;
-    let chroma_height = output.chroma_height() as usize;
-    let luma_x = ScaleBounds::new(out_w as usize, 1, width, out_w);
-    let luma_y = ScaleBounds::new(out_h as usize, 1, height, out_h);
-    let chroma_x = ScaleBounds::new(chroma_width, 2, width, out_w);
-    let chroma_y = ScaleBounds::new(chroma_height, 2, height, out_h);
+    let bounds = ScaleBounds::new(
+        (width, height),
+        (out_w, out_h),
+        (
+            output.chroma_width() as usize,
+            output.chroma_height() as usize,
+        ),
+    );
     let (data_y, data_u, data_v) = output.data_mut();
     let box_mean = |x0: u32, x1: u32, y0: u32, y1: u32| -> (u32, u32, u32) {
         let mut red = 0_u32;
@@ -673,16 +721,9 @@ fn convert_bgra_to_i420_box(
     };
     // One chroma sample covers a 2×2 block of destination luma pixels, so its
     // source box is the union of those four boxes.
-    for chroma_row in 0..chroma_height {
-        let y0 = chroma_y.start[chroma_row];
-        let y1 = chroma_y.end[chroma_row];
-        for chroma_column in 0..chroma_width {
-            let (red, green, blue) = box_mean(
-                chroma_x.start[chroma_column],
-                chroma_x.end[chroma_column],
-                y0,
-                y1,
-            );
+    for (chroma_row, &(y0, y1)) in bounds.chroma_rows().iter().enumerate() {
+        for (chroma_column, &(x0, x1)) in bounds.chroma_columns().iter().enumerate() {
+            let (red, green, blue) = box_mean(x0, x1, y0, y1);
             let (_, u, v) = bgra_to_yuv(red, green, blue);
             data_u[chroma_row * stride_u + chroma_column] = u;
             data_v[chroma_row * stride_v + chroma_column] = v;
@@ -690,27 +731,28 @@ fn convert_bgra_to_i420_box(
     }
     // Luma is written per destination pixel so a non-integer scale keeps the
     // geometry; the chroma pass above used the same source boxes.
-    for out_row in 0..out_h as usize {
-        let y0 = luma_y.start[out_row];
-        let y1 = luma_y.end[out_row];
-        for out_column in 0..out_w as usize {
-            let (red, green, blue) =
-                box_mean(luma_x.start[out_column], luma_x.end[out_column], y0, y1);
+    for (out_row, &(y0, y1)) in bounds.luma_rows().iter().enumerate() {
+        for (out_column, &(x0, x1)) in bounds.luma_columns().iter().enumerate() {
+            let (red, green, blue) = box_mean(x0, x1, y0, y1);
             let (y, _, _) = bgra_to_yuv(red, green, blue);
             data_y[out_row * stride_y + out_column] = y;
         }
     }
 }
 
-/// Convert a BGRA picture into `output` with a box filter.
+/// Convert a BGRA picture into `output`.
 ///
 /// `output` must be sized to the wanted picture. The source may have any
 /// stride (including padding after every row) and odd sizes; the destination
 /// is I420 and therefore always even. Returns `false` on an unusable input.
 ///
-/// An unchanged size takes the libyuv path, which reads the BGRA bytes as its
-/// `ARGB` fourcc: on little-endian Windows that word is 0xAARRGGBB, i.e. the
-/// same B,G,R,A byte order. A size change stays on the scalar box filter.
+/// The path follows the size:
+/// - an unchanged size is converted by libyuv (`argb_to_i420`, SIMD), which
+///   reads the BGRA bytes as its `ARGB` fourcc: on little-endian Windows that
+///   word is 0xAARRGGBB, i.e. the same B,G,R,A byte order. Its fixed-point
+///   rounding may differ from the scalar reference by up to one bit;
+/// - any size change uses the scalar box filter, which averages the exact
+///   source rectangle of every destination sample.
 pub fn convert_bgra_to_i420(
     bgra: &[u8],
     width: u32,

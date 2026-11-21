@@ -60,7 +60,7 @@ fn a_clear_writes_an_empty_new_format_with_a_new_generation() {
 
     // A late delete of the old generation cannot touch the cleared file.
     assert_eq!(
-        store.delete("https://chat.example.org", "neva", before),
+        store.delete("https://chat.example.org", "neva", "token-1", before),
         Err(StoreError::Stale)
     );
     std::fs::remove_dir_all(dir).unwrap();
@@ -286,7 +286,7 @@ fn a_second_store_cannot_revive_or_delete_after_a_cleanup() {
     // and the new empty generation stays empty.
     assert_eq!(writer.save(&first, old_epoch), Err(StoreError::Stale));
     assert_eq!(
-        writer.delete(&first.origin, &first.account, old_epoch),
+        writer.delete(&first.origin, &first.account, &first.token, old_epoch),
         Err(StoreError::Stale)
     );
     assert_eq!(
@@ -306,7 +306,7 @@ fn a_second_store_cannot_revive_or_delete_after_a_cleanup() {
     // writer still cannot erase it.
     other.save(&second, other.begin_login()).unwrap();
     assert_eq!(
-        writer.delete(&second.origin, &second.account, old_epoch),
+        writer.delete(&second.origin, &second.account, &second.token, old_epoch),
         Err(StoreError::Stale)
     );
     assert_eq!(other.load_all().unwrap(), vec![second]);
@@ -362,10 +362,105 @@ fn a_login_starts_above_the_generation_on_disk() {
     .unwrap();
 
     let second = SessionStore::new(Some(path));
+    let before = second.state().unwrap().generation;
     let generation = second.begin_login();
-    assert!(generation > second.state().unwrap().generation);
+    assert!(
+        generation > before,
+        "the claim is above the file it started from"
+    );
+    assert_eq!(
+        second.state().unwrap().generation,
+        generation,
+        "the claim is persisted under the lock"
+    );
     assert!(generation > 0);
     assert_eq!(second.epoch(), generation);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// Two processes that start a login from one file must not receive the same
+/// generation, and the delete of the older session must keep the record the
+/// newer one saved — neither through the generation nor through the token.
+#[test]
+fn two_processes_claim_distinct_generations_and_keep_the_newer_login() {
+    let (dir, path) = scratch("two-claims");
+    let first = SessionStore::new(Some(path.clone()));
+    let old = record("https://chat.example.org", "neva", "token-old");
+    save_now(&first, &old).unwrap();
+
+    // Both processes open the same file and start a login before either writes.
+    let a = SessionStore::new(Some(path.clone()));
+    let b = SessionStore::new(Some(path.clone()));
+    let claim_a = a.begin_login();
+    let claim_b = b.begin_login();
+    assert!(
+        claim_b > claim_a,
+        "the second claim is strictly newer: {claim_a} vs {claim_b}"
+    );
+    assert_eq!(
+        b.state().unwrap().generation,
+        claim_b,
+        "the claim is on disk before the login writes"
+    );
+
+    // B signs in; then the session of A ends and tries to delete its record.
+    let fresh = record("https://chat.example.org", "neva", "token-fresh");
+    b.save(&fresh, claim_b).unwrap();
+    assert_eq!(
+        a.delete(&old.origin, &old.account, &old.token, claim_a),
+        Err(StoreError::Stale),
+        "a delete of the old generation never reaches the newer record"
+    );
+    assert_eq!(
+        a.clear_all(claim_a),
+        Err(StoreError::Stale),
+        "a cleanup of the old generation cannot erase the newer login"
+    );
+
+    // Even at the current generation a delete is scoped to the session token.
+    let current = a.state().unwrap().generation;
+    a.delete(&fresh.origin, &fresh.account, &old.token, current)
+        .unwrap();
+    assert_eq!(
+        a.load_all().unwrap(),
+        vec![fresh.clone()],
+        "the record of the newer login stays"
+    );
+    assert_eq!(
+        a.state().unwrap().target,
+        Some(AutoLoginTarget::from_record(&fresh))
+    );
+
+    // A cleanup claims its generation before it clears: a login saved above
+    // that claim afterwards survives the close-time clear of the old window.
+    let cleanup = b.begin_login();
+    let later = record("https://chat.example.org", "bob", "token-later");
+    let later_claim = a.begin_login();
+    a.save(&later, later_claim).unwrap();
+    assert_eq!(
+        b.clear_all(cleanup),
+        Err(StoreError::Stale),
+        "the cleanup cannot erase a login saved after its claim"
+    );
+    assert_eq!(a.load_all().unwrap(), vec![fresh.clone(), later.clone()]);
+
+    // The ended session still removes only its own record; the target now
+    // names the other account and stays.
+    let current = a.state().unwrap().generation;
+    a.delete(&fresh.origin, &fresh.account, &fresh.token, current)
+        .unwrap();
+    assert_eq!(a.load_all().unwrap(), vec![later.clone()]);
+    assert_eq!(
+        a.state().unwrap().target,
+        Some(AutoLoginTarget::from_record(&later))
+    );
+
+    // The record of the session that ended is removed when its token matches.
+    let current = a.state().unwrap().generation;
+    a.delete(&later.origin, &later.account, &later.token, current)
+        .unwrap();
+    assert!(a.load_all().unwrap().is_empty());
+    assert!(a.state().unwrap().target.is_none());
     std::fs::remove_dir_all(dir).unwrap();
 }
 

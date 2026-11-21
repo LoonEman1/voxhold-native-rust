@@ -251,10 +251,13 @@ impl Voxhold {
     /// The token is invalid, so only local state is cleared. The remembered
     /// record cannot be used any more and is deleted even when offline.
     fn expire_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let stored = self
-            .session
-            .as_ref()
-            .map(|session| (session.origin().to_owned(), session.username().to_owned()));
+        let stored = self.session.as_ref().map(|session| {
+            (
+                session.origin().to_owned(),
+                session.username().to_owned(),
+                session.token().to_owned(),
+            )
+        });
         // Keep the drafts of this account in memory. This runs before
         // `end_session`, whose normal clear empties the live (now new) set.
         self.preserve_drafts(window, cx);
@@ -487,10 +490,13 @@ impl Voxhold {
     ) {
         self.session = Some(session);
         self.session_epoch = self.session_epoch.wrapping_add(1);
-        // A new login owns a fresh store generation above both this process
-        // and the file on disk, so a delete that was queued by the previous
-        // session is stale even if it runs later.
-        self.session_store.begin_login();
+        // A new login owns a fresh generation in memory immediately, so a
+        // write or a delete that was queued by the previous session is stale
+        // even if it runs later. Nothing is read or written here: the
+        // generation is claimed on disk by the first write of this session
+        // (`begin_login` inside the background save/cleanup task), so the UI
+        // thread never waits for DPAPI or the named lock.
+        self.session_store.bump_epoch();
         self.auto_epoch = self.session_store.epoch();
         self.session_gate.reset();
         self.start_session_clock(window, cx);

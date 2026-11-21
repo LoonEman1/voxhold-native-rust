@@ -90,6 +90,9 @@ impl Voxhold {
             self.startup_manual(attempt, "");
             return;
         }
+        // A lost answer must not keep the neutral surface forever: the budget
+        // is the hard bound of the whole startup phase.
+        self.arm_startup_deadline(attempt, self.startup_deadline, window, cx);
         let store = self.session_store.clone();
         let rt = self.runtime.clone();
         let budget = self.startup_budget;
@@ -201,7 +204,12 @@ impl Voxhold {
         cx: &mut Context<Self>,
     ) {
         if record.is_expired(now_unix()) {
-            self.forget_record(record.origin.clone(), record.account.clone(), cx);
+            self.forget_record(
+                record.origin.clone(),
+                record.account.clone(),
+                record.token.clone(),
+                cx,
+            );
             self.auto_expired(attempt, cx);
             return;
         }
@@ -266,6 +274,15 @@ impl Voxhold {
                 if !self.auth.remember_login {
                     return;
                 }
+                // The background step compares the disk generation around its
+                // own reads; this is the last cheap check before a token is
+                // installed. A newer generation cannot be verified without a
+                // blocking read here, so the answer becomes a manual start
+                // instead of entering a workspace that another window replaced.
+                if self.auto_stored_generation_moved() {
+                    self.startup_manual(attempt, "");
+                    return;
+                }
                 // The server expiry is re-checked after the request: the stored
                 // record may have expired while profile and servers were on
                 // the wire.
@@ -273,6 +290,7 @@ impl Voxhold {
                     self.forget_record(
                         session.origin().to_owned(),
                         session.username().to_owned(),
+                        session.token().to_owned(),
                         cx,
                     );
                     self.auto_expired(attempt, cx);
@@ -409,11 +427,23 @@ impl Voxhold {
                         expires_at,
                         saved_at: now_unix(),
                     };
-                    match store.save(&record, expected_epoch) {
-                        Ok(()) => Ok(Some(token)),
+                    // The claim reserves this login's generation on disk, above
+                    // every earlier one, so another process's older delete or
+                    // cleanup cannot reach this record. Both steps are blocking
+                    // (DPAPI and the named mutex) and stay together, so the save
+                    // uses the generation the claim just wrote.
+                    let writer = store.clone();
+                    let saved = tokio::task::spawn_blocking(move || {
+                        let claim = writer.begin_login();
+                        writer.save(&record, claim)
+                    })
+                    .await;
+                    match saved {
+                        Ok(Ok(())) => Ok(Some(token)),
                         // The session ended while this save was queued.
-                        Err(StoreError::Stale) => Ok(None),
-                        Err(error) => Err(error),
+                        Ok(Err(StoreError::Stale)) => Ok(None),
+                        Ok(Err(error)) => Err(error),
+                        Err(_) => Err(StoreError::Io),
                     }
                 } else {
                     match store.forget(&origin, &account, expected_epoch) {
@@ -437,7 +467,6 @@ impl Voxhold {
                         // cleanup and its suppression marker.
                         s.auto_blocked = false;
                         s.cleanup_retry = false;
-                        s.cleanup_unconfirmed = false;
                         if s.auth.status.starts_with(CLEAR_ERROR) {
                             s.auth.status.clear();
                         }
@@ -518,27 +547,35 @@ impl Voxhold {
     }
 
     /// Delete the record of the session that just ended. `None` (no session)
-    /// is a no-op; the delete itself is local, so it also works offline.
+    /// is a no-op; the delete itself is local, so it also works offline. The
+    /// delete is scoped to the token that ended, so a login saved afterwards by
+    /// another window or process is never removed.
     pub(super) fn forget_stored(
         &self,
-        stored: Option<(String, String)>,
+        stored: Option<(String, String, String)>,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some((origin, account)) = stored {
-            self.forget_record(origin, account, cx);
+        if let Some((origin, account, token)) = stored {
+            self.forget_record(origin, account, token, cx);
         }
     }
 
-    pub(super) fn forget_record(&self, origin: String, account: String, cx: &mut Context<Self>) {
+    pub(super) fn forget_record(
+        &self,
+        origin: String,
+        account: String,
+        token: String,
+        cx: &mut Context<Self>,
+    ) {
         let store = self.session_store.clone();
         let expected_epoch = store.epoch();
         cx.background_spawn(async move {
             // One retry for a briefly held lock; the visible result is handled
             // by the caller that owns the screen.
-            let result = store.delete(&origin, &account, expected_epoch);
+            let result = store.delete(&origin, &account, &token, expected_epoch);
             if matches!(result, Err(StoreError::Lock) | Err(StoreError::Io)) {
-                let _ = store.delete(&origin, &account, expected_epoch);
+                let _ = store.delete(&origin, &account, &token, expected_epoch);
             }
         })
         .detach();
@@ -554,14 +591,27 @@ impl Voxhold {
         self.cleanup_retry = false;
         let expected_epoch = self.session_store.epoch();
         self.cleanup_epoch = expected_epoch;
+        self.cleanup_claim
+            .store(0, std::sync::atomic::Ordering::SeqCst);
+        let claim_slot = self.cleanup_claim.clone();
         let store = self.session_store.clone();
         let rt = self.runtime.clone();
         let task = cx.background_spawn(async move {
             rt.block_on(async move {
-                let result = store.clear_all(expected_epoch);
+                // Reserve this cleanup's generation on disk before clearing.
+                // A login that another window or process saves after this point
+                // claims a higher generation, so this clear is refused with
+                // `Stale` and that record survives. The claim reads, decrypts
+                // and rewrites the file, so it runs on a blocking worker.
+                let claim = store.clone();
+                let expected = tokio::task::spawn_blocking(move || claim.begin_login())
+                    .await
+                    .unwrap_or(expected_epoch);
+                claim_slot.store(expected, std::sync::atomic::Ordering::SeqCst);
+                let result = store.clear_all(expected);
                 // If the records could not be removed, try to leave a marker
                 // that suppresses the next automatic restoration.
-                let blocked = result.is_err() && store.block_restore(expected_epoch).is_ok();
+                let blocked = result.is_err() && store.block_restore(expected).is_ok();
                 (result, blocked)
             })
         });
@@ -575,7 +625,6 @@ impl Voxhold {
                     Ok(_) | Err(StoreError::Stale) => {
                         s.auto_blocked = false;
                         s.cleanup_retry = false;
-                        s.cleanup_unconfirmed = false;
                         if s.session.is_none() && s.auth.status.starts_with(CLEAR_ERROR) {
                             s.auth.status.clear();
                         }
@@ -583,7 +632,6 @@ impl Voxhold {
                     Err(_) => {
                         s.auto_blocked = true;
                         s.cleanup_retry = true;
-                        s.cleanup_unconfirmed = !blocked;
                         let message = if blocked {
                             CLEAR_ERROR.to_string()
                         } else {
@@ -623,9 +671,12 @@ impl Voxhold {
             return;
         }
         self.cleanup_pending = false;
-        // The captured generation, not the current one: a login that already
-        // started supersedes this cleanup and must survive the close.
-        let expected = self.cleanup_epoch;
+        // The claimed generation when the background step already reserved one;
+        // otherwise the generation captured at the logout. Never the current
+        // one: a login that another window saved in between is above both and
+        // must survive this close.
+        let claim = self.cleanup_claim.load(std::sync::atomic::Ordering::SeqCst);
+        let expected = if claim > 0 { claim } else { self.cleanup_epoch };
         match self.session_store.clear_all(expected) {
             Ok(_) | Err(StoreError::Stale) => {}
             Err(_) => {
@@ -663,7 +714,7 @@ impl Voxhold {
 
     fn delete_attempted_record(&mut self, cx: &mut Context<Self>) {
         if let Some(record) = self.auto_record.clone() {
-            self.forget_record(record.origin, record.account, cx);
+            self.forget_record(record.origin, record.account, record.token, cx);
         }
     }
 
@@ -675,11 +726,54 @@ impl Voxhold {
     }
 
     fn auto_still_owns(&self, attempt: u64) -> bool {
+        // The store generation is deliberately not part of this check. The
+        // background step reads the store, and such a read raises the
+        // in-process generation to the disk one; comparing it here would drop
+        // every late answer of this attempt and leave `startup_restoring` set
+        // forever. The generation is checked where it changes the decision:
+        // before a session is installed.
         self.auto_attempt == attempt
             && self.auth.screen == auth::AuthScreen::Login
             && self.session.is_none()
             && !self.auth.busy
-            && self.auto_epoch == self.session_store.epoch()
+    }
+
+    /// A store generation above the one captured for this attempt means another
+    /// window or process logged in or out while the answer was on the wire. The
+    /// check is one atomic load; the file is never read on the UI thread.
+    fn auto_stored_generation_moved(&self) -> bool {
+        self.session_store.epoch() > self.auto_epoch
+    }
+
+    /// The hard bound of the startup phase. A background answer is expected
+    /// within the budget, but a lost one must hand the window over to the
+    /// manual form instead of leaving the neutral surface on screen.
+    fn arm_startup_deadline(
+        &mut self,
+        attempt: u64,
+        deadline: Instant,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let executor = cx.background_executor().clone();
+        cx.spawn_in(window, async move |this, cx| {
+            executor
+                .timer(deadline.saturating_duration_since(Instant::now()))
+                .await;
+            let _ = this.update_in(cx, |s, _window, cx| {
+                if s.auto_attempt != attempt || !s.startup_restoring || s.session.is_some() {
+                    return;
+                }
+                // Keep the screen: an answer that still arrives for this
+                // attempt is applied by its own branch.
+                s.startup_restoring = false;
+                s.auth.auto_login = false;
+                s.auth.auto_retry = false;
+                s.initial_focus_done = false;
+                cx.notify();
+            });
+        })
+        .detach();
     }
 }
 
@@ -690,8 +784,9 @@ async fn auto_network(
     record: RememberedSession,
     deadline: Instant,
 ) -> AutoNetwork {
-    // Every delete in this attempt belongs to the generation that started it;
-    // a logout that bumps the generation makes a late delete harmless.
+    // Every delete in this attempt belongs to the generation that started it
+    // and to the exact token of the record; a logout or a newer login that
+    // moved the generation or the token makes a late delete harmless.
     let expected_epoch = store.epoch();
     let mut client = match Client::new(&record.origin) {
         // The canonical origin must round-trip exactly before a Bearer token
@@ -712,7 +807,12 @@ async fn auto_network(
     // The expiry is checked again after each wire trip; a token that ran out
     // while the request was in flight is not used for the next one.
     if record.is_expired(now_unix()) {
-        let _ = store.delete(&record.origin, &record.account, expected_epoch);
+        let _ = store.delete(
+            &record.origin,
+            &record.account,
+            &record.token,
+            expected_epoch,
+        );
         return AutoNetwork::Unauthorized;
     }
     if store
@@ -725,7 +825,12 @@ async fn auto_network(
     }
     if profile.user_id != record.user_id || !accounts_match(&record.account, &profile.username) {
         // A record that now answers as another user is not this login.
-        let _ = store.delete(&record.origin, &record.account, expected_epoch);
+        let _ = store.delete(
+            &record.origin,
+            &record.account,
+            &record.token,
+            expected_epoch,
+        );
         return AutoNetwork::WrongUser;
     }
     let servers = match request_with_deadline(deadline, client.servers()).await {
@@ -733,7 +838,12 @@ async fn auto_network(
         Err(error) => return auto_error(store, &record, &error, expected_epoch),
     };
     if record.is_expired(now_unix()) {
-        let _ = store.delete(&record.origin, &record.account, expected_epoch);
+        let _ = store.delete(
+            &record.origin,
+            &record.account,
+            &record.token,
+            expected_epoch,
+        );
         return AutoNetwork::Unauthorized;
     }
     if store
@@ -788,7 +898,12 @@ fn auto_error(
 ) -> AutoNetwork {
     match error {
         voxhold_api::Error::Http(401) => {
-            let _ = store.delete(&record.origin, &record.account, expected_epoch);
+            let _ = store.delete(
+                &record.origin,
+                &record.account,
+                &record.token,
+                expected_epoch,
+            );
             AutoNetwork::Unauthorized
         }
         voxhold_api::Error::Network

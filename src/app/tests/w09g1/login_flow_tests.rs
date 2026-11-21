@@ -3,6 +3,27 @@
 
 use super::*;
 
+/// Let the requests of the previous window finish before a test snapshots a
+/// counter: the realtime handshake can land after the window is dropped.
+fn settle_requests(visual: &mut VisualTestContext, servers: &[&TestServer]) {
+    let mut last: Vec<usize> = servers.iter().map(|s| s.requests().len()).collect();
+    let mut stable = 0;
+    for _ in 0..80 {
+        visual.run_until_parked();
+        std::thread::sleep(Duration::from_millis(25));
+        let now: Vec<usize> = servers.iter().map(|s| s.requests().len()).collect();
+        if now == last {
+            stable += 1;
+            if stable >= 8 {
+                return;
+            }
+        } else {
+            last = now;
+            stable = 0;
+        }
+    }
+}
+
 /// A02: all four checkbox combinations decide the next start, and an unchecked
 /// manual login removes the previous account.
 #[gpui::test]

@@ -48,13 +48,27 @@ impl VoicePanel {
         }
     }
 
-    pub(super) fn live_clock_changed(&mut self) -> bool {
-        let next = (self.room_painted
+    /// Whether a painted room card shows a running stream. Such a card owns a
+    /// live `M:SS` label even when this client is not in the call.
+    fn room_stream_clock(&self) -> bool {
+        self.room_painted
             && self
                 .room_streams()
                 .iter()
-                .any(|item| item.started_at_ms > 0))
-        .then(|| voice_room::now_millis() / 1000);
+                .any(|item| item.started_at_ms > 0)
+    }
+
+    /// Whether the one-second tick has a reason to poll: a call, an open
+    /// handle, or a painted room list with a running foreign stream. Without
+    /// any of them an idle panel must not poll.
+    pub(super) fn live_clock_due(&self) -> bool {
+        self.call_active() || self.handle.is_some() || self.room_stream_clock()
+    }
+
+    pub(super) fn live_clock_changed(&mut self) -> bool {
+        let next = self
+            .room_stream_clock()
+            .then(|| voice_room::now_millis() / 1000);
         let changed = self.live_clock_second != next;
         self.live_clock_second = next;
         changed

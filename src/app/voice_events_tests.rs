@@ -9,6 +9,7 @@ use super::voice_tests::{draw, fixture_with};
 use crate::voice_panel::VoicePanel;
 use gpui::{BackgroundExecutor, Entity, TestAppContext, VisualTestContext};
 use std::collections::HashMap;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use voxhold_media::controller::Publication;
 use voxhold_media::publisher::{Phase, Sharing};
@@ -123,6 +124,68 @@ async fn a_call_without_a_stream_has_no_100ms_poll_but_ticks_the_clock(cx: &mut 
             panel.test_live_clock_second().is_some(),
             "the clock tick recorded the on-air second"
         );
+    });
+}
+
+/// A watcher who is not in the call still sees a foreign stream card with an
+/// `M:SS` label. The painted room list with a running stream is the third
+/// reason for the one-second clock, after a call and an open handle, and it
+/// must not turn into a 100 ms deadline.
+#[gpui::test]
+async fn a_room_stream_outside_a_call_ticks_the_live_clock_once_per_second(
+    cx: &mut TestAppContext,
+) {
+    let (mut visual, _view, voice) = fixture_with(cx, None, false);
+    visual.update(|_window, app| {
+        voice.update(app, |panel, _| {
+            panel.set_room_state(7, Vec::new(), vec![publication(7, "alice", 1)]);
+        });
+    });
+    draw(&mut visual);
+    let executor = executor(&mut visual);
+    reset_polls(&mut visual, &voice);
+    voice.read_with(&*visual, |panel, _| {
+        assert_eq!(
+            panel.test_live_clock_second(),
+            None,
+            "the setup has not polled yet"
+        );
+    });
+    advance(&mut visual, &executor, 1_000);
+    assert_eq!(
+        poll_count(&visual, &voice),
+        1,
+        "one second of a painted foreign stream is exactly one clock poll"
+    );
+    voice.read_with(&*visual, |panel, _| {
+        assert!(
+            panel.test_live_clock_second().is_some(),
+            "that poll recorded the on-air second"
+        );
+    });
+}
+
+/// The same idle room without a running stream has nothing to repaint, so the
+/// clock stays asleep even though the room pane is painted.
+#[gpui::test]
+async fn an_idle_room_without_a_stream_does_not_tick(cx: &mut TestAppContext) {
+    let (mut visual, _view, voice) = fixture_with(cx, None, false);
+    visual.update(|_window, app| {
+        voice.update(app, |panel, _| {
+            panel.set_room_state(7, Vec::new(), Vec::new());
+        });
+    });
+    draw(&mut visual);
+    let executor = executor(&mut visual);
+    reset_polls(&mut visual, &voice);
+    advance(&mut visual, &executor, 1_000);
+    assert_eq!(
+        poll_count(&visual, &voice),
+        0,
+        "a painted room without a stream or a call has no reason to poll"
+    );
+    voice.read_with(&*visual, |panel, _| {
+        assert_eq!(panel.test_live_clock_second(), None);
     });
 }
 
@@ -361,6 +424,34 @@ async fn a_published_preview_wakes_the_panel_and_is_shown(cx: &mut TestAppContex
             "the visible card counted exactly one shown preview"
         );
     });
+}
+
+/// An idle panel is released while its event task is parked on the media
+/// wake. Release must wake that task once; otherwise it would wait for an
+/// update of a dead entity until the app quits.
+#[gpui::test]
+async fn a_released_idle_panel_ends_its_parked_event_task(cx: &mut TestAppContext) {
+    let (mut visual, view, voice) = fixture_with(cx, None, false);
+    draw(&mut visual);
+    let tasks = voice.read_with(&*visual, |panel, _| panel.test_event_tasks());
+    assert_eq!(
+        tasks.load(Ordering::Relaxed),
+        1,
+        "the panel runs exactly one event task"
+    );
+    // The fixture view keeps a second strong handle to the panel.
+    visual.update(|_window, app| {
+        view.update(app, |view, _| view.voice = None);
+    });
+    drop(voice);
+    // The next app update flushes the dropped entity and runs its `Drop`.
+    visual.update(|_window, _app| {});
+    visual.run_until_parked();
+    assert_eq!(
+        tasks.load(Ordering::Relaxed),
+        0,
+        "release woke the task and it ended instead of staying parked"
+    );
 }
 
 /// The O02 minor: a preview frame taken while the card is not visible is

@@ -8,14 +8,19 @@
 //!   stream error, a screen snapshot), a prepared player picture or a local
 //!   preview. In an idle call the task sleeps and the panel never polls.
 //! - [`spawn_clock`] is the one-second live-clock tick. It polls only while a
-//!   call exists (a handle or a call channel); after Leave/Stop it keeps
-//!   sleeping without polling.
+//!   painted card shows a running stream or a call exists (a handle or a call
+//!   channel); after Leave/Stop or with an empty room it keeps sleeping
+//!   without polling. A watcher who is not in the call still needs this tick,
+//!   because the room list keeps the M:SS label of a foreign stream alive.
 //! - [`spawn_frames`] is the ten-frames-per-second player deadline. It exists
 //!   only between `watch` and `close_player` and never polls while the window
 //!   is minimized; activating the window wakes the event task again.
 //!
 //! Every task ends when the panel entity is gone or an update fails, so a
-//! closed window cannot leave a task polling a freed entity.
+//! closed window cannot leave a task polling a freed entity. The clock and the
+//! player task have their own deadlines, but the event task has no timer: an
+//! idle panel that is released wakes it once through [`VoicePanel::drop`], it
+//! sees the failed upgrade and ends.
 
 use super::*;
 use std::time::{Duration, Instant};
@@ -27,32 +32,85 @@ pub(super) const CLOCK_INTERVAL: Duration = Duration::from_secs(1);
 /// whatever rate the decoder and the update queue produce.
 pub(super) const FRAME_INTERVAL: Duration = Duration::from_millis(100);
 
+/// The number of event tasks that have not finished. A production build
+/// compiles it to a zero-sized value, so the task carries no extra state; a
+/// test reads the counter after releasing the panel to prove that nothing is
+/// left parked.
+#[derive(Clone, Default)]
+pub(super) struct EventTasks {
+    #[cfg(test)]
+    count: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl EventTasks {
+    /// Enter one event task. The guard counts it until the loop ends or the
+    /// executor drops the future.
+    fn enter(&self) -> EventTaskGuard {
+        #[cfg(test)]
+        self.count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        EventTaskGuard {
+            #[cfg(test)]
+            count: self.count.clone(),
+        }
+    }
+
+    /// Handle to the live count that stays readable after the panel is gone.
+    #[cfg(test)]
+    pub(super) fn running(&self) -> Arc<std::sync::atomic::AtomicUsize> {
+        self.count.clone()
+    }
+}
+
+/// Lives exactly as long as one event task.
+struct EventTaskGuard {
+    #[cfg(test)]
+    count: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[cfg(test)]
+impl Drop for EventTaskGuard {
+    fn drop(&mut self) {
+        self.count
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// Wait for the media runtime's wake, then poll once.
-pub(super) fn spawn(wake: Arc<Notify>, window: &mut Window, cx: &mut Context<VoicePanel>) {
-    cx.spawn_in(window, async move |this, cx| loop {
-        // Await first: the wake keeps a permit when it fires before this
-        // future is polled, so a push between two polls is never lost.
-        wake.notified().await;
-        let Some(entity) = this.upgrade() else { break };
-        if entity
-            .update_in(cx, |panel, window, cx| panel.poll(window, cx))
-            .is_err()
-        {
-            break;
+pub(super) fn spawn(
+    wake: Arc<Notify>,
+    tasks: EventTasks,
+    window: &mut Window,
+    cx: &mut Context<VoicePanel>,
+) {
+    cx.spawn_in(window, async move |this, cx| {
+        let _live = tasks.enter();
+        loop {
+            // Await first: the wake keeps a permit when it fires before this
+            // future is polled, so a push between two polls is never lost.
+            wake.notified().await;
+            let Some(entity) = this.upgrade() else { break };
+            if entity
+                .update_in(cx, |panel, window, cx| panel.poll(window, cx))
+                .is_err()
+            {
+                break;
+            }
         }
     })
     .detach();
 }
 
-/// The one-second live clock. A call without a handle still ticks the clock;
-/// an idle panel does not poll at all.
+/// The one-second live clock. A call without a handle still ticks the clock,
+/// and so does a painted room list with a running stream; an idle panel does
+/// not poll at all.
 pub(super) fn spawn_clock(window: &mut Window, cx: &mut Context<VoicePanel>) {
     let executor = cx.background_executor().clone();
     cx.spawn_in(window, async move |this, cx| loop {
         executor.timer(CLOCK_INTERVAL).await;
         let Some(entity) = this.upgrade() else { break };
         let updated = entity.update_in(cx, |panel, window, cx| {
-            if panel.call_active() || panel.handle.is_some() {
+            if panel.live_clock_due() {
                 panel.poll(window, cx);
             }
         });
@@ -61,6 +119,17 @@ pub(super) fn spawn_clock(window: &mut Window, cx: &mut Context<VoicePanel>) {
         }
     })
     .detach();
+}
+
+impl Drop for VoicePanel {
+    fn drop(&mut self) {
+        // The event task has no timer. Without this wake a panel that ends in
+        // idle would leave the task parked for the rest of the app lifetime.
+        // The woken task upgrades its weak handle, sees `None` and ends; it
+        // never touches the freed panel. `notify_one` neither blocks nor
+        // panics.
+        self.wake.notify_one();
+    }
 }
 
 /// The player frame deadline. `epoch` belongs to one `watch`; closing the

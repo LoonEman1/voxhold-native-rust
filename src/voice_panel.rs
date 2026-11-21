@@ -255,6 +255,10 @@ pub struct VoicePanel {
     /// Number of `poll` calls. Test-only: an idle panel must not poll.
     #[cfg(test)]
     polls: u32,
+    /// Event tasks still running. Test-only: releasing an idle panel must end
+    /// the parked task instead of leaving it for the app lifetime.
+    #[cfg(test)]
+    event_tasks: events::EventTasks,
     /// Test override of the platform minimize state. A GPUI test window has
     /// no platform handle, so `window_state::is_minimized` always says false.
     #[cfg(test)]
@@ -276,7 +280,8 @@ impl VoicePanel {
             panel.window_activation(window.is_window_active());
         });
         let wake = Arc::new(Notify::new());
-        events::spawn(wake.clone(), window, cx);
+        let event_tasks = events::EventTasks::default();
+        events::spawn(wake.clone(), event_tasks.clone(), window, cx);
         events::spawn_clock(window, cx);
         let controls = Controls {
             muted: true,
@@ -384,6 +389,8 @@ impl VoicePanel {
             last_release_slot_image: None,
             #[cfg(test)]
             polls: 0,
+            #[cfg(test)]
+            event_tasks,
             #[cfg(test)]
             test_minimized: None,
         }

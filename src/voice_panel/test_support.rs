@@ -878,6 +878,12 @@ impl VoicePanel {
         self.polls = 0;
     }
 
+    /// Live event tasks. The handle stays readable after the panel entity is
+    /// released, so a test can prove that the idle task really ended.
+    pub fn test_event_tasks(&self) -> std::sync::Arc<std::sync::atomic::AtomicUsize> {
+        self.event_tasks.running()
+    }
+
     /// Override the platform minimize state for the event and preview gates.
     pub fn test_set_minimized(&mut self, minimized: Option<bool>) {
         self.test_minimized = minimized;

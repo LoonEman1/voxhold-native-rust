@@ -38,37 +38,15 @@ pub const MAX_CHANNEL_PUBLISHERS: usize = 8;
 /// SDR is the only rendition of this stage; HDR is a later task.
 pub const SDR_RENDITION: &str = "sdr";
 
-/// The one video codec this stage can prove. VP8 is in the pinned software
-/// encoder set and has a passing in-process publishing loopback; the picker
-/// must not offer anything else.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Codec {
-    Vp8,
-}
-
-impl Codec {
-    pub fn wire(self) -> &'static str {
-        match self {
-            Self::Vp8 => "vp8",
-        }
-    }
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Vp8 => "VP8",
-        }
-    }
-
-    /// The codecs the picker may offer. A codec is added only together with a
-    /// publishing run that proves frames reach the SFU with it.
-    pub fn available() -> Vec<Codec> {
-        if engine::vp8_encoder_available() {
-            vec![Self::Vp8]
-        } else {
-            Vec::new()
-        }
-    }
-}
+/// The four SDR codecs of the web client, the picker intent and the capability
+/// snapshot of this build. Resolution and profile rules live there so the
+/// picker, the request path and the viewer tests share one model.
+mod codec;
+pub use codec::{
+    Codec, CodecAvailability, CodecIntent, CodecProbe, CodecRejection, CodecRole, CodecSnapshot,
+    H264Baseline, ProfileRejection, SdrProfile, VideoCodecCapability, parse_fmtp, sdr_compatible,
+    sdr_profile,
+};
 
 mod bitrate;
 mod quality;

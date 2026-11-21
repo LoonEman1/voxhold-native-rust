@@ -10,8 +10,8 @@
 
 use super::*;
 use voxhold_media::publisher::{
-    Codec, Phase, Preset, PublishRequest, Quality, QualityChange, QualityOutcome, Resolution,
-    Sharing, AUDIO_BITRATES, MAX_CHANNEL_PUBLISHERS,
+    CodecIntent, CodecRole, CodecSnapshot, Phase, Preset, PublishRequest, Quality, QualityChange,
+    QualityOutcome, Resolution, Sharing, AUDIO_BITRATES, MAX_CHANNEL_PUBLISHERS,
 };
 use voxhold_media::screen_capture::{
     self, PreviewFrame, ScreenSource, SourceId, SourceIdentity, SourceKind, ThumbnailError,
@@ -110,6 +110,10 @@ pub(super) struct ScreenShareUi {
     pub(super) resolution: Resolution,
     pub(super) fps: u32,
     pub(super) bitrate_kbps: u32,
+    /// What the picker asks for. The request sent to the media layer carries
+    /// the concrete codec resolved against the sender snapshot, never this
+    /// intent.
+    pub(super) codec: CodecIntent,
     pub(super) audio_enabled: bool,
     /// The scope the next request carries. Only meaningful when audio is on;
     /// the provided source kind decides the default choice.
@@ -201,6 +205,7 @@ impl Default for ScreenShareUi {
             resolution: Resolution::P1080,
             fps: 30,
             bitrate_kbps: 6000,
+            codec: CodecIntent::Auto,
             audio_enabled: false,
             audio_scope: AudioScope::EverythingExceptSelf,
             audio_bitrate_kbps: 128,
@@ -518,7 +523,7 @@ impl VoicePanel {
         if screen_capture::capability_cached().is_err() {
             return Err("Захват экрана недоступен на этом устройстве.");
         }
-        if Codec::available().is_empty() {
+        if !CodecSnapshot::current().sender_available() {
             return Err("В этой сборке нет подтверждённого кодека трансляции.");
         }
         if matches!(
@@ -562,6 +567,9 @@ impl VoicePanel {
         // A fresh publication starts without system sound, and the previous
         // picker's probe answer must not leak in: Start stays locked until
         // the new probe settles and offers the safe default scope.
+        // A fresh publication starts from «Автоматически»: the concrete codec
+        // is resolved against the current sender snapshot when Start is pressed.
+        self.screen.codec = CodecIntent::Auto;
         self.screen.audio_enabled = false;
         self.screen.reset_audio_scope(SourceKind::Monitor);
         self.screen.audio_availability = None;
@@ -595,6 +603,9 @@ impl VoicePanel {
         self.screen.fps = confirmed.quality.fps;
         self.screen.bitrate_kbps = confirmed.quality.bitrate_kbps;
         self.screen.audio_bitrate_kbps = confirmed.quality.audio_bitrate_kbps;
+        // A restart keeps the codec that is really on air; changing it is a
+        // separate explicit choice.
+        self.screen.codec = CodecIntent::Explicit(confirmed.codec);
         self.screen.audio_enabled = confirmed.audio;
         // The dialog starts from the scope the live attempt accepted; opening
         // it never widens a narrow scope.
@@ -835,7 +846,9 @@ impl VoicePanel {
             && !self.screen.busy
             && !self.screen.preflight
             && !self.screen.sharing.preflighting
-            && !Codec::available().is_empty()
+            && CodecSnapshot::current()
+                .resolve(self.screen.codec, CodecRole::Sender)
+                .is_ok()
             && self.screen.audio_availability.is_some()
             && (!self.screen.restart || self.screen.sharing.phase == Phase::Live)
     }
@@ -914,10 +927,18 @@ impl VoicePanel {
             }
             source
         };
+        let codec = match CodecSnapshot::current().resolve(self.screen.codec, CodecRole::Sender) {
+            Ok(codec) => codec,
+            Err(rejection) => {
+                self.screen.error = rejection.reason().to_owned();
+                cx.notify();
+                return;
+            }
+        };
         let request = PublishRequest {
             source,
             quality: self.screen.quality(),
-            codec: Codec::Vp8,
+            codec,
             audio: self.screen.audio_requested(),
             audio_scope: self.screen.effective_audio_scope(
                 self.screen

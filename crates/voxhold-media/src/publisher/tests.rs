@@ -29,6 +29,10 @@ fn request() -> PublishRequest {
     }
 }
 
+fn request_with_codec(codec: Codec) -> PublishRequest {
+    PublishRequest { codec, ..request() }
+}
+
 fn allowed() -> Access {
     Access {
         joined: true,
@@ -180,6 +184,30 @@ fn the_offer_is_answered_before_stream_started_arrives() {
     );
     assert!(matches!(started.as_slice(), [Outcome::State(_)]));
     assert_eq!(publisher.phase(), Phase::Publishing);
+}
+
+#[test]
+fn stream_start_carries_the_exact_codec() {
+    let now = Instant::now();
+    for codec in Codec::ALL {
+        let mut publisher = publisher();
+        publisher.begin_picker(1);
+        let started = publisher.publish(1, request_with_codec(codec), false, now);
+        assert!(
+            matches!(started.first(), Some(Outcome::StartEngine { .. })),
+            "the capture must start for {codec:?}: {started:?}"
+        );
+        let outcomes = publisher.engine_ready(now, false, None);
+        let sent = sends(&outcomes);
+        assert_eq!(sent.len(), 1, "one stream.start for {codec:?}");
+        assert_eq!(sent[0].kind, "stream.start");
+        assert_eq!(
+            sent[0].data["codec"],
+            codec.wire(),
+            "the wire value must be exact for {codec:?}"
+        );
+        assert_eq!(publisher.phase(), Phase::Publishing);
+    }
 }
 
 #[test]

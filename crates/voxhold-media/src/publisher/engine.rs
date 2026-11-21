@@ -15,7 +15,7 @@
 use std::{
     collections::VecDeque,
     sync::{
-        Arc, OnceLock,
+        Arc,
         atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
@@ -30,10 +30,9 @@ use libwebrtc::{
         IceServer as RtcIceServer, IceTransportsType, PeerConnectionFactory, RtcConfiguration,
         native::PeerConnectionFactoryExt,
     },
-    rtp_sender::{RtpSender, VideoEncoderBackend},
+    rtp_sender::RtpSender,
     session_description::{SdpType, SessionDescription},
     stats::{QualityLimitationReason, RtcStats},
-    video_codec::VideoCodec,
     video_frame::{BoxVideoBuffer, I420Buffer, VideoFrame, VideoRotation},
     video_source::{VideoResolution, native::NativeVideoSource},
 };
@@ -171,18 +170,6 @@ impl PublishStats {
             self.sources
         )
     }
-}
-
-/// Whether the pinned build has a VP8 encoder. Only a confirmed codec may be
-/// offered by the picker.
-pub fn vp8_encoder_available() -> bool {
-    static AVAILABLE: OnceLock<bool> = OnceLock::new();
-    *AVAILABLE.get_or_init(|| {
-        let factory = PeerConnectionFactory::default();
-        factory
-            .video_encoder_codecs(VideoEncoderBackend::Auto)
-            .contains(&VideoCodec::VP8)
-    })
 }
 
 /// Where the pump takes its pictures. The production producer pulls the

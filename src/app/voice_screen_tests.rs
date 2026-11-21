@@ -174,15 +174,16 @@ async fn the_screen_action_needs_a_confirmed_join_permission_and_slot(cx: &mut T
             // local capture/codec capability; the test states which it got
             // instead of pretending capture always exists.
             let capability = voxhold_media::screen_capture::capability_cached();
-            let codec = voxhold_media::publisher::Codec::available();
+            let codec_available =
+                voxhold_media::publisher::CodecSnapshot::current().sender_available();
             match panel.share_gate() {
                 Ok(()) => {
                     assert!(capability.is_ok(), "gate passed without a capturer");
-                    assert!(!codec.is_empty(), "gate passed without a codec");
+                    assert!(codec_available, "gate passed without a codec");
                 }
                 Err(error) => {
                     assert!(
-                        capability.is_err() || codec.is_empty(),
+                        capability.is_err() || !codec_available,
                         "gate failed for an unexpected reason: {error}"
                     );
                 }

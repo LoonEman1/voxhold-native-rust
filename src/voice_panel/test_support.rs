@@ -620,7 +620,12 @@ impl VoicePanel {
         let mut request = voxhold_media::publisher::PublishRequest {
             source,
             quality: self.screen.quality(),
-            codec: voxhold_media::publisher::Codec::Vp8,
+            codec: voxhold_media::publisher::CodecSnapshot::current()
+                .resolve(
+                    self.screen.codec,
+                    voxhold_media::publisher::CodecRole::Sender,
+                )
+                .unwrap_or(voxhold_media::publisher::Codec::Vp8),
             audio: self.screen.audio_requested(),
             audio_scope: self.screen.audio_scope,
         };

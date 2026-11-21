@@ -1,7 +1,7 @@
 //! Update integration tests: state mapping, popup layout, cancellation and the
 //! helper launch seam. No test performs a real network request.
 
-use super::update_ops::{LaunchRequest, UpdateLauncher};
+use super::update_ops::{LaunchRequest, ProgressCounters, UpdateLauncher};
 use super::*;
 use crate::update::{self, RetryKind, UpdatePhase};
 use gpui::{px, size, Modifiers, TestAppContext, VisualTestContext};
@@ -9,10 +9,11 @@ use gpui_component::Root;
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::Arc;
 use voxhold_update::download::CancelToken;
 use voxhold_update::error::UpdateError;
 use voxhold_update::manifest::{FullPackage, Manifest, SetupPackage, VerifiedManifest};
-use voxhold_update::stage::{StageMethod, StageOutcome, StagedUpdate};
+use voxhold_update::stage::{StageMethod, StageOutcome, StagePhase, StagedUpdate};
 
 fn draw(visual: &mut VisualTestContext) {
     visual.update(|window, app| {
@@ -193,7 +194,7 @@ async fn the_panel_renders_every_state_in_both_themes(cx: &mut TestAppContext) {
             UpdatePhase::Preparing {
                 version: "0.2.0".into(),
             },
-            &[],
+            &["update-cancel"],
         ),
         (
             UpdatePhase::Ready {
@@ -391,6 +392,10 @@ async fn skipping_a_version_persists_the_choice(cx: &mut TestAppContext) {
                 version: "0.2.0".into(),
                 notes: String::new(),
             };
+            // Both switches off must survive the skip: the whole document is
+            // rewritten and only the skipped version changes.
+            v.update.prefs.auto_download = false;
+            v.update.prefs.install_on_next_start = false;
             v.skip_version(cx);
         });
         let _ = window;
@@ -400,6 +405,11 @@ async fn skipping_a_version_persists_the_choice(cx: &mut TestAppContext) {
         assert_eq!(v.update.declined, Some(semver::Version::new(0, 2, 0)));
         let prefs = update::load_prefs(v.update.prefs_path.as_deref());
         assert_eq!(prefs.declined(), Some(semver::Version::new(0, 2, 0)));
+        assert!(!prefs.auto_download, "skipping must keep the switch off");
+        assert!(
+            !prefs.install_on_next_start,
+            "skipping must keep the install switch off"
+        );
     });
 }
 
@@ -600,6 +610,181 @@ async fn cancelling_a_download_sets_the_token(cx: &mut TestAppContext) {
         assert!(v.update.cancel.as_ref().unwrap().is_cancelled());
         assert!(v.update.cancelling);
         assert_eq!(v.update.auto_suppressed.as_deref(), Some("0.2.0"));
+    });
+}
+
+#[gpui::test]
+async fn cancelling_while_preparing_also_works_and_suppresses_the_version(cx: &mut TestAppContext) {
+    cx.update(|cx| gpui_component::init(cx));
+    let (window, view, _dir) = make_app(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
+    let token = CancelToken::new();
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            v.update.phase = UpdatePhase::Preparing {
+                version: "0.2.0".into(),
+            };
+            v.update.cancel = Some(token.clone());
+            v.update.panel_open = true;
+            cx.notify();
+        });
+        let _ = window;
+    });
+    draw(&mut visual);
+    let cancel = center(&mut visual, "update-cancel");
+    click(&mut visual, cancel);
+    view.read_with(&*visual, |v, _| {
+        assert!(token.is_cancelled(), "Preparing owns the cancel token");
+        assert!(v.update.cancelling);
+        assert_eq!(
+            v.update.auto_suppressed.as_deref(),
+            Some("0.2.0"),
+            "a cancel in Preparing must suppress the automatic retry"
+        );
+    });
+}
+
+#[gpui::test]
+async fn a_full_fallback_returns_the_poller_to_downloading(cx: &mut TestAppContext) {
+    cx.update(|cx| gpui_component::init(cx));
+    let (window, view, dir) = make_app(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
+    let progress = Arc::new(ProgressCounters::new(4_000));
+    let generation = 11;
+    visual.update(|window, app| {
+        view.update(app, |v, _| {
+            v.update.phase = UpdatePhase::Preparing {
+                version: "0.2.0".into(),
+            };
+            v.update.generation = generation;
+            v.update.progress = Some(progress.clone());
+        });
+        let _ = window;
+    });
+
+    // The delta failed and the full package started: fresh counters with the
+    // full total must bring the panel back to percentages.
+    progress.restart(4_000);
+    let mut keep = false;
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            keep = v.poll_progress(generation, &progress, cx)
+        });
+        let _ = window;
+    });
+    assert!(keep, "the poller must stay alive through Preparing");
+    view.read_with(&*visual, |v, _| match &v.update.phase {
+        UpdatePhase::Downloading {
+            downloaded,
+            total,
+            version,
+        } => {
+            assert_eq!(*downloaded, 0);
+            assert_eq!(*total, 4_000);
+            assert_eq!(version, "0.2.0");
+        }
+        other => panic!("expected Downloading, got {other:?}"),
+    });
+
+    progress.set(1_500, Some(4_000));
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            keep = v.poll_progress(generation, &progress, cx)
+        });
+        let _ = window;
+    });
+    assert!(keep);
+    view.read_with(&*visual, |v, _| {
+        assert!(matches!(
+            v.update.phase,
+            UpdatePhase::Downloading {
+                downloaded: 1_500,
+                total: 4_000,
+                ..
+            }
+        ));
+    });
+
+    // Staging reports Preparing again once the full body is on disk, and the
+    // poller waits for the result instead of dropping the interval.
+    progress.set(4_000, Some(4_000));
+    progress.set_phase(StagePhase::Preparing);
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            keep = v.poll_progress(generation, &progress, cx)
+        });
+        let _ = window;
+    });
+    assert!(keep, "hashing and unpacking still need the poller");
+    view.read_with(&*visual, |v, _| {
+        assert!(matches!(v.update.phase, UpdatePhase::Preparing { .. }));
+    });
+
+    // A final state ends it.
+    let staged = staged_update(&dir);
+    visual.update(|window, app| {
+        view.update(app, |v, _| {
+            v.update.phase = UpdatePhase::Ready {
+                version: "0.2.0".into(),
+                staged,
+            };
+        });
+        let _ = window;
+    });
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            keep = v.poll_progress(generation, &progress, cx)
+        });
+        let _ = window;
+    });
+    assert!(!keep, "a finished download stops the poller");
+}
+
+#[gpui::test]
+async fn a_check_starts_the_automatic_download_exactly_once(cx: &mut TestAppContext) {
+    cx.update(|cx| gpui_component::init(cx));
+    let (window, view, _dir) = make_app(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            v.update.prefs.auto_download = true;
+            // Test seam: record the intent without spawning the staging task,
+            // so this test never touches a network.
+            v.update.download_task_enabled = false;
+            v.update.phase = UpdatePhase::Checking;
+            let generation = v.update.generation;
+            v.finish_check(generation, Ok(verified_manifest("9.9.9")), cx);
+        });
+        let _ = window;
+    });
+    view.read_with(&*visual, |v, _| {
+        assert_eq!(
+            v.update.download_starts, 1,
+            "the first check starts one download"
+        );
+        assert!(matches!(v.update.phase, UpdatePhase::Downloading { .. }));
+        assert_eq!(v.update.auto_started.as_deref(), Some("9.9.9"));
+    });
+
+    // The next check sees the same version, remembers the automatic start and
+    // only offers it again.
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            v.update.phase = UpdatePhase::Checking;
+            let generation = v.update.generation;
+            v.finish_check(generation, Ok(verified_manifest("9.9.9")), cx);
+        });
+        let _ = window;
+    });
+    view.read_with(&*visual, |v, _| {
+        assert_eq!(
+            v.update.download_starts, 1,
+            "a repeated check must not start a second download"
+        );
+        assert!(matches!(
+            &v.update.phase,
+            UpdatePhase::Available { version, .. } if version == "9.9.9"
+        ));
     });
 }
 

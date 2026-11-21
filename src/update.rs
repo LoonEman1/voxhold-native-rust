@@ -2,8 +2,9 @@
 //!
 //! The network, signature, staging and apply work lives in `voxhold-update`.
 //! This module adds the pieces the window needs and that must stay testable on
-//! their own: the build version, the channel URLs, the dismissed-version
-//! preference, startup cleanup/ready detection and short user-facing errors.
+//! their own: the build version, the channel URLs, `UpdatePrefs` (skipped
+//! version plus the `auto_download` and `install_on_next_start` switches),
+//! startup cleanup/ready detection and short user-facing errors.
 
 use std::path::{Path, PathBuf};
 
@@ -246,6 +247,17 @@ impl UpdatePhase {
             _ => None,
         }
     }
+
+    /// Version whose download owns the cancel token.
+    ///
+    /// `Preparing` still belongs to the download: a failed delta can restart
+    /// the full package from there, and the user must be able to cancel it.
+    pub fn downloading_version(&self) -> Option<&str> {
+        match self {
+            Self::Downloading { version, .. } | Self::Preparing { version } => Some(version),
+            _ => None,
+        }
+    }
 }
 
 /// Percentage for the progress label. A zero total stays at zero.
@@ -258,8 +270,11 @@ pub fn percent(downloaded: u64, total: u64) -> u8 {
 
 /// True once every expected byte of the download has been reported.
 ///
-/// The caller switches to [`UpdatePhase::Preparing`] on this condition; the
-/// archive is still being hashed and unpacked at that point.
+/// The controller takes the visible phase from [`voxhold_update::stage::StagePhase`]
+/// instead of guessing it from these totals, because a failed delta restarts
+/// the download with a new total. The threshold stays here for the progress
+/// tests. A zero total is never complete.
+#[cfg(test)]
 pub fn download_complete(downloaded: u64, total: u64) -> bool {
     total > 0 && downloaded >= total
 }

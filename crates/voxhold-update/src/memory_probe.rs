@@ -20,9 +20,11 @@
 //! cargo test -p voxhold-update --locked memory_probe -- --ignored --nocapture
 //! ```
 //!
-//! `VOXHOLD_MEMORY_ZIP` overrides the portable ZIP path. The ZIP itself is
-//! never committed or copied into the repository; it is served from a loopback
-//! HTTP listener so the real download code runs.
+//! `VOXHOLD_MEMORY_ZIP` overrides the portable ZIP path; without it the probe
+//! uses `%USERPROFILE%\Downloads\VoxHold-portable.zip` (`$HOME` outside
+//! Windows) and fails with a clear message when that file is missing. The ZIP
+//! itself is never committed or copied into the repository; it is served from
+//! a loopback HTTP listener so the real download code runs.
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -40,8 +42,6 @@ use crate::manifest::{
 use crate::package;
 use crate::stage::{stage_update, StageOutcome, StageRequest};
 
-const DEFAULT_ZIP: &str = r"C:\Users\pnik2\Downloads\VoxHold-portable.zip";
-
 #[test]
 #[ignore = "manual peak-memory probe; run one case per process"]
 fn memory_probe() {
@@ -52,28 +52,70 @@ fn memory_probe() {
     }
 
     let case = std::env::var("VOXHOLD_MEMORY_CASE").unwrap_or_else(|_| "full".into());
-    let zip = std::env::var_os("VOXHOLD_MEMORY_ZIP")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_ZIP));
-    let archive_bytes = std::fs::metadata(&zip).map(|meta| meta.len()).unwrap_or(0);
+    let zip = match case.as_str() {
+        "delta" => None,
+        _ => Some(memory_zip()),
+    };
+    let archive_bytes = zip
+        .as_ref()
+        .map(|path| std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0))
+        .unwrap_or(0);
+    let archive = zip
+        .as_ref()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "-".into());
     let started = Instant::now();
     let (result, synthetic_generation) = match case.as_str() {
-        "legacy" => (probe_legacy(&zip), false),
+        "legacy" => (
+            probe_legacy(zip.as_ref().expect("legacy needs a ZIP")),
+            false,
+        ),
         "delta" => probe_delta(),
-        _ => (probe_full(&zip), false),
+        _ => (probe_full(zip.as_ref().expect("full needs a ZIP")), false),
     };
     let (working_set, pagefile) = peak_memory();
     println!(
-        "memory-probe: case={case} archive={} archive_bytes={archive_bytes} \
+        "memory-probe: case={case} archive={archive} archive_bytes={archive_bytes} \
          peak_working_set_bytes={working_set} peak_working_set_mib={:.1} \
          peak_pagefile_bytes={pagefile} peak_pagefile_mib={:.1} \
          synthetic_generation={synthetic_generation} elapsed_ms={} result={result}",
-        zip.display(),
         working_set as f64 / (1024.0 * 1024.0),
         pagefile as f64 / (1024.0 * 1024.0),
         started.elapsed().as_millis(),
     );
     assert!(result.starts_with("ok"), "memory probe failed: {result}");
+}
+
+/// Portable ZIP for the probe: `VOXHOLD_MEMORY_ZIP`, else the user's
+/// `Downloads` folder. There is no machine-specific path in the repository.
+fn memory_zip() -> PathBuf {
+    if let Some(path) = std::env::var_os("VOXHOLD_MEMORY_ZIP") {
+        let path = PathBuf::from(path);
+        if !path.is_file() {
+            panic!(
+                "memory-probe: VOXHOLD_MEMORY_ZIP points at {}, which is not a file",
+                path.display()
+            );
+        }
+        return path;
+    }
+    let home = std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            panic!(
+                "memory-probe: set VOXHOLD_MEMORY_ZIP to a portable ZIP; \
+                 USERPROFILE and HOME are not set"
+            )
+        });
+    let path = home.join("Downloads").join("VoxHold-portable.zip");
+    if !path.is_file() {
+        panic!(
+            "memory-probe: {} is missing; set VOXHOLD_MEMORY_ZIP to a portable ZIP",
+            path.display()
+        );
+    }
+    path
 }
 
 #[cfg(windows)]
@@ -260,6 +302,7 @@ fn run_stage(
         updates_root: &root,
         cancel: CancelToken::new(),
         progress: None,
+        phase: None,
     }));
     match outcome {
         StageOutcome::Ready(staged) => {

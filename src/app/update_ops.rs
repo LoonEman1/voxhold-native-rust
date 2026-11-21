@@ -1,23 +1,25 @@
 //! Background update controller: start-up cleanup, periodic checks, download,
 //! cancellation and launching the helper.
 //!
-//! The UI thread never waits on the network or on the filesystem. Every async
-//! answer carries a generation; a logout, a new check or a closed panel can
-//! discard a late result before it touches the visible state.
+//! The UI thread never waits on the network or on the filesystem. A generation
+//! discards late answers of a superseded manual check or download. Logging out
+//! and closing the panel only hide the surface: neither drops a check, a
+//! download or a staged package, so the generation is not bumped by them.
 
 use super::*;
 use crate::update::{self, RetryKind, UpdatePhase, UpdatePrefs};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use voxhold_update::check::{check_signed_manifest, CheckRequest};
 use voxhold_update::download::CancelToken;
 use voxhold_update::error::UpdateError;
 use voxhold_update::manifest::{VerifiedManifest, WindowsVersion};
 use voxhold_update::package::read_package_json_from_dir;
-use voxhold_update::stage::{stage_update, updates_root, StageOutcome, StageRequest, StagedUpdate};
+use voxhold_update::stage::{
+    stage_update, updates_root, StageOutcome, StagePhase, StageRequest, StagedUpdate,
+};
 use voxhold_update::verify::embedded_public_key;
 
 const START_DELAY: Duration = Duration::from_secs(3);
@@ -77,32 +79,68 @@ impl UpdateLauncher for ProcessUpdateLauncher {
     }
 }
 
-/// Progress shared between the download callback and the UI poller.
+/// Progress and phase shared between staging and the UI poller.
+///
+/// Staging decides when a download starts again after a failed delta; the UI
+/// must not guess that from byte counters, because a full package restarts at
+/// zero after the delta already reported its total.
 pub(super) struct ProgressCounters {
-    downloaded: AtomicU64,
-    total: AtomicU64,
+    state: Mutex<ProgressState>,
+}
+
+#[derive(Clone, Copy)]
+struct ProgressState {
+    downloaded: u64,
+    total: u64,
+    phase: StagePhase,
 }
 
 impl ProgressCounters {
-    fn new(total: u64) -> Self {
+    pub(super) fn new(total: u64) -> Self {
         Self {
-            downloaded: AtomicU64::new(0),
-            total: AtomicU64::new(total),
+            state: Mutex::new(ProgressState {
+                downloaded: 0,
+                total,
+                phase: StagePhase::Downloading { total },
+            }),
         }
     }
 
-    fn set(&self, downloaded: u64, total: Option<u64>) {
-        self.downloaded.store(downloaded, Ordering::Relaxed);
+    /// Record download bytes without changing the phase.
+    pub(super) fn set(&self, downloaded: u64, total: Option<u64>) {
+        let mut state = self.lock();
+        state.downloaded = downloaded;
         if let Some(total) = total.filter(|value| *value > 0) {
-            self.total.store(total, Ordering::Relaxed);
+            state.total = total;
         }
     }
 
-    fn snapshot(&self) -> (u64, u64) {
-        (
-            self.downloaded.load(Ordering::Relaxed),
-            self.total.load(Ordering::Relaxed),
-        )
+    /// Start a new download attempt: zero bytes and a new expected total.
+    pub(super) fn restart(&self, total: u64) {
+        *self.lock() = ProgressState {
+            downloaded: 0,
+            total,
+            phase: StagePhase::Downloading { total },
+        };
+    }
+
+    pub(super) fn set_phase(&self, phase: StagePhase) {
+        self.lock().phase = phase;
+    }
+
+    pub(super) fn snapshot(&self) -> (u64, u64) {
+        let state = self.lock();
+        (state.downloaded, state.total)
+    }
+
+    pub(super) fn phase(&self) -> StagePhase {
+        self.lock().phase
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, ProgressState> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
 
@@ -133,6 +171,11 @@ pub(super) struct UpdateUi {
     pub launcher: Box<dyn UpdateLauncher>,
     /// Test seam: a successful launch asked the app to quit.
     pub quit_requested: bool,
+    /// Test seam: how many download requests passed the phase check.
+    pub download_starts: u32,
+    /// Test seam: when false, a download records the start but does not spawn
+    /// the staging task, so tests never touch a real network.
+    pub download_task_enabled: bool,
     pub clock_task: Option<gpui::Task<()>>,
     pub work_task: Option<gpui::Task<()>>,
     pub cleanup_task: Option<gpui::Task<()>>,
@@ -179,6 +222,8 @@ impl UpdateUi {
             root_override: None,
             launcher: Box::new(ProcessUpdateLauncher),
             quit_requested: false,
+            download_starts: 0,
+            download_task_enabled: true,
             clock_task: None,
             work_task: None,
             cleanup_task: None,
@@ -494,6 +539,7 @@ impl Voxhold {
         self.update.cancelling = false;
         self.update.generation = self.update.generation.wrapping_add(1);
         let generation = self.update.generation;
+        self.update.download_starts = self.update.download_starts.saturating_add(1);
         let progress = Arc::new(ProgressCounters::new(manifest.full.size));
         self.update.progress = Some(progress.clone());
         self.update.phase = UpdatePhase::Downloading {
@@ -502,8 +548,12 @@ impl Voxhold {
             total: manifest.full.size,
         };
         cx.notify();
+        if !self.update.download_task_enabled {
+            return;
+        }
 
         let runtime = self.runtime.clone();
+        let phase_progress = progress.clone();
         self.update.work_task = Some(cx.spawn(async move |this, cx| {
             let outcome = runtime
                 .spawn(async move {
@@ -517,6 +567,14 @@ impl Voxhold {
                         cancel,
                         progress: Some(Arc::new(move |downloaded, total| {
                             progress.set(downloaded, total);
+                        })),
+                        phase: Some(Arc::new(move |phase| match phase {
+                            // A failed delta restarts the whole download; the
+                            // new total must replace the delta counters.
+                            StagePhase::Downloading { total } => phase_progress.restart(total),
+                            StagePhase::Preparing => {
+                                phase_progress.set_phase(StagePhase::Preparing)
+                            }
                         })),
                     })
                     .await
@@ -545,7 +603,12 @@ impl Voxhold {
         }));
     }
 
-    fn poll_progress(
+    /// Mirror the staging phase and counters into the visible state.
+    ///
+    /// The poller lives through `Preparing`: a delta that fails after its body
+    /// arrived restarts `stage_full`, and the next `Downloading` report has to
+    /// bring back percentages and the cancel button for the full package.
+    pub(super) fn poll_progress(
         &mut self,
         generation: u64,
         progress: &ProgressCounters,
@@ -554,32 +617,25 @@ impl Voxhold {
         if generation != self.update.generation {
             return false;
         }
-        let UpdatePhase::Downloading {
-            version,
-            downloaded,
-            total,
-        } = &self.update.phase
-        else {
-            return false;
+        let version = match &self.update.phase {
+            UpdatePhase::Downloading { version, .. } | UpdatePhase::Preparing { version } => {
+                version.clone()
+            }
+            _ => return false,
         };
-        let (next_downloaded, next_total) = progress.snapshot();
-        if update::download_complete(next_downloaded, next_total) {
-            // Every byte is on disk; hashing and unpacking still take time.
-            self.update.phase = UpdatePhase::Preparing {
-                version: version.clone(),
-            };
-            cx.notify();
+        let (downloaded, total) = progress.snapshot();
+        let next = match progress.phase() {
+            StagePhase::Preparing => UpdatePhase::Preparing { version },
+            StagePhase::Downloading { .. } => UpdatePhase::Downloading {
+                version,
+                downloaded: downloaded.min(total),
+                total,
+            },
+        };
+        if same_visible_phase(&self.update.phase, &next) {
             return true;
         }
-        if next_downloaded == *downloaded && next_total == *total {
-            return true;
-        }
-        let version = version.clone();
-        self.update.phase = UpdatePhase::Downloading {
-            version,
-            downloaded: next_downloaded,
-            total: next_total,
-        };
+        self.update.phase = next;
         cx.notify();
         true
     }
@@ -633,13 +689,16 @@ impl Voxhold {
 
     /// Ask the library to stop and remove the partial staging directory.
     ///
-    /// The cancelled version is remembered for the rest of this process: the
-    /// 6 h clock must not start the same automatic download again. The manual
-    /// button stays available and is not affected.
+    /// This works while a body is downloading and while a finished body is
+    /// being hashed/unpacked: a failed delta fallback still owns the cancel
+    /// token during its full re-download. The cancelled version is remembered
+    /// for the rest of this process: the 6 h clock must not start the same
+    /// automatic download again. The manual button stays available and is not
+    /// affected.
     pub(super) fn cancel_download(&mut self, cx: &mut Context<Self>) {
         if let Some(cancel) = &self.update.cancel {
-            if let UpdatePhase::Downloading { version, .. } = &self.update.phase {
-                self.update.auto_suppressed = Some(version.clone());
+            if let Some(version) = self.update.phase.downloading_version() {
+                self.update.auto_suppressed = Some(version.to_string());
             }
             cancel.cancel();
             self.update.cancelling = true;
@@ -860,6 +919,32 @@ impl Voxhold {
         self.update.handshake_error = Some(message.clone());
         self.error = format!("Не удалось подтвердить запуск обновления: {message}");
         self.auth.status = self.error.clone();
+    }
+}
+
+/// Whether two visible phases are indistinguishable for the poller.
+fn same_visible_phase(left: &UpdatePhase, right: &UpdatePhase) -> bool {
+    match (left, right) {
+        (
+            UpdatePhase::Downloading {
+                version: left_version,
+                downloaded: left_downloaded,
+                total: left_total,
+            },
+            UpdatePhase::Downloading {
+                version: right_version,
+                downloaded: right_downloaded,
+                total: right_total,
+            },
+        ) => {
+            left_version == right_version
+                && left_downloaded == right_downloaded
+                && left_total == right_total
+        }
+        (UpdatePhase::Preparing { version: left }, UpdatePhase::Preparing { version: right }) => {
+            left == right
+        }
+        _ => false,
     }
 }
 

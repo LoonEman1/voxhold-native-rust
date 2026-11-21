@@ -5,6 +5,7 @@
 //! with `ready.json`. Any failure removes the whole staging directory.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use semver::Version;
@@ -70,6 +71,22 @@ pub enum StageOutcome {
     Failed(UpdateError),
 }
 
+/// Visible phase of a staging attempt.
+///
+/// The UI must not guess the phase from byte counters: a failed delta restarts
+/// the whole download, so a full package can begin after the first progress
+/// callback already reached its total. Staging reports every transition here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StagePhase {
+    /// A package body is being downloaded; `total` is its expected size.
+    Downloading { total: u64 },
+    /// The body is on disk and is being hashed, verified and unpacked.
+    Preparing,
+}
+
+/// Phase callback for [`StageRequest::phase`].
+pub type PhaseFn = Arc<dyn Fn(StagePhase) + Send + Sync>;
+
 /// Input for [`stage_update`].
 ///
 /// `manifest` is a [`VerifiedManifest`]: staging accepts only a document whose
@@ -83,6 +100,28 @@ pub struct StageRequest<'a> {
     pub updates_root: &'a Path,
     pub cancel: CancelToken,
     pub progress: Option<ProgressFn>,
+    /// Reported before every download and once its body is complete.
+    pub phase: Option<PhaseFn>,
+}
+
+fn report_phase(request: &StageRequest<'_>, phase: StagePhase) {
+    if let Some(callback) = &request.phase {
+        callback(phase);
+    }
+}
+
+/// Stop between stages, not only inside the download loop.
+///
+/// The UI can cancel while a finished body is hashed or unpacked. The blocking
+/// unpack cannot be interrupted, so the check runs before it and once more
+/// after it; either way the staging directory is removed and no update is
+/// offered.
+fn check_cancelled(request: &StageRequest<'_>) -> Result<()> {
+    if request.cancel.is_cancelled() {
+        Err(UpdateError::Cancelled)
+    } else {
+        Ok(())
+    }
 }
 
 /// Default updates root for this user.
@@ -167,6 +206,7 @@ async fn stage_inner(request: &StageRequest<'_>) -> Result<Option<StagedUpdate>>
         .await
         .map_err(|error| UpdateError::io(&staging, error))?;
 
+    check_cancelled(request)?;
     let base = base_package(request).await;
     let mut delta_reason = None;
     if let Some((base, delta)) = base {
@@ -219,6 +259,7 @@ async fn stage_delta(
 ) -> Result<()> {
     let delta_path = staging.join(DELTA_FILE);
     let mut attempt = 1;
+    report_phase(request, StagePhase::Downloading { total: delta.size });
     let outcome = loop {
         let result = download(DownloadRequest {
             url: &delta.url,
@@ -239,6 +280,8 @@ async fn stage_delta(
             other => break other?,
         }
     };
+    report_phase(request, StagePhase::Preparing);
+    check_cancelled(request)?;
     if outcome.sha256 != delta.sha256 {
         return Err(UpdateError::HashMismatch { path: delta_path });
     }
@@ -257,12 +300,19 @@ async fn stage_delta(
     tokio::fs::write(&package_path, &target)
         .await
         .map_err(|error| UpdateError::io(&package_path, error))?;
-    unpack_bytes_to(staging, target, &request.manifest.version).await
+    unpack_bytes_to(staging, target, &request.manifest.version).await?;
+    check_cancelled(request)
 }
 
 async fn stage_full(request: &StageRequest<'_>, staging: &Path) -> Result<()> {
     let package_path = staging.join(PACKAGE_FILE);
     let mut attempt = 1;
+    report_phase(
+        request,
+        StagePhase::Downloading {
+            total: request.manifest.full.size,
+        },
+    );
     let outcome = loop {
         let result = download(DownloadRequest {
             url: &request.manifest.full.url,
@@ -283,19 +333,21 @@ async fn stage_full(request: &StageRequest<'_>, staging: &Path) -> Result<()> {
             other => break other?,
         }
     };
+    report_phase(request, StagePhase::Preparing);
+    check_cancelled(request)?;
     if outcome.sha256 != request.manifest.full.package_sha256 {
         return Err(UpdateError::HashMismatch { path: package_path });
     }
-    // Re-check the archive digest on the file itself and unpack straight from
-    // disk. The ZIP never has to sit in memory as one `Vec`.
-    let digest_path = package_path.clone();
-    let digest = tokio::task::spawn_blocking(move || package::sha256_file(&digest_path))
-        .await
-        .map_err(|error| UpdateError::Apply(format!("hash task failed: {error}")))??;
-    if digest != request.manifest.full.package_sha256 {
-        return Err(UpdateError::HashMismatch { path: package_path });
-    }
-    unpack_file_to(staging, &package_path, &request.manifest.version).await
+    // Hash and unpack one opened file: a different file cannot slip between
+    // the digest check and the ZIP reader.
+    unpack_file_to(
+        staging,
+        &package_path,
+        &request.manifest.full.package_sha256,
+        &request.manifest.version,
+    )
+    .await?;
+    check_cancelled(request)
 }
 
 async fn unpack_bytes_to(staging: &Path, bytes: Vec<u8>, version: &str) -> Result<()> {
@@ -316,12 +368,18 @@ async fn unpack_bytes_to(staging: &Path, bytes: Vec<u8>, version: &str) -> Resul
     Ok(())
 }
 
-async fn unpack_file_to(staging: &Path, archive: &Path, version: &str) -> Result<()> {
+async fn unpack_file_to(
+    staging: &Path,
+    archive: &Path,
+    expected_sha256: &str,
+    version: &str,
+) -> Result<()> {
     let app = staging.join(APP_DIR);
     let archive = archive.to_path_buf();
+    let expected_sha256 = expected_sha256.to_owned();
     let version = version.to_owned();
     tokio::task::spawn_blocking(move || {
-        let index = package::unpack_file(&archive, &app)?;
+        let index = package::unpack_file_verified(&archive, &app, &expected_sha256)?;
         if index.version != version {
             return Err(UpdateError::InvalidPackage(format!(
                 "package version {} does not match manifest version {version}",
@@ -342,6 +400,9 @@ fn ready(
     method: StageMethod,
     fallback_reason: Option<String>,
 ) -> Result<StagedUpdate> {
+    // A cancel that arrived after the unpack must not leave `ready.json`
+    // behind: the next start would offer an update the user stopped.
+    check_cancelled(request)?;
     let package_sha256 = request.manifest.full.package_sha256.clone();
     let marker = ReadyMarker {
         version: version.to_string(),

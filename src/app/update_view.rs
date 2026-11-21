@@ -293,6 +293,22 @@ impl Voxhold {
                         .child(format!("Версия {version}")),
                 );
                 panel = panel.child(self.update_note("Проверяем и готовим обновление…", p));
+                // Staging still owns the cancel token here: a rejected delta
+                // restarts the full download from this phase.
+                let cancelling = self.update.cancelling;
+                panel = panel.child(update_button(
+                    "update-cancel",
+                    if cancelling {
+                        "Отмена…"
+                    } else {
+                        "Отмена"
+                    },
+                    false,
+                    !cancelling,
+                    p,
+                    cx,
+                    |view, _, cx| view.cancel_download(cx),
+                ));
             }
             UpdatePhase::Ready { version, .. } => {
                 panel = panel.child(

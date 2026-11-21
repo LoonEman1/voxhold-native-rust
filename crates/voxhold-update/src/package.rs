@@ -272,6 +272,31 @@ pub fn unpack_file(path: &Path, dest: &Path) -> Result<PackageIndex> {
     unpack_archive(archive, dest)
 }
 
+/// Unpack a package ZIP after checking its digest through the same handle.
+///
+/// The file is opened once: SHA-256 is computed over this handle, the handle is
+/// rewound and handed to `ZipArchive`. A different file cannot be swapped in
+/// between the digest check and the unpack, which a separate
+/// [`sha256_file`] + [`unpack_file`] pair would allow.
+pub fn unpack_file_verified(
+    path: &Path,
+    dest: &Path,
+    expected_sha256: &str,
+) -> Result<PackageIndex> {
+    let mut file = std::fs::File::open(path).map_err(|error| UpdateError::io(path, error))?;
+    let digest = sha256_reader(&mut file, path)?;
+    if digest != expected_sha256 {
+        return Err(UpdateError::HashMismatch {
+            path: path.to_path_buf(),
+        });
+    }
+    file.seek(std::io::SeekFrom::Start(0))
+        .map_err(|error| UpdateError::io(path, error))?;
+    let archive =
+        ZipArchive::new(file).map_err(|error| UpdateError::InvalidPackage(error.to_string()))?;
+    unpack_archive(archive, dest)
+}
+
 fn package_json_limit() -> u64 {
     (crate::manifest::MAX_NOTES_BYTES * 16) as u64
 }
@@ -522,6 +547,10 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 /// SHA-256 of a file as lowercase hex.
 pub fn sha256_file(path: &Path) -> Result<String> {
     let mut file = std::fs::File::open(path).map_err(|error| UpdateError::io(path, error))?;
+    sha256_reader(&mut file, path)
+}
+
+fn sha256_reader(file: &mut std::fs::File, path: &Path) -> Result<String> {
     let mut hasher = Sha256::new();
     let mut buffer = vec![0u8; 128 * 1024];
     loop {
@@ -807,6 +836,34 @@ mod tests {
         let installed = temp.path().join("installed");
         assert!(unpack_file(&archive, &installed).is_err());
         assert!(temporary_files(&installed).is_empty());
+    }
+
+    #[test]
+    fn unpack_file_verified_rejects_a_mismatched_digest() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        sample_dir(&source);
+        let packed = pack_with_index(&source, "1.2.3").unwrap();
+        let archive = temp.path().join("package.zip");
+        fs::write(&archive, &packed.bytes).unwrap();
+        let installed = temp.path().join("installed");
+
+        // The digest of another file must not admit this archive, and the
+        // rejected attempt must leave no payload behind.
+        assert!(matches!(
+            unpack_file_verified(&archive, &installed, &sha256_hex(b"another archive")),
+            Err(UpdateError::HashMismatch { .. })
+        ));
+        assert!(!installed.join("Voxhold.exe").exists());
+        assert!(temporary_files(&installed).is_empty());
+
+        // Hashing and unpacking share one opened handle.
+        let index = unpack_file_verified(&archive, &installed, &packed.sha256).unwrap();
+        assert_eq!(index, packed.index);
+        assert_eq!(
+            fs::read(installed.join("Voxhold.exe")).unwrap(),
+            b"binary payload"
+        );
     }
 
     fn temporary_files(dir: &Path) -> Vec<PathBuf> {

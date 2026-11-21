@@ -315,7 +315,7 @@ impl VoicePanel {
         if self.screen.restart {
             // No picker grid exists here; the locked card is the only picture
             // and it comes from the confirmed live source.
-            self.screen.sync_visible_previews(&[], columns, card_width);
+            self.screen.sync_visible_previews(&[], columns);
             // Locked context: only the confirmed live source is painted, and
             // it is inert. It is not part of the focus ring, so neither Tab
             // nor a click can move the restart onto another cached source.
@@ -331,9 +331,7 @@ impl VoicePanel {
             let sources: Vec<ScreenSource> = self.screen.sources().to_vec();
             // The rows of this frame decide which thumbnails the batch claims
             // first, so a scrolled list no longer waits for the whole tab.
-            scrolled = self
-                .screen
-                .sync_visible_previews(&sources, columns, card_width);
+            scrolled = self.screen.sync_visible_previews(&sources, columns);
             let selected = self.screen.selected;
             self.screen.preview_cards = sources.len();
             if sources.is_empty() {
@@ -393,9 +391,14 @@ impl VoicePanel {
         }
         // A wheel or scrollbar move happens outside the request points of the
         // picker, so the frame asks once for the rows that just became
-        // visible. The request itself is guarded: a running batch keeps its
-        // single capture and picks the new rows up at its next claim.
+        // visible. A plain repaint changes neither the rows nor the scroll and
+        // asks nothing. The request itself is guarded: a running batch keeps
+        // its single capture and picks the new rows up at its next claim.
         if scrolled && !self.screen.visible_previews.is_empty() {
+            #[cfg(test)]
+            {
+                self.screen.preview_deferrals = self.screen.preview_deferrals.saturating_add(1);
+            }
             let entity = cx.entity();
             window.defer(cx, move |window, cx| {
                 let _ = entity.update(cx, |panel, cx| {

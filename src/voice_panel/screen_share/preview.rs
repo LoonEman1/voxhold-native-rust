@@ -30,8 +30,10 @@ impl ScreenShareUi {
         self.release_images(window, images);
         self.preview_failures.clear();
         self.preview_pending.clear();
+        self.preview_unfit.clear();
         self.preview_batching = false;
         self.preview_bytes = 0;
+        self.preview_order.clear();
         self.preview_rejected = 0;
         self.preview_cards = 0;
         // The next picker starts at the top of its own list: a scroll offset
@@ -40,7 +42,6 @@ impl ScreenShareUi {
         self.visible_previews.clear();
         self.visible_scratch.clear();
         self.visible_scroll = 0.0;
-        self.preview_card_width = 0.0;
         self.scroll = ScrollHandle::new();
     }
 
@@ -82,6 +83,7 @@ impl ScreenShareUi {
         }
         self.release_images(window, previews);
         self.preview_bytes = 0;
+        self.preview_order.clear();
     }
 
     /// Replace the on-air card picture, releasing the previous one only after
@@ -107,29 +109,44 @@ impl ScreenShareUi {
     /// Claim the next source that still needs a picture, marking it pending.
     /// `None` means the batch has no work left for this epoch and category.
     ///
-    /// The visible rows of the last painted frame come first, in visual order,
-    /// so the cards the user actually looks at get their picture without
-    /// waiting for the whole tab. Off-screen rows follow only while the cache
-    /// has room for one more estimated frame: a full cache must not start a
-    /// capturer and a Windows enumeration for a card that could never keep its
-    /// picture. An empty visibility list keeps the plain snapshot order, which
-    /// is the first-frame, restart and empty-list behaviour.
+    /// Only the painted rows of this category are claimed; the snapshot order
+    /// is used only before the first visibility list exists, and then only for
+    /// the first [`BOOTSTRAP_PREVIEW_CARDS`] cards. Room is checked before any
+    /// capture starts: off-screen pictures are released first and, when
+    /// nothing can be evicted, no capturer is started at all. Otherwise a full
+    /// cache would answer every visible card with a memory note instead of a
+    /// picture.
     ///
     /// Called before every capture, so a row that became visible while the
     /// batch waits on a capture is picked up without starting a second batch.
     pub(super) fn take_next_preview_source(
         &mut self,
+        window: &mut Window,
         epoch: u64,
         kind: SourceKind,
     ) -> Option<ScreenSource> {
         if !self.open || self.restart || self.preview_epoch != epoch || self.kind != kind {
             return None;
         }
-        let source = self
-            .visible_preview_source(kind)
-            .or_else(|| self.remaining_preview_source(kind))?;
+        let source = self.next_preview_source(kind)?;
+        if !self.reserve_preview_room(window, &source) {
+            return None;
+        }
         self.preview_pending.insert(source.identity()?);
         Some(source)
+    }
+
+    /// The next card in claim order: the painted visible rows first, else the
+    /// bootstrap cards of a category the dialog has not painted yet.
+    fn next_preview_source(&self, kind: SourceKind) -> Option<ScreenSource> {
+        if self.visible_kind == kind && !self.visible_previews.is_empty() {
+            return self.visible_preview_source(kind);
+        }
+        self.snapshot(kind)
+            .iter()
+            .take(BOOTSTRAP_PREVIEW_CARDS)
+            .find(|source| self.preview_source_ready(source))
+            .cloned()
     }
 
     /// One visible, uncached source, in the order the grid paints it. A
@@ -157,88 +174,129 @@ impl ScreenShareUi {
         None
     }
 
-    /// The first off-screen source that still needs a picture, but only while
-    /// the cache could keep one more frame.
-    fn remaining_preview_source(&self, kind: SourceKind) -> Option<ScreenSource> {
-        if !self.preview_has_room() {
-            return None;
-        }
-        self.snapshot(kind)
-            .iter()
-            .filter(|source| {
-                !(self.visible_kind == kind
-                    && source
-                        .identity()
-                        .is_some_and(|identity| self.visible_previews.contains(&identity)))
-            })
-            .find(|source| self.preview_source_ready(source))
-            .cloned()
-    }
-
     /// Whether one capture of this surface can still be claimed: not cached,
-    /// not failed, not in flight and unambiguous in the current snapshot.
+    /// not failed, not refused for lack of room, not in flight and
+    /// unambiguous in the current snapshot.
     fn preview_source_ready(&self, source: &ScreenSource) -> bool {
         let Some(identity) = source.identity() else {
             return false;
         };
         !self.previews.contains_key(&identity)
             && !self.preview_failures.contains_key(&identity)
+            && !self.preview_unfit.contains(&identity)
             && !self.preview_pending.contains(&identity)
             && self.source_for_identity(&identity).is_some()
     }
 
-    /// Whether the cache has room for one more picture at the size the picker
-    /// paints. The estimate is the frame the card needs (`card² × 9/16 × 4`),
-    /// capped by the whole byte bound. A visible card is still captured near
-    /// the bound: its result is either kept or gets the honest memory note.
-    fn preview_has_room(&self) -> bool {
-        self.previews.len() < MAX_SCREEN_PREVIEWS
-            && MAX_SCREEN_PREVIEW_BYTES.saturating_sub(self.preview_bytes)
-                >= self.preview_frame_estimate()
+    /// Whether the cache can keep a picture of `bytes` without passing the
+    /// count or byte bound. A cached identity only replaces its own bytes.
+    fn preview_has_room_for(&self, identity: &SourceIdentity, bytes: usize) -> bool {
+        let existing = self
+            .previews
+            .get(identity)
+            .map(|thumb| thumb.bytes)
+            .unwrap_or(0);
+        let grows_count = usize::from(existing == 0);
+        self.previews.len() + grows_count <= MAX_SCREEN_PREVIEWS
+            && self.preview_bytes.saturating_sub(existing) + bytes <= MAX_SCREEN_PREVIEW_BYTES
     }
 
-    /// Conservative BGRA size of one card picture. Before the first frame the
-    /// capture width is used, so the gate never trusts a zero card width.
-    fn preview_frame_estimate(&self) -> usize {
-        let width = if self.preview_card_width > 0.0 {
-            self.preview_card_width
-        } else {
-            SCREEN_THUMBNAIL_WIDTH as f32
+    /// Free cached pictures until one frame of `bytes` fits again. The oldest
+    /// picture that is neither visible in this category nor in flight goes
+    /// first. Returns false when nothing can be evicted, so the caller never
+    /// starts a capture whose result could not be kept.
+    fn evict_previews(
+        &mut self,
+        window: &mut Window,
+        identity: &SourceIdentity,
+        bytes: usize,
+    ) -> bool {
+        while !self.preview_has_room_for(identity, bytes) {
+            let kind = identity_kind(identity);
+            let Some(oldest) = self.oldest_evictable_preview(kind) else {
+                return false;
+            };
+            if let Some(thumb) = self.previews.remove(&oldest) {
+                self.preview_bytes = self.preview_bytes.saturating_sub(thumb.bytes);
+                self.release_image(window, thumb.image);
+            }
+        }
+        true
+    }
+
+    /// The oldest cached identity an eviction may take: not in flight and,
+    /// once the rows of this category were painted, not one of its visible
+    /// cards. A visibility list of another category protects nothing here, so
+    /// a tab switch can free the pictures of the hidden one.
+    fn oldest_evictable_preview(&mut self, kind: SourceKind) -> Option<SourceIdentity> {
+        let mut index = 0;
+        while index < self.preview_order.len() {
+            let identity = self.preview_order[index].clone();
+            if !self.previews.contains_key(&identity) {
+                self.preview_order.remove(index);
+                continue;
+            }
+            let visible = self.visible_kind == kind && self.visible_previews.contains(&identity);
+            if visible || self.preview_pending.contains(&identity) {
+                index += 1;
+                continue;
+            }
+            self.preview_order.remove(index);
+            return Some(identity);
+        }
+        None
+    }
+
+    /// Make room for the estimated frame of `source`, evicting off-screen
+    /// pictures if needed. False means no capture may start.
+    fn reserve_preview_room(&mut self, window: &mut Window, source: &ScreenSource) -> bool {
+        let Some(identity) = source.identity() else {
+            return false;
         };
-        let bytes = (f64::from(width) * f64::from(width) * 9.0 / 16.0 * 4.0).ceil();
-        (bytes as usize).min(MAX_SCREEN_PREVIEW_BYTES)
+        let estimate = self.preview_frame_estimate(source);
+        self.evict_previews(window, &identity, estimate)
+    }
+
+    /// Conservative BGRA size of one card picture: the fixed capture width and
+    /// the surface's own aspect, never the painted card width. A surface with
+    /// no reported size is treated as a square at the capture width, the worst
+    /// reasonable frame that still fits a card.
+    fn preview_frame_estimate(&self, source: &ScreenSource) -> usize {
+        let (width, height) = preview_frame_size(source);
+        width as usize * height as usize * 4
     }
 
     /// Recompute the visible rows from the scroll handle of the last painted
     /// frame. The identity list is swapped into place through a reused buffer,
-    /// so neither a scroll nor a repaint allocates a new list. Returns whether
-    /// the scroll top moved since the previous frame; the dialog then asks for
-    /// previews once, and the batch guard keeps that from starting a second
-    /// capture beside a running one.
+    /// so a repaint does not allocate a new `Vec`; every identity is still
+    /// cloned because a monitor identity owns its device string. Returns
+    /// whether the rows or the scroll changed since the previous frame; the
+    /// dialog then asks for previews once, and the batch guard keeps that from
+    /// starting a second capture beside a running one.
     pub(super) fn sync_visible_previews(
         &mut self,
         sources: &[ScreenSource],
         columns: usize,
-        card_width: f32,
     ) -> bool {
-        self.preview_card_width = card_width;
         // A scroll offset is zero at the top and negative further down.
         let scroll_top = (-f32::from(self.scroll.offset().y)).max(0.0);
         let scrolled = (scroll_top - self.visible_scroll).abs() > 0.5;
         self.visible_scroll = scroll_top;
         self.visible_scratch.clear();
         if self.restart || columns == 0 || sources.is_empty() {
+            let changed = self.visible_kind != self.kind || !self.visible_previews.is_empty();
             self.visible_previews.clear();
             self.visible_kind = self.kind;
-            return scrolled;
+            return scrolled || changed;
         }
         let rows = sources.len().div_ceil(columns);
         let Some((start, end)) =
             visible_row_range(scroll_top, SOURCE_LIST_HEIGHT, SOURCE_ROW_HEIGHT, rows)
         else {
+            let changed = self.visible_kind != self.kind || !self.visible_previews.is_empty();
             self.visible_previews.clear();
             self.visible_kind = self.kind;
-            return scrolled;
+            return scrolled || changed;
         };
         for row in start..end {
             for column in 0..columns {
@@ -250,12 +308,14 @@ impl ScreenShareUi {
                 }
             }
         }
-        if self.visible_kind != self.kind || self.visible_scratch != self.visible_previews {
+        let changed =
+            self.visible_kind != self.kind || self.visible_scratch != self.visible_previews;
+        if changed {
             self.visible_kind = self.kind;
             std::mem::swap(&mut self.visible_previews, &mut self.visible_scratch);
         }
         self.visible_scratch.clear();
-        scrolled
+        scrolled || changed
     }
 
     /// Release the batch guard at the end of a batch. A stale batch (its epoch
@@ -270,48 +330,59 @@ impl ScreenShareUi {
         true
     }
 
-    /// Add one picture to the bounded cache. A picture over the width, count
-    /// or byte bound is counted as rejected and never queued.
+    /// Add one picture to the bounded cache for a test seam. A picture over the
+    /// width, count or byte bound is counted as rejected and never queued. The
+    /// background path reserves room first, so a `Full` answer here is a caller
+    /// mistake, not a card failure.
+    #[cfg(test)]
     pub(crate) fn insert_preview(
         &mut self,
         window: &mut Window,
         identity: SourceIdentity,
         frame: PreviewFrame,
     ) -> bool {
-        if frame.width == 0
-            || frame.height == 0
-            || frame.width > SCREEN_THUMBNAIL_WIDTH
-            || frame.bgra.len() != frame.width as usize * frame.height as usize * 4
-        {
+        let stored = self.store_preview(window, identity, frame);
+        if !stored {
             self.preview_rejected = self.preview_rejected.saturating_add(1);
+        }
+        stored
+    }
+
+    /// Put an already validated picture into the cache, replacing the previous
+    /// one of the same identity. The caller has reserved room for `bytes`.
+    fn store_preview(
+        &mut self,
+        window: &mut Window,
+        identity: SourceIdentity,
+        frame: PreviewFrame,
+    ) -> bool {
+        let Some(bytes) = valid_preview_bytes(&frame) else {
+            return false;
+        };
+        if !self.preview_has_room_for(&identity, bytes) {
             return false;
         }
-        let bytes = frame.bgra.len();
+        let Some(image) = preview_render_image(frame) else {
+            return false;
+        };
         let existing = self
             .previews
             .get(&identity)
             .map(|thumb| thumb.bytes)
             .unwrap_or(0);
-        let grows_count = usize::from(existing == 0);
-        if self.previews.len() + grows_count > MAX_SCREEN_PREVIEWS
-            || self.preview_bytes.saturating_sub(existing) + bytes > MAX_SCREEN_PREVIEW_BYTES
-        {
-            self.preview_rejected = self.preview_rejected.saturating_add(1);
-            return false;
-        }
-        let Some(image) = preview_render_image(frame) else {
-            self.preview_rejected = self.preview_rejected.saturating_add(1);
-            return false;
-        };
         self.preview_bytes = self.preview_bytes.saturating_sub(existing) + bytes;
         let previous = self
             .previews
             .insert(identity.clone(), PreviewThumb { image, bytes });
+        if previous.is_none() {
+            self.preview_order.push_back(identity.clone());
+        }
         if let Some(previous) = previous {
             self.release_image(window, previous.image);
         }
         self.preview_failures.remove(&identity);
         self.preview_pending.remove(&identity);
+        self.preview_unfit.remove(&identity);
         true
     }
 
@@ -323,6 +394,10 @@ impl ScreenShareUi {
     /// Apply a background result. A different epoch (closed/old picker), a
     /// non-pending id (cancelled batch) or an id absent from the current
     /// snapshot is ignored and never inserted.
+    ///
+    /// A cache that is still full after evicting everything it may is not a
+    /// failure: the picture is dropped, nothing is painted on the card and the
+    /// surface is retried when a later snapshot or tab describes it again.
     pub(crate) fn finish_preview(
         &mut self,
         window: &mut Window,
@@ -336,6 +411,11 @@ impl ScreenShareUi {
         if !self.preview_pending.remove(&identity) {
             return false;
         }
+        // A result of another category can only be a late frame of a tab the
+        // user already left: the current batch captures `kind` only.
+        if identity_kind(&identity) != self.kind {
+            return false;
+        }
         // The result belongs to the surface, not to the number its capture
         // started with: after a reorder the same id can name another display.
         if self.source_for_identity(&identity).is_none() {
@@ -343,8 +423,21 @@ impl ScreenShareUi {
         }
         match result {
             Ok(frame) => {
-                if !self.insert_preview(window, identity.clone(), frame) {
-                    self.insert_preview_failure(identity, PREVIEW_MEMORY_REASON.to_owned());
+                let Some(bytes) = valid_preview_bytes(&frame) else {
+                    // The card could never paint this frame: an honest note.
+                    self.preview_rejected = self.preview_rejected.saturating_add(1);
+                    self.insert_preview_failure(identity, PREVIEW_UNREADABLE_REASON.to_owned());
+                    return true;
+                };
+                // The real frame may be larger than the reservation (a window
+                // resized between the enumeration and the capture): release
+                // the pictures an eviction may take for its exact size.
+                if !self.preview_has_room_for(&identity, bytes) {
+                    self.evict_previews(window, &identity, bytes);
+                }
+                if !self.store_preview(window, identity.clone(), frame) {
+                    self.preview_rejected = self.preview_rejected.saturating_add(1);
+                    self.preview_unfit.insert(identity);
                 }
             }
             Err(error) => self.insert_preview_failure(identity, error.message().to_owned()),
@@ -384,10 +477,67 @@ impl ScreenShareUi {
             }
         }
         self.release_images(window, removed);
+        self.preview_order
+            .retain(|identity| self.previews.contains_key(identity));
         self.preview_failures
             .retain(|identity, _| identity_kind(identity) != kind || present(identity));
         self.preview_pending
             .retain(|identity| identity_kind(identity) != kind || present(identity));
+        // A fresh answer describes the surface again, so a frame that did not
+        // fit before gets another chance.
+        self.preview_unfit
+            .retain(|identity| identity_kind(identity) != kind);
+    }
+}
+
+/// BGRA size of a frame the picker may paint, or `None` for a picture that can
+/// never reach a card (zero size, over the capture width, malformed buffer).
+fn valid_preview_bytes(frame: &PreviewFrame) -> Option<usize> {
+    if frame.width == 0
+        || frame.height == 0
+        || frame.width > SCREEN_THUMBNAIL_WIDTH
+        || frame.bgra.len() != frame.width as usize * frame.height as usize * 4
+    {
+        return None;
+    }
+    Some(frame.bgra.len())
+}
+
+/// Cards the first batch may claim before the dialog has painted a visibility
+/// list of its category: two rows of the default two-column grid. Everything
+/// past them waits for a real scroll instead of walking the whole tab.
+pub(super) const BOOTSTRAP_PREVIEW_CARDS: usize = 4;
+/// A frame the media layer returned but a card could never paint: an honest
+/// note, unlike a full cache, which is not a failure of the surface.
+const PREVIEW_UNREADABLE_REASON: &str = "Предпросмотр источника не получен.";
+/// Largest side the media layer keeps for a thumbnail, mirroring
+/// `screen_capture::MAX_CAPTURE_SIDE`. It bounds the height of a portrait
+/// surface captured at the fixed width.
+const PREVIEW_MAX_SIDE: u32 = 4096;
+
+/// Size of the BGRA picture the media layer returns for `source`: at most
+/// `SCREEN_THUMBNAIL_WIDTH` wide, the surface's own aspect and even sides, the
+/// same rules as `screen_capture::preview_from_bgra`. The cache gate estimates
+/// the real frame with this, never the painted card.
+fn preview_frame_size(source: &ScreenSource) -> (u32, u32) {
+    let (width, height) = (source.width, source.height);
+    if width == 0 || height == 0 {
+        // No reported size: a square at the capture width is the worst
+        // reasonable frame, not an unbounded portrait guess.
+        return (SCREEN_THUMBNAIL_WIDTH, SCREEN_THUMBNAIL_WIDTH);
+    }
+    if width <= SCREEN_THUMBNAIL_WIDTH && height <= PREVIEW_MAX_SIDE {
+        return ((width & !1).max(2), (height & !1).max(2));
+    }
+    if u64::from(SCREEN_THUMBNAIL_WIDTH) * u64::from(height)
+        <= u64::from(PREVIEW_MAX_SIDE) * u64::from(width)
+    {
+        let scaled =
+            (u64::from(SCREEN_THUMBNAIL_WIDTH) * u64::from(height) / u64::from(width)) as u32;
+        (SCREEN_THUMBNAIL_WIDTH, (scaled & !1).max(2))
+    } else {
+        let scaled = (u64::from(PREVIEW_MAX_SIDE) * u64::from(width) / u64::from(height)) as u32;
+        ((scaled & !1).max(2), PREVIEW_MAX_SIDE)
     }
 }
 
@@ -405,8 +555,8 @@ fn preview_render_image(frame: PreviewFrame) -> Option<Arc<RenderImage>> {
 /// Half-open row range `[start, end)` that a viewport covers at `scroll_top`,
 /// widened by one row above and below so a small scroll already has its
 /// pictures. `None` means the layout is unknown (no rows, no viewport, a zero
-/// row height or a non-finite value): the caller then keeps the plain
-/// snapshot order instead of guessing.
+/// row height or a non-finite value): the caller then falls back to the small
+/// bootstrap set instead of guessing.
 ///
 /// `scroll_top` is the positive distance from the top of the content; the
 /// GPUI scroll handle stores the same distance negated.
@@ -462,8 +612,10 @@ impl VoicePanel {
     /// active only returns: the running batch re-reads the visible rows before
     /// every capture and re-requests pending work when it ends, so a source
     /// that appeared mid-batch (or scrolled into view) is still captured, just
-    /// not concurrently. The visible rows come first and the rest only while
-    /// the cache has room for one more picture.
+    /// not concurrently. Only the painted rows plus their one-row margin are
+    /// captured; the rest of the tab waits for a scroll. Before every source
+    /// the cache reserves room, evicting off-screen pictures, and a source with
+    /// no room is not captured at all.
     /// Before every source the batch re-checks that the same picker, epoch and
     /// category are still current, so a closed dialog or a tab switch never
     /// starts another capture. The capture itself is bounded by the media layer
@@ -486,7 +638,7 @@ impl VoicePanel {
         }
         let kind = self.screen.kind;
         let epoch = self.screen.preview_epoch;
-        let Some(first) = self.screen.take_next_preview_source(epoch, kind) else {
+        let Some(first) = self.screen.take_next_preview_source(window, epoch, kind) else {
             return;
         };
         self.screen.preview_batching = true;
@@ -544,8 +696,8 @@ impl VoicePanel {
                 // The next claim re-checks the session, so a row added while
                 // this capture ran joins the same batch.
                 next = this
-                    .update_in(cx, |panel, _, _| {
-                        panel.screen.take_next_preview_source(epoch, kind)
+                    .update_in(cx, |panel, window, _| {
+                        panel.screen.take_next_preview_source(window, epoch, kind)
                     })
                     .ok()
                     .flatten();
@@ -667,8 +819,50 @@ mod tests {
         );
     }
 
-    /// No layout means no visibility claim: the batch keeps the snapshot
-    /// order, which is the first-frame and restart behaviour.
+    /// The cache gate must estimate the frame the media layer really returns:
+    /// the fixed capture width and the surface aspect, not the painted card.
+    /// Unknown sizes get a square at that width, the worst reasonable frame.
+    #[test]
+    fn the_frame_estimate_follows_the_capture_width_and_source_aspect() {
+        fn surface(width: u32, height: u32) -> ScreenSource {
+            ScreenSource {
+                id: 1,
+                kind: SourceKind::Window,
+                title: "surface".into(),
+                display_id: -1,
+                width,
+                height,
+                monitor: None,
+            }
+        }
+        assert_eq!(preview_frame_size(&surface(1920, 1080)), (320, 180));
+        assert_eq!(preview_frame_size(&surface(1280, 720)), (320, 180));
+        assert_eq!(
+            preview_frame_size(&surface(0, 0)),
+            (SCREEN_THUMBNAIL_WIDTH, SCREEN_THUMBNAIL_WIDTH),
+            "an unknown size is not trusted as a small frame"
+        );
+        assert_eq!(
+            preview_frame_size(&surface(100, 50)),
+            (100, 50),
+            "a small surface is never upscaled"
+        );
+        assert_eq!(preview_frame_size(&surface(1080, 1920)), (320, 568));
+        assert_eq!(
+            preview_frame_size(&surface(200, 5000)),
+            (162, PREVIEW_MAX_SIDE),
+            "an extreme portrait surface is bounded by the capture side"
+        );
+        let (width, height) = preview_frame_size(&surface(1920, 1080));
+        assert_eq!(
+            width as usize * height as usize * 4,
+            230_400,
+            "a 1080p surface really costs 320×180 BGRA bytes"
+        );
+    }
+
+    /// No layout means no visibility claim: the batch falls back to the small
+    /// bootstrap set, which is the first-frame and restart behaviour.
     #[test]
     fn an_unknown_layout_has_no_visible_range() {
         assert_eq!(

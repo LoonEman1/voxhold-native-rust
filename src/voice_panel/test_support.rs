@@ -366,6 +366,28 @@ impl VoicePanel {
         self.screen.preview_failures.get(&identity).cloned()
     }
 
+    /// Whether a painted card of this row currently holds a picture.
+    pub fn test_screen_preview_cached(&self, id: SourceId) -> bool {
+        self.screen
+            .source_for(id)
+            .and_then(ScreenSource::identity)
+            .is_some_and(|identity| self.screen.previews.contains_key(&identity))
+    }
+
+    /// Deferred preview requests the dialog made for changed visible rows.
+    pub fn test_screen_preview_deferrals(&self) -> u32 {
+        self.screen.preview_deferrals
+    }
+
+    /// The painted card height, row gap and row step the visibility range uses.
+    pub fn test_screen_row_geometry(&self) -> (f32, f32, f32) {
+        (
+            super::screen_share::SOURCE_CARD_HEIGHT,
+            super::screen_share::SOURCE_ROW_GAP,
+            super::screen_share::SOURCE_ROW_HEIGHT,
+        )
+    }
+
     /// The hard bounds the cache enforces, for a test assertion.
     pub fn test_screen_preview_bounds(&self) -> (usize, usize) {
         (

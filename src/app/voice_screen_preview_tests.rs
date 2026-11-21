@@ -768,13 +768,20 @@ async fn a_late_preview_batch_cannot_clear_a_newer_batch(cx: &mut TestAppContext
         });
     });
 
-    // A new picker starts its own batch before the old task ever ran.
-    open_picker_with(
-        &mut visual,
-        &voice,
-        SourceKind::Monitor,
-        vec![source.clone()],
-    );
+    // A new picker starts its own batch before the old task ever ran. No draw
+    // here: a paint would run that batch to completion and release the guard
+    // the stale end is supposed to leave alone.
+    visual.update(|window, app| {
+        voice.update(app, |panel, _| {
+            panel.test_attach_detached_handle();
+            panel.test_open_screen_picker_with(
+                window,
+                SourceKind::Monitor,
+                vec![source.clone()],
+                None,
+            );
+        });
+    });
     let new_epoch = voice.read_with(&*visual, |panel, _| panel.test_preview_epoch());
     assert_ne!(new_epoch, old_epoch, "a new picker has a new epoch");
     visual.update(|window, app| {

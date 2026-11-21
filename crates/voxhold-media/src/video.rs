@@ -47,6 +47,10 @@ pub struct VideoStore {
     next_sequence: AtomicU64,
     latest: Mutex<Option<Arc<Frame>>>,
     scratch: Mutex<Option<I420Buffer>>,
+    /// Test-only: number of pictures actually scaled and converted. A skipped
+    /// identity (same sequence and size, or no frame) does not count.
+    #[cfg(test)]
+    conversions: AtomicU64,
 }
 
 impl VideoStore {
@@ -94,6 +98,8 @@ impl VideoStore {
         if output.len() < len {
             return -(len as isize);
         }
+        #[cfg(test)]
+        self.conversions.fetch_add(1, Ordering::Relaxed);
 
         let converted;
         let source = if let Some(buffer) = source.as_i420() {
@@ -134,6 +140,12 @@ impl VideoStore {
             libwebrtc::video_frame::VideoRotation::VideoRotation0,
             Box::new(buffer) as Box<dyn VideoBuffer>,
         ))
+    }
+
+    /// Test-only: how many pictures were actually converted. A read that finds
+    /// the same sequence and size (or no frame) is not counted.
+    pub(crate) fn conversions(&self) -> u64 {
+        self.conversions.load(Ordering::Relaxed)
     }
 }
 

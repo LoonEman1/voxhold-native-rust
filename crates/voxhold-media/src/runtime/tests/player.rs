@@ -76,8 +76,9 @@ fn a_replacement_engine_reads_its_first_frame_at_the_same_sequence_and_size() {
     let (mut first, _commands_a, events_a, store_a) = StreamViewer::detached_for_tests();
     assert!(store_a.publish_i420(I420Buffer::new_black(640, 360)));
     events_a.push(Event::Frame);
+    let mut request = false;
     assert!(matches!(
-        first.poll(&mut render, 320, 180),
+        first.poll(&mut render, 320, 180, &mut request),
         Some(EngineUpdate::Frame)
     ));
     let outcomes = frame_outcomes(&mut viewer, &mut render, EngineUpdate::Frame, now);
@@ -116,7 +117,7 @@ fn a_replacement_engine_reads_its_first_frame_at_the_same_sequence_and_size() {
     events_b.push(Event::Frame);
     render.reset_for_new_engine();
     assert!(matches!(
-        second.poll(&mut render, 320, 180),
+        second.poll(&mut render, 320, 180, &mut request),
         Some(EngineUpdate::Frame)
     ));
     let outcomes = frame_outcomes(&mut viewer, &mut render, EngineUpdate::Frame, now);
@@ -134,7 +135,7 @@ fn a_replacement_engine_reads_its_first_frame_at_the_same_sequence_and_size() {
     // Entering and leaving fullscreen is only a repaint of B's cached frame.
     assert!(
         matches!(
-            second.poll(&mut render, 640, 360),
+            second.poll(&mut render, 640, 360, &mut request),
             Some(EngineUpdate::Repaint)
         ),
         "a larger surface re-reads the cached picture"
@@ -153,14 +154,14 @@ fn a_replacement_engine_reads_its_first_frame_at_the_same_sequence_and_size() {
     events_c.push(Event::Frame);
     render.reset_for_new_engine();
     assert!(matches!(
-        third.poll(&mut render, 640, 360),
+        third.poll(&mut render, 640, 360, &mut request),
         Some(EngineUpdate::Frame)
     ));
     assert!(matches!(
-        third.poll(&mut render, 160, 90),
+        third.poll(&mut render, 160, 90, &mut request),
         Some(EngineUpdate::Repaint)
     ));
-    assert!(third.poll(&mut render, 160, 90).is_none());
+    assert!(third.poll(&mut render, 160, 90, &mut request).is_none());
     assert_eq!((render.width(), render.height()), (160, 90));
 }
 
@@ -335,8 +336,12 @@ fn installing_a_replacement_engine_resets_the_cached_frame_identity() {
     assert!(store_a.publish_i420(I420Buffer::new_black(640, 360)));
     events_a.push(Event::Frame);
     install_stream(&mut stream, &mut selection, &slot, &mut render, first, 1);
+    let mut request = false;
     assert!(matches!(
-        stream.as_mut().unwrap().poll(&mut render, 320, 180),
+        stream
+            .as_mut()
+            .unwrap()
+            .poll(&mut render, 320, 180, &mut request),
         Some(EngineUpdate::Frame)
     ));
 
@@ -347,7 +352,10 @@ fn installing_a_replacement_engine_resets_the_cached_frame_identity() {
     events_b.push(Event::Frame);
     install_stream(&mut stream, &mut selection, &slot, &mut render, second, 1);
     assert!(matches!(
-        stream.as_mut().unwrap().poll(&mut render, 320, 180),
+        stream
+            .as_mut()
+            .unwrap()
+            .poll(&mut render, 320, 180, &mut request),
         Some(EngineUpdate::Frame)
     ));
     assert_eq!(selection, Some(1), "the install owns the selection too");
@@ -367,7 +375,10 @@ fn statistics_are_stamped_with_the_attempt_the_runtime_installed() {
         frames_decoded: 7,
     });
     let mut render = VideoFrame::default();
-    let update = engine.poll(&mut render, 1, 1).expect("a stats event");
+    let mut request = false;
+    let update = engine
+        .poll(&mut render, 1, 1, &mut request)
+        .expect("a stats event");
     assert!(matches!(
         update,
         EngineUpdate::Stats {
@@ -376,4 +387,193 @@ fn statistics_are_stamped_with_the_attempt_the_runtime_installed() {
             frames_decoded: 7,
         } if stamped == attempt
     ));
+}
+
+#[test]
+fn a_decode_without_a_prepared_picture_still_confirms_recovery() {
+    let now = Instant::now();
+    let (mut viewer, _stream) = watching(now);
+    assert!(viewer.on_frame().iter().any(|outcome| matches!(
+        outcome,
+        ViewerOutcome::Connected {
+            connected: true,
+            ..
+        }
+    )));
+    assert!(
+        viewer
+            .on_engine_state("disconnected", now)
+            .iter()
+            .any(|outcome| matches!(
+                outcome,
+                ViewerOutcome::Connected {
+                    connected: false,
+                    ..
+                }
+            ))
+    );
+    assert!(viewer.watching().unwrap().recovering);
+
+    // No picture was requested, so the update is `Decoded`, not `Frame`. The
+    // transport still observes a decoded frame and ends recovery; it must not
+    // wait for a prepared picture.
+    let outcomes = frame_outcomes(
+        &mut viewer,
+        &mut VideoFrame::default(),
+        EngineUpdate::Decoded,
+        now,
+    );
+    assert!(
+        outcomes.iter().any(|outcome| matches!(
+            outcome,
+            ViewerOutcome::Connected {
+                connected: true,
+                ..
+            }
+        )),
+        "a decode confirms recovery without a prepared picture: {outcomes:?}"
+    );
+    assert!(!viewer.watching().unwrap().recovering);
+}
+
+#[test]
+fn decoded_frames_are_converted_only_for_requests_and_viewport_changes() {
+    let (mut engine, _commands, events, video) = StreamViewer::detached_for_tests();
+    let mut render = VideoFrame::default();
+    let mut request = false;
+    let mut viewport = (160u32, 90u32);
+    let mut viewport_changes = 0u32;
+    let mut requests = 0u32;
+
+    // The first picture moves the surface from 0x0 to the player size, so it
+    // is prepared even before the first request.
+    assert!(video.publish_i420(I420Buffer::new_black(640, 360)));
+    events.push(Event::Frame);
+    viewport_changes += 1;
+    assert!(matches!(
+        engine.poll(&mut render, viewport.0, viewport.1, &mut request),
+        Some(EngineUpdate::Frame)
+    ));
+
+    // Twenty decoded frames without a player request: every one confirms the
+    // transport, none is scaled or converted again.
+    for _ in 0..20 {
+        assert!(video.publish_i420(I420Buffer::new_black(640, 360)));
+        events.push(Event::Frame);
+        assert!(matches!(
+            engine.poll(&mut render, viewport.0, viewport.1, &mut request),
+            Some(EngineUpdate::Decoded)
+        ));
+    }
+    assert_eq!(video.conversions(), 1, "only the initial surface was read");
+
+    // Five player requests, each with a newer decoded frame: at most one
+    // conversion per request.
+    for _ in 0..5 {
+        assert!(video.publish_i420(I420Buffer::new_black(640, 360)));
+        events.push(Event::Frame);
+        request = true;
+        requests += 1;
+        assert!(matches!(
+            engine.poll(&mut render, viewport.0, viewport.1, &mut request),
+            Some(EngineUpdate::Frame)
+        ));
+        assert!(!request, "a completed conversion consumes the request");
+    }
+
+    // Exiting fullscreen does not wait for an RTP frame: the static picture
+    // is re-read once at the new size.
+    viewport = (320, 277);
+    viewport_changes += 1;
+    assert!(matches!(
+        engine.poll(&mut render, viewport.0, viewport.1, &mut request),
+        Some(EngineUpdate::Repaint)
+    ));
+    assert_eq!((render.width(), render.height()), (320, 180));
+
+    // A repeat at the same size prepares nothing yet: the request stays
+    // pending for the next decoded frame instead of converting again.
+    request = true;
+    requests += 1;
+    assert!(
+        engine
+            .poll(&mut render, viewport.0, viewport.1, &mut request)
+            .is_none()
+    );
+    assert!(request, "the request waits for a new picture");
+
+    assert_eq!(
+        video.conversions(),
+        7,
+        "initial surface + five prepared requests + one resize"
+    );
+    assert!(
+        video.conversions() <= u64::from(requests + viewport_changes),
+        "conversions never exceed requests plus viewport changes"
+    );
+}
+
+#[test]
+fn a_decode_without_a_request_is_not_lost_for_the_next_take_frame() {
+    use super::super::engine::{EngineEffect, apply_engine_update};
+
+    let now = Instant::now();
+    let (mut viewer, _stream) = watching(now);
+    let (mut engine, _commands, events, video) = StreamViewer::detached_for_tests();
+    let mut render = VideoFrame::default();
+    let slot = Mutex::new(None);
+
+    // The first picture is prepared, published and taken by the UI.
+    assert!(video.publish_i420(I420Buffer::new_black(320, 180)));
+    events.push(Event::Frame);
+    let mut request = false;
+    assert!(matches!(
+        engine.poll(&mut render, 160, 90, &mut request),
+        Some(EngineUpdate::Frame)
+    ));
+    assert!(matches!(
+        apply_engine_update(&slot, &mut render, &mut viewer, EngineUpdate::Frame, now),
+        EngineEffect::Outcomes(_)
+    ));
+    assert!(
+        slot.lock().unwrap().take().is_some(),
+        "the UI took the prepared picture"
+    );
+
+    // A newer frame is decoded while the UI has not asked for it. The surface
+    // keeps the last picture, but the decode still reports progress.
+    assert!(video.publish_i420(I420Buffer::new_black(320, 180)));
+    events.push(Event::Frame);
+    assert!(matches!(
+        engine.poll(&mut render, 160, 90, &mut request),
+        Some(EngineUpdate::Decoded)
+    ));
+    assert_eq!(video.conversions(), 1, "no picture was prepared");
+    let EngineEffect::Outcomes(outcomes) =
+        apply_engine_update(&slot, &mut render, &mut viewer, EngineUpdate::Decoded, now)
+    else {
+        panic!("a decode update is never an audio-output result");
+    };
+    assert!(outcomes.is_empty(), "the decode only confirmed progress");
+    assert!(
+        slot.lock().unwrap().is_none(),
+        "a decode without a request must not publish a stale picture"
+    );
+
+    // The next `take_frame` request prepares the last decoded frame, so the
+    // cached picture is not lost.
+    request = true;
+    assert!(matches!(
+        engine.poll(&mut render, 160, 90, &mut request),
+        Some(EngineUpdate::Repaint)
+    ));
+    assert_eq!(video.conversions(), 2);
+    let _ = apply_engine_update(&slot, &mut render, &mut viewer, EngineUpdate::Repaint, now);
+    let frame = slot
+        .lock()
+        .unwrap()
+        .take()
+        .expect("the next take returns the last decoded frame");
+    assert_eq!((frame.width, frame.height), (160, 90));
+    assert_eq!(frame.bgra.len(), 160 * 90 * 4);
 }

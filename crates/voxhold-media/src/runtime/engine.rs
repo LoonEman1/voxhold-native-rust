@@ -78,6 +78,10 @@ pub(super) fn apply_engine_update(
 ) -> EngineEffect {
     match update {
         EngineUpdate::Frame => EngineEffect::Outcomes(picture_outcomes(slot, render, viewer, true)),
+        // The decode still confirms the transport; only its picture was not
+        // prepared because the player had not asked for one. Publishing the
+        // previous surface here would redraw a stale size after a switch.
+        EngineUpdate::Decoded => EngineEffect::Outcomes(viewer.on_frame()),
         EngineUpdate::Repaint => {
             EngineEffect::Outcomes(picture_outcomes(slot, render, viewer, false))
         }

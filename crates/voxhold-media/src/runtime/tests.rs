@@ -663,6 +663,24 @@ fn a_failed_engine_start_cancels_the_attempt_without_stream_start() {
 }
 
 #[test]
+fn taking_a_frame_requests_the_next_picture_from_the_worker() {
+    let handle = VoiceHandle::detached_for_tests();
+    assert!(handle.take_frame().is_none(), "no picture was prepared yet");
+    assert!(
+        handle.take_frame_request_for_tests(),
+        "the UI must ask the background loop for the next picture"
+    );
+    // The flag is last-value: a repeat poll still leaves only one request, and
+    // the worker consumes it exactly once.
+    assert!(handle.take_frame().is_none());
+    assert!(handle.take_frame_request_for_tests());
+    assert!(
+        !handle.take_frame_request_for_tests(),
+        "the worker took the request once"
+    );
+}
+
+#[test]
 fn the_newest_screen_gate_is_a_last_value_request() {
     let requests = Requests::default();
     requests
@@ -735,15 +753,19 @@ fn a_cached_repaint_does_not_confirm_a_recovering_stream() {
     assert!(video.publish_i420(libwebrtc::video_frame::I420Buffer::new_black(320, 180)));
     events.push(crate::Event::Frame);
     let mut render = crate::VideoFrame::default();
+    let mut request = false;
     assert!(matches!(
-        stream.poll(&mut render, 160, 90),
+        stream.poll(&mut render, 160, 90, &mut request),
         Some(EngineUpdate::Frame)
     ));
     // Only the picture surface changes now; no RTP frame is queued.
     assert!(matches!(
-        stream.poll(&mut render, 320, 278),
+        stream.poll(&mut render, 320, 278, &mut request),
         Some(EngineUpdate::Repaint)
     ));
+    // The static picture was converted once for the fresh frame and once for
+    // the new surface, not once per poll.
+    assert_eq!(video.conversions(), 2);
 
     // Exactly what `drain_viewer` does for the cached update: publish the
     // picture without any viewer transition.

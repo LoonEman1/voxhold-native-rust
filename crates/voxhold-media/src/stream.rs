@@ -7,12 +7,18 @@ use std::time::Duration;
 /// An engine event that belongs to the current attempt. Signaling is returned
 /// without request ids; `viewer` stamps the attempt's ids.
 pub enum EngineUpdate {
-    /// A fresh RTP frame was decoded. Only this update confirms the
-    /// connection and ends recovery.
+    /// A fresh RTP frame was decoded and prepared for the player. Only this
+    /// update confirms the connection and ends recovery.
     Frame,
-    /// The cached last frame was re-read at a new viewport size. It refreshes
-    /// the picture only: connection state, status text and the recovery
-    /// deadline must stay exactly as they were. It is never video progress.
+    /// A fresh RTP frame was decoded but the player did not ask for a picture,
+    /// so only the last prepared frame stayed in the surface. It confirms the
+    /// connection exactly like `Frame`; the picture is prepared on the next
+    /// request instead of once per decoded frame.
+    Decoded,
+    /// The cached last frame was re-read at a new viewport size or on a player
+    /// request. It refreshes the picture only: connection state, status text
+    /// and the recovery deadline must stay exactly as they were. It is never
+    /// video progress.
     Repaint,
     /// Cumulative inbound video counters of this attempt. A resize repaint and
     /// a missing report must not be confused with these values.
@@ -238,40 +244,65 @@ impl StreamViewer {
     /// Non-blocking: one queued engine event per call, so a burst of frames
     /// cannot starve signaling or the voice session on the same worker.
     ///
-    /// A queued event always wins: a fresh RTP frame is reported as `Frame`.
-    /// Only when the queue is empty does a changed viewport re-read the frame
-    /// `VideoStore` already holds, and that is reported as `Repaint`, never as
-    /// a connection-confirming `Frame`. The read is size-aware, so an
-    /// unchanged size reports nothing and the caller settles instead of
+    /// A queued event always wins. A fresh RTP frame is reported as `Frame`
+    /// only when the picture was prepared; otherwise it is `Decoded`, which
+    /// still confirms the transport but reuses the last prepared surface. A
+    /// changed viewport or a `request` from the player re-reads the frame
+    /// `VideoStore` already holds and is reported as `Repaint`, never as a
+    /// connection-confirming `Frame`. The read is size- and sequence-aware, so
+    /// an unchanged picture reports nothing and the caller settles instead of
     /// polling in a loop.
+    ///
+    /// `request` is a last-value flag owned by the player: it is cleared here
+    /// once this poll used it for a read, so one `take_frame` prepares at most
+    /// one picture. A failed read keeps it pending for the next poll.
     pub fn poll(
         &mut self,
         frame: &mut VideoFrame,
         width: u32,
         height: u32,
+        request: &mut bool,
     ) -> Option<EngineUpdate> {
         let Some(event) = self.media.poll(Duration::ZERO) else {
-            // No engine event: the only remaining reason to touch the
-            // decoder is a new picture surface for the cached frame.
-            if (width, height) != self.viewport && self.media.read_video(frame, width, height) {
-                // Only a completed read counts. A failed attempt leaves the
-                // viewport unchanged so the next poll retries it.
-                self.viewport = (width, height);
-                return Some(EngineUpdate::Repaint);
+            // No engine event: a player request or a new picture surface is
+            // the only remaining reason to touch the decoder.
+            if !*request && (width, height) == self.viewport {
+                return None;
             }
-            return None;
+            if !self.media.read_video(frame, width, height) {
+                // Nothing newer was decoded, or the surface could not be
+                // read. Keep the request: it means "prepare the next
+                // picture", so it is served by the next decoded frame instead
+                // of forcing the player to ask again.
+                return None;
+            }
+            // Only a completed read counts. A failed attempt leaves the
+            // viewport unchanged so the next poll retries it.
+            *request = false;
+            self.viewport = (width, height);
+            return Some(EngineUpdate::Repaint);
         };
         match event {
             Event::Frame => {
-                if !self.media.read_video(frame, width, height) {
-                    return None;
+                if *request || (width, height) != self.viewport {
+                    if !self.media.read_video(frame, width, height) {
+                        // A queued decode could not be prepared yet. Keep the
+                        // request and the old surface baseline so a later poll
+                        // retries instead of settling on a stale picture.
+                        return None;
+                    }
+                    *request = false;
+                    // The fresh frame now owns the picture surface, so the
+                    // idle path must use this size as its baseline. Without
+                    // it a later smaller viewport looks unchanged and the
+                    // stale larger texture survives a fullscreen exit.
+                    self.viewport = (width, height);
+                    return Some(EngineUpdate::Frame);
                 }
-                // The fresh frame now owns the picture surface, so the idle
-                // path must use this size as its baseline. Without it a
-                // later smaller viewport looks unchanged and the stale
-                // larger texture survives a fullscreen exit.
-                self.viewport = (width, height);
-                Some(EngineUpdate::Frame)
+                // Video arrived, but no picture was requested. Still report
+                // the decode so the state machine confirms the connection;
+                // the picture is prepared on the next request or resize.
+                Some(EngineUpdate::Decoded)
             }
             Event::Answer { sdp } => Some(EngineUpdate::Answer(sdp)),
             Event::Ice(candidate) => Some(EngineUpdate::Ice(candidate)),
@@ -351,8 +382,9 @@ mod tests {
             error: Some("Не удалось переключить устройство воспроизведения, прежнее работает."),
         });
         let mut frame = VideoFrame::default();
+        let mut request = false;
         assert!(matches!(
-            viewer.poll(&mut frame, 1, 1),
+            viewer.poll(&mut frame, 1, 1, &mut request),
             Some(EngineUpdate::Output { applied: Some(applied), .. }) if applied == "usb"
         ));
         // Repeating the same preference must reach the engine again instead of
@@ -375,8 +407,9 @@ mod tests {
             error: Some("Устройство воспроизведения отключено, используется системное."),
         });
         let mut frame = VideoFrame::default();
+        let mut request = false;
         assert!(matches!(
-            viewer.poll(&mut frame, 1, 1),
+            viewer.poll(&mut frame, 1, 1, &mut request),
             Some(EngineUpdate::Output {
                 applied: None,
                 working: true,
@@ -397,9 +430,10 @@ mod tests {
         assert!(video.publish_i420(libwebrtc::video_frame::I420Buffer::new_black(320, 180)));
         events.push(Event::Frame);
         let mut frame = VideoFrame::default();
+        let mut request = false;
         // A queued fresh RTP frame wins over the viewport re-read.
         assert!(matches!(
-            viewer.poll(&mut frame, 160, 90),
+            viewer.poll(&mut frame, 160, 90, &mut request),
             Some(EngineUpdate::Frame)
         ));
         assert_eq!((frame.width(), frame.height()), (160, 90));
@@ -408,14 +442,14 @@ mod tests {
         // changed. The viewer must re-read the frame it already decodes, as a
         // repaint rather than a connection-confirming fresh frame.
         assert!(matches!(
-            viewer.poll(&mut frame, 320, 278),
+            viewer.poll(&mut frame, 320, 278, &mut request),
             Some(EngineUpdate::Repaint)
         ));
         assert_eq!((frame.width(), frame.height()), (320, 180));
 
         // The same size reports nothing, so the worker settles after one
         // repaint instead of forcing frames in a loop.
-        assert!(viewer.poll(&mut frame, 320, 278).is_none());
+        assert!(viewer.poll(&mut frame, 320, 278, &mut request).is_none());
     }
 
     #[test]
@@ -424,9 +458,10 @@ mod tests {
         assert!(video.publish_i420(libwebrtc::video_frame::I420Buffer::new_black(320, 180)));
         events.push(Event::Frame);
         let mut frame = VideoFrame::default();
+        let mut request = false;
         // Floating window first.
         assert!(matches!(
-            viewer.poll(&mut frame, 160, 90),
+            viewer.poll(&mut frame, 160, 90, &mut request),
             Some(EngineUpdate::Frame)
         ));
         assert_eq!((frame.width(), frame.height()), (160, 90));
@@ -435,7 +470,7 @@ mod tests {
         // fullscreen surface, so the cached baseline must move to 320x278.
         events.push(Event::Frame);
         assert!(matches!(
-            viewer.poll(&mut frame, 320, 278),
+            viewer.poll(&mut frame, 320, 278, &mut request),
             Some(EngineUpdate::Frame)
         ));
         assert_eq!((frame.width(), frame.height()), (320, 180));
@@ -443,11 +478,11 @@ mod tests {
         // Leaving fullscreen queues no frame. The cached picture must be
         // re-read at the window surface, not stay at the fullscreen size.
         assert!(matches!(
-            viewer.poll(&mut frame, 160, 90),
+            viewer.poll(&mut frame, 160, 90, &mut request),
             Some(EngineUpdate::Repaint)
         ));
         assert_eq!((frame.width(), frame.height()), (160, 90));
-        assert!(viewer.poll(&mut frame, 160, 90).is_none());
+        assert!(viewer.poll(&mut frame, 160, 90, &mut request).is_none());
     }
 
     #[test]
@@ -456,9 +491,10 @@ mod tests {
         assert!(video.publish_i420(libwebrtc::video_frame::I420Buffer::new_black(320, 180)));
         events.push(Event::Frame);
         let mut frame = VideoFrame::default();
+        let mut request = false;
         // The last decode happened at the fullscreen surface.
         assert!(matches!(
-            viewer.poll(&mut frame, 320, 278),
+            viewer.poll(&mut frame, 320, 278, &mut request),
             Some(EngineUpdate::Frame)
         ));
         assert_eq!((frame.width(), frame.height()), (320, 180));
@@ -466,11 +502,11 @@ mod tests {
         // Exiting fullscreen only changes the surface: the same picture is
         // re-read smaller and reported as a repaint.
         assert!(matches!(
-            viewer.poll(&mut frame, 160, 90),
+            viewer.poll(&mut frame, 160, 90, &mut request),
             Some(EngineUpdate::Repaint)
         ));
         assert_eq!((frame.width(), frame.height()), (160, 90));
-        assert!(viewer.poll(&mut frame, 160, 90).is_none());
+        assert!(viewer.poll(&mut frame, 160, 90, &mut request).is_none());
     }
 
     #[test]
@@ -478,16 +514,18 @@ mod tests {
         let (mut viewer, _commands, events, video) = headless(None);
         events.push(Event::Frame);
         let mut frame = VideoFrame::default();
+        let mut request = true;
         // Nothing was published, so the fresh frame cannot be decoded. The
         // failed attempt must not record the viewport as applied.
-        assert!(viewer.poll(&mut frame, 160, 90).is_none());
+        assert!(viewer.poll(&mut frame, 160, 90, &mut request).is_none());
         assert!(matches!(viewer.viewport, (0, 0)));
+        assert!(request, "a failed read keeps the request for the next poll");
 
         // A later attempt at the same size must still read the picture
         // instead of settling because the size looks unchanged.
         assert!(video.publish_i420(libwebrtc::video_frame::I420Buffer::new_black(320, 180)));
         assert!(matches!(
-            viewer.poll(&mut frame, 160, 90),
+            viewer.poll(&mut frame, 160, 90, &mut request),
             Some(EngineUpdate::Repaint)
         ));
         assert_eq!((frame.width(), frame.height()), (160, 90));
@@ -501,8 +539,9 @@ mod tests {
             frames_decoded: 2,
         });
         let mut frame = VideoFrame::default();
+        let mut request = false;
         assert!(matches!(
-            viewer.poll(&mut frame, 1, 1),
+            viewer.poll(&mut frame, 1, 1, &mut request),
             Some(EngineUpdate::Stats {
                 attempt: 0,
                 bytes_received: 10,

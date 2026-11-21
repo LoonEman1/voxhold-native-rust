@@ -178,7 +178,7 @@ impl Voxhold {
         self.highlighted_message = None;
         self.hovered_message = 0;
         self.messages.clear();
-        self.history_keys.clear();
+        self.reset_history_cache();
         self.history_list = Self::new_history_list(ListAlignment::Bottom, cx);
         self.scrollbar_drag = None;
         self.before = None;
@@ -907,7 +907,7 @@ impl Voxhold {
                         let found = page.messages.iter().any(|row| row.id == message);
                         s.messages = page.messages;
                         s.messages.sort_by_key(|row| row.id);
-                        s.history_keys.clear();
+                        s.reset_history_cache();
                         s.history_list.reset(0);
                         s.before = page.pagination.next_before_id;
                         s.has_more = page.pagination.has_more;

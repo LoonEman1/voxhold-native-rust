@@ -13,14 +13,14 @@ use voxhold_media::screen_capture::{PreviewFrame, ScreenSource, SourceKind, Thum
 /// number of captures that were ever inside it at once. No capture stack is
 /// involved.
 #[derive(Clone, Default)]
-struct RecordingPreview {
+pub(super) struct RecordingPreview {
     attempted: Arc<Mutex<Vec<String>>>,
     in_flight: Arc<AtomicUsize>,
     peak: Arc<AtomicUsize>,
 }
 
 impl RecordingPreview {
-    fn provider(
+    pub(super) fn provider(
         &self,
     ) -> Arc<dyn Fn(&ScreenSource) -> Result<PreviewFrame, ThumbnailError> + Send + Sync> {
         let attempted = self.attempted.clone();
@@ -41,7 +41,7 @@ impl RecordingPreview {
         })
     }
 
-    fn attempts(&self) -> Vec<String> {
+    pub(super) fn attempts(&self) -> Vec<String> {
         self.attempted.lock().expect("provider log").clone()
     }
 
@@ -349,8 +349,8 @@ async fn the_preview_cache_enforces_its_count_and_byte_bounds(cx: &mut TestAppCo
             panel.test_open_screen_picker_with(window, SourceKind::Monitor, Vec::new(), None);
             assert_eq!(panel.test_screen_preview_counts(), (0, 0));
             for index in 0..(max_count + 5) {
-                let source = monitor(20_000 + index as u64, "Экран", 320, 320);
-                panel.test_inject_screen_preview(window, &source, 320, 320);
+                let source = monitor(20_000 + index as u64, "Экран", 1920, 1080);
+                panel.test_inject_screen_preview(window, &source, 480, 270);
             }
             let (count, bytes) = panel.test_screen_preview_counts();
             assert!(count < max_count, "the byte bound bound the cache first");
@@ -509,12 +509,12 @@ async fn replacing_a_preview_does_not_inflate_the_byte_budget(cx: &mut TestAppCo
             // replacement did not leave a stale copy in the byte budget.
             let other = monitor(5, "Экран B", 2560, 1440);
             assert!(
-                panel.test_inject_screen_preview(window, &other, 320, 320),
+                panel.test_inject_screen_preview(window, &other, 320, 240),
                 "the budget was not inflated by the replacement"
             );
             assert_eq!(
                 panel.test_screen_preview_counts(),
-                (2, 16 * 16 * 4 + 320 * 320 * 4),
+                (2, 16 * 16 * 4 + 320 * 240 * 4),
                 "the two live frames are the only bytes counted"
             );
         });

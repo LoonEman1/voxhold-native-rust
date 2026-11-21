@@ -41,27 +41,30 @@ pub(crate) const SOURCE_CHANGED_REASON: &str =
 /// It still does not allow publishing more than one stream in this stage.
 pub(crate) const MULTI_STREAMS_SUPPORTED: bool = true;
 
-/// Width requested from the media layer for one picker card. The media layer
+/// Largest thumbnail width requested from the media layer. The media layer
 /// clamps it again, so a caller cannot grow the cache.
-pub(super) const SCREEN_THUMBNAIL_WIDTH: u32 = 320;
+pub(super) const SCREEN_THUMBNAIL_WIDTH: u32 = 480;
+/// Largest thumbnail height. The pair is the `480×270` request rectangle.
+pub(super) const SCREEN_THUMBNAIL_HEIGHT: u32 = 270;
+/// Request width before the first picker frame knows the real card width and
+/// Windows scale. It matches the normal two-column card in logical pixels, so
+/// no test seam captures a 2 px placeholder.
+pub(super) const SCREEN_THUMBNAIL_DEFAULT_WIDTH: u32 = 288;
 /// Hard bound of the picker preview cache: at most 64 cards.
 pub(super) const MAX_SCREEN_PREVIEWS: usize = 64;
 /// Hard bound of all BGRA bytes kept for picker previews.
 pub(super) const MAX_SCREEN_PREVIEW_BYTES: usize = 16 * 1024 * 1024;
-/// Height of the scrolling picker list. The visibility range must match the
-/// dialog's `#share-sources`, so both use this value.
-pub(super) const SOURCE_LIST_HEIGHT: f32 = 236.0;
-/// Height of one picker card, unchanged from the painted layout.
-pub(super) const SOURCE_CARD_HEIGHT: f32 = 124.0;
-/// Gap between two card rows and between two cards of one row.
-pub(super) const SOURCE_ROW_GAP: f32 = 8.0;
-/// Vertical distance from one row to the next.
-pub(super) const SOURCE_ROW_HEIGHT: f32 = SOURCE_CARD_HEIGHT + SOURCE_ROW_GAP;
+/// A picture that does not fit the cache still gets an honest card note; the
+/// note is dropped again when the card returns to the painted viewport.
+pub(super) const PREVIEW_MEMORY_REASON: &str = "Предпросмотр недоступен: превышен лимит памяти.";
 
 /// One cached card picture. `bytes` is the BGRA source size, so the budget
-/// stays comparable across sessions.
+/// stays comparable across sessions; `width`/`height` are the delivered frame
+/// dimensions and drive the explicit slot geometry.
 pub(super) struct PreviewThumb {
     pub(super) image: Arc<RenderImage>,
+    pub(super) width: u32,
+    pub(super) height: u32,
     pub(super) bytes: usize,
 }
 
@@ -147,6 +150,11 @@ pub(super) struct ScreenShareUi {
     /// picks up newly visible rows at its next safe point and re-requests at
     /// its end.
     pub(super) preview_batching: bool,
+    /// A background capture really runs right now. Unlike [`Self::preview_batching`]
+    /// this latch is not released by a new epoch: replacing the preview
+    /// generation must wait until the old capture returns, so two captures can
+    /// never overlap after a DPI or width change.
+    pub(super) preview_in_flight: bool,
     /// Session epoch of the open picker. Closing it, a stop, a restart or a new
     /// picker bumps this value; a late capture result is then ignored and no
     /// further source is started.
@@ -164,30 +172,10 @@ pub(super) struct ScreenShareUi {
     /// Cards painted by the last frame, so a layout test can prove one card per
     /// source without relying on a single `debug_selector`.
     pub(super) preview_cards: usize,
-    /// Identities inside the picker viewport plus one row of margin above and
-    /// below, in visual order. Captures claim only these rows. Empty means no
-    /// measurable rows yet (the first frame, a restart dialog or an empty
-    /// list): the batch then claims only the small bootstrap set.
-    pub(super) visible_previews: Vec<SourceIdentity>,
-    /// Scratch list of the per-frame visibility computation. The `Vec` itself
-    /// is reused, but each identity is cloned: a monitor identity owns its
-    /// device string, so a scroll still copies those strings instead of
-    /// allocating a brand-new list.
-    visible_scratch: Vec<SourceIdentity>,
-    /// Category that `visible_previews` describes. A list of another category
-    /// is ignored instead of capturing the hidden tab.
-    pub(super) visible_kind: SourceKind,
-    /// Scroll top observed by the last painted frame, used to notice a scroll
-    /// without comparing the whole identity list.
-    visible_scroll: f32,
     /// Requests the dialog deferred for the rows of the last painted frame.
     /// Test-only: it proves a scroll asks once, not once per repaint.
     #[cfg(test)]
     pub(super) preview_deferrals: u32,
-    /// Scroll state of `#share-sources`. The dialog tracks it so the picker
-    /// knows which rows are visible; tests drive the same handle through a
-    /// wheel event.
-    pub(super) scroll: ScrollHandle,
     /// Pictures really handed to `Window::drop_image`. Test-only: it proves
     /// that a replaced or cleared preview left the sprite atlas instead of
     /// being only removed from a collection.
@@ -198,6 +186,20 @@ pub(super) struct ScreenShareUi {
     /// the old picture was handed to `Window::drop_image`.
     #[cfg(test)]
     pub(super) last_release_slot_image: Option<u64>,
+    /// Native width requested for new thumbnails, derived from the card width
+    /// and the current Windows scale. `0` before the first picker frame.
+    pub(super) preview_width: u32,
+    /// Columns of the currently painted grid. Focus scrolling maps a source
+    /// index to its grid row with this value.
+    pub(super) preview_columns: usize,
+    /// Visible grid rows of the last frame, so captures claim only cards the
+    /// user can actually see. `None` means the dialog has not measured its
+    /// grid yet (first frame, a restart or an empty list): the batch then
+    /// claims only the small bootstrap set.
+    pub(super) visible_rows: Option<(usize, usize)>,
+    /// Scroll state of the source grid; a focused row is scrolled into view
+    /// before the next paint. Recreated for every new picker and tab.
+    pub(super) list_scroll: ScrollHandle,
     pub(super) ring: Vec<(FocusHandle, ShareKey)>,
     /// Set once the dialog focused its first ring element. The flag is reset
     /// with the dialog, so a repaint never steals focus back from the user.
@@ -239,23 +241,23 @@ impl Default for ScreenShareUi {
             preview_failures: HashMap::new(),
             preview_pending: HashSet::new(),
             preview_batching: false,
+            preview_in_flight: false,
             preview_epoch: 0,
             preview_bytes: 0,
             preview_order: VecDeque::new(),
             preview_unfit: HashSet::new(),
             preview_rejected: 0,
             preview_cards: 0,
-            visible_previews: Vec::new(),
-            visible_scratch: Vec::new(),
-            visible_kind: SourceKind::Monitor,
-            visible_scroll: 0.0,
             #[cfg(test)]
             preview_deferrals: 0,
-            scroll: ScrollHandle::new(),
             #[cfg(test)]
             released_images: 0,
             #[cfg(test)]
             last_release_slot_image: None,
+            preview_width: 0,
+            preview_columns: 2,
+            visible_rows: None,
+            list_scroll: ScrollHandle::new(),
             ring: Vec::new(),
             focus_placed: false,
         }
@@ -584,8 +586,12 @@ impl VoicePanel {
         self.screen.monitor_error.clear();
         self.screen.window_error.clear();
         // A new epoch: a capture of the previous dialog is ignored.
+        // A new epoch: a capture of the previous dialog is ignored, and the
+        // pictures it owned leave the sprite atlas.
         self.screen.clear_previews(window);
-        // A fresh publication starts without system sound, and the previous
+        // A reopened picker starts at the top of its grid: the scroll handle
+        // and the rows of the previous dialog are dropped, not reused.
+        self.screen.reset_preview_viewport();
         // picker's probe answer must not leak in: Start stays locked until
         // the new probe settles and offers the safe default scope.
         self.screen.audio_enabled = false;
@@ -834,6 +840,9 @@ impl VoicePanel {
             return;
         }
         self.screen.kind = kind;
+        // The other tab starts at the top of its own list: the rows and the
+        // scroll offset of the previous grid must not choose its captures.
+        self.screen.reset_preview_viewport();
         if self.screen.selected.is_some_and(|id| id.kind != kind) {
             self.screen.selected = None;
             self.screen.selected_identity = None;
@@ -1066,40 +1075,6 @@ impl VoicePanel {
         cx.notify();
     }
 
-    /// Take the newest local preview for the on-air card. The previous picture
-    /// is released only after the slot already points at the new frame. The
-    /// protection does not come from the old `Arc`: `drop_image` removes the
-    /// atlas entry regardless of other owners. It comes from the replacement
-    /// running in the poll before the next repaint, so the renderer never
-    /// paints a picture whose entry was already dropped.
-    ///
-    /// While no visible card asks for a preview (Idle, a hidden phase, an
-    /// unpainted room pane, a minimized window or a card scrolled out of the
-    /// viewport) the pending frame is drained without being counted as shown:
-    /// a picture the user never saw must not be reported, and a leftover frame
-    /// must not reappear when the card returns. The predicate is exactly the
-    /// demand's, so no `RenderImage` is created for a hidden card.
-    pub(super) fn take_screen_preview(&mut self, window: &mut Window) -> bool {
-        let Some(handle) = &self.handle else {
-            return false;
-        };
-        if !self.screen_preview_wanted(window) {
-            handle.discard_screen_frame();
-            return false;
-        }
-        let Some(frame) = handle.take_screen_frame() else {
-            return false;
-        };
-        let Some(buffer) = image::RgbaImage::from_raw(frame.width, frame.height, frame.bgra) else {
-            return false;
-        };
-        let image = Arc::new(RenderImage::new(smallvec::smallvec![image::Frame::new(
-            buffer
-        )]));
-        self.screen.set_preview(window, image);
-        true
-    }
-
     /// Forget every screen-share surface: leaving the call or a revoked
     /// session must not keep a card, a picker or a stale preview.
     pub(super) fn reset_screen(&mut self, window: &mut Window) {
@@ -1193,6 +1168,7 @@ impl VoicePanel {
 mod audio_scope;
 mod card;
 mod dialog;
+mod picker;
 mod preview;
 mod selection;
 mod update;

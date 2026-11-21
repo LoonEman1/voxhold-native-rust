@@ -10,6 +10,7 @@ mod composer;
 mod context_menus;
 mod history_actions;
 mod history_ops;
+mod history_rows;
 mod history_view;
 #[cfg(all(feature = "voxhold-media", test))]
 mod hotkey_tests;
@@ -82,6 +83,8 @@ mod voice_screen_identity_tests;
 mod voice_screen_image_tests;
 #[cfg(test)]
 mod voice_screen_operation_tests;
+#[cfg(test)]
+mod voice_screen_picker_tests;
 #[cfg(test)]
 mod voice_screen_preview_tests;
 #[cfg(test)]
@@ -439,6 +442,8 @@ pub(crate) struct Voxhold {
     messages: Vec<Message>,
     history_list: ListState,
     history_keys: Vec<HistoryKey>,
+    /// Prepared stable row data; rebuilt only when a history input changes.
+    history_rows: history_rows::HistoryRows,
     /// Bumped when the room chat opens or closes so a read scheduled for the
     /// previous surface cannot mark anything visible.
     chat_scope_epoch: u64,
@@ -841,6 +846,7 @@ impl Voxhold {
             messages: vec![],
             history_list,
             history_keys: Vec::new(),
+            history_rows: Default::default(),
             chat_scope_epoch: 0,
             before: None,
             has_more: false,

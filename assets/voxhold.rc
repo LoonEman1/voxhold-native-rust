@@ -1,0 +1,7 @@
+// Product icon for the Windows executable.
+//
+// build.rs compiles this file with embed-resource and passes the assets
+// directory as an include path, so `rc.exe` finds `voxhold.ico` next to this
+// file. The identifier stays 1 so Explorer and the taskbar pick this group as
+// the application icon.
+1 ICON "voxhold.ico"

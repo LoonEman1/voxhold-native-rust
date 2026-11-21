@@ -58,9 +58,14 @@ pub use topology::{MonitorIdentity, MonitorRect};
 pub const MAX_PREVIEW_WIDTH: u32 = 640;
 /// Upper bound of one stored preview picture. A bigger picture is rejected.
 pub const MAX_PREVIEW_BYTES: usize = 4 * 1024 * 1024;
-/// The picker thumbnail is never wider than this, so a grid of previews stays
-/// small even when the source is a 4K monitor.
-pub const MAX_THUMBNAIL_WIDTH: u32 = 320;
+/// The picker thumbnail is never wider than this. A 620 px dialog gives a
+/// 286 px card, so 480 px still covers the card at 150% Windows scaling
+/// without upscaling the source.
+pub const MAX_THUMBNAIL_WIDTH: u32 = 480;
+/// The picker thumbnail is also bounded vertically. Together with
+/// [`MAX_THUMBNAIL_WIDTH`] this is the `480×270` request rectangle: a 21:9
+/// source becomes 480×205, a 9:16 source 152×270, and neither is stretched.
+pub const MAX_THUMBNAIL_HEIGHT: u32 = 270;
 /// One thumbnail attempt gives up after this long without a frame. The whole
 /// call is synchronous and meant for a background thread.
 pub const THUMBNAIL_TIMEOUT: Duration = Duration::from_millis(900);
@@ -869,8 +874,9 @@ pub fn preview_from_i420(source: &I420Buffer, max_width: u32) -> Option<PreviewF
 
 /// Downscale one BGRA desktop frame into a bounded preview, preserving the
 /// aspect ratio and never upscaling. The output is at most `max_width` wide
-/// (clamped to [`MAX_THUMBNAIL_WIDTH`]); each destination pixel averages its
-/// source box. The input may have row padding and the result has no padding.
+/// (clamped to [`MAX_THUMBNAIL_WIDTH`]) and at most
+/// [`MAX_THUMBNAIL_HEIGHT`] high; each destination pixel averages its source
+/// box. The input may have row padding and the result has no padding.
 ///
 /// The loop is bounded by the destination size and the source size is checked
 /// first, so a malformed frame returns `None` instead of indexing out of range.
@@ -888,7 +894,7 @@ pub fn preview_from_bgra(
         return None;
     }
     let max_width = max_width.clamp(2, MAX_THUMBNAIL_WIDTH);
-    let (out_w, out_h) = fit_even(width, height, max_width, MAX_CAPTURE_SIDE);
+    let (out_w, out_h) = fit_even(width, height, max_width, MAX_THUMBNAIL_HEIGHT);
     if out_w == 0 || out_h == 0 {
         return None;
     }

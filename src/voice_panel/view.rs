@@ -783,8 +783,8 @@ fn initials(name: &str) -> String {
 }
 
 impl Render for VoicePanel {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let root = div()
             .id("voice-panel")
             .track_focus(&self.focus)
             .key_context("VoiceRoom")
@@ -805,6 +805,12 @@ impl Render for VoicePanel {
                 cx.stop_propagation();
             }))
             .size_full()
-            .child(self.room_body(cx))
+            .child(self.room_body(cx));
+        // The card rect of this frame is known only now. Syncing here keeps the
+        // preview demand on the painted card without the removed 100 ms poll:
+        // a card scrolled in starts, a hidden or minimized one stops, and a
+        // repaint is not needed for the atomics.
+        self.sync_screen_preview_demand(window);
+        root
     }
 }

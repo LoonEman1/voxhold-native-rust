@@ -70,11 +70,24 @@ impl VoicePanel {
             // pane of this frame, so a card in a hidden pane requests nothing
             // even while the publication keeps running.
             self.room_painted && self.screen_card_active(),
-            crate::window_state::is_minimized(window),
+            self.window_minimized(window),
             self.screen_card_rect,
             window.scale_factor(),
         );
         handle.set_screen_preview_demand(request);
+    }
+
+    /// The same visibility predicate as the preview demand. The take path uses
+    /// it too, so a hidden or minimized card discards the prepared picture
+    /// instead of creating a `RenderImage` and counting it as shown.
+    pub(in crate::voice_panel) fn screen_preview_wanted(&self, window: &Window) -> bool {
+        preview_request(
+            self.room_painted && self.screen_card_active(),
+            self.window_minimized(window),
+            self.screen_card_rect,
+            window.scale_factor(),
+        )
+        .is_some()
     }
 
     /// The card that replaces the local publication in the room grid while a

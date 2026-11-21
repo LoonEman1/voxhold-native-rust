@@ -17,8 +17,9 @@ use gpui::{
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     sync::Arc,
-    time::Duration,
+    time::Instant,
 };
+use tokio::sync::Notify;
 use voxhold_api::Client;
 use voxhold_media::{
     controller::{AppliedAudio, Participant, Publication},
@@ -151,6 +152,16 @@ pub struct VoicePanel {
     /// room roster and the call worker's roster/streams stay hidden until the
     /// fresh channel list confirms access again.
     access_confirmed: bool,
+    /// One wake for the whole panel lifetime. Handles receive a clone on
+    /// join, so replacing the handle never drops a pending wake.
+    wake: Arc<Notify>,
+    /// Epoch of the running 100 ms player ticker. A new watch starts one and
+    /// closing the player stops the previous one at its next tick.
+    frame_ticker: u64,
+    /// Executor clock of the last taken player picture. Event wakes may not
+    /// take a newer frame before this deadline, so the redraw stays at the
+    /// previous ~10 frames/s.
+    last_frame_at: Option<Instant>,
     frame: Option<Arc<RenderImage>>,
     stream_status: String,
     stream_error: String,
@@ -241,6 +252,13 @@ pub struct VoicePanel {
     /// Test-only: it proves the slot already pointed at the replacement.
     #[cfg(test)]
     last_release_slot_image: Option<u64>,
+    /// Number of `poll` calls. Test-only: an idle panel must not poll.
+    #[cfg(test)]
+    polls: u32,
+    /// Test override of the platform minimize state. A GPUI test window has
+    /// no platform handle, so `window_state::is_minimized` always says false.
+    #[cfg(test)]
+    test_minimized: Option<bool>,
 }
 
 impl VoicePanel {
@@ -255,22 +273,11 @@ impl VoicePanel {
         let focus = cx.focus_handle();
         let blur = cx.on_blur(&focus, window, |panel, _, _| panel.release_push_to_talk());
         let activation = cx.observe_window_activation(window, |panel, window, _| {
-            if !window.is_window_active() {
-                panel.release_push_to_talk();
-            }
+            panel.window_activation(window.is_window_active());
         });
-        let executor = cx.background_executor().clone();
-        cx.spawn_in(window, async move |this, cx| loop {
-            executor.timer(Duration::from_millis(100)).await;
-            let Some(entity) = this.upgrade() else { break };
-            if entity
-                .update_in(cx, |panel, window, cx| panel.poll(window, cx))
-                .is_err()
-            {
-                break;
-            }
-        })
-        .detach();
+        let wake = Arc::new(Notify::new());
+        events::spawn(wake.clone(), window, cx);
+        events::spawn_clock(window, cx);
         let controls = Controls {
             muted: true,
             ..Controls::default()
@@ -323,6 +330,9 @@ impl VoicePanel {
             screen_card_rect: None,
             screen_audio_probe: 0,
             access_confirmed: true,
+            wake,
+            frame_ticker: 0,
+            last_frame_at: None,
             frame: None,
             stream_status: String::new(),
             stream_error: String::new(),
@@ -372,6 +382,10 @@ impl VoicePanel {
             player_images_released: 0,
             #[cfg(test)]
             last_release_slot_image: None,
+            #[cfg(test)]
+            polls: 0,
+            #[cfg(test)]
+            test_minimized: None,
         }
     }
 
@@ -640,6 +654,7 @@ impl VoicePanel {
             self.controls.clone(),
             self.self_muted,
             self.rotation_in_flight,
+            self.wake.clone(),
         ) {
             Ok(handle) => {
                 self.call_channel = self.room;
@@ -666,6 +681,9 @@ impl VoicePanel {
         self.close_player(window);
         self.refresh_capture();
         self.notify_call_changed(cx);
+        // A fresh handle changes the poll gate (clock tick) and may already
+        // hold the first updates; do not wait for the next deadline.
+        self.wake.notify_one();
     }
 
     pub fn leave_in_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -738,6 +756,9 @@ impl VoicePanel {
         self.tracks.clear();
         self.local_mutes.clear();
         self.streams.clear();
+        // The handle is gone: the clock tick stops polling and a pending
+        // wake must not leave a stale unpainted call state behind.
+        self.wake.notify_one();
         cx.notify();
     }
 
@@ -934,9 +955,15 @@ impl VoicePanel {
         self.watching = Some(publication.clone());
         self.watching_selection = Some(selection);
         self.stream_muted = false;
+        self.last_frame_at = None;
+        // One ticker belongs to one player. A repeated watch replaces it; the
+        // old task sees the moved epoch and stops at its next wake.
+        self.frame_ticker = self.frame_ticker.wrapping_add(1);
+        events::spawn_frames(self.frame_ticker, window, cx);
         if let Some(handle) = &self.handle {
             handle.watch_stream(selection, publication);
         }
+        self.wake.notify_one();
         cx.notify();
     }
 
@@ -954,6 +981,9 @@ impl VoicePanel {
         self.clear_player_frame(window);
         self.watching = None;
         self.watching_selection = None;
+        // Stop the 100 ms player ticker: the next watch starts a new one.
+        self.frame_ticker = self.frame_ticker.wrapping_add(1);
+        self.last_frame_at = None;
         self.player_open = false;
         // The next player may be served by another handle; its first viewport
         // must reach that worker even if the size matches the closed player.
@@ -1043,50 +1073,6 @@ impl VoicePanel {
         self.watching.as_ref()
     }
 
-    fn poll(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.sync_viewport();
-        let clock_changed = self.live_clock_changed();
-        let Some(handle) = &self.handle else {
-            if clock_changed {
-                cx.notify();
-            }
-            return;
-        };
-        let mut changed = clock_changed;
-        let mut updates = Vec::new();
-        while let Some(update) = handle.try_update() {
-            updates.push(update);
-        }
-        let frame = handle.take_frame();
-        for update in updates {
-            changed |= self.apply_update(update, window, cx);
-        }
-        self.watch_after_join(window, cx);
-        if let Some(frame) = frame {
-            if self.watching_selection != Some(frame.selection) {
-                // A frame that was already in the last-value slot when the
-                // user switched selections belongs to the old player.
-            } else if let Some(buffer) =
-                image::RgbaImage::from_raw(frame.width, frame.height, frame.bgra)
-            {
-                let image = Arc::new(RenderImage::new(smallvec::smallvec![image::Frame::new(
-                    buffer
-                )]));
-                self.set_player_frame(window, image);
-                changed = true;
-            }
-        }
-        // The demand follows the phase this poll just applied, not the one the
-        // previous frame painted. A Stop answer clears the card in the same
-        // tick; syncing before the updates would ask for one more capture
-        // interval of a preview nobody shows.
-        self.sync_screen_preview_demand(window);
-        changed |= self.take_screen_preview(window);
-        if changed {
-            cx.notify();
-        }
-    }
-
     /// Test hook: install a confirmed call without opening a socket, so the
     /// room, dock and keyboard can be tested deterministically.
     #[cfg(test)]
@@ -1174,6 +1160,7 @@ impl VoicePanel {
 mod colors;
 mod controls;
 mod cues;
+mod events;
 mod focus;
 mod player;
 mod player_frame;

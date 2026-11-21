@@ -72,6 +72,9 @@ pub struct StreamFrame {
 pub struct VoiceHandle {
     requests: Arc<Requests>,
     updates: Arc<Updates>,
+    /// UI wake shared with the panel. Updates, a prepared player picture and a
+    /// local preview set it, so the panel polls on events instead of a timer.
+    wake: Arc<Notify>,
     frame: Arc<Mutex<Option<StreamFrame>>>,
     /// Capture permission is independent of the socket worker, so leave, a
     /// released PTT key or logout silences the track immediately.
@@ -99,13 +102,26 @@ impl VoiceHandle {
         controls: Controls,
         self_muted: bool,
     ) -> Result<Self, String> {
-        Self::join_with_rotation(client, server, channel, controls, self_muted, false)
+        Self::join_with_rotation(
+            client,
+            server,
+            channel,
+            controls,
+            self_muted,
+            false,
+            Arc::new(Notify::new()),
+        )
     }
 
     /// Join while a token refresh is already in flight. The gate is installed
     /// on the shared requests before the worker thread starts, so its first
     /// authorization waits for the refresh answer (or the 30 s deadline)
     /// instead of using the revoked token.
+    ///
+    /// `wake` belongs to the panel: it is stored for the whole handle lifetime
+    /// and is set when the update queue turns non-empty, when a player picture
+    /// is published and when a local preview is stored.
+    #[allow(clippy::too_many_arguments)]
     pub fn join_with_rotation(
         client: voxhold_api::Client,
         server: i64,
@@ -113,6 +129,7 @@ impl VoiceHandle {
         controls: Controls,
         self_muted: bool,
         rotation_pending: bool,
+        wake: Arc<Notify>,
     ) -> Result<Self, String> {
         static ATTEMPT: AtomicU64 = AtomicU64::new(1);
         let attempt = ATTEMPT.fetch_add(1, Ordering::SeqCst);
@@ -120,11 +137,11 @@ impl VoiceHandle {
         if rotation_pending {
             requests.rotation_started(Instant::now());
         }
-        let updates = Arc::new(Updates::new());
+        let updates = Arc::new(Updates::with_wake(wake.clone()));
         let frame = Arc::new(Mutex::new(None));
         let capture = Arc::new(CaptureGate::default());
         let finished = Arc::new((Mutex::new(false), Condvar::new()));
-        let screen_preview = Arc::new(crate::screen_capture::PreviewStore::default());
+        let screen_preview = Arc::new(crate::screen_capture::PreviewStore::with_wake(wake.clone()));
         let screen_demand = Arc::new(crate::screen_capture::PreviewDemand::default());
         let screen_picker = Arc::new(AtomicU64::new(1));
         let source_generation = Arc::new(AtomicU64::new(1));
@@ -133,6 +150,7 @@ impl VoiceHandle {
         let worker_capture = capture.clone();
         let worker_preview = screen_preview.clone();
         let worker_demand = screen_demand.clone();
+        let worker_wake = wake.clone();
         let worker = thread::Builder::new()
             .name("voxhold-voice-session".into())
             .spawn(move || {
@@ -148,6 +166,7 @@ impl VoiceHandle {
                     worker_capture,
                     worker_preview,
                     worker_demand,
+                    worker_wake,
                 );
                 if let Ok(mut done) = worker_finished.0.lock() {
                     *done = true;
@@ -158,6 +177,7 @@ impl VoiceHandle {
         Ok(Self {
             requests,
             updates,
+            wake,
             frame,
             capture,
             screen_preview,
@@ -428,6 +448,8 @@ struct Live {
     local_level: Option<(f64, bool)>,
     frame: Arc<Mutex<Option<StreamFrame>>>,
     updates: Arc<Updates>,
+    /// Panel wake of this handle; a published player picture sets it.
+    wake: Arc<Notify>,
 }
 
 /// One drain batch's claim on the player's last-value picture request. Taking
@@ -574,28 +596,32 @@ impl Live {
                 break;
             };
             let now = Instant::now();
-            let outcomes =
-                match apply_engine_update(&self.frame, &mut self.render, viewer, update, now) {
-                    EngineEffect::Outcomes(outcomes) => outcomes,
-                    EngineEffect::Output {
-                        applied,
-                        working,
-                        error,
-                    } => {
-                        // The applied endpoint may be the previous one after a
-                        // rollback. Updating both values lets a repeated request
-                        // retry instead of being skipped as unchanged.
-                        self.output = applied;
-                        self.output_working = working;
-                        if let Some(selection) =
-                            viewer.watching().map(|watching| watching.selection)
-                        {
-                            self.updates
-                                .push(VoiceUpdate::StreamAudio { selection, error });
-                        }
-                        Vec::new()
+            let outcomes = match apply_engine_update(
+                &self.frame,
+                &mut self.render,
+                viewer,
+                update,
+                now,
+                &self.wake,
+            ) {
+                EngineEffect::Outcomes(outcomes) => outcomes,
+                EngineEffect::Output {
+                    applied,
+                    working,
+                    error,
+                } => {
+                    // The applied endpoint may be the previous one after a
+                    // rollback. Updating both values lets a repeated request
+                    // retry instead of being skipped as unchanged.
+                    self.output = applied;
+                    self.output_working = working;
+                    if let Some(selection) = viewer.watching().map(|watching| watching.selection) {
+                        self.updates
+                            .push(VoiceUpdate::StreamAudio { selection, error });
                     }
-                };
+                    Vec::new()
+                }
+            };
             match self.apply(outcomes, viewer).await {
                 Ok(true) => {}
                 Ok(false) => {

@@ -771,9 +771,15 @@ fn a_cached_repaint_does_not_confirm_a_recovering_stream() {
     // Exactly what `drain_viewer` does for the cached update: publish the
     // picture without any viewer transition.
     let slot = Mutex::new(None);
-    let EngineEffect::Outcomes(outcomes) =
-        apply_engine_update(&slot, &mut render, &mut viewer, EngineUpdate::Repaint, now)
-    else {
+    let wake = tokio::sync::Notify::new();
+    let EngineEffect::Outcomes(outcomes) = apply_engine_update(
+        &slot,
+        &mut render,
+        &mut viewer,
+        EngineUpdate::Repaint,
+        now,
+        &wake,
+    ) else {
         panic!("a repaint is a picture update, not an audio-output result");
     };
     assert!(

@@ -1073,16 +1073,17 @@ impl VoicePanel {
     /// running in the poll before the next repaint, so the renderer never
     /// paints a picture whose entry was already dropped.
     ///
-    /// While no card is painted (Idle, a failed stop, a hidden phase) or the
-    /// card is scrolled outside the room viewport, the pending frame is drained
-    /// without being counted as shown: the media layer must not report a
-    /// picture the user never saw, and a leftover frame must not reappear when
-    /// the card returns. No `RenderImage` is created for it.
+    /// While no visible card asks for a preview (Idle, a hidden phase, an
+    /// unpainted room pane, a minimized window or a card scrolled out of the
+    /// viewport) the pending frame is drained without being counted as shown:
+    /// a picture the user never saw must not be reported, and a leftover frame
+    /// must not reappear when the card returns. The predicate is exactly the
+    /// demand's, so no `RenderImage` is created for a hidden card.
     pub(super) fn take_screen_preview(&mut self, window: &mut Window) -> bool {
         let Some(handle) = &self.handle else {
             return false;
         };
-        if !self.screen_card_active() || self.screen_card_rect.is_none() {
+        if !self.screen_preview_wanted(window) {
             handle.discard_screen_frame();
             return false;
         }

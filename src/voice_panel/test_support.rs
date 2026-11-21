@@ -17,7 +17,7 @@ impl VoicePanel {
     /// Install a handle that has no worker or socket, so `refresh_capture`
     /// queues the snapshot exactly as the live path would.
     pub fn test_attach_detached_handle(&mut self) {
-        let handle = VoiceHandle::detached_for_tests();
+        let handle = VoiceHandle::detached_for_tests_with_wake(self.wake.clone());
         self.attempt = handle.attempt();
         self.handle = Some(handle);
         // A new worker starts with no viewport; the next render must send it.
@@ -28,7 +28,10 @@ impl VoicePanel {
     /// with a detached worker so no socket is opened. This is exactly what
     /// `VoicePanel::join` hands to the worker when a refresh is in flight.
     pub fn test_join_detached(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let handle = VoiceHandle::detached_for_tests_with_rotation(self.rotation_in_flight);
+        let handle = VoiceHandle::detached_for_tests_with_wake_and_rotation(
+            self.wake.clone(),
+            self.rotation_in_flight,
+        );
         self.call_channel = self.room;
         self.install_handle(handle, window, cx);
     }
@@ -863,5 +866,63 @@ impl VoicePanel {
     /// The production reset path shared by leaving the call and a lost call.
     pub fn test_reset_screen(&mut self, window: &mut Window) {
         self.reset_screen(window);
+    }
+
+    /// Number of `poll` calls, so a test proves that an idle panel has none.
+    pub fn test_poll_count(&self) -> u32 {
+        self.polls
+    }
+
+    /// Start counting polls from zero after a test finished its setup.
+    pub fn test_reset_poll_count(&mut self) {
+        self.polls = 0;
+    }
+
+    /// Override the platform minimize state for the event and preview gates.
+    pub fn test_set_minimized(&mut self, minimized: Option<bool>) {
+        self.test_minimized = minimized;
+    }
+
+    /// The production window-activation path with an explicit answer: a GPUI
+    /// test window never reports itself as active.
+    pub fn test_window_activated(&mut self) {
+        self.window_activation(true);
+    }
+
+    /// Selection of the open player, if any.
+    pub fn test_watching_selection(&self) -> Option<u64> {
+        self.watching_selection
+    }
+
+    /// Put one update into the real coalescing queue, exactly as the worker
+    /// does; the queue is the production wake path of the panel.
+    pub fn test_push_update(&self, update: VoiceUpdate) {
+        if let Some(handle) = &self.handle {
+            handle.push_update_for_tests(update);
+        }
+    }
+
+    /// Publish one prepared player picture for `selection` and wake the panel.
+    pub fn test_push_player_frame(&self, selection: u64, width: u32, height: u32) {
+        if let Some(handle) = &self.handle {
+            handle.push_stream_frame_for_tests(voxhold_media::runtime::StreamFrame {
+                selection,
+                width,
+                height,
+                bgra: vec![0x24; width as usize * height as usize * 4],
+            });
+        }
+    }
+
+    /// Take the player's one pending conversion request like the worker does.
+    pub fn test_take_frame_request(&self) -> bool {
+        self.handle
+            .as_ref()
+            .is_some_and(VoiceHandle::take_frame_request_for_tests)
+    }
+
+    /// The live-clock second the last poll recorded, for the 1 s tick test.
+    pub fn test_live_clock_second(&self) -> Option<i64> {
+        self.live_clock_second
     }
 }

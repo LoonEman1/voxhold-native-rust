@@ -10,11 +10,20 @@ use crate::{
 };
 use std::{sync::Mutex, time::Instant};
 
+use tokio::sync::Notify;
+
 use super::StreamFrame;
 
 /// Move the freshly decoded picture into the last-value slot, reclaiming the
-/// buffer the UI has not taken yet so steady state does not allocate.
-fn publish_frame(slot: &Mutex<Option<StreamFrame>>, render: &mut VideoFrame, selection: u64) {
+/// buffer the UI has not taken yet so steady state does not allocate. A ready
+/// picture is an event: it wakes the panel, which then takes it at its frame
+/// deadline. A decode that prepared no picture never reaches here.
+fn publish_frame(
+    slot: &Mutex<Option<StreamFrame>>,
+    render: &mut VideoFrame,
+    selection: u64,
+    wake: &Notify,
+) {
     let mut next = slot
         .lock()
         .ok()
@@ -38,6 +47,7 @@ fn publish_frame(slot: &Mutex<Option<StreamFrame>>, render: &mut VideoFrame, sel
             bgra: next,
         });
     }
+    wake.notify_one();
 }
 
 /// Publish the decoded picture for the current selection. `fresh` marks a new
@@ -50,9 +60,10 @@ fn picture_outcomes(
     render: &mut VideoFrame,
     viewer: &mut Viewer,
     fresh: bool,
+    wake: &Notify,
 ) -> Vec<ViewerOutcome> {
     if let Some(selection) = viewer.watching().map(|watching| watching.selection) {
-        publish_frame(slot, render, selection);
+        publish_frame(slot, render, selection, wake);
     }
     if fresh { viewer.on_frame() } else { Vec::new() }
 }
@@ -77,15 +88,18 @@ pub(super) fn apply_engine_update(
     viewer: &mut Viewer,
     update: EngineUpdate,
     now: Instant,
+    wake: &Notify,
 ) -> EngineEffect {
     match update {
-        EngineUpdate::Frame => EngineEffect::Outcomes(picture_outcomes(slot, render, viewer, true)),
+        EngineUpdate::Frame => {
+            EngineEffect::Outcomes(picture_outcomes(slot, render, viewer, true, wake))
+        }
         // The decode still confirms the transport; only its picture was not
         // prepared because the player had not asked for one. Publishing the
         // previous surface here would redraw a stale size after a switch.
         EngineUpdate::Decoded => EngineEffect::Outcomes(viewer.on_frame()),
         EngineUpdate::Repaint => {
-            EngineEffect::Outcomes(picture_outcomes(slot, render, viewer, false))
+            EngineEffect::Outcomes(picture_outcomes(slot, render, viewer, false, wake))
         }
         EngineUpdate::Answer(sdp) => EngineEffect::Outcomes(viewer.on_answer(sdp)),
         EngineUpdate::Ice(candidate) => EngineEffect::Outcomes(viewer.on_ice(candidate)),

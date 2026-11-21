@@ -13,6 +13,7 @@ async fn run_session(
     capture: Arc<CaptureGate>,
     screen_preview: Arc<crate::screen_capture::PreviewStore>,
     screen_demand: Arc<crate::screen_capture::PreviewDemand>,
+    wake: Arc<Notify>,
 ) -> SessionEnd {
     let config = match client.webrtc_config().await {
         Ok(config) => config,
@@ -96,6 +97,7 @@ async fn run_session(
         local_level: None,
         frame,
         updates,
+        wake,
     };
     live.publisher
         .set_connection(controller.resume_connection_id.clone());
@@ -414,6 +416,7 @@ pub(super) fn run(
     capture: Arc<CaptureGate>,
     screen_preview: Arc<crate::screen_capture::PreviewStore>,
     screen_demand: Arc<crate::screen_capture::PreviewDemand>,
+    wake: Arc<Notify>,
 ) {
     let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -457,6 +460,7 @@ pub(super) fn run(
             capture.clone(),
             screen_preview.clone(),
             screen_demand.clone(),
+            wake.clone(),
         ));
         controller.joined = false;
         // A reconnect never resumes the old capture, but a confirmed

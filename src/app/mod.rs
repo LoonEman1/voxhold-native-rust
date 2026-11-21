@@ -66,6 +66,8 @@ mod voice_cue_tests;
 #[cfg(test)]
 mod voice_dock_tests;
 #[cfg(test)]
+mod voice_events_tests;
+#[cfg(test)]
 mod voice_form_tests;
 #[cfg(test)]
 mod voice_gain_tests;

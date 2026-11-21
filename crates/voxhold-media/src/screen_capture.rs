@@ -36,6 +36,7 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use libwebrtc::video_frame::{I420Buffer, VideoBuffer};
+use tokio::sync::Notify;
 
 mod topology;
 
@@ -404,9 +405,21 @@ pub struct PreviewStore {
     latest: Mutex<Option<PreviewFrame>>,
     published: AtomicU64,
     rejected: AtomicU64,
+    /// Wake of the panel that owns this store. `None` for a store built by a
+    /// test or by a publisher double without a UI.
+    wake: Option<Arc<Notify>>,
 }
 
 impl PreviewStore {
+    /// A store that wakes `wake` when it accepts a picture. The voice handle
+    /// shares the panel's wake with the capture thread through this.
+    pub fn with_wake(wake: Arc<Notify>) -> Self {
+        Self {
+            wake: Some(wake),
+            ..Self::default()
+        }
+    }
+
     /// Replace the stored picture. A picture above the memory bound is
     /// rejected; the previous one stays until the next acceptable frame.
     pub fn publish(&self, frame: PreviewFrame) -> bool {
@@ -425,7 +438,13 @@ impl PreviewStore {
             return false;
         };
         *slot = Some(frame);
+        drop(slot);
         self.published.fetch_add(1, Ordering::Relaxed);
+        // The card takes the picture only when the panel polls; the ready
+        // preview is exactly one of the events that must wake it.
+        if let Some(wake) = &self.wake {
+            wake.notify_one();
+        }
         true
     }
 

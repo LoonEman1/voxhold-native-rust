@@ -11,7 +11,9 @@
 //!   painted card shows a running stream or a call exists (a handle or a call
 //!   channel); after Leave/Stop or with an empty room it keeps sleeping
 //!   without polling. A watcher who is not in the call still needs this tick,
-//!   because the room list keeps the M:SS label of a foreign stream alive.
+//!   because the room list keeps the M:SS label of a foreign stream alive, but
+//!   only while the window is not minimized: a hidden label needs no repaint,
+//!   and activation wakes the panel for the current second.
 //! - [`spawn_frames`] is the ten-frames-per-second player deadline. It exists
 //!   only between `watch` and `close_player` and never polls while the window
 //!   is minimized; activating the window wakes the event task again.

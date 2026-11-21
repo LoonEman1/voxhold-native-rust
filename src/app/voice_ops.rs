@@ -198,6 +198,7 @@ impl Voxhold {
                     window,
                     cx,
                 );
+                panel.set_stream_preferences(self.stream_preferences.clone());
                 panel.set_access_confirmed(access_confirmed);
                 panel.set_rooms(rooms);
                 panel.set_self_user(self_user);

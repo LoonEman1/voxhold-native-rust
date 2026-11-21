@@ -395,7 +395,7 @@ impl PublisherEngine {
             return Err(PREP_CANCELLED.into());
         }
         let latest = Arc::new(LatestImage::default());
-        let target = request.quality.resolution.size();
+        let target = request.capture_target();
         let capture = ScreenCapture::start(
             request.source.clone(),
             target,
@@ -676,7 +676,7 @@ async fn run(
     ready: std::sync::mpsc::Sender<Result<(), String>>,
 ) {
     let factory = PeerConnectionFactory::default();
-    let (width, height) = request.quality.resolution.size();
+    let (width, height) = request.capture_size();
     let source = NativeVideoSource::new(VideoResolution { width, height }, true);
     let mut config = RtcConfiguration::default();
     config.ice_transport_type = match policy.as_str() {
@@ -782,7 +782,8 @@ async fn run(
         events.clone(),
         preview,
         counters.clone(),
-        request.quality,
+        request.quality.fps,
+        (width, height),
     ));
     // The last quality really applied to the live senders. The backend's
     // `startRecovery` may offer again to a live publisher, so a later answer
@@ -956,6 +957,12 @@ async fn apply_offer(
         ));
         return false;
     }
+    if !super::bitrate::set_video_frame_rate(sender, quality.fps) {
+        events.push(EngineEvent::Error(
+            "Не удалось применить частоту кадров трансляции.".into(),
+        ));
+        return false;
+    }
     apply_confirmed_limits(peer, sender, audio_sender, quality, limits, applied);
     events.push(EngineEvent::Answer(text));
     true
@@ -1074,16 +1081,18 @@ async fn frame_loop(
     events: Arc<EventQueue>,
     preview: Arc<PreviewStore>,
     counters: Arc<FrameCounters>,
-    quality: Quality,
+    fps: u32,
+    mut size: (u32, u32),
 ) {
-    let interval = Duration::from_micros(1_000_000 / u64::from(quality.fps.max(1)));
+    let interval = Duration::from_secs(1) / fps.clamp(1, super::MAX_SCREEN_FPS);
+    let mut tick = tokio::time::interval(interval);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut window = Instant::now();
     let mut sent_in_window = 0_u32;
     let mut first = false;
     let mut last_frame = Instant::now();
-    let mut size = quality.resolution.size();
     loop {
-        tokio::time::sleep(interval).await;
+        tick.tick().await;
         let mut failed = producer.failure();
         if let Some(image) = producer.next_frame() {
             last_frame = Instant::now();

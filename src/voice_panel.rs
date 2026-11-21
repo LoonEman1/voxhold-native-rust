@@ -140,6 +140,7 @@ pub struct VoicePanel {
     can_stream: bool,
     /// Screen-share picker, on-air card and preview.
     screen: ScreenShareUi,
+    stream_preferences: screen_share::StreamPrefsStore,
     /// Rect of the visible on-air card painted by the last frame. The preview
     /// demand of the media capture is computed from it on the 100 ms poll, the
     /// same cadence at which the card takes a frame. `None` while the card is
@@ -332,6 +333,7 @@ impl VoicePanel {
             live_clock_second: None,
             can_stream: false,
             screen: ScreenShareUi::default(),
+            stream_preferences: screen_share::StreamPrefsStore::default(),
             screen_card_rect: None,
             screen_audio_probe: 0,
             access_confirmed: true,
@@ -1173,6 +1175,7 @@ mod player;
 mod player_frame;
 mod screen_share;
 use screen_share::ScreenShareUi;
+pub(crate) use screen_share::StreamPrefsStore;
 mod sidebar;
 #[cfg(test)]
 mod test_support;

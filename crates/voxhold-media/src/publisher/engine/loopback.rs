@@ -167,7 +167,16 @@ fn loopback_with_frame_size(frame_size: (u32, u32)) {
     loopback(frame_size, None);
 }
 
+#[test]
+fn the_sfu_receives_video_with_a_180_fps_sender_limit() {
+    loopback_at((640, 360), None, 180);
+}
+
 fn loopback(frame_size: (u32, u32), scenario: Option<Scenario>) {
+    loopback_at(frame_size, scenario, 30);
+}
+
+fn loopback_at(frame_size: (u32, u32), scenario: Option<Scenario>, fps: u32) {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -221,8 +230,10 @@ fn loopback(frame_size: (u32, u32), scenario: Option<Scenario>) {
         })));
         let sfu_candidates = candidates(&sfu);
 
+        let mut request = request();
+        request.quality.fps = fps;
         let engine = PublisherEngine::start_synthetic(
-            request(),
+            request,
             Vec::new(),
             "all".into(),
             false,

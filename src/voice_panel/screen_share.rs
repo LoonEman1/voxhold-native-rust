@@ -3,8 +3,9 @@
 //! its state and forwards explicit user intents.
 //!
 //! Only settings that the SDR publication really applies are shown: the four
-//! web presets, 720p or 1080p, 30/60 FPS, 0,5–16 Мбит/с, the six Opus audio
-//! bitrates and the confirmed codec. P2P, HDR and the web «Содержание»
+//! web presets, resolutions up to the source's size, 30–180 FPS targets,
+//! 0,5–16 Мбит/с, the six Opus bitrates and the confirmed codec. P2P, HDR
+//! and the web «Содержание»
 //! (degradation preference) are absent because the pinned engine or backend
 //! cannot apply them.
 
@@ -109,6 +110,7 @@ pub(super) struct ScreenShareUi {
     /// The surface the user really chose. A monitor is its Windows identity;
     /// a window is its `HWND` in [`SourceId::id`].
     pub(super) selected_identity: Option<SourceIdentity>,
+    pending_preferences: Option<(PublishRequest, preferences::StreamPreferences)>,
     pub(super) resolution: Resolution,
     pub(super) fps: u32,
     pub(super) bitrate_kbps: u32,
@@ -222,6 +224,7 @@ impl Default for ScreenShareUi {
             window_error: String::new(),
             selected: None,
             selected_identity: None,
+            pending_preferences: None,
             resolution: Resolution::P1080,
             fps: 30,
             bitrate_kbps: 6000,
@@ -591,10 +594,9 @@ impl VoicePanel {
         // A reopened picker starts at the top of its grid: the scroll handle
         // and the rows of the previous dialog are dropped, not reused.
         self.screen.reset_preview_viewport();
-        // picker's probe answer must not leak in: Start stays locked until
-        // the new probe settles and offers the safe default scope.
-        self.screen.audio_enabled = false;
-        self.screen.reset_audio_scope(SourceKind::Monitor);
+        // Restore the local preferences, then probe this session's endpoint
+        // before letting the user start the stream.
+        self.load_stream_preferences();
         self.screen.audio_availability = None;
         self.begin_audio_probe(cx);
         self.screen.focus_placed = false;
@@ -671,9 +673,6 @@ impl VoicePanel {
             let _ = this.update(cx, |panel, cx| {
                 if panel.screen_audio_probe != generation {
                     return;
-                }
-                if result.is_err() {
-                    panel.screen.audio_enabled = false;
                 }
                 panel.screen.audio_availability = Some(result);
                 // The blocked-Start reason is no longer true; any other error
@@ -958,9 +957,10 @@ impl VoicePanel {
             }
             source
         };
+        let quality = self.screen.quality_for_source(&source);
         let request = PublishRequest {
             source,
-            quality: self.screen.quality(),
+            quality,
             codec: Codec::Vp8,
             audio: self.screen.audio_requested(),
             audio_scope: self.screen.effective_audio_scope(
@@ -1002,8 +1002,12 @@ impl VoicePanel {
                 slot_available,
             );
         }
-        // The request is only this attempt's draft. It becomes confirmed when
-        // the media layer reports the attempt Live.
+        if self.screen.restart {
+            self.stage_live_preferences(request);
+        } else {
+            self.remember_stream_preferences(cx);
+        }
+        // The request becomes confirmed when the media layer reports Live.
         self.screen.busy = true;
         // A restart without a live bitrate starts a preflight; closing the
         // dialog while it runs must cancel it instead of stopping the stream.
@@ -1167,6 +1171,8 @@ mod audio_scope;
 mod card;
 mod dialog;
 mod picker;
+mod preferences;
+pub(crate) use preferences::StreamPrefsStore;
 mod preview;
 mod selection;
 mod update;

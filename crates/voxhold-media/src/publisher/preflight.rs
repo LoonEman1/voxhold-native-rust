@@ -102,7 +102,7 @@ where
         return Err(PREFLIGHT_CANCELLED.into());
     }
     let latest = Arc::new(LatestImage::default());
-    let target = request.quality.resolution.size();
+    let target = request.capture_target();
     let capture = start_capture(
         request.source.clone(),
         target,

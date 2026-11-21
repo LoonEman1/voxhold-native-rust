@@ -41,6 +41,7 @@ impl VoicePanel {
                             self.screen.preflight = false;
                         }
                         QualityOutcome::Failed(message) => {
+                            self.screen.pending_preferences = None;
                             failed_current = true;
                             self.screen.busy = false;
                             self.screen.pending_quality_op = None;
@@ -52,6 +53,7 @@ impl VoicePanel {
                             self.screen.restore_confirmed_quality();
                         }
                         QualityOutcome::Cancelled => {
+                            self.screen.pending_preferences = None;
                             self.screen.busy = false;
                             self.screen.pending_quality_op = None;
                             self.screen.preflight = false;
@@ -114,6 +116,7 @@ impl VoicePanel {
                     self.close_screen_dialog(window);
                 }
                 if phase == Phase::Failed {
+                    self.screen.pending_preferences = None;
                     self.screen.busy = false;
                     self.screen.focus_placed = false;
                     self.screen.error = self.screen.sharing.error.clone().unwrap_or_default();

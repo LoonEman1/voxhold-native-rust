@@ -20,6 +20,8 @@ impl VoicePanel {
                 // A fresh answer can add, remove or rename rows; only the
                 // visible category is queued, and cached/pending ids skip.
                 self.request_screen_previews(window, cx);
+            } else {
+                self.save_confirmed_stream_preferences(cx);
             }
             return repaint;
         }

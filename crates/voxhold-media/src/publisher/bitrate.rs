@@ -288,6 +288,26 @@ pub(super) fn apply_sender_limits(
     )
 }
 
+/// Apply the capture-rate target at the encoder as well as at the producer.
+pub(super) fn set_video_frame_rate(sender: &RtpSender, fps: u32) -> bool {
+    let fps = Some(f64::from(fps.clamp(1, super::MAX_SCREEN_FPS)));
+    let mut parameters = sender.parameters();
+    if parameters.encodings.is_empty() {
+        return false;
+    }
+    for encoding in &mut parameters.encodings {
+        encoding.max_framerate = fps;
+    }
+    if sender.set_parameters(parameters).is_err() {
+        return false;
+    }
+    let confirmed = sender.parameters().encodings;
+    !confirmed.is_empty()
+        && confirmed
+            .iter()
+            .all(|encoding| encoding.max_framerate == fps)
+}
+
 /// Set `max_bitrate` on every encoding of one sender and return the value the
 /// sender reports afterwards. `None` means the encoding list is empty or at
 /// least one encoding still reports another value, which never confirms a

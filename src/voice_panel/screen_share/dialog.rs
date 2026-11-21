@@ -6,10 +6,39 @@
 use super::picker::*;
 use super::*;
 use crate::theme;
-use voxhold_media::publisher::{Codec, Preset, Resolution};
+use voxhold_media::publisher::{Codec, Preset, Resolution, SCREEN_FRAME_RATES};
 use voxhold_media::screen_capture::ScreenSource;
 
 impl ScreenShareUi {
+    pub(in crate::voice_panel) fn quality_for_source(&self, source: &ScreenSource) -> Quality {
+        let mut quality = self.quality().clamped();
+        if !self.restart {
+            quality.resolution = quality
+                .resolution
+                .for_source(Some((source.width, source.height)));
+        }
+        quality
+    }
+
+    fn resolution_source(&self) -> Option<(u32, u32)> {
+        let source = if self.restart {
+            self.restart_source()
+        } else {
+            self.selected.and_then(|id| self.source_for(id))
+        };
+        source.map(|source| (source.width, source.height))
+    }
+
+    fn offers_resolution(&self, resolution: Resolution) -> bool {
+        resolution.available_for(self.resolution_source())
+            || (self.restart
+                && self
+                    .sharing
+                    .confirmed
+                    .as_ref()
+                    .is_some_and(|live| live.quality.resolution == resolution))
+    }
+
     /// Bind the restart dialog to the attempt that is already live.
     ///
     /// The capture engine accepted this identity, so it is known available
@@ -41,7 +70,7 @@ impl ScreenShareUi {
 impl VoicePanel {
     fn choice(
         &self,
-        label: &'static str,
+        label: impl Into<gpui::SharedString>,
         active: bool,
         focus: FocusHandle,
         key: ShareKey,
@@ -52,7 +81,7 @@ impl VoicePanel {
 
     fn choice_enabled(
         &self,
-        label: &'static str,
+        label: impl Into<gpui::SharedString>,
         active: bool,
         enabled: bool,
         focus: FocusHandle,
@@ -60,8 +89,13 @@ impl VoicePanel {
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let c = self.colors();
-        let mut button = div()
-            .id(label)
+        let label = label.into();
+        #[cfg(test)]
+        let selector = format!("share-option-{label}");
+        let button = div().id(label.clone());
+        #[cfg(test)]
+        let button = button.debug_selector(move || selector);
+        let mut button = button
             .h(px(30.))
             .px(px(10.))
             .rounded(px(8.))
@@ -108,8 +142,10 @@ impl VoicePanel {
         let top = area.y + (area.h - height) / 2.0;
 
         let mut ring: Vec<(FocusHandle, ShareKey)> = Vec::new();
-        let row = |panel: &Self, ring: &mut Vec<(FocusHandle, ShareKey)>, key: ShareKey| {
-            let handle = panel.share_focus(ring.len());
+        let mut control_index = 0;
+        let mut row = |panel: &Self, ring: &mut Vec<(FocusHandle, ShareKey)>, key: ShareKey| {
+            let handle = panel.share_focus(control_index);
+            control_index += 1;
             ring.push((handle.clone(), key));
             handle
         };
@@ -350,10 +386,43 @@ impl VoicePanel {
             ));
         }
 
-        let res720 = row(self, &mut ring, ShareKey::Resolution(Resolution::P720));
-        let res1080 = row(self, &mut ring, ShareKey::Resolution(Resolution::P1080));
-        let fps30 = row(self, &mut ring, ShareKey::Fps(30));
-        let fps60 = row(self, &mut ring, ShareKey::Fps(60));
+        let option_row = |label| {
+            div().flex().items_start().gap_2().child(
+                div()
+                    .w(px(92.))
+                    .flex_shrink_0()
+                    .pt(px(7.))
+                    .text_size(px(12.))
+                    .text_color(rgb(c.muted))
+                    .child(label),
+            )
+        };
+        let active_resolution = if self.screen.restart {
+            q.resolution
+        } else {
+            q.resolution.for_source(self.screen.resolution_source())
+        };
+        let mut resolutions = div().flex().flex_wrap().gap_2().min_w_0();
+        for resolution in Resolution::OPTIONS {
+            if self.screen.offers_resolution(resolution) {
+                let key = ShareKey::Resolution(resolution);
+                let focus = row(self, &mut ring, key);
+                resolutions = resolutions.child(self.choice(
+                    resolution.label(),
+                    active_resolution == resolution,
+                    focus,
+                    key,
+                    cx,
+                ));
+            }
+        }
+        let mut frame_rates = div().flex().flex_wrap().gap_2().min_w_0();
+        for fps in SCREEN_FRAME_RATES {
+            let key = ShareKey::Fps(fps);
+            let focus = row(self, &mut ring, key);
+            frame_rates =
+                frame_rates.child(self.choice(format!("{fps} FPS"), q.fps == fps, focus, key, cx));
+        }
         let bitrate_down = row(self, &mut ring, ShareKey::BitrateDown);
         let bitrate_up = row(self, &mut ring, ShareKey::BitrateUp);
         let audio_available = self.screen.audio_available();
@@ -371,48 +440,8 @@ impl VoicePanel {
             .flex()
             .flex_col()
             .gap_1()
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        div()
-                            .w(px(92.))
-                            .text_size(px(12.))
-                            .text_color(rgb(c.muted))
-                            .child("Разрешение"),
-                    )
-                    .child(self.choice(
-                        Resolution::P720.label(),
-                        q.resolution == Resolution::P720,
-                        res720,
-                        ShareKey::Resolution(Resolution::P720),
-                        cx,
-                    ))
-                    .child(self.choice(
-                        Resolution::P1080.label(),
-                        q.resolution == Resolution::P1080,
-                        res1080,
-                        ShareKey::Resolution(Resolution::P1080),
-                        cx,
-                    )),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        div()
-                            .w(px(92.))
-                            .text_size(px(12.))
-                            .text_color(rgb(c.muted))
-                            .child("Кадры"),
-                    )
-                    .child(self.choice("30 FPS", q.fps == 30, fps30, ShareKey::Fps(30), cx))
-                    .child(self.choice("60 FPS", q.fps == 60, fps60, ShareKey::Fps(60), cx)),
-            )
+            .child(option_row("Разрешение").child(resolutions))
+            .child(option_row("Кадры").child(frame_rates))
             .child(
                 div()
                     .flex()
@@ -780,6 +809,9 @@ impl VoicePanel {
             ShareKey::Windows => self.change_share_kind(SourceKind::Window, window, cx),
             ShareKey::Refresh => self.refresh_screen_sources(window, cx),
             ShareKey::Resolution(resolution) => {
+                if !self.screen.offers_resolution(resolution) {
+                    return;
+                }
                 self.screen.resolution = resolution;
                 cx.notify();
             }
@@ -807,6 +839,22 @@ impl VoicePanel {
                 // focused row still selects it after the list is reordered.
                 self.select_screen_source(id, cx);
             }
+        }
+        if !self.screen.restart
+            && matches!(
+                key,
+                ShareKey::Resolution(_)
+                    | ShareKey::Fps(_)
+                    | ShareKey::Preset(_)
+                    | ShareKey::BitrateDown
+                    | ShareKey::BitrateUp
+                    | ShareKey::Audio
+                    | ShareKey::AudioScope(_)
+                    | ShareKey::AudioBitrateDown
+                    | ShareKey::AudioBitrateUp
+            )
+        {
+            self.remember_stream_preferences(cx);
         }
     }
 

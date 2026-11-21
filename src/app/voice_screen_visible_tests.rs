@@ -717,3 +717,65 @@ async fn a_late_frame_of_the_previous_session_does_not_land_in_the_new_picker(
         "the closed monitor batch never captured after the reopen"
     );
 }
+
+#[gpui::test]
+async fn stream_quality_options_follow_the_source_and_reload_from_disk(cx: &mut TestAppContext) {
+    use crate::voice_panel::StreamPrefsStore;
+    use voxhold_media::publisher::Resolution;
+
+    let (mut visual, _view, voice) = super::voice_tests::fixture_with(cx, Some(1400.), true);
+    draw(&mut visual);
+    let path = std::env::temp_dir().join(format!("voxhold-quality-{}", uuid::Uuid::new_v4()));
+    let layout = path.join("layout.json");
+    let qhd = monitor(3, "QHD", 2560, 1440);
+    let uhd = monitor(5, "UHD", 3840, 2160);
+    visual.update(|window, app| {
+        voice.update(app, |panel, _| {
+            panel.set_stream_preferences(StreamPrefsStore::with_layout(Some(&layout)));
+            panel.test_open_screen_picker(window, qhd.clone());
+        });
+    });
+    draw(&mut visual);
+    assert!(visual.debug_bounds("share-option-2560 × 1440").is_some());
+    assert!(visual.debug_bounds("share-option-3840 × 2160").is_none());
+
+    visual.update(|window, app| {
+        voice.update(app, |panel, _| {
+            panel.test_open_screen_picker(window, uhd.clone())
+        });
+    });
+    draw(&mut visual);
+    for option in ["share-option-3840 × 2160", "share-option-180 FPS"] {
+        let at = visual
+            .debug_bounds(option)
+            .expect("supported quality option")
+            .center();
+        visual.simulate_click(at, Default::default());
+        draw(&mut visual);
+    }
+    let quality = voice.read_with(&*visual, |panel, _| panel.test_screen_request().quality);
+    assert_eq!((quality.resolution, quality.fps), (Resolution::P2160, 180));
+
+    visual.update(|window, app| {
+        voice.update(app, |panel, cx| {
+            panel.set_stream_preferences(StreamPrefsStore::default());
+            panel.set_stream_preferences(StreamPrefsStore::with_layout(Some(&layout)));
+            panel.test_open_screen_share(window, cx);
+            panel.test_apply_screen_sources(
+                window,
+                SourceKind::Monitor,
+                vec![qhd.clone(), uhd.clone()],
+            );
+            panel.test_select_screen_source(qhd.clone(), cx);
+            let restored = panel.test_screen_request().quality;
+            assert_eq!(
+                (restored.resolution, restored.fps),
+                (Resolution::P1440, 180)
+            );
+            panel.test_select_screen_source(uhd, cx);
+            assert_eq!(panel.test_screen_request().quality, quality);
+        });
+    });
+    std::fs::remove_file(path.join("layout.json.stream.json")).unwrap();
+    std::fs::remove_dir(path).unwrap();
+}

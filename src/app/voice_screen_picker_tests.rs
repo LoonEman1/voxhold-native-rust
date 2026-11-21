@@ -243,8 +243,8 @@ fn assert_frame_fits_slot(
 /// inside an explicit slot at both the normal two-column and the narrow
 /// one-column width. The checked bounds are the painted image bounds, not the
 /// source aspect. Measured fact from the base layout: a `Contain` image does
-/// not crop its texture, the old card was simply small (about 124×70) and the
-/// 236 px list viewport hid the second row.
+/// not crop its texture, the old picture slot was simply small (about 124×70
+/// inside a ~286 px card) and the 236 px list viewport hid the second row.
 #[gpui::test]
 async fn every_preview_aspect_keeps_all_edges_at_normal_and_narrow_widths(cx: &mut TestAppContext) {
     let frames = [(320_u32, 180_u32), (90, 160), (240, 180), (420, 180)];

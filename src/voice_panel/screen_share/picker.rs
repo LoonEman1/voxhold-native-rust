@@ -4,8 +4,8 @@
 //! scroll viewport. Measured facts about the old layout:
 //!
 //! * A `Contain` image does not crop its texture: the base screenshot showed a
-//!   *whole* frame of about 124×70 logical pixels, i.e. the slot was simply
-//!   small (the card was 124 px wide), not clipped at its edges.
+//!   *whole* frame of about 124×70 logical pixels inside a ~286 px card, i.e.
+//!   the picture slot was simply small, not clipped at its edges.
 //! * The "cut" second row on that screenshot came from the list viewport,
 //!   which was fixed at 236 px and hid the bottom row.
 //! * A percentage-sized `img` still has its intrinsic aspect ratio, so the

@@ -363,7 +363,9 @@ impl Voxhold {
         // An older page or a late event cannot resurrect a deleted attachment.
         let purged = &self.media.purged;
         if let Ok(index) = self.messages.binary_search_by_key(&id, |row| row.id) {
-            crate::history::apply_attachment_tombstones(&mut self.messages[index], purged);
+            let row = &mut self.messages[index];
+            crate::history::apply_attachment_tombstones(row, purged);
+            self.history_rows.note_message_merge(row);
         }
     }
 

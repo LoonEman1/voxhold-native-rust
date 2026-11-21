@@ -154,6 +154,8 @@ pub(super) struct HistoryRows {
     confirm_delete: Option<i64>,
     menu: Option<(i64, bool)>,
     attachment_epoch: u64,
+    message_epoch: u64,
+    changed_messages: std::collections::HashSet<i64>,
     /// Set by an explicit external reset (context replacement, chat switch,
     /// logout). Those paths clear `history_keys`; the next render must not
     /// reuse rows even when the identity stamps happen to match.
@@ -186,6 +188,8 @@ impl Default for HistoryRows {
             confirm_delete: None,
             menu: None,
             attachment_epoch: 0,
+            message_epoch: 0,
+            changed_messages: Default::default(),
             dirty: false,
             #[cfg(test)]
             rebuilds: 0,
@@ -222,6 +226,24 @@ impl HistoryRows {
         self.dirty = true;
     }
 
+    /// A merge can replace data at the same server revisions. Compare the
+    /// payload on the merge path so ordinary paints only check stamps.
+    pub(super) fn note_message_merge(&mut self, message: &Message) {
+        let Ok(index) = self
+            .stamp
+            .binary_search_by_key(&message.id, |stamp| stamp.id)
+        else {
+            return;
+        };
+        let cached = self.rows[index].message.as_ref();
+        if cached.revision == message.revision
+            && cached.reactions_revision == message.reactions_revision
+            && cached != message
+        {
+            self.changed_messages.insert(message.id);
+        }
+    }
+
     /// Drop every prepared row and cache input. Used by the paths that clear or
     /// replace the confirmed messages (logout, session/chat switch, access
     /// reset): the cached rows hold `Arc<Message>` bodies, including private
@@ -249,6 +271,7 @@ impl HistoryRows {
 
     fn stale(&self, input: &HistoryInput<'_>) -> bool {
         self.dirty
+            || !self.changed_messages.is_empty()
             || self.stamp.len() != input.messages.len()
             || !self
                 .stamp
@@ -312,22 +335,25 @@ impl HistoryRows {
         let mut old_index = 0;
         let mut rows = Vec::with_capacity(input.messages.len());
         let mut keys = Vec::with_capacity(input.messages.len());
+        if !self.changed_messages.is_empty() {
+            self.message_epoch = self.message_epoch.wrapping_add(1);
+        }
         for (message, meta) in input.messages.iter().zip(meta) {
             while old_index < old_rows.len() && old_rows[old_index].message.id < message.id {
                 old_index += 1;
             }
-            let reused = if refresh {
-                None
+            let old_row = old_rows
+                .get(old_index)
+                .filter(|row| row.message.id == message.id);
+            let changed = self.changed_messages.contains(&message.id);
+            let message_epoch = if changed {
+                self.message_epoch
             } else {
-                old_rows
-                    .get(old_index)
-                    .filter(|row| {
-                        row.message.id == message.id
-                            && row.message.revision == message.revision
-                            && row.message.reactions_revision == message.reactions_revision
-                    })
-                    .map(|row| row.message.clone())
+                old_row.map_or(0, |_| self.keys[old_index].7)
             };
+            let reused = old_row
+                .filter(|_| !refresh && !changed && self.stamp[old_index].matches(message))
+                .map(|row| row.message.clone());
             let message = reused.unwrap_or_else(|| std::sync::Arc::new(message.clone()));
             let own = input.self_user_id > 0 && input.self_user_id == message.author.user_id;
             let permissions = message_tools::permissions_for(
@@ -379,6 +405,7 @@ impl HistoryRows {
                 meta.grouped,
                 meta.unread,
                 input.attachment_epoch,
+                message_epoch,
             ));
             rows.push(std::sync::Arc::new(HistoryRow {
                 message,
@@ -432,6 +459,7 @@ impl HistoryRows {
         self.confirm_delete = input.confirm_delete;
         self.menu = input.menu;
         self.attachment_epoch = input.attachment_epoch;
+        self.changed_messages.clear();
         self.dirty = false;
         #[cfg(test)]
         {

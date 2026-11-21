@@ -294,10 +294,10 @@ impl StreamViewer {
             Event::Frame => {
                 if *request || (width, height) != self.viewport {
                     if !self.media.read_video(frame, width, height) {
-                        // A queued decode could not be prepared yet. Keep the
-                        // request and the old surface baseline so a later poll
-                        // retries instead of settling on a stale picture.
-                        return None;
+                        // The frame was decoded even if the picture cannot be
+                        // prepared or was already read before the event arrived.
+                        // Keep the request and viewport for the next poll.
+                        return Some(EngineUpdate::Decoded);
                     }
                     *request = false;
                     // The fresh frame now owns the picture surface, so the
@@ -519,12 +519,11 @@ mod tests {
 
     #[test]
     fn a_cached_repaint_retries_after_a_failed_read() {
-        let (mut viewer, _commands, events, video) = headless(None);
-        events.push(Event::Frame);
+        let (mut viewer, _commands, _events, video) = headless(None);
         let mut frame = VideoFrame::default();
         let mut request = true;
-        // Nothing was published, so the fresh frame cannot be decoded. The
-        // failed attempt must not record the viewport as applied.
+        // Nothing was published. The failed attempt must not record the
+        // viewport as applied.
         assert!(viewer.poll(&mut frame, 160, 90, &mut request).is_none());
         assert!(matches!(viewer.viewport, (0, 0)));
         assert!(request, "a failed read keeps the request for the next poll");
@@ -537,6 +536,28 @@ mod tests {
             Some(EngineUpdate::Repaint)
         ));
         assert_eq!((frame.width(), frame.height()), (160, 90));
+    }
+
+    #[test]
+    fn a_frame_read_before_its_event_still_confirms_the_decode() {
+        let (mut viewer, _commands, events, video) = headless(None);
+        let mut frame = VideoFrame::default();
+        let mut request = true;
+
+        assert!(video.publish_i420(libwebrtc::video_frame::I420Buffer::new_black(320, 180)));
+        assert!(matches!(
+            viewer.poll(&mut frame, 160, 90, &mut request),
+            Some(EngineUpdate::Repaint)
+        ));
+        assert!(!request);
+
+        request = true;
+        events.push(Event::Frame);
+        assert!(matches!(
+            viewer.poll(&mut frame, 160, 90, &mut request),
+            Some(EngineUpdate::Decoded)
+        ));
+        assert!(request, "the next picture is still requested");
     }
 
     #[test]

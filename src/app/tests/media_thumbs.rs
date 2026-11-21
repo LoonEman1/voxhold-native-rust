@@ -212,7 +212,7 @@ fn removing_an_attachment_drops_both_caches_and_its_pending_state() {
     );
     media.begin_thumb_load(&key);
     media.thumb_waiting.insert(key.clone());
-    media.thumb_building.insert(ThumbKey::new(&id, 32., 32.));
+    media.begin_thumb_build(&ThumbKey::new(&id, 32., 32.));
     media.thumb_retry(&id, Some(429));
 
     let (images, _) = media.remove_attachment(&id);
@@ -224,6 +224,21 @@ fn removing_an_attachment_drops_both_caches_and_its_pending_state() {
     assert!(media.thumb_building.is_empty());
     assert!(!media.thumb_blocked(&id, Instant::now()));
     assert!(media.is_purged(&id));
+}
+
+#[test]
+fn a_late_thumbnail_build_cannot_retire_its_replacement() {
+    let mut media = Media::default();
+    let id = "d".repeat(32);
+    let key = ThumbKey::new(&id, 16., 16.);
+    let old_build = media.begin_thumb_build(&key);
+
+    media.remove_attachment(&id);
+    let current_build = media.begin_thumb_build(&key);
+    assert!(!media.finish_thumb_build(&key, old_build));
+    assert!(media.thumb_building.contains_key(&key));
+    assert!(media.finish_thumb_build(&key, current_build));
+    assert!(media.thumb_building.is_empty());
 }
 
 #[gpui::test]

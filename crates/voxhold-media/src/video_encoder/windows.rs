@@ -593,7 +593,10 @@ unsafe fn pump_events(
             unsafe { event.GetType() }.map_err(|error| classify(error, Stage::Output, adapter))?;
         if kind == METransformNeedInput.0 as u32 {
             if frames >= 8 {
-                continue;
+                return Err(EncoderReason::ProbeFailed(
+                    "кодировщик требует больше 8 кадров до ключевого".into(),
+                )
+                .into());
             }
             let stream = unsafe { event.GetUINT32(&MF_EVENT_MFT_INPUT_STREAM_ID) }.unwrap_or(0);
             let sample = unsafe { input_sample(query, frames) }

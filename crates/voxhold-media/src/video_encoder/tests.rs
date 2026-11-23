@@ -519,13 +519,17 @@ fn g04_driver_change_invalidates_the_confirmation() {
 
 #[test]
 fn g04_inventory_change_drops_the_cached_confirmation() {
-    let fake = FakeProbe::new(vec![FakeAdapter::new(A, "A", &[Codec::H264]).primary()]);
+    let fake = FakeProbe::new(vec![FakeAdapter::new(A, "A", &Codec::ALL).primary()]);
     let service = service(&fake);
+    // All four codecs confirm, so every one of them is in the cache.
     let first = submit(&service, request(gpu(A, false), q720(), 1, Some(46)));
-    assert!(first.resolve(CodecIntent::Explicit(Codec::H264)).is_ok());
+    for codec in Codec::ALL {
+        assert!(first.resolve(CodecIntent::Explicit(codec)).is_ok());
+    }
     let probes = fake.probes();
+    assert_eq!(probes, Codec::ALL.len(), "one probe per codec");
 
-    // A disappears. Nothing is probed, but the cached confirmation of the old
+    // A disappears. Nothing is probed, but the cached confirmations of the old
     // inventory must not survive it.
     fake.remove(luid(A));
     let removed = submit(&service, request(gpu(A, false), q720(), 2, Some(46)));
@@ -535,12 +539,15 @@ fn g04_inventory_change_drops_the_cached_confirmation() {
 
     // A returns with the same LUID and the same driver version. The identity of
     // the pair is identical, but the inventory generation changed while it was
-    // gone, so the old confirmation is not reused.
-    fake.set_adapters(vec![FakeAdapter::new(A, "A", &[Codec::H264]).primary()]);
+    // gone, so none of the old confirmations is reused.
+    fake.set_adapters(vec![FakeAdapter::new(A, "A", &Codec::ALL).primary()]);
     let back = submit(&service, request(gpu(A, false), q720(), 3, Some(46)));
-    assert!(back.resolve(CodecIntent::Explicit(Codec::H264)).is_ok());
-    assert!(
-        fake.probes() > probes,
+    for codec in Codec::ALL {
+        assert!(back.resolve(CodecIntent::Explicit(codec)).is_ok());
+    }
+    assert_eq!(
+        fake.probes(),
+        probes + Codec::ALL.len(),
         "the returning adapter is confirmed again instead of served from the dropped cache"
     );
     service.shutdown();
@@ -850,14 +857,16 @@ mod hardware {
         inventory
     }
 
-    fn probe_one(codec: Codec, query: EncodeQuery) -> ProbeOutcome {
+    /// `None` means the machine has no hardware adapter at all: the test then
+    /// reports an explicit SKIP instead of a green run without proof.
+    fn probe_one(codec: Codec, query: EncodeQuery) -> Option<ProbeOutcome> {
         let _platform = platform();
         let probe = PlatformProbe;
         let inventory = inventory(&probe);
-        assert!(
-            !inventory.adapters().is_empty(),
-            "SKIP: на машине нет аппаратного адаптера, проверять нечего"
-        );
+        if inventory.adapters().is_empty() {
+            eprintln!("SKIP: на машине нет аппаратного адаптера, проверять нечего");
+            return None;
+        }
         let adapter = inventory
             .resolve(AdapterSelection::Auto)
             .expect("no suitable hardware adapter");
@@ -866,13 +875,16 @@ mod hardware {
             "версия драйвера {} не определена, кэш не заметит её смену",
             adapter.name
         );
-        probe.probe(adapter, codec, query, &ProbeCancel::never())
+        Some(probe.probe(adapter, codec, query, &ProbeCancel::never()))
     }
 
     #[test]
     #[ignore = "needs real Windows hardware; G08 manual run"]
     fn hardware_h264_mft_720p30() {
-        match probe_one(Codec::H264, q720()) {
+        let Some(outcome) = probe_one(Codec::H264, q720()) else {
+            return;
+        };
+        match outcome {
             ProbeOutcome::Confirmed(SdrProfile::H264 { baseline, level }) => {
                 eprintln!(
                     "confirmed codec=H264 baseline={baseline:?} level=0x{level:02x} 1280x720@30"
@@ -891,7 +903,10 @@ mod hardware {
     #[test]
     #[ignore = "needs real Windows hardware; G08 manual run"]
     fn hardware_av1_mft_720p30() {
-        match probe_one(Codec::Av1, q720()) {
+        let Some(outcome) = probe_one(Codec::Av1, q720()) else {
+            return;
+        };
+        match outcome {
             ProbeOutcome::Confirmed(profile) => {
                 eprintln!("confirmed codec=AV1 profile={profile:?} 1280x720@30");
             }
@@ -952,10 +967,11 @@ mod hardware {
                 adapter.luid, adapter.name, adapter.driver_version
             );
         }
-        assert!(
-            snapshot.has_hardware_adapter(),
-            "SKIP: на машине нет аппаратного адаптера"
-        );
+        if !snapshot.has_hardware_adapter() {
+            eprintln!("SKIP: на машине нет аппаратного адаптера, проверять нечего");
+            service.shutdown();
+            return;
+        }
         let adapter = snapshot.adapter().expect("adapter");
         assert_ne!(
             adapter.driver_version, 0,

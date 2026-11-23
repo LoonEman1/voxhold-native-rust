@@ -230,3 +230,34 @@ async fn a_failed_logout_delete_is_visible_and_keeps_the_record(cx: &mut TestApp
     });
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[gpui::test]
+async fn retry_cleanup_keeps_a_newer_login_even_after_observing_it(cx: &mut TestAppContext) {
+    cx.update(|cx| gpui_component::init(cx));
+    let server = TestServer::spawn(Vec::new());
+    let dir = scratch("logout-retry-new-login");
+    let (window, view) = open(cx, &server.base, &dir);
+    let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
+    visual.run_until_parked();
+    let second = store(&dir);
+
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            // The first attempt failed at this generation. Another process
+            // then remembered a login before the user hit Retry.
+            v.cleanup_epoch = v.session_store.known_disk_generation();
+            v.cleanup_retry = true;
+            let newer = record(&server.base, "bob", 9, "token-b", 3_600);
+            second.save(&newer, second.begin_login()).unwrap();
+            let state = v.session_store.state().unwrap();
+            assert!(state.generation > v.cleanup_epoch);
+            v.retry_cleanup(window, cx);
+        });
+    });
+
+    wait_for(&mut visual, &view, |v| !v.cleanup_pending);
+    let state = second.state().unwrap();
+    assert_eq!(state.records.len(), 1);
+    assert_eq!(state.target.unwrap().account, "bob");
+    std::fs::remove_dir_all(dir).unwrap();
+}

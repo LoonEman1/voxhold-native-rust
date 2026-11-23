@@ -598,8 +598,7 @@ impl Voxhold {
         // newer generation is claimed here either, so a login saved from now on
         // is above this value and `clear_captured` refuses the cleanup with
         // `Stale`.
-        let expected_epoch = self.session_store.known_disk_generation();
-        self.cleanup_epoch = expected_epoch;
+        self.cleanup_epoch = self.session_store.known_disk_generation();
         if self.cleanup_pending {
             // A logout during the running cleanup fixed a newer generation:
             // a login saved between the two logouts is above the capture of the
@@ -609,6 +608,11 @@ impl Voxhold {
             self.cleanup_again = true;
             return;
         }
+        self.start_logout_cleanup(window, cx);
+    }
+
+    fn start_logout_cleanup(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let expected_epoch = self.cleanup_epoch;
         self.cleanup_pending = true;
         self.cleanup_again = false;
         self.cleanup_retry = false;
@@ -626,7 +630,7 @@ impl Voxhold {
         });
         cx.spawn_in(window, async move |this, window| {
             let (result, blocked) = task.await;
-            let _ = this.update_in(window, |s, _window, cx| {
+            let _ = this.update_in(window, |s, window, cx| {
                 s.cleanup_pending = false;
                 let again = std::mem::take(&mut s.cleanup_again);
                 match result {
@@ -660,7 +664,7 @@ impl Voxhold {
                 if again {
                     // The latest logout of the two owns the file from now on:
                     // its capture is above the one this clear was bound to.
-                    s.clear_saved_logins(_window, cx);
+                    s.start_logout_cleanup(window, cx);
                 }
                 cx.notify();
             });
@@ -674,7 +678,7 @@ impl Voxhold {
             return;
         }
         self.auth.status.clear();
-        self.clear_saved_logins(window, cx);
+        self.start_logout_cleanup(window, cx);
         cx.notify();
     }
 

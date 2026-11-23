@@ -322,10 +322,8 @@ impl SessionStore {
     }
 
     /// Claim the next login generation, optionally only when the store has not
-    /// moved past `checked`. The unconditional caller accepts the fallback,
-    /// while a checked caller turns every failure into [`StoreError::Stale`]:
-    /// an unclaimed generation must never let a queued save pass a logout
-    /// barrier.
+    /// moved past `checked`. A stale caller cannot claim a new generation.
+    /// I/O and lock failures are returned so a failed save can be reported.
     fn claim_generation(&self, checked: Option<u64>) -> Result<u64, StoreError> {
         let Some(path) = &self.path else {
             if checked.is_some_and(|expected| self.epoch() != expected) {
@@ -340,9 +338,7 @@ impl SessionStore {
         if checked.is_some_and(|expected| self.epoch() != expected) {
             return Err(StoreError::Stale);
         }
-        let Ok(_named) = NamedLock::acquire() else {
-            return Err(StoreError::Stale);
-        };
+        let _named = NamedLock::acquire()?;
         let mut state = match read_state(path) {
             Ok(state) => state,
             // A claim may replace a damaged file, exactly like a manual save.

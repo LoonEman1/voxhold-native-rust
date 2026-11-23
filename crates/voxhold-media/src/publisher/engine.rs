@@ -805,9 +805,10 @@ async fn run(
     let gpu_backend = gpu.is_some();
     // The GPU attempt sends access units that were already encoded by the
     // hardware session: the sender must use the pass-through encoder, never a
-    // The audio track is added after the video track, so the local
-    // transceivers mirror the backend's m-line order: video, then audio. EC,
-    // NS and AGC are disabled: system audio is a program feed, not a mic.
+    // software encoder of the pinned build. The audio track is added after the
+    // video track, so the local transceivers mirror the backend's m-line order:
+    // video, then audio. EC, NS and AGC are disabled: system audio is a program
+    // feed, not a mic.
     let (audio_sender, audio_pump) = match audio {
         Some(producer) => {
             let audio_source = NativeAudioSource::new(
@@ -868,32 +869,40 @@ async fn run(
         }
     }
     // The open session names its adapter; the publisher compares this
-    // identity with the attempt's plan before anything may look «GPU».
-    if let Some(adapter) = gpu.as_ref().and_then(|encoder| encoder.adapter()) {
+    // identity with the attempt's plan before anything may look «GPU». The
+    // evidence travels with it: an attribute read from the MFT is a fact, an
+    // echoed plan is only the request and is labelled as such.
+    if let Some((adapter, evidence)) = gpu.as_ref().and_then(|encoder| {
+        encoder
+            .adapter()
+            .map(|adapter| (adapter, encoder.adapter_evidence()))
+    }) {
         events.push(EngineEvent::EncoderOpened(HardwareEncoderIdentity {
             luid: adapter.luid,
             adapter: adapter.name,
             driver_version: adapter.driver_version,
             codec: request.codec,
             generation: request.encoder.generation,
+            adapter_evidence: evidence,
         }));
     }
+    // The pinned CPU build can encode this codec; that is the honest answer the
+    // failure paths use to offer «Продолжить на процессоре». The codec never
+    // changes and nothing is substituted automatically.
+    let cpu_available = negotiation::sender_profile(request.codec).is_ok();
     let pump = match gpu.take() {
-        Some(encoder) => {
-            let cpu_available = negotiation::sender_profile(request.codec).is_ok();
-            tokio::spawn(gpu_frame_loop(
-                producer,
-                source,
-                encoder,
-                events.clone(),
-                preview,
-                counters.clone(),
-                request.quality.fps,
-                (width, height),
-                cpu_available,
-                request.codec,
-            ))
-        }
+        Some(encoder) => tokio::spawn(gpu_frame_loop(
+            producer,
+            source,
+            encoder,
+            events.clone(),
+            preview,
+            counters.clone(),
+            request.quality.fps,
+            (width, height),
+            cpu_available,
+            request.codec,
+        )),
         None => tokio::spawn(frame_loop(
             producer,
             source,
@@ -950,11 +959,24 @@ async fn run(
                 if confirmed.is_none()
                     && confirm_deadline.is_some_and(|deadline| Instant::now() >= deadline)
                 {
-                    events.push(EngineEvent::Error(format!(
+                    let message = format!(
                         "Кодек {} не подтверждён: за {} с не пришло ни одного закодированного кадра.",
                         request.codec.label(),
                         confirm_timeout.as_secs().max(1)
-                    )));
+                    );
+                    // A GPU attempt that never confirmed the codec is a failed
+                    // hardware session, not an ordinary codec error: report it
+                    // as such so the publisher can offer the explicit
+                    // «Продолжить на процессоре» when the same codec exists on
+                    // the CPU build. Nothing switches by itself.
+                    if request.encoder.is_gpu() && cpu_available {
+                        events.push(EngineEvent::EncoderFailed {
+                            message,
+                            cpu_available: true,
+                        });
+                    } else {
+                        events.push(EngineEvent::Error(message));
+                    }
                     break;
                 }
                 if last_stats.elapsed() >= STATS_INTERVAL {

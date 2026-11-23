@@ -2,9 +2,10 @@
 //! CPU continuation (G04–G06). No driver and no WebRTC run here.
 
 use super::*;
+use crate::publisher::QualityChange;
 use crate::video_encoder::{
-    AdapterInfo, AdapterLuid, EncodeQuery, EncoderBackend, EncoderPlan, HardwareEncoderIdentity,
-    codec_profile,
+    AdapterEvidence, AdapterInfo, AdapterLuid, EncodeQuery, EncoderBackend, EncoderPlan,
+    HardwareEncoderIdentity, codec_profile,
 };
 
 fn adapter(luid: u64) -> AdapterInfo {
@@ -41,6 +42,7 @@ fn live_gpu(codec: Codec, now: Instant) -> Publisher {
             driver_version: adapter(1).driver_version,
             codec,
             generation: 7,
+            adapter_evidence: AdapterEvidence::PlanEcho,
         }),
         now,
     );
@@ -73,6 +75,7 @@ fn the_open_hardware_session_is_required_before_the_stream_is_live() {
             driver_version: adapter(1).driver_version,
             codec: Codec::H264,
             generation: 7,
+            adapter_evidence: AdapterEvidence::PlanEcho,
         }),
         now,
     );
@@ -103,6 +106,7 @@ fn a_mismatched_hardware_identity_is_refused_instead_of_confirmed() {
             driver_version: adapter(2).driver_version,
             codec: Codec::H264,
             generation: 7,
+            adapter_evidence: AdapterEvidence::PlanEcho,
         },
         HardwareEncoderIdentity {
             luid: adapter(1).luid,
@@ -110,6 +114,7 @@ fn a_mismatched_hardware_identity_is_refused_instead_of_confirmed() {
             driver_version: adapter(1).driver_version,
             codec: Codec::H264,
             generation: 6,
+            adapter_evidence: AdapterEvidence::PlanEcho,
         },
         HardwareEncoderIdentity {
             luid: adapter(1).luid,
@@ -117,6 +122,7 @@ fn a_mismatched_hardware_identity_is_refused_instead_of_confirmed() {
             driver_version: adapter(1).driver_version,
             codec: Codec::Vp8,
             generation: 7,
+            adapter_evidence: AdapterEvidence::PlanEcho,
         },
     ];
     for identity in mismatches {
@@ -256,5 +262,73 @@ fn a_cpu_attempt_does_not_need_a_hardware_identity() {
             .as_ref()
             .map(|confirmed| confirmed.encoder.backend),
         Some(EncoderBackend::Cpu)
+    );
+}
+
+/// Every probe of the dialog owns a fresh `EncoderProbeService`, so its
+/// snapshot generation starts over. A live change must compare the checked
+/// pair (backend, adapter and driver, profile), never that generation: an
+/// unchanged request may not turn into a restart, while another adapter,
+/// profile, backend or codec still does.
+#[test]
+fn a_fresh_probe_generation_is_not_a_live_change() {
+    let live = gpu_request(Codec::H264);
+    let mut regenerated = gpu_request(Codec::H264);
+    regenerated.encoder.generation = live.encoder.generation + 1;
+    assert_eq!(
+        live.change_to(&regenerated),
+        QualityChange::Unchanged,
+        "the generation of a new probe is not a change of the encoder pair"
+    );
+
+    let mut bitrate = regenerated.clone();
+    bitrate.quality.bitrate_kbps += 1000;
+    assert_eq!(
+        live.change_to(&bitrate),
+        QualityChange::LiveBitrate,
+        "a bitrate-only change still reaches the live sender"
+    );
+
+    let mut other_adapter = regenerated.clone();
+    other_adapter.encoder = EncoderPlan::gpu(
+        adapter(2),
+        codec_profile(Codec::H264, EncodeQuery::default()),
+        live.encoder.generation,
+    );
+    assert_eq!(
+        live.change_to(&other_adapter),
+        QualityChange::Restart,
+        "another adapter needs a new hardware session"
+    );
+
+    let mut other_driver = regenerated.clone();
+    if let Some(adapter) = other_driver.encoder.adapter.as_mut() {
+        adapter.driver_version += 1;
+    }
+    assert_eq!(
+        live.change_to(&other_driver),
+        QualityChange::Restart,
+        "a driver update changes the cache identity of the pair"
+    );
+
+    let mut other_profile = regenerated.clone();
+    other_profile.encoder.profile = Some(SdrProfile::H264 {
+        baseline: crate::publisher::H264Baseline::Legacy,
+        level: 0x1f,
+    });
+    assert_eq!(
+        live.change_to(&other_profile),
+        QualityChange::Restart,
+        "another SDR profile needs a new negotiation"
+    );
+
+    let cpu = PublishRequest {
+        encoder: EncoderPlan::cpu(),
+        ..regenerated
+    };
+    assert_eq!(
+        live.change_to(&cpu),
+        QualityChange::Restart,
+        "another backend is never a live change"
     );
 }

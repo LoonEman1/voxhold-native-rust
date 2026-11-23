@@ -13,10 +13,10 @@ use std::time::Duration;
 use crate::publisher::SdrProfile;
 use crate::video_encoder::windows::WorkerPlatform;
 use crate::video_encoder::{
-    AdapterInfo, AdapterInventory, AdapterSelection, Codec, EncodeQuery, EncodedAccessUnit,
-    EncoderProbeService, EncoderProbeTarget, EncoderRequest, GpuEncoder, HardwareProbe, Nv12Frame,
-    PlatformProbe, ProbeCancel, ProbeOutcome, VideoEncoderPreference, driver_version,
-    open_gpu_encoder,
+    AdapterEvidence, AdapterInfo, AdapterInventory, AdapterSelection, Codec, EncodeQuery,
+    EncodedAccessUnit, EncoderProbeService, EncoderProbeTarget, EncoderRequest, GpuEncoder,
+    HardwareProbe, Nv12Frame, PlatformProbe, ProbeCancel, ProbeOutcome, VideoEncoderPreference,
+    driver_version, open_gpu_encoder,
 };
 
 fn q720() -> EncodeQuery {
@@ -362,6 +362,18 @@ fn hardware_h264_session_encodes_keyframes_and_rate_control() {
     let Some(mut encoder) = hardware_encoder(Codec::H264, query) else {
         return;
     };
+    // M3: the requested bitrate must be applied before the session starts
+    // streaming, not silently swapped away by the worker.
+    let initial = encoder.counters();
+    eprintln!("h264 session initial counters {initial:?}");
+    assert_eq!(
+        initial.bitrate_bps, 2_500_000,
+        "the requested mean bitrate was lost at session start"
+    );
+    assert!(
+        initial.bitrate_applied,
+        "the initial CODECAPI_AVEncCommonMeanBitRate was not applied before streaming"
+    );
     let first = packets(&mut encoder, query, 1, 1_000);
     assert!(
         first[0].keyframe,
@@ -398,6 +410,87 @@ fn hardware_h264_session_encodes_keyframes_and_rate_control() {
         started.elapsed() < Duration::from_secs(15),
         "shutdown did not release the session"
     );
+}
+
+/// M4: the adapter evidence of an open session is either a real MFT attribute
+/// or the plan echoed by the session; it is never guessed.
+#[test]
+#[ignore = "needs real Windows hardware; G06/G08 manual run"]
+fn hardware_session_reports_its_adapter_evidence() {
+    let query = q720();
+    let Some(mut encoder) = hardware_encoder(Codec::H264, query) else {
+        return;
+    };
+    let evidence = encoder.adapter_evidence();
+    let adapter = encoder.adapter().expect("the session names an adapter");
+    eprintln!(
+        "session adapter evidence={evidence:?} luid={} name={}",
+        adapter.luid, adapter.name
+    );
+    match evidence {
+        AdapterEvidence::MftAttribute => {
+            eprintln!(
+                "the driver exposes MFT_ENUM_ADAPTER_LUID: the identity is a fact about the MFT"
+            )
+        }
+        AdapterEvidence::PlanEcho => eprintln!(
+            "the driver exposes no adapter LUID: the adapter is the plan echo with the vendor cross-checked"
+        ),
+    }
+    assert_eq!(
+        real_luid_of(&adapter.name),
+        Some(adapter.luid),
+        "the session must name the adapter the inventory resolved"
+    );
+    encoder.shutdown();
+}
+
+/// The LUID of the adapter the inventory reports for `name`, so the evidence
+/// test can compare the session against the real DXGI list.
+fn real_luid_of(name: &str) -> Option<crate::video_encoder::AdapterLuid> {
+    let _platform = platform();
+    let probe = PlatformProbe;
+    probe
+        .inventory()
+        .ok()?
+        .adapters()
+        .iter()
+        .find(|adapter| adapter.name == name)
+        .map(|adapter| adapter.luid)
+}
+
+/// A transform of another vendor is refused even when the adapter LUID cannot
+/// be read: the vendor attribute is the weaker attribute this driver does
+/// expose, and it is compared instead of being ignored.
+#[test]
+#[ignore = "needs real Windows hardware; G06/G08 manual run"]
+fn hardware_session_refuses_an_adapter_of_another_vendor() {
+    let _platform = platform();
+    let probe = PlatformProbe;
+    let inventory = inventory(&probe);
+    let Some(real) = inventory.resolve(AdapterSelection::Auto).ok().cloned() else {
+        eprintln!("SKIP: на машине нет аппаратного адаптера, проверять нечего");
+        return;
+    };
+    let mut impostor = real.clone();
+    impostor.vendor_id = if real.vendor_id == 0x10de {
+        0x1002
+    } else {
+        0x10de
+    };
+    match open_gpu_encoder(&impostor, Codec::H264, q720(), 2_500_000) {
+        Ok(mut encoder) => {
+            encoder.shutdown();
+            panic!(
+                "a session of vendor 0x{:04x} was accepted as 0x{:04x}",
+                real.vendor_id, impostor.vendor_id
+            );
+        }
+        Err(message) => assert!(
+            message.contains("производителя"),
+            "the refusal does not name the vendor mismatch: {message}"
+        ),
+    }
 }
 
 /// G08 (AV1) on a driver that registers an AV1 encoder (the RTX 40 cards do).

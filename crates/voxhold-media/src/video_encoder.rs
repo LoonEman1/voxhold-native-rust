@@ -59,8 +59,8 @@ use crate::screen_capture::SourceIdentity;
 pub use probe::{HardwareProbe, ProbeCancel, ProbeOutcome};
 pub use service::{EncoderProbeService, EncoderRequest, EncoderRequestError, RevalidateError};
 pub use session::{
-    EncodeSubmit, EncodedAccessUnit, EncoderCounters, GpuEncoder, GpuEncoderFailure, Nv12Frame,
-    open_gpu_encoder,
+    AdapterEvidence, EncodeSubmit, EncodedAccessUnit, EncoderCounters, GpuEncoder,
+    GpuEncoderFailure, Nv12Frame, open_gpu_encoder,
 };
 
 #[cfg(not(windows))]
@@ -271,6 +271,14 @@ impl VideoEncoderPreference {
 /// The UI shows «GPU» only when this value matches the attempt's
 /// [`EncoderPlan`] and encoded frames were delivered. The adapter is named by
 /// its LUID, never by an order or a display string.
+///
+/// [`Self::adapter_evidence`] states how `luid` was obtained. Only
+/// [`AdapterEvidence::MftAttribute`] is a fact read from the open MFT;
+/// [`AdapterEvidence::PlanEcho`] repeats the requested adapter because the
+/// driver exposes no adapter attribute, and must not be described as proof of
+/// the session's adapter. `generation` likewise names the snapshot the request
+/// was built from (it travels with the request and is echoed by the engine), not
+/// a value measured on the transform.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HardwareEncoderIdentity {
     pub luid: AdapterLuid,
@@ -279,6 +287,8 @@ pub struct HardwareEncoderIdentity {
     pub codec: Codec,
     /// Generation of the snapshot the attempt was built from.
     pub generation: u64,
+    /// How the adapter LUID was obtained.
+    pub adapter_evidence: AdapterEvidence,
 }
 
 impl HardwareEncoderIdentity {
@@ -334,6 +344,22 @@ impl EncoderPlan {
 
     pub const fn is_gpu(&self) -> bool {
         matches!(self.backend, EncoderBackend::Gpu)
+    }
+
+    /// The same backend and the same checked pair.
+    ///
+    /// The snapshot generation is deliberately **not** part of the live
+    /// comparison: every dialog probe owns a fresh [`EncoderProbeService`]
+    /// whose generation starts over, so a re-opened dialog would otherwise
+    /// report an unchanged GPU request as a restart. The generation still
+    /// travels with the attempt and is compared by
+    /// [`HardwareEncoderIdentity::matches`]; it identifies the snapshot the
+    /// request was built from, not the open MFT session.
+    pub fn same_pair(&self, other: &Self) -> bool {
+        self.backend == other.backend
+            && self.adapter.as_ref().map(AdapterInfo::key)
+                == other.adapter.as_ref().map(AdapterInfo::key)
+            && self.profile == other.profile
     }
 
     /// The pair a live preflight revalidates. `None` when the plan is CPU or

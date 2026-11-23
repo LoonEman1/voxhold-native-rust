@@ -57,6 +57,48 @@ pub(super) fn revalidate_gpu(
         })
 }
 
+/// Launch one prepared screen attempt on the preparation thread.
+///
+/// This is the body of the closure [`Live::start_screen_prep`] hands to
+/// [`ScreenPrep::start`], split out so the launch permit is exercised by the
+/// exact code the session runs. The hardware revalidation must stay the first
+/// step: a refused pair fails before a capture, an audio loopback or a peer
+/// exists, so `stream.start` cannot follow.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn launch_screen(
+    probe: Option<Arc<EncoderProbeService>>,
+    request: crate::publisher::PublishRequest,
+    servers: Vec<crate::IceServer>,
+    policy: String,
+    preview: Arc<crate::screen_capture::PreviewStore>,
+    demand: Arc<crate::screen_capture::PreviewDemand>,
+    cancelled: &AtomicBool,
+) -> Result<(PublisherEngine, bool, Option<String>), String> {
+    revalidate_gpu(probe.as_ref(), &request)?;
+    let engine = PublisherEngine::start(request, servers, policy, preview, demand, cancelled)?;
+    let has_audio = engine.has_audio();
+    let audio_scope = engine.audio_scope();
+    Ok((engine, has_audio, audio_scope))
+}
+
+/// Preflight of a live quality change on the preparation thread: the same
+/// launch permit, then the temporary capture.
+///
+/// A refused hardware pair leaves the live publication exactly as it is; the
+/// new capture is never opened on the strength of the dialog alone.
+pub(super) fn launch_restart_preflight(
+    probe: Option<Arc<EncoderProbeService>>,
+    request: &crate::publisher::PublishRequest,
+    cancelled: &AtomicBool,
+) -> Result<crate::publisher::preflight::PreflightReport, String> {
+    revalidate_gpu(probe.as_ref(), request)?;
+    crate::publisher::preflight::run(
+        request,
+        cancelled,
+        crate::publisher::preflight::PREFLIGHT_BUDGET,
+    )
+}
+
 mod preview;
 
 /// The newest live bitrate change that the engine worker has not accepted yet.
@@ -527,15 +569,7 @@ impl Live {
         let probe = self.encoder_probe.clone();
         let checked = request.clone();
         let prep = ScreenPrep::start(binding, Instant::now(), PREP_BUDGET, move |cancelled| {
-            // The GPU pair must activate again before the server learns about
-            // this attempt. A refusal is an ordinary preparation failure: no
-            // `stream.start`, and an older live stream was never touched.
-            revalidate_gpu(probe.as_ref(), &checked)?;
-            let engine =
-                PublisherEngine::start(request, servers, policy, preview, demand, cancelled)?;
-            let has_audio = engine.has_audio();
-            let audio_scope = engine.audio_scope();
-            Ok((engine, has_audio, audio_scope))
+            launch_screen(probe, checked, servers, policy, preview, demand, cancelled)
         })?;
         self.prep = Some(prep);
         Ok(())
@@ -565,12 +599,7 @@ impl Live {
                 // The live attempt keeps running until the new pair is
                 // confirmed. A refused GPU revalidation therefore leaves the
                 // old stream exactly as it is.
-                revalidate_gpu(probe.as_ref(), &plan)?;
-                crate::publisher::preflight::run(
-                    &plan,
-                    cancelled,
-                    crate::publisher::preflight::PREFLIGHT_BUDGET,
-                )
+                launch_restart_preflight(probe, &plan, cancelled)
             },
         )?;
         self.restart = Some(pending);

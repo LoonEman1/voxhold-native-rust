@@ -250,6 +250,12 @@ impl VoicePanel {
 
     /// Probe the selected adapter/codec pair off the UI thread. The answer is
     /// dropped when the dialog moved on (another generation or CPU mode).
+    ///
+    /// Every call owns a fresh [`EncoderProbeService`], so the snapshot
+    /// generation starts over on each probe. The generation binds the answer to
+    /// this dialog; the live-change comparison uses the checked pair
+    /// (`EncoderPlan::same_pair`), never the generation, so re-opening the
+    /// dialog cannot turn an unchanged GPU request into a restart.
     pub(super) fn begin_encoder_probe(&mut self, cx: &mut Context<Self>) {
         let generation = self.screen.encoder_probe_generation;
         let preference = self.screen.encoder_preference();

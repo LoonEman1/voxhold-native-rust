@@ -20,8 +20,8 @@ use voxhold_media::screen_capture::{
 };
 use voxhold_media::system_audio::{self, AudioDeviceInfo, AudioScope};
 use voxhold_media::video_encoder::{
-    AdapterSelection, EncodeQuery, EncoderBackend, EncoderPlan, VideoEncoderPreference,
-    VideoEncoderSnapshot,
+    AdapterEvidence, AdapterSelection, EncodeQuery, EncoderBackend, EncoderPlan,
+    VideoEncoderPreference, VideoEncoderSnapshot,
 };
 
 /// The backend has no runtime reconfigure; the dialog must warn honestly.
@@ -548,8 +548,15 @@ pub(in crate::voice_panel) fn screen_on_air_line(
         .as_ref()
         .filter(|_| confirmed_codec.is_some())
     {
+        // An adapter read from the open MFT is a fact. A driver that exposes no
+        // adapter attribute leaves only the plan the session was asked to open,
+        // and the line says so instead of presenting it as proof.
+        let evidence = match hardware.adapter_evidence {
+            AdapterEvidence::MftAttribute => "",
+            AdapterEvidence::PlanEcho => " (адаптер из плана)",
+        };
         parts.push(format!(
-            "GPU {} · драйвер 0x{:x}",
+            "GPU {} · драйвер 0x{:x}{evidence}",
             hardware.adapter, hardware.driver_version
         ));
     }

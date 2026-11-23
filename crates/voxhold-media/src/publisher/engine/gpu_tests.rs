@@ -6,8 +6,21 @@
 
 use std::time::{Duration, Instant};
 
+use libwebrtc::{
+    MediaType,
+    ice_candidate::IceCandidate,
+    peer_connection::OfferOptions,
+    rtp_transceiver::{RtpTransceiverDirection, RtpTransceiverInit},
+    session_description::{SdpType, SessionDescription},
+};
+use tokio::time::sleep;
+
+use super::codec_tests::{candidates, drain, drain_to_engine};
 use super::*;
-use crate::video_encoder::{AdapterInfo, AdapterLuid, EncoderPlan, FakeGpuEncoder, codec_profile};
+use crate::video_encoder::{
+    AdapterInfo, AdapterLuid, EncodeSubmit, EncodedAccessUnit, EncoderCounters, EncoderPlan,
+    FakeGpuEncoder, GpuEncoder, GpuEncoderFailure, Nv12Frame, codec_profile,
+};
 
 fn adapter() -> AdapterInfo {
     AdapterInfo {
@@ -189,4 +202,142 @@ fn a_gpu_request_without_an_encoder_is_refused() {
         None,
     );
     assert!(result.is_err());
+}
+
+/// An encoder that accepts input and never emits an access unit, like a driver
+/// that opened the transform but never produced a frame.
+struct SilentEncoder {
+    adapter: AdapterInfo,
+}
+
+impl GpuEncoder for SilentEncoder {
+    fn submit(&mut self, _frame: Nv12Frame) -> EncodeSubmit {
+        EncodeSubmit::Queued
+    }
+
+    fn next_packet(&mut self) -> Option<EncodedAccessUnit> {
+        None
+    }
+
+    fn request_keyframe(&mut self) {}
+
+    fn set_bitrate(&mut self, _target_bps: u32) {}
+
+    fn counters(&self) -> EncoderCounters {
+        EncoderCounters::default()
+    }
+
+    fn adapter(&self) -> Option<AdapterInfo> {
+        Some(self.adapter.clone())
+    }
+
+    fn failure(&self) -> Option<GpuEncoderFailure> {
+        None
+    }
+
+    fn shutdown(&mut self) {}
+}
+
+/// M7: a GPU attempt whose codec never confirms is a failed hardware session,
+/// not an ordinary codec error. The engine reports `EncoderFailed` with the
+/// CPU availability, which is the one message behind «Продолжить на
+/// процессоре»; it still never switches by itself.
+#[test]
+fn an_unconfirmed_gpu_codec_reports_the_cpu_option_instead_of_a_plain_error() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let factory = PeerConnectionFactory::default();
+        let sfu = factory
+            .create_peer_connection(Default::default())
+            .expect("sfu peer");
+        let capabilities = factory.get_rtp_sender_capabilities(MediaType::Video);
+        let profile = negotiation::sender_profile(Codec::H264).expect("checked H.264 profile");
+        let video = sfu
+            .add_transceiver_for_media(
+                MediaType::Video,
+                RtpTransceiverInit {
+                    direction: RtpTransceiverDirection::RecvOnly,
+                    stream_ids: Vec::new(),
+                    send_encodings: Vec::new(),
+                },
+            )
+            .expect("recvonly transceiver");
+        video
+            .set_codec_preferences(negotiation::preferences(
+                &capabilities.codecs,
+                Codec::H264,
+                profile,
+            ))
+            .expect("the fake SFU pins H.264");
+        let offer = sfu
+            .create_offer(OfferOptions {
+                offer_to_receive_audio: None,
+                offer_to_receive_video: None,
+                ..OfferOptions::default()
+            })
+            .await
+            .expect("offer");
+        let sdp = offer.to_string();
+        sfu.set_local_description(offer)
+            .await
+            .expect("sfu local offer");
+
+        let engine = PublisherEngine::start_synthetic_gpu(
+            gpu_request(Codec::H264),
+            Vec::new(),
+            "all".into(),
+            (1280, 720),
+            Box::new(SilentEncoder { adapter: adapter() }),
+        )
+        .expect("gpu engine");
+        assert!(engine.set_codec_confirm_timeout(Duration::from_secs(2)));
+        let sfu_candidates = candidates(&sfu);
+        engine.offer(sdp).expect("offer command");
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut failure = None;
+        let mut plain_error = None;
+        while Instant::now() < deadline && failure.is_none() && plain_error.is_none() {
+            while let Some(event) = engine.poll() {
+                match event {
+                    EngineEvent::Answer(answer) => {
+                        let parsed = SessionDescription::parse(&answer, SdpType::Answer)
+                            .expect("answer sdp");
+                        let _ = sfu.set_remote_description(parsed).await;
+                    }
+                    EngineEvent::Ice(candidate) => {
+                        let mid = candidate.sdp_mid.clone().unwrap_or_default();
+                        let index = candidate.sdp_mline_index.map(i32::from).unwrap_or(-1);
+                        if let Ok(parsed) = IceCandidate::parse(&mid, index, &candidate.candidate) {
+                            let _ = sfu.add_ice_candidate(parsed).await;
+                        }
+                    }
+                    EngineEvent::EncoderFailed {
+                        message,
+                        cpu_available,
+                    } => failure = Some((message, cpu_available)),
+                    EngineEvent::Error(message) => plain_error = Some(message),
+                    _ => {}
+                }
+            }
+            drain(&sfu_candidates, &sfu).await;
+            drain_to_engine(&sfu_candidates, &engine);
+            sleep(Duration::from_millis(20)).await;
+        }
+        sfu.close();
+        assert!(
+            plain_error.is_none(),
+            "a GPU attempt must not report a plain codec error: {plain_error:?}"
+        );
+        let (message, cpu_available) =
+            failure.expect("the engine never reported the unconfirmed GPU codec");
+        assert!(message.contains("не подтверждён"), "{message}");
+        assert!(
+            cpu_available,
+            "H.264 exists on the pinned CPU build, so the continuation is offered"
+        );
+    });
 }

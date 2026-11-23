@@ -10,22 +10,24 @@ use std::{
     time::{Duration, Instant},
 };
 
+use super::preflight::PendingRestart;
 use super::preflight::PreflightEvent;
 use super::preflight::finish_preflight;
 use super::prep::PrepEvent;
 use super::prep::finish_prep;
-use super::screen::revalidate_gpu;
+use super::screen::{launch_restart_preflight, launch_screen, revalidate_gpu};
 use crate::publisher::engine::PublisherEngine;
 use crate::publisher::{
     Access, Codec, Confirmed, Connection, EngineEvent, Outcome as PublisherOutcome, PublishRequest,
     Publisher, Quality, SdrProfile,
 };
-use crate::screen_capture::{ScreenSource, SourceKind};
+use crate::screen_capture::{PreviewDemand, PreviewStore, ScreenSource, SourceKind};
 use crate::video_encoder::{
-    AdapterInfo, AdapterInventory, AdapterLuid, AdapterSelection, CpuEncoderSource, CpuEncoders,
-    EncodeQuery, EncoderBackend, EncoderPlan, EncoderProbeService, EncoderReason, HardwareProbe,
-    ProbeCancel, ProbeOutcome, VideoEncoderPreference,
+    AdapterEvidence, AdapterInfo, AdapterInventory, AdapterLuid, AdapterSelection,
+    CpuEncoderSource, CpuEncoders, EncodeQuery, EncoderBackend, EncoderPlan, EncoderProbeService,
+    EncoderReason, HardwareProbe, ProbeCancel, ProbeOutcome, VideoEncoderPreference,
 };
+use std::sync::atomic::AtomicBool;
 
 fn adapter() -> AdapterInfo {
     AdapterInfo {
@@ -145,6 +147,7 @@ fn live_publisher(now: Instant) -> Publisher {
             driver_version: adapter().driver_version,
             codec: Codec::H264,
             generation: 9,
+            adapter_evidence: AdapterEvidence::MftAttribute,
         }),
         now,
     );
@@ -326,4 +329,118 @@ fn the_confirmed_encoder_survives_a_preflight() {
     );
     publisher.preflight_started(1);
     assert_eq!(publisher.sharing().confirmed, Some(confirmed));
+}
+
+/// The preparation closure of `start_screen_prep` itself, not a hand-made
+/// failure: a refusing revalidation has to stop the launch before any capture,
+/// loopback or peer exists, so `stream.start` is never sent.
+#[test]
+fn the_real_preparation_launch_stops_before_stream_start_after_a_refused_pair() {
+    let now = Instant::now();
+    let service = refusing_service(EncoderReason::EncoderBusy("лимит сессий NVENC".into()));
+    let error = match launch_screen(
+        Some(service.clone()),
+        gpu_request(),
+        Vec::new(),
+        "all".into(),
+        Arc::new(PreviewStore::default()),
+        Arc::new(PreviewDemand::default()),
+        &AtomicBool::new(false),
+    ) {
+        Ok(_) => panic!("the launch must not create an engine for a refused pair"),
+        Err(error) => error,
+    };
+    assert!(
+        error.contains("не подтвердила кодировщик"),
+        "the launch reported another stage: {error}"
+    );
+
+    // The session applies exactly this result of its preparation worker.
+    let mut publisher = publishing(now);
+    let binding = binding(&publisher);
+    let outcomes = finish_prep(
+        &mut publisher,
+        &binding,
+        &binding,
+        allowed(),
+        PrepEvent::<PublisherEngine>::Failed(error),
+        now,
+    );
+    assert!(outcomes.engine.is_none(), "no engine is installed");
+    assert!(
+        !outcomes.outcomes.iter().any(|outcome| matches!(
+            outcome,
+            PublisherOutcome::Send(_) | PublisherOutcome::StartEngine { .. }
+        )),
+        "the refused launch reached the server: {:?}",
+        outcomes.outcomes
+    );
+    assert_eq!(publisher.phase(), crate::publisher::Phase::Failed);
+    service.shutdown();
+}
+
+/// The restart closure of `start_restart_prep`: the live attempt is not
+/// stopped when the new hardware pair is refused.
+#[test]
+fn the_real_restart_preflight_keeps_the_live_stream_after_a_refused_pair() {
+    let now = Instant::now();
+    let service = refusing_service(EncoderReason::ProbeFailed(
+        "активация MFT не удалась".into(),
+    ));
+    let mut publisher = live_publisher(now);
+    let binding = binding(&publisher);
+    let attempt = publisher.sharing().attempt;
+    let confirmed = publisher.sharing().confirmed.clone();
+    let plan = gpu_request();
+    let request = plan.clone();
+    publisher.preflight_started(1);
+    let probe = Some(service.clone());
+    let mut pending = PendingRestart::start_with(binding.clone(), now, 1, request.clone(), {
+        move |cancelled| launch_restart_preflight(probe, &plan, cancelled)
+    })
+    .expect("the preflight thread starts");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let event = loop {
+        if let Some(event) = pending.poll(Instant::now()) {
+            break event;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the preflight worker never reported"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    };
+    match &event {
+        PreflightEvent::Failed(message) => assert!(
+            message.contains("не подтвердила кодировщик"),
+            "the preflight failed in another stage: {message}"
+        ),
+        PreflightEvent::Ready => panic!("a refused pair must not report a ready capture"),
+        PreflightEvent::Timeout => panic!("the test probe refused instead of timing out"),
+    }
+    let outcomes = finish_preflight(
+        &mut publisher,
+        &binding,
+        &binding,
+        allowed(),
+        event,
+        1,
+        request,
+        now,
+    );
+    assert!(
+        !outcomes.iter().any(|outcome| matches!(
+            outcome,
+            PublisherOutcome::Send(_)
+                | PublisherOutcome::StartEngine { .. }
+                | PublisherOutcome::StopEngine
+        )),
+        "the refused restart touched the live stream: {outcomes:?}"
+    );
+    let sharing = publisher.sharing();
+    assert_eq!(sharing.phase, crate::publisher::Phase::Live);
+    assert_eq!(sharing.attempt, attempt);
+    assert_eq!(sharing.confirmed, confirmed);
+    service.shutdown();
 }

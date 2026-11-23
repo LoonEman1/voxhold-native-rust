@@ -63,9 +63,11 @@ impl Nv12Frame {
     }
 }
 
-/// BT.601 limited-range I420 to NV12. The screen path already delivers I420,
-/// so this is one bounded copy and no colour-space maths the capturer did not
-/// already do.
+/// Repack the captured I420 planes into the NV12 layout an MFT takes.
+///
+/// This is a bounded copy, not a colour conversion: the screen path already
+/// delivers I420 in the target range and the chroma planes are only
+/// interleaved U/V, with no BT.601 maths here.
 fn nv12_from_i420(buffer: &I420Buffer, width: u32, height: u32) -> Vec<u8> {
     let (stride_y, stride_u, stride_v) = buffer.strides();
     let (chroma_width, chroma_height) = (buffer.chroma_width(), buffer.chroma_height());
@@ -146,6 +148,39 @@ impl EncoderCounters {
     }
 }
 
+/// Parse the vendor part of `MFT_ENUM_HARDWARE_VENDOR_ID_Attribute`.
+///
+/// NVIDIA reports `"VEN_10DE"` on the transform's attribute store. The value
+/// names the hardware vendor, not the adapter, so it is a cross-check that can
+/// refuse a transform from another vendor but cannot prove which of several
+/// adapters of the same vendor was opened.
+pub(crate) fn hardware_vendor(text: &str) -> Option<u32> {
+    let rest = text.trim().strip_prefix("VEN_")?;
+    u32::from_str_radix(rest.trim_end_matches('\0'), 16)
+        .ok()
+        .filter(|vendor| *vendor != 0)
+}
+
+/// What the open session itself reported about its adapter.
+///
+/// Media Foundation does not promise that an activation object exposes the
+/// adapter it was enumerated for. The session always reads what the open MFT
+/// has: the adapter LUID where a driver provides it and the hardware vendor id
+/// otherwise. When neither distinguishes the adapter, the session can only
+/// repeat the adapter it was asked to open, and that value must not be
+/// presented as proof of the open transform.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AdapterEvidence {
+    /// The adapter LUID was read from the open MFT (or its activation) and
+    /// matched the requested plan.
+    MftAttribute,
+    /// The driver exposes no adapter LUID; the vendor id was checked where it
+    /// exists, but the adapter itself is the plan echoed back by this session,
+    /// not evidence about the open transform.
+    #[default]
+    PlanEcho,
+}
+
 /// The live encoder of one attempt. The engine owns exactly one.
 pub trait GpuEncoder: Send {
     /// Enqueue a captured frame without blocking.
@@ -166,6 +201,12 @@ pub trait GpuEncoder: Send {
     /// The adapter the open session really uses. The engine compares it with
     /// the attempt's plan before the GUI may call the stream «GPU».
     fn adapter(&self) -> Option<AdapterInfo>;
+
+    /// Where [`Self::adapter`] came from. The default is the honest answer for
+    /// a double: it repeats the plan and proves nothing about a driver.
+    fn adapter_evidence(&self) -> AdapterEvidence {
+        AdapterEvidence::PlanEcho
+    }
 
     /// The terminal failure of this session, if it already ended.
     fn failure(&self) -> Option<GpuEncoderFailure>;

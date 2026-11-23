@@ -86,6 +86,20 @@ fn shutdown_closes_the_session_and_its_queue() {
     assert!(encoder.next_packet().is_none(), "the queue was released");
 }
 
+/// The vendor attribute of an open MFT is reported as `"VEN_10DE"`. Parsing is
+/// strict: a foreign or malformed value must not be read as "no mismatch".
+#[test]
+fn the_hardware_vendor_attribute_is_parsed_strictly() {
+    assert_eq!(super::hardware_vendor("VEN_10DE"), Some(0x10de));
+    assert_eq!(super::hardware_vendor("VEN_10de\0"), Some(0x10de));
+    assert_eq!(super::hardware_vendor("VEN_1002"), Some(0x1002));
+    assert_eq!(super::hardware_vendor("ven_10de"), None);
+    assert_eq!(super::hardware_vendor("10DE"), None);
+    assert_eq!(super::hardware_vendor("VEN_"), None);
+    assert_eq!(super::hardware_vendor("VEN_0000"), None);
+    assert_eq!(super::hardware_vendor("VEN_ZZZZ"), None);
+}
+
 /// A driver failure is reported once, with the device-loss flag the publisher
 /// uses for its one explicit message.
 #[test]

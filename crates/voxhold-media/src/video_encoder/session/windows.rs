@@ -30,10 +30,11 @@ use windows::{
         Foundation::E_FAIL,
         Media::MediaFoundation::{
             CODECAPI_AVEncCommonMeanBitRate, CODECAPI_AVEncVideoForceKeyFrame, ICodecAPI,
-            IMFMediaEventGenerator, IMFMediaType, IMFSample, IMFTransform, METransformHaveOutput,
-            METransformNeedInput, MF_E_NO_EVENTS_AVAILABLE, MF_E_NOTACCEPTING,
-            MF_EVENT_FLAG_NO_WAIT, MF_EVENT_MFT_INPUT_STREAM_ID, MF_MT_SUBTYPE,
+            IMFActivate, IMFAttributes, IMFMediaEventGenerator, IMFMediaType, IMFSample,
+            IMFTransform, METransformHaveOutput, METransformNeedInput, MF_E_NO_EVENTS_AVAILABLE,
+            MF_E_NOTACCEPTING, MF_EVENT_FLAG_NO_WAIT, MF_EVENT_MFT_INPUT_STREAM_ID, MF_MT_SUBTYPE,
             MFCreateMemoryBuffer, MFCreateSample, MFSampleExtension_CleanPoint,
+            MFT_ENUM_ADAPTER_LUID, MFT_ENUM_HARDWARE_VENDOR_ID_Attribute,
             MFT_MESSAGE_COMMAND_DRAIN, MFT_MESSAGE_COMMAND_FLUSH,
             MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, MFT_MESSAGE_NOTIFY_END_STREAMING,
             MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_STREAM_PROVIDES_SAMPLES,
@@ -44,7 +45,7 @@ use windows::{
 };
 
 use crate::video_encoder::{
-    AdapterInfo, Codec, EncodeQuery, EncoderReason, av1, h264,
+    AdapterInfo, AdapterLuid, Codec, EncodeQuery, EncoderReason, av1, h264,
     windows::{
         EVENT_POLL, Stage, StageError, classify, codec_format, configure_types_for, enumerate_mfts,
         receive_output, sample_bytes, sequence_header, unlock_async,
@@ -52,7 +53,8 @@ use crate::video_encoder::{
 };
 
 use super::{
-    EncodeSubmit, EncodedAccessUnit, EncoderCounters, GpuEncoder, GpuEncoderFailure, Nv12Frame,
+    AdapterEvidence, EncodeSubmit, EncodedAccessUnit, EncoderCounters, GpuEncoder,
+    GpuEncoderFailure, Nv12Frame,
 };
 
 /// Frames waiting for the encoder. Two frames is the whole overrun a driver
@@ -72,6 +74,7 @@ pub(crate) struct HardwareEncoder {
     packets: Receiver<EncodedAccessUnit>,
     shared: Arc<Shared>,
     adapter: AdapterInfo,
+    evidence: AdapterEvidence,
     thread: Option<JoinHandle<()>>,
     released: bool,
 }
@@ -165,11 +168,12 @@ impl HardwareEncoder {
                 format!("Не удалось запустить поток аппаратного кодировщика: {error}")
             })?;
         match ready_rx.recv_timeout(OPEN_TIMEOUT) {
-            Ok(Ok(())) => Ok(Self {
+            Ok(Ok(evidence)) => Ok(Self {
                 frames: Some(frames),
                 packets,
                 shared,
                 adapter: adapter.clone(),
+                evidence,
                 thread: Some(thread),
                 released: false,
             }),
@@ -233,6 +237,10 @@ impl GpuEncoder for HardwareEncoder {
         Some(self.adapter.clone())
     }
 
+    fn adapter_evidence(&self) -> AdapterEvidence {
+        self.evidence
+    }
+
     fn failure(&self) -> Option<GpuEncoderFailure> {
         self.shared.failure.lock().unwrap().clone()
     }
@@ -275,7 +283,7 @@ fn worker(
     shared: Arc<Shared>,
     frames: Receiver<Nv12Frame>,
     packets: SyncSender<EncodedAccessUnit>,
-    ready: SyncSender<Result<(), String>>,
+    ready: SyncSender<Result<AdapterEvidence, String>>,
 ) {
     let platform = super::super::windows::WorkerPlatform::new();
     if !platform.is_ready() {
@@ -285,7 +293,7 @@ fn worker(
         return;
     }
     let subtype = codec_format(codec);
-    let (transform, asynchronous) =
+    let (transform, asynchronous, evidence) =
         match unsafe { activate(&adapter, codec, subtype, query, shared_bitrate(&shared)) } {
             Ok(pair) => pair,
             Err(message) => {
@@ -313,24 +321,22 @@ fn worker(
     } else {
         None
     };
-    #[cfg(test)]
-    eprintln!(
-        "hw session: asynchronous={asynchronous} generator={}",
-        generator.is_some()
-    );
     let codec_api: Option<ICodecAPI> = transform.cast().ok();
     // The mean bitrate must be set before the encoder starts streaming: some
     // MFTs stop announcing input when it is changed on a live stream. Later
     // changes (rate control) use the same codec API on the running session.
+    //
+    // A driver that exposes no codec API (or refuses the value this early)
+    // keeps the target and retries it once streaming has started, instead of
+    // dropping the requested bitrate or spinning on a rejecting driver.
     let initial = shared.bitrate.swap(0, Ordering::AcqRel);
-    if false && initial > 0 {
-        apply_bitrate(codec_api.as_ref(), &shared, initial);
-    }
+    let mut initial_retry =
+        (initial > 0 && !apply_bitrate(codec_api.as_ref(), &shared, initial)).then_some(initial);
     unsafe {
         let _ = transform.ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
         let _ = transform.ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
     }
-    if ready.send(Ok(())).is_err() {
+    if ready.send(Ok(evidence)).is_err() {
         unsafe { stop_stream(&transform) };
         return;
     }
@@ -354,7 +360,7 @@ fn worker(
         }
         let requested = shared.bitrate.swap(0, Ordering::AcqRel);
         if requested > 0 {
-            apply_bitrate(codec_api.as_ref(), &shared, requested);
+            let _ = apply_bitrate(codec_api.as_ref(), &shared, requested);
         }
         loop {
             match frames.try_recv() {
@@ -444,6 +450,14 @@ fn worker(
         if kicked {
             have_output = true;
         }
+        if let Some(target) = initial_retry
+            && shared.counters.submitted.load(Ordering::Relaxed) > 0
+        {
+            // One retry on the live session: some MFTs only accept the mean
+            // bitrate after the first input. It is not re-armed forever.
+            initial_retry = None;
+            let _ = apply_bitrate(codec_api.as_ref(), &shared, target);
+        }
         if have_output {
             have_output = false;
             match unsafe { receive_output(&transform, info.cbSize, provides_samples, &adapter) } {
@@ -502,7 +516,7 @@ unsafe fn activate(
     subtype: GUID,
     query: EncodeQuery,
     bitrate: u32,
-) -> Result<(IMFTransform, bool), String> {
+) -> Result<(IMFTransform, bool, AdapterEvidence), String> {
     let activates = unsafe { enumerate_mfts(adapter, subtype) }.map_err(|error| {
         format!(
             "Не удалось перечислить аппаратные кодировщики {}: 0x{:08x}",
@@ -520,7 +534,7 @@ unsafe fn activate(
     }
     let mut last = None;
     for activate in &activates {
-        let result = (|| -> Result<(IMFTransform, bool), EncoderReason> {
+        let result = (|| -> Result<(IMFTransform, bool, AdapterEvidence), EncoderReason> {
             let transform: IMFTransform = unsafe { activate.ActivateObject() }
                 .map_err(|error| classify(error, Stage::Activate, adapter))?;
             let asynchronous = unsafe { unlock_async(&transform, activate) }
@@ -541,7 +555,8 @@ unsafe fn activate(
                     "кодировщик сменил выходной формат".into(),
                 ));
             }
-            Ok((transform, asynchronous))
+            let evidence = unsafe { mft_adapter_evidence(&transform, activate, adapter) }?;
+            Ok((transform, asynchronous, evidence))
         })();
         match result {
             Ok(pair) => return Ok(pair),
@@ -551,6 +566,71 @@ unsafe fn activate(
     Err(last
         .map(|reason| reason.to_string())
         .unwrap_or_else(|| "Ни один аппаратный кодировщик не открылся.".into()))
+}
+
+/// What the activated transform reports about its own adapter.
+///
+/// `MFT_ENUM_ADAPTER_LUID` is the enumeration attribute Media Foundation uses
+/// for a per-adapter hardware enumeration. A driver may keep it on the
+/// activation object, in the transform's attribute store, or expose neither;
+/// only a value that is really present is treated as evidence. The value is
+/// compared with the requested LUID, so an enumeration that silently picked
+/// another adapter is refused instead of being presented as the plan. When the
+/// LUID cannot be read the hardware vendor id is compared where the driver
+/// exposes it, and the session keeps the requested adapter and reports
+/// [`AdapterEvidence::PlanEcho`]; that value is not proof of which adapter of
+/// the vendor is open.
+unsafe fn mft_adapter_evidence(
+    transform: &IMFTransform,
+    activate: &IMFActivate,
+    requested: &AdapterInfo,
+) -> Result<AdapterEvidence, EncoderReason> {
+    let read =
+        |attributes: &IMFAttributes| unsafe { attributes.GetUINT64(&MFT_ENUM_ADAPTER_LUID).ok() };
+    let raw = unsafe { transform.GetAttributes() }
+        .ok()
+        .and_then(|attributes| read(&attributes))
+        .or_else(|| read(activate));
+    let Some(raw) = raw.filter(|value| *value != 0) else {
+        // Media Foundation does not expose the adapter LUID on this driver. The
+        // hardware vendor id is a weaker but real attribute: it can prove that
+        // the MFT belongs to another vendor, even though it cannot distinguish
+        // two adapters of the same vendor.
+        if let Some(vendor) = unsafe { mft_vendor(transform, activate) }
+            && vendor != requested.vendor_id
+        {
+            return Err(EncoderReason::DeviceDisabled(format!(
+                "MFT активировался на оборудовании производителя 0x{vendor:04x}, а запрошен {} (0x{:04x})",
+                requested.name, requested.vendor_id
+            )));
+        }
+        return Ok(AdapterEvidence::PlanEcho);
+    };
+    let found = AdapterLuid::new(raw as u32, (raw >> 32) as u32);
+    if found != requested.luid {
+        return Err(EncoderReason::DeviceDisabled(format!(
+            "MFT активировался на адаптере {found}, а запрошен {}",
+            requested.luid
+        )));
+    }
+    Ok(AdapterEvidence::MftAttribute)
+}
+
+/// `MFT_ENUM_HARDWARE_VENDOR_ID_Attribute` of the open transform or its
+/// activation, parsed from the `"VEN_10DE"` form the driver reports.
+unsafe fn mft_vendor(transform: &IMFTransform, activate: &IMFActivate) -> Option<u32> {
+    let read = |attributes: &IMFAttributes| {
+        let length =
+            unsafe { attributes.GetStringLength(&MFT_ENUM_HARDWARE_VENDOR_ID_Attribute) }.ok()?;
+        let mut buffer = vec![0u16; length as usize + 1];
+        unsafe { attributes.GetString(&MFT_ENUM_HARDWARE_VENDOR_ID_Attribute, &mut buffer, None) }
+            .ok()?;
+        super::hardware_vendor(&String::from_utf16_lossy(&buffer))
+    };
+    unsafe { transform.GetAttributes() }
+        .ok()
+        .and_then(|attributes| read(&attributes))
+        .or_else(|| read(activate))
 }
 
 unsafe fn input_sample(
@@ -694,7 +774,7 @@ fn with_decoder_config(codec: Codec, mut payload: Vec<u8>, header: &[u8]) -> Vec
     combined
 }
 
-fn apply_bitrate(api: Option<&ICodecAPI>, shared: &Shared, target_bps: u32) {
+fn apply_bitrate(api: Option<&ICodecAPI>, shared: &Shared, target_bps: u32) -> bool {
     let applied = api.is_some_and(|api| {
         let value = ui4_variant(target_bps);
         unsafe { api.SetValue(&CODECAPI_AVEncCommonMeanBitRate, &value) }.is_ok()
@@ -707,6 +787,7 @@ fn apply_bitrate(api: Option<&ICodecAPI>, shared: &Shared, target_bps: u32) {
         .counters
         .bitrate_applied
         .store(applied, Ordering::Release);
+    applied
 }
 
 fn force_keyframe(api: Option<&ICodecAPI>) {

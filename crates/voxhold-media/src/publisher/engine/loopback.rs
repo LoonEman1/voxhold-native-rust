@@ -34,6 +34,9 @@ use tokio_stream::StreamExt;
 use super::{BitrateSend, PublisherEngine};
 use crate::publisher::{Codec, PublishRequest, Quality, Resolution};
 use crate::screen_capture::{ScreenSource, SourceKind};
+use crate::video_encoder::{
+    AdapterInfo, AdapterLuid, EncodeQuery, EncoderPlan, FakeGpuEncoder, GpuEncoder, codec_profile,
+};
 
 type Candidates = Arc<Mutex<Vec<(String, String, i32)>>>;
 
@@ -525,4 +528,330 @@ async fn inbound_video_packets(sfu: &PeerConnection) -> u64 {
         })
         .max()
         .unwrap_or(0)
+}
+
+fn adapter() -> AdapterInfo {
+    AdapterInfo {
+        luid: AdapterLuid::new(1, 0),
+        name: "NVIDIA GeForce RTX 4070 Ti".into(),
+        vendor_id: 0x10de,
+        device_id: 0x2782,
+        driver_version: 0x0020_0000_0010_069c,
+        dedicated_video_memory: 12 << 30,
+        software: false,
+    }
+}
+
+fn gpu_request(codec: Codec, adapter: AdapterInfo) -> PublishRequest {
+    let query = EncodeQuery::new(1280, 720, 30);
+    PublishRequest {
+        codec,
+        encoder: EncoderPlan::gpu(adapter, codec_profile(codec, query), 7),
+        ..request()
+    }
+}
+
+/// The synthetic pass-through proof. The payload is not a decodable VP8
+/// bitstream; only the sender side is asserted (the encoder really forwarded
+/// units and the SFU received RTP packets).
+#[test]
+fn a_vp8_gpu_publication_uses_the_preencoded_sender() {
+    gpu_loopback(
+        Codec::Vp8,
+        Box::new(FakeGpuEncoder::new(4).on(adapter())),
+        adapter(),
+        false,
+    );
+}
+
+/// G09: a real hardware session feeds the WebRTC pass-through and the SFU
+/// decodes the result. This is the acceptance proof for the GPU slice; it
+/// needs the driver, so it is a manual run.
+#[cfg(windows)]
+#[test]
+#[ignore = "needs real Windows hardware; G09 manual run"]
+fn hardware_h264_publication_reaches_the_sfu_through_the_preencoded_sender() {
+    let Some((adapter, encoder)) = hardware_encoder(Codec::H264) else {
+        return;
+    };
+    gpu_loopback(Codec::H264, encoder, adapter, true);
+}
+
+#[cfg(windows)]
+#[test]
+#[ignore = "needs real Windows hardware; G09 manual run"]
+fn hardware_av1_publication_reaches_the_sfu_through_the_preencoded_sender() {
+    let Some((adapter, encoder)) = hardware_encoder(Codec::Av1) else {
+        return;
+    };
+    gpu_loopback(Codec::Av1, encoder, adapter, true);
+}
+
+#[cfg(windows)]
+fn hardware_encoder(codec: Codec) -> Option<(AdapterInfo, Box<dyn GpuEncoder>)> {
+    use crate::video_encoder::{
+        AdapterSelection, HardwareProbe, PlatformProbe, WorkerPlatform, open_gpu_encoder,
+    };
+
+    let platform = WorkerPlatform::new();
+    if !platform.is_ready() {
+        eprintln!("SKIP: COM/Media Foundation не инициализировались на тестовом потоке");
+        return None;
+    }
+    let inventory = PlatformProbe.inventory().expect("DXGI enumeration failed");
+    let Some(adapter) = inventory.resolve(AdapterSelection::Auto).ok().cloned() else {
+        eprintln!("SKIP: на машине нет аппаратного адаптера, проверять нечего");
+        return None;
+    };
+    let query = EncodeQuery::new(1280, 720, 30);
+    match open_gpu_encoder(&adapter, codec, query, 2_500_000) {
+        Ok(encoder) => {
+            eprintln!(
+                "loopback session codec={} adapter={} luid={} driver=0x{:x}",
+                codec.label(),
+                adapter.name,
+                adapter.luid,
+                adapter.driver_version
+            );
+            Some((adapter, encoder))
+        }
+        Err(message) => {
+            eprintln!(
+                "SKIP loopback session codec={} reason={message}",
+                codec.label()
+            );
+            None
+        }
+    }
+}
+
+/// A multi-codec offer makes WebRTC pick the first offered codec (VP8 here)
+/// even when the pinned answer names H.264. The engine must refuse before any
+/// frame, with a message that names the contract violation.
+#[test]
+fn a_multi_codec_offer_is_refused_instead_of_sending_an_unrequested_codec() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let factory = PeerConnectionFactory::default();
+        let sfu = factory
+            .create_peer_connection(Default::default())
+            .expect("sfu peer");
+        sfu.add_transceiver_for_media(
+            MediaType::Video,
+            RtpTransceiverInit {
+                direction: RtpTransceiverDirection::RecvOnly,
+                stream_ids: Vec::new(),
+                send_encodings: Vec::new(),
+            },
+        )
+        .expect("recvonly transceiver");
+        let offer = sfu
+            .create_offer(OfferOptions {
+                offer_to_receive_audio: None,
+                offer_to_receive_video: None,
+                ..OfferOptions::default()
+            })
+            .await
+            .expect("offer");
+        let offer_sdp = offer.to_string();
+        sfu.set_local_description(offer)
+            .await
+            .expect("sfu local offer");
+
+        let engine = PublisherEngine::start_synthetic_gpu(
+            gpu_request(Codec::H264, adapter()),
+            Vec::new(),
+            "all".into(),
+            (1280, 720),
+            Box::new(FakeGpuEncoder::new(4).on(adapter())),
+        )
+        .expect("gpu engine");
+        engine.offer(offer_sdp).expect("offer command");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut error = None;
+        while Instant::now() < deadline && error.is_none() {
+            while let Some(event) = engine.poll() {
+                if let crate::publisher::EngineEvent::Error(message) = event {
+                    error = Some(message);
+                    break;
+                }
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+        let error = error.expect("the engine did not refuse the multi-codec offer");
+        println!("multi-codec offer: {error}");
+        assert!(
+            error.contains("ограничивать кодеки"),
+            "the error must name the offer contract: {error}"
+        );
+        drop(engine);
+        sfu.close();
+    });
+}
+
+fn gpu_loopback(
+    codec: Codec,
+    encoder: Box<dyn GpuEncoder>,
+    plan_adapter: AdapterInfo,
+    expect_decoded: bool,
+) {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let factory = PeerConnectionFactory::default();
+        let sfu = factory
+            .create_peer_connection(Default::default())
+            .expect("sfu peer");
+        sfu.add_transceiver_for_media(
+            MediaType::Video,
+            RtpTransceiverInit {
+                direction: RtpTransceiverDirection::RecvOnly,
+                stream_ids: Vec::new(),
+                send_encodings: Vec::new(),
+            },
+        )
+        .expect("recvonly transceiver");
+        // The backend's stream manager offers exactly the rendition codec the
+        // session asked for. A fake SFU that offers every codec would let the
+        // media channel start on VP8 and the selector would then pin the
+        // pass-through to VP8 while the hardware session emits another codec.
+        let request = gpu_request(codec, plan_adapter.clone());
+        let profile = request
+            .encoder
+            .profile
+            .expect("a GPU request names its verified profile");
+        let capabilities = factory.get_rtp_sender_capabilities(MediaType::Video);
+        let preferences = super::negotiation::preferences(&capabilities.codecs, codec, profile);
+        for transceiver in sfu.transceivers() {
+            transceiver
+                .set_codec_preferences(preferences.clone())
+                .expect("the fake SFU pins the rendition codec");
+        }
+        let offer = sfu
+            .create_offer(OfferOptions {
+                offer_to_receive_audio: None,
+                offer_to_receive_video: None,
+                ..OfferOptions::default()
+            })
+            .await
+            .expect("offer");
+        let offer_sdp = offer.to_string();
+        sfu.set_local_description(offer)
+            .await
+            .expect("sfu local offer");
+        let sfu_candidates = candidates(&sfu);
+
+        // The SFU decodes the publication, exactly like the browser viewer.
+        let decoded = Arc::new(AtomicU64::new(0));
+        let decoded_sink = decoded.clone();
+        let track_slot: Arc<Mutex<Option<RtcVideoTrack>>> = Arc::new(Mutex::new(None));
+        let track_sink = track_slot.clone();
+        sfu.on_track(Some(Box::new(move |event| {
+            if let MediaStreamTrack::Video(track) = event.track {
+                *track_sink.lock().unwrap() = Some(track);
+            }
+        })));
+
+        let engine = PublisherEngine::start_synthetic_gpu(
+            request,
+            Vec::new(),
+            "all".into(),
+            (1280, 720),
+            encoder,
+        )
+        .expect("gpu engine");
+        engine.offer(offer_sdp).expect("offer command");
+
+        let mut answer: Option<String> = None;
+        let mut applied = 0_u32;
+        let mut answers = 0_u32;
+        let mut confirmed = None;
+        let mut error = None;
+        let mut first_frame = false;
+        let mut reader = None;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline {
+            while let Some(event) = engine.poll() {
+                match event {
+                    crate::publisher::EngineEvent::Answer(sdp) => {
+                        answers += 1;
+                        answer = Some(sdp);
+                    }
+                    crate::publisher::EngineEvent::Ice(candidate) => {
+                        let mid = candidate.sdp_mid.clone().unwrap_or_default();
+                        let index = candidate.sdp_mline_index.map(i32::from).unwrap_or(-1);
+                        if let Ok(parsed) = IceCandidate::parse(&mid, index, &candidate.candidate) {
+                            let _ = sfu.add_ice_candidate(parsed).await;
+                        }
+                    }
+                    crate::publisher::EngineEvent::Stats(stats) => {
+                        confirmed = stats.confirmed_codec;
+                    }
+                    crate::publisher::EngineEvent::State(
+                        crate::publisher::Connection::FirstFrame,
+                    ) => first_frame = true,
+                    crate::publisher::EngineEvent::Error(message) => error = Some(message),
+                    crate::publisher::EngineEvent::Closed => {
+                        error.get_or_insert_with(|| "closed".into());
+                    }
+                    _ => {}
+                }
+            }
+            drain_to_sfu(&sfu_candidates, &sfu).await;
+            if applied < answers {
+                if let Some(sdp) = answer.as_deref() {
+                    let parsed =
+                        SessionDescription::parse(sdp, SdpType::Answer).expect("answer sdp");
+                    sfu.set_remote_description(parsed)
+                        .await
+                        .expect("sfu remote answer");
+                    applied += 1;
+                }
+            }
+            if reader.is_none() && applied > 0 {
+                if let Some(track) = track_slot.lock().unwrap().clone() {
+                    let counter = decoded_sink.clone();
+                    reader = Some(tokio::spawn(async move {
+                        let mut stream = NativeVideoStream::new(track);
+                        while stream.next().await.is_some() {
+                            counter.fetch_add(1, Ordering::SeqCst);
+                        }
+                    }));
+                }
+            }
+            if confirmed == Some(codec) && (!expect_decoded || decoded.load(Ordering::SeqCst) > 0) {
+                break;
+            }
+            sleep(Duration::from_millis(25)).await;
+        }
+
+        let inbound = inbound_video_packets(&sfu).await;
+        let decoded = decoded.load(Ordering::SeqCst);
+        println!(
+            "gpu loopback {codec:?}: answers={answers} applied={applied} first_frame={first_frame} confirmed={confirmed:?} inbound={inbound} decoded={decoded} error={error:?}"
+        );
+        assert!(error.is_none(), "the engine failed: {error:?}");
+        assert!(first_frame, "the encoder never delivered a frame");
+        assert_eq!(confirmed, Some(codec), "the outbound codec did not match");
+        assert!(inbound > 0, "no RTP packet reached the SFU");
+        if expect_decoded {
+            assert!(
+                decoded > 0,
+                "the SFU received packets but decoded no frame"
+            );
+        }
+
+        if let Some(reader) = reader {
+            reader.abort();
+            let _ = reader.await;
+        }
+        drop(engine);
+        sfu.close();
+    });
 }

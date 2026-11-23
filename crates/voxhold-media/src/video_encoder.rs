@@ -67,6 +67,8 @@ pub use session::{
 pub use unsupported::UnsupportedHardwareProbe as PlatformProbe;
 #[cfg(windows)]
 pub use windows::WindowsHardwareProbe as PlatformProbe;
+#[cfg(all(test, windows))]
+pub(crate) use windows::WorkerPlatform;
 
 /// The publisher's four SDR codecs in the website's automatic order.
 pub const ENCODER_CODECS: [Codec; 4] = Codec::ALL;

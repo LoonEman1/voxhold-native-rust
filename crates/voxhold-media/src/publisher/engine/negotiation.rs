@@ -155,6 +155,29 @@ fn sends_video(transceiver: &RtpTransceiver) -> bool {
     )
 }
 
+/// The codec WebRTC will really encode with.
+///
+/// `GetParameters` puts the active send codec first. An offer that names
+/// another codec first makes the send channel choose it, no matter what the
+/// pinned answer says. The caller requires the requested codec, so a mismatch
+/// is a terminal contract violation instead of a stream with the wrong codec.
+fn verify_send_codec(sender: &RtpSender, codec: Codec) -> Result<(), String> {
+    let parameters = sender.parameters();
+    let Some(active) = parameters.codecs.first() else {
+        return Err("Сервер не согласовал ни одного кодека трансляции.".into());
+    };
+    if Codec::parse(&active.mime_type) == Some(codec) {
+        return Ok(());
+    }
+    Err(format!(
+        "Сервер предложил первым {}, поэтому в эфир пошёл бы он вместо {}. Предложение должно ограничивать кодеки выбранным для трансляции.",
+        Codec::parse(&active.mime_type)
+            .map(Codec::label)
+            .unwrap_or(active.mime_type.as_str()),
+        codec.label()
+    ))
+}
+
 /// Apply one server offer, verify the delivered answer and return both.
 ///
 /// Every error is terminal for the attempt: the caller reports it once and
@@ -184,6 +207,13 @@ pub(super) async fn apply_offer(
     if peer.set_local_description(answer).await.is_err() {
         return Err("Не удалось применить ответ трансляции.".into());
     }
+    // The answer names the codec the publisher wants, but WebRTC's send
+    // channel picks the active send codec from the offer order. A backend
+    // that offers several codecs can therefore run a different one than the
+    // answer and the request. The pre-encoded pass-through then locks onto
+    // that wrong codec and rejects every access unit as a mismatch, so the
+    // attempt would only time out with "no encoded frame". Refuse it here.
+    verify_send_codec(sender, context.codec)?;
     // The answer carries the frame rate the backend really applies; a refused
     // set is terminal, exactly like a refused answer.
     if !set_video_frame_rate(sender, context.quality.fps) {

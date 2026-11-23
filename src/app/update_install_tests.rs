@@ -603,3 +603,21 @@ fn the_install_mutex_decides_who_may_clean_the_staging_tree() {
     // temporary directory itself is not locked by the named mutex.
     std::fs::remove_dir_all(&temp).ok();
 }
+
+#[test]
+fn the_helper_monitor_argument_keeps_the_win32_rectangle() {
+    assert_eq!(
+        super::update_install::format_monitor_argument(0, 0, 1920, 1040),
+        "0,0,1920,1040"
+    );
+    // A monitor left of the primary one has negative coordinates; the helper
+    // parses them back unchanged.
+    assert_eq!(
+        super::update_install::format_monitor_argument(-1920, 0, 0, 1080),
+        "-1920,0,0,1080"
+    );
+    assert_eq!(
+        super::update_install::format_monitor_argument(0, -120, 2560, 1320),
+        "0,-120,2560,1320"
+    );
+}

@@ -6,8 +6,10 @@
 //!
 //! The window is fixed at 360 × 240 logical pixels and is centred in the work
 //! area passed by the client (`--monitor <left,top,right,bottom>`) or in the
-//! primary work area. DPI awareness is set before the first window exists and
-//! every metric is scaled by the window DPI (`GetDpiForWindow`).
+//! primary work area. DPI awareness is set before the first window exists, the
+//! initial frame is scaled from the monitor DPI, and after creation every
+//! metric is scaled by the window DPI (`GetDpiForWindow`) so the client area
+//! stays 360 × 240 logical at 100%, 125% and 150%.
 //!
 //! The ring turns once per second at ~30 fps from `Instant`; the timer stops
 //! while the window is minimised. When Windows reports client-area animations
@@ -25,7 +27,9 @@ use std::time::{Duration, Instant};
 
 use crate::stages::Stage;
 
-/// Outer size of the window in logical pixels.
+pub use crate::monitor::MonitorRect;
+
+/// Client area of the window in logical pixels.
 const LOGICAL_WIDTH: i32 = 360;
 const LOGICAL_HEIGHT: i32 = 240;
 const RING_DIAMETER: i32 = 92;
@@ -38,35 +42,6 @@ const WM_APP_STAGE: u32 = 0x8001;
 const WM_APP_CLOSE: u32 = 0x8002;
 const CLASS_NAME: &str = "VoxholdUpdaterWindow";
 const WINDOW_TITLE: &str = "Voxhold";
-
-/// Rectangle in physical pixels, as reported by `GetMonitorInfoW`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MonitorRect {
-    pub left: i32,
-    pub top: i32,
-    pub right: i32,
-    pub bottom: i32,
-}
-
-impl MonitorRect {
-    /// Parse `left,top,right,bottom`. Rejects a reversed or empty rectangle.
-    pub fn parse(raw: &str) -> Option<Self> {
-        let mut parts = raw.split(',');
-        let left = parts.next()?.trim().parse().ok()?;
-        let top = parts.next()?.trim().parse().ok()?;
-        let right = parts.next()?.trim().parse().ok()?;
-        let bottom = parts.next()?.trim().parse().ok()?;
-        if parts.next().is_some() || right <= left || bottom <= top {
-            return None;
-        }
-        Some(Self {
-            left,
-            top,
-            right,
-            bottom,
-        })
-    }
-}
 
 #[cfg(windows)]
 struct StageState {
@@ -244,27 +219,31 @@ mod platform {
 
     use crate::stages::TITLE;
     use windows_sys::Win32::Foundation::{
-        GetLastError, COLORREF, ERROR_CLASS_ALREADY_EXISTS, HWND, LPARAM, LRESULT, RECT, WPARAM,
+        GetLastError, COLORREF, ERROR_CLASS_ALREADY_EXISTS, HWND, LPARAM, LRESULT, POINT, RECT,
+        WPARAM,
     };
     use windows_sys::Win32::Graphics::Gdi::{
         Arc, BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW,
         CreatePen, CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, Ellipse, EndPaint,
-        FillRect, GetMonitorInfoW, GetStockObject, InvalidateRect, MonitorFromPoint, RoundRect,
-        SelectObject, SetArcDirection, SetBkMode, SetTextColor, UpdateWindow, AD_CLOCKWISE,
-        DT_CENTER, DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, FW_BOLD, FW_SEMIBOLD,
-        HBRUSH, HDC, HFONT, HGDIOBJ, MONITORINFO, MONITOR_DEFAULTTOPRIMARY, NULL_BRUSH, SRCCOPY,
-        TRANSPARENT,
+        FillRect, GetMonitorInfoW, GetStockObject, InvalidateRect, MonitorFromPoint,
+        MonitorFromRect, RoundRect, SelectObject, SetArcDirection, SetBkMode, SetTextColor,
+        UpdateWindow, AD_CLOCKWISE, DT_CENTER, DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE,
+        DT_VCENTER, FW_BOLD, HBRUSH, HDC, HFONT, HGDIOBJ, HMONITOR, MONITORINFO,
+        MONITOR_DEFAULTTONULL, MONITOR_DEFAULTTOPRIMARY, NULL_BRUSH, SRCCOPY, TRANSPARENT,
     };
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
-    use windows_sys::Win32::UI::HiDpi::{AdjustWindowRectExForDpi, GetDpiForWindow};
+    use windows_sys::Win32::UI::HiDpi::{
+        AdjustWindowRectExForDpi, GetDpiForMonitor, GetDpiForSystem, GetDpiForWindow,
+        MDT_EFFECTIVE_DPI,
+    };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyWindow, DispatchMessageW, DrawIconEx,
-        GetClientRect, GetMessageW, KillTimer, LoadCursorW, LoadImageW, PostQuitMessage,
-        RegisterClassW, SetTimer, SetWindowPos, ShowWindow, TranslateMessage, UnregisterClassW,
-        CS_HREDRAW, CS_VREDRAW, DI_NORMAL, HICON, IDC_ARROW, IMAGE_ICON, LR_DEFAULTCOLOR, MSG,
-        SIZE_MINIMIZED, SWP_NOACTIVATE, SWP_NOZORDER, SW_HIDE, SW_SHOWNORMAL, WM_CLOSE, WM_DESTROY,
-        WM_DPICHANGED, WM_ERASEBKGND, WM_PAINT, WM_SIZE, WM_TIMER, WNDCLASSW, WS_CAPTION,
-        WS_MINIMIZEBOX, WS_SYSMENU,
+        GetClientRect, GetMessageW, GetSystemMetrics, KillTimer, LoadCursorW, LoadImageW,
+        PostQuitMessage, RegisterClassW, SetTimer, SetWindowPos, ShowWindow, TranslateMessage,
+        UnregisterClassW, CS_HREDRAW, CS_VREDRAW, DI_NORMAL, HICON, IDC_ARROW, IMAGE_ICON,
+        LR_DEFAULTCOLOR, MSG, SIZE_MINIMIZED, SM_CXSCREEN, SM_CYSCREEN, SWP_NOACTIVATE,
+        SWP_NOZORDER, SW_HIDE, SW_SHOWNORMAL, WM_CLOSE, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND,
+        WM_PAINT, WM_SIZE, WM_TIMER, WNDCLASSW, WS_CAPTION, WS_MINIMIZEBOX, WS_SYSMENU,
     };
 
     // Only the messages this module needs; the rest goes to `DefWindowProcW`.
@@ -287,17 +266,18 @@ mod platform {
 
     impl Colors {
         fn new(light: bool) -> Self {
-            let (bg, fg, lime, muted) = if light {
-                (0xf2f1ec, 0x20211d, 0xb5cf16, 0x62635b)
+            let (bg, fg, lime, muted, line) = if light {
+                (0xf2f1ec, 0x20211d, 0xb5cf16, 0x62635b, 0xdbdbd1)
             } else {
-                (0x10100f, 0xf5f3ec, 0xe7ff5b, 0xa6a69e)
+                (0x10100f, 0xf5f3ec, 0xe7ff5b, 0xa6a69e, 0x292927)
             };
             Self {
                 bg: colorref(bg),
                 fg: colorref(fg),
                 lime: colorref(lime),
                 muted: colorref(muted),
-                ring: colorref(mix(bg, muted, 0.32)),
+                // The same `line` token the client uses for its ring.
+                ring: colorref(line),
             }
         }
     }
@@ -314,13 +294,38 @@ mod platform {
         ((value as f32) * dpi as f32 / 96.0).round() as i32
     }
 
-    fn mix(a: u32, b: u32, t: f32) -> u32 {
-        let channel = |value: u32, shift: u32| ((value >> shift) & 0xff) as f32;
-        let blend = |shift: u32| {
-            let value = channel(a, shift) * (1.0 - t) + channel(b, shift) * t;
-            (value.round().clamp(0.0, 255.0) as u32) << shift
+    /// Physical client area of the fixed logical window size at `dpi`.
+    ///
+    /// The window is created with this area, so 100%, 125% and 150% show the
+    /// same 360 x 240 logical client instead of a physical 360 x 240 that would
+    /// clip the ring and the stage line.
+    fn client_size(dpi: u32) -> (i32, i32) {
+        (
+            scaled(LOGICAL_WIDTH, dpi).max(1),
+            scaled(LOGICAL_HEIGHT, dpi).max(1),
+        )
+    }
+
+    /// Outer window size that yields `client_width` x `client_height`.
+    unsafe fn outer_size(
+        style: u32,
+        client_width: i32,
+        client_height: i32,
+        dpi: u32,
+    ) -> (i32, i32) {
+        let mut frame = RECT {
+            left: 0,
+            top: 0,
+            right: client_width,
+            bottom: client_height,
         };
-        blend(16) | blend(8) | blend(0)
+        if AdjustWindowRectExForDpi(&mut frame, style, 0, 0, dpi) == 0 {
+            return (client_width.max(1), client_height.max(1));
+        }
+        (
+            (frame.right - frame.left).max(1),
+            (frame.bottom - frame.top).max(1),
+        )
     }
 
     struct WindowData {
@@ -355,7 +360,8 @@ mod platform {
                 hidden: false,
                 colors,
                 bg_brush: CreateSolidBrush(colors.bg),
-                title_font: create_font(18, FW_SEMIBOLD, dpi),
+                // 15 px bold matches the client's installing overlay.
+                title_font: create_font(15, FW_BOLD, dpi),
                 stage_font: create_font(13, 400, dpi),
                 mark_font: create_font(30, FW_BOLD, dpi),
                 icon,
@@ -366,7 +372,7 @@ mod platform {
             if self.dpi == dpi || dpi == 0 {
                 return;
             }
-            replace_font(&mut self.title_font, 18, FW_SEMIBOLD, dpi);
+            replace_font(&mut self.title_font, 15, FW_BOLD, dpi);
             replace_font(&mut self.stage_font, 13, 400, dpi);
             replace_font(&mut self.mark_font, 30, FW_BOLD, dpi);
             self.dpi = dpi;
@@ -425,30 +431,57 @@ mod platform {
         }
     }
 
-    unsafe fn monitor_work_area(monitor: Option<MonitorRect>) -> RECT {
-        if let Some(rect) = monitor {
-            return RECT {
-                left: rect.left,
-                top: rect.top,
-                right: rect.right,
-                bottom: rect.bottom,
-            };
-        }
-        let point = windows_sys::Win32::Foundation::POINT { x: 0, y: 0 };
-        let handle = MonitorFromPoint(point, MONITOR_DEFAULTTOPRIMARY);
+    /// Work area of the monitor that will host the window, and its effective DPI.
+    ///
+    /// `--monitor` is trusted only while the rectangle intersects a live monitor;
+    /// a stale rectangle (monitor unplugged, layout changed) falls back to the
+    /// primary work area so the window never opens off-screen. A failed monitor
+    /// query falls back to the primary screen size and the system DPI.
+    unsafe fn target_area(monitor: Option<MonitorRect>) -> (RECT, u32) {
+        let requested = monitor.map(|rect| RECT {
+            left: rect.left,
+            top: rect.top,
+            right: rect.right,
+            bottom: rect.bottom,
+        });
+        // MONITOR_DEFAULTTONULL returns null when no monitor intersects.
+        let handle = requested
+            .map(|rect| MonitorFromRect(&rect, MONITOR_DEFAULTTONULL))
+            .filter(|handle| !handle.is_null())
+            .unwrap_or_else(|| MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY));
+        let dpi = monitor_dpi(handle);
         let mut info = MONITORINFO {
             cbSize: std::mem::size_of::<MONITORINFO>() as u32,
             ..Default::default()
         };
         if !handle.is_null() && GetMonitorInfoW(handle, &mut info) != 0 {
-            info.rcWork
+            (info.rcWork, dpi)
         } else {
-            RECT {
-                left: 0,
-                top: 0,
-                right: LOGICAL_WIDTH,
-                bottom: LOGICAL_HEIGHT,
-            }
+            (
+                RECT {
+                    left: 0,
+                    top: 0,
+                    right: GetSystemMetrics(SM_CXSCREEN).max(1),
+                    bottom: GetSystemMetrics(SM_CYSCREEN).max(1),
+                },
+                dpi,
+            )
+        }
+    }
+
+    /// Effective DPI of `monitor`, falling back to the system DPI.
+    unsafe fn monitor_dpi(monitor: HMONITOR) -> u32 {
+        let mut dpi_x = 0u32;
+        let mut dpi_y = 0u32;
+        if !monitor.is_null()
+            && GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y) == 0
+            && dpi_x >= 96
+        {
+            return dpi_x;
+        }
+        match GetDpiForSystem() {
+            0 => 96,
+            dpi => dpi,
         }
     }
 
@@ -484,25 +517,33 @@ mod platform {
                 lpszClassName: class_name.as_ptr(),
                 ..Default::default()
             };
-            let atom = RegisterClassW(&class);
-            if atom == 0 && GetLastError() != ERROR_CLASS_ALREADY_EXISTS {
+            let mut atom = RegisterClassW(&class);
+            if atom == 0 && GetLastError() == ERROR_CLASS_ALREADY_EXISTS {
+                // A class left by an earlier attempt still holds the previous
+                // brush and icon; drop it before registering the live handles.
+                UnregisterClassW(class_name.as_ptr(), module);
+                atom = RegisterClassW(&class);
+            }
+            if atom == 0 {
                 let code = GetLastError();
                 cleanup_brush_and_icon(brush, class_icon);
                 let _ = ready.send(Err(format!("RegisterClassW failed with code {code}")));
                 return;
             }
 
-            let area = monitor_work_area(monitor);
+            let (area, monitor_dpi) = target_area(monitor);
             let style = WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
+            let (client_width, client_height) = client_size(monitor_dpi);
+            let (width, height) = outer_size(style, client_width, client_height, monitor_dpi);
             let hwnd = CreateWindowExW(
                 0,
                 class_name.as_ptr(),
                 title.as_ptr(),
                 style,
-                area.left,
-                area.top,
-                LOGICAL_WIDTH,
-                LOGICAL_HEIGHT,
+                area.left + (area.right - area.left - width) / 2,
+                area.top + (area.bottom - area.top - height) / 2,
+                width,
+                height,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
                 module,
@@ -511,43 +552,42 @@ mod platform {
             if hwnd.is_null() {
                 let code = GetLastError();
                 cleanup_brush_and_icon(brush, class_icon);
+                // The class would outlive the brush and icon it points at.
+                UnregisterClassW(class_name.as_ptr(), module);
                 let _ = ready.send(Err(format!("CreateWindowExW failed with code {code}")));
                 return;
             }
 
             let dpi = match GetDpiForWindow(hwnd) {
-                0 => 96,
+                0 => monitor_dpi,
                 value => value,
             };
+            if dpi != monitor_dpi {
+                // Windows placed the window on a monitor with another DPI than
+                // the one used for the initial frame. Recompute the outer frame
+                // before the window is shown so the client area still matches
+                // the logical size and the size never jumps after that.
+                let (client_width, client_height) = client_size(dpi);
+                let (width, height) = outer_size(style, client_width, client_height, dpi);
+                SetWindowPos(
+                    hwnd,
+                    std::ptr::null_mut(),
+                    area.left + (area.right - area.left - width) / 2,
+                    area.top + (area.bottom - area.top - height) / 2,
+                    width,
+                    height,
+                    SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+            }
             let data = WindowData::new(Arc::clone(&shared), dpi, colors, animate, class_icon);
             STATE.with(|cell| *cell.borrow_mut() = Some(data));
-
-            let mut frame = RECT {
-                left: 0,
-                top: 0,
-                right: LOGICAL_WIDTH,
-                bottom: LOGICAL_HEIGHT,
-            };
-            AdjustWindowRectExForDpi(&mut frame, style, 0, 0, dpi);
-            let width = (frame.right - frame.left).max(1);
-            let height = (frame.bottom - frame.top).max(1);
-            let x = area.left + ((area.right - area.left) - width) / 2;
-            let y = area.top + ((area.bottom - area.top) - height) / 2;
-            SetWindowPos(
-                hwnd,
-                std::ptr::null_mut(),
-                x,
-                y,
-                width,
-                height,
-                SWP_NOZORDER | SWP_NOACTIVATE,
-            );
 
             ShowWindow(hwnd, SW_SHOWNORMAL);
             UpdateWindow(hwnd);
             start_timer(hwnd);
             // The marker is written by the caller only after this message, so
-            // the window is visible and can already receive stage messages.
+            // the window is visible; the loop below is entered immediately
+            // after the send, so queued stage messages are never lost.
             let _ = ready.send(Ok(hwnd as isize));
 
             let mut message = MSG::default();
@@ -665,17 +705,23 @@ mod platform {
         let width = client.right - client.left;
         let height = client.bottom - client.top;
         let memory = CreateCompatibleDC(hdc);
-        let bitmap = if width > 0 && height > 0 {
-            CreateCompatibleBitmap(hdc, width, height)
-        } else {
-            std::ptr::null_mut()
-        };
-        if !memory.is_null() && !bitmap.is_null() {
-            let previous = SelectObject(memory, bitmap as HGDIOBJ);
-            draw(memory, width, height);
-            BitBlt(hdc, 0, 0, width, height, memory, 0, 0, SRCCOPY);
-            SelectObject(memory, previous);
-            DeleteObject(bitmap as HGDIOBJ);
+        if !memory.is_null() {
+            let bitmap = if width > 0 && height > 0 {
+                CreateCompatibleBitmap(hdc, width, height)
+            } else {
+                std::ptr::null_mut()
+            };
+            if !bitmap.is_null() {
+                let previous = SelectObject(memory, bitmap as HGDIOBJ);
+                draw(memory, width, height);
+                BitBlt(hdc, 0, 0, width, height, memory, 0, 0, SRCCOPY);
+                SelectObject(memory, previous);
+                DeleteObject(bitmap as HGDIOBJ);
+            } else {
+                draw(hdc, width, height);
+            }
+            // Every path that created the memory DC releases it here, so a
+            // failed bitmap allocation cannot leak a DC per paint.
             DeleteDC(memory);
         } else {
             draw(hdc, width, height);
@@ -894,45 +940,15 @@ mod platform {
             assert_eq!(scaled(92, 144), 138);
             assert_eq!(scaled(1, 144), 2);
         }
+
+        #[test]
+        fn the_client_area_stays_360_by_240_logical_pixels() {
+            assert_eq!(client_size(96), (360, 240));
+            assert_eq!(client_size(120), (450, 300));
+            assert_eq!(client_size(144), (540, 360));
+        }
     }
 }
 
 #[cfg(windows)]
 use platform::run_window;
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn monitor_rect_parsing_is_strict() {
-        assert_eq!(
-            MonitorRect::parse("0,0,1920,1040"),
-            Some(MonitorRect {
-                left: 0,
-                top: 0,
-                right: 1920,
-                bottom: 1040,
-            })
-        );
-        assert_eq!(
-            MonitorRect::parse("-1920, 0, 0, 1080"),
-            Some(MonitorRect {
-                left: -1920,
-                top: 0,
-                right: 0,
-                bottom: 1080,
-            })
-        );
-        for invalid in [
-            "",
-            "0,0,1920",
-            "0,0,1920,1040,1",
-            "0,0,0,1040",
-            "0,0,1920,0",
-            "left,top,right,bottom",
-        ] {
-            assert_eq!(MonitorRect::parse(invalid), None, "{invalid}");
-        }
-    }
-}

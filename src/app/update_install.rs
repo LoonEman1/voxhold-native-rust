@@ -319,6 +319,14 @@ impl Drop for UpdateUi {
     }
 }
 
+/// Format a monitor work area for the helper's `--monitor` argument.
+///
+/// Kept separate from the Win32 lookup so the wire format stays testable
+/// without a native window handle.
+pub(super) fn format_monitor_argument(left: i32, top: i32, right: i32, bottom: i32) -> String {
+    format!("{left},{top},{right},{bottom}")
+}
+
 /// Work area of the monitor that currently shows the client, formatted for the
 /// helper's `--monitor` argument. `None` lets the helper use the primary work
 /// area (tests and platforms without a native handle).
@@ -355,9 +363,11 @@ fn monitor_work_area_argument(window: &Window) -> Option<String> {
             return None;
         }
         let work = info.rcWork;
-        Some(format!(
-            "{},{},{},{}",
-            work.left, work.top, work.right, work.bottom
+        Some(format_monitor_argument(
+            work.left,
+            work.top,
+            work.right,
+            work.bottom,
         ))
     }
 }

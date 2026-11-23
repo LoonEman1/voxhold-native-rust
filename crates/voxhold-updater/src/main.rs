@@ -13,8 +13,9 @@
 //! and `--staged` must already exist and are canonicalised before the process
 //! changes its working directory. `--exe` is a plain file name inside the
 //! staged `app` directory. `--monitor` is the work area of the monitor that
-//! showed the client; the helper centres its own window in it and falls back to
-//! the primary work area when the argument is absent.
+//! showed the client; the helper centres its own window in it. A rectangle that
+//! no longer intersects a live monitor falls back to the primary work area,
+//! exactly like an absent argument.
 //!
 //! `--staged` is the version directory (`...\updates\<version>`); the helper
 //! uses `<staged>\app` as the prepared payload and writes `<staged>\apply.log`.
@@ -28,9 +29,11 @@
 //! reported through `apply.log` and the exit code.
 //!
 //! The helper owns the visible installation window (see `window.rs`). It is
-//! created and shown before `--ready` is written, so the client only exits once
-//! the helper can already receive stage messages. After a confirmed handshake
-//! the window closes and the helper exits.
+//! created and shown before `--ready` is written, and the window thread enters
+//! its message loop immediately after sending that readiness signal, so the
+//! client only exits once the helper can already receive (or queue) stage
+//! messages. After a confirmed handshake the window closes and the helper
+//! exits.
 //!
 //! After a successful apply the helper removes the staged payload and then
 //! runs a best-effort `cleanup_stale` over the updates root, keeping its own
@@ -40,6 +43,7 @@
 
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+mod monitor;
 mod stages;
 mod window;
 
@@ -500,11 +504,31 @@ fn validate_exe_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Suppress the hard-error dialogs a child with a broken image would raise.
+///
+/// The mode is inherited by processes started from this one, so a damaged
+/// client or helper image fails with an exit code instead of blocking the
+/// update behind a modal dialog.
+#[cfg(windows)]
+fn suppress_child_hard_error_dialogs() {
+    use windows_sys::Win32::System::Diagnostics::Debug::{
+        SetErrorMode, SEM_FAILCRITICALERRORS, SEM_NOOPENFILEERRORBOX,
+    };
+    // SAFETY: the call takes no pointers and only changes this process mode.
+    unsafe {
+        SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOOPENFILEERRORBOX);
+    }
+}
+
+#[cfg(not(windows))]
+fn suppress_child_hard_error_dialogs() {}
+
 fn spawn_detached(exe: &Path, raw: &[String]) -> Result<(), String> {
     let mut command = Command::new(exe);
     command.args(raw);
     command.arg("--detached");
     command.current_dir(std::env::temp_dir());
+    suppress_child_hard_error_dialogs();
     command
         .spawn()
         .map(|_| ())

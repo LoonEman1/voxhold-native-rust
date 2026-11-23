@@ -238,46 +238,15 @@ pub(crate) fn apply_staged_with_hooks(
     observer: &dyn ApplyObserver,
 ) -> Result<ApplyOutcome> {
     observer.stage(ApplyStage::Verifying);
-    let new_index = read_package_json_from_dir(staged_app)?;
-    let exe = staged_app.join(exe_name);
-    if !exe.is_file() {
-        return Err(UpdateError::NotStaged(exe));
-    }
-
-    // Resolve a previous operation first. A state that cannot be resolved is
-    // never overwritten: overwriting it would destroy the only proof that the
-    // backup is still needed.
-    let recovery = recovery::recover_install(target_dir, RecoveryMode::Updater)?;
-    match recovery {
-        RecoveryOutcome::Clean
-        | RecoveryOutcome::Completed { .. }
-        | RecoveryOutcome::RolledBack { .. } => {}
-        // Without a state file the backup is an unknown legacy leftover, not
-        // an unfinished operation: there is no proof to preserve and the new
-        // operation uses its own backup name. With a state, ambiguity refuses.
-        RecoveryOutcome::Ambiguous { .. }
-            if matches!(state::load(target_dir), StateLoad::Missing) => {}
-        outcome => {
-            return Err(UpdateError::InvalidState(format!(
-                "a previous update is still unresolved ({outcome:?}); its backup was kept"
-            )));
+    let new_index = match preflight(target_dir, staged_app, exe_name) {
+        Ok(index) => index,
+        Err(error) => {
+            // Nothing was renamed yet, but the window must still leave the
+            // "installing" line while the helper reports the failure.
+            observer.stage(ApplyStage::RollingBack);
+            return Err(error);
         }
-    }
-    match state::load(target_dir) {
-        StateLoad::Missing => {}
-        // A completed operation is proven, not unresolved. Its backup can
-        // still be locked; clearing the state unblocks the next update. The
-        // backup stays untouched on disk and becomes an unknown legacy backup,
-        // so `choose_backup_path` gives the new operation its own name.
-        StateLoad::Valid(state) if state.stage == OperationStage::Completed => {
-            state::clear(target_dir)?;
-        }
-        StateLoad::Valid(_) | StateLoad::Corrupt(_) => {
-            return Err(UpdateError::InvalidState(
-                "a previous update is still unresolved; its backup was kept".into(),
-            ));
-        }
-    }
+    };
 
     let operation_id = state::new_operation_id();
     let staging_dir = state::operation_staging_path(target_dir, &operation_id);
@@ -363,11 +332,13 @@ pub(crate) fn apply_staged_with_hooks(
         }
         Err(error) if interrupted => Err(error),
         Err(error) => {
+            // A failure before the durable state exists (for example a broken
+            // payload) is followed by cleanup too. Report the rollback stage on
+            // every failure so the window never keeps claiming that files are
+            // being installed while recovery runs.
+            observer.stage(ApplyStage::RollingBack);
             let rollback = match applied.as_ref() {
-                Some(applied) => {
-                    observer.stage(ApplyStage::RollingBack);
-                    recovery::rollback_operation(applied)
-                }
+                Some(applied) => recovery::rollback_operation(applied),
                 None => {
                     let _ = fsutil::remove_dir_with_timeout(&staging_dir, STAGING_CLEANUP_TIMEOUT);
                     Ok(())
@@ -382,6 +353,55 @@ pub(crate) fn apply_staged_with_hooks(
             }
         }
     }
+}
+
+/// Check the staged payload and resolve any previous operation.
+///
+/// Runs before the first rename and returns the index of the new package. The
+/// caller reports [`ApplyStage::RollingBack`] when this fails, so a broken
+/// payload does not leave the update window on the install line.
+fn preflight(target_dir: &Path, staged_app: &Path, exe_name: &str) -> Result<PackageIndex> {
+    let new_index = read_package_json_from_dir(staged_app)?;
+    let exe = staged_app.join(exe_name);
+    if !exe.is_file() {
+        return Err(UpdateError::NotStaged(exe));
+    }
+
+    // Resolve a previous operation first. A state that cannot be resolved is
+    // never overwritten: overwriting it would destroy the only proof that the
+    // backup is still needed.
+    let recovery = recovery::recover_install(target_dir, RecoveryMode::Updater)?;
+    match recovery {
+        RecoveryOutcome::Clean
+        | RecoveryOutcome::Completed { .. }
+        | RecoveryOutcome::RolledBack { .. } => {}
+        // Without a state file the backup is an unknown legacy leftover, not
+        // an unfinished operation: there is no proof to preserve and the new
+        // operation uses its own backup name. With a state, ambiguity refuses.
+        RecoveryOutcome::Ambiguous { .. }
+            if matches!(state::load(target_dir), StateLoad::Missing) => {}
+        outcome => {
+            return Err(UpdateError::InvalidState(format!(
+                "a previous update is still unresolved ({outcome:?}); its backup was kept"
+            )));
+        }
+    }
+    match state::load(target_dir) {
+        StateLoad::Missing => {}
+        // A completed operation is proven, not unresolved. Its backup can
+        // still be locked; clearing the state unblocks the next update. The
+        // backup stays untouched on disk and becomes an unknown legacy backup,
+        // so `choose_backup_path` gives the new operation its own name.
+        StateLoad::Valid(state) if state.stage == OperationStage::Completed => {
+            state::clear(target_dir)?;
+        }
+        StateLoad::Valid(_) | StateLoad::Corrupt(_) => {
+            return Err(UpdateError::InvalidState(
+                "a previous update is still unresolved; its backup was kept".into(),
+            ));
+        }
+    }
+    Ok(new_index)
 }
 
 fn copy_payload(staged_app: &Path, staging: &Path, new_index: &PackageIndex) -> Result<()> {

@@ -35,9 +35,11 @@ impl VoicePanel {
             // still blocks it.
             let restart_bypass = self.screen.restart && reason == "Трансляция уже идёт.";
             if !restart_bypass {
-                // An active publication is not an error for this button; its
-                // card owns the status and the stop action.
-                if !self.share_active() {
+                // An active publication is not an error for the toolbar; its
+                // card owns the status and the stop action. The open quality
+                // dialog is different: it asked for a change and must say why
+                // the change was refused.
+                if !self.share_active() || self.screen.open {
                     self.screen.error = reason.to_owned();
                 }
                 cx.notify();
@@ -136,14 +138,15 @@ impl VoicePanel {
             self.active_publishers_in_room() < MAX_CHANNEL_PUBLISHERS
         };
         let permission = self.stream_permission_for(gate_room);
-        // The owner snapshot is the confirmed access of this new publication.
-        // A restart keeps the owner captured by the first start.
+        // The owner identity is the confirmed access of this new publication.
+        // A restart keeps the owner and the latch session captured by the
+        // first start.
         if !self.screen.restart {
             self.publish_access = Some(PublishAccess {
                 room: self.room,
+                session: self.screen.picker,
+                attempt: 0,
                 connection: self.self_connection.clone(),
-                can_stream: permission,
-                slot_available,
             });
             self.screen.owner_room = self.room;
         }
@@ -185,6 +188,9 @@ impl VoicePanel {
         }
         // The request becomes confirmed when the media layer reports Live.
         self.screen.busy = true;
+        // The worker keeps the gate of the owner that was just captured, even
+        // before the first snapshot arrives.
+        self.sync_screen_access();
         // A restart without a live bitrate starts a preflight; closing the
         // dialog while it runs must cancel it instead of stopping the stream.
         // The pending operation tag is the only confirmation this dialog needs.

@@ -9,7 +9,7 @@ use voxhold_media::publisher::{Phase, Sharing};
 use voxhold_media::runtime::VoiceUpdate;
 use voxhold_media::screen_capture::ScreenSource;
 
-fn publication(channel_id: i64, publisher: &str, user: i64) -> Publication {
+pub(super) fn publication(channel_id: i64, publisher: &str, user: i64) -> Publication {
     Publication {
         server_id: 1,
         channel_id,
@@ -23,7 +23,7 @@ fn publication(channel_id: i64, publisher: &str, user: i64) -> Publication {
     }
 }
 
-fn draw(visual: &mut VisualTestContext) {
+pub(super) fn draw(visual: &mut VisualTestContext) {
     visual.update(|window, app| {
         window.refresh();
         window.draw(app).clear();
@@ -31,7 +31,7 @@ fn draw(visual: &mut VisualTestContext) {
     visual.run_until_parked();
 }
 
-fn live(attempt: u64) -> Sharing {
+pub(super) fn live(attempt: u64) -> Sharing {
     Sharing {
         phase: Phase::Live,
         attempt,
@@ -40,24 +40,24 @@ fn live(attempt: u64) -> Sharing {
     }
 }
 
-fn source() -> ScreenSource {
+pub(super) fn source() -> ScreenSource {
     super::voice_screen_tests::monitor(1, "Экран 1", 1920, 1080)
 }
 
-fn click(visual: &mut VisualTestContext, selector: &'static str) {
+pub(super) fn click(visual: &mut VisualTestContext, selector: &'static str) {
     let bounds = visual
         .debug_bounds(selector)
         .unwrap_or_else(|| panic!("{selector} is painted"));
     visual.simulate_click(bounds.center(), Modifiers::default());
 }
 
-fn center(rect: crate::voice_room::Rect) -> (f32, f32) {
+pub(super) fn center(rect: crate::voice_room::Rect) -> (f32, f32) {
     (rect.x + rect.w / 2.0, rect.y + rect.h / 2.0)
 }
 
 /// Start one own publication through the production intent and then install
 /// the snapshot the media layer would report for it.
-fn publish_live(
+pub(super) fn publish_live(
     panel: &mut voice_panel::VoicePanel,
     window: &mut Window,
     cx: &mut Context<voice_panel::VoicePanel>,
@@ -72,7 +72,7 @@ fn publish_live(
     panel.test_set_screen_confirmed_source(source());
 }
 
-fn watch_publication(
+pub(super) fn watch_publication(
     panel: &mut voice_panel::VoicePanel,
     window: &mut Window,
     cx: &mut Context<voice_panel::VoicePanel>,
@@ -83,7 +83,7 @@ fn watch_publication(
         .expect("the viewer owns a selection")
 }
 
-fn open_room(visual: &mut VisualTestContext, view: &Entity<Voxhold>, channel: i64) {
+pub(super) fn open_room(visual: &mut VisualTestContext, view: &Entity<Voxhold>, channel: i64) {
     visual.update(|window, app| {
         view.update(app, |v, cx| {
             v.channel = channel;
@@ -312,7 +312,9 @@ async fn m03_each_role_closes_with_one_command(cx: &mut TestAppContext) {
     );
 
     // A repeated close of the viewer sends nothing more.
-    visual.update(|window, app| voice.update(app, |panel, cx| panel.leave_stream(window, cx)));
+    visual.update(|window, app| {
+        voice.update(app, |panel, cx| panel.leave_stream(window, cx));
+    });
     assert_eq!(
         voice.update(&mut *visual, |panel, _| panel.test_take_stream_commands()),
         Vec::new()
@@ -385,6 +387,20 @@ async fn m04_live_settings_use_the_owner_room_and_b_blocks_its_own_start(cx: &mu
     });
     draw(&mut visual);
     let _ = voice.update(&mut *visual, |panel, _| panel.test_take_screen_commands());
+
+    // The confirmed channel list grants Stream in A only. The shell hands that
+    // map to the panel on navigation, so it must agree with the confirmed
+    // permission the publication started with.
+    visual.update(|_window, app| {
+        view.update(app, |v, cx| {
+            for item in &mut v.channels {
+                if item.id == 7 {
+                    item.permissions |= crate::settings::PERMISSION_STREAM;
+                }
+            }
+            cx.notify();
+        });
+    });
 
     // Navigate to B, which has no Stream permission. The panel pushes A's
     // confirmed access to the worker, not B's.

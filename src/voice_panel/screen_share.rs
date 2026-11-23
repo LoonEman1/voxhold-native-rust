@@ -1095,6 +1095,9 @@ impl VoicePanel {
         {
             self.screen.released_images = old.released_images;
         }
+        // The owner identity belongs to the session that just ended; keeping it
+        // would gate the next displayed room with a stream that no longer runs.
+        self.publish_access = None;
     }
 
     fn share_focus(&self, index: usize) -> FocusHandle {

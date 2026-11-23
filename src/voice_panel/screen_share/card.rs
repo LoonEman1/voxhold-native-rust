@@ -116,10 +116,18 @@ impl VoicePanel {
     }
 
     /// The publication picture is on screen: either the on-air card of the
-    /// room grid or the publisher role of the compact PiP. Only a surface that
-    /// is really painted asks the capture worker for a preview.
+    /// room grid or the publisher role of the compact PiP, and that surface
+    /// lives inside the voice room pane the shell really painted. Only such a
+    /// surface asks the capture worker for a preview.
     fn screen_card_painted(&self) -> bool {
-        self.screen_card_in_room() || self.screen_pip_publisher_painted()
+        self.room_painted && (self.screen_card_in_room() || self.screen_pip_publisher_painted())
+    }
+
+    /// The card paints its stop action only while a stop still has something
+    /// to do. A stopping attempt paints its status instead, so its handle must
+    /// not be a Tab stop either.
+    pub(in crate::voice_panel) fn screen_card_stop_painted(&self) -> bool {
+        self.screen_card_active() && self.screen.sharing.phase != Phase::Stopping
     }
 
     /// The status the on-air card and the PiP paint for the current attempt.
@@ -322,7 +330,11 @@ impl VoicePanel {
                     .on_click(
                         cx.listener(|panel, _, window, cx| panel.stop_screen_share(window, cx)),
                     )
-                    .child("Завершить"),
+                    .child(if sharing.phase == Phase::Failed {
+                        "Закрыть"
+                    } else {
+                        "Завершить"
+                    }),
             );
             card = card.child(actions);
         }

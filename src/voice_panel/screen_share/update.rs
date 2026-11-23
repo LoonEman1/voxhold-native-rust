@@ -28,6 +28,12 @@ impl VoicePanel {
                 let previous = self.screen.sharing.phase;
                 self.screen.sharing = sharing;
                 let phase = self.screen.sharing.phase;
+                // A confirmed attempt refreshes the owner identity: a recovered
+                // reconnect reports the same publication with the current
+                // connection, so its PiP label returns to the normal one.
+                if matches!(phase, Phase::Publishing | Phase::Live) {
+                    self.confirm_publish_access();
+                }
                 let status = self.screen.sharing.quality_status.clone();
                 let pending = self.screen.pending_quality_op;
                 let current = status.clone().filter(|status| Some(status.op) == pending);

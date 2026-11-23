@@ -86,6 +86,8 @@ mod voice_form_tests;
 mod voice_gain_tests;
 mod voice_ops;
 #[cfg(all(feature = "voxhold-media", test))]
+mod voice_pip_owner_tests;
+#[cfg(all(feature = "voxhold-media", test))]
 mod voice_pip_tests;
 #[cfg(test)]
 mod voice_screen_audio_tests;

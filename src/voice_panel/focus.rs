@@ -7,6 +7,12 @@ use super::*;
 
 impl VoicePanel {
     pub(super) fn focus_ring(&self) -> Vec<(&'static str, FocusHandle)> {
+        // The fullscreen layer covers the room pane and the dock, so nothing
+        // underneath it is visible: only its own exit and audio controls are
+        // real Tab stops while the player owns the window.
+        if self.fullscreen_player() {
+            return self.pip_focus_entries();
+        }
         let mut ring = Vec::new();
         // Room entries exist only for elements the shell actually painted.
         // The room pane is hidden on a text channel, another room or a DM, and
@@ -26,7 +32,7 @@ impl VoicePanel {
                         ring.push((VOICE_ACTIONS[index].id, self.action_focus[index].clone()));
                     }
                 }
-                if self.screen_card_in_room() {
+                if self.screen_card_stop_painted() {
                     ring.push(("screen-stop", self.screen_focus[0].clone()));
                 }
             } else {
@@ -67,8 +73,8 @@ impl VoicePanel {
         }
         // The floating player is a shell-level overlay and is not tied to the
         // room pane, so it keeps its entries independently. The compact PiP
-        // owns a different set: role tabs, settings and close, or the compact
-        // panel rows while that panel is open.
+        // owns the role tabs, settings and close, or the compact panel rows
+        // while that panel is open.
         if self.pip_active() {
             ring.extend(self.pip_focus_entries());
         } else if self.player_open && self.viewer_in_room() {

@@ -61,15 +61,22 @@ struct PlayerDrag {
     offset_y: f32,
 }
 
-/// The confirmed owner of the publication this panel started. Live settings,
-/// the codec restart and the PiP of that stream use this snapshot, never the
-/// access of whatever room happens to be displayed.
+/// The identity of the publication this panel started. Live settings, the
+/// codec restart and the PiP of that stream use this owner, never the access of
+/// whatever room happens to be displayed. Permission and slot are not copied
+/// here: they are re-read from the current confirmation, so a revocation
+/// reaches a preparation, a preflight and the settings dialog.
 #[derive(Clone, Debug)]
 struct PublishAccess {
     room: i64,
+    /// Picker id of the intent. It is the stable identity of the stop latch for
+    /// the whole publication, including its restarts and its confirmation.
+    session: u64,
+    /// Attempt the media layer confirmed for this intent; 0 before it does.
+    attempt: u64,
+    /// Connection id confirmed with that attempt. A different current one is a
+    /// reconnect the media layer has not recovered yet.
     connection: Option<String>,
-    can_stream: bool,
-    slot_available: bool,
 }
 
 pub(crate) struct ParticipantClick {

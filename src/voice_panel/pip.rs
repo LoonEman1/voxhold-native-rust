@@ -17,6 +17,12 @@ impl VoicePanel {
         self.screen_pip_active() || self.viewer_pip_active()
     }
 
+    /// The player owns the whole window. The fullscreen layer, not the compact
+    /// card, is what the user sees and can reach with Tab.
+    pub(in crate::voice_panel) fn fullscreen_player(&self) -> bool {
+        self.player_fullscreen && self.player_open
+    }
+
     /// Both roles are owned at once, so the PiP reserves the role switcher.
     pub(in crate::voice_panel) fn pip_tabs(&self) -> bool {
         self.screen_pip_active() && self.viewer_pip_active()
@@ -33,7 +39,7 @@ impl VoicePanel {
         }
     }
 
-    fn pip_title(&self) -> String {
+    pub(super) fn pip_title(&self) -> String {
         match self.active_pip_role() {
             PipRole::Viewer => self
                 .watching
@@ -69,9 +75,45 @@ impl VoicePanel {
         }
     }
 
+    /// Whether the settings action of the painted role really opens something.
+    /// The publisher dialog only exists for a confirmed live attempt; a
+    /// starting or failed one has no configuration to change.
+    pub(super) fn pip_settings_enabled(&self) -> bool {
+        match self.active_pip_role() {
+            PipRole::Viewer => true,
+            PipRole::Publisher => self.screen.sharing.phase == Phase::Live,
+        }
+    }
+
+    /// Whether the close action of the painted role has a command or a local
+    /// dismissal to run. A stop that is already in flight (`Stopping`) owns
+    /// nothing more, so its control is a status, not a button.
+    pub(super) fn pip_close_enabled(&self) -> bool {
+        match self.active_pip_role() {
+            PipRole::Viewer => true,
+            PipRole::Publisher => self.screen.sharing.phase != Phase::Stopping,
+        }
+    }
+
+    /// Tab entries of the painted fullscreen layer: its exit control and, when
+    /// the evidence track exists, the viewer-only volume control.
+    fn fullscreen_focus_entries(&self) -> Vec<(&'static str, FocusHandle)> {
+        let mut ring = Vec::new();
+        if self.has_audio() {
+            ring.push(("stream-audio", self.player_actions[0].clone()));
+        }
+        ring.push(("stream-exit-full", self.player_actions[1].clone()));
+        ring
+    }
+
     /// The Tab ring entries of the painted PiP. They exist only for the role
-    /// currently visible and for the compact panel that is really open.
+    /// currently visible and for the compact panel that is really open. While
+    /// the player owns the window, the fullscreen layer replaces the card
+    /// entirely, so none of the card's buttons are painted or focusable.
     pub(super) fn pip_focus_entries(&self) -> Vec<(&'static str, FocusHandle)> {
+        if self.fullscreen_player() {
+            return self.fullscreen_focus_entries();
+        }
         if !self.pip_active() {
             return Vec::new();
         }
@@ -91,8 +133,12 @@ impl VoicePanel {
             ring.push(("pip-tab-viewer", self.player_actions[4].clone()));
             ring.push(("pip-tab-publisher", self.player_actions[5].clone()));
         }
-        ring.push(("pip-settings", self.player_actions[3].clone()));
-        ring.push(("pip-close", self.player_actions[2].clone()));
+        if self.pip_settings_enabled() {
+            ring.push(("pip-settings", self.player_actions[3].clone()));
+        }
+        if self.pip_close_enabled() {
+            ring.push(("pip-close", self.player_actions[2].clone()));
+        }
         ring
     }
 
@@ -157,25 +203,33 @@ impl VoicePanel {
     pub(super) fn pip_close_role(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.pip_settings = false;
         match self.active_pip_role() {
+            // Closing the viewer while it owns the window must give the window
+            // back; otherwise the user is left in fullscreen without a player.
             PipRole::Viewer => self.leave_stream(window, cx),
             PipRole::Publisher => self.stop_screen_share(window, cx),
         }
     }
 
-    /// Enter/Space on a focused PiP action. Returns whether the key belonged
-    /// to the PiP. PTT and text input keep their existing path when no PiP
-    /// control is focused.
+    /// Enter/Space on a focused PiP or fullscreen action. Returns whether the
+    /// key belonged to the surface. PTT and text input keep their existing path
+    /// when no control is focused.
     pub(crate) fn pip_key_down(
         &mut self,
         key: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        if !self.pip_active() {
+        let fullscreen = self.fullscreen_player();
+        if !fullscreen && !self.pip_active() {
             return false;
         }
         if key == "escape" {
-            return self.pip_escape(window, cx);
+            // A fullscreen Escape belongs to the player and was already routed.
+            return if fullscreen {
+                false
+            } else {
+                self.pip_escape(window, cx)
+            };
         }
         if key != "enter" && key != "space" {
             return false;
@@ -186,6 +240,14 @@ impl VoicePanel {
             .find(|(_, handle)| handle.is_focused(window))
             .map(|(id, _)| id);
         match focused {
+            Some("stream-exit-full") => {
+                self.exit_fullscreen(window);
+                true
+            }
+            Some("stream-audio") => {
+                self.toggle_stream_mute(cx);
+                true
+            }
             Some("pip-settings") => self.pip_toggle_settings(window, cx),
             Some("pip-close") => {
                 self.pip_close_role(window, cx);
@@ -460,62 +522,72 @@ impl VoicePanel {
                 ));
         }
 
-        let close_label = match role {
-            PipRole::Viewer => "Выйти",
-            PipRole::Publisher => "Завершить",
+        let close_label = match (role, self.screen.sharing.phase) {
+            (PipRole::Viewer, _) => "Выйти",
+            (PipRole::Publisher, Phase::Failed) => "Закрыть",
+            (PipRole::Publisher, Phase::Stopping) => "Остановка…",
+            (PipRole::Publisher, _) => "Завершить",
         };
-        card = card
-            .child(
-                div()
-                    .id("pip-settings")
-                    .debug_selector(|| "pip-settings".into())
-                    .absolute()
-                    .left(px(settings.x))
-                    .top(px(settings.y))
-                    .w(px(settings.w))
-                    .h(px(settings.h))
-                    .rounded(px(5.))
-                    .border_1()
-                    .border_color(rgb(c.line))
-                    .text_color(rgb(c.muted))
-                    .text_size(px(9.))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .gap_1()
-                    .cursor_pointer()
-                    .track_focus(&self.player_actions[3])
-                    .on_click(cx.listener(|panel, _, window, cx| {
-                        panel.pip_toggle_settings(window, cx);
-                    }))
-                    .child(img("icons/settings.svg").w(px(10.)).h(px(10.)))
-                    .child("Настройки"),
-            )
-            .child(
-                div()
-                    .id("pip-close")
-                    .debug_selector(|| "pip-close".into())
-                    .absolute()
-                    .left(px(close.x))
-                    .top(px(close.y))
-                    .w(px(close.w))
-                    .h(px(close.h))
-                    .rounded(px(5.))
-                    .border_1()
-                    .border_color(rgb(c.danger))
-                    .text_color(rgb(c.danger))
-                    .text_size(px(9.))
-                    .font_weight(gpui::FontWeight::BOLD)
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .gap_1()
-                    .cursor_pointer()
-                    .track_focus(&self.player_actions[2])
-                    .on_click(cx.listener(|panel, _, window, cx| panel.pip_close_role(window, cx)))
-                    .child(img("icons/close.svg").w(px(9.)).h(px(9.)))
-                    .child(close_label),
-            );
+        // A stopping attempt and an unconfirmed role have no command left to
+        // send; their control is painted as a status instead of a live button.
+        let close_enabled = self.pip_close_enabled();
+        let settings_enabled = self.pip_settings_enabled();
+        let mut close_button = div()
+            .id("pip-close")
+            .debug_selector(|| "pip-close".into())
+            .absolute()
+            .left(px(close.x))
+            .top(px(close.y))
+            .w(px(close.w))
+            .h(px(close.h))
+            .rounded(px(5.))
+            .border_1()
+            .border_color(rgb(if close_enabled { c.danger } else { c.line }))
+            .text_color(rgb(if close_enabled { c.danger } else { c.muted }))
+            .text_size(px(9.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .gap_1()
+            .child(img("icons/close.svg").w(px(9.)).h(px(9.)))
+            .child(close_label);
+        if close_enabled {
+            close_button = close_button
+                .font_weight(gpui::FontWeight::BOLD)
+                .cursor_pointer()
+                .track_focus(&self.player_actions[2])
+                .on_click(cx.listener(|panel, _, window, cx| {
+                    panel.pip_close_role(window, cx);
+                }));
+        }
+        let mut settings_button = div()
+            .id("pip-settings")
+            .debug_selector(|| "pip-settings".into())
+            .absolute()
+            .left(px(settings.x))
+            .top(px(settings.y))
+            .w(px(settings.w))
+            .h(px(settings.h))
+            .rounded(px(5.))
+            .border_1()
+            .border_color(rgb(c.line))
+            .text_color(rgb(if settings_enabled { c.muted } else { c.line }))
+            .text_size(px(9.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .gap_1()
+            .child(img("icons/settings.svg").w(px(10.)).h(px(10.)))
+            .child("Настройки");
+        if settings_enabled {
+            settings_button = settings_button
+                .cursor_pointer()
+                .track_focus(&self.player_actions[3])
+                .on_click(cx.listener(|panel, _, window, cx| {
+                    panel.pip_toggle_settings(window, cx);
+                }));
+        }
+        card = card.child(settings_button).child(close_button);
 
         if self.pip_settings && role == PipRole::Viewer {
             let audio = self.has_audio();

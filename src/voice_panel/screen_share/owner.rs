@@ -1,9 +1,12 @@
 //! Ownership of a screen publication: the confirmed `Stream` permission of
-//! every room, the owner snapshot captured at the publish start, the gate that
+//! every room, the owner identity captured at the publish start, the gate that
 //! is pushed to the media worker and the one-stop latch.
 //!
 //! The displayed room may be a text channel, another voice channel or a DM;
 //! live settings must still use the access of the room that owns the stream.
+//! That access is re-read from the current confirmation on every gate push: a
+//! permission or slot loss after the start must reach the worker exactly like
+//! it did before the own PiP existed.
 
 use super::*;
 
@@ -13,8 +16,9 @@ impl VoicePanel {
         // Remember the confirmed permission of this room, so a publication
         // started here keeps its own access after the user opens another room.
         self.stream_permissions.insert(self.room, allowed);
-        // A revocation that arrives while the picker or a capture preparation
-        // is open must reach the worker, not wait for the next Start.
+        // A revocation that arrives while the picker, a capture preparation or
+        // a quality preflight is open must reach the worker, not wait for the
+        // next Start.
         self.sync_screen_access();
     }
 
@@ -66,25 +70,41 @@ impl VoicePanel {
         self.call_channel
     }
 
+    /// Confirmed free slot of one room. The call roster is authoritative for
+    /// the room this session publishes in; a room the panel neither joined nor
+    /// displays has no confirmed contradiction to report.
+    pub(super) fn slot_available_in(&self, room: i64) -> bool {
+        let streams = if self.call_channel != 0 && room == self.call_channel {
+            self.streams.as_slice()
+        } else if room == self.room {
+            self.room_streams()
+        } else {
+            return true;
+        };
+        streams
+            .iter()
+            .filter(|publication| {
+                Some(&publication.publisher_connection_id) != self.self_connection.as_ref()
+            })
+            .count()
+            < MAX_CHANNEL_PUBLISHERS
+    }
+
+    /// The current confirmed permission of the owner. Never the snapshot taken
+    /// at the start: a revocation has to cancel a preparation or a preflight and
+    /// block the live settings, exactly like the displayed room did before.
     pub(super) fn publish_permission(&self) -> bool {
-        self.publish_access
-            .as_ref()
-            .map(|access| access.can_stream)
-            .unwrap_or_else(|| self.stream_permission_for(self.publisher_room()))
+        self.stream_permission_for(self.publisher_room())
     }
 
     pub(super) fn publish_slot_available(&self) -> bool {
-        self.publish_access
-            .as_ref()
-            .map(|access| access.slot_available)
-            .unwrap_or_else(|| self.active_publishers_in_room() < MAX_CHANNEL_PUBLISHERS)
+        self.slot_available_in(self.publisher_room())
     }
 
     /// Push the current gate to the worker while a picker or an attempt is
-    /// open. A live attempt uses the confirmed access of its owner room; only a
-    /// start uses the displayed room. The session re-checks it before it
-    /// accepts a prepared engine, so a permission or slot loss during the
-    /// capture start cannot be missed.
+    /// open. The owner branch starts with the sent intent, not with its `Live`
+    /// confirmation: navigating away during a preparation must not replace the
+    /// owner gate with the displayed room's.
     pub(crate) fn sync_screen_access(&self) {
         if !(self.screen.open || self.screen.busy || self.share_active()) {
             return;
@@ -92,7 +112,7 @@ impl VoicePanel {
         let Some(handle) = &self.handle else {
             return;
         };
-        let (permission, slot_available) = if self.share_active() || self.screen.restart {
+        let (permission, slot_available) = if self.publish_access.is_some() {
             (self.publish_permission(), self.publish_slot_available())
         } else {
             (
@@ -103,14 +123,14 @@ impl VoicePanel {
         handle.screen_access(permission, slot_available);
     }
 
-    /// The one id that may own a stop intent: the confirmed attempt, or the
-    /// picker id while the first publish is still unconfirmed.
+    /// Stable identity of the publish session: the picker id of its first
+    /// start. It does not change when the media layer confirms the attempt, so
+    /// the latch still suppresses a second stop of the same intent.
     pub(super) fn screen_stop_id(&self) -> u64 {
-        if self.screen.sharing.attempt != 0 {
-            self.screen.sharing.attempt
-        } else {
-            self.screen.picker
-        }
+        self.publish_access
+            .as_ref()
+            .map(|access| access.session)
+            .unwrap_or(self.screen.picker)
     }
 
     /// Latch one stop per attempt. Returns whether the command must be sent.
@@ -124,5 +144,21 @@ impl VoicePanel {
         }
         self.screen.stop_sent = Some(id);
         true
+    }
+
+    /// Bind the attempt the media layer confirmed to the intent that is already
+    /// open. A recovered reconnect reports the attempt again with the new
+    /// connection, so the PiP stops calling a healthy stream "recovering".
+    pub(super) fn confirm_publish_access(&mut self) {
+        let attempt = self.screen.sharing.attempt;
+        if attempt == 0 {
+            return;
+        }
+        let connection = self.self_connection.clone();
+        let Some(access) = self.publish_access.as_mut() else {
+            return;
+        };
+        access.attempt = attempt;
+        access.connection = connection;
     }
 }

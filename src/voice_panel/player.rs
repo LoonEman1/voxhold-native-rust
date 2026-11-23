@@ -151,7 +151,10 @@ impl VoicePanel {
             self.player_pos = (player.x, player.y);
         }
         self.sync_viewport();
-        window.focus(&self.player_actions[1]);
+        // Land on an action the restored surface really paints: the compact PiP
+        // has no fullscreen toggle, its settings button is its first action.
+        let target = if self.pip_active() { 3 } else { 1 };
+        window.focus(&self.player_actions[target]);
     }
 
     /// Returns whether the key belonged to the player.
@@ -319,6 +322,7 @@ impl VoicePanel {
     ) -> gpui::AnyElement {
         div()
             .id("stream-audio")
+            .debug_selector(|| "stream-audio".into())
             .absolute()
             .left(px(area.x - origin.0))
             .top(px(area.y - origin.1))
@@ -548,6 +552,7 @@ impl VoicePanel {
         let audio = geometry.fullscreen_audio;
         let mut root = div()
             .id("stream-fullscreen-player")
+            .key_context("VoiceRoom")
             .absolute()
             .left(px(area.x))
             .top(px(area.y))
@@ -594,6 +599,7 @@ impl VoicePanel {
         root = root.child(frame).child(
             div()
                 .id("stream-exit-full")
+                .debug_selector(|| "stream-exit-full".into())
                 .absolute()
                 .left(px(exit.x - area.x))
                 .top(px(exit.y - area.y))
@@ -623,15 +629,15 @@ impl VoicePanel {
     pub fn leave_stream(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // One explicit leave for the current selection. A repeated close after
         // the selection is gone must not send another `stream.leave`.
-        let Some(selection) = self.watching_selection else {
-            self.close_player(window);
-            return;
-        };
-        if let Some(handle) = &self.handle {
-            handle.leave_stream(selection);
+        if let Some(selection) = self.watching_selection {
+            if let Some(handle) = &self.handle {
+                handle.leave_stream(selection);
+            }
+            self.watching_selection = None;
         }
-        self.watching_selection = None;
-        self.close_player(window);
+        // A viewer closed from its PiP while fullscreen must release the window
+        // it made fullscreen: `close_player` alone would leave it owned.
+        self.close_player_in_window(window);
         cx.notify();
     }
 
@@ -643,6 +649,10 @@ impl VoicePanel {
         self.frame_ticker = self.frame_ticker.wrapping_add(1);
         self.last_frame_at = None;
         self.player_open = false;
+        // The fullscreen view belongs to the player that is gone. The window
+        // ownership flag stays set, so a later window-aware exit (`leave`) still
+        // releases the window instead of leaving an empty fullscreen.
+        self.player_fullscreen = false;
         self.pip_settings = false;
         self.pip_restore_focus = false;
         // The next player may be served by another handle; its first viewport

@@ -769,6 +769,10 @@ impl VoicePanel {
         self.screen_pip_active()
     }
 
+    pub fn test_screen_card_stop_painted(&self) -> bool {
+        self.screen_card_stop_painted()
+    }
+
     pub fn test_viewer_in_room(&self) -> bool {
         self.viewer_in_room()
     }
@@ -791,6 +795,11 @@ impl VoicePanel {
 
     pub fn test_pip_close_role(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.pip_close_role(window, cx);
+    }
+
+    /// Whether the player made the window fullscreen and still owes its exit.
+    pub fn test_owns_fullscreen(&self) -> bool {
+        self.owns_fullscreen
     }
 
     pub fn test_sync_pip(&mut self, window: &mut Window) {
@@ -820,6 +829,34 @@ impl VoicePanel {
 
     pub fn test_pip_status(&self) -> String {
         self.pip_status()
+    }
+
+    /// The title the PiP paints for the active role. The publisher title labels
+    /// a confirmed connection that the current one no longer matches.
+    pub fn test_pip_title(&self) -> String {
+        self.pip_title()
+    }
+
+    /// Whether the PiP paints its close control as a live action or as the
+    /// status of a stop that is already in flight.
+    pub fn test_pip_close_enabled(&self) -> bool {
+        self.pip_close_enabled()
+    }
+
+    pub fn test_pip_settings_enabled(&self) -> bool {
+        self.pip_settings_enabled()
+    }
+
+    /// The confirmed owner identity of the publication, if an intent exists.
+    pub fn test_publish_access(&self) -> Option<(i64, u64, u64, Option<String>)> {
+        self.publish_access.as_ref().map(|access| {
+            (
+                access.room,
+                access.session,
+                access.attempt,
+                access.connection.clone(),
+            )
+        })
     }
 
     pub fn test_take_stream_mute(&mut self) -> Option<(u64, bool)> {

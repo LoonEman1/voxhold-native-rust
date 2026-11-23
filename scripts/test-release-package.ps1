@@ -11,6 +11,8 @@ $Tool = (Resolve-Path -LiteralPath $Tool).Path
 $Dist = (Resolve-Path -LiteralPath $Dist).Path
 $root = (New-Item -ItemType Directory -Path (Join-Path ([IO.Path]::GetTempPath()) "VoxHold smoke $([guid]::NewGuid())")).FullName
 $zip = Join-Path $Dist 'VoxHold-portable.zip'
+$manifest = Join-Path $Dist 'latest.json'
+$signature = Join-Path $Dist 'latest.json.sig'
 $portable = Join-Path $root 'Portable'
 $setup = Join-Path $root 'Setup'
 $originalAppData = $env:APPDATA
@@ -30,12 +32,26 @@ function Test-Update([string] $Install, $Index) {
     $exe = Join-Path $Install 'Voxhold.exe'
     $staging = Join-Path $root "staging-$(Split-Path -Leaf $Install)"
     $handshake = Join-Path $staging 'handshake.ok'
+    $ready = Join-Path $staging 'helper-ready.ok'
     $log = Join-Path $staging 'apply.log'
     $userFile = Join-Path $Install 'smoke-user-state.txt'
     $oldAsset = Join-Path $Install 'obsolete-smoke-asset.txt'
     $startMarker = Join-Path $root 'startup.ok'
     Remove-Item -LiteralPath $startMarker -ErrorAction SilentlyContinue
     & $Tool unpack --zip $zip --out (Join-Path $staging 'app')
+    Copy-Item -LiteralPath $zip -Destination (Join-Path $staging 'package.zip')
+    Copy-Item -LiteralPath $manifest -Destination (Join-Path $staging 'manifest.json')
+    Copy-Item -LiteralPath $signature -Destination (Join-Path $staging 'manifest.sig')
+    $signedManifest = Get-Content -LiteralPath $manifest -Raw | ConvertFrom-Json
+    @{
+        version = $Index.version
+        package_sha256 = $signedManifest.full.package_sha256
+        install_dir = $Install
+        created_at = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+        method = 'full'
+        manifest_sha256 = (Get-FileHash -LiteralPath $manifest -Algorithm SHA256).Hash.ToLowerInvariant()
+        manifest_signature = (Get-Content -LiteralPath $signature -Raw).Trim()
+    } | ConvertTo-Json -Compress | Set-Content -LiteralPath (Join-Path $staging 'ready.json') -Encoding utf8NoBOM
 
     # Model an older installation with an obsolete tracked asset and user data.
     'user state' | Set-Content -LiteralPath $userFile
@@ -59,16 +75,26 @@ function Test-Update([string] $Install, $Index) {
         }
 
         $helper = Join-Path $staging 'app/voxhold-updater.exe'
-        $arguments = "--pid $($client.Id) --target `"$Install`" --staged `"$staging`" --exe Voxhold.exe --handshake `"$handshake`""
+        $arguments = "--pid $($client.Id) --target `"$Install`" --staged `"$staging`" --exe Voxhold.exe --handshake `"$handshake`" --ready `"$ready`""
         $launcher = Start-Process -FilePath $helper -ArgumentList $arguments -WorkingDirectory $root -PassThru
         if (!$launcher.WaitForExit(10000) -or $launcher.ExitCode -ne 0) { throw 'Failed to launch the update helper.' }
-        if (!$client.CloseMainWindow() -or !$client.WaitForExit(10000)) { throw 'The old client did not close.' }
+        $deadline = [DateTime]::UtcNow.AddSeconds(15)
+        while (!(Test-Path -LiteralPath $ready)) {
+            if ($client.HasExited -or [DateTime]::UtcNow -ge $deadline) {
+                throw "The update helper did not confirm readiness for $Install."
+            }
+            Start-Sleep -Milliseconds 200
+        }
+        # This smoke test drives the helper directly. The window close button
+        # may hide the running client to the tray instead of ending its PID.
+        $client | Stop-Process
+        if (!$client.WaitForExit(10000)) { throw 'The old client did not exit.' }
 
         $deadline = [DateTime]::UtcNow.AddSeconds(55)
         while ([DateTime]::UtcNow -lt $deadline) {
             $progress = if (Test-Path -LiteralPath $log) { Get-Content -LiteralPath $log -Raw }
             if ($progress -match 'apply succeeded backup_removed=true') { break }
-            if ($progress -match 'apply failed|wait failed') { throw $progress }
+            if ($progress -match 'apply failed|wait failed|staged proof failed') { throw $progress }
             Start-Sleep -Milliseconds 200
         }
         if ($progress -notmatch 'apply succeeded backup_removed=true') { throw "Update did not finish. $progress" }

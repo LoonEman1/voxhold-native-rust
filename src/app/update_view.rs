@@ -316,13 +316,22 @@ impl Voxhold {
                         .font_weight(gpui::FontWeight::BOLD)
                         .child(format!("Версия {version} готова")),
                 );
-                panel = panel.child(self.update_note(
-                    update::ready_note(self.update.prefs.install_on_next_start),
-                    p,
-                ));
+                let note = if self.update.confirm_install {
+                    "Идёт звонок или трансляция. Нажмите ещё раз, чтобы перезапустить."
+                } else {
+                    update::ready_note(
+                        self.update.prefs.install_on_next_start,
+                        self.update.prefs.install_refused(&version),
+                    )
+                };
+                panel = panel.child(self.update_note(note, p));
                 panel = panel.child(update_button(
                     "update-install",
-                    "Перезапустить и установить",
+                    if self.update.confirm_install {
+                        "Подтвердить перезапуск"
+                    } else {
+                        "Перезапустить и установить"
+                    },
                     true,
                     true,
                     p,
@@ -405,6 +414,25 @@ impl Voxhold {
                 cx,
                 |view, cx| view.toggle_install_on_next_start(cx),
             ))
+            .into_any_element()
+    }
+
+    /// Blocking surface while the helper takes over the installation. The
+    /// process is about to exit, so the window only explains why.
+    pub(super) fn update_install_overlay(&self) -> AnyElement {
+        let p = self.palette;
+        div()
+            .id("update-installing")
+            .debug_selector(|| "update-installing".into())
+            .absolute()
+            .size_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(ink(p.bg))
+            .text_size(px(14.))
+            .text_color(ink(p.fg))
+            .child("Подготавливаем обновление…")
             .into_any_element()
     }
 

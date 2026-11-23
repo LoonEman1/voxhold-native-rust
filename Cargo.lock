@@ -6988,6 +6988,7 @@ dependencies = [
 name = "voxhold-updater"
 version = "0.1.0"
 dependencies = [
+ "serde_json",
  "tempfile",
  "voxhold-update",
  "windows-sys 0.61.2",

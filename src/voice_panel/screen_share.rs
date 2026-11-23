@@ -499,7 +499,7 @@ impl VoicePanel {
     }
 
     /// Whether this client owns an attempt. The action shows a status then.
-    pub(super) fn share_active(&self) -> bool {
+    pub(crate) fn share_active(&self) -> bool {
         matches!(
             self.screen.sharing.phase,
             Phase::Publishing | Phase::Live | Phase::Stopping

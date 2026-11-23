@@ -5,6 +5,7 @@
 //! with `ready.json`. Any failure removes the whole staging directory.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -18,6 +19,10 @@ use crate::package::{self, PackageIndex, PackedPackage};
 
 /// Marker written after a successful stage.
 pub const READY_FILE: &str = "ready.json";
+/// Exact signed `latest.json` bytes kept next to the staged package.
+pub const MANIFEST_FILE: &str = "manifest.json";
+/// Detached signature kept next to the staged package.
+pub const SIGNATURE_FILE: &str = "manifest.sig";
 /// Helper log inside the staging directory.
 pub const APPLY_LOG: &str = "apply.log";
 /// Downloaded or reconstructed full package.
@@ -26,10 +31,47 @@ pub const PACKAGE_FILE: &str = "package.zip";
 pub const DELTA_FILE: &str = "delta.zip";
 /// Unpacked next version.
 pub const APP_DIR: &str = "app";
+/// Marker written while this process owns the staging directory.
+///
+/// It carries `{pid, created_at}`. `cleanup_stale*` skips a version directory
+/// that contains it, so a second process of the same installation cannot delete
+/// an active download. A PID alone is not enough: Windows reuses process ids,
+/// so a claim older than [`ACTIVE_MAX_AGE`] is stale even when the id is alive
+/// again. The marker is removed once `ready.json` exists.
+pub const ACTIVE_FILE: &str = "downloading.lock";
+/// Age after which a `downloading.lock` claim is stale regardless of its PID.
+///
+/// A download that runs longer than this is already beyond every timeout in
+/// the update layer; treating the directory as abandoned recovers from a crash
+/// and from a reused PID.
+pub const ACTIVE_MAX_AGE: Duration = Duration::from_secs(6 * 60 * 60);
+/// A staging directory is assembled as `<version>.staging-<pid>` and renamed
+/// into place after its owner marker exists. Cleanup leaves such a directory
+/// alone while it is younger than this grace window, so the short creation
+/// race cannot delete a download that has not written its marker yet.
+pub const STAGING_GRACE: Duration = Duration::from_secs(5);
+/// Suffix of the temporary directory name used by [`begin_staging`].
+const STAGING_TEMP_MARKER: &str = ".staging-";
+/// Distinguishes two staging attempts of the same process.
+static STAGING_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 /// Number of download attempts: the first try plus one retry.
 pub const DOWNLOAD_ATTEMPTS: u32 = 2;
 /// Pause between download attempts.
 const RETRY_DELAY: Duration = Duration::from_millis(200);
+
+/// Body of [`ACTIVE_FILE`].
+#[derive(Debug, Serialize, Deserialize)]
+struct ActiveMarker {
+    pid: u32,
+    created_at: u64,
+}
+
+fn now_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
 
 /// How the staged package was produced.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -51,6 +93,13 @@ pub struct ReadyMarker {
     pub method: StageMethod,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub fallback_reason: Option<String>,
+    /// SHA-256 of `manifest.json`. Empty in a marker written before signed
+    /// proofs were stored; such a marker is not installable.
+    #[serde(default)]
+    pub manifest_sha256: String,
+    /// Base64 detached signature over `manifest.json`.
+    #[serde(default)]
+    pub manifest_signature: String,
 }
 
 /// A verified staged update.
@@ -61,6 +110,9 @@ pub struct StagedUpdate {
     pub staging_dir: PathBuf,
     pub app_dir: PathBuf,
     pub package_sha256: String,
+    /// `true` when the staging directory carries a signed manifest proof.
+    /// A marker without proof may be shown but is never installed.
+    pub verified: bool,
 }
 
 /// Result of a staging attempt.
@@ -161,9 +213,27 @@ fn updates_root_from_base(base: Option<&std::ffi::OsStr>) -> Result<PathBuf> {
     }
 }
 
-/// Staging directory for a version.
-pub fn staging_dir(root: &Path, version: &Version) -> PathBuf {
-    root.join(version.to_string())
+/// Stable per-installation key.
+///
+/// Two portable copies under the same Windows user share `%LOCALAPPDATA%`.
+/// Binding staging to the canonical install path keeps their preparations (and
+/// the helper's cleanup) apart.
+pub fn installation_id(install_dir: &Path) -> String {
+    let canonical =
+        std::fs::canonicalize(install_dir).unwrap_or_else(|_| install_dir.to_path_buf());
+    let text = canonical.to_string_lossy().to_lowercase();
+    crate::package::sha256_hex(text.as_bytes())[..16].to_string()
+}
+
+/// Updates root for one installation.
+pub fn updates_root_for(install_dir: &Path) -> Result<PathBuf> {
+    Ok(updates_root()?.join(installation_id(install_dir)))
+}
+
+/// Staging directory for a version of one installation.
+pub fn staging_dir(root: &Path, install_dir: &Path, version: &Version) -> PathBuf {
+    root.join(installation_id(install_dir))
+        .join(version.to_string())
 }
 
 /// Read `ready.json` from a staging directory.
@@ -173,13 +243,172 @@ pub fn read_ready(staging: &Path) -> Result<ReadyMarker> {
     serde_json::from_slice(&bytes).map_err(|_| UpdateError::NotStaged(staging.to_path_buf()))
 }
 
+/// Whether another process is currently downloading into `staging`.
+///
+/// The marker carries the owner's PID and creation time. A claim is stale when
+/// it is older than [`ACTIVE_MAX_AGE`] or its process is gone, so a crashed
+/// download and a reused PID cannot block a retry forever. A marker that
+/// cannot be read or parsed is treated as active: cleanup never deletes a
+/// claim it does not understand. A missing marker is not a claim.
+pub fn staging_is_active(staging: &Path) -> bool {
+    let marker = staging.join(ACTIVE_FILE);
+    match std::fs::read_to_string(&marker) {
+        Ok(text) => claim_is_active(&text),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(_) => true,
+    }
+}
+
+/// Interpret a claim body: the current JSON form or a legacy plain PID.
+fn claim_is_active(text: &str) -> bool {
+    let text = text.trim();
+    if text.is_empty() {
+        // An empty claim is unreadable in effect: never clean it up.
+        return true;
+    }
+    // Legacy markers before `created_at` carried only the PID. Such a claim
+    // has no age, so only the process check can release it.
+    if let Ok(pid) = text.parse::<u32>() {
+        return process_alive(pid);
+    }
+    let Ok(marker) = serde_json::from_str::<ActiveMarker>(text) else {
+        return true;
+    };
+    let age = now_seconds().saturating_sub(marker.created_at);
+    if age > ACTIVE_MAX_AGE.as_secs() {
+        return false;
+    }
+    process_alive(marker.pid)
+}
+
+#[cfg(windows)]
+fn process_alive(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, WAIT_TIMEOUT};
+    use windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE;
+    use windows_sys::Win32::System::Threading::{OpenProcess, WaitForSingleObject};
+
+    if pid == std::process::id() {
+        return true;
+    }
+    // SAFETY: the handle is closed on both paths below.
+    unsafe {
+        let handle = OpenProcess(SYNCHRONIZE, 0, pid);
+        if handle.is_null() {
+            // No process with this id (or no access): the claim is stale.
+            return false;
+        }
+        let wait = WaitForSingleObject(handle, 0);
+        CloseHandle(handle);
+        wait == WAIT_TIMEOUT
+    }
+}
+
+/// Outside Windows the client is not shipped; keeping an unclear claim is the
+/// safe choice for the shared library tests.
+#[cfg(not(windows))]
+fn process_alive(_pid: u32) -> bool {
+    true
+}
+
+/// Whether cleanup must leave the directory alone.
+///
+/// The claim protects an unfinished download. If `ready.json` already exists,
+/// the package is complete and an owner that crashed between the rename and
+/// the marker removal must not leak the directory forever.
+fn cleanup_protected(staging: &Path) -> bool {
+    staging_is_active(staging) && !staging.join(READY_FILE).is_file()
+}
+
+/// Whether a directory is a staging tree that is still being assembled.
+///
+/// `begin_staging` creates the tree under a temporary name, writes the claim
+/// and only then renames it to the version name. A cleanup that runs in the
+/// short window before the rename sees the temporary name; it must not remove
+/// it while it is fresh.
+fn staging_temp_young(name: &str, path: &Path) -> bool {
+    name.contains(STAGING_TEMP_MARKER) && modified_within(path, STAGING_GRACE)
+}
+
+/// Whether the directory was modified less than `window` ago.
+///
+/// A metadata or clock failure is handled conservatively: a tree is treated as
+/// fresh when its age cannot be established.
+fn modified_within(path: &Path, window: Duration) -> bool {
+    let Ok(modified) = std::fs::metadata(path).and_then(|metadata| metadata.modified()) else {
+        return false;
+    };
+    SystemTime::now()
+        .duration_since(modified)
+        .map(|age| age < window)
+        .unwrap_or(true)
+}
+
+/// Create the staging directory and claim it for this process.
+///
+/// The tree is built under `<version>.staging-<pid>` with the claim already in
+/// place and renamed to its final name atomically. Cleanup therefore never
+/// sees the final directory without a marker, and the temporary tree is
+/// skipped by [`cleanup_stale_keeping`] while it is younger than
+/// [`STAGING_GRACE`].
+fn begin_staging(staging: &Path) -> Result<()> {
+    let parent = staging.parent().ok_or_else(|| {
+        UpdateError::InvalidArgument(format!("staging path {} has no parent", staging.display()))
+    })?;
+    let name = staging
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .ok_or_else(|| {
+            UpdateError::InvalidArgument(format!("staging path {} has no name", staging.display()))
+        })?;
+    let sequence = STAGING_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let temporary = parent.join(format!(
+        "{name}{STAGING_TEMP_MARKER}{}-{sequence}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&temporary);
+    std::fs::create_dir_all(temporary.join(APP_DIR))
+        .map_err(|error| UpdateError::io(&temporary, error))?;
+    let marker = ActiveMarker {
+        pid: std::process::id(),
+        created_at: now_seconds(),
+    };
+    let body = serde_json::to_vec(&marker).expect("active marker serialization");
+    let marker_path = temporary.join(ACTIVE_FILE);
+    if let Err(error) = std::fs::write(&marker_path, body) {
+        let _ = std::fs::remove_dir_all(&temporary);
+        return Err(UpdateError::io(&marker_path, error));
+    }
+    match std::fs::rename(&temporary, staging) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let _ = std::fs::remove_dir_all(&temporary);
+            // Another process may have completed the same directory between
+            // our existence check and the rename. Do not let the caller clean
+            // a tree this process never created.
+            if staging.exists() {
+                Err(UpdateError::AlreadyDownloading(staging.to_path_buf()))
+            } else {
+                Err(UpdateError::io(staging, error))
+            }
+        }
+    }
+}
+
 /// Stage an update for the next start or an explicit install command.
 pub async fn stage_update(request: StageRequest<'_>) -> StageOutcome {
     match stage_inner(&request).await {
         Ok(Some(staged)) => StageOutcome::Ready(staged),
         Ok(None) => StageOutcome::UpToDate,
+        // The directory belongs to another process; deleting it here would
+        // destroy a download this process never started.
+        Err(error @ UpdateError::AlreadyDownloading(_)) => StageOutcome::Failed(error),
         Err(error) => {
-            let _ = cleanup_version(request.updates_root, &request.manifest.version).await;
+            let _ = cleanup_version(
+                request.updates_root,
+                request.install_dir,
+                &request.manifest.version,
+            )
+            .await;
             StageOutcome::Failed(error)
         }
     }
@@ -196,15 +425,19 @@ async fn stage_inner(request: &StageRequest<'_>) -> Result<Option<StagedUpdate>>
     }
 
     let version = candidate;
-    let staging = staging_dir(request.updates_root, &version);
+    let staging = staging_dir(request.updates_root, request.install_dir, &version);
     if staging.exists() {
+        // A directory claimed by another process is never removed: the second
+        // client may be mid-download. The UI already refuses to start a
+        // download without the per-installation mutex.
+        if staging_is_active(&staging) {
+            return Err(UpdateError::AlreadyDownloading(staging));
+        }
         tokio::fs::remove_dir_all(&staging)
             .await
             .map_err(|error| UpdateError::io(&staging, error))?;
     }
-    tokio::fs::create_dir_all(staging.join(APP_DIR))
-        .await
-        .map_err(|error| UpdateError::io(&staging, error))?;
+    begin_staging(&staging)?;
 
     check_cancelled(request)?;
     let base = base_package(request).await;
@@ -218,9 +451,7 @@ async fn stage_inner(request: &StageRequest<'_>) -> Result<Option<StagedUpdate>>
             Err(error) => {
                 delta_reason = Some(format!("{}: {error}", error.code()));
                 let _ = tokio::fs::remove_dir_all(&staging).await;
-                tokio::fs::create_dir_all(staging.join(APP_DIR))
-                    .await
-                    .map_err(|error| UpdateError::io(&staging, error))?;
+                begin_staging(&staging)?;
             }
         }
     }
@@ -404,6 +635,23 @@ fn ready(
     // behind: the next start would offer an update the user stopped.
     check_cancelled(request)?;
     let package_sha256 = request.manifest.full.package_sha256.clone();
+    // Keep the exact bytes and signature that were verified. A value built
+    // only in memory has no signature; its marker stays displayable but the
+    // startup check refuses to install it.
+    let manifest_bytes = if request.manifest.signed_bytes().is_empty() {
+        serde_json::to_vec(request.manifest.manifest()).expect("manifest serialization")
+    } else {
+        request.manifest.signed_bytes().to_vec()
+    };
+    let manifest_path = staging.join(MANIFEST_FILE);
+    std::fs::write(&manifest_path, &manifest_bytes)
+        .map_err(|error| UpdateError::io(&manifest_path, error))?;
+    let signature = request.manifest.signature().to_string();
+    if !signature.is_empty() {
+        let signature_path = staging.join(SIGNATURE_FILE);
+        std::fs::write(&signature_path, signature.as_bytes())
+            .map_err(|error| UpdateError::io(&signature_path, error))?;
+    }
     let marker = ReadyMarker {
         version: version.to_string(),
         package_sha256: package_sha256.clone(),
@@ -414,6 +662,8 @@ fn ready(
             .unwrap_or(0),
         method,
         fallback_reason,
+        manifest_sha256: package::sha256_hex(&manifest_bytes),
+        manifest_signature: signature,
     };
     let path = staging.join(READY_FILE);
     let temporary = staging.join("ready.json.tmp");
@@ -421,18 +671,129 @@ fn ready(
     // The marker is small; a synchronous write keeps the function total.
     std::fs::write(&temporary, bytes).map_err(|error| UpdateError::io(&temporary, error))?;
     std::fs::rename(&temporary, &path).map_err(|error| UpdateError::io(&path, error))?;
+    // The package is complete once `ready.json` exists. Releasing the claim
+    // afterwards means a cleanup never sees a half-finished directory.
+    let _ = std::fs::remove_file(staging.join(ACTIVE_FILE));
     Ok(StagedUpdate {
         version,
         method,
         app_dir: staging.join(APP_DIR),
         staging_dir: staging,
         package_sha256,
+        verified: !marker.manifest_signature.is_empty(),
     })
 }
 
-/// Remove one version's staging directory.
-pub async fn cleanup_version(root: &Path, version: &str) -> Result<()> {
-    let path = root.join(version);
+/// Verify the signed proof stored with a staged package, offline.
+///
+/// The startup scan and the app's pre-launch check use this via
+/// [`verify_staged_proof_with`]; the helper calls this immediately before
+/// [`crate::apply::apply_staged`]. Between the app's check and the helper's
+/// copy there is a window in which `app/package.json` could be replaced, so the
+/// helper must repeat the check itself instead of trusting the app.
+///
+/// Uses the embedded release key. Checks the detached signature, channel,
+/// version, install directory, full ZIP hash, the index inside the ZIP and the
+/// unpacked payload (including `app/package.json`).
+pub fn verify_staged_proof(staging: &Path, install_dir: &Path) -> Result<StagedUpdate> {
+    let key = crate::verify::embedded_public_key()?;
+    verify_staged_proof_with(staging, install_dir, &key)
+}
+
+/// [`verify_staged_proof`] with an explicit key for tests and local acceptance.
+pub fn verify_staged_proof_with(
+    staging: &Path,
+    install_dir: &Path,
+    key: &crate::verify::UpdatePublicKey,
+) -> Result<StagedUpdate> {
+    let marker = read_ready(staging)?;
+    let mismatch = || {
+        UpdateError::InvalidPackage(format!(
+            "staged proof at {} does not match the staged package",
+            staging.display()
+        ))
+    };
+    if marker.manifest_sha256.is_empty() || marker.manifest_signature.is_empty() {
+        return Err(mismatch());
+    }
+    let manifest_path = staging.join(MANIFEST_FILE);
+    let raw =
+        std::fs::read(&manifest_path).map_err(|error| UpdateError::io(&manifest_path, error))?;
+    if package::sha256_hex(&raw) != marker.manifest_sha256 {
+        return Err(mismatch());
+    }
+    let signature_path = staging.join(SIGNATURE_FILE);
+    let signature = match std::fs::read_to_string(&signature_path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            marker.manifest_signature.clone()
+        }
+        Err(error) => return Err(UpdateError::io(&signature_path, error)),
+    };
+    if signature.trim() != marker.manifest_signature.trim() {
+        return Err(mismatch());
+    }
+    let manifest = crate::verify::verify_and_parse(key, &raw, &signature)?;
+    if manifest.channel != crate::manifest::BETA_CHANNEL || manifest.version != marker.version {
+        return Err(mismatch());
+    }
+    let version = Version::parse(&marker.version)
+        .map_err(|_| UpdateError::InvalidVersion(marker.version.clone()))?;
+    if let Some(windows) = WindowsVersion::current() {
+        manifest.check_windows(&windows)?;
+    }
+    if marker.install_dir.is_empty() || !paths_equal(Path::new(&marker.install_dir), install_dir) {
+        return Err(mismatch());
+    }
+    if manifest.full.package_sha256 != marker.package_sha256 {
+        return Err(mismatch());
+    }
+    let package_path = staging.join(PACKAGE_FILE);
+    if package::sha256_file(&package_path)? != marker.package_sha256 {
+        return Err(mismatch());
+    }
+    let index = package::read_package_json_from_file(&package_path)?;
+    if index.version != marker.version {
+        return Err(mismatch());
+    }
+    // `package.json` is not part of its own file index, so a replaced copy
+    // would pass `verify_dir`. Compare it with the verified ZIP index and with
+    // the canonical bytes; the helper reads this file when it copies the tree.
+    let app = staging.join(APP_DIR);
+    let app_index = package::read_package_json_from_dir(&app)?;
+    if app_index != index {
+        return Err(mismatch());
+    }
+    let app_json_path = app.join(package::PACKAGE_JSON);
+    let app_json =
+        std::fs::read(&app_json_path).map_err(|error| UpdateError::io(&app_json_path, error))?;
+    if app_json != app_index.to_json() {
+        return Err(mismatch());
+    }
+    package::verify_dir(&app, &index)?;
+    Ok(StagedUpdate {
+        version,
+        method: marker.method,
+        staging_dir: staging.to_path_buf(),
+        app_dir: app,
+        package_sha256: marker.package_sha256,
+        verified: true,
+    })
+}
+
+/// Compare two paths the way Windows does: canonical when possible, then
+/// case-insensitively.
+fn paths_equal(left: &Path, right: &Path) -> bool {
+    let canonical_left = std::fs::canonicalize(left).unwrap_or_else(|_| left.to_path_buf());
+    let canonical_right = std::fs::canonicalize(right).unwrap_or_else(|_| right.to_path_buf());
+    canonical_left
+        .to_string_lossy()
+        .eq_ignore_ascii_case(&canonical_right.to_string_lossy())
+}
+
+/// Remove one version's staging directory for an installation.
+pub async fn cleanup_version(root: &Path, install_dir: &Path, version: &str) -> Result<()> {
+    let path = root.join(installation_id(install_dir)).join(version);
     match tokio::fs::remove_dir_all(&path).await {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -466,7 +827,9 @@ pub fn cleanup_stale(root: &Path, keep_version: Option<&str>) -> Result<usize> {
 /// directory of the running build still holds `helper.exe` and the handshake
 /// file, while a different directory may hold a staged update that must stay
 /// available to the user. Keeping both cannot be expressed with a single
-/// `keep_version`.
+/// `keep_version`. A directory claimed by an active download
+/// ([`ACTIVE_FILE`]) is skipped as well, even when it is not in
+/// `keep_versions`.
 pub fn cleanup_stale_keeping(root: &Path, keep_versions: &[&str]) -> Result<usize> {
     let entries = match std::fs::read_dir(root) {
         Ok(entries) => entries,
@@ -486,9 +849,61 @@ pub fn cleanup_stale_keeping(root: &Path, keep_versions: &[&str]) -> Result<usiz
         }
         let path = entry.path();
         let removed_ok = match entry.file_type() {
-            Ok(file_type) if file_type.is_dir() => std::fs::remove_dir_all(&path).is_ok(),
+            Ok(file_type) if file_type.is_dir() => {
+                // The directory may be a staging tree that is still being
+                // assembled under its temporary name; its marker is written
+                // immediately after creation, but the rename comes last.
+                if staging_temp_young(&name, &path) {
+                    continue;
+                }
+                // Another process claimed this directory for an active
+                // download; deleting it would break that update.
+                if cleanup_protected(&path) {
+                    continue;
+                }
+                std::fs::remove_dir_all(&path).is_ok()
+            }
             Ok(_) => std::fs::remove_file(&path).is_ok(),
             Err(_) => false,
+        };
+        if removed_ok {
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
+/// Remove the pre-per-install layout `updates\<version>` from the shared base.
+///
+/// Older builds staged directly under `%LOCALAPPDATA%\VoxHold\updates`. The
+/// current layout uses `updates\<installation-id>\<version>`, so an old
+/// version directory under the base is never used again. Only entries that
+/// look like that layout are removed: a directory whose name parses as a
+/// version, and stray files. Every other directory (an installation id) is
+/// left untouched, as is a version directory that another process is actively
+/// downloading into. Best-effort per entry, like [`cleanup_stale`].
+pub fn cleanup_legacy_layout(base: &Path) -> Result<usize> {
+    let entries = match std::fs::read_dir(base) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(UpdateError::io(base, error)),
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let path = entry.path();
+        let legacy_dir =
+            file_type.is_dir() && Version::parse(&name).is_ok() && !cleanup_protected(&path);
+        let removed_ok = if legacy_dir {
+            std::fs::remove_dir_all(&path).is_ok()
+        } else if file_type.is_file() {
+            std::fs::remove_file(&path).is_ok()
+        } else {
+            false
         };
         if removed_ok {
             removed += 1;
@@ -540,128 +955,5 @@ pub fn cleanup_after_install_payload(staging: &Path) -> Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn cleanup_removes_old_attempts() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("updates");
-        std::fs::create_dir_all(root.join("0.1.0").join(APP_DIR)).unwrap();
-        std::fs::create_dir_all(root.join("0.2.0").join(APP_DIR)).unwrap();
-        std::fs::write(root.join("stray.part"), b"partial").unwrap();
-        assert_eq!(cleanup_stale(&root, Some("0.2.0")).unwrap(), 2);
-        assert!(!root.join("0.1.0").exists());
-        assert!(root.join("0.2.0").exists());
-        assert!(!root.join("stray.part").exists());
-        assert_eq!(cleanup_stale(&root, None).unwrap(), 1);
-        assert!(root.exists());
-    }
-
-    #[cfg(windows)]
-    struct LockedFile(windows_sys::Win32::Foundation::HANDLE);
-
-    #[cfg(windows)]
-    impl Drop for LockedFile {
-        fn drop(&mut self) {
-            // SAFETY: the handle was created by `CreateFileW` and is closed once.
-            unsafe { windows_sys::Win32::Foundation::CloseHandle(self.0) };
-        }
-    }
-
-    #[cfg(windows)]
-    fn lock_without_sharing(path: &Path) -> LockedFile {
-        use std::os::windows::ffi::OsStrExt;
-        use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
-        use windows_sys::Win32::Storage::FileSystem::{
-            CreateFileW, FILE_ATTRIBUTE_NORMAL, OPEN_EXISTING,
-        };
-
-        const GENERIC_READ: u32 = 0x8000_0000;
-        let wide: Vec<u16> = path
-            .as_os_str()
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect();
-        // SAFETY: `wide` is NUL-terminated and outlives the call.
-        let handle = unsafe {
-            CreateFileW(
-                wide.as_ptr(),
-                GENERIC_READ,
-                0,
-                std::ptr::null(),
-                OPEN_EXISTING,
-                FILE_ATTRIBUTE_NORMAL,
-                std::ptr::null_mut(),
-            )
-        };
-        assert_ne!(handle, INVALID_HANDLE_VALUE, "CreateFileW failed");
-        LockedFile(handle)
-    }
-
-    /// The first start after an update still sees a relocated helper image
-    /// that waits for its handshake. Its version directory must be skipped
-    /// while the neighbouring leftovers are removed.
-    #[cfg(windows)]
-    #[test]
-    fn cleanup_stale_skips_a_locked_entry() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("updates");
-        let busy = root.join("0.1.0");
-        std::fs::create_dir_all(&busy).unwrap();
-        let helper = busy.join(crate::apply::HELPER_FILE);
-        std::fs::write(&helper, b"helper image").unwrap();
-        std::fs::create_dir_all(root.join("0.2.0").join(APP_DIR)).unwrap();
-        std::fs::write(root.join("stray.part"), b"partial").unwrap();
-
-        // Emulates a running helper image: the file is opened without sharing,
-        // so `remove_dir_all` cannot delete its directory.
-        let lock = lock_without_sharing(&helper);
-        let removed = cleanup_stale(&root, None).unwrap();
-        assert_eq!(removed, 2);
-        assert!(busy.exists());
-        assert!(helper.exists());
-        assert!(!root.join("0.2.0").exists());
-        assert!(!root.join("stray.part").exists());
-
-        drop(lock);
-        assert_eq!(cleanup_stale(&root, None).unwrap(), 1);
-        assert!(!busy.exists());
-    }
-
-    #[test]
-    fn payload_cleanup_keeps_the_relocated_helper() {
-        let temp = tempfile::tempdir().unwrap();
-        let staging = temp.path().join("0.2.0");
-        std::fs::create_dir_all(staging.join(APP_DIR)).unwrap();
-        std::fs::write(staging.join(APP_DIR).join("Voxhold.exe"), b"exe").unwrap();
-        std::fs::write(staging.join(PACKAGE_FILE), b"zip").unwrap();
-        std::fs::write(staging.join(READY_FILE), b"{}").unwrap();
-        std::fs::write(staging.join(crate::apply::HELPER_FILE), b"helper").unwrap();
-        std::fs::write(staging.join(APPLY_LOG), b"log").unwrap();
-
-        cleanup_after_install_payload(&staging).unwrap();
-        assert!(!staging.join(APP_DIR).exists());
-        assert!(!staging.join(PACKAGE_FILE).exists());
-        assert!(!staging.join(READY_FILE).exists());
-        assert!(staging.join(crate::apply::HELPER_FILE).exists());
-        assert!(staging.join(APPLY_LOG).exists());
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn updates_root_requires_local_appdata() {
-        assert!(matches!(
-            updates_root_from_base(None),
-            Err(UpdateError::InvalidArgument(_))
-        ));
-        assert!(matches!(
-            updates_root_from_base(Some(std::ffi::OsStr::new(""))),
-            Err(UpdateError::InvalidArgument(_))
-        ));
-        let root =
-            updates_root_from_base(Some(std::ffi::OsStr::new(r"C:\Users\test\AppData\Local")))
-                .unwrap();
-        assert!(root.ends_with(Path::new("VoxHold").join("updates")));
-    }
-}
+#[path = "stage_tests.rs"]
+mod tests;

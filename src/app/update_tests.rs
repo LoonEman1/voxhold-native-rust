@@ -1,7 +1,7 @@
 //! Update integration tests: state mapping, popup layout, cancellation and the
 //! helper launch seam. No test performs a real network request.
 
-use super::update_ops::{phase_counter, LaunchRequest, ProgressCounters, UpdateLauncher};
+use super::update_progress::{phase_counter, ProgressCounters};
 use super::*;
 use crate::update::{self, RetryKind, UpdatePhase};
 use gpui::{px, size, Modifiers, TestAppContext, VisualTestContext};
@@ -76,7 +76,7 @@ pub(super) fn make_app(
     (window, view, dir)
 }
 
-fn staged_update(dir: &Path) -> StagedUpdate {
+pub(super) fn staged_update(dir: &Path) -> StagedUpdate {
     staged_update_with_exe(dir, Some("Voxhold.exe"))
 }
 
@@ -94,6 +94,7 @@ fn staged_update_with_exe(dir: &Path, exe: Option<&str>) -> StagedUpdate {
         staging_dir: staging,
         app_dir: app,
         package_sha256: "a".repeat(64),
+        verified: true,
     }
 }
 
@@ -832,6 +833,7 @@ async fn a_cancelled_download_returns_to_available_without_a_new_auto_start(
             v.update.declined.as_ref(),
             &v.update.auto_suppressed,
             &v.update.auto_started,
+            v.update.single_instance,
         ));
     });
 }
@@ -893,181 +895,6 @@ async fn a_404_or_a_broken_signature_becomes_an_error_state(cx: &mut TestAppCont
     });
 }
 
-struct RecordingLauncher {
-    seen: Rc<RefCell<Vec<LaunchRequest>>>,
-    fail: bool,
-}
-
-impl UpdateLauncher for RecordingLauncher {
-    fn launch(&self, request: &LaunchRequest) -> Result<(), String> {
-        self.seen.borrow_mut().push(LaunchRequest {
-            exe: request.exe.clone(),
-            args: request.args.clone(),
-        });
-        if self.fail {
-            Err("Не удалось запустить установщик.".into())
-        } else {
-            Ok(())
-        }
-    }
-}
-
-#[gpui::test]
-async fn install_uses_absolute_arguments_and_never_detached(cx: &mut TestAppContext) {
-    cx.update(|cx| gpui_component::init(cx));
-    let (window, view, dir) = make_app(cx);
-    let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
-    let staged = staged_update(&dir);
-    let seen = Rc::new(RefCell::new(Vec::new()));
-    let install = dir.join("install");
-    let staging = staged.staging_dir.clone();
-    visual.update(|window, app| {
-        view.update(app, |v, cx| {
-            v.update.launcher = Box::new(RecordingLauncher {
-                seen: seen.clone(),
-                fail: false,
-            });
-            v.update.phase = UpdatePhase::Ready {
-                version: "0.2.0".into(),
-                staged: staged.clone(),
-            };
-            v.update.install_dir = install.clone();
-            v.install_ready(window, cx);
-        });
-    });
-    let seen = seen.borrow();
-    assert_eq!(seen.len(), 1);
-    let request = &seen[0];
-    assert_eq!(request.exe, staged.app_dir.join("voxhold-updater.exe"));
-    assert!(!request.has_arg("--detached"));
-    assert_eq!(
-        request.value_after("--target").as_deref(),
-        Some(install.to_string_lossy().as_ref())
-    );
-    assert_eq!(
-        request.value_after("--staged").as_deref(),
-        Some(staging.to_string_lossy().as_ref())
-    );
-    let handshake = request.value_after("--handshake").expect("handshake");
-    assert!(Path::new(&handshake).is_absolute());
-    assert!(handshake.ends_with("handshake.ok"));
-    assert_eq!(request.value_after("--exe").as_deref(), Some("Voxhold.exe"));
-    let expected_pid = std::process::id().to_string();
-    assert_eq!(
-        request.value_after("--pid").as_deref(),
-        Some(expected_pid.as_str())
-    );
-    view.read_with(&*visual, |v, _| {
-        assert!(v.update.quit_requested);
-        assert!(matches!(v.update.phase, UpdatePhase::Installing));
-    });
-}
-
-#[gpui::test]
-async fn a_failed_helper_launch_keeps_the_app_in_the_error_state(cx: &mut TestAppContext) {
-    cx.update(|cx| gpui_component::init(cx));
-    let (window, view, dir) = make_app(cx);
-    let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
-    let staged = staged_update(&dir);
-    let seen = Rc::new(RefCell::new(Vec::new()));
-    visual.update(|window, app| {
-        view.update(app, |v, cx| {
-            v.update.launcher = Box::new(RecordingLauncher {
-                seen: seen.clone(),
-                fail: true,
-            });
-            v.update.phase = UpdatePhase::Ready {
-                version: "0.2.0".into(),
-                staged: staged.clone(),
-            };
-            v.update.install_dir = dir.join("install");
-            v.install_ready(window, cx);
-        });
-    });
-    assert_eq!(seen.borrow().len(), 1);
-    view.read_with(&*visual, |v, _| {
-        assert!(!v.update.quit_requested);
-        match &v.update.phase {
-            UpdatePhase::Error { retry, .. } => assert_eq!(*retry, RetryKind::Install),
-            other => panic!("expected an install error, got {other:?}"),
-        }
-    });
-}
-
-#[gpui::test]
-async fn install_falls_back_to_the_packaged_exe_name(cx: &mut TestAppContext) {
-    cx.update(|cx| gpui_component::init(cx));
-    let (window, view, dir) = make_app(cx);
-    let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
-    // The package ships `Voxhold.exe`; the running development binary has a
-    // different name and must not be handed to the helper.
-    let staged = staged_update(&dir);
-    let seen = Rc::new(RefCell::new(Vec::new()));
-    visual.update(|window, app| {
-        view.update(app, |v, cx| {
-            v.update.launcher = Box::new(RecordingLauncher {
-                seen: seen.clone(),
-                fail: false,
-            });
-            v.update.exe_name = "voxhold-native-rust.exe".into();
-            v.update.phase = UpdatePhase::Ready {
-                version: "0.2.0".into(),
-                staged: staged.clone(),
-            };
-            v.update.install_dir = dir.join("install");
-            v.install_ready(window, cx);
-        });
-    });
-    let seen = seen.borrow();
-    assert_eq!(seen.len(), 1);
-    assert_eq!(seen[0].value_after("--exe").as_deref(), Some("Voxhold.exe"));
-    view.read_with(&*visual, |v, _| {
-        assert!(v.update.quit_requested);
-        assert!(matches!(v.update.phase, UpdatePhase::Installing));
-    });
-}
-
-#[gpui::test]
-async fn a_package_without_the_app_image_never_quits(cx: &mut TestAppContext) {
-    cx.update(|cx| gpui_component::init(cx));
-    let (window, view, dir) = make_app(cx);
-    let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
-    let staged = staged_update_with_exe(&dir, None);
-    let seen = Rc::new(RefCell::new(Vec::new()));
-    visual.update(|window, app| {
-        view.update(app, |v, cx| {
-            v.update.launcher = Box::new(RecordingLauncher {
-                seen: seen.clone(),
-                fail: false,
-            });
-            v.update.exe_name = "voxhold-native-rust.exe".into();
-            v.update.phase = UpdatePhase::Ready {
-                version: "0.2.0".into(),
-                staged: staged.clone(),
-            };
-            v.update.install_dir = dir.join("install");
-            v.install_ready(window, cx);
-        });
-    });
-    assert!(
-        seen.borrow().is_empty(),
-        "the helper must not start without an image"
-    );
-    view.read_with(&*visual, |v, _| {
-        assert!(!v.update.quit_requested, "the app stays open");
-        match &v.update.phase {
-            UpdatePhase::Error { message, retry } => {
-                assert_eq!(*retry, RetryKind::Install);
-                assert!(
-                    message.contains("voxhold-native-rust.exe"),
-                    "the error names the missing image: {message}"
-                );
-            }
-            other => panic!("expected an install error, got {other:?}"),
-        }
-    });
-}
-
 #[cfg(windows)]
 #[test]
 fn a_busy_helper_does_not_break_the_startup_scan() {
@@ -1125,6 +952,8 @@ fn a_busy_helper_does_not_break_the_startup_scan() {
         created_at: 1,
         method: StageMethod::Full,
         fallback_reason: None,
+        manifest_sha256: String::new(),
+        manifest_signature: String::new(),
     };
     std::fs::write(
         ready.join(voxhold_update::stage::READY_FILE),
@@ -1139,15 +968,22 @@ fn a_busy_helper_does_not_break_the_startup_scan() {
         &semver::Version::new(0, 1, 0),
         Some(root.as_path()),
         true,
+        true,
     );
     assert!(
         scan.error.is_none(),
         "a locked helper is not a startup error"
     );
-    assert!(scan.ready.is_some(), "the ready marker is still reported");
+    assert!(
+        scan.ready.is_none(),
+        "a marker without signed proof is shown as unavailable, not installable"
+    );
+    assert!(
+        !ready.exists(),
+        "an old marker without proof is removed for a fresh preparation"
+    );
     assert!(busy.exists(), "the locked helper directory is skipped");
     assert!(!root.join("0.1.8").exists(), "other leftovers are removed");
-    assert!(ready.exists(), "the ready directory is preserved");
 
     std::fs::remove_dir_all(&temp).ok();
 }

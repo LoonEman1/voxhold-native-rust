@@ -6,6 +6,8 @@
 //! and closing the panel only hide the surface: neither drops a check, a
 //! download or a staged package, so the generation is not bumped by them.
 
+use super::update_install::acquire_install_lock;
+use super::update_progress::{phase_counter, ProgressCounters};
 use super::*;
 use crate::update::{self, RetryKind, UpdatePhase, UpdatePrefs};
 use std::ffi::OsString;
@@ -18,17 +20,26 @@ use voxhold_update::error::UpdateError;
 use voxhold_update::manifest::{VerifiedManifest, WindowsVersion};
 use voxhold_update::package::read_package_json_from_dir;
 use voxhold_update::stage::{
-    stage_update, updates_root, PhaseFn, StageOutcome, StagePhase, StageRequest, StagedUpdate,
+    installation_id, stage_update, updates_root, updates_root_for, StageOutcome, StagePhase,
+    StageRequest, StagedUpdate,
 };
-use voxhold_update::verify::embedded_public_key;
+use voxhold_update::verify::{embedded_public_key, UpdatePublicKey};
 
 const START_DELAY: Duration = Duration::from_secs(3);
+/// Startup budget for finding and verifying a ready package. A slower disk
+/// continues the normal start; the late result only updates the panel.
+const STARTUP_SCAN_BUDGET: Duration = Duration::from_millis(500);
+/// Upper bound for showing a scan that missed the 500 ms budget. A hung disk
+/// must not delay the 3 s check clock forever.
+const LATE_SCAN_WAIT: Duration = Duration::from_secs(5);
 const CHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 const SECOND_CLEANUP_DELAY: Duration = Duration::from_secs(10);
 const PROGRESS_TICK: Duration = Duration::from_millis(100);
-const HELPER_NAME: &str = "voxhold-updater.exe";
+pub(super) const HELPER_NAME: &str = "voxhold-updater.exe";
+pub(super) const HELPER_READY_NAME: &str = "helper-ready.ok";
+pub(super) const HELPER_READY_TIMEOUT: Duration = Duration::from_secs(15);
 const PACKAGE_EXE_NAME: &str = "Voxhold.exe";
-const HANDSHAKE_NAME: &str = "handshake.ok";
+pub(super) const HANDSHAKE_NAME: &str = "handshake.ok";
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// One helper launch request. Paths are absolute.
@@ -79,80 +90,6 @@ impl UpdateLauncher for ProcessUpdateLauncher {
     }
 }
 
-/// Progress and phase shared between staging and the UI poller.
-///
-/// Staging decides when a download starts again after a failed delta; the UI
-/// must not guess that from byte counters, because a full package restarts at
-/// zero after the delta already reported its total.
-pub(super) struct ProgressCounters {
-    state: Mutex<ProgressState>,
-}
-
-#[derive(Clone, Copy)]
-struct ProgressState {
-    downloaded: u64,
-    total: u64,
-    phase: StagePhase,
-}
-
-impl ProgressCounters {
-    pub(super) fn new(total: u64) -> Self {
-        Self {
-            state: Mutex::new(ProgressState {
-                downloaded: 0,
-                total,
-                phase: StagePhase::Downloading { total },
-            }),
-        }
-    }
-
-    /// Record download bytes without changing the phase.
-    pub(super) fn set(&self, downloaded: u64, total: Option<u64>) {
-        let mut state = self.lock();
-        state.downloaded = downloaded;
-        if let Some(total) = total.filter(|value| *value > 0) {
-            state.total = total;
-        }
-    }
-
-    /// Start a new download attempt: zero bytes and a new expected total.
-    pub(super) fn restart(&self, total: u64) {
-        *self.lock() = ProgressState {
-            downloaded: 0,
-            total,
-            phase: StagePhase::Downloading { total },
-        };
-    }
-
-    pub(super) fn set_phase(&self, phase: StagePhase) {
-        self.lock().phase = phase;
-    }
-
-    pub(super) fn snapshot(&self) -> (u64, u64) {
-        let state = self.lock();
-        (state.downloaded, state.total)
-    }
-
-    pub(super) fn phase(&self) -> StagePhase {
-        self.lock().phase
-    }
-
-    fn lock(&self) -> std::sync::MutexGuard<'_, ProgressState> {
-        self.state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-}
-
-/// Phase callback for staging: it owns the counters the poller reads.
-/// Staging announces every transition; no counters are inferred here.
-pub(super) fn phase_counter(progress: Arc<ProgressCounters>) -> PhaseFn {
-    Arc::new(move |phase| match phase {
-        StagePhase::Downloading { total } => progress.restart(total),
-        StagePhase::Preparing => progress.set_phase(StagePhase::Preparing),
-    })
-}
-
 /// Controller state owned by `Voxhold`.
 pub(super) struct UpdateUi {
     pub phase: UpdatePhase,
@@ -172,10 +109,30 @@ pub(super) struct UpdateUi {
     pub hover: bool,
     pub prefs_error: Option<String>,
     pub prefs_path: Option<PathBuf>,
+    /// Helper sidecar that records an automatic-install refusal after a
+    /// failed apply. It falls back to the installation directory when no
+    /// per-user preference path exists.
+    pub refusal_path: Option<PathBuf>,
+    /// Named mutex held for this installation. `false` means another process
+    /// owns the same installation, so this one must not clean staging, start a
+    /// download or install automatically.
+    pub single_instance: bool,
+    #[cfg(windows)]
+    pub install_lock: Option<isize>,
     pub install_dir: PathBuf,
     pub exe_name: String,
-    /// Test seam: use a temporary updates root instead of `LOCALAPPDATA`.
+    /// Test seam: replaces the real updates root.
+    ///
+    /// `start_update` reads it as the per-installation root that directly
+    /// holds version directories, exactly like
+    /// `updates_root_for(install_dir)`. `start_download` keeps the
+    /// `stage_update` contract and treats it as the shared *base*, appending
+    /// the installation id itself. Production leaves this `None`, so the two
+    /// readings never meet; tests only use the scan.
     pub root_override: Option<PathBuf>,
+    /// Test seam: verification key for the staged proof. `None` uses the
+    /// embedded release key.
+    pub proof_key: Option<UpdatePublicKey>,
     /// Test seam: observe or fail the helper launch.
     pub launcher: Box<dyn UpdateLauncher>,
     /// Test seam: a successful launch asked the app to quit.
@@ -185,6 +142,14 @@ pub(super) struct UpdateUi {
     /// Test seam: when false, a download records the start but does not spawn
     /// the staging task, so tests never touch a real network.
     pub download_task_enabled: bool,
+    /// Test seam: production waits for `helper-ready.ok` before quitting.
+    pub wait_for_helper_ready: bool,
+    /// A manual install during a call needs one explicit confirmation.
+    pub confirm_install: bool,
+    /// A helper process was started successfully and has not confirmed yet.
+    /// A manual retry after a timeout must not start a second helper: two
+    /// copies would race for the same installation.
+    pub helper_pending: bool,
     pub clock_task: Option<gpui::Task<()>>,
     pub work_task: Option<gpui::Task<()>>,
     pub cleanup_task: Option<gpui::Task<()>>,
@@ -225,14 +190,22 @@ impl UpdateUi {
             panel_open: false,
             hover: false,
             prefs_error: None,
+            refusal_path: Some(update::refusal_path(prefs_path.as_deref(), &install_dir)),
+            single_instance: true,
+            #[cfg(windows)]
+            install_lock: None,
             prefs_path,
             install_dir,
             exe_name,
             root_override: None,
+            proof_key: None,
             launcher: Box::new(ProcessUpdateLauncher),
             quit_requested: false,
             download_starts: 0,
             download_task_enabled: true,
+            wait_for_helper_ready: !cfg!(test),
+            confirm_install: false,
+            helper_pending: false,
             clock_task: None,
             work_task: None,
             cleanup_task: None,
@@ -262,31 +235,101 @@ impl Voxhold {
         &mut self,
         after_update: bool,
         handshake_written: bool,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // The helper can leave a refusal marker after a failed apply. Only the
+        // process that owns the installation mutex merges it; a second
+        // process leaves the shared preference file alone.
         let install = self.update.install_dir.clone();
-        let root_override = self.update.root_override.clone();
+        #[cfg(windows)]
+        if self.update.install_lock.is_none() {
+            match acquire_install_lock(&install) {
+                Some(handle) => self.update.install_lock = Some(handle),
+                None => self.update.single_instance = false,
+            }
+        }
+        let single_instance = self.update.single_instance;
+        if single_instance {
+            self.merge_install_refusal();
+        }
+        let root_override = self
+            .update
+            .root_override
+            .clone()
+            .or_else(|| updates_root_for(&install).ok());
         let current = update::current_version();
-        let recovery_allowed = startup_recovery_allowed(after_update, handshake_written);
+        // A second process of the same installation must not finish or clean
+        // an operation the owner is running.
+        let (recovery_allowed, cleanup_staging) = startup_scan_flags(
+            single_instance,
+            startup_recovery_allowed(after_update, handshake_written),
+        );
         let executor = cx.background_executor().clone();
-        let scan_executor = cx.background_executor().clone();
-        self.update.clock_task = Some(cx.spawn(async move |this, cx| {
-            let scan = scan_executor
-                .spawn(async move {
-                    update::startup_scan(
-                        &install,
-                        &current,
-                        root_override.as_deref(),
-                        recovery_allowed,
-                    )
-                })
-                .await;
-            let _ = this.update(cx, |view, cx| view.apply_startup_scan(scan, cx));
+        // Run the disk scan off the UI thread. The first 500 ms are the only
+        // window for an automatic install decision; a late answer may still
+        // update the panel but cannot make this launch quit.
+        let slot = Arc::new(Mutex::new(None::<update::StartupScan>));
+        let thread_slot = slot.clone();
+        std::thread::spawn(move || {
+            let scan = update::startup_scan(
+                &install,
+                &current,
+                root_override.as_deref(),
+                recovery_allowed,
+                cleanup_staging,
+            );
+            if let Ok(mut slot) = thread_slot.lock() {
+                *slot = Some(scan);
+            }
+        });
+        self.update.clock_task = Some(cx.spawn_in(window, async move |this, window| {
+            executor.timer(STARTUP_SCAN_BUDGET).await;
+            let early = slot.lock().ok().and_then(|mut slot| slot.take());
+            let mut auto = false;
+            if let Some(scan) = early {
+                auto = this
+                    .update_in(window, |view, window, cx| {
+                        let auto = view.apply_startup_scan_auto(scan, true, cx);
+                        if auto {
+                            view.install_ready_confirmed(window, cx, true);
+                        }
+                        // The clock must stop only when the helper really
+                        // started; a launch error keeps the app running and
+                        // the 3 s / 6 h checks alive.
+                        auto && view.install_started()
+                    })
+                    .unwrap_or(false);
+            } else {
+                // The decision is closed now. Keep a short, bounded wait for
+                // the late scan so its result can still show "Ready" in the
+                // panel; a hung disk must not keep the clock from starting.
+                let deadline = std::time::Instant::now() + LATE_SCAN_WAIT;
+                loop {
+                    executor.timer(Duration::from_millis(100)).await;
+                    let late = slot.lock().ok().and_then(|mut slot| slot.take());
+                    if let Some(scan) = late {
+                        let _ = this.update_in(window, |view, window, cx| {
+                            view.apply_startup_scan_auto(scan, false, cx);
+                            let _ = window;
+                        });
+                        break;
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        break;
+                    }
+                }
+            }
+            if auto {
+                // The helper owns the next step; the normal clock would only
+                // race the process exit.
+                return;
+            }
             executor.timer(START_DELAY).await;
-            let _ = this.update(cx, |view, cx| view.check_updates(cx));
+            let _ = this.update_in(window, |view, _, cx| view.check_updates(cx));
             loop {
                 executor.timer(CHECK_INTERVAL).await;
-                let _ = this.update(cx, |view, cx| view.check_updates(cx));
+                let _ = this.update_in(window, |view, _, cx| view.check_updates(cx));
             }
         }));
 
@@ -294,7 +337,7 @@ impl Voxhold {
         let cleanup_executor = cx.background_executor().clone();
         self.update.cleanup_task = Some(cx.spawn(async move |this, cx| {
             executor.timer(SECOND_CLEANUP_DELAY).await;
-            let Ok((root, ready, active)) = this.update(cx, |view, _| {
+            let Ok((root, ready, active, single_instance)) = this.update(cx, |view, _| {
                 let active = match &view.update.phase {
                     UpdatePhase::Downloading { version, .. }
                     | UpdatePhase::Preparing { version } => Some(version.clone()),
@@ -307,10 +350,16 @@ impl Voxhold {
                         .as_ref()
                         .map(|staged| staged.version.to_string()),
                     active,
+                    view.update.single_instance,
                 )
             }) else {
                 return;
             };
+            // A second process only observes; it never deletes the staging
+            // tree of the instance that owns the update mutex.
+            if !single_instance {
+                return;
+            }
             let Some(root) = root else {
                 return;
             };
@@ -330,7 +379,21 @@ impl Voxhold {
         }));
     }
 
+    #[cfg(test)]
     pub(super) fn apply_startup_scan(&mut self, scan: update::StartupScan, cx: &mut Context<Self>) {
+        self.apply_startup_scan_auto(scan, false, cx);
+    }
+
+    /// Apply the startup scan and optionally decide that this launch installs.
+    ///
+    /// `allow_auto` is false for a result that arrives after the 500 ms budget:
+    /// the package is still shown, but the launch must continue normally.
+    pub(super) fn apply_startup_scan_auto(
+        &mut self,
+        scan: update::StartupScan,
+        allow_auto: bool,
+        cx: &mut Context<Self>,
+    ) -> bool {
         if let Some(root) = scan.root {
             self.update.root = Some(root);
         }
@@ -341,29 +404,34 @@ impl Voxhold {
         if let Some(warning) = scan.warning {
             eprintln!("voxhold-update: {warning}");
         }
-        if let Some(staged) = scan.ready {
-            if matches!(
-                &self.update.phase,
-                UpdatePhase::Downloading { .. }
-                    | UpdatePhase::Preparing { .. }
-                    | UpdatePhase::Installing
-            ) {
-                return;
-            }
-            self.update.ready = Some(staged.clone());
-            // A startup scan can finish after the 3 s check started. The
-            // staged update wins; invalidate the older check answer.
-            self.update.generation = self.update.generation.wrapping_add(1);
-            if let Some(cancel) = &self.update.cancel {
-                cancel.cancel();
-            }
-            self.update.cancel = None;
-            self.update.phase = UpdatePhase::Ready {
-                version: staged.version.to_string(),
-                staged,
-            };
-            cx.notify();
+        let Some(staged) = scan.ready else {
+            return false;
+        };
+        if matches!(
+            &self.update.phase,
+            UpdatePhase::Downloading { .. }
+                | UpdatePhase::Preparing { .. }
+                | UpdatePhase::Installing
+        ) {
+            return false;
         }
+        self.update.ready = Some(staged.clone());
+        // A startup scan can finish after the 3 s check started. The
+        // staged update wins; invalidate the older check answer.
+        self.update.generation = self.update.generation.wrapping_add(1);
+        if let Some(cancel) = &self.update.cancel {
+            cancel.cancel();
+        }
+        self.update.cancel = None;
+        let auto = allow_auto
+            && self.update.single_instance
+            && update::should_auto_install(&self.update.prefs, &staged, &update::current_version());
+        self.update.phase = UpdatePhase::Ready {
+            version: staged.version.to_string(),
+            staged,
+        };
+        cx.notify();
+        auto
     }
 
     /// Fetch and verify the signed manifest, one check at a time.
@@ -469,6 +537,7 @@ impl Voxhold {
                                     self.update.declined.as_ref(),
                                     &self.update.auto_suppressed,
                                     &self.update.auto_started,
+                                    self.update.single_instance,
                                 ) =>
                             {
                                 self.update.auto_started.insert(version.clone());
@@ -507,7 +576,20 @@ impl Voxhold {
     }
 
     /// Start the explicit download of the available version.
+    ///
+    /// The manual button is refused for a process that does not own the
+    /// per-installation mutex: the staging directory belongs to the instance
+    /// that does, and `stage_update` must not remove it. Nothing on disk is
+    /// touched in that case.
     pub(super) fn start_download(&mut self, cx: &mut Context<Self>) {
+        if !self.update.single_instance {
+            self.update.phase = UpdatePhase::Error {
+                message: "Обновление уже скачивает другая копия приложения.".into(),
+                retry: RetryKind::Download,
+            };
+            cx.notify();
+            return;
+        }
         let Some(manifest) = self.update.verified.clone() else {
             return;
         };
@@ -522,7 +604,12 @@ impl Voxhold {
             },
             _ => return,
         };
-        let root = match self
+        let install_dir = self.update.install_dir.clone();
+        // `stage_update` takes the shared base and adds the installation id
+        // itself. The cleanup task needs the per-install root.
+        // `root_override` is therefore a *base* here, while `start_update`
+        // treats it as the per-install root that directly holds versions.
+        let base_root = match self
             .update
             .root_override
             .clone()
@@ -539,8 +626,7 @@ impl Voxhold {
                 return;
             }
         };
-        self.update.root = Some(root.clone());
-        let install_dir = self.update.install_dir.clone();
+        self.update.root = Some(base_root.join(installation_id(&install_dir)));
         let installed = read_package_json_from_dir(&install_dir).ok();
         let current = update::current_version();
         let cancel = CancelToken::new();
@@ -572,7 +658,7 @@ impl Voxhold {
                         current_version: &current,
                         install_dir: &install_dir,
                         installed: installed.as_ref(),
-                        updates_root: &root,
+                        updates_root: &base_root,
                         cancel,
                         progress: Some(Arc::new(move |downloaded, total| {
                             progress.set(downloaded, total);
@@ -776,112 +862,6 @@ impl Voxhold {
         }
     }
 
-    /// Stop voice, media and preview work and persist the current settings.
-    fn prepare_for_install(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        #[cfg(feature = "voxhold-media")]
-        self.abandon_voice(window, cx);
-        self.stop_voice_preview();
-        self.stop_voice_meter();
-        if self.recordings_dialog.is_some() {
-            self.close_recordings(false, window, cx);
-        }
-        if self.media.viewer.is_some() {
-            self.close_viewer(window);
-        }
-        self.preview_wakeup = None;
-        self.preview_wake_at = None;
-        self.save_shell();
-        // Atomic and synchronous: the helper may replace the installation as
-        // soon as this process exits.
-        self.voice_settings.flush();
-    }
-
-    /// Launch the helper for a ready staged update.
-    pub(super) fn install_ready(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let staged = match &self.update.phase {
-            UpdatePhase::Ready { staged, .. } => staged.clone(),
-            _ => match &self.update.ready {
-                Some(staged) => staged.clone(),
-                None => return,
-            },
-        };
-        let helper = staged.app_dir.join(HELPER_NAME);
-        if !helper.is_file() {
-            self.update.phase = UpdatePhase::Error {
-                message: "В обновлении нет установщика.".into(),
-                retry: RetryKind::Install,
-            };
-            cx.notify();
-            return;
-        }
-        if staged.version <= update::current_version() {
-            self.update.phase = UpdatePhase::Error {
-                message: "Обновление не новее установленной версии.".into(),
-                retry: RetryKind::Check,
-            };
-            cx.notify();
-            return;
-        }
-        let install_dir = self.update.install_dir.clone();
-        let staging_dir = staged.staging_dir.clone();
-        let handshake = staging_dir.join(HANDSHAKE_NAME);
-        if !install_dir.is_absolute() || !staging_dir.is_absolute() || !handshake.is_absolute() {
-            self.update.phase = UpdatePhase::Error {
-                message: "Путь установки не абсолютный.".into(),
-                retry: RetryKind::Install,
-            };
-            cx.notify();
-            return;
-        }
-        // The helper copies the running image back into the installation by
-        // this name. A build under a different name (`voxhold-native-rust.exe`)
-        // must not make it fail after this process has already quit.
-        let Some(exe_name) = packaged_exe_name(&staged.app_dir, &self.update.exe_name) else {
-            self.update.phase = UpdatePhase::Error {
-                message: format!(
-                    "В обновлении нет исполняемого файла приложения ({}).",
-                    self.update.exe_name
-                ),
-                retry: RetryKind::Install,
-            };
-            cx.notify();
-            return;
-        };
-        self.prepare_for_install(window, cx);
-        let pid = std::process::id();
-        let request = LaunchRequest {
-            exe: helper,
-            args: vec![
-                "--pid".into(),
-                OsString::from(pid.to_string()),
-                "--target".into(),
-                install_dir.into_os_string(),
-                "--staged".into(),
-                staging_dir.into_os_string(),
-                "--exe".into(),
-                OsString::from(exe_name),
-                "--handshake".into(),
-                handshake.into_os_string(),
-            ],
-        };
-        self.update.quit_requested = false;
-        self.update.phase = UpdatePhase::Installing;
-        cx.notify();
-        match self.update.launcher.launch(&request) {
-            Ok(()) => {
-                self.update.quit_requested = true;
-                cx.quit();
-            }
-            Err(message) => {
-                self.update.phase = UpdatePhase::Error {
-                    message,
-                    retry: RetryKind::Install,
-                };
-                cx.notify();
-            }
-        }
-    }
-
     pub(super) fn toggle_update_panel(&mut self, cx: &mut Context<Self>) {
         if self.update.panel_open {
             self.close_update_panel(cx);
@@ -960,12 +940,21 @@ pub(super) fn startup_recovery_allowed(after_update: bool, handshake_written: bo
     !after_update || handshake_written
 }
 
+/// Flags passed to `update::startup_scan`: `(finish_recovery, clean_staging)`.
+///
+/// Only the process that owns the per-installation update mutex may finish a
+/// recovery or delete a staging tree. A second process of the same installation
+/// (`single_instance == false`) only reads it, so both flags are false.
+pub(super) fn startup_scan_flags(single_instance: bool, recovery_allowed: bool) -> (bool, bool) {
+    (recovery_allowed && single_instance, single_instance)
+}
+
 /// The image name the helper must copy back into the installation.
 ///
 /// Prefers the name this process was started with, but only when the package
 /// actually contains it. A development build (`voxhold-native-rust.exe`) must
 /// fall back to the release name instead of failing after the app quit.
-fn packaged_exe_name(app_dir: &Path, running: &str) -> Option<String> {
+pub(super) fn packaged_exe_name(app_dir: &Path, running: &str) -> Option<String> {
     if !running.is_empty() && app_dir.join(running).is_file() {
         return Some(running.to_string());
     }

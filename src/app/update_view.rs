@@ -418,7 +418,8 @@ impl Voxhold {
     }
 
     /// Blocking surface while the helper takes over the installation. The
-    /// process is about to exit, so the window only explains why.
+    /// process is about to exit, so the window only explains why. The mark and
+    /// the static ring mirror the helper window that follows.
     pub(super) fn update_install_overlay(&self) -> AnyElement {
         let p = self.palette;
         div()
@@ -430,9 +431,38 @@ impl Voxhold {
             .items_center()
             .justify_center()
             .bg(ink(p.bg))
-            .text_size(px(14.))
-            .text_color(ink(p.fg))
-            .child("Подготавливаем обновление…")
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap_4()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .w(px(92.))
+                            .h(px(92.))
+                            .rounded_full()
+                            .border_2()
+                            .border_color(ink(p.line))
+                            .child(icon("icons/brand.svg", 64., ink(p.lime))),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(15.))
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .text_color(ink(p.fg))
+                            .child("Обновляем Voxhold"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(13.))
+                            .text_color(ink(p.muted))
+                            .child("Подготавливаем обновление…"),
+                    ),
+            )
             .into_any_element()
     }
 

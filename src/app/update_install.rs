@@ -190,27 +190,31 @@ impl Voxhold {
             return;
         };
         let pid = std::process::id();
-        let request = LaunchRequest {
-            exe: helper,
-            args: vec![
-                "--pid".into(),
-                OsString::from(pid.to_string()),
-                "--target".into(),
-                install_dir.into_os_string(),
-                "--staged".into(),
-                staging_dir.into_os_string(),
-                "--exe".into(),
-                OsString::from(exe_name),
-                "--handshake".into(),
-                handshake.into_os_string(),
-                "--ready".into(),
-                ready.clone().into_os_string(),
-                "--refusal".into(),
-                refusal.into_os_string(),
-                "--version".into(),
-                OsString::from(staged.version.to_string()),
-            ],
-        };
+        let mut args = vec![
+            "--pid".into(),
+            OsString::from(pid.to_string()),
+            "--target".into(),
+            install_dir.into_os_string(),
+            "--staged".into(),
+            staging_dir.into_os_string(),
+            "--exe".into(),
+            OsString::from(exe_name),
+            "--handshake".into(),
+            handshake.into_os_string(),
+            "--ready".into(),
+            ready.clone().into_os_string(),
+            "--refusal".into(),
+            refusal.into_os_string(),
+            "--version".into(),
+            OsString::from(staged.version.to_string()),
+        ];
+        // The helper centres its own window in the work area of the monitor
+        // that showed Voxhold, so the two windows do not jump between screens.
+        if let Some(monitor) = monitor_work_area_argument(window) {
+            args.push("--monitor".into());
+            args.push(OsString::from(monitor));
+        }
+        let request = LaunchRequest { exe: helper, args };
         self.update.quit_requested = false;
         self.update.phase = UpdatePhase::Installing;
         cx.notify();
@@ -313,6 +317,64 @@ impl Drop for UpdateUi {
             }
         }
     }
+}
+
+/// Format a monitor work area for the helper's `--monitor` argument.
+///
+/// Kept separate from the Win32 lookup so the wire format stays testable
+/// without a native window handle.
+pub(super) fn format_monitor_argument(left: i32, top: i32, right: i32, bottom: i32) -> String {
+    format!("{left},{top},{right},{bottom}")
+}
+
+/// Work area of the monitor that currently shows the client, formatted for the
+/// helper's `--monitor` argument. `None` lets the helper use the primary work
+/// area (tests and platforms without a native handle).
+#[cfg(windows)]
+fn monitor_work_area_argument(window: &Window) -> Option<String> {
+    use raw_window_handle::RawWindowHandle;
+    use windows_sys::Win32::Graphics::Gdi::{
+        GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    };
+
+    // The GPUI test window has no native handle.
+    if cfg!(test) {
+        return None;
+    }
+    let handle = raw_window_handle::HasWindowHandle::window_handle(window).ok()?;
+    let RawWindowHandle::Win32(win32) = handle.as_raw() else {
+        return None;
+    };
+    let hwnd = win32.hwnd.get() as *mut core::ffi::c_void;
+    if hwnd.is_null() {
+        return None;
+    }
+    // SAFETY: a live native window handle; the monitor info struct is local.
+    unsafe {
+        let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        if monitor.is_null() {
+            return None;
+        }
+        let mut info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if GetMonitorInfoW(monitor, &mut info) == 0 {
+            return None;
+        }
+        let work = info.rcWork;
+        Some(format_monitor_argument(
+            work.left,
+            work.top,
+            work.right,
+            work.bottom,
+        ))
+    }
+}
+
+#[cfg(not(windows))]
+fn monitor_work_area_argument(_window: &Window) -> Option<String> {
+    None
 }
 
 /// Acquire the per-installation update mutex. `None` means another process of

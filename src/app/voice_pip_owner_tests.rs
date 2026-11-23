@@ -694,6 +694,132 @@ async fn a09_exit_fullscreen_focuses_a_painted_publisher_action(cx: &mut TestApp
     );
 }
 
+/// P3: `F` leaves fullscreen through the same path as `Escape`, so the focus
+/// must land on an action the restored PiP really paints. The toggle handler
+/// used to overwrite that with the fullscreen action, which the compact card
+/// never draws.
+#[gpui::test]
+async fn a09_f_exit_fullscreen_focuses_a_painted_pip_action(cx: &mut TestAppContext) {
+    let (mut visual, view, voice) = super::voice_tests::fixture(cx);
+    visual.update(|window, app| {
+        voice.update(app, |panel, cx| {
+            publish_live(panel, window, cx, 4);
+            watch_publication(panel, window, cx);
+        });
+    });
+    open_room(&mut visual, &view, 8);
+    let _ = voice.update(&mut *visual, |panel, _| panel.test_take_stream_commands());
+    let _ = voice.update(&mut *visual, |panel, _| panel.test_take_screen_commands());
+    let focused = |visual: &mut VisualTestContext| {
+        visual.update(|window, app| voice.read(app).focused_action(window))
+    };
+
+    // Viewer role on the role switcher.
+    visual.update(|window, app| {
+        voice.update(app, |panel, _| panel.player_toggle_fullscreen(window));
+    });
+    draw(&mut visual);
+    assert!(voice.read_with(&*visual, |panel, _| panel.player_fullscreen()));
+    visual.simulate_keystrokes("f");
+    draw(&mut visual);
+    assert!(
+        !voice.read_with(&*visual, |panel, _| panel.player_fullscreen()),
+        "F leaves fullscreen in the PiP"
+    );
+    assert_eq!(
+        focused(&mut visual),
+        Some("pip-tab-viewer"),
+        "focus lands on a painted viewer action"
+    );
+    assert!(
+        visual.debug_bounds("pip-tab-viewer").is_some(),
+        "the focused action is painted"
+    );
+
+    // Publisher role on the same switcher.
+    click(&mut visual, "pip-tab-publisher");
+    visual.update(|window, app| {
+        voice.update(app, |panel, _| panel.player_toggle_fullscreen(window));
+    });
+    draw(&mut visual);
+    assert!(voice.read_with(&*visual, |panel, _| panel.player_fullscreen()));
+    visual.simulate_keystrokes("f");
+    draw(&mut visual);
+    assert!(
+        !voice.read_with(&*visual, |panel, _| panel.player_fullscreen()),
+        "F leaves fullscreen for the publisher role"
+    );
+    assert_eq!(
+        focused(&mut visual),
+        Some("pip-tab-publisher"),
+        "focus lands on a painted publisher action"
+    );
+    assert!(
+        visual.debug_bounds("pip-tab-publisher").is_some(),
+        "the focused action is painted"
+    );
+}
+
+/// P3: the publication dialog can end the attempt it was opened for. A
+/// `Failed` publisher paints its close instead of its settings, so restoring
+/// the keyboard to a hardcoded settings action would land on a dead control.
+#[gpui::test]
+async fn a09_a_failed_publisher_dialog_returns_focus_to_a_painted_action(cx: &mut TestAppContext) {
+    let (mut visual, view, voice) = super::voice_tests::fixture(cx);
+    visual.update(|window, app| {
+        voice.update(app, |panel, cx| {
+            publish_live(panel, window, cx, 11);
+            watch_publication(panel, window, cx);
+            panel.test_select_pip_role(crate::voice_panel::PipRole::Publisher);
+        });
+    });
+    open_room(&mut visual, &view, 8);
+    draw(&mut visual);
+    click(&mut visual, "pip-settings");
+    voice.read_with(&*visual, |panel, _| {
+        assert!(panel.screen_share_open());
+        assert!(panel.test_pip_restore_focus());
+    });
+
+    // The attempt fails while its dialog is open: the dialog closes itself and
+    // the publisher card no longer paints a settings action.
+    visual.update(|window, app| {
+        voice.update(app, |panel, _| {
+            assert!(panel.test_apply_screen_sharing(
+                window,
+                Sharing {
+                    phase: Phase::Failed,
+                    attempt: 11,
+                    live: true,
+                    ..Sharing::default()
+                },
+            ));
+        });
+    });
+    assert!(
+        !voice.read_with(&*visual, |panel, _| panel.screen_share_open()),
+        "the failed attempt closes its settings dialog"
+    );
+    visual.update(|window, app| {
+        voice.update(app, |panel, _| panel.test_sync_pip(window));
+    });
+    draw(&mut visual);
+    assert_eq!(
+        visual.update(|window, app| voice.read(app).focused_action(window)),
+        Some("pip-tab-publisher"),
+        "focus returns to the first action the failed PiP paints"
+    );
+    assert!(
+        visual.debug_bounds("pip-tab-publisher").is_some(),
+        "that action is painted"
+    );
+    let ring = voice.read_with(&*visual, |panel, _| panel.test_focus_ring_ids());
+    assert!(
+        !ring.contains(&"pip-settings"),
+        "the failed publisher paints no settings action: {ring:?}"
+    );
+}
+
 /// P3: `Failed` before `Live` keeps the sent intent as the gate owner. Joining
 /// B afterwards must hand the worker A's confirmed permission, not B's.
 #[gpui::test]

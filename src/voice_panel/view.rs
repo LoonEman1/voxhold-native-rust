@@ -424,9 +424,13 @@ impl VoicePanel {
         // The on-air card takes a grid slot only in the room that owns the
         // publication; any other case is the compact PiP.
         let sharing = self.screen_card_in_room();
-        // The preview demand follows the card of this frame. A card that is no
-        // longer painted must not keep the request of an older paint alive; the
-        // PiP publisher sets its own rect later in the same frame.
+        // The on-air card of this frame is known only now. A card that is no
+        // longer painted must not keep the request of an older paint alive.
+        // The publisher PiP is pure geometry and needs no stored rect, so this
+        // reset cannot starve it. Syncing here keeps the preview demand on the
+        // painted card without the removed 100 ms poll: a card scrolled in
+        // starts, a hidden or minimized one stops, and a repaint is not needed
+        // for the atomics.
         self.screen_card_rect = None;
         let own_cards = usize::from(sharing);
         let count = roster.len() + streams.len() + own_cards;

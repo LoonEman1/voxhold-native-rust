@@ -25,10 +25,6 @@ impl VoicePanel {
         self.screen_card_stop_painted()
     }
 
-    pub fn test_viewer_in_room(&self) -> bool {
-        self.viewer_in_room()
-    }
-
     pub fn test_pip_role(&self) -> super::PipRole {
         self.active_pip_role()
     }

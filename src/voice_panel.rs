@@ -165,10 +165,12 @@ pub struct VoicePanel {
     /// Screen-share picker, on-air card and preview.
     screen: ScreenShareUi,
     stream_preferences: screen_share::StreamPrefsStore,
-    /// Rect of the visible on-air card painted by the last frame. The preview
-    /// demand of the media capture is computed from it on the 100 ms poll, the
-    /// same cadence at which the card takes a frame. `None` while the card is
-    /// not painted or is scrolled completely out of the room viewport.
+    /// Rect of the visible on-air card painted by the last frame, used only
+    /// while the displayed room is the owner room. The preview demand of the
+    /// media capture is computed from it on the 100 ms poll, the same cadence
+    /// at which the card takes a frame. `None` while the card is not painted or
+    /// is scrolled completely out of the room viewport. The publisher PiP does
+    /// not use this field: its picture rect is pure geometry.
     screen_card_rect: Option<Rect>,
     /// Monotonic id of the newest screen-audio probe. A slower, older probe
     /// must not overwrite the availability of a newer dialog.

@@ -234,12 +234,13 @@ impl VoicePanel {
     pub(super) fn pip_close_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.pip_settings = false;
         if self.pip_active() {
-            // The panel belongs to the settings button; returning there keeps
-            // the keyboard on the surface the user was using.
-            self.focus_pip(3, window, cx);
-        } else {
-            cx.notify();
+            // Prefer the settings button the panel belongs to; if it is gone
+            // (a failed publisher), the first painted action of the role keeps
+            // the keyboard on the surface, and with no such action the panel
+            // itself does.
+            self.restore_pip_focus(window);
         }
+        cx.notify();
     }
 
     pub(crate) fn pip_escape(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
@@ -346,7 +347,32 @@ impl VoicePanel {
         }
         if self.pip_restore_focus && !self.screen.open {
             self.pip_restore_focus = false;
-            window.focus(&self.player_actions[3]);
+            // The dialog can end the attempt (a failed restart), so resolve the
+            // target from the role and phase painted now instead of assuming
+            // the settings button still exists.
+            self.restore_pip_focus(window);
+        }
+    }
+
+    /// Put the keyboard back on the PiP after a dialog or its compact panel
+    /// closed. The settings button that owns the dialog is preferred while it
+    /// is still painted; a dialog that ended its attempt (`Failed`) no longer
+    /// paints it, so the first painted action of the role takes over. With no
+    /// action at all (a stopping publisher paints its close as a status) the
+    /// panel keeps the keyboard rather than a dead control.
+    fn restore_pip_focus(&self, window: &mut Window) {
+        let target = if self
+            .pip_focus_entries()
+            .iter()
+            .any(|(id, _)| *id == "pip-settings")
+        {
+            Some(3)
+        } else {
+            self.pip_exit_focus_index()
+        };
+        match target {
+            Some(index) => window.focus(&self.player_actions[index]),
+            None => window.focus(&self.focus),
         }
     }
 
@@ -425,17 +451,10 @@ impl VoicePanel {
             PipRole::Viewer => self.frame.clone(),
             PipRole::Publisher => self.screen.preview.clone(),
         };
-        // The PiP publisher paints the same preview slot as the on-air card, so
-        // the demand of this frame follows the PiP picture when that role is
-        // on screen. The viewer role paints no screen preview.
-        if role == PipRole::Publisher {
-            self.screen_card_rect = Some(Rect::new(
-                player.x + picture.x,
-                player.y + picture.y,
-                picture.w,
-                picture.h,
-            ));
-        }
+        // The demand of this frame needs no stored rect: the publisher picture
+        // is pure geometry of the PiP box, so the poll and the panel render
+        // compute the same value without depending on which of them painted
+        // last.
         let mut picture_div = div()
             .id("pip-picture")
             .debug_selector(|| "pip-picture".into())

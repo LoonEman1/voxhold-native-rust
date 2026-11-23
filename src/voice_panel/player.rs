@@ -122,8 +122,11 @@ impl VoicePanel {
             return;
         }
         if self.player_fullscreen {
+            // `exit_fullscreen` already landed the keyboard on an action the
+            // restored surface paints: the room player's fullscreen toggle or
+            // the first painted PiP control. Overwriting it with the fullscreen
+            // action would focus a control the compact PiP does not draw.
             self.exit_fullscreen(window);
-            window.focus(&self.player_actions[1]);
             return;
         }
         self.player_fullscreen = true;

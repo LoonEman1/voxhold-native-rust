@@ -71,7 +71,7 @@ impl VoicePanel {
             // publication that keeps running elsewhere requests nothing.
             self.screen_card_painted(),
             self.window_minimized(window),
-            self.screen_card_rect,
+            self.screen_preview_rect(),
             window.scale_factor(),
         );
         handle.set_screen_preview_demand(request);
@@ -84,7 +84,7 @@ impl VoicePanel {
         preview_request(
             self.screen_card_painted(),
             self.window_minimized(window),
-            self.screen_card_rect,
+            self.screen_preview_rect(),
             window.scale_factor(),
         )
         .is_some()
@@ -115,12 +115,40 @@ impl VoicePanel {
             && self.active_pip_role() == crate::voice_panel::pip::PipRole::Publisher
     }
 
+    /// The picture rect the compact PiP paints for the publisher role, derived
+    /// from the same pure geometry the overlay uses.
+    ///
+    /// This deliberately does not depend on `pip_overlay` having run: the shell
+    /// builds the overlay while it renders its own tree, before the child panel
+    /// paints, so a value stored by the overlay would be reset by the panel's
+    /// next `render`. `player_box()` is `None` when the overlay area is empty,
+    /// which is exactly when no PiP is painted at all.
+    pub(in crate::voice_panel) fn screen_pip_picture_rect(&self) -> Option<Rect> {
+        if !self.screen_pip_publisher_painted() {
+            return None;
+        }
+        let player = self.player_box()?;
+        Some(voice_room::pip_geometry(player, self.pip_tabs()).picture)
+    }
+
+    /// The picture rect of the own publication actually on screen this frame:
+    /// the on-air card of the displayed owner room, or the publisher picture of
+    /// the compact PiP anywhere else. `None` when neither surface is painted.
+    fn screen_preview_rect(&self) -> Option<Rect> {
+        if self.screen_card_in_room() {
+            // The grid card keeps the rect its last paint stored; a card
+            // scrolled out of the viewport stored `None`.
+            return self.screen_card_rect;
+        }
+        self.screen_pip_picture_rect()
+    }
+
     /// The publication picture is on screen: either the on-air card of the
-    /// room grid or the publisher role of the compact PiP, and that surface
-    /// lives inside the voice room pane the shell really painted. Only such a
-    /// surface asks the capture worker for a preview.
+    /// room grid or the publisher role of the compact PiP. The PiP is a
+    /// window-level overlay, so it does not depend on the room pane being
+    /// painted; only the grid card does.
     fn screen_card_painted(&self) -> bool {
-        self.room_painted && (self.screen_card_in_room() || self.screen_pip_publisher_painted())
+        self.screen_card_in_room() || self.screen_pip_publisher_painted()
     }
 
     /// The card paints its stop action only while a stop still has something

@@ -1,7 +1,7 @@
 //! Encoder UI minimum: the processor default, the GPU row and the explicit
 //! «Продолжить на процессоре» action of a failed hardware attempt.
 
-use super::voice_screen_tests::{draw, monitor, open_picker_with};
+use super::voice_screen_tests::{draw, monitor, open_picker_with, tab_to};
 use gpui::TestAppContext;
 use voxhold_media::screen_capture::SourceKind;
 
@@ -51,15 +51,10 @@ async fn a_lost_gpu_encoder_offers_the_cpu_continuation(cx: &mut TestAppContext)
         });
     });
     draw(&mut visual);
-    assert!(
-        visual.debug_bounds("screen-continue-cpu").is_some(),
-        "a lost GPU encoder must offer «Продолжить на процессоре»"
-    );
-    visual.update(|_window, app| {
-        voice.update(app, |panel, cx| {
-            panel.test_continue_screen_on_cpu(cx);
-        });
-    });
+    let button = visual
+        .debug_bounds("screen-continue-cpu")
+        .expect("a lost GPU encoder must offer «Продолжить на процессоре»");
+    visual.simulate_click(button.center(), gpui::Modifiers::default());
     visual.update(|_window, app| {
         voice.update(app, |panel, _| {
             let commands = panel.test_take_screen_commands();
@@ -69,4 +64,23 @@ async fn a_lost_gpu_encoder_offers_the_cpu_continuation(cx: &mut TestAppContext)
             );
         });
     });
+}
+
+#[gpui::test]
+async fn gpu_picker_explains_an_unsupported_capture_rate(cx: &mut TestAppContext) {
+    let (mut visual, _view, voice) = super::voice_tests::fixture_with(cx, Some(1280.), true);
+    open_picker_with(
+        &mut visual,
+        &voice,
+        SourceKind::Monitor,
+        vec![monitor(3, "Экран", 1920, 1080)],
+    );
+    for option in ["Fps(144)", "EncoderBackend(Gpu)"] {
+        tab_to(&mut visual, &voice, option);
+        visual.simulate_keystrokes("enter");
+        draw(&mut visual);
+    }
+    assert!(visual
+        .debug_bounds("share-encoder-reason:Частота кадров вне диапазона 1–120.")
+        .is_some());
 }

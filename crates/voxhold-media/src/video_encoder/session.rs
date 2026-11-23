@@ -186,6 +186,12 @@ pub trait GpuEncoder: Send {
     /// Enqueue a captured frame without blocking.
     fn submit(&mut self, frame: Nv12Frame) -> EncodeSubmit;
 
+    /// The hardware session reserves input space before allocating its NV12
+    /// copy. Other encoders can retain the ordinary `submit` implementation.
+    fn submit_captured(&mut self, frame: &CapturedImage, timestamp_us: i64) -> EncodeSubmit {
+        self.submit(Nv12Frame::from_captured(frame, timestamp_us))
+    }
+
     /// Take the oldest encoded access unit, if any.
     fn next_packet(&mut self) -> Option<EncodedAccessUnit>;
 

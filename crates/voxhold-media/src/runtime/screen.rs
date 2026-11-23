@@ -18,7 +18,7 @@ use crate::runtime::requests::{
     ScreenAccess, ScreenCommand, SourceRequest, push_screen, set_source_request,
 };
 use crate::screen_capture::SourceKind;
-use crate::video_encoder::{EncodeQuery, EncoderProbeService};
+use crate::video_encoder::EncoderProbeService;
 
 /// How long a live GPU revalidation may take. It runs on the preparation
 /// thread before `stream.start`; a slower driver is refused instead of being
@@ -38,8 +38,10 @@ pub(super) fn revalidate_gpu(
     if !request.encoder.is_gpu() {
         return Ok(());
     }
-    let (width, height) = request.capture_size();
-    let query = EncodeQuery::new(width, height, request.quality.fps.clamp(1, 120));
+    let query = request
+        .encoder_query()
+        .validate()
+        .map_err(|error| error.to_string())?;
     let Some(resolved) = request.encoder.resolved(request.codec, query) else {
         return Err(
             "Выбранный аппаратный кодировщик не подтверждён. Откройте настройки трансляции снова."

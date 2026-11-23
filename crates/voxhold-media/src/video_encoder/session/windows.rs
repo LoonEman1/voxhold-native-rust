@@ -44,6 +44,7 @@ use windows::{
     core::{Error, GUID, Interface, Result as WinResult},
 };
 
+use crate::screen_capture::CapturedImage;
 use crate::video_encoder::{
     AdapterInfo, AdapterLuid, Codec, EncodeQuery, EncoderReason, av1, h264,
     windows::{
@@ -51,6 +52,7 @@ use crate::video_encoder::{
         receive_output, sample_bytes, sequence_header, unlock_async,
     },
 };
+use tokio::sync::mpsc as input_queue;
 
 use super::{
     AdapterEvidence, EncodeSubmit, EncodedAccessUnit, EncoderCounters, GpuEncoder,
@@ -70,7 +72,7 @@ const OPEN_TIMEOUT: Duration = Duration::from_secs(10);
 /// One live session handle. Dropping it releases the encoder thread and its
 /// transform.
 pub(crate) struct HardwareEncoder {
-    frames: Option<SyncSender<Nv12Frame>>,
+    frames: Option<input_queue::Sender<Nv12Frame>>,
     packets: Receiver<EncodedAccessUnit>,
     shared: Arc<Shared>,
     adapter: AdapterInfo,
@@ -146,7 +148,7 @@ impl HardwareEncoder {
         bitrate_bps: u32,
     ) -> Result<Self, String> {
         let shared = Arc::new(Shared::new(bitrate_bps));
-        let (frames, frame_rx) = mpsc::sync_channel(INPUT_QUEUE);
+        let (frames, frame_rx) = input_queue::channel(INPUT_QUEUE);
         let (packet_tx, packets) = mpsc::sync_channel(OUTPUT_QUEUE);
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let worker_shared = shared.clone();
@@ -188,28 +190,42 @@ impl HardwareEncoder {
             }
         }
     }
-}
-
-impl GpuEncoder for HardwareEncoder {
-    fn submit(&mut self, frame: Nv12Frame) -> EncodeSubmit {
+    fn submit_input(&self, make_frame: impl FnOnce() -> Nv12Frame) -> EncodeSubmit {
         if self.shared.stop.load(Ordering::Acquire) {
             return EncodeSubmit::Closed;
         }
         let Some(frames) = self.frames.as_ref() else {
             return EncodeSubmit::Closed;
         };
-        match frames.try_send(frame) {
-            Ok(()) => EncodeSubmit::Queued,
-            Err(TrySendError::Full(_)) => {
-                // The frame was never encoded, so no reference chain breaks.
-                self.shared
-                    .counters
-                    .dropped_input
-                    .fetch_add(1, Ordering::Relaxed);
-                EncodeSubmit::Dropped
-            }
-            Err(TrySendError::Disconnected(_)) => EncodeSubmit::Closed,
+        reserve_input(frames, &self.shared.counters.dropped_input, make_frame)
+    }
+}
+
+fn reserve_input(
+    frames: &input_queue::Sender<Nv12Frame>,
+    dropped: &AtomicU64,
+    make_frame: impl FnOnce() -> Nv12Frame,
+) -> EncodeSubmit {
+    match frames.try_reserve() {
+        Ok(permit) => {
+            permit.send(make_frame());
+            EncodeSubmit::Queued
         }
+        Err(input_queue::error::TrySendError::Full(())) => {
+            dropped.fetch_add(1, Ordering::Relaxed);
+            EncodeSubmit::Dropped
+        }
+        Err(input_queue::error::TrySendError::Closed(())) => EncodeSubmit::Closed,
+    }
+}
+
+impl GpuEncoder for HardwareEncoder {
+    fn submit(&mut self, frame: Nv12Frame) -> EncodeSubmit {
+        self.submit_input(|| frame)
+    }
+
+    fn submit_captured(&mut self, frame: &CapturedImage, timestamp_us: i64) -> EncodeSubmit {
+        self.submit_input(|| Nv12Frame::from_captured(frame, timestamp_us))
     }
 
     fn next_packet(&mut self) -> Option<EncodedAccessUnit> {
@@ -281,7 +297,7 @@ fn worker(
     codec: Codec,
     query: EncodeQuery,
     shared: Arc<Shared>,
-    frames: Receiver<Nv12Frame>,
+    mut frames: input_queue::Receiver<Nv12Frame>,
     packets: SyncSender<EncodedAccessUnit>,
     ready: SyncSender<Result<AdapterEvidence, String>>,
 ) {
@@ -360,22 +376,15 @@ fn worker(
         }
         let requested = shared.bitrate.swap(0, Ordering::AcqRel);
         if requested > 0 {
-            let _ = apply_bitrate(codec_api.as_ref(), &shared, requested);
+            let applied = apply_bitrate(codec_api.as_ref(), &shared, requested);
+            let starting = shared.counters.submitted.load(Ordering::Relaxed) == 0;
+            initial_retry = (!applied && starting).then_some(requested);
         }
-        loop {
+        while pending.len() < INPUT_QUEUE {
             match frames.try_recv() {
-                Ok(frame) => {
-                    if pending.len() >= INPUT_QUEUE {
-                        shared
-                            .counters
-                            .dropped_input
-                            .fetch_add(1, Ordering::Relaxed);
-                    } else {
-                        pending.push_back(frame);
-                    }
-                }
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => {
+                Ok(frame) => pending.push_back(frame),
+                Err(input_queue::error::TryRecvError::Empty) => break,
+                Err(input_queue::error::TryRecvError::Disconnected) => {
                     disconnected = true;
                     break;
                 }
@@ -825,5 +834,36 @@ unsafe fn stop_stream(transform: &IMFTransform) {
         let _ = transform.ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0);
         let _ = transform.ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
         let _ = transform.ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
+    }
+}
+
+#[cfg(test)]
+mod input_queue_tests {
+    use super::*;
+
+    #[test]
+    fn a_full_or_closed_queue_drops_before_converting_capture() {
+        let (sender, mut receiver) = input_queue::channel(1);
+        let dropped = AtomicU64::new(0);
+        assert_eq!(
+            reserve_input(&sender, &dropped, || Nv12Frame {
+                width: 2,
+                height: 2,
+                data: vec![0; 6],
+                timestamp_us: 1,
+            }),
+            EncodeSubmit::Queued
+        );
+        assert_eq!(
+            reserve_input(&sender, &dropped, || panic!("no queue space")),
+            EncodeSubmit::Dropped
+        );
+        assert_eq!(dropped.load(Ordering::Relaxed), 1);
+        assert_eq!(receiver.try_recv().unwrap().timestamp_us, 1);
+        drop(receiver);
+        assert_eq!(
+            reserve_input(&sender, &dropped, || panic!("encoder is gone")),
+            EncodeSubmit::Closed
+        );
     }
 }

@@ -21,7 +21,7 @@ use voxhold_media::screen_capture::{
 use voxhold_media::system_audio::{self, AudioDeviceInfo, AudioScope};
 use voxhold_media::video_encoder::{
     AdapterEvidence, AdapterSelection, EncodeQuery, EncoderBackend, EncoderPlan,
-    VideoEncoderPreference, VideoEncoderSnapshot,
+    VideoEncoderPreference,
 };
 
 /// The backend has no runtime reconfigure; the dialog must warn honestly.
@@ -132,12 +132,7 @@ pub(super) struct ScreenShareUi {
     pub(super) encoder_backend: EncoderBackend,
     /// Automatic primary adapter (default) or one explicit LUID.
     pub(super) encoder_adapter: AdapterSelection,
-    /// The bounded probe answer of the GPU path. `None` while it is running or
-    /// when the dialog is in CPU mode; an explicit GPU codec is only paintable
-    /// and selectable against a ready snapshot.
-    pub(super) encoder_probe: Option<Arc<VideoEncoderSnapshot>>,
-    /// Generation of the newest encoder probe request.
-    pub(super) encoder_probe_generation: u64,
+    encoder_probe: encoder::DialogEncoderProbe,
     pub(super) audio_enabled: bool,
     /// The scope the next request carries. Only meaningful when audio is on;
     /// the provided source kind decides the default choice.
@@ -264,8 +259,7 @@ impl Default for ScreenShareUi {
             codec: CodecIntent::Auto,
             encoder_backend: EncoderBackend::Cpu,
             encoder_adapter: AdapterSelection::Auto,
-            encoder_probe: None,
-            encoder_probe_generation: 0,
+            encoder_probe: encoder::DialogEncoderProbe::default(),
             audio_enabled: false,
             audio_scope: AudioScope::EverythingExceptSelf,
             audio_bitrate_kbps: 128,
@@ -340,25 +334,6 @@ impl ScreenShareUi {
         self.restart_source().is_some_and(|source| {
             self.selected == Some(source.source_id()) && self.selected_identity == source.identity()
         })
-    }
-
-    /// The concrete codec the dialog would send. `Auto` resolves against the
-    /// sender snapshot exactly like Start does; an explicit unavailable codec
-    /// keeps its reason. The test seam replaces the probe answer so a
-    /// classification test never depends on the host build's encoders.
-    /// The probe preference of the current dialog.
-    pub(super) fn encoder_preference(&self) -> VideoEncoderPreference {
-        VideoEncoderPreference {
-            backend: self.encoder_backend,
-            adapter: self.encoder_adapter,
-            allow_fallback: false,
-        }
-    }
-
-    /// Encoder query of the current dialog, shared with the probe and the
-    /// engine preflight.
-    pub(super) fn encoder_query(&self) -> EncodeQuery {
-        EncodeQuery::from_quality(self.quality())
     }
 
     /// The request a restart dialog would send: the confirmed live source with
@@ -711,12 +686,8 @@ impl VoicePanel {
         // into Auto with its reason by the restore.
         self.load_stream_preferences();
         self.screen.audio_availability = None;
-        if self.screen.encoder_backend == EncoderBackend::Gpu {
-            self.screen.encoder_probe = None;
-            self.screen.encoder_probe_generation =
-                self.screen.encoder_probe_generation.wrapping_add(1);
-            self.begin_encoder_probe(cx);
-        }
+        self.cancel_encoder_probe();
+        self.begin_encoder_probe(cx);
         self.begin_audio_probe(cx);
         self.screen.focus_placed = false;
         if let Some(handle) = &self.handle {
@@ -755,11 +726,7 @@ impl VoicePanel {
         // it never widens a narrow scope.
         self.screen.audio_scope = confirmed.audio_scope;
         self.screen.encoder_backend = confirmed.encoder.backend;
-        self.screen.encoder_probe = None;
-        self.screen.encoder_probe_generation = self.screen.encoder_probe_generation.wrapping_add(1);
-        if self.screen.encoder_backend == EncoderBackend::Gpu {
-            self.begin_encoder_probe(cx);
-        }
+        self.cancel_encoder_probe();
         self.begin_audio_probe(cx);
         self.screen.restart = true;
         // The restart dialog is bound to the confirmed live source here, and
@@ -770,6 +737,7 @@ impl VoicePanel {
         // so an earlier picker capture cannot land in this dialog.
         self.screen.clear_previews(window);
         self.screen.open = true;
+        self.begin_encoder_probe(cx);
         self.screen.busy = false;
         self.screen.preflight = false;
         self.screen.pending_quality_op = None;
@@ -853,6 +821,7 @@ impl VoicePanel {
         };
         let pending_op = self.screen.pending_quality_op;
         self.screen.open = false;
+        self.cancel_encoder_probe();
         self.screen.restart = false;
         self.screen.busy = false;
         self.screen.preflight = false;
@@ -948,6 +917,7 @@ impl VoicePanel {
         self.screen.selected = Some(id);
         self.screen.selected_identity = Some(identity);
         self.screen.error.clear();
+        self.begin_encoder_probe(cx);
         cx.notify();
     }
 
@@ -989,6 +959,7 @@ impl VoicePanel {
         self.screen
             .preview_unfit
             .retain(|id| selection::identity_kind(id) != kind);
+        self.begin_encoder_probe(cx);
         self.request_screen_previews(window, cx);
         cx.notify();
     }

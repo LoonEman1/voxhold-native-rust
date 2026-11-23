@@ -9,9 +9,44 @@
 
 use super::*;
 use std::time::Duration;
-use voxhold_media::video_encoder::{EncoderProbeService, EncoderProbeTarget, EncoderRequest};
+use voxhold_media::video_encoder::{
+    EncoderProbeService, EncoderProbeState, EncoderProbeTarget, EncoderRequest,
+    VideoEncoderSnapshot,
+};
+
+const PROBE_POLL: Duration = Duration::from_millis(50);
+const PROBE_TIMEOUT: Duration = Duration::from_secs(60);
+const PROBE_PENDING: &str = "Проверяем видеокарту…";
+
+#[derive(Default)]
+pub(super) struct DialogEncoderProbe {
+    service: Option<EncoderProbeService>,
+    query: Option<EncodeQuery>,
+    task: Option<gpui::Task<()>>,
+    result: Option<Result<Arc<VideoEncoderSnapshot>, String>>,
+}
 
 impl ScreenShareUi {
+    pub(super) fn encoder_query(&self) -> EncodeQuery {
+        let mut quality = self.quality().clamped();
+        let source = self.resolution_source();
+        if !self.restart && source.is_some() {
+            quality.resolution = quality.resolution.for_source(source);
+        }
+        EncodeQuery::from_source(quality, source.unwrap_or_default())
+    }
+
+    fn gpu_snapshot(&self) -> Result<&VideoEncoderSnapshot, &str> {
+        if self.encoder_probe.query != Some(self.encoder_query()) {
+            return Err(PROBE_PENDING);
+        }
+        match &self.encoder_probe.result {
+            Some(Ok(snapshot)) => Ok(snapshot),
+            Some(Err(reason)) => Err(reason),
+            None => Err(PROBE_PENDING),
+        }
+    }
+
     pub(super) fn resolved_codec(&self) -> Result<Codec, String> {
         #[cfg(test)]
         if let Some(codec) = self.test_codec {
@@ -41,9 +76,7 @@ impl ScreenShareUi {
             };
         }
         if self.encoder_backend == EncoderBackend::Gpu {
-            let Some(snapshot) = self.encoder_probe.as_ref() else {
-                return Err("Проверяем видеокарту…".to_owned());
-            };
+            let snapshot = self.gpu_snapshot().map_err(str::to_owned)?;
             return snapshot
                 .resolve(self.codec)
                 .map(|resolved| resolved.codec)
@@ -66,9 +99,7 @@ impl ScreenShareUi {
                 .unwrap_or_else(|| Err("Кодек не описан в тестовом наборе.".to_owned()));
         }
         if self.encoder_backend == EncoderBackend::Gpu {
-            let Some(snapshot) = self.encoder_probe.as_ref() else {
-                return Err("Проверяем видеокарту…".to_owned());
-            };
+            let snapshot = self.gpu_snapshot().map_err(str::to_owned)?;
             let Some(slot) = snapshot.gpu(codec) else {
                 return Err("Кодек не описан в снимке видеокарты.".to_owned());
             };
@@ -92,9 +123,7 @@ impl ScreenShareUi {
         if self.encoder_backend != EncoderBackend::Gpu {
             return Ok(EncoderPlan::cpu());
         }
-        let Some(snapshot) = self.encoder_probe.as_ref() else {
-            return Err("Проверяем видеокарту…".to_owned());
-        };
+        let snapshot = self.gpu_snapshot().map_err(str::to_owned)?;
         let resolved = snapshot
             .resolve(self.codec)
             .map_err(|rejection| rejection.to_string())?;
@@ -125,11 +154,8 @@ impl VoicePanel {
             return;
         }
         self.screen.encoder_backend = backend;
-        self.screen.encoder_probe = None;
-        self.screen.encoder_probe_generation = self.screen.encoder_probe_generation.wrapping_add(1);
-        if backend == EncoderBackend::Gpu {
-            self.begin_encoder_probe(cx);
-        }
+        self.cancel_encoder_probe();
+        self.begin_encoder_probe(cx);
         // A codec that only the other backend provides is re-resolved by the
         // selector; an explicit unavailable item stays explicit and blocked.
         cx.notify();
@@ -167,9 +193,12 @@ impl VoicePanel {
                 "Кодирование: Процессор · программный WebRTC".to_owned(),
                 false,
             ),
-            EncoderBackend::Gpu => match self.screen.encoder_probe.as_ref() {
-                None => ("Кодирование: Видеокарта · проверяем…".to_owned(), false),
-                Some(snapshot) => {
+            EncoderBackend::Gpu => match self.screen.gpu_snapshot() {
+                Err(reason) => (
+                    "Кодирование: Видеокарта".to_owned(),
+                    reason != PROBE_PENDING,
+                ),
+                Ok(snapshot) => {
                     let adapter = snapshot
                         .adapter()
                         .map(|adapter| {
@@ -187,9 +216,9 @@ impl VoicePanel {
         };
         let reason = match selected {
             EncoderBackend::Cpu => "SDR · программное кодирование".to_owned(),
-            EncoderBackend::Gpu => match self.screen.encoder_probe.as_ref() {
-                None => "Проверяем видеокарту и кодировщики…".to_owned(),
-                Some(snapshot) => match snapshot.adapter() {
+            EncoderBackend::Gpu => match self.screen.gpu_snapshot() {
+                Err(reason) => reason.to_owned(),
+                Ok(snapshot) => match snapshot.adapter() {
                     Some(adapter) => format!(
                         "Аппаратный MFT · {}{}",
                         adapter.name,
@@ -248,41 +277,97 @@ impl VoicePanel {
             .into_any_element()
     }
 
-    /// Probe the selected adapter/codec pair off the UI thread. The answer is
-    /// dropped when the dialog moved on (another generation or CPU mode).
-    ///
-    /// Every call owns a fresh [`EncoderProbeService`], so the snapshot
-    /// generation starts over on each probe. The generation binds the answer to
-    /// this dialog; the live-change comparison uses the checked pair
-    /// (`EncoderPlan::same_pair`), never the generation, so re-opening the
-    /// dialog cannot turn an unchanged GPU request into a restart.
-    pub(super) fn begin_encoder_probe(&mut self, cx: &mut Context<Self>) {
-        let generation = self.screen.encoder_probe_generation;
-        let preference = self.screen.encoder_preference();
+    pub(in crate::voice_panel) fn cancel_encoder_probe(&mut self) {
+        self.screen.encoder_probe = DialogEncoderProbe::default();
+    }
+
+    /// Probe one exact capture format. A setting change supersedes the pending
+    /// request on the same worker, so rapid edits cannot open competing MFTs.
+    pub(in crate::voice_panel) fn begin_encoder_probe(&mut self, cx: &mut Context<Self>) {
+        if !self.screen.open || self.screen.encoder_backend != EncoderBackend::Gpu {
+            return;
+        }
         let query = self.screen.encoder_query();
-        let target = EncoderProbeTarget::default();
-        let task = cx.background_spawn(async move {
-            let service = EncoderProbeService::platform().ok()?;
-            let requested = service
-                .set_video_encoder_backend(EncoderRequest::new(preference, query, target))
-                .ok()?;
-            let snapshot = service.wait_for(requested, Duration::from_secs(60));
-            service.shutdown();
-            snapshot
-        });
-        cx.spawn(async move |this, cx| {
-            let result = task.await;
-            let _ = this.update(cx, |panel, cx| {
-                if panel.screen.encoder_probe_generation != generation
-                    || panel.screen.encoder_backend != EncoderBackend::Gpu
-                {
+        let probe = &mut self.screen.encoder_probe;
+        if probe.query == Some(query) {
+            return;
+        }
+        probe.query = Some(query);
+        probe.task = None;
+        probe.result = None;
+        if let Err(error) = query.validate() {
+            if let Some(service) = probe.service.as_ref() {
+                service.cancel();
+            }
+            probe.result = Some(Err(error.to_string()));
+            cx.notify();
+            return;
+        }
+        if probe.service.is_none() {
+            match EncoderProbeService::platform() {
+                Ok(service) => probe.service = Some(service),
+                Err(error) => {
+                    probe.result = Some(Err(format!("Проверка видеокарты недоступна: {error}")));
+                    cx.notify();
                     return;
                 }
-                panel.screen.encoder_probe = result;
+            }
+        }
+        let preference = VideoEncoderPreference {
+            backend: EncoderBackend::Gpu,
+            adapter: self.screen.encoder_adapter,
+            allow_fallback: false,
+        };
+        let request = EncoderRequest::new(preference, query, EncoderProbeTarget::default());
+        let generation = match probe
+            .service
+            .as_ref()
+            .unwrap()
+            .set_video_encoder_backend(request)
+        {
+            Ok(generation) => generation,
+            Err(error) => {
+                probe.result = Some(Err(error.to_string()));
+                cx.notify();
+                return;
+            }
+        };
+        let timer = cx.background_executor().clone();
+        probe.task = Some(cx.spawn(async move |this, cx| {
+            for _ in 0..(PROBE_TIMEOUT.as_millis() / PROBE_POLL.as_millis()) {
+                timer.timer(PROBE_POLL).await;
+                let done = this
+                    .update(cx, |panel, cx| {
+                        let probe = &mut panel.screen.encoder_probe;
+                        let Some(service) = probe.service.as_ref() else {
+                            return true;
+                        };
+                        let snapshot = service.snapshot();
+                        if snapshot.generation() != generation || !panel.screen.open {
+                            return true;
+                        }
+                        if snapshot.state() != EncoderProbeState::Ready {
+                            return false;
+                        }
+                        probe.result = Some(Ok(snapshot));
+                        cx.notify();
+                        true
+                    })
+                    .unwrap_or(true);
+                if done {
+                    return;
+                }
+            }
+            let _ = this.update(cx, |panel, cx| {
+                let probe = &mut panel.screen.encoder_probe;
+                if let Some(service) = probe.service.as_ref() {
+                    service.cancel();
+                }
+                probe.result = Some(Err("Проверка видеокарты не ответила вовремя.".into()));
                 cx.notify();
             });
-        })
-        .detach();
+        }));
+        cx.notify();
     }
 
     /// «Продолжить на процессоре» of a failed GPU attempt. Only this explicit

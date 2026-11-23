@@ -307,6 +307,13 @@ impl QualityStatus {
 }
 
 impl PublishRequest {
+    pub(crate) fn encoder_query(&self) -> crate::video_encoder::EncodeQuery {
+        crate::video_encoder::EncodeQuery::from_source(
+            self.quality,
+            (self.source.width, self.source.height),
+        )
+    }
+
     pub(crate) fn capture_target(&self) -> (u32, u32) {
         self.quality
             .resolution

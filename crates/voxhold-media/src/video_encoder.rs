@@ -405,15 +405,15 @@ impl EncodeQuery {
         Self { width, height, fps }
     }
 
-    /// The current dialog quality mapped to one encoder query. The web form
-    /// offers 720p/1080p at 30/60 FPS.
     pub fn from_quality(quality: crate::publisher::Quality) -> Self {
-        let (width, height) = quality.resolution.size();
-        Self {
-            width,
-            height,
-            fps: if quality.fps >= 60 { 60 } else { 30 },
-        }
+        Self::from_source(quality, (0, 0))
+    }
+
+    /// Use the dimensions capture will produce and preserve the requested
+    /// rate so unsupported GPU settings are refused during validation.
+    pub fn from_source(quality: crate::publisher::Quality, source: (u32, u32)) -> Self {
+        let (width, height) = quality.resolution.capture_size(source.0, source.1);
+        Self::new(width, height, quality.fps)
     }
 
     /// NV12 has no odd chroma dimension, and the MFT contract is bounded.

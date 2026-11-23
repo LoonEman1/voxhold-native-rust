@@ -20,7 +20,7 @@ impl ScreenShareUi {
         quality
     }
 
-    fn resolution_source(&self) -> Option<(u32, u32)> {
+    pub(super) fn resolution_source(&self) -> Option<(u32, u32)> {
         let source = if self.restart {
             self.restart_source()
         } else {
@@ -826,6 +826,12 @@ impl VoicePanel {
                 // focused row still selects it after the list is reordered.
                 self.select_screen_source(id, cx);
             }
+        }
+        if matches!(
+            key,
+            ShareKey::Resolution(_) | ShareKey::Fps(_) | ShareKey::Preset(_)
+        ) {
+            self.begin_encoder_probe(cx);
         }
         if !self.screen.restart
             && matches!(

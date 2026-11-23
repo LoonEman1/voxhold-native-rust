@@ -21,7 +21,7 @@ use libwebrtc::{
 use super::{EngineEvent, EventQueue, FRAME_TIMEOUT, FrameCounters, FrameProducer};
 use crate::publisher::Codec;
 use crate::screen_capture::{CaptureFailure, PreviewStore};
-use crate::video_encoder::{EncodeSubmit, GpuEncoder, Nv12Frame};
+use crate::video_encoder::{EncodeSubmit, GpuEncoder};
 
 /// What the hardware frame pump reads from the pass-through source.
 ///
@@ -168,7 +168,7 @@ pub(super) async fn gpu_frame_loop<S>(
             size = (image.width, image.height);
             let timestamp = wall_micros().max(last_timestamp + 1);
             last_timestamp = timestamp;
-            let submit = encoder.submit(Nv12Frame::from_captured(&image, timestamp));
+            let submit = encoder.submit_captured(&image, timestamp);
             if submit != EncodeSubmit::Closed {
                 failed = None;
             }
@@ -290,7 +290,7 @@ mod tests {
     use super::*;
     use crate::publisher::engine::SyntheticProducer;
     use crate::video_encoder::{
-        AdapterInfo, EncodedAccessUnit, EncoderCounters, GpuEncoderFailure,
+        AdapterInfo, EncodedAccessUnit, EncoderCounters, GpuEncoderFailure, Nv12Frame,
     };
     use std::sync::{Mutex, atomic::AtomicBool};
     use std::time::Duration;

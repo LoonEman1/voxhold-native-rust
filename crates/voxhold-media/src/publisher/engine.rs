@@ -361,12 +361,10 @@ impl PublisherEngine {
         // an activation or type error must fail this attempt before
         // `stream.start`, never after the server created the publication.
         let gpu = if request.encoder.is_gpu() {
-            let (width, height) = request.capture_size();
-            let query = crate::video_encoder::EncodeQuery::new(
-                width,
-                height,
-                request.quality.fps.clamp(1, 120),
-            );
+            let query = request
+                .encoder_query()
+                .validate()
+                .map_err(|error| error.to_string())?;
             let Some(resolved) = request.encoder.resolved(request.codec, query) else {
                 return Err(
                     "Аппаратный кодировщик этой попытки не подтверждён; выберите видеокарту снова."

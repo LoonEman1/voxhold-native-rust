@@ -774,6 +774,17 @@ impl VoicePanel {
             .unwrap_or_default()
     }
 
+    /// Queued screen actions with the concrete codec of every publish, restart
+    /// or live-bitrate request.
+    pub fn test_take_screen_requests(
+        &mut self,
+    ) -> Vec<(&'static str, u64, Option<voxhold_media::publisher::Codec>)> {
+        self.handle
+            .as_ref()
+            .map(|handle| handle.take_screen_requests_for_tests())
+            .unwrap_or_default()
+    }
+
     /// Debug label of the focused picker element, e.g. `Source(monitor:3)` or
     /// `Start`.
     pub fn test_focused_share(&self, window: &Window) -> Option<String> {

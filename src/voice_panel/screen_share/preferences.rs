@@ -10,10 +10,55 @@ use std::sync::{
 
 use super::*;
 
+/// The codec the previous picker left behind. The wire value is the website's
+/// `StreamPreferences.codec` (`auto` or one of the SDR codec names), so the same
+/// file stays readable by both clients. Unknown or missing values fall back to
+/// `Auto` instead of discarding the other preferences.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) enum CodecPreference {
+    #[default]
+    Auto,
+    Explicit(Codec),
+}
+
+impl CodecPreference {
+    fn wire(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Explicit(codec) => codec.wire(),
+        }
+    }
+
+    fn parse(value: &str) -> Self {
+        Codec::parse(value).map_or(Self::Auto, Self::Explicit)
+    }
+
+    fn from_intent(intent: CodecIntent) -> Self {
+        match intent {
+            CodecIntent::Auto => Self::Auto,
+            CodecIntent::Explicit(codec) => Self::Explicit(codec),
+        }
+    }
+}
+
+impl serde::Serialize for CodecPreference {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.wire())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for CodecPreference {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = <String as serde::Deserialize>::deserialize(deserializer)?;
+        Ok(Self::parse(&value))
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(default)]
 pub(super) struct StreamPreferences {
     quality: Quality,
+    codec: CodecPreference,
     audio_enabled: bool,
     audio_scope: AudioScope,
 }
@@ -22,6 +67,7 @@ impl Default for StreamPreferences {
     fn default() -> Self {
         Self {
             quality: Quality::default(),
+            codec: CodecPreference::Auto,
             audio_enabled: false,
             audio_scope: AudioScope::EverythingExceptSelf,
         }
@@ -41,6 +87,7 @@ impl StreamPreferences {
     fn read_picker(picker: &ScreenShareUi) -> Self {
         Self {
             quality: picker.quality().clamped(),
+            codec: CodecPreference::from_intent(picker.codec),
             audio_enabled: picker.audio_enabled,
             audio_scope: picker.audio_scope,
         }
@@ -54,6 +101,23 @@ impl StreamPreferences {
         picker.audio_enabled = self.audio_enabled;
         picker.audio_scope = self.audio_scope;
         picker.audio_scope = picker.effective_audio_scope(picker.kind);
+        // A saved explicit codec is restored only while this build can encode
+        // it. Otherwise the picker falls back to Auto and says why, instead of
+        // restoring an inert item the user would have to fix on every start.
+        picker.codec = match self.codec {
+            CodecPreference::Auto => CodecIntent::Auto,
+            CodecPreference::Explicit(codec) => match picker.codec_availability(codec) {
+                Ok(()) => CodecIntent::Explicit(codec),
+                Err(reason) => {
+                    let reason = reason.trim_end_matches('.');
+                    picker.error = format!(
+                        "Сохранённый кодек {} недоступен: {reason}. Выбран «Автоматически».",
+                        codec.label()
+                    );
+                    CodecIntent::Auto
+                }
+            },
+        };
     }
 }
 
@@ -151,6 +215,19 @@ impl VoicePanel {
     }
 
     pub(super) fn stage_live_preferences(&mut self, request: PublishRequest) {
+        let prefs = self.live_preferences();
+        self.screen.pending_preferences = Some((request, prefs));
+    }
+
+    pub(super) fn remember_live_preferences(&mut self, cx: &mut Context<Self>) {
+        let prefs = self.live_preferences();
+        self.stream_preferences.set(prefs, cx);
+    }
+
+    /// Preferences read from the live dialog. A smaller source may be on air at
+    /// a fallback resolution: an FPS, bitrate or codec edit must keep the saved
+    /// resolution preference instead of lowering it to the applied one.
+    fn live_preferences(&self) -> StreamPreferences {
         let mut prefs = StreamPreferences::read_picker(&self.screen);
         if self
             .screen
@@ -159,11 +236,9 @@ impl VoicePanel {
             .as_ref()
             .is_some_and(|live| live.quality.resolution == prefs.quality.resolution)
         {
-            // A smaller source may be on air at a fallback resolution. An
-            // FPS or bitrate edit must keep the saved resolution preference.
             prefs.quality.resolution = self.stream_preferences.0.prefs.get().quality.resolution;
         }
-        self.screen.pending_preferences = Some((request, prefs));
+        prefs
     }
 
     pub(in crate::voice_panel) fn save_confirmed_stream_preferences(
@@ -206,6 +281,7 @@ mod tests {
                 bitrate_kbps: 14_000,
                 audio_bitrate_kbps: 256,
             },
+            codec: CodecPreference::Explicit(Codec::Av1),
             audio_enabled: true,
             audio_scope: AudioScope::Device,
         };
@@ -214,8 +290,60 @@ mod tests {
         writes.save(2, &path, latest);
         writes.save(1, &path, StreamPreferences::default());
         assert_eq!(StreamPreferences::load(Some(&path)), latest);
+        let stored = std::fs::read_to_string(&path).unwrap();
+        assert!(stored.contains("\"codec\": \"av1\""), "{stored}");
         let _ = std::fs::remove_file(path);
         let _ = std::fs::remove_dir(dir);
+    }
+
+    #[test]
+    fn a_selected_codec_is_remembered_and_restored() {
+        let mut picker = ScreenShareUi::default();
+        picker.codec = CodecIntent::Explicit(Codec::Vp9);
+        let prefs = StreamPreferences::read_picker(&picker);
+        assert_eq!(prefs.codec, CodecPreference::Explicit(Codec::Vp9));
+        let json = serde_json::to_string(&prefs).unwrap();
+        assert!(json.contains("\"codec\":\"vp9\""), "{json}");
+
+        let mut reopened = ScreenShareUi::default();
+        reopened.test_codec_availability = Some(vec![(Codec::Vp9, None)]);
+        prefs.apply(&mut reopened);
+        assert_eq!(reopened.codec, CodecIntent::Explicit(Codec::Vp9));
+        assert!(reopened.error.is_empty());
+    }
+
+    #[test]
+    fn a_missing_or_unknown_saved_codec_falls_back_to_auto() {
+        // The previous file format had no codec field at all.
+        let older: StreamPreferences = serde_json::from_str("{}").unwrap();
+        assert_eq!(older.codec, CodecPreference::Auto);
+        // A value this build does not know must not discard the whole file.
+        let unknown: StreamPreferences = serde_json::from_str(r#"{"codec":"hevc"}"#).unwrap();
+        assert_eq!(unknown.codec, CodecPreference::Auto);
+    }
+
+    #[test]
+    fn an_unavailable_saved_codec_restores_auto_with_the_reason() {
+        const REASON: &str = "Кодировщик VP9 отсутствует в этой сборке WebRTC.";
+        let prefs = StreamPreferences {
+            codec: CodecPreference::Explicit(Codec::Vp9),
+            ..Default::default()
+        };
+        let mut picker = ScreenShareUi::default();
+        picker.test_codec_availability =
+            Some(vec![(Codec::H264, None), (Codec::Vp9, Some(REASON.into()))]);
+        prefs.apply(&mut picker);
+        assert_eq!(
+            picker.codec,
+            CodecIntent::Auto,
+            "an unencodable saved codec is not restored as an inert choice"
+        );
+        assert!(picker.error.contains("VP9"), "{}", picker.error);
+        assert!(
+            picker.error.contains(REASON.trim_end_matches('.')),
+            "the reason must reach the dialog: {}",
+            picker.error
+        );
     }
 
     fn tempfile_for_test() -> PathBuf {

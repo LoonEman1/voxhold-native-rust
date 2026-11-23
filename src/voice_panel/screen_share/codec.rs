@@ -27,7 +27,13 @@ impl VoicePanel {
                 CodecIntent::Auto => format!("Автоматически · {}", codec.label()),
                 CodecIntent::Explicit(_) => codec.label().to_owned(),
             },
-            Err(_) => "Нет доступного SDR-кодека".to_owned(),
+            // Only the chosen explicit codec can be the refused one here; the
+            // other items may still be encodable. «Нет доступного» is reserved
+            // for Auto, where the whole build really has no SDR encoder.
+            Err(_) => match intent {
+                CodecIntent::Auto => "Нет доступного SDR-кодека".to_owned(),
+                CodecIntent::Explicit(codec) => format!("{} недоступен", codec.label()),
+            },
         };
         // gpui exposes painted bounds, not text; the selector carries the exact
         // line so a UI test asserts what the dialog says, not only its slot.
@@ -48,7 +54,7 @@ impl VoicePanel {
             // with no encoder is not a reachable choice.
             let enabled = match choice {
                 CodecIntent::Auto => true,
-                CodecIntent::Explicit(codec) => self.screen.codec_availability(codec).is_ok(),
+                CodecIntent::Explicit(codec) => self.codec_availability(codec).is_ok(),
             };
             options = options.child(self.choice_enabled(
                 choice.label(),
@@ -65,23 +71,31 @@ impl VoicePanel {
         // dialog does not start to scroll.
         let mut unavailable: Vec<String> = Vec::new();
         for codec in Codec::ALL {
-            if let Err(reason) = self.screen.codec_availability(codec) {
+            if let Err(reason) = self.codec_availability(codec) {
                 unavailable.push(format!("{} недоступен: {reason}", codec.label()));
             }
         }
         let any_refused = !unavailable.is_empty();
         let unavailable_text = unavailable.join(" · ");
         let unavailable_selector = format!("share-codec-unavailable:{unavailable_text}");
-        // The live dialog shows what is really on air next to the choice. A
-        // confirmed codec is never replaced by the desired one before the
-        // restart actually commits it.
+        // The live dialog shows what is really on air next to the choice. The
+        // encoder-confirmed codec from the stats wins over the configuration
+        // the attempt accepted: before the first stats sample the confirmed
+        // configuration is only a promise, while the measured codec is the
+        // payload that truly leaves this client.
         let confirmed = (self.screen.sharing.phase == Phase::Live)
             .then(|| {
                 self.screen
                     .sharing
-                    .confirmed
-                    .as_ref()
-                    .map(|live| live.codec)
+                    .stats
+                    .and_then(|stats| stats.confirmed_codec)
+                    .or_else(|| {
+                        self.screen
+                            .sharing
+                            .confirmed
+                            .as_ref()
+                            .map(|live| live.codec)
+                    })
             })
             .flatten();
         div()

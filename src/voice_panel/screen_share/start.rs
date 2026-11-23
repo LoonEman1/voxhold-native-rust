@@ -106,6 +106,17 @@ impl VoicePanel {
                     .unwrap_or(self.screen.kind),
             ),
         };
+        // The live dialog may resolve back to the payload that is already on
+        // air (for example «Автоматически» after an explicit codec). Nothing
+        // has to be stopped or restarted then: no preflight, no stop, no start,
+        // and the dialog simply closes. Only the preference may have changed.
+        if self.screen.restart
+            && self.screen.restart_change_to(&request) == Some(QualityChange::Unchanged)
+        {
+            self.remember_live_preferences(cx);
+            self.close_screen_share(window, cx);
+            return;
+        }
         let Some(handle) = &self.handle else {
             self.screen.error = "Голосовое соединение уже закрыто.".into();
             cx.notify();

@@ -571,7 +571,9 @@ impl VoicePanel {
         let cancel_focus = row(self, &mut ring, ShareKey::Cancel);
         let start_focus = row(self, &mut ring, ShareKey::Start);
         let can_start = self.screen_can_start();
-        let live_bitrate = self.screen.restart_change() == Some(QualityChange::LiveBitrate);
+        let restart_change = self.screen.restart_change();
+        let live_bitrate = restart_change == Some(QualityChange::LiveBitrate);
+        let unchanged = restart_change == Some(QualityChange::Unchanged);
         let applying = self
             .screen
             .sharing
@@ -583,7 +585,10 @@ impl VoicePanel {
         } else if self.screen.sharing.preflighting {
             "Проверяем…"
         } else if self.screen.restart {
-            if live_bitrate {
+            if unchanged {
+                // Apply would be a verified no-op: the dialog only closes.
+                "Готово"
+            } else if live_bitrate {
                 "Применить"
             } else {
                 "Перезапустить"
@@ -828,6 +833,7 @@ impl VoicePanel {
                     | ShareKey::Preset(_)
                     | ShareKey::BitrateDown
                     | ShareKey::BitrateUp
+                    | ShareKey::Codec(_)
                     | ShareKey::Audio
                     | ShareKey::AudioScope(_)
                     | ShareKey::AudioBitrateDown

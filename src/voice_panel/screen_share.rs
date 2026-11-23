@@ -522,6 +522,8 @@ impl ScreenShareUi {
         }
         match self.restart_change() {
             Some(QualityChange::LiveBitrate) => Some(LIVE_BITRATE_HINT),
+            // Apply would send nothing: values equal the live payload.
+            Some(QualityChange::Unchanged) => None,
             _ => Some(RESTART_WARNING),
         }
     }
@@ -697,12 +699,11 @@ impl VoicePanel {
         self.screen.reset_preview_viewport();
         // Restore the local preferences, then probe this session's endpoint
         // before letting the user start the stream. Restored preferences own
-        // the resolution, FPS, bitrate and system-sound choice; the probe
-        // answer must not leak in, and Start stays locked until it settles.
+        // the resolution, FPS, bitrate, codec and system-sound choice; the
+        // probe answer must not leak in, and Start stays locked until it
+        // settles. A saved codec this build cannot encode was already turned
+        // into Auto with its reason by the restore.
         self.load_stream_preferences();
-        // A fresh publication starts from «Автоматически»: the concrete codec
-        // is resolved against the current sender snapshot when Start is pressed.
-        self.screen.codec = CodecIntent::Auto;
         self.screen.audio_availability = None;
         self.begin_audio_probe(cx);
         self.screen.focus_placed = false;
@@ -984,6 +985,18 @@ impl VoicePanel {
         self.screen.resolved_codec()
     }
 
+    /// Sender availability of one codec exactly as the selector paints it. The
+    /// injected refusal that makes `codec_resolution` fail describes the same
+    /// build here, so the dialog can never claim «no SDR codec» while painting
+    /// every item as selectable.
+    pub(super) fn codec_availability(&self, codec: Codec) -> Result<(), String> {
+        #[cfg(test)]
+        if let Some(reason) = &self.test_codec_error {
+            return Err(reason.clone());
+        }
+        self.screen.codec_availability(codec)
+    }
+
     /// Start waits for the endpoint probe: committing earlier would publish
     /// video without the requested system audio. A normal Start needs its id
     /// in the snapshot; a restart needs the confirmed live identity.
@@ -1015,7 +1028,7 @@ impl VoicePanel {
     /// `restart_change_to`, never as a live bitrate reconfiguration.
     pub(super) fn select_screen_codec(&mut self, intent: CodecIntent, cx: &mut Context<Self>) {
         if let CodecIntent::Explicit(codec) = intent {
-            if self.screen.codec_availability(codec).is_err() {
+            if self.codec_availability(codec).is_err() {
                 return;
             }
         }

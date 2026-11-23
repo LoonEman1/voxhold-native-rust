@@ -422,15 +422,20 @@ async fn the_live_quality_dialog_warns_and_restarts_with_the_new_values(cx: &mut
                 voxhold_media::publisher::CodecIntent::Explicit(confirmed.codec)
             );
             assert_eq!(panel.test_screen_request().codec, confirmed.codec);
-            assert!(
-                panel.test_restart_warning().is_some(),
-                "a live change must warn about the restart"
+            assert_eq!(
+                panel.test_restart_warning(),
+                None,
+                "an untouched live payload has nothing to restart"
             );
             assert!(panel.test_sound_label().contains("128"));
             // The preset changes only the applied fps/bitrate; audio is a
             // separate field and can be turned off.
             panel.test_apply_preset(Preset::Games, cx);
             panel.test_toggle_system_audio(cx);
+            assert!(
+                panel.test_restart_warning().is_some(),
+                "changed live values must warn about the restart"
+            );
             let request = panel.test_screen_request();
             assert_eq!(request.quality.fps, 60);
             assert_eq!(request.quality.bitrate_kbps, 12_000);

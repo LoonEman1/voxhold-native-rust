@@ -49,8 +49,8 @@ impl serde::Serialize for CodecPreference {
 
 impl<'de> serde::Deserialize<'de> for CodecPreference {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let value = <String as serde::Deserialize>::deserialize(deserializer)?;
-        Ok(Self::parse(&value))
+        let value = <serde_json::Value as serde::Deserialize>::deserialize(deserializer)?;
+        Ok(value.as_str().map_or(Self::Auto, Self::parse))
     }
 }
 
@@ -320,6 +320,11 @@ mod tests {
         // A value this build does not know must not discard the whole file.
         let unknown: StreamPreferences = serde_json::from_str(r#"{"codec":"hevc"}"#).unwrap();
         assert_eq!(unknown.codec, CodecPreference::Auto);
+
+        let invalid: StreamPreferences =
+            serde_json::from_str(r#"{"codec":null,"audio_enabled":true}"#).unwrap();
+        assert_eq!(invalid.codec, CodecPreference::Auto);
+        assert!(invalid.audio_enabled);
     }
 
     #[test]

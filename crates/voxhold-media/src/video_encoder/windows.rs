@@ -515,18 +515,18 @@ unsafe fn pump_frames(
         }
         if supply_input && frames < 8 {
             let sample = unsafe { input_sample(query, frames) }
-                .map_err(|error| classify(error, Stage::Encode, adapter))?;
+                .map_err(|error| classify(error, Stage::Input, adapter))?;
             match unsafe { transform.ProcessInput(0, &sample, 0) } {
                 Ok(()) => frames += 1,
                 Err(error) if error.code() == MF_E_NOTACCEPTING => {}
-                Err(error) => return Err(classify(error, Stage::Encode, adapter).into()),
+                Err(error) => return Err(classify(error, Stage::Input, adapter).into()),
             }
         }
         supply_input =
             match unsafe { receive_output(transform, output_size, provides_samples, adapter)? } {
                 Some(sample) => {
                     return unsafe { sample_bytes(&sample) }
-                        .map_err(|error| classify(error, Stage::Encode, adapter).into());
+                        .map_err(|error| classify(error, Stage::Output, adapter).into());
                 }
                 None => true,
             };
@@ -538,8 +538,14 @@ unsafe fn pump_frames(
 }
 
 /// Asynchronous MFT: the encoder asks for input and announces output through
-/// its event generator. The loop is bounded by [`ENCODE_DEADLINE`] and checks
-/// cancellation between events.
+/// its event generator.
+///
+/// The events are read with `GetEvent(MF_EVENT_FLAG_NO_WAIT)` instead of
+/// `BeginGetEvent`: the registered hardware MFTs accept a NULL callback only
+/// through the polling form, and the NVIDIA MFT rejects `BeginGetEvent(None,
+/// None)` with `E_INVALIDARG`. The loop is bounded by [`ENCODE_DEADLINE`] and
+/// checks cancellation between events, so a driver that never answers cannot
+/// pin the worker.
 unsafe fn pump_events(
     transform: &IMFTransform,
     query: EncodeQuery,
@@ -550,9 +556,7 @@ unsafe fn pump_events(
 ) -> Result<Vec<u8>, StageError> {
     let generator: IMFMediaEventGenerator = transform
         .cast()
-        .map_err(|error| classify(error, Stage::Encode, adapter))?;
-    unsafe { generator.BeginGetEvent(None, None) }
-        .map_err(|error| classify(error, Stage::Encode, adapter))?;
+        .map_err(|error| classify(error, Stage::Output, adapter))?;
     let deadline = Instant::now() + ENCODE_DEADLINE;
     let mut frames = 0u32;
     let mut drain_sent = false;
@@ -578,33 +582,33 @@ unsafe fn pump_events(
                 thread::sleep(EVENT_POLL);
                 continue;
             }
-            Err(error) => return Err(classify(error, Stage::Encode, adapter).into()),
+            Err(error) => return Err(classify(error, Stage::Output, adapter).into()),
         };
         if let Ok(status) = unsafe { event.GetStatus() }
             && status.0 < 0
         {
-            return Err(classify(Error::from_hresult(status), Stage::Encode, adapter).into());
+            return Err(classify(Error::from_hresult(status), Stage::Output, adapter).into());
         }
         let kind =
-            unsafe { event.GetType() }.map_err(|error| classify(error, Stage::Encode, adapter))?;
+            unsafe { event.GetType() }.map_err(|error| classify(error, Stage::Output, adapter))?;
         if kind == METransformNeedInput.0 as u32 {
             if frames >= 8 {
                 continue;
             }
             let stream = unsafe { event.GetUINT32(&MF_EVENT_MFT_INPUT_STREAM_ID) }.unwrap_or(0);
             let sample = unsafe { input_sample(query, frames) }
-                .map_err(|error| classify(error, Stage::Encode, adapter))?;
+                .map_err(|error| classify(error, Stage::Input, adapter))?;
             match unsafe { transform.ProcessInput(stream, &sample, 0) } {
                 Ok(()) => frames += 1,
                 Err(error) if error.code() == MF_E_NOTACCEPTING => {}
-                Err(error) => return Err(classify(error, Stage::Encode, adapter).into()),
+                Err(error) => return Err(classify(error, Stage::Input, adapter).into()),
             }
         } else if kind == METransformHaveOutput.0 as u32 {
             if let Some(sample) =
                 unsafe { receive_output(transform, output_size, provides_samples, adapter)? }
             {
                 return unsafe { sample_bytes(&sample) }
-                    .map_err(|error| classify(error, Stage::Encode, adapter).into());
+                    .map_err(|error| classify(error, Stage::Output, adapter).into());
             }
         } else if kind == METransformDrainComplete.0 as u32 {
             return Err(EncoderReason::ProbeFailed(
@@ -628,7 +632,7 @@ unsafe fn receive_output(
     } else {
         Some(
             unsafe { output_sample(output_size) }
-                .map_err(|error| classify(error, Stage::Encode, adapter))?,
+                .map_err(|error| classify(error, Stage::Output, adapter))?,
         )
     };
     let mut data = MFT_OUTPUT_DATA_BUFFER {
@@ -650,7 +654,7 @@ unsafe fn receive_output(
             unsafe { renegotiate_output(transform, adapter)? };
             Ok(None)
         }
-        Err(error) => Err(classify(error, Stage::Encode, adapter).into()),
+        Err(error) => Err(classify(error, Stage::Output, adapter).into()),
     }
 }
 
@@ -880,7 +884,8 @@ fn validate_frame(codec: Codec, bytes: &[u8]) -> Result<(), String> {
 enum Stage {
     Activate,
     Profile,
-    Encode,
+    Input,
+    Output,
 }
 
 impl Stage {
@@ -888,7 +893,8 @@ impl Stage {
         match self {
             Self::Activate => "активация",
             Self::Profile => "профиль",
-            Self::Encode => "пробное кодирование",
+            Self::Input => "подача кадра",
+            Self::Output => "получение кадра",
         }
     }
 }

@@ -45,6 +45,14 @@ use crate::publisher::{
 use crate::screen_capture::{ScreenSource, SourceKind};
 use crate::system_audio::AudioProducer;
 
+/// C03 needs the far side to decode at least three *changing* frames. The run
+/// keeps sampling well past that, so a two-frame plateau in a slowly moving
+/// synthetic pattern cannot pass as movement.
+const DECODED_FRAMES: usize = 8;
+/// The per-run sample is bounded: a frozen stream must not grow the list while
+/// the decoder keeps repeating the last picture until the deadline.
+const DECODED_SAMPLES: usize = 16;
+
 type Candidates = Arc<Mutex<Vec<(String, String, i32)>>>;
 
 pub(super) fn candidates(peer: &PeerConnection) -> Candidates {
@@ -384,7 +392,7 @@ async fn run(codec: Codec, with_audio: bool, change: Option<Quality>) -> Run {
                         while let Some(frame) = stream.next().await {
                             let hash = frame_hash(&frame);
                             let mut frames = store.lock().unwrap();
-                            if frames.len() < 16 {
+                            if frames.len() < DECODED_SAMPLES {
                                 frames.push(hash);
                             }
                             counter.fetch_add(1, Ordering::SeqCst);
@@ -409,7 +417,7 @@ async fn run(codec: Codec, with_audio: bool, change: Option<Quality>) -> Run {
             }
         }
         let decoded_len = decoded.lock().unwrap().len();
-        if confirmed_codec.is_some() && decoded_len >= 3 {
+        if confirmed_codec.is_some() && decoded_len >= DECODED_FRAMES {
             match change {
                 None => break,
                 Some(next) if !change_applied => {
@@ -731,13 +739,14 @@ fn check_codec(codec: Codec) {
             run.audio_packets
         );
         assert!(
-            run.decoded.len() >= 3,
+            run.decoded.len() >= DECODED_FRAMES,
             "{codec:?} decoded only {} frames",
             run.decoded.len()
         );
         assert!(
-            distinct.len() >= 2,
-            "{codec:?} decoded {} identical frames: the screen is frozen",
+            distinct.len() >= 3,
+            "{codec:?} decoded {} of {} identical frames: the screen is frozen",
+            run.decoded.len() - distinct.len(),
             run.decoded.len()
         );
     });

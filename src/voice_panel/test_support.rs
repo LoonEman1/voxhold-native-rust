@@ -692,6 +692,13 @@ impl VoicePanel {
         self.screen.codec
     }
 
+    /// Replace both the visible intent and the resolved codec of the dialog, so
+    /// a classification test can name any codec regardless of the host build.
+    pub fn test_set_screen_codec(&mut self, codec: voxhold_media::publisher::Codec) {
+        self.screen.codec = CodecIntent::Explicit(codec);
+        self.screen.test_codec = Some(codec);
+    }
+
     /// Model an unavailable codec without depending on the host build's probe,
     /// so the dialog's refusal line is paintable in a UI test.
     pub fn test_set_codec_error(&mut self, reason: &str) {

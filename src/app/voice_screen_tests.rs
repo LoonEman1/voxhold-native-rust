@@ -62,7 +62,7 @@ pub(super) fn window(id: u64, title: &str) -> ScreenSource {
     }
 }
 
-fn source() -> ScreenSource {
+pub(super) fn source() -> ScreenSource {
     monitor(3, "Экран 1", 1920, 1080)
 }
 

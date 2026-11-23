@@ -206,6 +206,13 @@ mod tests {
         }
     }
 
+    fn codec_request(quality: Quality, codec: Codec) -> PublishRequest {
+        PublishRequest {
+            codec,
+            ..request(quality)
+        }
+    }
+
     fn allowed() -> Access {
         Access {
             joined: true,
@@ -262,20 +269,20 @@ mod tests {
     }
 
     #[test]
-    fn a_successful_preflight_commits_one_stop_before_any_start() {
+    fn a_successful_codec_preflight_commits_one_stop_before_any_start() {
         let now = Instant::now();
         let mut publisher = live_publisher(now);
         let binding = binding(&publisher);
+        let next = codec_request(changed(), Codec::Vp9);
         publisher.preflight_started(1);
-        let mut pending =
-            PendingRestart::start_with(binding.clone(), now, 1, request(changed()), |_| {
-                Ok(PreflightReport {
-                    width: 1280,
-                    height: 720,
-                    audio_scope: None,
-                })
+        let mut pending = PendingRestart::start_with(binding.clone(), now, 1, next.clone(), |_| {
+            Ok(PreflightReport {
+                width: 1280,
+                height: 720,
+                audio_scope: None,
             })
-            .expect("the preflight thread starts");
+        })
+        .expect("the preflight thread starts");
         let event = poll_ready(&mut pending);
         assert!(matches!(event, PreflightEvent::Ready));
         let outcomes = finish_preflight(
@@ -285,7 +292,7 @@ mod tests {
             allowed(),
             event,
             1,
-            request(changed()),
+            next.clone(),
             now,
         );
         let kinds: Vec<&str> = outcomes
@@ -305,31 +312,35 @@ mod tests {
         assert_eq!(publisher.phase(), Phase::Stopping);
         assert!(publisher.sharing().restarting);
 
-        // Only the acknowledgement starts the new attempt, exactly once.
+        // Only the acknowledgement starts the new attempt, exactly once, with
+        // the new codec.
         let ack = publisher.on_server_event("stream.stopped", "", &serde_json::json!({}), now);
         let starts: Vec<_> = ack
             .iter()
             .filter_map(|outcome| match outcome {
-                PublisherOutcome::StartEngine { request, .. } => Some(request.quality),
+                PublisherOutcome::StartEngine { request, .. } => {
+                    Some((request.quality, request.codec))
+                }
                 _ => None,
             })
             .collect();
-        assert_eq!(starts, vec![changed()]);
+        assert_eq!(starts, vec![(changed(), Codec::Vp9)]);
         assert_eq!(publisher.phase(), Phase::Publishing);
     }
 
     #[test]
-    fn a_failed_preflight_keeps_the_live_stream_and_sends_nothing() {
+    fn a_failed_codec_preflight_keeps_the_live_stream_and_sends_nothing() {
         let now = Instant::now();
         let mut publisher = live_publisher(now);
         let binding = binding(&publisher);
         let attempt = publisher.sharing().attempt;
+        let confirmed = publisher.sharing().confirmed.clone();
+        let next = codec_request(changed(), Codec::Vp9);
         publisher.preflight_started(1);
-        let mut pending =
-            PendingRestart::start_with(binding.clone(), now, 1, request(changed()), |_| {
-                Err("Системный звук недоступен".into())
-            })
-            .expect("the preflight thread starts");
+        let mut pending = PendingRestart::start_with(binding.clone(), now, 1, next.clone(), |_| {
+            Err("Системный звук недоступен".into())
+        })
+        .expect("the preflight thread starts");
         let event = poll_ready(&mut pending);
         let outcomes = finish_preflight(
             &mut publisher,
@@ -338,7 +349,7 @@ mod tests {
             allowed(),
             event,
             1,
-            request(changed()),
+            next,
             now,
         );
         assert!(
@@ -353,6 +364,10 @@ mod tests {
         let sharing = publisher.sharing();
         assert_eq!(sharing.phase, Phase::Live);
         assert_eq!(sharing.attempt, attempt);
+        assert_eq!(
+            sharing.confirmed, confirmed,
+            "the VP8 on air stays confirmed after a refused VP9 preflight"
+        );
         assert!(!sharing.restarting);
         assert!(!sharing.preflighting);
         assert!(

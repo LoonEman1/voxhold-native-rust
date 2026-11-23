@@ -60,7 +60,12 @@ pub(super) async fn sample(
                 }
                 RtcStats::OutboundRtp(outbound) => match outbound.stream.kind.as_str() {
                     "video" => {
-                        if video_mid.is_some_and(|mid| mid == outbound.outbound.mid) {
+                        // An empty negotiated mid names nothing: falling back
+                        // keeps a missing field from matching an unrelated
+                        // empty mid of another stream.
+                        if video_mid
+                            .is_some_and(|mid| !mid.is_empty() && mid == outbound.outbound.mid)
+                        {
                             matched = Some(outbound);
                         } else {
                             fallback = Some(outbound);
@@ -77,7 +82,6 @@ pub(super) async fn sample(
     let video_wire = video.as_ref().map(|outbound| WireVideo {
         mid: outbound.outbound.mid.clone(),
         frames_encoded: outbound.outbound.frames_encoded,
-        packets_sent: outbound.sent.packets_sent,
         codec: codecs
             .get(&outbound.stream.codec_id)
             .map(|codec| WireCodec {

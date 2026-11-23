@@ -46,14 +46,13 @@ pub(super) struct SelectedVideo {
 }
 
 /// What an answer really encoded, read back from the outbound statistics.
+///
+/// The SDP contract (mid, payload pair, profile) is verified before the answer
+/// is applied, and the profile again in [`reported_profile`]; only the codec
+/// itself travels on, because that is what the state machine and the UI show.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct ConfirmedCodec {
     pub codec: Codec,
-    pub profile: SdrProfile,
-    pub mid: String,
-    pub primary_pt: u8,
-    pub rtx_pt: Option<u8>,
-    pub frames_encoded: u32,
 }
 
 /// The context of one offer: the requested codec, its checked SDR profile and
@@ -212,16 +211,28 @@ fn apply_confirmed_limits(
 /// the locally checked SDR profile is accepted, in offered order.
 pub(super) fn select_offer(sdp: &str, context: &OfferContext<'_>) -> Result<SelectedVideo, String> {
     let sections = media_sections(sdp);
-    let video_sections: Vec<&Media> = sections
+    let all_video: Vec<&Media> = sections
         .iter()
         .filter(|section| section.kind == Kind::Video)
         .collect();
+    // A rejected m-line (port 0) is not a second video track: the SFU keeps
+    // the old section with `m=video 0` when it disables one and adds the real
+    // one next to it. Counting it would turn a normal offer into "several
+    // video tracks".
+    let video_sections: Vec<&Media> = all_video
+        .iter()
+        .copied()
+        .filter(|section| !section.rejected)
+        .collect();
     let video = match video_sections.as_slice() {
-        [] => return Err("Сервер не предложил видеодорожку трансляции.".into()),
+        [] if all_video.is_empty() => {
+            return Err("Сервер не предложил видеодорожку трансляции.".into());
+        }
+        [] => return Err("Сервер выключил видеодорожку трансляции.".into()),
         [video] => *video,
         _ => return Err("Сервер предложил несколько видеодорожек трансляции.".into()),
     };
-    if video.rejected || !video.direction.accepts_send() {
+    if !video.direction.accepts_send() {
         return Err("Сервер выключил видеодорожку трансляции.".into());
     }
     if video.mid.is_empty() {
@@ -377,7 +388,11 @@ pub(super) fn verify_answer(
                 selected.mid
             )
         })?;
-    if video.rejected || matches!(video.direction, Direction::RecvOnly | Direction::Inactive) {
+    // The local send track creates a sendonly answer m-line: the media engine
+    // is the offerer's peer and never receives the rendition it publishes.
+    // A `sendrecv` answer would let the SFU push a second stream onto the same
+    // payload, so the loopback of all four codecs pins `a=sendonly`.
+    if video.rejected || video.direction != Direction::SendOnly {
         return Err(format!(
             "Ответ трансляции выключил видеодорожку {}.",
             selected.codec.label()
@@ -463,7 +478,6 @@ pub(super) fn verify_answer(
 pub(super) struct WireVideo {
     pub mid: String,
     pub frames_encoded: u32,
-    pub packets_sent: u64,
     pub codec: Option<WireCodec>,
 }
 
@@ -484,7 +498,12 @@ pub(super) fn confirm_codec(
     selected: &SelectedVideo,
     wire: &WireVideo,
 ) -> Result<Option<ConfirmedCodec>, String> {
-    if !wire.mid.is_empty() && wire.mid != selected.mid {
+    // An empty mid is missing data, not a match: a report that does not name
+    // the video stream cannot confirm the negotiated one.
+    if wire.mid.is_empty() {
+        return Err("Статистика WebRTC не называет видеодорожку трансляции.".into());
+    }
+    if wire.mid != selected.mid {
         return Err(format!(
             "Статистика описывает другую видеодорожку: {} вместо {}.",
             wire.mid, selected.mid
@@ -514,14 +533,11 @@ pub(super) fn confirm_codec(
             selected.primary_pt
         ));
     }
-    let profile = reported_profile(selected.codec, &codec.fmtp, selected.profile)?;
+    // The profile is verified here, never trusted from the request: the SDP
+    // already named it, so a report that omits FMTP keeps that value.
+    reported_profile(selected.codec, &codec.fmtp, selected.profile)?;
     Ok(Some(ConfirmedCodec {
         codec: selected.codec,
-        profile,
-        mid: selected.mid.clone(),
-        primary_pt: selected.primary_pt,
-        rtx_pt: selected.rtx_pt,
-        frames_encoded: wire.frames_encoded,
     }))
 }
 
@@ -801,12 +817,73 @@ a=fmtp:105 apt=104\r\n";
     }
 
     #[test]
+    fn a_rejected_video_m_line_is_not_a_second_video_track() {
+        // The SFU disables the previous section with `m=video 0` and adds the
+        // real one after it. Only one m-line carries a stream.
+        const WITH_DISABLED: &str = "v=0\r\n\
+m=video 0 UDP/TLS/RTP/SAVPF 96\r\n\
+a=mid:old\r\n\
+a=inactive\r\n\
+m=video 9 UDP/TLS/RTP/SAVPF 102 103\r\n\
+a=mid:0\r\n\
+a=recvonly\r\n\
+a=rtpmap:102 H264/90000\r\n\
+a=fmtp:102 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f\r\n\
+a=rtpmap:103 rtx/90000\r\n\
+a=fmtp:103 apt=102\r\n";
+        let selected = select_offer(WITH_DISABLED, &context(None)).expect("select");
+        assert_eq!(selected.mid, "0");
+        assert_eq!(selected.primary_pt, 102);
+    }
+
+    #[test]
+    fn an_offer_with_only_a_rejected_video_line_is_refused() {
+        const REJECTED: &str = "v=0\r\n\
+m=video 0 UDP/TLS/RTP/SAVPF 102\r\n\
+a=mid:0\r\n\
+a=inactive\r\n\
+a=rtpmap:102 H264/90000\r\n";
+        let error = select_offer(REJECTED, &context(None)).expect_err("rejected");
+        assert!(error.contains("выключил видеодорожку"), "{error}");
+    }
+
+    #[test]
+    fn a_sendrecv_answer_is_not_the_supported_sendonly_contract() {
+        let selected = select_offer(OFFER, &context(None)).expect("select");
+        let answer = "v=0\r\n\
+m=video 9 UDP/TLS/RTP/SAVPF 102 103\r\n\
+a=mid:0\r\n\
+a=sendrecv\r\n\
+a=rtpmap:102 H264/90000\r\n\
+a=fmtp:102 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f\r\n\
+a=rtpmap:103 rtx/90000\r\n\
+a=fmtp:103 apt=102\r\n";
+        let error = verify_answer(answer, &selected, false).expect_err("sendrecv");
+        assert!(error.contains("выключил видеодорожку"), "{error}");
+    }
+
+    #[test]
+    fn a_statistics_report_without_a_mid_never_confirms() {
+        let selected = select_offer(OFFER, &context(None)).expect("select");
+        let wire = WireVideo {
+            mid: String::new(),
+            frames_encoded: 7,
+            codec: Some(WireCodec {
+                payload_type: 102,
+                mime_type: "video/H264".into(),
+                fmtp: String::new(),
+            }),
+        };
+        let error = confirm_codec(&selected, &wire).expect_err("an empty mid is missing data");
+        assert!(error.contains("не называет"), "{error}");
+    }
+
+    #[test]
     fn the_confirmation_keeps_the_sdp_profile_when_the_report_omits_fmtp() {
         let selected = select_offer(OFFER, &context(None)).expect("select");
         let wire = WireVideo {
             mid: "0".into(),
             frames_encoded: 7,
-            packets_sent: 12,
             codec: Some(WireCodec {
                 payload_type: 102,
                 mime_type: "video/H264".into(),
@@ -817,7 +894,6 @@ a=fmtp:105 apt=104\r\n";
             .expect("the omitted FMTP falls back to the checked SDP")
             .expect("frames were encoded");
         assert_eq!(confirmed.codec, Codec::H264);
-        assert_eq!(confirmed.frames_encoded, 7);
     }
 
     #[test]
@@ -826,7 +902,6 @@ a=fmtp:105 apt=104\r\n";
         let wire = WireVideo {
             mid: "0".into(),
             frames_encoded: 3,
-            packets_sent: 3,
             codec: Some(WireCodec {
                 payload_type: 102,
                 mime_type: "video/VP8".into(),

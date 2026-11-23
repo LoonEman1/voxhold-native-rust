@@ -3,6 +3,7 @@
 
 use super::*;
 
+mod codec;
 mod stall;
 
 fn publication(connection: &str, user: i64) -> Publication {
@@ -936,4 +937,18 @@ fn a_publication_that_disappears_after_the_loss_is_dropped_with_a_reason() {
         Outcome::Failed { selection: 12, message } if message.contains("недоступна")
     )));
     assert!(viewer.intent().is_none());
+}
+
+/// Enter the room and watch one publication: the snapshot is catalogued, the
+/// join is confirmed, and the selection is the only path that sends
+/// `stream.watch`.
+fn watch(
+    viewer: &mut Viewer,
+    publication: &Publication,
+    selection: u64,
+    now: Instant,
+) -> Vec<Outcome> {
+    snapshot(viewer, std::slice::from_ref(publication), now);
+    viewer.set_joined(true, now);
+    viewer.select(publication, selection, now)
 }

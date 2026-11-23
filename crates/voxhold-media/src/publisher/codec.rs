@@ -280,6 +280,21 @@ impl CodecSnapshot {
         }
     }
 
+    /// Test entry point: this build views with exactly `receiver` and has no
+    /// encoder at all, so a viewing test can never depend on the host's
+    /// publisher capabilities (CPU or GPU).
+    #[cfg(test)]
+    pub(crate) fn receiver_only(receiver: Vec<VideoCodecCapability>) -> Self {
+        Self::from_probe(
+            next_generation(),
+            &CodecProbe {
+                encoders: Vec::new(),
+                sender: Vec::new(),
+                receiver,
+            },
+        )
+    }
+
     pub const fn generation(&self) -> u64 {
         self.generation
     }

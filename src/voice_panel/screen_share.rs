@@ -135,6 +135,10 @@ pub(super) struct ScreenShareUi {
     /// Next tag of a quality-change operation. It survives closing the dialog,
     /// so a delayed answer of an older operation can never match a newer one.
     pub(super) quality_op: u64,
+    /// The concrete codec the dialog would send, injected by a test so the
+    /// restart classification does not depend on the host encoders.
+    #[cfg(test)]
+    pub(super) test_codec: Option<Codec>,
     /// The operation whose result this dialog is waiting for. `busy` belongs
     /// to it; a result of another operation never clears it.
     pub(super) pending_quality_op: Option<u64>,
@@ -241,6 +245,8 @@ impl Default for ScreenShareUi {
             busy: false,
             preflight: false,
             quality_op: 0,
+            #[cfg(test)]
+            test_codec: None,
             pending_quality_op: None,
             error: String::new(),
             sharing: Sharing::default(),
@@ -305,11 +311,28 @@ impl ScreenShareUi {
         })
     }
 
+    /// The concrete codec the dialog would send. `Auto` resolves against the
+    /// sender snapshot exactly like Start does; an explicit unavailable codec
+    /// keeps its reason. The test seam replaces the probe answer so a
+    /// classification test never depends on the host build's encoders.
+    pub(super) fn resolved_codec(&self) -> Result<Codec, String> {
+        #[cfg(test)]
+        if let Some(codec) = self.test_codec {
+            return Ok(codec);
+        }
+        CodecSnapshot::current()
+            .resolve(self.codec, CodecRole::Sender)
+            .map_err(|rejection| rejection.reason().to_owned())
+    }
+
     /// The request a restart dialog would send: the confirmed live source with
-    /// the quality and audio fields shown by the dialog. Only a scope the user
-    /// really picks in the dialog can widen a narrow live scope.
+    /// the quality, audio and codec fields shown by the dialog. Only a scope the
+    /// user really picks in the dialog can widen a narrow live scope, and the
+    /// codec is the one Start resolved, so a codec change is classified as a
+    /// restart instead of quietly staying the live payload.
     pub(super) fn restart_request(&self) -> Option<PublishRequest> {
         let mut request = self.sharing.confirmed.as_ref()?.request();
+        request.codec = self.resolved_codec().ok()?;
         request.quality = self.quality().clamped();
         request.audio = self.audio_requested();
         request.audio_scope = self.effective_audio_scope(request.source.kind);
@@ -320,12 +343,19 @@ impl ScreenShareUi {
     /// live configuration. `None` outside a restart dialog or before that
     /// configuration is known.
     pub(super) fn restart_change(&self) -> Option<QualityChange> {
+        let next = self.restart_request()?;
+        self.restart_change_to(&next)
+    }
+
+    /// Classify the exact request the dialog would commit. Start resolves the
+    /// codec once; comparing that value (not a second resolution) keeps the
+    /// queued command and its hint in agreement.
+    pub(super) fn restart_change_to(&self, request: &PublishRequest) -> Option<QualityChange> {
         if !self.restart {
             return None;
         }
         let live = self.sharing.confirmed.as_ref()?.request();
-        let next = self.restart_request()?;
-        Some(live.change_to(&next))
+        Some(live.change_to(request))
     }
 
     fn loading(&self) -> bool {
@@ -885,9 +915,7 @@ impl VoicePanel {
         if let Some(reason) = &self.test_codec_error {
             return Err(reason.clone());
         }
-        CodecSnapshot::current()
-            .resolve(self.screen.codec, CodecRole::Sender)
-            .map_err(|rejection| rejection.reason().to_owned())
+        self.screen.resolved_codec()
     }
 
     /// Start waits for the endpoint probe: committing earlier would publish
@@ -1008,8 +1036,11 @@ impl VoicePanel {
             return;
         };
         let slot_available = self.active_publishers_in_room() < MAX_CHANNEL_PUBLISHERS;
-        let live_bitrate =
-            self.screen.restart && self.screen.restart_change() == Some(QualityChange::LiveBitrate);
+        // Classify with the exact request above, including the codec Start just
+        // resolved. A codec or profile change is a restart; only the bitrates
+        // reach the live sender.
+        let live_bitrate = self.screen.restart
+            && self.screen.restart_change_to(&request) == Some(QualityChange::LiveBitrate);
         // Every quality change gets its own tag, so a delayed answer of an
         // older Apply cannot clear the busy state of this one.
         let quality_op = if self.screen.restart {

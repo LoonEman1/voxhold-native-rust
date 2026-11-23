@@ -4,13 +4,17 @@
 //!
 //! ```text
 //! --pid <process id> --target <install dir> --staged <staging dir>
-//! --exe <executable name> --handshake <file> [--detached]
+//! --exe <executable name> --handshake <file> [--ready <file>]
+//! [--refusal <file>] [--version <version>]
+//! [--monitor <left,top,right,bottom>] [--detached]
 //! ```
 //!
 //! `--target`, `--staged` and `--handshake` must be absolute paths; `--target`
 //! and `--staged` must already exist and are canonicalised before the process
 //! changes its working directory. `--exe` is a plain file name inside the
-//! staged `app` directory.
+//! staged `app` directory. `--monitor` is the work area of the monitor that
+//! showed the client; the helper centres its own window in it and falls back to
+//! the primary work area when the argument is absent.
 //!
 //! `--staged` is the version directory (`...\updates\<version>`); the helper
 //! uses `<staged>\app` as the prepared payload and writes `<staged>\apply.log`.
@@ -23,6 +27,11 @@
 //! subsystem so the helper never flashes a console window; failures are
 //! reported through `apply.log` and the exit code.
 //!
+//! The helper owns the visible installation window (see `window.rs`). It is
+//! created and shown before `--ready` is written, so the client only exits once
+//! the helper can already receive stage messages. After a confirmed handshake
+//! the window closes and the helper exits.
+//!
 //! After a successful apply the helper removes the staged payload and then
 //! runs a best-effort `cleanup_stale` over the updates root, keeping its own
 //! version directory because the running image cannot be deleted. The
@@ -31,6 +40,9 @@
 
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+mod stages;
+mod window;
+
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -38,7 +50,8 @@ use std::process::{Command, ExitCode};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use voxhold_update::apply::{
-    apply_staged, helper_relocation_destination, is_relocated_helper, relocate_helper,
+    apply_staged_observed, helper_relocation_destination, is_relocated_helper, relocate_helper,
+    ApplyObserver, ApplyStage,
 };
 use voxhold_update::recovery::{recover_install, RecoveryMode, RecoveryOutcome};
 use voxhold_update::stage::{
@@ -63,6 +76,7 @@ struct Arguments {
     ready: Option<PathBuf>,
     refusal: Option<PathBuf>,
     version: Option<String>,
+    monitor: Option<window::MonitorRect>,
 }
 
 fn main() -> ExitCode {
@@ -139,6 +153,30 @@ fn main() -> ExitCode {
         }
     }
 
+    // DPI awareness must be selected before any window is created.
+    window::set_dpi_awareness();
+    let version = arguments
+        .version
+        .clone()
+        .or_else(|| read_staged_version(&arguments.staged));
+    let update_window = match window::spawn(arguments.monitor, version) {
+        Ok(update_window) => Some(update_window),
+        Err(message) => {
+            log(
+                &log_path,
+                &format!("cannot create the update window: {message}"),
+            );
+            // The client waits for the marker; without a window it must stay
+            // open and show the error instead of quitting.
+            if arguments.ready.is_some() {
+                return ExitCode::from(EXIT_APPLY);
+            }
+            None
+        }
+    };
+
+    // Only now is the window created, shown and able to receive stage
+    // messages, so the client may finish and let this process take over.
     if let Some(ready) = arguments.ready.as_deref() {
         if let Err(error) = write_marker(ready, b"ready\n") {
             log(
@@ -154,6 +192,9 @@ fn main() -> ExitCode {
     }
     log(&log_path, "client exited");
 
+    if let Some(update_window) = &update_window {
+        update_window.set_stage(stages::Stage::Verifying);
+    }
     // Directory replacement belongs to the helper, and only after the
     // application exited. The same recovery runs in the app as an observer.
     match recover_install(&arguments.target, RecoveryMode::Updater) {
@@ -182,17 +223,21 @@ fn main() -> ExitCode {
             return fail_apply(&arguments, &log_path);
         }
     }
-    match apply_staged(
+    let observer = WindowObserver(update_window.as_ref());
+    match apply_staged_observed(
         &arguments.target,
         &app,
         &arguments.exe,
         &arguments.handshake,
+        &observer,
     ) {
         Ok(outcome) => {
             log(
                 &log_path,
                 &format!("apply succeeded backup_removed={}", outcome.backup_removed),
             );
+            // The handshake is confirmed: the installation surface is done.
+            drop(update_window);
             let relocated = is_relocated_helper(&current, &arguments.staged);
             let cleanup = if relocated {
                 cleanup_after_install_payload(&arguments.staged)
@@ -219,6 +264,7 @@ fn main() -> ExitCode {
                 &log_path,
                 &format!("apply failed: {} ({error})", error.code()),
             );
+            drop(update_window);
             fail_apply(&arguments, &log_path)
         }
     }
@@ -283,6 +329,23 @@ fn failure_action(
     match recovery {
         Ok(RecoveryOutcome::Completed { .. }) => FailureAction::KeepInstalled,
         _ => FailureAction::RefuseAndRestart,
+    }
+}
+
+/// Forwards apply stages to the helper window. Absent window means the helper
+/// continues headless (only possible without `--ready`, see `main`).
+struct WindowObserver<'a>(Option<&'a window::WindowHandle>);
+
+impl ApplyObserver for WindowObserver<'_> {
+    fn stage(&self, stage: ApplyStage) {
+        if let Some(update_window) = self.0 {
+            update_window.set_stage(stage.into());
+            if stage == ApplyStage::Done {
+                // The handshake is confirmed; the installation surface has
+                // nothing left to show while the backup is cleaned up.
+                update_window.request_close();
+            }
+        }
     }
 }
 
@@ -359,6 +422,7 @@ fn parse_arguments(mut arguments: impl Iterator<Item = String>) -> Result<Argume
     let mut ready = None;
     let mut refusal = None;
     let mut version = None;
+    let mut monitor = None;
     while let Some(flag) = arguments.next() {
         let mut value = || {
             arguments
@@ -384,6 +448,13 @@ fn parse_arguments(mut arguments: impl Iterator<Item = String>) -> Result<Argume
             "--ready" => ready = Some(absolute_path("--ready", &value()?)?),
             "--refusal" => refusal = Some(absolute_path("--refusal", &value()?)?),
             "--version" => version = Some(value()?),
+            "--monitor" => {
+                let raw = value()?;
+                monitor = Some(
+                    window::MonitorRect::parse(&raw)
+                        .ok_or_else(|| format!("invalid monitor rectangle {raw}"))?,
+                );
+            }
             "--detached" => detached = true,
             other => return Err(format!("unknown argument {other}")),
         }
@@ -410,6 +481,7 @@ fn parse_arguments(mut arguments: impl Iterator<Item = String>) -> Result<Argume
         ready,
         refusal,
         version,
+        monitor,
     })
 }
 
@@ -621,6 +693,28 @@ mod tests {
         assert_eq!(parsed.ready.as_deref(), Some(ready.as_path()));
         assert_eq!(parsed.refusal.as_deref(), Some(refusal.as_path()));
         assert_eq!(parsed.version.as_deref(), Some("0.2.0"));
+    }
+
+    #[test]
+    fn accepts_the_monitor_rectangle() {
+        let fixture = Fixture::new();
+        let mut args = fixture.args();
+        args.extend(["--monitor".into(), "-1920,0,0,1040".into()]);
+        let parsed = parse_arguments(args.into_iter()).unwrap();
+        assert_eq!(
+            parsed.monitor,
+            Some(window::MonitorRect {
+                left: -1920,
+                top: 0,
+                right: 0,
+                bottom: 1040,
+            })
+        );
+
+        let mut args = fixture.args();
+        args.extend(["--monitor".into(), "0,0,0,100".into()]);
+        let error = parse_arguments(args.into_iter()).unwrap_err();
+        assert!(error.contains("monitor"), "{error}");
     }
 
     #[test]

@@ -53,6 +53,37 @@ pub struct ApplyOutcome {
     pub backup_removed: bool,
 }
 
+/// Coarse stage reported while an update is applied.
+///
+/// The stages describe what the helper is doing so its window can show one
+/// truthful line. They carry no percentage: these steps have no measurable
+/// progress.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApplyStage {
+    /// Reading and checking the staged payload before touching the installation.
+    Verifying,
+    /// Copying the payload, migrating user files and swapping the directories.
+    Replacing,
+    /// The new installation is in place and its executable is starting.
+    Launching,
+    /// A failure occurred and the previous installation is being restored.
+    RollingBack,
+    /// The new version confirmed startup; the helper may close its surface
+    /// while the backup is cleaned up.
+    Done,
+}
+
+/// Receives [`ApplyStage`] changes. Purely observational: it never changes
+/// the apply result.
+pub trait ApplyObserver {
+    fn stage(&self, _stage: ApplyStage) {}
+}
+
+/// Observer used when nobody displays the progress.
+pub struct NoObserver;
+
+impl ApplyObserver for NoObserver {}
+
 /// A process started after the swap.
 pub trait LaunchedProcess {
     fn try_wait(&mut self) -> Result<Option<i32>>;
@@ -123,13 +154,32 @@ pub fn apply_staged(
     exe_name: &str,
     handshake_path: &Path,
 ) -> Result<ApplyOutcome> {
-    apply_staged_with(
+    apply_staged_observed(
+        target_dir,
+        staged_app,
+        exe_name,
+        handshake_path,
+        &NoObserver,
+    )
+}
+
+/// Apply a staged update and report its stages to `observer`.
+pub fn apply_staged_observed(
+    target_dir: &Path,
+    staged_app: &Path,
+    exe_name: &str,
+    handshake_path: &Path,
+    observer: &dyn ApplyObserver,
+) -> Result<ApplyOutcome> {
+    apply_staged_with_hooks(
         target_dir,
         staged_app,
         exe_name,
         handshake_path,
         &ProcessLauncher,
         HANDSHAKE_TIMEOUT,
+        &NoHooks,
+        observer,
     )
 }
 
@@ -150,6 +200,7 @@ pub fn apply_staged_with(
         launcher,
         timeout,
         &NoHooks,
+        &NoObserver,
     )
 }
 
@@ -184,7 +235,9 @@ pub(crate) fn apply_staged_with_hooks(
     launcher: &dyn UpdateLauncher,
     timeout: Duration,
     hooks: &dyn ApplyHooks,
+    observer: &dyn ApplyObserver,
 ) -> Result<ApplyOutcome> {
+    observer.stage(ApplyStage::Verifying);
     let new_index = read_package_json_from_dir(staged_app)?;
     let exe = staged_app.join(exe_name);
     if !exe.is_file() {
@@ -257,6 +310,7 @@ pub(crate) fn apply_staged_with_hooks(
         };
     }
 
+    observer.stage(ApplyStage::Replacing);
     let result = (|| -> Result<()> {
         copy_payload(staged_app, &staging_dir, &new_index)?;
         checkpoint!(InterruptPoint::Staged);
@@ -285,6 +339,7 @@ pub(crate) fn apply_staged_with_hooks(
         applied = Some(state.clone());
         checkpoint!(InterruptPoint::NewInPlace);
 
+        observer.stage(ApplyStage::Launching);
         let process = launch_new(
             target_dir,
             exe_name,
@@ -301,12 +356,18 @@ pub(crate) fn apply_staged_with_hooks(
     match result {
         Ok(()) => {
             let applied = applied.expect("state is persisted before launch");
+            // The handshake is confirmed: the new version is running, so the
+            // helper may close its window before the backup cleanup.
+            observer.stage(ApplyStage::Done);
             finish_success(&applied, target_dir, staged_app)
         }
         Err(error) if interrupted => Err(error),
         Err(error) => {
             let rollback = match applied.as_ref() {
-                Some(applied) => recovery::rollback_operation(applied),
+                Some(applied) => {
+                    observer.stage(ApplyStage::RollingBack);
+                    recovery::rollback_operation(applied)
+                }
                 None => {
                     let _ = fsutil::remove_dir_with_timeout(&staging_dir, STAGING_CLEANUP_TIMEOUT);
                     Ok(())

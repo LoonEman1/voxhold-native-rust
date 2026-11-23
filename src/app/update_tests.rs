@@ -213,7 +213,7 @@ async fn the_panel_renders_every_state_in_both_themes(cx: &mut TestAppContext) {
             },
             &["update-error", "update-retry"],
         ),
-        (UpdatePhase::Installing, &[]),
+        (UpdatePhase::Installing, &["update-installing"]),
     ];
     for light in [false, true] {
         for (phase, selectors) in &states {

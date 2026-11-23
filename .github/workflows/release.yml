@@ -74,6 +74,17 @@ jobs:
       - name: Test update layer
         run: cargo test -p voxhold-update -p voxhold-release -p voxhold-updater --locked
 
+      - name: Generate the preview signing key
+        if: steps.plan.outputs.publish != 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $previewKey = Join-Path $env:RUNNER_TEMP 'release-preview-key.b64'
+          cargo run --release --locked -p voxhold-release -- keygen --out $previewKey |
+            Where-Object { $_ -cmatch '^public_key=' } |
+            ForEach-Object { $_ -creplace '^public_key=', 'VOXHOLD_UPDATE_PUBKEY=' } >> $env:GITHUB_ENV
+
       - name: Build client and tools
         shell: pwsh
         run: |
@@ -238,10 +249,7 @@ jobs:
             }
           } else {
             $previewKey = Join-Path $env:RUNNER_TEMP 'release-preview-key.b64'
-            $keyInfo = & $tool keygen --out $previewKey
-            $publicKey = ($keyInfo -cmatch '^public_key=') -creplace '^public_key=', ''
             $manifestArgs += @('--key-file', $previewKey)
-            $verifyArgs += @('--pubkey', $publicKey)
           }
           try {
             & $tool @manifestArgs

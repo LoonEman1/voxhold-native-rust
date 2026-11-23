@@ -29,8 +29,13 @@ fn save_now(store: &SessionStore, record: &RememberedSession) -> Result<(), Stor
     store.save(record, store.epoch())
 }
 
-fn delete_now(store: &SessionStore, origin: &str, account: &str) -> Result<(), StoreError> {
-    store.delete(origin, account, store.epoch())
+fn delete_now(
+    store: &SessionStore,
+    origin: &str,
+    account: &str,
+    token: &str,
+) -> Result<(), StoreError> {
+    store.delete(origin, account, token, store.epoch())
 }
 
 fn load(store: &SessionStore, origin: &str) -> Result<Option<RememberedSession>, StoreError> {
@@ -265,7 +270,7 @@ fn the_account_ignores_case_and_save_replaces_the_same_key() {
     assert_eq!(all.len(), 1, "one record per origin and account");
     assert_eq!(all[0].token, "token-2");
 
-    delete_now(&store, "https://chat.example.org", "NEVA").unwrap();
+    delete_now(&store, "https://chat.example.org", "NEVA", "token-2").unwrap();
     assert!(store.load_all().unwrap().is_empty());
     std::fs::remove_dir_all(dir).unwrap();
 }
@@ -304,7 +309,7 @@ fn expiry_is_visible_so_the_caller_can_delete_the_record() {
     let loaded = store.load_all().unwrap();
     assert!(loaded[0].is_expired(101));
     assert!(!loaded[0].is_expired(99));
-    delete_now(&store, &saved.origin, &saved.account).unwrap();
+    delete_now(&store, &saved.origin, &saved.account, &saved.token).unwrap();
     assert!(store.load_all().unwrap().is_empty());
     std::fs::remove_dir_all(dir).unwrap();
 }
@@ -415,7 +420,8 @@ fn a_late_save_after_a_logout_does_not_resurrect_the_record() {
         scope.spawn(move || {
             start.wait();
             let epoch = out.bump_epoch();
-            out.delete(&saved.origin, &saved.account, epoch).unwrap();
+            out.delete(&saved.origin, &saved.account, &saved.token, epoch)
+                .unwrap();
         });
     });
     assert!(
@@ -441,7 +447,7 @@ fn a_late_delete_does_not_remove_a_new_record() {
         let start = &barrier;
         scope.spawn(move || {
             start.wait();
-            let _ = late.delete("https://chat.example.org", "neva", old_epoch);
+            let _ = late.delete("https://chat.example.org", "neva", "token-1", old_epoch);
         });
         let fresh = store.clone();
         scope.spawn(move || {
@@ -518,7 +524,7 @@ fn a_stale_generation_is_an_explicit_error() {
         Err(StoreError::Stale)
     );
     assert_eq!(
-        store.delete("https://chat.example.org", "neva", old_epoch),
+        store.delete("https://chat.example.org", "neva", "token-1", old_epoch),
         Err(StoreError::Stale)
     );
     assert_eq!(
@@ -551,19 +557,16 @@ fn two_threads_saving_and_deleting_keep_every_other_record() {
                 // file cap, so a lost cross-thread record would show as eight.
                 for index in 0..16 {
                     let account = format!("user-{worker}-{index}");
+                    let token = format!("token-{worker}-{index}");
                     store
                         .save(
-                            &record(
-                                "https://chat.example.org",
-                                &account,
-                                &format!("token-{worker}-{index}"),
-                            ),
+                            &record("https://chat.example.org", &account, &token),
                             store.epoch(),
                         )
                         .unwrap();
                     if index % 2 == 0 {
                         store
-                            .delete("https://chat.example.org", &account, store.epoch())
+                            .delete("https://chat.example.org", &account, &token, store.epoch())
                             .unwrap();
                     }
                 }
@@ -658,6 +661,37 @@ fn a_disabled_store_is_a_quiet_no_op() {
 }
 
 #[test]
+fn an_unchecked_login_clears_this_account_and_the_active_target() {
+    let (dir, path) = scratch("forget");
+    let store = SessionStore::new(Some(path));
+    let first = record("https://chat.example.org", "neva", "token-1");
+    let second = record("https://chat.example.org", "bob", "token-2");
+    save_now(&store, &first).unwrap();
+    save_now(&store, &second).unwrap();
+    assert_eq!(
+        store.state().unwrap().target.map(|target| target.account),
+        Some("bob".into())
+    );
+
+    // bob signs in without the box: his record and the active target go, while
+    // neva's record stays for a later explicit choice.
+    store
+        .forget(&second.origin, &second.account, store.epoch())
+        .unwrap();
+    let state = store.state().unwrap();
+    assert_eq!(state.records, vec![first]);
+    assert!(state.target.is_none());
+    assert_eq!(
+        store
+            .plan_auto_login(crate::auth_session::now_unix(), None, true)
+            .unwrap(),
+        AutoLogin::Manual,
+        "the new format never searches records after an explicit forget"
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn debug_output_never_prints_the_token() {
     let saved = record("https://chat.example.org", "neva", "token-secret");
     let debug = format!("{saved:?}");
@@ -665,3 +699,5 @@ fn debug_output_never_prints_the_token() {
     assert!(!debug.contains("token-secret"), "{debug}");
     assert!(debug.contains("neva"), "{debug}");
 }
+
+mod target_tests;

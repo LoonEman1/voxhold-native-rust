@@ -379,7 +379,7 @@ async fn explicit_logout_still_clears_the_drafts(cx: &mut TestAppContext) {
     });
     pump(visual);
     view.read_with(&*visual, |v, _| {
-        assert_eq!(v.auth.screen, crate::auth::AuthScreen::Login);
+        assert_eq!(v.auth.screen, crate::auth::AuthScreen::Instance);
         assert!(v.session.is_none());
         assert!(v.drafts.borrow().text(key).is_empty());
         assert!(v.drafts.borrow().files(key).is_empty());

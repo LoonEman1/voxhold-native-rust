@@ -246,8 +246,8 @@ impl EncoderProbeService {
             request.target.clone(),
         ));
         state.pending = Some(request);
-        drop(state);
         self.inner.current.store(generation, Ordering::Release);
+        drop(state);
         self.inner.wake.notify_all();
         Ok(generation)
     }
@@ -270,8 +270,8 @@ impl EncoderProbeService {
             previous.query(),
             previous.target().clone(),
         ));
-        drop(state);
         self.inner.current.store(generation, Ordering::Release);
+        drop(state);
         self.inner.wake.notify_all();
         generation
     }

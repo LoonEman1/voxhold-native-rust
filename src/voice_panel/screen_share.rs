@@ -83,6 +83,9 @@ pub(super) enum ShareKey {
     BitrateDown,
     BitrateUp,
     Preset(Preset),
+    /// One codec choice of the picker: «Автоматически» or one of the four SDR
+    /// codecs, in the website's order.
+    Codec(CodecIntent),
     Audio,
     /// One offered capture scope of the system-audio track.
     AudioScope(AudioScope),
@@ -139,6 +142,11 @@ pub(super) struct ScreenShareUi {
     /// restart classification does not depend on the host encoders.
     #[cfg(test)]
     pub(super) test_codec: Option<Codec>,
+    /// Sender availability per codec injected by a test, so the selector can
+    /// paint a greyed item and its reason on a build whose probe finds every
+    /// codec. `None` keeps the real process snapshot.
+    #[cfg(test)]
+    pub(super) test_codec_availability: Option<Vec<(Codec, Option<String>)>>,
     /// The operation whose result this dialog is waiting for. `busy` belongs
     /// to it; a result of another operation never clears it.
     pub(super) pending_quality_op: Option<u64>,
@@ -247,6 +255,8 @@ impl Default for ScreenShareUi {
             quality_op: 0,
             #[cfg(test)]
             test_codec: None,
+            #[cfg(test)]
+            test_codec_availability: None,
             pending_quality_op: None,
             error: String::new(),
             sharing: Sharing::default(),
@@ -320,9 +330,50 @@ impl ScreenShareUi {
         if let Some(codec) = self.test_codec {
             return Ok(codec);
         }
+        #[cfg(test)]
+        if let Some(entries) = &self.test_codec_availability {
+            let reason = |codec: Codec| {
+                entries
+                    .iter()
+                    .find(|(entry, _)| *entry == codec)
+                    .map(|(_, reason)| reason.clone())
+                    .unwrap_or_else(|| Some("Кодек не описан в тестовом наборе.".to_owned()))
+            };
+            return match self.codec {
+                CodecIntent::Auto => entries
+                    .iter()
+                    .find(|(_, reason)| reason.is_none())
+                    .map(|(codec, _)| *codec)
+                    .ok_or_else(|| {
+                        "В этой сборке нет доступного SDR-кодека для публикации.".to_owned()
+                    }),
+                CodecIntent::Explicit(codec) => match reason(codec) {
+                    None => Ok(codec),
+                    Some(reason) => Err(reason),
+                },
+            };
+        }
         CodecSnapshot::current()
             .resolve(self.codec, CodecRole::Sender)
             .map_err(|rejection| rejection.reason().to_owned())
+    }
+
+    /// Sender availability of one codec exactly as the selector paints it:
+    /// `Ok(())` when this build can encode it, otherwise the probe's reason.
+    pub(super) fn codec_availability(&self, codec: Codec) -> Result<(), String> {
+        #[cfg(test)]
+        if let Some(entries) = &self.test_codec_availability {
+            return entries
+                .iter()
+                .find(|(entry, _)| *entry == codec)
+                .map(|(_, reason)| reason.clone().map_or(Ok(()), Err))
+                .unwrap_or_else(|| Err("Кодек не описан в тестовом наборе.".to_owned()));
+        }
+        let availability = CodecSnapshot::current().availability(CodecRole::Sender, codec);
+        match availability.reason() {
+            None => Ok(()),
+            Some(reason) => Err(reason.to_owned()),
+        }
     }
 
     /// The request a restart dialog would send: the confirmed live source with
@@ -480,7 +531,9 @@ impl ScreenShareUi {
 /// measured counters once the engine sampled them, `sound` is the fallback
 /// label (which already names the scope). The engine's real scope is appended
 /// exactly once, so the measured-stats card names the capture instead of hiding
-/// it behind the counters.
+/// it behind the counters. The codec in the line is the confirmed one — the
+/// encoded codec from the stats when present, otherwise the configuration the
+/// media layer accepted — never the picker's current desire.
 pub(in crate::voice_panel) fn screen_on_air_line(
     sharing: &Sharing,
     quality: &str,
@@ -491,14 +544,27 @@ pub(in crate::voice_panel) fn screen_on_air_line(
         .audio_scope
         .as_deref()
         .filter(|scope| sharing.has_audio && !scope.is_empty());
-    match (stats, scope) {
-        (Some(stats), Some(scope)) => format!("{quality} · {stats} · {scope}"),
-        (Some(stats), None) => format!("{quality} · {stats}"),
-        (None, Some(scope)) if !sound.contains(scope) => {
-            format!("{quality} · {sound} · {scope}")
-        }
-        (None, _) => format!("{quality} · {sound}"),
+    let confirmed_codec = sharing
+        .stats
+        .and_then(|stats| stats.confirmed_codec)
+        .or_else(|| sharing.confirmed.as_ref().map(|confirmed| confirmed.codec));
+    let mut parts = vec![quality.to_owned()];
+    if let Some(codec) = confirmed_codec {
+        parts.push(codec.label().to_owned());
     }
+    match (stats, scope) {
+        (Some(stats), Some(scope)) => {
+            parts.push(stats.to_owned());
+            parts.push(scope.to_owned());
+        }
+        (Some(stats), None) => parts.push(stats.to_owned()),
+        (None, Some(scope)) if !sound.contains(scope) => {
+            parts.push(sound.to_owned());
+            parts.push(scope.to_owned());
+        }
+        (None, _) => parts.push(sound.to_owned()),
+    }
+    parts.join(" · ")
 }
 
 impl VoicePanel {
@@ -942,6 +1008,24 @@ impl VoicePanel {
         cx.notify();
     }
 
+    /// Choose a codec in the picker or the live dialog. An explicit item this
+    /// build cannot encode is inert: the greyed button keeps its reason and
+    /// Start stays blocked instead of silently substituting another codec.
+    /// A changed codec reaches Start as a restart/preflight through
+    /// `restart_change_to`, never as a live bitrate reconfiguration.
+    pub(super) fn select_screen_codec(&mut self, intent: CodecIntent, cx: &mut Context<Self>) {
+        if let CodecIntent::Explicit(codec) = intent {
+            if self.screen.codec_availability(codec).is_err() {
+                return;
+            }
+        }
+        if self.screen.codec == intent {
+            return;
+        }
+        self.screen.codec = intent;
+        cx.notify();
+    }
+
     pub(super) fn apply_preset(&mut self, preset: Preset, cx: &mut Context<Self>) {
         let quality = preset.apply(self.screen.quality());
         self.screen.fps = quality.fps;
@@ -1071,6 +1155,7 @@ impl VoicePanel {
 
 mod audio_scope;
 mod card;
+mod codec;
 mod dialog;
 mod picker;
 mod preferences;

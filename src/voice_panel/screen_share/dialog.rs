@@ -6,7 +6,7 @@
 use super::picker::*;
 use super::*;
 use crate::theme;
-use voxhold_media::publisher::{CodecIntent, Preset, Resolution, SCREEN_FRAME_RATES};
+use voxhold_media::publisher::{Preset, Resolution, SCREEN_FRAME_RATES};
 use voxhold_media::screen_capture::ScreenSource;
 
 impl ScreenShareUi {
@@ -76,14 +76,15 @@ impl VoicePanel {
         key: ShareKey,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        self.choice_enabled(label, active, true, focus, key, cx)
+        self.choice_enabled(label, active, true, 30., focus, key, cx)
     }
 
-    fn choice_enabled(
+    pub(super) fn choice_enabled(
         &self,
         label: impl Into<gpui::SharedString>,
         active: bool,
         enabled: bool,
+        height: f32,
         focus: FocusHandle,
         key: ShareKey,
         cx: &mut Context<Self>,
@@ -96,7 +97,7 @@ impl VoicePanel {
         #[cfg(test)]
         let button = button.debug_selector(move || selector);
         let mut button = button
-            .h(px(30.))
+            .h(px(height))
             .px(px(10.))
             .rounded(px(8.))
             .border_1()
@@ -361,27 +362,8 @@ impl VoicePanel {
 
         // Quality: only values the SDR publication applies.
         let q = self.screen.quality();
-        // The picker offers the website's «Автоматически» first. The concrete
-        // codec is what the current sender snapshot resolves right now; an
-        // unavailable explicit choice keeps its reason until the user changes
-        // it. The full four-item list with per-codec reasons is the next slice.
-        let codec_intent = self.screen.codec;
-        let codec_resolution = self.codec_resolution();
-        let codec_label = match &codec_resolution {
-            Ok(codec) => match codec_intent {
-                CodecIntent::Auto => format!("Автоматически · {}", codec.label()),
-                CodecIntent::Explicit(_) => codec.label().to_owned(),
-            },
-            Err(_) => "Нет доступного SDR-кодека".to_owned(),
-        };
-        // gpui exposes painted bounds, not text; the selector carries the exact
-        // line so a UI test asserts what the dialog says, not only its slot.
-        let codec_label_selector = format!("share-codec-label:{codec_label}");
-        let codec_refused = codec_resolution.is_err();
-        let codec_reason = codec_resolution
-            .err()
-            .unwrap_or_else(|| "SDR · серверная передача".to_owned());
-        let codec_reason_selector = format!("share-codec-reason:{codec_reason}");
+        // Codec: the website's «Автоматически» plus its four SDR codecs. The
+        // selector and its reasons live in `screen_share/codec.rs`.
         let bitrate = format!(
             "{},{:01} Мбит/с",
             self.screen.bitrate_kbps / 1000,
@@ -502,6 +484,7 @@ impl VoicePanel {
                         "− 64",
                         false,
                         audio_controls,
+                        30.,
                         audio_down,
                         ShareKey::AudioBitrateDown,
                         cx,
@@ -519,6 +502,7 @@ impl VoicePanel {
                         "+ 64",
                         false,
                         audio_controls,
+                        30.,
                         audio_up,
                         ShareKey::AudioBitrateUp,
                         cx,
@@ -540,6 +524,7 @@ impl VoicePanel {
                         audio_toggle,
                         audio_requested,
                         audio_available,
+                        30.,
                         audio_focus,
                         ShareKey::Audio,
                         cx,
@@ -568,6 +553,7 @@ impl VoicePanel {
                         label,
                         self.screen.audio_scope == scope,
                         audio_available,
+                        30.,
                         focus,
                         ShareKey::AudioScope(scope),
                         cx,
@@ -580,36 +566,7 @@ impl VoicePanel {
                         .child(scope_sentence),
                 )
             })
-            .child(
-                div()
-                    .debug_selector(|| "share-codec".into())
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        div()
-                            .w(px(92.))
-                            .text_size(px(12.))
-                            .text_color(rgb(c.muted))
-                            .child("Кодек"),
-                    )
-                    .child(
-                        div()
-                            .debug_selector(move || codec_label_selector.clone().into())
-                            .text_size(px(12.))
-                            .child(codec_label),
-                    )
-                    .child(
-                        div()
-                            .debug_selector(move || codec_reason_selector.clone().into())
-                            .flex_1()
-                            .min_w(px(0.))
-                            .text_size(px(10.))
-                            .text_color(rgb(if codec_refused { c.danger } else { c.muted }))
-                            .truncate()
-                            .child(codec_reason),
-                    ),
-            );
+            .child(self.codec_row(&mut ring, &mut row, cx));
 
         let cancel_focus = row(self, &mut ring, ShareKey::Cancel);
         let start_focus = row(self, &mut ring, ShareKey::Start);
@@ -844,6 +801,7 @@ impl VoicePanel {
             ShareKey::BitrateDown => self.change_bitrate(-100, cx),
             ShareKey::BitrateUp => self.change_bitrate(100, cx),
             ShareKey::Preset(preset) => self.apply_preset(preset, cx),
+            ShareKey::Codec(intent) => self.select_screen_codec(intent, cx),
             ShareKey::Audio => self.toggle_system_audio(cx),
             ShareKey::AudioScope(scope) => self.select_audio_scope(scope, cx),
             ShareKey::AudioBitrateDown => self.change_audio_bitrate(false, cx),

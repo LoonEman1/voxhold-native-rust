@@ -71,4 +71,24 @@ impl VoicePanel {
     pub fn test_set_codec_error(&mut self, reason: &str) {
         self.test_codec_error = Some(reason.to_owned());
     }
+
+    /// Replace the sender availability matrix of the dialog. Every codec in
+    /// `entries` gets the injected state (`None` is available); a UI test can
+    /// paint a greyed item, its reason and the Auto answer deterministically.
+    pub fn test_set_screen_codec_availability(
+        &mut self,
+        entries: Vec<(voxhold_media::publisher::Codec, Option<String>)>,
+    ) {
+        self.screen.test_codec_availability = Some(entries);
+    }
+
+    /// The codec the live attempt really confirmed on air, never the dialog's
+    /// current desire.
+    pub fn test_screen_confirmed_codec(&self) -> Option<voxhold_media::publisher::Codec> {
+        self.screen
+            .sharing
+            .confirmed
+            .as_ref()
+            .map(|confirmed| confirmed.codec)
+    }
 }

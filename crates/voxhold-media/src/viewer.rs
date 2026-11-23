@@ -589,6 +589,14 @@ impl Viewer {
         if !accepted {
             return Vec::new();
         }
+        // Stale signaling is ignored before the codec is judged: an offer of
+        // the publication this attempt replaced still names the old codec, so
+        // reading it against the new catalogue would end a healthy view with a
+        // false "server did not offer <new codec>" refusal.
+        let ufrags = sdp_ufrags(sdp);
+        if !ufrags.is_empty() && ufrags.iter().all(|ufrag| self.retired(now, ufrag)) {
+            return Vec::new();
+        }
         // The offer names the rendition profile. A stream this build cannot
         // decode is released with the ordinary `stream.leave` instead of
         // hanging on a black picture until the start deadline. The codec the
@@ -596,10 +604,6 @@ impl Viewer {
         // audio m-lines belong to the separate voice path.
         if let Some(message) = self.offer_refusal(sdp, &active.publication) {
             return self.fail(&message, now);
-        }
-        let ufrags = sdp_ufrags(sdp);
-        if !ufrags.is_empty() && ufrags.iter().all(|ufrag| self.retired(now, ufrag)) {
-            return Vec::new();
         }
         let previous = self
             .active

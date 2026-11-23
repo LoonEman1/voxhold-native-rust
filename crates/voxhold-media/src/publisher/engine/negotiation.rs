@@ -289,13 +289,23 @@ pub(super) fn select_offer(sdp: &str, context: &OfferContext<'_>) -> Result<Sele
             .find(|section| section.kind == Kind::Audio && !section.rejected)
             .map(|section| section.mid.clone()),
         true => {
-            let audio = sections.iter().find(|section| section.kind == Kind::Audio);
+            // A rejected m=audio 0 is the previous section the SFU disabled on
+            // a re-offer; the live track sits next to it. Looking at the first
+            // audio section without this filter would report a track that was
+            // deliberately turned off and ignore the real one.
+            let audio = sections
+                .iter()
+                .find(|section| section.kind == Kind::Audio && !section.rejected);
             let Some(audio) = audio else {
-                return Err(
-                    "Сервер не предложил звуковую дорожку, хотя системный звук включён.".into(),
-                );
+                let had_audio = sections.iter().any(|section| section.kind == Kind::Audio);
+                return Err(match had_audio {
+                    true => "Сервер выключил звуковую дорожку трансляции.".into(),
+                    false => {
+                        "Сервер не предложил звуковую дорожку, хотя системный звук включён.".into()
+                    }
+                });
             };
-            if audio.rejected || !audio.direction.accepts_send() {
+            if !audio.direction.accepts_send() {
                 return Err("Сервер выключил звуковую дорожку трансляции.".into());
             }
             if !audio
@@ -860,6 +870,52 @@ a=rtpmap:103 rtx/90000\r\n\
 a=fmtp:103 apt=102\r\n";
         let error = verify_answer(answer, &selected, false).expect_err("sendrecv");
         assert!(error.contains("выключил видеодорожку"), "{error}");
+    }
+
+    #[test]
+    fn a_rejected_audio_line_does_not_hide_the_live_track_of_a_reoffer() {
+        // The SFU disables the previous audio section with `m=audio 0` and
+        // adds the live one after it.
+        const REAUDIO: &str = "v=0\r\n\
+m=video 9 UDP/TLS/RTP/SAVPF 102 103\r\n\
+a=mid:0\r\n\
+a=recvonly\r\n\
+a=rtpmap:102 H264/90000\r\n\
+a=fmtp:102 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f\r\n\
+a=rtpmap:103 rtx/90000\r\n\
+a=fmtp:103 apt=102\r\n\
+m=audio 0 UDP/TLS/RTP/SAVPF 111\r\n\
+a=mid:old-audio\r\n\
+a=inactive\r\n\
+a=rtpmap:111 opus/48000/2\r\n\
+m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n\
+a=mid:audio\r\n\
+a=recvonly\r\n\
+a=rtpmap:111 opus/48000/2\r\n";
+        let mut context = context(None);
+        context.audio_active = true;
+        let selected = select_offer(REAUDIO, &context).expect("the live audio track is offered");
+        assert_eq!(selected.audio_mid.as_deref(), Some("audio"));
+    }
+
+    #[test]
+    fn an_offer_with_only_a_rejected_audio_line_is_refused_when_audio_is_active() {
+        const REJECTED_AUDIO: &str = "v=0\r\n\
+m=video 9 UDP/TLS/RTP/SAVPF 102 103\r\n\
+a=mid:0\r\n\
+a=recvonly\r\n\
+a=rtpmap:102 H264/90000\r\n\
+a=fmtp:102 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f\r\n\
+a=rtpmap:103 rtx/90000\r\n\
+a=fmtp:103 apt=102\r\n\
+m=audio 0 UDP/TLS/RTP/SAVPF 111\r\n\
+a=mid:audio\r\n\
+a=inactive\r\n\
+a=rtpmap:111 opus/48000/2\r\n";
+        let mut context = context(None);
+        context.audio_active = true;
+        let error = select_offer(REJECTED_AUDIO, &context).expect_err("the audio track is off");
+        assert!(error.contains("выключил звуковую дорожку"), "{error}");
     }
 
     #[test]

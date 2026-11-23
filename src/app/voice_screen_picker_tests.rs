@@ -457,16 +457,7 @@ async fn the_last_card_is_reachable_by_wheel_and_tab_and_actions_stay_visible(
         "Tab reveals the whole focused card"
     );
 
-    for _ in 0..24 {
-        if super::voice_screen_tests::focused(&mut visual, &voice).as_deref() == Some("Start") {
-            break;
-        }
-        visual.simulate_keystrokes("tab");
-    }
-    assert_eq!(
-        super::voice_screen_tests::focused(&mut visual, &voice),
-        Some("Start".to_owned())
-    );
+    super::voice_screen_tests::tab_to(&mut visual, &voice, "Start");
     let card = bounds(&mut visual, "screen-share-card");
     let actions = bounds(&mut visual, "share-actions");
     assert!(
@@ -489,13 +480,7 @@ async fn tab_reaches_the_actions_after_a_long_source_list(cx: &mut TestAppContex
         super::voice_screen_tests::focused(&mut visual, &voice).as_deref(),
         Some("Source(monitor:40)")
     );
-    for _ in 0..24 {
-        visual.simulate_keystrokes("tab");
-        if super::voice_screen_tests::focused(&mut visual, &voice).as_deref() == Some("Start") {
-            return;
-        }
-    }
-    panic!("Tab never reached the start action");
+    super::voice_screen_tests::tab_to(&mut visual, &voice, "Start");
 }
 
 /// P03: a scrolling grid paints a real bar from the scroll handle, inside the

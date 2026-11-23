@@ -117,12 +117,7 @@ async fn a_live_window_restart_binds_to_the_confirmed_source_with_an_empty_list(
     wait_for(&mut visual, &voice, |panel| !panel.test_audio_pending());
     draw(&mut visual);
 
-    for _ in 0..40 {
-        if focused(&mut visual, &voice).as_deref() == Some("Start") {
-            break;
-        }
-        visual.simulate_keystrokes("tab");
-    }
+    super::voice_screen_tests::tab_to(&mut visual, &voice, "Start");
     assert_eq!(focused(&mut visual, &voice).as_deref(), Some("Start"));
     visual.simulate_keystrokes("enter");
     let (commands, op) = visual.update(|_window, app| {
@@ -217,12 +212,7 @@ async fn restart_rows_are_inert_for_mouse_and_keyboard(cx: &mut TestAppContext) 
             );
         }
     }
-    for _ in 0..40 {
-        if focused(&mut visual, &voice).as_deref() == Some("Start") {
-            break;
-        }
-        visual.simulate_keystrokes("tab");
-    }
+    super::voice_screen_tests::tab_to(&mut visual, &voice, "Start");
     assert_eq!(focused(&mut visual, &voice).as_deref(), Some("Start"));
     visual.simulate_keystrokes("enter");
     let (commands, op) = visual.update(|_window, app| {

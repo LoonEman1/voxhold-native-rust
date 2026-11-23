@@ -330,3 +330,83 @@ a=sendonly\r\na=rtpmap:96 opus/48000/2\r\n";
     );
     assert!(viewer.watching().is_some());
 }
+
+/// P1: a stale offer of the publication this attempt replaced is ignored
+/// before its codec is judged. The old VP8 offer names the old catalogue
+/// codec, so checking it against B's H.264 would end a healthy B view with
+/// "the server did not offer H.264".
+#[test]
+fn a_stale_offer_with_a_video_payload_does_not_end_the_next_view() {
+    let now = Instant::now();
+    let mut a = publication("a", 1);
+    a.codec = Codec::Vp8.wire().into();
+    // B publishes another catalogued codec, so A's payload cannot satisfy it.
+    let mut b = publication("b", 2);
+    b.codec = Codec::H264.wire().into();
+    let mut viewer =
+        Viewer::with_snapshot(1, 10, receiver_capabilities(&[Codec::Vp8, Codec::H264]));
+    snapshot(&mut viewer, &[a.clone(), b.clone()], now);
+    viewer.set_joined(true, now);
+    start_of(&viewer.select(&a, 1, now));
+
+    // A's accepted offer carries its real video payload; that generation is
+    // the one the switch must retire.
+    let a_offer = format!("{}{}", offer(Codec::Vp8, None), "a=ice-ufrag:a-ufrag\r\n");
+    assert!(matches!(
+        viewer
+            .on_server_event("stream.webrtc_offer", "", &json!({"sdp": a_offer}), now)
+            .as_slice(),
+        [Outcome::Offer(_)]
+    ));
+
+    let switching = viewer.select(&b, 2, now);
+    let leave = sends(&switching, "stream.leave");
+    let ack = viewer.on_server_event("stream.left", &leave[0], &json!({}), now);
+    start_of(&ack);
+    assert_eq!(
+        viewer
+            .watching()
+            .expect("B is watched")
+            .publication
+            .publisher_connection_id,
+        "b"
+    );
+
+    // A's old offer arrives again, this time with its VP8 m-line and not only
+    // its ICE ufrag. It belongs to the retired generation: no outcome, no
+    // `stream.leave`, no error, B stays on air.
+    let stale = viewer.on_server_event("stream.webrtc_offer", "", &json!({"sdp": a_offer}), now);
+    assert!(
+        stale.is_empty(),
+        "a stale offer must be ignored before the codec decision: {stale:?}"
+    );
+    assert!(
+        sends(&stale, "stream.leave").is_empty(),
+        "a stale offer must not release B: {stale:?}"
+    );
+    assert_eq!(
+        viewer
+            .watching()
+            .expect("B keeps watching")
+            .publication
+            .publisher_connection_id,
+        "b"
+    );
+
+    // B's own offer still reaches the engine, proving the stale one did not
+    // consume the attempt.
+    let b_offer = format!(
+        "{}{}",
+        offer(Codec::H264, sdr_fmtp(Codec::H264)),
+        "a=ice-ufrag:b-ufrag\r\n"
+    );
+    let outcomes = viewer.on_server_event("stream.webrtc_offer", "", &json!({"sdp": b_offer}), now);
+    assert!(
+        matches!(outcomes.as_slice(), [Outcome::Offer(received)] if received == &b_offer),
+        "B's offer is accepted after the stale one: {outcomes:?}"
+    );
+    assert!(
+        sends(&outcomes, "stream.leave").is_empty(),
+        "B is not released: {outcomes:?}"
+    );
+}

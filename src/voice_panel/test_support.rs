@@ -577,11 +577,17 @@ impl VoicePanel {
     /// Record the accepted attempt exactly as the media layer does when it
     /// turns Live. This is the configuration a restart dialog must bind to.
     pub fn test_set_screen_confirmed_source(&mut self, source: ScreenSource) {
+        // Mirror production: the accepted attempt carried the codec the dialog
+        // really resolves, never a fixed substitute that this build may not
+        // publish.
+        let codec = self
+            .codec_resolution()
+            .expect("the fixture codec must resolve");
         self.screen.sharing.confirmed = Some(Confirmed {
             attempt: self.screen.sharing.attempt,
             source,
             quality: self.screen.quality(),
-            codec: voxhold_media::publisher::Codec::Vp8,
+            codec,
             audio: false,
             audio_scope: voxhold_media::system_audio::AudioScope::Device,
         });

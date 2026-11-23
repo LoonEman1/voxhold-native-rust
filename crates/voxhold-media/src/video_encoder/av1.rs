@@ -56,6 +56,15 @@ const KIND_SEQUENCE_HEADER: u8 = 1;
 const KIND_FRAME_HEADER: u8 = 3;
 const KIND_FRAME: u8 = 6;
 
+/// `true` when the buffer already starts with a sequence header OBU. A live
+/// session prepends the stored `MF_MT_MPEG_SEQUENCE_HEADER` only when the
+/// temporal unit lacks it, so a keyframe always carries the decoder config.
+pub(crate) fn has_sequence_header(bytes: &[u8]) -> bool {
+    obus(bytes)
+        .map(|obus| obus.iter().any(|obu| obu.kind == KIND_SEQUENCE_HEADER))
+        .unwrap_or(false)
+}
+
 /// The parts of the sequence header the frame header depends on.
 struct Sequence {
     /// In this mode every frame is intra: the spec forces

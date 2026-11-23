@@ -117,6 +117,7 @@ fn request(audio: bool) -> PublishRequest {
         codec: Codec::Vp8,
         audio,
         audio_scope: crate::system_audio::AudioScope::Device,
+        encoder: Default::default(),
     }
 }
 

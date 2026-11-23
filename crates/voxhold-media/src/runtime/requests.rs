@@ -55,6 +55,10 @@ pub(super) enum ScreenCommand {
     CancelRestart {
         op: u64,
     },
+    /// The GPU encoder of a failed attempt is gone and the same codec can still
+    /// be encoded by the CPU build. This explicit action starts that attempt;
+    /// nothing switches automatically.
+    ContinueOnCpu,
     Stop,
 }
 

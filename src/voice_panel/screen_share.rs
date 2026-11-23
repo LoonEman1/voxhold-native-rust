@@ -19,6 +19,10 @@ use voxhold_media::screen_capture::{
     self, PreviewFrame, ScreenSource, SourceId, SourceIdentity, SourceKind, ThumbnailError,
 };
 use voxhold_media::system_audio::{self, AudioDeviceInfo, AudioScope};
+use voxhold_media::video_encoder::{
+    AdapterEvidence, AdapterSelection, EncodeQuery, EncoderBackend, EncoderPlan,
+    VideoEncoderPreference,
+};
 
 /// The backend has no runtime reconfigure; the dialog must warn honestly.
 pub(crate) const RESTART_WARNING: &str =
@@ -86,6 +90,9 @@ pub(super) enum ShareKey {
     /// One codec choice of the picker: «Автоматически» or one of the four SDR
     /// codecs, in the website's order.
     Codec(CodecIntent),
+    /// Processor or one hardware adapter. The automatic adapter is the
+    /// Windows primary suitable one.
+    EncoderBackend(EncoderBackend),
     Audio,
     /// One offered capture scope of the system-audio track.
     AudioScope(AudioScope),
@@ -121,6 +128,11 @@ pub(super) struct ScreenShareUi {
     /// the concrete codec resolved against the sender snapshot, never this
     /// intent.
     pub(super) codec: CodecIntent,
+    /// Processor or hardware. CPU is the default; no vendor SDK is involved.
+    pub(super) encoder_backend: EncoderBackend,
+    /// Automatic primary adapter (default) or one explicit LUID.
+    pub(super) encoder_adapter: AdapterSelection,
+    encoder_probe: encoder::DialogEncoderProbe,
     pub(super) audio_enabled: bool,
     /// The scope the next request carries. Only meaningful when audio is on;
     /// the provided source kind decides the default choice.
@@ -245,6 +257,9 @@ impl Default for ScreenShareUi {
             fps: 30,
             bitrate_kbps: 6000,
             codec: CodecIntent::Auto,
+            encoder_backend: EncoderBackend::Cpu,
+            encoder_adapter: AdapterSelection::Auto,
+            encoder_probe: encoder::DialogEncoderProbe::default(),
             audio_enabled: false,
             audio_scope: AudioScope::EverythingExceptSelf,
             audio_bitrate_kbps: 128,
@@ -321,61 +336,6 @@ impl ScreenShareUi {
         })
     }
 
-    /// The concrete codec the dialog would send. `Auto` resolves against the
-    /// sender snapshot exactly like Start does; an explicit unavailable codec
-    /// keeps its reason. The test seam replaces the probe answer so a
-    /// classification test never depends on the host build's encoders.
-    pub(super) fn resolved_codec(&self) -> Result<Codec, String> {
-        #[cfg(test)]
-        if let Some(codec) = self.test_codec {
-            return Ok(codec);
-        }
-        #[cfg(test)]
-        if let Some(entries) = &self.test_codec_availability {
-            let reason = |codec: Codec| {
-                entries
-                    .iter()
-                    .find(|(entry, _)| *entry == codec)
-                    .map(|(_, reason)| reason.clone())
-                    .unwrap_or_else(|| Some("Кодек не описан в тестовом наборе.".to_owned()))
-            };
-            return match self.codec {
-                CodecIntent::Auto => entries
-                    .iter()
-                    .find(|(_, reason)| reason.is_none())
-                    .map(|(codec, _)| *codec)
-                    .ok_or_else(|| {
-                        "В этой сборке нет доступного SDR-кодека для публикации.".to_owned()
-                    }),
-                CodecIntent::Explicit(codec) => match reason(codec) {
-                    None => Ok(codec),
-                    Some(reason) => Err(reason),
-                },
-            };
-        }
-        CodecSnapshot::current()
-            .resolve(self.codec, CodecRole::Sender)
-            .map_err(|rejection| rejection.reason().to_owned())
-    }
-
-    /// Sender availability of one codec exactly as the selector paints it:
-    /// `Ok(())` when this build can encode it, otherwise the probe's reason.
-    pub(super) fn codec_availability(&self, codec: Codec) -> Result<(), String> {
-        #[cfg(test)]
-        if let Some(entries) = &self.test_codec_availability {
-            return entries
-                .iter()
-                .find(|(entry, _)| *entry == codec)
-                .map(|(_, reason)| reason.clone().map_or(Ok(()), Err))
-                .unwrap_or_else(|| Err("Кодек не описан в тестовом наборе.".to_owned()));
-        }
-        let availability = CodecSnapshot::current().availability(CodecRole::Sender, codec);
-        match availability.reason() {
-            None => Ok(()),
-            Some(reason) => Err(reason.to_owned()),
-        }
-    }
-
     /// The request a restart dialog would send: the confirmed live source with
     /// the quality, audio and codec fields shown by the dialog. Only a scope the
     /// user really picks in the dialog can widen a narrow live scope, and the
@@ -384,6 +344,7 @@ impl ScreenShareUi {
     pub(super) fn restart_request(&self) -> Option<PublishRequest> {
         let mut request = self.sharing.confirmed.as_ref()?.request();
         request.codec = self.resolved_codec().ok()?;
+        request.encoder = self.encoder_plan(request.codec).ok()?;
         request.quality = self.quality().clamped();
         request.audio = self.audio_requested();
         request.audio_scope = self.effective_audio_scope(request.source.kind);
@@ -554,6 +515,26 @@ pub(in crate::voice_panel) fn screen_on_air_line(
     if let Some(codec) = confirmed_codec {
         parts.push(codec.label().to_owned());
     }
+    // «GPU» is not a checkbox echo: the engine reported the open hardware
+    // session and encoded frames were measured. Before that the line stays
+    // silent about the backend.
+    if let Some(hardware) = sharing
+        .hardware
+        .as_ref()
+        .filter(|_| confirmed_codec.is_some())
+    {
+        // An adapter read from the open MFT is a fact. A driver that exposes no
+        // adapter attribute leaves only the plan the session was asked to open,
+        // and the line says so instead of presenting it as proof.
+        let evidence = match hardware.adapter_evidence {
+            AdapterEvidence::MftAttribute => "",
+            AdapterEvidence::PlanEcho => " (адаптер из плана)",
+        };
+        parts.push(format!(
+            "GPU {} · драйвер 0x{:x}{evidence}",
+            hardware.adapter, hardware.driver_version
+        ));
+    }
     match (stats, scope) {
         (Some(stats), Some(scope)) => {
             parts.push(stats.to_owned());
@@ -705,6 +686,8 @@ impl VoicePanel {
         // into Auto with its reason by the restore.
         self.load_stream_preferences();
         self.screen.audio_availability = None;
+        self.cancel_encoder_probe();
+        self.begin_encoder_probe(cx);
         self.begin_audio_probe(cx);
         self.screen.focus_placed = false;
         if let Some(handle) = &self.handle {
@@ -742,6 +725,8 @@ impl VoicePanel {
         // The dialog starts from the scope the live attempt accepted; opening
         // it never widens a narrow scope.
         self.screen.audio_scope = confirmed.audio_scope;
+        self.screen.encoder_backend = confirmed.encoder.backend;
+        self.cancel_encoder_probe();
         self.begin_audio_probe(cx);
         self.screen.restart = true;
         // The restart dialog is bound to the confirmed live source here, and
@@ -752,6 +737,7 @@ impl VoicePanel {
         // so an earlier picker capture cannot land in this dialog.
         self.screen.clear_previews(window);
         self.screen.open = true;
+        self.begin_encoder_probe(cx);
         self.screen.busy = false;
         self.screen.preflight = false;
         self.screen.pending_quality_op = None;
@@ -835,6 +821,7 @@ impl VoicePanel {
         };
         let pending_op = self.screen.pending_quality_op;
         self.screen.open = false;
+        self.cancel_encoder_probe();
         self.screen.restart = false;
         self.screen.busy = false;
         self.screen.preflight = false;
@@ -930,6 +917,7 @@ impl VoicePanel {
         self.screen.selected = Some(id);
         self.screen.selected_identity = Some(identity);
         self.screen.error.clear();
+        self.begin_encoder_probe(cx);
         cx.notify();
     }
 
@@ -971,6 +959,7 @@ impl VoicePanel {
         self.screen
             .preview_unfit
             .retain(|id| selection::identity_kind(id) != kind);
+        self.begin_encoder_probe(cx);
         self.request_screen_previews(window, cx);
         cx.notify();
     }
@@ -1173,6 +1162,7 @@ mod dialog;
 mod picker;
 mod preferences;
 pub(crate) use preferences::StreamPrefsStore;
+mod encoder;
 mod preview;
 mod selection;
 mod start;

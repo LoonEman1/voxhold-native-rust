@@ -167,6 +167,7 @@ impl VoiceHandle {
                 }
                 ScreenCommand::CancelRestart { op } => ("cancel-restart", op, None),
                 ScreenCommand::CancelPicker { picker } => ("cancel", picker, None),
+                ScreenCommand::ContinueOnCpu => ("continue-cpu", 0, None),
                 ScreenCommand::Stop => ("stop", 0, None),
             });
         }

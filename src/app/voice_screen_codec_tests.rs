@@ -376,6 +376,7 @@ async fn an_explicit_codec_without_an_encoder_blocks_apply(cx: &mut TestAppConte
                 codec: Codec::Vp9,
                 audio: false,
                 audio_scope: AudioScope::Device,
+                encoder: Default::default(),
             });
             panel.test_open_live_screen_settings(window, cx);
         });
@@ -434,6 +435,7 @@ async fn the_live_dialog_prefers_the_codec_confirmed_by_the_encoder(cx: &mut Tes
                     codec: Codec::Vp8,
                     audio: false,
                     audio_scope: AudioScope::EverythingExceptSelf,
+                    encoder: Default::default(),
                 }),
                 stats: Some(PublishStats {
                     confirmed_codec: Some(Codec::Vp9),
@@ -480,6 +482,7 @@ async fn the_on_air_line_prefers_the_codec_confirmed_by_the_encoder(cx: &mut Tes
                     codec: Codec::Vp8,
                     audio: false,
                     audio_scope: AudioScope::EverythingExceptSelf,
+                    encoder: Default::default(),
                 }),
                 stats: Some(PublishStats {
                     confirmed_codec: Some(Codec::Vp9),
@@ -558,6 +561,7 @@ async fn applying_auto_for_the_live_codec_sends_no_command(cx: &mut TestAppConte
                 codec: Codec::H264,
                 audio: false,
                 audio_scope: AudioScope::EverythingExceptSelf,
+                encoder: Default::default(),
             });
             panel.test_open_live_screen_settings(window, cx);
         });

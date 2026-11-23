@@ -250,7 +250,9 @@ impl Preset {
 /// scope, audio flag or codec change needs a new capture and a new SDP payload,
 /// therefore a confirmed stop+start. The SDR profile travels with the codec
 /// ([`PublishRequest::codec`]); it is resolved by the capability snapshot, so a
-/// profile change can never be mistaken for a live bitrate change.
+/// profile change can never be mistaken for a live bitrate change. The encoder
+/// plan is compared by its checked pair (backend, adapter and driver, profile);
+/// its snapshot generation belongs to the dialog probe and is not a live change.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum QualityChange {
     /// The request is the live one; nothing has to be sent anywhere.
@@ -305,13 +307,20 @@ impl QualityStatus {
 }
 
 impl PublishRequest {
-    pub(super) fn capture_target(&self) -> (u32, u32) {
+    pub(crate) fn encoder_query(&self) -> crate::video_encoder::EncodeQuery {
+        crate::video_encoder::EncodeQuery::from_source(
+            self.quality,
+            (self.source.width, self.source.height),
+        )
+    }
+
+    pub(crate) fn capture_target(&self) -> (u32, u32) {
         self.quality
             .resolution
             .capture_target(self.source.width, self.source.height)
     }
 
-    pub(super) fn capture_size(&self) -> (u32, u32) {
+    pub(crate) fn capture_size(&self) -> (u32, u32) {
         self.quality
             .resolution
             .capture_size(self.source.width, self.source.height)
@@ -322,6 +331,7 @@ impl PublishRequest {
     pub fn change_to(&self, next: &Self) -> QualityChange {
         if self.source.source_id() != next.source.source_id()
             || self.codec != next.codec
+            || !self.encoder.same_pair(&next.encoder)
             || self.audio != next.audio
             || self.audio_scope != next.audio_scope
             || self.quality.resolution != next.quality.resolution

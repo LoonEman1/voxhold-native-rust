@@ -320,6 +320,8 @@ fn bitrate_sharing(
             codec: Codec::Vp8,
             audio: false,
             audio_scope: AudioScope::Device,
+
+            encoder: Default::default(),
         }),
         has_audio: false,
         quality_status: Some(QualityStatus::new(op, outcome)),

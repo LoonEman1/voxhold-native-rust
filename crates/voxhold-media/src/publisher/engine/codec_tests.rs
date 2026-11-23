@@ -143,6 +143,7 @@ pub(super) fn request(codec: Codec, audio: bool) -> PublishRequest {
         codec,
         audio,
         audio_scope: crate::system_audio::AudioScope::Device,
+        encoder: Default::default(),
     }
 }
 
@@ -363,6 +364,8 @@ async fn run(codec: Codec, with_audio: bool, change: Option<Quality>) -> Run {
                 EngineEvent::Bitrate { result, .. } => {
                     change_verified = matches!(result, crate::publisher::BitrateResult::Applied);
                 }
+                EngineEvent::EncoderFailed { message, .. } => errors.push(message),
+                EngineEvent::EncoderOpened(_) => {}
                 EngineEvent::Error(message) => errors.push(message),
                 EngineEvent::Closed => errors.push("engine closed".into()),
             }

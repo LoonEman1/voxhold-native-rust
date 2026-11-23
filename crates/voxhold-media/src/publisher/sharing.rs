@@ -21,6 +21,10 @@ pub struct Confirmed {
     pub source: ScreenSource,
     pub quality: Quality,
     pub codec: Codec,
+    /// The encoder that was really on air: the CPU default or the confirmed
+    /// adapter and its generation. The UI never guesses the backend from the
+    /// request.
+    pub encoder: crate::video_encoder::EncoderPlan,
     /// The accepted system-audio flag of the attempt.
     pub audio: bool,
     /// The typed capture scope carried by the request this configuration was
@@ -38,6 +42,7 @@ impl Confirmed {
             source: request.source.clone(),
             quality: request.quality,
             codec: request.codec,
+            encoder: request.encoder.clone(),
             audio: request.audio,
             audio_scope: request.audio_scope,
         }
@@ -51,6 +56,7 @@ impl Confirmed {
             codec: self.codec,
             audio: self.audio,
             audio_scope: self.audio_scope,
+            encoder: self.encoder.clone(),
         }
     }
 }
@@ -66,6 +72,10 @@ pub struct Sharing {
     /// `confirmed` describes what is on air.
     pub quality: Option<Quality>,
     pub codec: Option<Codec>,
+    /// The encoder of the current attempt (CPU or the confirmed hardware
+    /// encoder). It follows the request, so the dialog can paint what Start
+    /// would use; the on-air value stays in `confirmed`.
+    pub encoder: Option<crate::video_encoder::EncoderPlan>,
     /// The accepted configuration of the live attempt. It stays at the last
     /// confirmed values during a preflight, a restart or a rollback; only a
     /// live bitrate change applied in the air or the next `Live` attempt
@@ -87,6 +97,15 @@ pub struct Sharing {
     /// `preflighting`, this survives coalescing, so a fast failure still names
     /// the request it belongs to.
     pub quality_status: Option<QualityStatus>,
+    /// The GPU encoder died after the publication started and the same codec
+    /// can still be encoded by the pinned CPU build. The dialog shows one
+    /// explicit message and the «Продолжить на процессоре» action; nothing is
+    /// substituted automatically.
+    pub cpu_fallback: bool,
+    /// The open hardware session that matched the attempt. `Some` is the local
+    /// provider confirmation; the dialog additionally needs delivered encoded
+    /// frames before it names the stream «GPU».
+    pub hardware: Option<crate::video_encoder::HardwareEncoderIdentity>,
     pub status: String,
     pub error: Option<String>,
     pub stats: Option<engine::PublishStats>,
@@ -100,12 +119,15 @@ impl Default for Sharing {
             live: false,
             quality: None,
             codec: None,
+            encoder: None,
             confirmed: None,
             has_audio: false,
             audio_scope: None,
             restarting: false,
             preflighting: false,
             quality_status: None,
+            cpu_fallback: false,
+            hardware: None,
             status: String::new(),
             error: None,
             stats: None,

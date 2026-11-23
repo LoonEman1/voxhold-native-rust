@@ -1,6 +1,8 @@
 //! Headless tests of the publishing state machine: no WebRTC, no Windows and
 //! no socket. Every decision is driven by the clock argument.
 
+mod gpu;
+
 use super::*;
 use crate::publisher::engine::PublishStats;
 use crate::screen_capture::{ScreenSource, SourceKind};
@@ -26,6 +28,7 @@ fn request() -> PublishRequest {
         codec: Codec::Vp8,
         audio: false,
         audio_scope: crate::system_audio::AudioScope::Device,
+        encoder: Default::default(),
     }
 }
 

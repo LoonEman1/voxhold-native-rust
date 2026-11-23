@@ -13,9 +13,10 @@ use std::time::Duration;
 use crate::publisher::SdrProfile;
 use crate::video_encoder::windows::WorkerPlatform;
 use crate::video_encoder::{
-    AdapterInfo, AdapterInventory, AdapterSelection, Codec, EncodeQuery, EncoderProbeService,
-    EncoderProbeTarget, EncoderRequest, HardwareProbe, PlatformProbe, ProbeCancel, ProbeOutcome,
-    VideoEncoderPreference, driver_version,
+    AdapterEvidence, AdapterInfo, AdapterInventory, AdapterSelection, Codec, EncodeQuery,
+    EncodedAccessUnit, EncoderProbeService, EncoderProbeTarget, EncoderRequest, GpuEncoder,
+    HardwareProbe, Nv12Frame, PlatformProbe, ProbeCancel, ProbeOutcome, VideoEncoderPreference,
+    driver_version, open_gpu_encoder,
 };
 
 fn q720() -> EncodeQuery {
@@ -221,4 +222,296 @@ fn hardware_service_confirms_h264() {
         ),
     }
     service.shutdown();
+}
+
+/// A neutral black NV12 frame, never captured content.
+fn nv12(query: EncodeQuery, timestamp_us: i64) -> Nv12Frame {
+    let luma = query.width as usize * query.height as usize;
+    let mut data = vec![0x10u8; luma + luma / 2];
+    data[luma..].fill(0x80);
+    Nv12Frame {
+        width: query.width,
+        height: query.height,
+        data,
+        timestamp_us,
+    }
+}
+
+fn hardware_encoder(codec: Codec, query: EncodeQuery) -> Option<Box<dyn GpuEncoder>> {
+    let _platform = platform();
+    let probe = PlatformProbe;
+    let inventory = inventory(&probe);
+    let Some(adapter) = inventory.resolve(AdapterSelection::Auto).ok().cloned() else {
+        eprintln!("SKIP: на машине нет аппаратного адаптера, проверять нечего");
+        return None;
+    };
+    assert_driver_identity(&adapter);
+    match open_gpu_encoder(&adapter, codec, query, 2_500_000) {
+        Ok(encoder) => {
+            eprintln!(
+                "session codec={} adapter={} luid={} driver=0x{:x}",
+                codec.label(),
+                adapter.name,
+                adapter.luid,
+                adapter.driver_version
+            );
+            Some(encoder)
+        }
+        Err(message) => {
+            eprintln!("SKIP session codec={} reason={message}", codec.label());
+            None
+        }
+    }
+}
+
+/// Drive the real encoder until it produced `count` access units. The driver
+/// decides how many inputs precede the first keyframe, so more frames are
+/// submitted while the output is empty; the loop is bounded.
+fn packets(
+    encoder: &mut Box<dyn GpuEncoder>,
+    query: EncodeQuery,
+    count: usize,
+    start_timestamp: i64,
+) -> Vec<EncodedAccessUnit> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let mut packets = Vec::new();
+    let mut timestamp = start_timestamp;
+    let mut submitted = 0;
+    while std::time::Instant::now() < deadline && packets.len() < count {
+        if submitted < 64 {
+            encoder.submit(nv12(query, timestamp));
+            timestamp += 33_000;
+            submitted += 1;
+        }
+        while let Some(packet) = encoder.next_packet() {
+            packets.push(packet);
+            if packets.len() >= count {
+                break;
+            }
+        }
+        if let Some(failure) = encoder.failure() {
+            panic!("the hardware session failed: {failure}");
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(
+        packets.len(),
+        count,
+        "no encoded access unit was produced; counters={:?} failure={:?}",
+        encoder.counters(),
+        encoder.failure()
+    );
+    packets
+}
+
+/// Collect access units until the encoder really emitted a keyframe. A
+/// keyframe request may still be preceded by an access unit for a frame that
+/// was already accepted, so the stream is scanned, not assumed.
+fn packets_until_key(
+    encoder: &mut Box<dyn GpuEncoder>,
+    query: EncodeQuery,
+    start_timestamp: i64,
+) -> EncodedAccessUnit {
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let mut timestamp = start_timestamp;
+    let mut submitted = 0;
+    while std::time::Instant::now() < deadline {
+        if submitted < 64 {
+            encoder.submit(nv12(query, timestamp));
+            timestamp += 33_000;
+            submitted += 1;
+        }
+        while let Some(packet) = encoder.next_packet() {
+            if packet.keyframe {
+                return packet;
+            }
+        }
+        if let Some(failure) = encoder.failure() {
+            panic!("the hardware session failed: {failure}");
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    panic!(
+        "no keyframe after the request; counters={:?}",
+        encoder.counters()
+    );
+}
+
+fn assert_h264_access_unit(packet: &EncodedAccessUnit, keyframe: bool) {
+    assert!(
+        packet.payload.windows(3).any(|window| window == [0, 0, 1]),
+        "H.264 output is not an Annex B byte stream"
+    );
+    let types = crate::video_encoder::h264::nal_types(&packet.payload);
+    assert!(
+        types.contains(&7) && types.contains(&8),
+        "a keyframe must carry SPS/PPS: {types:?}"
+    );
+    assert_eq!(
+        types.contains(&5),
+        keyframe,
+        "the reported frame type does not match the NAL units: {types:?}"
+    );
+}
+
+/// G08 (H.264) and G07 (keyframe, bitrate, shutdown) on the real card.
+#[test]
+#[ignore = "needs real Windows hardware; G07/G08 manual run"]
+fn hardware_h264_session_encodes_keyframes_and_rate_control() {
+    let query = q720();
+    let Some(mut encoder) = hardware_encoder(Codec::H264, query) else {
+        return;
+    };
+    // M3: the requested bitrate must be applied before the session starts
+    // streaming, not silently swapped away by the worker.
+    let initial = encoder.counters();
+    eprintln!("h264 session initial counters {initial:?}");
+    assert_eq!(
+        initial.bitrate_bps, 2_500_000,
+        "the requested mean bitrate was lost at session start"
+    );
+    assert!(
+        initial.bitrate_applied,
+        "the initial CODECAPI_AVEncCommonMeanBitRate was not applied before streaming"
+    );
+    let first = packets(&mut encoder, query, 1, 1_000);
+    assert!(
+        first[0].keyframe,
+        "the first access unit must be a keyframe"
+    );
+    assert_h264_access_unit(&first[0], true);
+
+    let delta = packets(&mut encoder, query, 1, 1_000_000);
+    assert_h264_access_unit(&delta[0], delta[0].keyframe);
+    assert!(
+        delta[0].timestamp_us > first[0].timestamp_us,
+        "timestamps must increase: {first:?} {delta:?}"
+    );
+
+    encoder.request_keyframe();
+    let key = packets_until_key(&mut encoder, query, 2_000_000);
+    assert!(key.keyframe, "PLI recovery must be a keyframe");
+    assert_h264_access_unit(&key, true);
+
+    encoder.set_bitrate(1_200_000);
+    let _ = packets(&mut encoder, query, 1, 3_000_000);
+    let counters = encoder.counters();
+    eprintln!("h264 session counters {counters:?}");
+    assert_eq!(counters.bitrate_bps, 1_200_000);
+    assert!(
+        counters.bitrate_applied,
+        "the driver did not accept CODECAPI_AVEncCommonMeanBitRate"
+    );
+    assert!(counters.delivered(), "no frame was delivered");
+
+    let started = std::time::Instant::now();
+    encoder.shutdown();
+    assert!(
+        started.elapsed() < Duration::from_secs(15),
+        "shutdown did not release the session"
+    );
+}
+
+/// M4: the adapter evidence of an open session is either a real MFT attribute
+/// or the plan echoed by the session; it is never guessed.
+#[test]
+#[ignore = "needs real Windows hardware; G06/G08 manual run"]
+fn hardware_session_reports_its_adapter_evidence() {
+    let query = q720();
+    let Some(mut encoder) = hardware_encoder(Codec::H264, query) else {
+        return;
+    };
+    let evidence = encoder.adapter_evidence();
+    let adapter = encoder.adapter().expect("the session names an adapter");
+    eprintln!(
+        "session adapter evidence={evidence:?} luid={} name={}",
+        adapter.luid, adapter.name
+    );
+    match evidence {
+        AdapterEvidence::MftAttribute => {
+            eprintln!(
+                "the driver exposes MFT_ENUM_ADAPTER_LUID: the identity is a fact about the MFT"
+            )
+        }
+        AdapterEvidence::PlanEcho => eprintln!(
+            "the driver exposes no adapter LUID: the adapter is the plan echo with the vendor cross-checked"
+        ),
+    }
+    assert_eq!(
+        real_luid_of(&adapter.name),
+        Some(adapter.luid),
+        "the session must name the adapter the inventory resolved"
+    );
+    encoder.shutdown();
+}
+
+/// The LUID of the adapter the inventory reports for `name`, so the evidence
+/// test can compare the session against the real DXGI list.
+fn real_luid_of(name: &str) -> Option<crate::video_encoder::AdapterLuid> {
+    let _platform = platform();
+    let probe = PlatformProbe;
+    probe
+        .inventory()
+        .ok()?
+        .adapters()
+        .iter()
+        .find(|adapter| adapter.name == name)
+        .map(|adapter| adapter.luid)
+}
+
+/// A transform of another vendor is refused even when the adapter LUID cannot
+/// be read: the vendor attribute is the weaker attribute this driver does
+/// expose, and it is compared instead of being ignored.
+#[test]
+#[ignore = "needs real Windows hardware; G06/G08 manual run"]
+fn hardware_session_refuses_an_adapter_of_another_vendor() {
+    let _platform = platform();
+    let probe = PlatformProbe;
+    let inventory = inventory(&probe);
+    let Some(real) = inventory.resolve(AdapterSelection::Auto).ok().cloned() else {
+        eprintln!("SKIP: на машине нет аппаратного адаптера, проверять нечего");
+        return;
+    };
+    let mut impostor = real.clone();
+    impostor.vendor_id = if real.vendor_id == 0x10de {
+        0x1002
+    } else {
+        0x10de
+    };
+    match open_gpu_encoder(&impostor, Codec::H264, q720(), 2_500_000) {
+        Ok(mut encoder) => {
+            encoder.shutdown();
+            panic!(
+                "a session of vendor 0x{:04x} was accepted as 0x{:04x}",
+                real.vendor_id, impostor.vendor_id
+            );
+        }
+        Err(message) => assert!(
+            message.contains("производителя"),
+            "the refusal does not name the vendor mismatch: {message}"
+        ),
+    }
+}
+
+/// G08 (AV1) on a driver that registers an AV1 encoder (the RTX 40 cards do).
+#[test]
+#[ignore = "needs real Windows hardware; G08 manual run"]
+fn hardware_av1_session_encodes_a_sequence_header_and_keyframes() {
+    let query = q720();
+    let Some(mut encoder) = hardware_encoder(Codec::Av1, query) else {
+        return;
+    };
+    let first = packets(&mut encoder, query, 1, 1_000);
+    assert!(
+        first[0].keyframe,
+        "the first AV1 temporal unit is a keyframe"
+    );
+    assert!(
+        crate::video_encoder::av1::has_sequence_header(&first[0].payload),
+        "the keyframe must carry the AV1 sequence header"
+    );
+    encoder.request_keyframe();
+    let key = packets_until_key(&mut encoder, query, 2_000_000);
+    assert!(key.keyframe, "PLI recovery must be a keyframe");
+    encoder.shutdown();
 }

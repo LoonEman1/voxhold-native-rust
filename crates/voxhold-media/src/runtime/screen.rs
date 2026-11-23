@@ -18,6 +18,88 @@ use crate::runtime::requests::{
     ScreenAccess, ScreenCommand, SourceRequest, push_screen, set_source_request,
 };
 use crate::screen_capture::SourceKind;
+use crate::video_encoder::EncoderProbeService;
+
+/// How long a live GPU revalidation may take. It runs on the preparation
+/// thread before `stream.start`; a slower driver is refused instead of being
+/// assumed healthy.
+const REVALIDATE_TIMEOUT: Duration = Duration::from_secs(4);
+
+/// Re-check the exact hardware pair of this attempt on the probe worker.
+///
+/// This is the launch permit of the GPU path: a cached snapshot is not enough,
+/// the transform must activate again with the same adapter/codec/profile. It
+/// runs on the preparation thread (never the UI), and a refusal keeps an
+/// already live publication untouched because this happens before its stop.
+pub(super) fn revalidate_gpu(
+    probe: Option<&std::sync::Arc<EncoderProbeService>>,
+    request: &crate::publisher::PublishRequest,
+) -> Result<(), String> {
+    if !request.encoder.is_gpu() {
+        return Ok(());
+    }
+    let query = request
+        .encoder_query()
+        .validate()
+        .map_err(|error| error.to_string())?;
+    let Some(resolved) = request.encoder.resolved(request.codec, query) else {
+        return Err(
+            "Выбранный аппаратный кодировщик не подтверждён. Откройте настройки трансляции снова."
+                .into(),
+        );
+    };
+    let Some(probe) = probe else {
+        return Err("Проверка видеокарты недоступна в этом сеансе; выберите «Процессор».".into());
+    };
+    probe
+        .revalidate(&resolved, REVALIDATE_TIMEOUT)
+        .map(|_| ())
+        .map_err(|error| {
+            format!("Видеокарта не подтвердила кодировщик: {error} Трансляция не запущена.")
+        })
+}
+
+/// Launch one prepared screen attempt on the preparation thread.
+///
+/// This is the body of the closure [`Live::start_screen_prep`] hands to
+/// [`ScreenPrep::start`], split out so the launch permit is exercised by the
+/// exact code the session runs. The hardware revalidation must stay the first
+/// step: a refused pair fails before a capture, an audio loopback or a peer
+/// exists, so `stream.start` cannot follow.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn launch_screen(
+    probe: Option<Arc<EncoderProbeService>>,
+    request: crate::publisher::PublishRequest,
+    servers: Vec<crate::IceServer>,
+    policy: String,
+    preview: Arc<crate::screen_capture::PreviewStore>,
+    demand: Arc<crate::screen_capture::PreviewDemand>,
+    cancelled: &AtomicBool,
+) -> Result<(PublisherEngine, bool, Option<String>), String> {
+    revalidate_gpu(probe.as_ref(), &request)?;
+    let engine = PublisherEngine::start(request, servers, policy, preview, demand, cancelled)?;
+    let has_audio = engine.has_audio();
+    let audio_scope = engine.audio_scope();
+    Ok((engine, has_audio, audio_scope))
+}
+
+/// Preflight of a live quality change on the preparation thread: the same
+/// launch permit, then the temporary capture.
+///
+/// A refused hardware pair leaves the live publication exactly as it is; the
+/// new capture is never opened on the strength of the dialog alone.
+pub(super) fn launch_restart_preflight(
+    probe: Option<Arc<EncoderProbeService>>,
+    request: &crate::publisher::PublishRequest,
+    cancelled: &AtomicBool,
+) -> Result<crate::publisher::preflight::PreflightReport, String> {
+    revalidate_gpu(probe.as_ref(), request)?;
+    crate::publisher::preflight::run(
+        request,
+        cancelled,
+        crate::publisher::preflight::PREFLIGHT_BUDGET,
+    )
+}
 
 mod preview;
 
@@ -244,6 +326,14 @@ impl VoiceHandle {
         // confirmation or the worker's next tick can read it.
         self.requests.cancel_publish_recovery();
         push_screen(&self.requests, ScreenCommand::Stop);
+        self.requests.wake();
+    }
+
+    /// The user chose «Продолжить на процессоре» after the hardware encoder of
+    /// a live attempt was lost. This is the only path that changes the
+    /// backend; the codec, source, quality and audio stay the same.
+    pub fn continue_screen_on_cpu(&self) {
+        push_screen(&self.requests, ScreenCommand::ContinueOnCpu);
         self.requests.wake();
     }
 
@@ -478,12 +568,10 @@ impl Live {
         let policy = self.policy.clone();
         let preview = self.screen_preview.clone();
         let demand = self.screen_demand.clone();
+        let probe = self.encoder_probe.clone();
+        let checked = request.clone();
         let prep = ScreenPrep::start(binding, Instant::now(), PREP_BUDGET, move |cancelled| {
-            let engine =
-                PublisherEngine::start(request, servers, policy, preview, demand, cancelled)?;
-            let has_audio = engine.has_audio();
-            let audio_scope = engine.audio_scope();
-            Ok((engine, has_audio, audio_scope))
+            launch_screen(probe, checked, servers, policy, preview, demand, cancelled)
         })?;
         self.prep = Some(prep);
         Ok(())
@@ -502,7 +590,20 @@ impl Live {
         op: u64,
         request: crate::publisher::PublishRequest,
     ) -> Result<(), String> {
-        let pending = PendingRestart::start(self.prep_binding(), Instant::now(), op, request)?;
+        let plan = request.clone();
+        let probe = self.encoder_probe.clone();
+        let pending = PendingRestart::start_with(
+            self.prep_binding(),
+            Instant::now(),
+            op,
+            request,
+            move |cancelled| {
+                // The live attempt keeps running until the new pair is
+                // confirmed. A refused GPU revalidation therefore leaves the
+                // old stream exactly as it is.
+                launch_restart_preflight(probe, &plan, cancelled)
+            },
+        )?;
         self.restart = Some(pending);
         Ok(())
     }
@@ -772,6 +873,13 @@ impl Drop for Live {
         if let Some(engine) = self.screen.take() {
             release_off_loop(engine, true);
         }
+        // The probe worker owns COM and every MFT it activated. Stop it on the
+        // same short-lived thread, never on the voice worker.
+        if let Some(probe) = self.encoder_probe.take() {
+            let _ = thread::Builder::new()
+                .name("voxhold-encoder-probe-stop".into())
+                .spawn(move || probe.shutdown());
+        }
     }
 }
 
@@ -855,6 +963,13 @@ impl Live {
                 // attempt was never stopped and stays exactly as it was; a
                 // cancel of an older operation is ignored.
                 let outcomes = self.cancel_restart_for_op(op);
+                self.apply_screen(outcomes, viewer).await?;
+            }
+            ScreenCommand::ContinueOnCpu => {
+                // The failed GPU attempt already released its encoder and sent
+                // `stream.stop`; this starts a fresh CPU attempt through the
+                // ordinary preparation and `stream.start` path.
+                let outcomes = self.publisher.continue_on_cpu(now);
                 self.apply_screen(outcomes, viewer).await?;
             }
             ScreenCommand::Publish {

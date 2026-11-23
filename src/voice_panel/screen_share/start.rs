@@ -94,6 +94,14 @@ impl VoicePanel {
             }
         };
         let quality = self.screen.quality_for_source(&source);
+        let encoder = match self.screen.encoder_plan(codec) {
+            Ok(encoder) => encoder,
+            Err(reason) => {
+                self.screen.error = reason;
+                cx.notify();
+                return;
+            }
+        };
         let request = PublishRequest {
             source,
             quality,
@@ -105,6 +113,7 @@ impl VoicePanel {
                     .map(|id| id.kind)
                     .unwrap_or(self.screen.kind),
             ),
+            encoder,
         };
         // The live dialog may resolve back to the payload that is already on
         // air (for example «Автоматически» after an explicit codec). Nothing

@@ -555,6 +555,8 @@ impl VoicePanel {
                 audio: sharing.has_audio,
                 audio_scope: voxhold_media::system_audio::AudioScope::Device,
                 source,
+
+                encoder: Default::default(),
             });
         }
         self.screen.sharing = sharing;
@@ -590,6 +592,8 @@ impl VoicePanel {
             codec,
             audio: false,
             audio_scope: voxhold_media::system_audio::AudioScope::Device,
+
+            encoder: Default::default(),
         });
     }
 
@@ -606,6 +610,8 @@ impl VoicePanel {
             codec: request.codec,
             audio: request.audio,
             audio_scope: request.audio_scope,
+
+            encoder: Default::default(),
         });
     }
 

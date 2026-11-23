@@ -16,6 +16,11 @@ impl VoicePanel {
         ) {
             let sources = matches!(update, VoiceUpdate::ScreenSources { .. });
             let repaint = self.apply_screen_update(update, window);
+            if self.screen.open {
+                self.begin_encoder_probe(cx);
+            } else {
+                self.cancel_encoder_probe();
+            }
             if sources {
                 // A fresh answer can add, remove or rename rows; only the
                 // visible category is queued, and cached/pending ids skip.

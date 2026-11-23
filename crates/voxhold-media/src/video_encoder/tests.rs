@@ -809,4 +809,15 @@ fn h264_level_and_quality_mapping_are_deterministic() {
         EncodeQuery::new(1280, 720, 60)
     );
     assert!(EncodeQuery::new(1280, 720, 60).validate().is_ok());
+
+    let portrait = EncodeQuery::from_source(
+        crate::publisher::Quality { fps: 90, ..quality },
+        (1080, 1920),
+    );
+    assert_eq!(portrait, EncodeQuery::new(720, 1280, 90));
+    let too_fast = EncodeQuery::from_quality(crate::publisher::Quality {
+        fps: 144,
+        ..quality
+    });
+    assert_eq!(too_fast.validate(), Err(super::EncoderRequestError::Fps));
 }

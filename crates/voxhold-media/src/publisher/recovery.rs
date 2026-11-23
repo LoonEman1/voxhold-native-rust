@@ -92,6 +92,7 @@ mod tests {
             codec: Codec::Vp8,
             audio: false,
             audio_scope: crate::system_audio::AudioScope::Device,
+            encoder: Default::default(),
         }
     }
 

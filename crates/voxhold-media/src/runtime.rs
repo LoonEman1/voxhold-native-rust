@@ -436,6 +436,11 @@ struct Live {
     /// an old-generation close must not end the call.
     session_token: String,
     screen_preview: Arc<crate::screen_capture::PreviewStore>,
+    /// The bounded probe worker of this voice session. It owns the COM
+    /// apartment and every MFT it activates; a GPU publication revalidates its
+    /// exact adapter/codec/profile here before `stream.start`, on the
+    /// preparation thread, never on the UI thread.
+    encoder_probe: Option<Arc<crate::video_encoder::EncoderProbeService>>,
     /// The card's preview request of this handle. Shared with the live capture
     /// thread; this session only disables it when an attempt ends.
     screen_demand: Arc<crate::screen_capture::PreviewDemand>,
@@ -811,6 +816,9 @@ impl Live {
         Ok(true)
     }
 }
+
+#[cfg(test)]
+mod gpu_tests;
 
 #[cfg(test)]
 mod tests;

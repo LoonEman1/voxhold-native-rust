@@ -92,6 +92,8 @@ mod voice_screen_codec_tests;
 #[cfg(test)]
 mod voice_screen_confirmed_tests;
 #[cfg(test)]
+mod voice_screen_encoder_tests;
+#[cfg(test)]
 mod voice_screen_identity_tests;
 #[cfg(test)]
 mod voice_screen_image_tests;

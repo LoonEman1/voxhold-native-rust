@@ -835,8 +835,8 @@ release p50/p95 1/1 мкс. Лимитер восстанавливается с
 
 ## Срез VXTRAY: закрытие в системный трей (21 ноября 2026)
 
-Ветка `codex/tray-close`, база `origin/dev` `b4b1b01`. Исходный коммит
-`7de7964`, затем исправления по независимому ревью.
+Ветка `codex/tray-close`, база `origin/dev` `ecb4a3d` (U1 #54, U2 #55, U3 #56).
+Исходный коммит `7de7964`, затем исправления по независимому ревью и ребейз.
 
 - Крестик главного окна скрывает существующий HWND (`ShowWindow(SW_HIDE)`),
   процесс, звонок, трансляция, чат и черновики продолжают работу. Кнопка
@@ -884,8 +884,8 @@ release p50/p95 1/1 мкс. Лимитер восстанавливается с
   --locked` успешен (два прежних предупреждения — `recordings_download::id` и
   `search::set_allowed_channels`); `cargo test --locked --bin
   voxhold-native-rust` (features по умолчанию, включая `voxhold-media`) —
-  753 passed, 1 ignored, 0 failed; `cargo fmt --all --
-  --check`; `scripts/check-file-sizes.ps1 -All` — 369 файлов в лимитах
+  891 passed, 1 ignored, 0 failed; `cargo fmt --all --
+  --check`; `scripts/check-file-sizes.ps1 -All` — 399 файлов в лимитах
   1000/1200.
 
 Не проверено вручную: реальное скрытие/показ HWND, клавиатурная активация

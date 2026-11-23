@@ -207,6 +207,11 @@ impl Voxhold {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
+        // A first install can race the platform window. Retry on the close
+        // gesture instead of leaving the tray unavailable until a restart.
+        if !self.quitting && !self.notification_tray.is_available_for(window_hwnd(window)) {
+            self.install_tray(window, cx);
+        }
         let available = self.notification_tray.is_available_for(window_hwnd(window));
         match close_decision(available, self.quitting) {
             CloseDecision::Hide => {

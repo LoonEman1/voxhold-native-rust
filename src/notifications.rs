@@ -942,14 +942,22 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn disabling_notifications_does_not_remove_the_icon() {
+        let dir = std::env::temp_dir().join(format!(
+            "voxhold-notification-tray-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
         let mut tray = TrayIcon::default();
         tray.test_add_result = Some(true);
         tray.register(1).unwrap();
-        let mut center = NotificationCenter::default();
+        let mut center = NotificationCenter::with_path(Some(
+            dir.join("workspace-layout.json.notifications.json"),
+        ));
         assert!(center.set_enabled(true));
         assert!(center.set_enabled(false));
         assert!(!center.enabled);
         assert!(tray.is_registered());
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]

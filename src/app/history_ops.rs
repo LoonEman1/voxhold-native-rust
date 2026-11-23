@@ -66,6 +66,23 @@ impl Voxhold {
 
     /// Access changed for the current scope: drop confirmed data, invalidate
     /// in-flight requests and take a fresh channel snapshot before restoring the chat.
+    /// Visibility gate for read marks. `SW_HIDE` leaves
+    /// `Window::is_window_active` on its last `WM_ACTIVATE` value, so the
+    /// tracked flag is the only reliable signal while the window is in the
+    /// tray. Kept separate so a test can prove the gate without a network
+    /// client or a loaded history page.
+    pub(super) fn can_mark_visible_read(&self) -> bool {
+        let conversation = self.in_conversation();
+        self.window_active
+            && !self.read_pending
+            && !self.history_has_newer
+            && !(self.access_pending && !conversation)
+            && !self
+                .read_retry_at
+                .is_some_and(|at| at > std::time::Instant::now())
+            && (conversation || self.channel_chat_readable(self.channel))
+    }
+
     pub(super) fn mark_visible_read(
         &mut self,
         message_id: i64,
@@ -73,21 +90,7 @@ impl Voxhold {
         cx: &mut Context<Self>,
     ) {
         let conversation = self.in_conversation();
-        // `SW_HIDE` leaves `Window::is_window_active` on its last `WM_ACTIVATE`
-        // value, so the tracked flag is the only reliable visibility signal.
-        if !self.window_active
-            || self.read_pending
-            // The loaded window ends before the live tail. A read mark taken
-            // from it would be cumulative up to the old right edge and would
-            // also bless a fresh row that a broken path appended to the gap.
-            // The confirmed latest page clears the flag before the next mark.
-            || self.history_has_newer
-            || (self.access_pending && !conversation)
-            || self
-                .read_retry_at
-                .is_some_and(|at| at > std::time::Instant::now())
-            || (!conversation && !self.channel_chat_readable(self.channel))
-        {
+        if !self.can_mark_visible_read() {
             return;
         }
         if message_id <= self.read_sent

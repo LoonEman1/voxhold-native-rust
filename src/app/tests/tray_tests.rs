@@ -39,8 +39,15 @@ async fn the_close_hook_hides_with_the_tray_and_keeps_the_window_without_it(
             assert!(!v.window_active);
             assert!(v.hidden_to_tray);
 
-            // A hidden window must not take a read mark from painted rows.
+            // A conversation makes every other read gate pass; only the
+            // hidden visibility flag may block the mark.
+            v.conversation = Some(voxhold_api::Conversation {
+                id: 99,
+                direct: true,
+                ..Default::default()
+            });
             v.mark_visible_read(1, window, cx);
+            assert!(!v.can_mark_visible_read());
             assert!(!v.read_pending);
 
             // `quitting` is the real close, even when the icon is present.
@@ -106,8 +113,39 @@ async fn a_hidden_window_ignores_activation_from_the_tray_menu(cx: &mut TestAppC
             v.deliver_notification(&event, window);
             assert_eq!(v.notification_tray.test_balloon_calls(), 1);
             assert_eq!(v.notifications.shown, 1);
+            v.conversation = Some(voxhold_api::Conversation {
+                id: 99,
+                direct: true,
+                ..Default::default()
+            });
             v.mark_visible_read(1, window, cx);
+            assert!(!v.can_mark_visible_read());
             assert!(!v.read_pending);
+        });
+    });
+}
+
+#[gpui::test]
+async fn quitting_retires_the_icon_and_clears_the_visible_state(cx: &mut TestAppContext) {
+    cx.update(|cx| gpui_component::init(cx));
+    let (window, view) = add_auth_window(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            v.notification_tray.set_proc_available(true);
+            v.notification_tray.set_test_add_result(true);
+            v.notification_tray.register(1).unwrap();
+            assert!(v.notification_tray.is_available());
+
+            v.quit_from_tray(window, cx);
+
+            assert!(v.quitting);
+            assert!(!v.notification_tray.is_registered());
+            assert!(!v.notification_tray.is_available());
+            assert_eq!(v.notification_tray.test_delete_calls(), 1);
+            // A late Explorer restart or notification cannot resurrect it.
+            assert!(v.notification_tray.register(1).is_err());
+            assert!(v.notification_tray.restore(1).is_err());
         });
     });
 }

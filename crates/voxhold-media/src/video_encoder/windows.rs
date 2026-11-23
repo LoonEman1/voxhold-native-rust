@@ -5,12 +5,13 @@
 //! generated black NV12 frame, never user content, and its encoded buffer is
 //! dropped before the function returns.
 //!
-//! Hardware encoders registered with `MFT_ENUM_FLAG_HARDWARE` are asynchronous
-//! by contract (NVENC, Quick Sync and the AMD MFT all are): they refuse types
-//! with `MF_E_TRANSFORM_ASYNC_LOCKED` until the transform is unlocked and they
-//! never push a frame through a synchronous `ProcessInput`/`ProcessOutput`
-//! pair. The probe therefore unlocks the transform and drives it through its
-//! `IMFMediaEventGenerator`, with a bounded wait.
+//! The hardware encoders that current drivers register with
+//! `MFT_ENUM_FLAG_HARDWARE` (NVENC, Quick Sync and the AMD MFT) are
+//! asynchronous: they refuse types with `MF_E_TRANSFORM_ASYNC_LOCKED` until
+//! the transform is unlocked, and they do not push a frame through a plain
+//! `ProcessInput`/`ProcessOutput` pair. The probe therefore unlocks the
+//! transform and drives it through its `IMFMediaEventGenerator` with a bounded
+//! wait; a synchronous MFT, if one is registered, still uses the direct loop.
 
 use std::{
     ffi::c_void,
@@ -190,11 +191,12 @@ unsafe fn owns_primary_output(adapter: &IDXGIAdapter1) -> bool {
 
 /// Driver version as a cache identity.
 ///
-/// `CheckInterfaceSupport` only answers for the D3D10 UMD interface on current
-/// drivers; the D3D11 IID returns `DXGI_ERROR_UNSUPPORTED`. If that query is
-/// unavailable too, the KMT adapter info of the same LUID returns the version
-/// Windows itself reports. Only when both fail is the value zero, and then a
-/// driver update genuinely cannot change the cache key.
+/// `CheckInterfaceSupport` is documented for the D3D10 UMD interface only; the
+/// D3D11 IID it used to be called with returns `DXGI_ERROR_UNSUPPORTED`. When
+/// the UMD query is unavailable, the KMT adapter info of the same LUID returns
+/// the version Windows itself reports (the `Win32_VideoController.DriverVersion`
+/// quadruple, packed). Only when both fail is the value zero, and then a driver
+/// update genuinely cannot change the cache key.
 unsafe fn driver_version(adapter: &IDXGIAdapter1, luid: AdapterLuid) -> u64 {
     // IID_ID3D10Device. `CheckInterfaceSupport` returns the D3D10 UMD version.
     const IID_ID3D10_DEVICE: GUID = GUID::from_u128(0x9b7e4c0f_342c_4106_a19f_4f2704f689f0);

@@ -60,6 +60,7 @@ use voxhold_update::apply::{
 use voxhold_update::recovery::{recover_install, RecoveryMode, RecoveryOutcome};
 use voxhold_update::stage::{
     cleanup_after_install, cleanup_after_install_payload, cleanup_stale, updates_root,
+    updates_root_for,
     verify_staged_proof, APPLY_LOG, APP_DIR,
 };
 
@@ -260,7 +261,7 @@ fn main() -> ExitCode {
                     &format!("staging cleanup failed: {}", error.code()),
                 );
             }
-            cleanup_other_versions(&arguments.staged, &log_path);
+            cleanup_other_versions(&arguments.staged, &arguments.target, &log_path);
             ExitCode::from(EXIT_OK)
         }
         Err(error) => {
@@ -375,22 +376,14 @@ fn write_marker(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 /// `apply.log`); the application removes it on the next start or after its
 /// post-handshake cleanup timer. Every other entry is best-effort: an entry
 /// that is still locked is skipped and retried by the next cleanup.
-fn cleanup_other_versions(staged: &Path, log_path: &Path) {
-    // `staged` is `<base>\<installation-id>\<version>`; the version directory's
-    // parent belongs to this installation only. Falling back to the shared
-    // base would let one portable copy delete another copy's staging.
-    let root = match staged.parent() {
-        Some(root) => root.to_path_buf(),
-        None => match updates_root() {
-            Ok(root) => root,
-            Err(error) => {
-                log(
-                    log_path,
-                    &format!("stale cleanup skipped: {}", error.code()),
-                );
-                return;
-            }
-        },
+fn cleanup_other_versions(staged: &Path, install: &Path, log_path: &Path) {
+    let Ok(updates_root) = updates_root_for(install) else {
+        return;
+    };
+    let Some(root) = matching_updates_root(staged, &updates_root) else {
+        // A locally staged package can live beside the installation itself.
+        // Its parent is not owned by the updater.
+        return;
     };
     let keep = staged
         .file_name()
@@ -403,6 +396,12 @@ fn cleanup_other_versions(staged: &Path, log_path: &Path) {
         ),
         Err(error) => log(log_path, &format!("stale cleanup failed: {}", error.code())),
     }
+}
+
+fn matching_updates_root(staged: &Path, expected: &Path) -> Option<PathBuf> {
+    let parent = staged.parent()?.canonicalize().ok()?;
+    let expected = expected.canonicalize().ok()?;
+    (parent == expected).then_some(expected)
 }
 
 fn collect_arguments() -> Result<Vec<String>, String> {
@@ -654,6 +653,24 @@ mod tests {
                 self.handshake.to_string_lossy().into_owned(),
             ]
         }
+    }
+
+    #[test]
+    fn only_the_installations_update_root_is_used_for_stale_cleanup() {
+        let fixture = Fixture::new();
+        let managed = fixture.temp.path().join("updates").join("installation-id");
+        let normal_stage = managed.join("0.2.5");
+        std::fs::create_dir_all(&normal_stage).unwrap();
+
+        assert_eq!(
+            matching_updates_root(&normal_stage, &managed),
+            Some(managed.canonicalize().unwrap())
+        );
+        assert_eq!(
+            matching_updates_root(&fixture.temp.path().join("external-stage"), &managed),
+            None
+        );
+        assert!(fixture.target.is_dir());
     }
 
     #[test]

@@ -85,18 +85,16 @@ function Test-Update([string] $Install, $Index) {
             }
             Start-Sleep -Milliseconds 200
         }
+        $helperPath = Join-Path $staging 'helper.exe'
+        $relocated = Get-Process -Name helper -ErrorAction SilentlyContinue | Where-Object Path -EQ $helperPath
+        if (!$relocated) { throw 'The relocated update helper is no longer running.' }
         # This smoke test drives the helper directly. The window close button
         # may hide the running client to the tray instead of ending its PID.
         $client | Stop-Process
         if (!$client.WaitForExit(10000)) { throw 'The old client did not exit.' }
 
-        $deadline = [DateTime]::UtcNow.AddSeconds(55)
-        while ([DateTime]::UtcNow -lt $deadline) {
-            $progress = if (Test-Path -LiteralPath $log) { Get-Content -LiteralPath $log -Raw }
-            if ($progress -match 'apply succeeded backup_removed=true') { break }
-            if ($progress -match 'apply failed|wait failed|staged proof failed') { throw $progress }
-            Start-Sleep -Milliseconds 200
-        }
+        if (!$relocated.WaitForExit(55000)) { throw 'The relocated update helper did not exit.' }
+        $progress = Get-Content -LiteralPath $log -Raw
         if ($progress -notmatch 'apply succeeded backup_removed=true') { throw "Update did not finish. $progress" }
         Assert-Payload $Install $Index
         $updated = Get-Content -LiteralPath (Join-Path $Install 'package.json') -Raw | ConvertFrom-Json

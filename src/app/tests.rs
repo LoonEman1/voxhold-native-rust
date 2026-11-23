@@ -978,7 +978,6 @@ async fn paste_and_drop_add_only_metadata_to_the_draft(cx: &mut TestAppContext) 
     assert!(!panel.read_with(&*visual, |panel, _| panel.is_reading()));
     std::fs::remove_file(path).unwrap();
 }
-
 mod auth_session_tests;
 mod cf_01_heartbeat;
 mod cf_02_send_ack;
@@ -999,6 +998,7 @@ mod o05_history;
 mod r04;
 mod remember_tests;
 mod review;
+mod tray_tests;
 mod w08a;
 mod w08a_p2;
 mod w08a_p2_b;

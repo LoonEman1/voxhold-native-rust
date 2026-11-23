@@ -116,6 +116,6 @@ unsafe fn set_icon(hwnd: *mut core::ffi::c_void) {
 /// Search the same locations as Go `findAssets`: next to the executable, one
 /// level up in a build output tree, then the current working directory.
 #[cfg(windows)]
-fn icon_path() -> Option<std::path::PathBuf> {
+pub(crate) fn icon_path() -> Option<std::path::PathBuf> {
     crate::assets::Assets::discover().path("voxhold.ico")
 }

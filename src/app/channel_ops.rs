@@ -605,11 +605,9 @@ impl Voxhold {
             }
             NotifAction::ToggleNotifications => {
                 let enabled = !self.notifications.enabled;
+                // The permanent tray icon stays registered; the preference
+                // only controls balloons.
                 let changed = self.notifications.set_enabled(enabled);
-                if changed && !enabled {
-                    self.notification_tray
-                        .clear(super::personal_ops::hwnd(window));
-                }
                 if !changed {
                     if let Some(panel) = &mut self.channel_notifications {
                         panel.error = self.notifications.error.clone();

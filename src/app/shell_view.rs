@@ -701,7 +701,15 @@ impl Render for Voxhold {
                     .child(explanation),
             );
         }
-        if !self.error.is_empty() {
+        // A tray failure is a separate banner: another error may replace
+        // `self.error` at any time, but the blocked close hook still needs the
+        // exit path. The same text is not painted twice.
+        let tray_text = self
+            .tray_close_blocked
+            .then(|| self.tray_error_text().to_string());
+        let show_error = !self.error.is_empty()
+            && !(self.tray_close_blocked && self.error == self.tray_error_text());
+        if show_error {
             chat = chat.child(
                 div()
                     .px(px(16.))
@@ -709,6 +717,32 @@ impl Render for Voxhold {
                     .text_size(px(12.))
                     .text_color(ink(p.danger))
                     .child(self.error.clone()),
+            );
+        }
+        if let Some(text) = tray_text {
+            chat = chat.child(
+                div()
+                    .id("tray-error")
+                    .debug_selector(|| "tray-error".into())
+                    .px(px(16.))
+                    .pb(px(6.))
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .text_size(px(12.))
+                    .text_color(ink(p.danger))
+                    .child(text)
+                    .child(
+                        div()
+                            .id("tray-exit")
+                            .debug_selector(|| "tray-exit".into())
+                            .flex_none()
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .text_color(ink(p.lime))
+                            .cursor_pointer()
+                            .on_click(cx.listener(|s, _, window, cx| s.quit_from_tray(window, cx)))
+                            .child("Выйти из Voxhold"),
+                    ),
             );
         }
         if readable && !thread_active && !voice_room {

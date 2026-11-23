@@ -15,8 +15,8 @@ use voxhold_update::error::UpdateError;
 use voxhold_update::manifest::{Manifest, Offer, WindowsVersion, BETA_CHANNEL};
 use voxhold_update::recovery::{recover_install, RecoveryMode, RecoveryOutcome};
 use voxhold_update::stage::{
-    cleanup_stale_keeping, read_ready, updates_root, StagedUpdate, APP_DIR, MANIFEST_FILE,
-    READY_FILE, SIGNATURE_FILE,
+    cleanup_legacy_layout, cleanup_stale_keeping, read_ready, updates_root_for, StagedUpdate,
+    APP_DIR, MANIFEST_FILE, READY_FILE, SIGNATURE_FILE,
 };
 use voxhold_update::urls::validate_update_url;
 use voxhold_update::verify::{embedded_public_key, verify_and_parse, UpdatePublicKey};
@@ -143,6 +143,11 @@ impl UpdatePrefs {
 
     pub fn set_declined(&mut self, version: &Version) {
         self.declined_version = Some(version.to_string());
+    }
+
+    /// Whether an automatic install of `version` was refused after a rollback.
+    pub fn install_refused(&self, version: &str) -> bool {
+        self.install_refused_version.as_deref() == Some(version)
     }
 }
 
@@ -282,18 +287,21 @@ pub type VersionSet = BTreeSet<String>;
 /// Whether a successful background check may start the download itself.
 ///
 /// Auto-download is skipped when the switch is off, when the version is the
-/// one the user skipped, and when this process already started (or the user
-/// cancelled) that version. A manual button never uses this decision. Both
-/// sets live as long as the process, so re-offering an older version later
-/// does not start it again and cancelling a newer one does not forget it.
+/// one the user skipped, when another process of the same installation owns
+/// the update mutex (`single_instance == false`), and when this process
+/// already started (or the user cancelled) that version. A manual button never
+/// uses this decision. Both sets live as long as the process, so re-offering
+/// an older version later does not start it again and cancelling a newer one
+/// does not forget it.
 pub fn should_auto_download(
     prefs: &UpdatePrefs,
     version: &str,
     declined: Option<&Version>,
     suppressed: &VersionSet,
     auto_started: &VersionSet,
+    single_instance: bool,
 ) -> bool {
-    if !prefs.auto_download {
+    if !single_instance || !prefs.auto_download {
         return false;
     }
     let Ok(candidate) = Version::parse(version) else {
@@ -311,33 +319,77 @@ pub fn should_auto_download(
 /// Whether a staged package found at startup may be installed automatically.
 ///
 /// A package without a re-verified signed manifest is never installed: an old
-/// `ready.json` has to be prepared again by a background download.
+/// `ready.json` has to be prepared again by a background download. A version
+/// whose automatic install was refused after a rollback stays manual.
 pub fn should_auto_install(prefs: &UpdatePrefs, staged: &StagedUpdate, current: &Version) -> bool {
+    let version = staged.version.to_string();
     prefs.install_on_next_start
         && staged.verified
         && staged.version > *current
-        && prefs.install_refused_version.as_deref() != Some(staged.version.to_string().as_str())
+        && !prefs.install_refused(&version)
 }
 
-/// Sidecar the helper writes after a confirmed rollback. It is read once at
-/// the next start and merged into `UpdatePrefs`.
-pub fn refusal_path(prefs_path: Option<&Path>) -> Option<PathBuf> {
-    prefs_path.map(|path| path.with_extension("refusal.json"))
+/// Sidecar the helper writes after a failed apply. It is read at the next
+/// start and merged into `UpdatePrefs`.
+///
+/// Without `%APPDATA%` the preference file has no path, so the fallback lives
+/// next to the installation. That is the only location this client can read
+/// back without a per-user configuration directory.
+pub fn refusal_path(prefs_path: Option<&Path>, install_dir: &Path) -> PathBuf {
+    match prefs_path {
+        Some(path) => path.with_extension("refusal.json"),
+        None => install_dir.join("update-prefs.refusal.json"),
+    }
 }
 
-/// Consume a rollback refusal left by the helper, if one exists.
-pub fn take_refusal(path: Option<&Path>) -> Option<String> {
+/// Read a refusal left by the helper without removing it.
+///
+/// Removal is separate ([`clear_refusal`]) so a failed preference write cannot
+/// lose the refusal: the in-memory value still blocks the install for this
+/// run and the file is retried on the next start.
+pub fn load_refusal(path: Option<&Path>) -> Option<String> {
     let path = path?;
     let bytes = std::fs::read(path).ok()?;
-    let _ = std::fs::remove_file(path);
     let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
     value.get("version")?.as_str().map(str::to_string)
 }
 
-/// Text under a ready version. It only promises an automatic install when the
-/// user left the switch on.
-pub fn ready_note(install_on_next_start: bool) -> &'static str {
-    if install_on_next_start {
+/// Remove a consumed refusal sidecar. A missing file is not an error.
+pub fn clear_refusal(path: Option<&Path>) {
+    if let Some(path) = path {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// Merge a helper refusal into preferences.
+///
+/// The in-memory value is always updated so this launch cannot install the
+/// same version again. The sidecar is removed only after the preference file
+/// was written; otherwise it stays for the next start. Returns `true` when a
+/// refusal was found.
+pub fn merge_refusal(
+    prefs: &mut UpdatePrefs,
+    prefs_path: Option<&Path>,
+    refusal: Option<&Path>,
+) -> bool {
+    let Some(version) = load_refusal(refusal) else {
+        return false;
+    };
+    prefs.install_refused_version = Some(version);
+    if save_prefs(prefs_path, prefs).is_ok() {
+        clear_refusal(refusal);
+    }
+    true
+}
+
+/// Text under a ready version.
+///
+/// It only promises an automatic install when the user left the switch on and
+/// this version was not refused after a rollback.
+pub fn ready_note(install_on_next_start: bool, refused: bool) -> &'static str {
+    if refused {
+        "Готово к установке · автоустановка отключена"
+    } else if install_on_next_start {
         "Установится при следующем запуске"
     } else {
         "Готово к установке"
@@ -396,6 +448,9 @@ pub fn message_for_error(error: &UpdateError) -> String {
         | UpdateError::InvalidManifest(_)
         | UpdateError::InvalidVersion(_) => "Манифест обновления повреждён.".into(),
         UpdateError::Cancelled => "Загрузка отменена.".into(),
+        UpdateError::AlreadyDownloading(_) => {
+            "Эту версию уже скачивает другая копия приложения.".into()
+        }
         UpdateError::Io { .. } => "Не удалось сохранить обновление на диске.".into(),
         UpdateError::InsecureUrl { .. } => "Адрес обновления небезопасен.".into(),
         UpdateError::InvalidArgument(_) => "Обновление настроено неверно.".into(),
@@ -426,14 +481,33 @@ pub struct StartupScan {
 ///
 /// Runs off the UI thread. A locked helper image is skipped by the library's
 /// best-effort cleanup, so a start that races the helper still succeeds.
+///
+/// `root_override` is a per-installation root (the directory that directly
+/// contains version directories), used by tests. Without it the root is
+/// `updates_root_for(install_dir)`, never the shared base: a second portable
+/// copy must not see or clean the staging of another installation.
+///
+/// `cleanup_staging` is `false` for a process that does not own the
+/// per-installation update mutex. Such a process only *reads* the staging
+/// tree: it must not delete a package another instance is downloading or has
+/// already prepared. Recovery and the legacy-layout cleanup are gated the same
+/// way by the caller.
 pub fn startup_scan(
     install_dir: &Path,
     current: &Version,
     root_override: Option<&Path>,
     cleanup_backup: bool,
+    cleanup_staging: bool,
 ) -> StartupScan {
     match embedded_public_key() {
-        Ok(key) => startup_scan_with_key(install_dir, current, root_override, cleanup_backup, &key),
+        Ok(key) => startup_scan_with_key(
+            install_dir,
+            current,
+            root_override,
+            cleanup_backup,
+            cleanup_staging,
+            &key,
+        ),
         Err(error) => StartupScan {
             error: Some(message_for_error(&error)),
             ..Default::default()
@@ -448,20 +522,25 @@ pub fn startup_scan_with_key(
     current: &Version,
     root_override: Option<&Path>,
     cleanup_backup: bool,
+    cleanup_staging: bool,
     key: &UpdatePublicKey,
 ) -> StartupScan {
-    let root = match root_override
-        .map(Path::to_path_buf)
-        .map(Ok)
-        .unwrap_or_else(updates_root)
-    {
-        Ok(root) => root,
-        Err(error) => {
-            return StartupScan {
-                error: Some(message_for_error(&error)),
-                ..Default::default()
+    let (root, legacy_base) = match root_override {
+        Some(root) => (root.to_path_buf(), None),
+        None => match updates_root_for(install_dir) {
+            Ok(root) => {
+                // Both paths are derived from the same base; the legacy pass
+                // needs the base, the scan needs the per-install directory.
+                let base = root.parent().map(Path::to_path_buf);
+                (root, base)
             }
-        }
+            Err(error) => {
+                return StartupScan {
+                    error: Some(message_for_error(&error)),
+                    ..Default::default()
+                }
+            }
+        },
     };
     let mut scan = StartupScan {
         root: Some(root.clone()),
@@ -478,20 +557,26 @@ pub fn startup_scan_with_key(
         }
     }
     let ready = find_ready(&root, install_dir, current, key);
-    let mut keep = vec![current.to_string()];
-    if let Some(staged) = &ready {
-        keep.push(staged.version.to_string());
-    }
-    // A directory that still holds the handshake or the relocated helper
-    // belongs to the update that just started this process. Its version may
-    // differ from `current_version` when a local build did not set
-    // `VOXHOLD_BUILD_VERSION`, so protect it by content, not only by name.
-    keep.extend(protected_staging_dirs(&root));
-    keep.sort();
-    keep.dedup();
-    let keep_refs: Vec<&str> = keep.iter().map(String::as_str).collect();
-    if let Err(error) = cleanup_stale_keeping(&root, &keep_refs) {
-        scan.error = Some(message_for_error(&error));
+    if cleanup_staging {
+        let mut keep = vec![current.to_string()];
+        if let Some(staged) = &ready {
+            keep.push(staged.version.to_string());
+        }
+        // A directory that still holds the handshake or the relocated helper
+        // belongs to the update that just started this process. Its version
+        // may differ from `current_version` when a local build did not set
+        // `VOXHOLD_BUILD_VERSION`, so protect it by content, not only by name.
+        keep.extend(protected_staging_dirs(&root));
+        keep.sort();
+        keep.dedup();
+        let keep_refs: Vec<&str> = keep.iter().map(String::as_str).collect();
+        if let Err(error) = cleanup_stale_keeping(&root, &keep_refs) {
+            scan.error = Some(message_for_error(&error));
+        }
+        if let Some(base) = legacy_base {
+            // Best-effort: the old layout is unused but harmless.
+            let _ = cleanup_legacy_layout(&base);
+        }
     }
     scan.ready = ready;
     scan
@@ -637,10 +722,57 @@ fn staged_proof_is_valid(
         if index.version != version.to_string() {
             return None;
         }
-        voxhold_update::package::verify_dir(&staging.join(APP_DIR), &index).ok()?;
+        // `package.json` is not part of its own file index, so a replaced
+        // copy would pass `verify_dir`. Compare it with the index inside the
+        // verified ZIP and with canonical bytes; the helper reads this file
+        // when it copies the payload.
+        let app = staging.join(APP_DIR);
+        let app_index = voxhold_update::package::read_package_json_from_dir(&app).ok()?;
+        if app_index != index {
+            return None;
+        }
+        if std::fs::read(app.join(voxhold_update::package::PACKAGE_JSON)).ok()?
+            != app_index.to_json()
+        {
+            return None;
+        }
+        voxhold_update::package::verify_dir(&app, &index).ok()?;
         Some(())
     })()
     .is_some()
+}
+
+/// Re-verify a staged package right before the helper starts.
+///
+/// The startup scan verified the package when the process started; a long
+/// session or another local writer can still change the staging directory
+/// afterwards. Every offline check is repeated here with the embedded key.
+pub fn reverify_staged(staged: &StagedUpdate, install_dir: &Path) -> bool {
+    match embedded_public_key() {
+        Ok(key) => reverify_staged_with(staged, install_dir, &key),
+        Err(_) => false,
+    }
+}
+
+/// [`reverify_staged`] with an explicit verification key.
+pub fn reverify_staged_with(
+    staged: &StagedUpdate,
+    install_dir: &Path,
+    key: &UpdatePublicKey,
+) -> bool {
+    if !staged.verified {
+        return false;
+    }
+    let Ok(marker) = read_ready(&staged.staging_dir) else {
+        return false;
+    };
+    let Ok(version) = Version::parse(&marker.version) else {
+        return false;
+    };
+    if version != staged.version {
+        return false;
+    }
+    staged_proof_is_valid(&staged.staging_dir, &marker, &version, install_dir, key)
 }
 
 fn paths_equal(left: &Path, right: &Path) -> bool {

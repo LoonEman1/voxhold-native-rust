@@ -115,21 +115,29 @@ fn auto_download_is_decided_once_per_version() {
     let none = VersionSet::new();
     let suppressed_020: VersionSet = ["0.2.0".to_string()].into();
     let started_020: VersionSet = ["0.2.0".to_string()].into();
-    assert!(should_auto_download(&prefs, "0.2.0", None, &none, &none));
+    assert!(should_auto_download(
+        &prefs, "0.2.0", None, &none, &none, true
+    ));
+    // Another process of the same installation owns the update mutex.
+    assert!(!should_auto_download(
+        &prefs, "0.2.0", None, &none, &none, false
+    ));
     // The user cancelled this version in this run.
     assert!(!should_auto_download(
         &prefs,
         "0.2.0",
         None,
         &suppressed_020,
-        &none
+        &none,
+        true
     ));
     assert!(should_auto_download(
         &prefs,
         "0.3.0",
         None,
         &suppressed_020,
-        &none
+        &none,
+        true
     ));
     // The automatic start already happened for this version.
     assert!(!should_auto_download(
@@ -137,7 +145,8 @@ fn auto_download_is_decided_once_per_version() {
         "0.2.0",
         None,
         &none,
-        &started_020
+        &started_020,
+        true
     ));
     // A skipped version is never downloaded automatically.
     let declined = Version::new(0, 2, 0);
@@ -146,16 +155,27 @@ fn auto_download_is_decided_once_per_version() {
         "0.2.0",
         Some(&declined),
         &none,
-        &none
+        &none,
+        true
     ));
     // The switch off wins over everything.
     let mut off = prefs.clone();
     off.auto_download = false;
-    assert!(!should_auto_download(&off, "0.2.0", None, &none, &none));
+    assert!(!should_auto_download(
+        &off, "0.2.0", None, &none, &none, true
+    ));
 }
 
 #[test]
-fn a_ready_note_follows_the_install_switch() {
-    assert_eq!(ready_note(true), "Установится при следующем запуске");
-    assert_eq!(ready_note(false), "Готово к установке");
+fn a_ready_note_follows_the_install_switch_and_the_refusal() {
+    assert_eq!(ready_note(true, false), "Установится при следующем запуске");
+    assert_eq!(ready_note(false, false), "Готово к установке");
+    assert!(
+        !ready_note(true, true).contains("следующем запуске"),
+        "a refused version must not promise an automatic install"
+    );
+    assert_eq!(
+        ready_note(true, true),
+        "Готово к установке · автоустановка отключена"
+    );
 }

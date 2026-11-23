@@ -11,6 +11,17 @@ use std::path::Path;
 use std::time::Duration;
 
 impl Voxhold {
+    /// Whether installing now would interrupt a live call or screen share.
+    ///
+    /// Both stop working when this process exits, so the manual path asks for
+    /// a second click in either case.
+    fn transmission_active_for_install(&self, cx: &Context<Self>) -> bool {
+        self.voice.as_ref().is_some_and(|panel| {
+            let panel = panel.read(cx);
+            panel.call_active() || panel.share_active()
+        })
+    }
+
     /// Stop voice, media and preview work and persist the current settings.
     fn prepare_for_install(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         #[cfg(feature = "voxhold-media")]
@@ -45,7 +56,7 @@ impl Voxhold {
         confirmed: bool,
     ) {
         let confirmed = confirmed || self.update.confirm_install;
-        if !confirmed && self.voice_call_active_for_power(cx) {
+        if !confirmed && self.transmission_active_for_install(cx) {
             self.update.confirm_install = true;
             cx.notify();
             return;
@@ -67,6 +78,23 @@ impl Voxhold {
             return;
         }
         let install_dir = self.update.install_dir.clone();
+        // The startup scan verified the package when this process started; a
+        // long session or a local writer can still change the staging tree.
+        // Repeat every offline check immediately before handing over control.
+        let proof_valid = match &self.update.proof_key {
+            Some(key) => update::reverify_staged_with(&staged, &install_dir, key),
+            None => update::reverify_staged(&staged, &install_dir),
+        };
+        if !proof_valid {
+            self.update.phase = UpdatePhase::Error {
+                message:
+                    "Подготовленное обновление изменилось после проверки. Скачайте его заново."
+                        .into(),
+                retry: RetryKind::Check,
+            };
+            cx.notify();
+            return;
+        }
         // Run the helper shipped with the installed version: it knows its own
         // relocation rules. A package-local helper is only a fallback for a
         // development install that has not shipped one yet.
@@ -98,7 +126,7 @@ impl Voxhold {
             .update
             .refusal_path
             .clone()
-            .unwrap_or_else(|| staging_dir.join("refusal.json"));
+            .unwrap_or_else(|| update::refusal_path(None, &install_dir));
         let _ = std::fs::remove_file(&ready);
         if !install_dir.is_absolute() || !staging_dir.is_absolute() || !handshake.is_absolute() {
             self.update.phase = UpdatePhase::Error {
@@ -165,28 +193,71 @@ impl Voxhold {
         // window and is ready to take over. Only then may this process exit.
         let executor = cx.background_executor().clone();
         self.update.work_task = Some(cx.spawn_in(window, async move |this, window| {
-            let deadline = HELPER_READY_TIMEOUT;
             let step = Duration::from_millis(100);
-            let ticks = deadline.as_millis() / step.as_millis();
-            for _ in 0..ticks {
+            let ticks = HELPER_READY_TIMEOUT.as_millis() / step.as_millis();
+            for tick in 0..ticks {
                 executor.timer(step).await;
-                if ready.is_file() {
-                    let _ = this.update_in(window, |view, window, cx| {
-                        view.prepare_for_install(window, cx);
-                        view.update.quit_requested = true;
-                        cx.quit();
-                    });
+                let expired = tick + 1 == ticks;
+                let done = this
+                    .update_in(window, |view, window, cx| {
+                        view.helper_ready_tick(window, cx, &ready, expired)
+                    })
+                    .unwrap_or(true);
+                if done {
                     return;
                 }
             }
-            let _ = this.update_in(window, |view, _, cx| {
-                view.update.phase = UpdatePhase::Error {
-                    message: "Установщик не подтвердил готовность.".into(),
-                    retry: RetryKind::Install,
-                };
-                cx.notify();
-            });
         }));
+    }
+
+    /// One poll of `helper-ready.ok`, extracted so a test can drive it without
+    /// waiting for the 15 s timer.
+    ///
+    /// Returns `true` when the wait is over: either the helper confirmed (the
+    /// app stops media and quits) or the timeout expired (the app stays open
+    /// with a retryable error).
+    pub(super) fn helper_ready_tick(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        ready: &Path,
+        expired: bool,
+    ) -> bool {
+        if ready.is_file() {
+            self.prepare_for_install(window, cx);
+            self.update.quit_requested = true;
+            cx.quit();
+            return true;
+        }
+        if expired {
+            self.update.phase = UpdatePhase::Error {
+                message: "Установщик не подтвердил готовность.".into(),
+                retry: RetryKind::Install,
+            };
+            cx.notify();
+            return true;
+        }
+        false
+    }
+
+    /// Whether the helper is taking over, so the check clock must stop.
+    pub(super) fn install_started(&self) -> bool {
+        self.update.quit_requested || matches!(self.update.phase, UpdatePhase::Installing)
+    }
+
+    /// Merge a helper refusal into the preferences before the startup decision.
+    ///
+    /// The in-memory value is set even when the preference file cannot be
+    /// written, so this launch cannot retry the same automatic install; the
+    /// sidecar is removed only after a successful save.
+    pub(super) fn merge_install_refusal(&mut self) {
+        let prefs_path = self.update.prefs_path.clone();
+        let refusal = self.update.refusal_path.clone();
+        update::merge_refusal(
+            &mut self.update.prefs,
+            prefs_path.as_deref(),
+            refusal.as_deref(),
+        );
     }
 }
 

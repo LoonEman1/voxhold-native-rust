@@ -319,7 +319,10 @@ impl Voxhold {
                 let note = if self.update.confirm_install {
                     "Идёт звонок или трансляция. Нажмите ещё раз, чтобы перезапустить."
                 } else {
-                    update::ready_note(self.update.prefs.install_on_next_start)
+                    update::ready_note(
+                        self.update.prefs.install_on_next_start,
+                        self.update.prefs.install_refused(&version),
+                    )
                 };
                 panel = panel.child(self.update_note(note, p));
                 panel = panel.child(update_button(

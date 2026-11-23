@@ -30,6 +30,12 @@ pub const PACKAGE_FILE: &str = "package.zip";
 pub const DELTA_FILE: &str = "delta.zip";
 /// Unpacked next version.
 pub const APP_DIR: &str = "app";
+/// Marker written while this process owns the staging directory.
+///
+/// `cleanup_stale*` skips a version directory that contains it, so a second
+/// process of the same installation cannot delete an active download. The
+/// marker is removed once `ready.json` exists.
+pub const ACTIVE_FILE: &str = "downloading.lock";
 /// Number of download attempts: the first try plus one retry.
 pub const DOWNLOAD_ATTEMPTS: u32 = 2;
 /// Pause between download attempts.
@@ -205,11 +211,78 @@ pub fn read_ready(staging: &Path) -> Result<ReadyMarker> {
     serde_json::from_slice(&bytes).map_err(|_| UpdateError::NotStaged(staging.to_path_buf()))
 }
 
+/// Whether another process is currently downloading into `staging`.
+///
+/// The marker carries the owner's PID. A marker left by a crashed process is
+/// not active, so a retry can reuse the directory instead of being refused
+/// forever. An unreadable or legacy body is treated as active: cleanup never
+/// deletes a claim it cannot understand.
+pub fn staging_is_active(staging: &Path) -> bool {
+    let marker = staging.join(ACTIVE_FILE);
+    let Ok(text) = std::fs::read_to_string(&marker) else {
+        return false;
+    };
+    match text.trim().parse::<u32>() {
+        Ok(pid) => process_alive(pid),
+        Err(_) => true,
+    }
+}
+
+#[cfg(windows)]
+fn process_alive(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, WAIT_TIMEOUT};
+    use windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE;
+    use windows_sys::Win32::System::Threading::{OpenProcess, WaitForSingleObject};
+
+    if pid == std::process::id() {
+        return true;
+    }
+    // SAFETY: the handle is closed on both paths below.
+    unsafe {
+        let handle = OpenProcess(SYNCHRONIZE, 0, pid);
+        if handle.is_null() {
+            // No process with this id (or no access): the claim is stale.
+            return false;
+        }
+        let wait = WaitForSingleObject(handle, 0);
+        CloseHandle(handle);
+        wait == WAIT_TIMEOUT
+    }
+}
+
+/// Outside Windows the client is not shipped; keeping an unclear claim is the
+/// safe choice for the shared library tests.
+#[cfg(not(windows))]
+fn process_alive(_pid: u32) -> bool {
+    true
+}
+
+/// Whether cleanup must leave the directory alone.
+///
+/// The claim protects an unfinished download. If `ready.json` already exists,
+/// the package is complete and an owner that crashed between the rename and
+/// the marker removal must not leak the directory forever.
+fn cleanup_protected(staging: &Path) -> bool {
+    staging_is_active(staging) && !staging.join(READY_FILE).is_file()
+}
+
+/// Create the staging directory and claim it for this process.
+fn begin_staging(staging: &Path) -> Result<()> {
+    std::fs::create_dir_all(staging.join(APP_DIR))
+        .map_err(|error| UpdateError::io(staging, error))?;
+    let marker = staging.join(ACTIVE_FILE);
+    let body = format!("{}\n", std::process::id());
+    std::fs::write(&marker, body).map_err(|error| UpdateError::io(&marker, error))
+}
+
 /// Stage an update for the next start or an explicit install command.
 pub async fn stage_update(request: StageRequest<'_>) -> StageOutcome {
     match stage_inner(&request).await {
         Ok(Some(staged)) => StageOutcome::Ready(staged),
         Ok(None) => StageOutcome::UpToDate,
+        // The directory belongs to another process; deleting it here would
+        // destroy a download this process never started.
+        Err(error @ UpdateError::AlreadyDownloading(_)) => StageOutcome::Failed(error),
         Err(error) => {
             let _ = cleanup_version(
                 request.updates_root,
@@ -235,13 +308,17 @@ async fn stage_inner(request: &StageRequest<'_>) -> Result<Option<StagedUpdate>>
     let version = candidate;
     let staging = staging_dir(request.updates_root, request.install_dir, &version);
     if staging.exists() {
+        // A directory claimed by another process is never removed: the second
+        // client may be mid-download. The UI already refuses to start a
+        // download without the per-installation mutex.
+        if staging_is_active(&staging) {
+            return Err(UpdateError::AlreadyDownloading(staging));
+        }
         tokio::fs::remove_dir_all(&staging)
             .await
             .map_err(|error| UpdateError::io(&staging, error))?;
     }
-    tokio::fs::create_dir_all(staging.join(APP_DIR))
-        .await
-        .map_err(|error| UpdateError::io(&staging, error))?;
+    begin_staging(&staging)?;
 
     check_cancelled(request)?;
     let base = base_package(request).await;
@@ -255,9 +332,7 @@ async fn stage_inner(request: &StageRequest<'_>) -> Result<Option<StagedUpdate>>
             Err(error) => {
                 delta_reason = Some(format!("{}: {error}", error.code()));
                 let _ = tokio::fs::remove_dir_all(&staging).await;
-                tokio::fs::create_dir_all(staging.join(APP_DIR))
-                    .await
-                    .map_err(|error| UpdateError::io(&staging, error))?;
+                begin_staging(&staging)?;
             }
         }
     }
@@ -477,6 +552,9 @@ fn ready(
     // The marker is small; a synchronous write keeps the function total.
     std::fs::write(&temporary, bytes).map_err(|error| UpdateError::io(&temporary, error))?;
     std::fs::rename(&temporary, &path).map_err(|error| UpdateError::io(&path, error))?;
+    // The package is complete once `ready.json` exists. Releasing the claim
+    // afterwards means a cleanup never sees a half-finished directory.
+    let _ = std::fs::remove_file(staging.join(ACTIVE_FILE));
     Ok(StagedUpdate {
         version,
         method,
@@ -523,7 +601,9 @@ pub fn cleanup_stale(root: &Path, keep_version: Option<&str>) -> Result<usize> {
 /// directory of the running build still holds `helper.exe` and the handshake
 /// file, while a different directory may hold a staged update that must stay
 /// available to the user. Keeping both cannot be expressed with a single
-/// `keep_version`.
+/// `keep_version`. A directory claimed by an active download
+/// ([`ACTIVE_FILE`]) is skipped as well, even when it is not in
+/// `keep_versions`.
 pub fn cleanup_stale_keeping(root: &Path, keep_versions: &[&str]) -> Result<usize> {
     let entries = match std::fs::read_dir(root) {
         Ok(entries) => entries,
@@ -543,9 +623,55 @@ pub fn cleanup_stale_keeping(root: &Path, keep_versions: &[&str]) -> Result<usiz
         }
         let path = entry.path();
         let removed_ok = match entry.file_type() {
-            Ok(file_type) if file_type.is_dir() => std::fs::remove_dir_all(&path).is_ok(),
+            Ok(file_type) if file_type.is_dir() => {
+                // Another process claimed this directory for an active
+                // download; deleting it would break that update.
+                if cleanup_protected(&path) {
+                    continue;
+                }
+                std::fs::remove_dir_all(&path).is_ok()
+            }
             Ok(_) => std::fs::remove_file(&path).is_ok(),
             Err(_) => false,
+        };
+        if removed_ok {
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
+/// Remove the pre-per-install layout `updates\<version>` from the shared base.
+///
+/// Older builds staged directly under `%LOCALAPPDATA%\VoxHold\updates`. The
+/// current layout uses `updates\<installation-id>\<version>`, so an old
+/// version directory under the base is never used again. Only entries that
+/// look like that layout are removed: a directory whose name parses as a
+/// version, and stray files. Every other directory (an installation id) is
+/// left untouched, as is a version directory that another process is actively
+/// downloading into. Best-effort per entry, like [`cleanup_stale`].
+pub fn cleanup_legacy_layout(base: &Path) -> Result<usize> {
+    let entries = match std::fs::read_dir(base) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(UpdateError::io(base, error)),
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let path = entry.path();
+        let legacy_dir =
+            file_type.is_dir() && Version::parse(&name).is_ok() && !cleanup_protected(&path);
+        let removed_ok = if legacy_dir {
+            std::fs::remove_dir_all(&path).is_ok()
+        } else if file_type.is_file() {
+            std::fs::remove_file(&path).is_ok()
+        } else {
+            false
         };
         if removed_ok {
             removed += 1;
@@ -627,6 +753,64 @@ mod tests {
         assert!(!root.join("stray.part").exists());
         assert_eq!(cleanup_stale(&root, None).unwrap(), 1);
         assert!(root.exists());
+    }
+
+    #[test]
+    fn cleanup_skips_a_directory_claimed_by_an_active_download() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("updates");
+        let active = root.join("0.2.0");
+        std::fs::create_dir_all(active.join(APP_DIR)).unwrap();
+        std::fs::write(active.join(ACTIVE_FILE), std::process::id().to_string()).unwrap();
+        std::fs::write(active.join(PACKAGE_FILE), b"half").unwrap();
+        std::fs::create_dir_all(root.join("0.1.0")).unwrap();
+
+        assert!(staging_is_active(&active));
+        assert_eq!(cleanup_stale(&root, None).unwrap(), 1);
+        assert!(active.exists(), "the active download is preserved");
+        assert!(active.join(PACKAGE_FILE).exists());
+        assert!(!root.join("0.1.0").exists());
+
+        // Once the owner releases the directory it becomes removable.
+        std::fs::remove_file(active.join(ACTIVE_FILE)).unwrap();
+        assert_eq!(cleanup_stale(&root, None).unwrap(), 1);
+        assert!(!active.exists());
+    }
+
+    #[test]
+    fn a_claim_left_by_a_dead_process_does_not_block_a_retry() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("updates");
+        let stale = root.join("0.2.0");
+        std::fs::create_dir_all(stale.join(APP_DIR)).unwrap();
+        // `u32::MAX` is not a live process id.
+        std::fs::write(stale.join(ACTIVE_FILE), u32::MAX.to_string()).unwrap();
+        std::fs::write(stale.join(PACKAGE_FILE), b"half").unwrap();
+
+        assert!(!staging_is_active(&stale));
+        assert_eq!(cleanup_stale(&root, None).unwrap(), 1);
+        assert!(!stale.exists(), "a crashed download is cleaned up");
+    }
+
+    #[test]
+    fn the_legacy_updates_layout_is_removed_but_installation_ids_stay() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().join("updates");
+        let id = "0123456789abcdef";
+        std::fs::create_dir_all(base.join("0.1.0").join(APP_DIR)).unwrap();
+        std::fs::create_dir_all(base.join(id).join("0.2.0").join(APP_DIR)).unwrap();
+        std::fs::create_dir_all(base.join("staging-notes")).unwrap();
+        std::fs::write(base.join("helper-usage.log"), b"log").unwrap();
+        let busy = base.join("0.3.0");
+        std::fs::create_dir_all(&busy).unwrap();
+        std::fs::write(busy.join(ACTIVE_FILE), std::process::id().to_string()).unwrap();
+
+        assert_eq!(cleanup_legacy_layout(&base).unwrap(), 2);
+        assert!(!base.join("0.1.0").exists());
+        assert!(!base.join("helper-usage.log").exists());
+        assert!(base.join(id).exists(), "installation ids are never touched");
+        assert!(base.join("staging-notes").exists());
+        assert!(busy.exists(), "an active legacy download is preserved");
     }
 
     #[cfg(windows)]

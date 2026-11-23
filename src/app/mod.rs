@@ -59,7 +59,10 @@ mod theme_ops;
 mod thread_ops;
 pub(crate) mod ui;
 mod update_install;
+#[cfg(test)]
+mod update_install_tests;
 mod update_ops;
+mod update_progress;
 #[cfg(test)]
 mod update_state_tests;
 #[cfg(test)]

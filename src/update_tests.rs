@@ -190,6 +190,7 @@ fn startup_scan_reports_a_ready_update_and_keeps_it() {
         &Version::new(0, 1, 0),
         Some(root.as_path()),
         true,
+        true,
         &key,
     );
     let ready = scan.ready.expect("ready update");
@@ -197,6 +198,131 @@ fn startup_scan_reports_a_ready_update_and_keeps_it() {
     assert!(staging.exists(), "the ready directory must be preserved");
     assert!(!root.join("0.1.9").exists());
 
+    std::fs::remove_dir_all(&temp).ok();
+}
+
+#[test]
+fn a_second_process_does_not_clean_a_shared_staging_root() {
+    let temp = std::env::temp_dir().join(format!(
+        "voxhold-second-process-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    let install = temp.join("VoxHold");
+    let base = temp.join("updates");
+    let root = base.join(voxhold_update::stage::installation_id(&install));
+    std::fs::create_dir_all(&install).unwrap();
+    std::fs::create_dir_all(&root).unwrap();
+    // The first process is mid-download in another version directory.
+    let active = root.join("0.3.0");
+    std::fs::create_dir_all(active.join(APP_DIR)).unwrap();
+    std::fs::write(
+        active.join(voxhold_update::stage::ACTIVE_FILE),
+        std::process::id().to_string(),
+    )
+    .unwrap();
+    std::fs::write(active.join(voxhold_update::stage::PACKAGE_FILE), b"half").unwrap();
+    std::fs::create_dir_all(root.join("0.1.9")).unwrap();
+    let (ready_dir, key) = signed_staging(&temp, &root, &install, "0.2.0");
+
+    // The second process does not own the installation mutex: it may show the
+    // ready package but must not delete anything.
+    let scan = startup_scan_with_key(
+        &install,
+        &Version::new(0, 1, 0),
+        Some(root.as_path()),
+        true,
+        false,
+        &key,
+    );
+    assert_eq!(
+        scan.ready.as_ref().map(|staged| &staged.version),
+        Some(&Version::new(0, 2, 0))
+    );
+    assert!(ready_dir.exists(), "the ready package is preserved");
+    assert!(active.exists(), "the first process download is preserved");
+    assert!(active.join(voxhold_update::stage::PACKAGE_FILE).exists());
+    assert!(
+        root.join("0.1.9").exists(),
+        "a second process does not clean the staging tree"
+    );
+
+    // Even the owner's cleanup skips the directory claimed by the download.
+    let scan = startup_scan_with_key(
+        &install,
+        &Version::new(0, 1, 0),
+        Some(root.as_path()),
+        true,
+        true,
+        &key,
+    );
+    assert!(scan.ready.is_some());
+    assert!(ready_dir.exists());
+    assert!(!root.join("0.1.9").exists());
+    assert!(active.exists(), "an active download is never removed");
+    assert!(active.join(voxhold_update::stage::ACTIVE_FILE).exists());
+
+    std::fs::remove_dir_all(&temp).ok();
+}
+
+#[test]
+fn a_replaced_app_package_json_is_not_ready() {
+    let temp = std::env::temp_dir().join(format!(
+        "voxhold-app-index-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    let install = temp.join("VoxHold");
+    let root = temp.join("updates");
+    std::fs::create_dir_all(&install).unwrap();
+    let (staging, key) = signed_staging(&temp, &root, &install, "0.2.0");
+    // The index is not listed in its own file table, so it can be replaced
+    // without breaking `verify_dir`; the proof must compare it anyway.
+    std::fs::write(
+        staging
+            .join(APP_DIR)
+            .join(voxhold_update::package::PACKAGE_JSON),
+        br#"{"version":"0.2.0","files":[]}"#,
+    )
+    .unwrap();
+    let scan = startup_scan_with_key(
+        &install,
+        &Version::new(0, 1, 0),
+        Some(root.as_path()),
+        true,
+        true,
+        &key,
+    );
+    assert!(
+        scan.ready.is_none(),
+        "a replaced app/package.json must not be offered"
+    );
+    std::fs::remove_dir_all(&temp).ok();
+}
+
+#[test]
+fn a_reverify_repeats_the_staged_proof() {
+    let temp = std::env::temp_dir().join(format!(
+        "voxhold-reverify-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    let install = temp.join("VoxHold");
+    let root = temp.join("updates");
+    std::fs::create_dir_all(&install).unwrap();
+    let (staging, key) = signed_staging(&temp, &root, &install, "0.2.0");
+    let staged = StagedUpdate {
+        version: Version::new(0, 2, 0),
+        method: voxhold_update::stage::StageMethod::Full,
+        staging_dir: staging.clone(),
+        app_dir: staging.join(APP_DIR),
+        package_sha256: String::new(),
+        verified: true,
+    };
+    assert!(reverify_staged_with(&staged, &install, &key));
+    // A replaced payload file is caught; the helper must not start.
+    std::fs::write(staging.join(APP_DIR).join("Voxhold.exe"), b"tampered").unwrap();
+    assert!(!reverify_staged_with(&staged, &install, &key));
     std::fs::remove_dir_all(&temp).ok();
 }
 
@@ -215,7 +341,13 @@ fn startup_scan_keeps_a_handshake_directory_without_ready() {
     std::fs::write(staging.join("handshake.ok"), b"ok").unwrap();
     std::fs::create_dir_all(root.join("0.1.9")).unwrap();
 
-    let scan = startup_scan(&install, &Version::new(0, 1, 0), Some(root.as_path()), true);
+    let scan = startup_scan(
+        &install,
+        &Version::new(0, 1, 0),
+        Some(root.as_path()),
+        true,
+        true,
+    );
     assert!(scan.ready.is_none());
     assert!(
         staging.exists(),
@@ -271,7 +403,13 @@ fn a_confirmed_update_start_completes_before_the_second_cleanup() {
 
     // An update start with a written handshake must run the observer,
     // which persists completion while the proof still exists.
-    let scan = startup_scan(&install, &Version::new(0, 2, 0), Some(root.as_path()), true);
+    let scan = startup_scan(
+        &install,
+        &Version::new(0, 2, 0),
+        Some(root.as_path()),
+        true,
+        true,
+    );
     assert!(scan.error.is_none(), "{scan:?}");
     assert!(handshake.exists(), "the observer must run before cleanup");
     assert_eq!(state::load(&install), StateLoad::Missing);
@@ -372,7 +510,7 @@ fn auto_install_requires_a_verified_newer_package_and_no_refusal() {
 }
 
 #[test]
-fn a_refusal_sidecar_is_consumed_once() {
+fn a_refusal_is_read_without_being_removed_before_the_preferences_are_saved() {
     let dir = std::env::temp_dir().join(format!(
         "voxhold-refusal-{}-{}",
         std::process::id(),
@@ -381,7 +519,54 @@ fn a_refusal_sidecar_is_consumed_once() {
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("update-prefs.refusal.json");
     std::fs::write(&path, br#"{"version":"0.2.0"}"#).unwrap();
-    assert_eq!(take_refusal(Some(&path)).as_deref(), Some("0.2.0"));
-    assert!(take_refusal(Some(&path)).is_none());
+    assert_eq!(load_refusal(Some(&path)).as_deref(), Some("0.2.0"));
+    assert!(path.exists(), "reading does not consume the sidecar");
+    clear_refusal(Some(&path));
+    assert!(load_refusal(Some(&path)).is_none());
+
+    // A preference path that cannot be written must not lose the refusal:
+    // the in-memory value still blocks the automatic install in this run and
+    // the sidecar stays for the next start.
+    std::fs::write(&path, br#"{"version":"0.2.0"}"#).unwrap();
+    let blocker = dir.join("blocked");
+    std::fs::write(&blocker, b"file").unwrap();
+    let blocked_prefs = blocker.join("update-prefs.json");
+    let mut prefs = UpdatePrefs::default();
+    assert!(merge_refusal(&mut prefs, Some(&blocked_prefs), Some(&path)));
+    assert_eq!(prefs.install_refused_version.as_deref(), Some("0.2.0"));
+    assert!(path.exists(), "the sidecar survives a failed save");
+    let staging = dir.join("updates").join("0.2.0");
+    let staged = StagedUpdate {
+        version: Version::new(0, 2, 0),
+        method: voxhold_update::stage::StageMethod::Full,
+        app_dir: staging.join(APP_DIR),
+        staging_dir: staging,
+        package_sha256: "a".repeat(64),
+        verified: true,
+    };
+    assert!(!should_auto_install(
+        &prefs,
+        &staged,
+        &Version::new(0, 1, 0)
+    ));
+
+    // A later successful save consumes the sidecar.
+    let writable = dir.join("update-prefs.json");
+    assert!(merge_refusal(&mut prefs, Some(&writable), Some(&path)));
+    assert!(!path.exists());
     std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn a_refusal_falls_back_to_the_installation_directory() {
+    let install = Path::new(r"C:\Games\Voxhold");
+    assert_eq!(
+        refusal_path(None, install),
+        install.join("update-prefs.refusal.json")
+    );
+    let prefs = Path::new(r"C:\Users\test\AppData\Roaming\Voxhold\update-prefs.json");
+    assert_eq!(
+        refusal_path(Some(prefs), install),
+        Path::new(r"C:\Users\test\AppData\Roaming\Voxhold\update-prefs.refusal.json")
+    );
 }

@@ -91,6 +91,7 @@ impl VerifiedManifest {
     /// This is only used by in-process tests that need a value for staging
     /// mechanics. A staged marker built from it cannot pass the startup
     /// signature check, which is what makes an old `ready.json` reprepare.
+    #[allow(dead_code)]
     pub(crate) fn new(manifest: Manifest) -> Self {
         Self {
             manifest,

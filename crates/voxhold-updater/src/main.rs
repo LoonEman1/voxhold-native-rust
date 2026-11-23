@@ -202,19 +202,18 @@ fn main() -> ExitCode {
                 &log_path,
                 &format!("apply failed: {} ({error})", error.code()),
             );
-            let rolled_back = matches!(
-                recover_install(&arguments.target, RecoveryMode::Updater),
-                Ok(RecoveryOutcome::RolledBack { .. })
-                    | Ok(RecoveryOutcome::Clean)
-                    | Ok(RecoveryOutcome::Completed { .. })
-            );
-            if rolled_back {
+            let recovery = recover_install(&arguments.target, RecoveryMode::Updater);
+            let action = failure_action(&recovery);
+            log(&log_path, &format!("recovery after failure: {recovery:?}"));
+            if action == FailureAction::RefuseAndRestart {
                 if let Some(path) = arguments.refusal.as_deref() {
                     let version = arguments
                         .version
                         .clone()
                         .or_else(|| read_staged_version(&arguments.staged));
                     if let Some(version) = version {
+                        // The refusal body carries only the version; paths and
+                        // errors stay in `apply.log`.
                         let body = format!("{{\"version\":\"{}\"}}", version);
                         if let Err(error) = write_marker(path, body.as_bytes()) {
                             log(
@@ -226,7 +225,8 @@ fn main() -> ExitCode {
                 }
                 // One normal start of the restored version. The refusal
                 // marker above stops it from auto-installing the same version
-                // again; a manual retry stays available.
+                // again; a manual retry stays available. A completed update is
+                // never started a second time.
                 let client = arguments.target.join(&arguments.exe);
                 if client.is_file() {
                     match Command::new(&client).current_dir(&arguments.target).spawn() {
@@ -240,6 +240,28 @@ fn main() -> ExitCode {
             }
             ExitCode::from(EXIT_APPLY)
         }
+    }
+}
+
+/// What the helper does after a failed apply, decided by recovery.
+///
+/// `Completed` means the swap is proven and the new version already confirmed
+/// startup: writing a refusal or starting the old client would fight the
+/// running installation. Every other answer — including a recovery error —
+/// leaves this version unproven, so it is refused and the restored client is
+/// started once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FailureAction {
+    KeepInstalled,
+    RefuseAndRestart,
+}
+
+fn failure_action(
+    recovery: &Result<RecoveryOutcome, voxhold_update::UpdateError>,
+) -> FailureAction {
+    match recovery {
+        Ok(RecoveryOutcome::Completed { .. }) => FailureAction::KeepInstalled,
+        _ => FailureAction::RefuseAndRestart,
     }
 }
 
@@ -616,5 +638,41 @@ mod tests {
             .into_owned();
         let error = parse_arguments(args.into_iter()).unwrap_err();
         assert!(error.contains("--staged"), "{error}");
+    }
+
+    #[test]
+    fn a_proven_completion_never_refuses_or_restarts_the_client() {
+        assert_eq!(
+            failure_action(&Ok(RecoveryOutcome::Completed {
+                operation_id: "op".into(),
+                backup_removed: false,
+            })),
+            FailureAction::KeepInstalled,
+            "the new version is already running"
+        );
+    }
+
+    #[test]
+    fn every_unproven_outcome_refuses_and_restarts_once() {
+        let outcomes = [
+            Ok(RecoveryOutcome::Clean),
+            Ok(RecoveryOutcome::RolledBack {
+                operation_id: "op".into(),
+            }),
+            Ok(RecoveryOutcome::NeedsUpdater {
+                operation_id: None,
+                stage: None,
+            }),
+            Ok(RecoveryOutcome::Ambiguous { backup: None }),
+            Ok(RecoveryOutcome::Corrupt { backup: None }),
+            Err(voxhold_update::UpdateError::Apply("recovery failed".into())),
+        ];
+        for outcome in outcomes {
+            assert_eq!(
+                failure_action(&outcome),
+                FailureAction::RefuseAndRestart,
+                "{outcome:?}"
+            );
+        }
     }
 }

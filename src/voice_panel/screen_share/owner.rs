@@ -104,15 +104,18 @@ impl VoicePanel {
     /// Push the current gate to the worker while a picker or an attempt is
     /// open. The owner branch starts with the sent intent, not with its `Live`
     /// confirmation: navigating away during a preparation must not replace the
-    /// owner gate with the displayed room's.
+    /// owner gate with the displayed room's. A terminal answer of an
+    /// unconfirmed start keeps that intent as well, so `Failed`/`Idle` after a
+    /// sent Start cannot fall back to the displayed room either.
     pub(crate) fn sync_screen_access(&self) {
-        if !(self.screen.open || self.screen.busy || self.share_active()) {
+        let owned_attempt = self.publish_access.is_some() || self.share_active();
+        if !(self.screen.open || self.screen.busy || owned_attempt) {
             return;
         }
         let Some(handle) = &self.handle else {
             return;
         };
-        let (permission, slot_available) = if self.publish_access.is_some() {
+        let (permission, slot_available) = if owned_attempt {
             (self.publish_permission(), self.publish_slot_available())
         } else {
             (

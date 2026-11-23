@@ -151,10 +151,23 @@ impl VoicePanel {
             self.player_pos = (player.x, player.y);
         }
         self.sync_viewport();
-        // Land on an action the restored surface really paints: the compact PiP
-        // has no fullscreen toggle, its settings button is its first action.
-        let target = if self.pip_active() { 3 } else { 1 };
-        window.focus(&self.player_actions[target]);
+        // Land on an action the restored surface really paints. The standard
+        // player paints its fullscreen toggle, but the compact PiP has no such
+        // button: its first action depends on the role and the phase, so a
+        // hardcoded index could focus the settings of a starting or failed
+        // publication, which is not painted at all.
+        let target = if self.pip_active() {
+            self.pip_exit_focus_index()
+        } else {
+            Some(1)
+        };
+        match target {
+            Some(index) => window.focus(&self.player_actions[index]),
+            // A stopping publication paints its close as a status instead of a
+            // button, so no card action is a Tab stop. Keep the keyboard on the
+            // panel rather than a dead control.
+            None => window.focus(&self.focus),
+        }
     }
 
     /// Returns whether the key belonged to the player.

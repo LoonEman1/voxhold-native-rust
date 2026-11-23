@@ -617,3 +617,138 @@ async fn m07_another_call_starts_without_the_old_intents(cx: &mut TestAppContext
         });
     });
 }
+
+/// P3: a terminal answer for an intent that never went Live must not replace
+/// the owner gate with the displayed room. The publisher PiP has no settings
+/// before its attempt is Live, so leaving fullscreen has to focus a painted
+/// tab or the close instead of a dead button.
+#[gpui::test]
+async fn a09_exit_fullscreen_focuses_a_painted_publisher_action(cx: &mut TestAppContext) {
+    let (mut visual, view, voice) = super::voice_tests::fixture(cx);
+    visual.update(|window, app| {
+        voice.update(app, |panel, cx| {
+            publish_live(panel, window, cx, 3);
+            watch_publication(panel, window, cx);
+            panel.test_select_pip_role(crate::voice_panel::PipRole::Publisher);
+        });
+    });
+    open_room(&mut visual, &view, 9);
+    let _ = voice.update(&mut *visual, |panel, _| panel.test_take_stream_commands());
+    let _ = voice.update(&mut *visual, |panel, _| panel.test_take_screen_commands());
+
+    // The player owns the window while the publisher role is on screen.
+    visual.update(|window, app| {
+        voice.update(app, |panel, _| panel.player_toggle_fullscreen(window));
+    });
+    draw(&mut visual);
+    assert!(voice.read_with(&*visual, |panel, _| panel.player_fullscreen()));
+
+    // The attempt starts stopping: the publisher settings button is no longer
+    // painted, and neither is its close (a status takes their place).
+    visual.update(|window, app| {
+        voice.update(app, |panel, _| {
+            panel.test_apply_screen_sharing(
+                window,
+                Sharing {
+                    phase: Phase::Stopping,
+                    attempt: 3,
+                    live: true,
+                    ..Sharing::default()
+                },
+            );
+        });
+    });
+    draw(&mut visual);
+    assert_eq!(
+        voice.read_with(&*visual, |panel, _| panel.test_selected_pip_role()),
+        crate::voice_panel::PipRole::Publisher
+    );
+
+    // Leaving fullscreen must put the keyboard on a control the restored card
+    // really paints: its publisher tab. Focusing its settings would target a
+    // button that this phase does not draw.
+    visual.update(|window, app| {
+        voice.update(app, |panel, _| panel.exit_fullscreen(window));
+    });
+    draw(&mut visual);
+    let focused = |visual: &mut VisualTestContext| {
+        visual.update(|window, app| voice.read(app).focused_action(window))
+    };
+    assert_eq!(
+        focused(&mut visual),
+        Some("pip-tab-publisher"),
+        "focus lands on the painted publisher action"
+    );
+    assert!(
+        visual.debug_bounds("pip-tab-publisher").is_some(),
+        "the focused control is painted"
+    );
+    // The stopping status paints its settings and close as text, not as live
+    // actions: neither is a Tab stop of the restored card.
+    let ring = voice.read_with(&*visual, |panel, _| panel.test_focus_ring_ids());
+    assert!(
+        !ring
+            .iter()
+            .any(|id| matches!(*id, "pip-settings" | "pip-close")),
+        "the stopping publisher paints no dead action: {ring:?}"
+    );
+}
+
+/// P3: `Failed` before `Live` keeps the sent intent as the gate owner. Joining
+/// B afterwards must hand the worker A's confirmed permission, not B's.
+#[gpui::test]
+async fn a09_a_terminal_snapshot_keeps_the_owner_gate(cx: &mut TestAppContext) {
+    let (visual, _view, voice) = super::voice_tests::fixture(cx);
+    visual.update(|window, app| {
+        voice.update(app, |panel, cx| {
+            panel.test_attach_detached_handle();
+            confirmed_permissions(panel, [(7, true), (8, false)], 7);
+            panel.test_set_share_gate(Ok(()));
+            panel.test_prepare_screen_publish(window, source());
+            panel.test_start_screen_share(window, cx);
+            let _ = panel.test_take_screen_commands();
+            let _ = panel.test_take_screen_access();
+            assert_eq!(panel.test_screen_phase(), Phase::Idle, "no Live yet");
+
+            // The worker answers with a terminal failure before the attempt is
+            // confirmed.
+            assert!(panel.test_apply_screen_sharing(
+                window,
+                Sharing {
+                    phase: Phase::Failed,
+                    attempt: 0,
+                    error: Some("Захват не начался".into()),
+                    ..Sharing::default()
+                },
+            ));
+            assert_eq!(panel.test_screen_phase(), Phase::Failed);
+            let access = panel
+                .test_publish_access()
+                .expect("the unconfirmed intent still owns A");
+            assert_eq!(access.0, 7, "the owner room is A");
+            assert_eq!(access.2, 0, "the attempt was never confirmed");
+
+            // The user opens B while the call stays in A. B grants no Stream,
+            // so leaking its gate would reach the worker as `(false, true)`.
+            panel.set_room_state(8, Vec::new(), Vec::new());
+            panel.test_set_stream_permissions(HashMap::from([(7, true), (8, false)]));
+            panel.set_stream_permission(false);
+            assert_eq!(panel.test_publisher_room(), 7);
+            assert_eq!(
+                panel.test_take_screen_access(),
+                Some((true, true)),
+                "the terminal intent keeps the confirmed gate of A"
+            );
+
+            // The dismissal drops the retained identity: no stale owner may
+            // gate the next room.
+            panel.test_stop_screen_share(window, cx);
+            assert_eq!(panel.test_publish_access(), None);
+            assert_eq!(
+                panel.test_take_screen_access(),
+                None,
+                "a dismissed attempt pushes no gate"
+            );
+        });
+    });
+}

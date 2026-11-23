@@ -142,6 +142,56 @@ impl VoicePanel {
         ring
     }
 
+    /// Index in `player_actions` of one PiP entry id. The fullscreen exit uses
+    /// it to land on an action the restored card really paints: a hardcoded
+    /// index would target a button that this role may not show.
+    fn pip_action_index(id: &str) -> Option<usize> {
+        Some(match id {
+            "pip-settings-audio" => 6,
+            "pip-settings-fullscreen" => 7,
+            "pip-settings-leave" => 8,
+            "pip-tab-viewer" => 4,
+            "pip-tab-publisher" => 5,
+            "pip-settings" => 3,
+            "pip-close" => 2,
+            _ => return None,
+        })
+    }
+
+    /// The first action of the painted PiP this frame, in Tab order. `None`
+    /// means no control of the card is focusable (a stopping publication paints
+    /// its close as a status), so the caller must keep the keyboard on a
+    /// surface that exists.
+    pub(super) fn pip_first_focus_index(&self) -> Option<usize> {
+        self.pip_focus_entries()
+            .into_iter()
+            .find_map(|(id, _)| Self::pip_action_index(id))
+    }
+
+    /// The action the restored card must focus after leaving fullscreen: the
+    /// first painted control of the role that is really shown, not a hardcoded
+    /// index. The publisher role paints no settings button before its attempt
+    /// is Live, so its first real action is the publisher tab or the close.
+    pub(super) fn pip_exit_focus_index(&self) -> Option<usize> {
+        let entries = self.pip_focus_entries();
+        let preferred: &[&str] = match self.active_pip_role() {
+            PipRole::Publisher => &["pip-tab-publisher", "pip-settings", "pip-close"],
+            PipRole::Viewer => &[
+                "pip-tab-viewer",
+                "pip-settings",
+                "pip-close",
+                "pip-settings-audio",
+                "pip-settings-fullscreen",
+                "pip-settings-leave",
+            ],
+        };
+        preferred
+            .iter()
+            .find(|id| entries.iter().any(|(entry, _)| entry == *id))
+            .and_then(|id| Self::pip_action_index(id))
+            .or_else(|| self.pip_first_focus_index())
+    }
+
     fn focus_pip(&self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         window.focus(&self.player_actions[index]);
         cx.notify();

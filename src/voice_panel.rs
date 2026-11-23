@@ -1183,6 +1183,8 @@ mod player_frame;
 mod screen_share;
 use screen_share::ScreenShareUi;
 pub(crate) use screen_share::StreamPrefsStore;
+#[cfg(test)]
+mod pip_test_support;
 mod sidebar;
 #[cfg(test)]
 mod test_support;

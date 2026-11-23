@@ -22,6 +22,9 @@ pub struct Route {
     /// Interrupt every response, not only the first one.
     pub interrupt_every: bool,
     pub allow_range: bool,
+    /// Pause between 8 KiB body chunks, so a client observes intermediate
+    /// progress instead of one full-size sample.
+    pub throttle: Option<Duration>,
 }
 
 #[derive(Clone, Debug)]
@@ -207,17 +210,33 @@ fn handle_connection(
                 record(requests, &path, range, limit, status);
                 return;
             }
-            _ => {
-                let _ = stream.write_all(body);
-                body.len()
-            }
+            _ => write_body(&mut stream, body, route.throttle),
         }
     } else {
-        let _ = stream.write_all(body);
-        body.len()
+        write_body(&mut stream, body, route.throttle)
     };
     let _ = stream.flush();
     record(requests, &path, range, sent, status);
+}
+
+/// Write a body, optionally pausing between 8 KiB chunks.
+fn write_body(stream: &mut TcpStream, body: &[u8], throttle: Option<Duration>) -> usize {
+    let Some(delay) = throttle else {
+        let _ = stream.write_all(body);
+        return body.len();
+    };
+    let mut sent = 0;
+    for chunk in body.chunks(8 * 1024) {
+        if stream.write_all(chunk).is_err() {
+            break;
+        }
+        let _ = stream.flush();
+        sent += chunk.len();
+        if sent < body.len() {
+            thread::sleep(delay);
+        }
+    }
+    sent
 }
 
 fn record(

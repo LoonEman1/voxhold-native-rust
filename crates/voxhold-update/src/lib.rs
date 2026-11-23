@@ -26,6 +26,8 @@ pub mod error;
 mod fsutil;
 pub mod handshake;
 pub mod manifest;
+#[cfg(all(test, windows))]
+mod memory_probe;
 pub mod package;
 pub mod patch;
 pub mod recovery;

@@ -17,6 +17,7 @@ voxhold-api = { path = "../voxhold-api" }
 [target.'cfg(windows)'.dependencies]
 windows-core = "0.61"
 windows = { version = "0.61", features = [
+    "Wdk_Graphics_Direct3D",
     "Win32_Foundation",
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",

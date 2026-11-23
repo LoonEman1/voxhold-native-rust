@@ -4,29 +4,51 @@
 //! apartment and one Media Foundation startup. The trial encode uses a
 //! generated black NV12 frame, never user content, and its encoded buffer is
 //! dropped before the function returns.
+//!
+//! Hardware encoders registered with `MFT_ENUM_FLAG_HARDWARE` are asynchronous
+//! by contract (NVENC, Quick Sync and the AMD MFT all are): they refuse types
+//! with `MF_E_TRANSFORM_ASYNC_LOCKED` until the transform is unlocked and they
+//! never push a frame through a synchronous `ProcessInput`/`ProcessOutput`
+//! pair. The probe therefore unlocks the transform and drives it through its
+//! `IMFMediaEventGenerator`, with a bounded wait.
 
-use std::{ffi::c_void, mem::ManuallyDrop, ptr};
+use std::{
+    ffi::c_void,
+    mem::ManuallyDrop,
+    ptr, thread,
+    time::{Duration, Instant},
+};
 
 use windows::{
+    Wdk::Graphics::Direct3D::{
+        D3DKMT_CLOSEADAPTER, D3DKMT_OPENADAPTERFROMLUID, D3DKMT_QUERYADAPTERINFO,
+        D3DKMTCloseAdapter, D3DKMTOpenAdapterFromLuid, D3DKMTQueryAdapterInfo,
+        KMTQAITYPE_DRIVERVERSION,
+    },
     Win32::{
-        Foundation::{E_ACCESSDENIED, E_FAIL, E_OUTOFMEMORY},
+        Foundation::{E_ACCESSDENIED, E_FAIL, E_OUTOFMEMORY, LUID, NTSTATUS},
         Graphics::Dxgi::{
             CreateDXGIFactory1, DXGI_ADAPTER_FLAG_SOFTWARE, DXGI_ERROR_DEVICE_REMOVED,
             DXGI_ERROR_DEVICE_RESET, DXGI_ERROR_NOT_CURRENTLY_AVAILABLE, IDXGIAdapter1,
             IDXGIFactory1,
         },
         Media::MediaFoundation::{
-            IMFActivate, IMFAttributes, IMFMediaType, IMFSample, IMFTransform,
-            MF_E_INVALIDMEDIATYPE, MF_E_INVALIDREQUEST, MF_E_NO_MORE_TYPES, MF_E_NOTACCEPTING,
+            IMFActivate, IMFAttributes, IMFMediaEventGenerator, IMFMediaType, IMFSample,
+            IMFTransform, METransformDrainComplete, METransformHaveOutput, METransformNeedInput,
+            MF_E_INVALIDMEDIATYPE, MF_E_INVALIDREQUEST, MF_E_NO_EVENTS_AVAILABLE,
+            MF_E_NO_MORE_TYPES, MF_E_NOTACCEPTING, MF_E_TRANSFORM_ASYNC_LOCKED,
             MF_E_TRANSFORM_NEED_MORE_INPUT,
             MF_E_TRANSFORM_NOT_POSSIBLE_FOR_CURRENT_INPUT_MEDIATYPE, MF_E_TRANSFORM_STREAM_CHANGE,
             MF_E_TRANSFORM_STREAM_INVALID_RESOLUTION, MF_E_TRANSFORM_TYPE_NOT_SET,
-            MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE,
-            MF_MT_MAJOR_TYPE, MF_MT_MPEG2_PROFILE, MF_MT_SUBTYPE, MF_VERSION, MFCreateAttributes,
-            MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample, MFMediaType_Video,
-            MFSTARTUP_FULL, MFShutdown, MFStartup, MFT_CATEGORY_VIDEO_ENCODER,
-            MFT_ENUM_ADAPTER_LUID, MFT_ENUM_FLAG_HARDWARE, MFT_MESSAGE_COMMAND_FLUSH,
-            MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, MFT_MESSAGE_NOTIFY_START_OF_STREAM,
+            MF_EVENT_FLAG_NO_WAIT, MF_EVENT_MFT_INPUT_STREAM_ID, MF_MT_AVG_BITRATE,
+            MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE,
+            MF_MT_MPEG_SEQUENCE_HEADER, MF_MT_MPEG2_PROFILE, MF_MT_SUBTYPE, MF_TRANSFORM_ASYNC,
+            MF_TRANSFORM_ASYNC_UNLOCK, MF_VERSION, MFCreateAttributes, MFCreateMediaType,
+            MFCreateMemoryBuffer, MFCreateSample, MFMediaType_Video, MFSTARTUP_FULL,
+            MFSampleExtension_CleanPoint, MFShutdown, MFStartup, MFT_CATEGORY_VIDEO_ENCODER,
+            MFT_ENUM_ADAPTER_LUID, MFT_ENUM_FLAG_HARDWARE, MFT_MESSAGE_COMMAND_DRAIN,
+            MFT_MESSAGE_COMMAND_FLUSH, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
+            MFT_MESSAGE_NOTIFY_END_STREAMING, MFT_MESSAGE_NOTIFY_START_OF_STREAM,
             MFT_OUTPUT_DATA_BUFFER, MFT_OUTPUT_STREAM_PROVIDES_SAMPLES, MFT_REGISTER_TYPE_INFO,
             MFTEnum2, MFVideoFormat_AV1, MFVideoFormat_H264, MFVideoFormat_NV12,
             MFVideoFormat_VP80, MFVideoFormat_VP90, MFVideoInterlace_Progressive,
@@ -34,13 +56,20 @@ use windows::{
         },
         System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoTaskMemFree, CoUninitialize},
     },
-    core::{Error, GUID, Result as WinResult},
+    core::{Error, GUID, Interface, Result as WinResult},
 };
 
 use super::{
-    AdapterInfo, AdapterInventory, AdapterLuid, Codec, EncodeQuery, EncoderReason, H264Baseline,
-    ProbeCancel, ProbeOutcome, SdrProfile, probe::HardwareProbe,
+    AdapterInfo, AdapterInventory, AdapterLuid, Codec, EncodeQuery, EncoderReason, ProbeCancel,
+    ProbeOutcome, SdrProfile, h264, probe::HardwareProbe,
 };
+
+/// How long the trial encode may take on the event-driven path. The wait is a
+/// guard against a driver that never answers, not a performance target.
+const ENCODE_DEADLINE: Duration = Duration::from_secs(5);
+
+/// Polling interval of the event queue while waiting for the encoder.
+const EVENT_POLL: Duration = Duration::from_millis(2);
 
 /// COM and Media Foundation lifetime of one probe worker.
 pub(crate) struct WorkerPlatform {
@@ -53,6 +82,14 @@ impl WorkerPlatform {
         let com = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.is_ok();
         let media = unsafe { MFStartup(MF_VERSION, MFSTARTUP_FULL) }.is_ok();
         Self { com, media }
+    }
+
+    /// True when both the MTA apartment and Media Foundation are usable. A
+    /// probe on a thread without them fails with `CO_E_NOTINITIALIZED`
+    /// (`0x800401f0`), so the hardware tests assert this before probing.
+    #[cfg(test)]
+    pub(crate) fn is_ready(&self) -> bool {
+        self.com && self.media
     }
 }
 
@@ -89,13 +126,7 @@ impl HardwareProbe for WindowsHardwareProbe {
         if cancel.is_cancelled() {
             return ProbeOutcome::Cancelled;
         }
-        let Some(subtype) = codec_format(codec) else {
-            return ProbeOutcome::Unavailable(EncoderReason::EncoderNotProvided(format!(
-                "Windows MFT не предоставляет формат {}",
-                codec.label()
-            )));
-        };
-        match unsafe { probe_stages(adapter, codec, subtype, query, cancel) } {
+        match unsafe { probe_stages(adapter, codec, codec_format(codec), query, cancel) } {
             Ok(profile) => ProbeOutcome::Confirmed(profile),
             Err(StageError::Cancelled) => ProbeOutcome::Cancelled,
             Err(StageError::Reason(reason)) => ProbeOutcome::Unavailable(reason),
@@ -111,20 +142,23 @@ unsafe fn enumerate_adapters() -> WinResult<AdapterInventory> {
         let Ok(adapter) = (unsafe { factory.EnumAdapters1(index) }) else {
             break;
         };
-        let desc = unsafe { adapter.GetDesc1() }?;
+        // A single unreadable description must not truncate the rest of the
+        // list; only an exhausted enumeration stops it.
+        let Ok(desc) = (unsafe { adapter.GetDesc1() }) else {
+            continue;
+        };
         let luid = AdapterLuid::new(desc.AdapterLuid.LowPart, desc.AdapterLuid.HighPart as u32);
         let software = desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0
             || (desc.VendorId == 0x1414 && desc.DeviceId == 0x8c);
         if !software && primary.is_none() && unsafe { owns_primary_output(&adapter) } {
             primary = Some(luid);
         }
-        let driver_version = unsafe { driver_version(&adapter) }.unwrap_or(0);
         adapters.push(AdapterInfo {
             luid,
             name: adapter_name(&desc.Description),
             vendor_id: desc.VendorId,
             device_id: desc.DeviceId,
-            driver_version,
+            driver_version: unsafe { driver_version(&adapter, luid) },
             dedicated_video_memory: desc.DedicatedVideoMemory as u64,
             software,
         });
@@ -132,6 +166,10 @@ unsafe fn enumerate_adapters() -> WinResult<AdapterInventory> {
     Ok(AdapterInventory::new(adapters, primary))
 }
 
+/// The adapter that draws the top-left corner of the virtual desktop. In clone
+/// mode several adapters can own an output at `(0, 0)`; the first suitable
+/// adapter in the stable DXGI order then wins, which is the same tie-break the
+/// automatic selection documents.
 unsafe fn owns_primary_output(adapter: &IDXGIAdapter1) -> bool {
     for index in 0..8u32 {
         let Ok(output) = (unsafe { adapter.EnumOutputs(index) }) else {
@@ -150,11 +188,49 @@ unsafe fn owns_primary_output(adapter: &IDXGIAdapter1) -> bool {
     false
 }
 
-unsafe fn driver_version(adapter: &IDXGIAdapter1) -> WinResult<u64> {
-    // IID_ID3D11Device. `CheckInterfaceSupport` returns the D3D11 UMD version
-    // for a D3D10.1/D3D11 interface without creating a device.
-    const ID3D11_DEVICE: GUID = GUID::from_u128(0xdb6f6ddb_ac77_4e88_8253_819df9bbf140);
-    unsafe { adapter.CheckInterfaceSupport(&ID3D11_DEVICE) }.map(|version| version as u64)
+/// Driver version as a cache identity.
+///
+/// `CheckInterfaceSupport` only answers for the D3D10 UMD interface on current
+/// drivers; the D3D11 IID returns `DXGI_ERROR_UNSUPPORTED`. If that query is
+/// unavailable too, the KMT adapter info of the same LUID returns the version
+/// Windows itself reports. Only when both fail is the value zero, and then a
+/// driver update genuinely cannot change the cache key.
+unsafe fn driver_version(adapter: &IDXGIAdapter1, luid: AdapterLuid) -> u64 {
+    // IID_ID3D10Device. `CheckInterfaceSupport` returns the D3D10 UMD version.
+    const IID_ID3D10_DEVICE: GUID = GUID::from_u128(0x9b7e4c0f_342c_4106_a19f_4f2704f689f0);
+    if let Ok(version) = unsafe { adapter.CheckInterfaceSupport(&IID_ID3D10_DEVICE) }
+        && version > 0
+    {
+        return version as u64;
+    }
+    unsafe { kmt_driver_version(luid) }.unwrap_or(0)
+}
+
+unsafe fn kmt_driver_version(luid: AdapterLuid) -> Option<u64> {
+    let mut open = D3DKMT_OPENADAPTERFROMLUID {
+        AdapterLuid: LUID {
+            LowPart: luid.low,
+            HighPart: luid.high as i32,
+        },
+        hAdapter: 0,
+    };
+    if unsafe { D3DKMTOpenAdapterFromLuid(&mut open) } != NTSTATUS(0) || open.hAdapter == 0 {
+        return None;
+    }
+    let mut version = 0u64;
+    let mut query = D3DKMT_QUERYADAPTERINFO {
+        hAdapter: open.hAdapter,
+        Type: KMTQAITYPE_DRIVERVERSION,
+        pPrivateDriverData: ptr::addr_of_mut!(version).cast(),
+        PrivateDriverDataSize: std::mem::size_of::<u64>() as u32,
+    };
+    let status = unsafe { D3DKMTQueryAdapterInfo(&mut query) };
+    let _ = unsafe {
+        D3DKMTCloseAdapter(&D3DKMT_CLOSEADAPTER {
+            hAdapter: open.hAdapter,
+        })
+    };
+    (status == NTSTATUS(0) && version != 0).then_some(version)
 }
 
 fn adapter_name(description: &[u16; 128]) -> String {
@@ -171,13 +247,15 @@ fn adapter_name(description: &[u16; 128]) -> String {
     }
 }
 
-fn codec_format(codec: Codec) -> Option<GUID> {
-    Some(match codec {
+/// The Media Foundation output subtype of a codec. All four SDR codecs have a
+/// registered video subtype, so this cannot fail.
+const fn codec_format(codec: Codec) -> GUID {
+    match codec {
         Codec::H264 => MFVideoFormat_H264,
         Codec::Vp8 => MFVideoFormat_VP80,
         Codec::Vp9 => MFVideoFormat_VP90,
         Codec::Av1 => MFVideoFormat_AV1,
-    })
+    }
 }
 
 enum StageError {
@@ -242,12 +320,37 @@ unsafe fn probe_activate(
     if cancel.is_cancelled() {
         return Err(StageError::Cancelled);
     }
+    let asynchronous = unsafe { unlock_async(&transform, activate) }
+        .map_err(|error| classify(error, Stage::Activate, adapter))?;
     unsafe { configure_types(&transform, codec, subtype, query, adapter)? };
     if cancel.is_cancelled() {
         return Err(StageError::Cancelled);
     }
-    unsafe { encode_keyframe(&transform, codec, query, adapter, cancel)? };
-    unsafe { verify_output_type(&transform, codec, subtype, query, adapter) }
+    let frame = unsafe { encode_keyframe(&transform, asynchronous, query, adapter, cancel)? };
+    unsafe { verify_output_type(&transform, codec, subtype, query, adapter, &frame) }
+}
+
+/// Unlock an asynchronous MFT. The flag lives in the transform's own attribute
+/// store: `GetAttributes()` returns that store, and setting
+/// `MF_TRANSFORM_ASYNC_UNLOCK` on it is the documented way to allow
+/// `SetOutputType`. A `QueryInterface(IMFAttributes)` may hand back a copy that
+/// does not affect the transform, so it is not used.
+unsafe fn unlock_async(transform: &IMFTransform, activate: &IMFActivate) -> WinResult<bool> {
+    let attributes = unsafe { transform.GetAttributes() }.ok();
+    let asynchronous = match &attributes {
+        Some(attributes) => unsafe { attributes.GetUINT32(&MF_TRANSFORM_ASYNC) }.unwrap_or(0) != 0,
+        None => unsafe { activate.GetUINT32(&MF_TRANSFORM_ASYNC) }.unwrap_or(0) != 0,
+    };
+    if !asynchronous {
+        return Ok(false);
+    }
+    let Some(attributes) = attributes else {
+        // The transform is asynchronous but exposes no attribute store to
+        // unlock; every type negotiation would fail with a locked transform.
+        return Err(Error::from_hresult(MF_E_TRANSFORM_ASYNC_LOCKED));
+    };
+    unsafe { attributes.SetUINT32(&MF_TRANSFORM_ASYNC_UNLOCK, 1) }?;
+    Ok(true)
 }
 
 unsafe fn enumerate_mfts(adapter: &AdapterInfo, subtype: GUID) -> WinResult<Vec<IMFActivate>> {
@@ -347,13 +450,17 @@ const fn pack_pair(high: u32, low: u32) -> u64 {
     (high as u64) << 32 | low as u64
 }
 
+/// Encode one neutral keyframe and return its bytes.
+///
+/// The transform is always left flushed and stopped, so a cancel or an error
+/// does not keep a pending input or output buffer inside the driver.
 unsafe fn encode_keyframe(
     transform: &IMFTransform,
-    codec: Codec,
+    asynchronous: bool,
     query: EncodeQuery,
     adapter: &AdapterInfo,
     cancel: &ProbeCancel,
-) -> Result<(), StageError> {
+) -> Result<Vec<u8>, StageError> {
     let info = unsafe { transform.GetOutputStreamInfo(0) }
         .map_err(|error| classify(error, Stage::Profile, adapter))?;
     let provides_samples = info.dwFlags & MFT_OUTPUT_STREAM_PROVIDES_SAMPLES.0 as u32 != 0;
@@ -361,71 +468,190 @@ unsafe fn encode_keyframe(
         let _ = transform.ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
         let _ = transform.ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
     }
-    let mut frames = 0;
-    let mut need_input = true;
+    let result = if asynchronous {
+        unsafe {
+            pump_events(
+                transform,
+                query,
+                info.cbSize,
+                provides_samples,
+                adapter,
+                cancel,
+            )
+        }
+    } else {
+        unsafe {
+            pump_frames(
+                transform,
+                query,
+                info.cbSize,
+                provides_samples,
+                adapter,
+                cancel,
+            )
+        }
+    };
+    unsafe {
+        let _ = transform.ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
+        let _ = transform.ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
+    }
+    result
+}
+
+/// Synchronous MFT: `ProcessInput` until the encoder produces a sample.
+unsafe fn pump_frames(
+    transform: &IMFTransform,
+    query: EncodeQuery,
+    output_size: u32,
+    provides_samples: bool,
+    adapter: &AdapterInfo,
+    cancel: &ProbeCancel,
+) -> Result<Vec<u8>, StageError> {
+    let mut frames = 0u32;
+    let mut supply_input = true;
     for _ in 0..64 {
         if cancel.is_cancelled() {
-            let _ = unsafe { transform.ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0) };
             return Err(StageError::Cancelled);
         }
-        if need_input && frames < 8 {
+        if supply_input && frames < 8 {
             let sample = unsafe { input_sample(query, frames) }
                 .map_err(|error| classify(error, Stage::Encode, adapter))?;
             match unsafe { transform.ProcessInput(0, &sample, 0) } {
-                Ok(()) => {
-                    frames += 1;
-                    need_input = false;
-                }
+                Ok(()) => frames += 1,
                 Err(error) if error.code() == MF_E_NOTACCEPTING => {}
                 Err(error) => return Err(classify(error, Stage::Encode, adapter).into()),
             }
         }
-        let sample = if provides_samples {
-            None
-        } else {
-            Some(
-                unsafe { output_sample(info.cbSize) }
-                    .map_err(|error| classify(error, Stage::Encode, adapter))?,
-            )
-        };
-        let mut data = MFT_OUTPUT_DATA_BUFFER {
-            dwStreamID: 0,
-            pSample: ManuallyDrop::new(sample),
-            dwStatus: 0,
-            pEvents: ManuallyDrop::new(None),
-        };
-        let mut status = 0u32;
-        let result =
-            unsafe { transform.ProcessOutput(0, std::slice::from_mut(&mut data), &mut status) };
-        let sample = unsafe { ManuallyDrop::take(&mut data.pSample) };
-        let events = unsafe { ManuallyDrop::take(&mut data.pEvents) };
-        drop(events);
-        match result {
-            Ok(()) => {
-                let Some(sample) = sample else {
-                    continue;
-                };
-                let bytes = unsafe { sample_bytes(&sample) }
-                    .map_err(|error| classify(error, Stage::Encode, adapter))?;
-                validate_keyframe(codec, &bytes).map_err(|detail| {
-                    EncoderReason::ProbeFailed(format!("формат результата: {detail}"))
-                })?;
-                return Ok(());
-            }
-            Err(error) if error.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => {
-                need_input = true;
-            }
-            Err(error) if error.code() == MF_E_TRANSFORM_STREAM_CHANGE => {
-                unsafe { renegotiate_output(transform, adapter)? };
-                need_input = true;
-            }
-            Err(error) => return Err(classify(error, Stage::Encode, adapter).into()),
-        }
+        supply_input =
+            match unsafe { receive_output(transform, output_size, provides_samples, adapter)? } {
+                Some(sample) => {
+                    return unsafe { sample_bytes(&sample) }
+                        .map_err(|error| classify(error, Stage::Encode, adapter).into());
+                }
+                None => true,
+            };
     }
     Err(
         EncoderReason::ProbeFailed("кодировщик не выдал кадр за ограниченное число попыток".into())
             .into(),
     )
+}
+
+/// Asynchronous MFT: the encoder asks for input and announces output through
+/// its event generator. The loop is bounded by [`ENCODE_DEADLINE`] and checks
+/// cancellation between events.
+unsafe fn pump_events(
+    transform: &IMFTransform,
+    query: EncodeQuery,
+    output_size: u32,
+    provides_samples: bool,
+    adapter: &AdapterInfo,
+    cancel: &ProbeCancel,
+) -> Result<Vec<u8>, StageError> {
+    let generator: IMFMediaEventGenerator = transform
+        .cast()
+        .map_err(|error| classify(error, Stage::Encode, adapter))?;
+    unsafe { generator.BeginGetEvent(None, None) }
+        .map_err(|error| classify(error, Stage::Encode, adapter))?;
+    let deadline = Instant::now() + ENCODE_DEADLINE;
+    let mut frames = 0u32;
+    let mut drain_sent = false;
+    loop {
+        if cancel.is_cancelled() {
+            return Err(StageError::Cancelled);
+        }
+        if Instant::now() >= deadline {
+            return Err(EncoderReason::ProbeFailed(
+                "асинхронный кодировщик не выдал кадр за отведённое время".into(),
+            )
+            .into());
+        }
+        let event = match unsafe { generator.GetEvent(MF_EVENT_FLAG_NO_WAIT) } {
+            Ok(event) => event,
+            Err(error) if error.code() == MF_E_NO_EVENTS_AVAILABLE => {
+                // Ask for the pending frames once the encoder had enough
+                // input; a driver that ignores DRAIN still gets the deadline.
+                if frames >= 3 && !drain_sent {
+                    let _ = unsafe { transform.ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0) };
+                    drain_sent = true;
+                }
+                thread::sleep(EVENT_POLL);
+                continue;
+            }
+            Err(error) => return Err(classify(error, Stage::Encode, adapter).into()),
+        };
+        if let Ok(status) = unsafe { event.GetStatus() }
+            && status.0 < 0
+        {
+            return Err(classify(Error::from_hresult(status), Stage::Encode, adapter).into());
+        }
+        let kind =
+            unsafe { event.GetType() }.map_err(|error| classify(error, Stage::Encode, adapter))?;
+        if kind == METransformNeedInput.0 as u32 {
+            if frames >= 8 {
+                continue;
+            }
+            let stream = unsafe { event.GetUINT32(&MF_EVENT_MFT_INPUT_STREAM_ID) }.unwrap_or(0);
+            let sample = unsafe { input_sample(query, frames) }
+                .map_err(|error| classify(error, Stage::Encode, adapter))?;
+            match unsafe { transform.ProcessInput(stream, &sample, 0) } {
+                Ok(()) => frames += 1,
+                Err(error) if error.code() == MF_E_NOTACCEPTING => {}
+                Err(error) => return Err(classify(error, Stage::Encode, adapter).into()),
+            }
+        } else if kind == METransformHaveOutput.0 as u32 {
+            if let Some(sample) =
+                unsafe { receive_output(transform, output_size, provides_samples, adapter)? }
+            {
+                return unsafe { sample_bytes(&sample) }
+                    .map_err(|error| classify(error, Stage::Encode, adapter).into());
+            }
+        } else if kind == METransformDrainComplete.0 as u32 {
+            return Err(EncoderReason::ProbeFailed(
+                "асинхронный кодировщик завершил поток без кадра".into(),
+            )
+            .into());
+        }
+    }
+}
+
+/// One `ProcessOutput` attempt. `Ok(None)` means "no sample yet": the encoder
+/// needs more input or renegotiated its output type.
+unsafe fn receive_output(
+    transform: &IMFTransform,
+    output_size: u32,
+    provides_samples: bool,
+    adapter: &AdapterInfo,
+) -> Result<Option<IMFSample>, StageError> {
+    let sample = if provides_samples {
+        None
+    } else {
+        Some(
+            unsafe { output_sample(output_size) }
+                .map_err(|error| classify(error, Stage::Encode, adapter))?,
+        )
+    };
+    let mut data = MFT_OUTPUT_DATA_BUFFER {
+        dwStreamID: 0,
+        pSample: ManuallyDrop::new(sample),
+        dwStatus: 0,
+        pEvents: ManuallyDrop::new(None),
+    };
+    let mut status = 0u32;
+    let result =
+        unsafe { transform.ProcessOutput(0, std::slice::from_mut(&mut data), &mut status) };
+    let sample = unsafe { ManuallyDrop::take(&mut data.pSample) };
+    let events = unsafe { ManuallyDrop::take(&mut data.pEvents) };
+    drop(events);
+    match result {
+        Ok(()) => Ok(sample),
+        Err(error) if error.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => Ok(None),
+        Err(error) if error.code() == MF_E_TRANSFORM_STREAM_CHANGE => {
+            unsafe { renegotiate_output(transform, adapter)? };
+            Ok(None)
+        }
+        Err(error) => Err(classify(error, Stage::Encode, adapter).into()),
+    }
 }
 
 unsafe fn verify_output_type(
@@ -434,6 +660,7 @@ unsafe fn verify_output_type(
     subtype: GUID,
     query: EncodeQuery,
     adapter: &AdapterInfo,
+    frame: &[u8],
 ) -> Result<SdrProfile, StageError> {
     let media_type = unsafe { transform.GetOutputCurrentType(0) }
         .map_err(|error| classify(error, Stage::Profile, adapter))?;
@@ -469,25 +696,43 @@ unsafe fn verify_output_type(
     }
     match codec {
         Codec::H264 => {
-            let profile = unsafe { media_type.GetUINT32(&MF_MT_MPEG2_PROFILE) }.unwrap_or(256);
-            let baseline = match profile {
-                256 => H264Baseline::Constrained,
-                66 => H264Baseline::Legacy,
-                other => {
-                    return Err(EncoderReason::ProfileUnsupported(format!(
-                        "драйвер выдал H.264 profile {other} вместо Baseline"
-                    ))
-                    .into());
-                }
-            };
+            let declared = unsafe { media_type.GetUINT32(&MF_MT_MPEG2_PROFILE) }.ok();
+            let header = unsafe { sequence_header(&media_type) };
+            let baseline = h264::keyframe_baseline(declared, frame, &header).map_err(|detail| {
+                EncoderReason::ProfileUnsupported(format!("формат результата: {detail}"))
+            })?;
             Ok(SdrProfile::H264 {
                 baseline,
                 level: query.h264_level(),
             })
         }
-        Codec::Vp8 => Ok(SdrProfile::Vp8),
-        Codec::Vp9 => Ok(SdrProfile::Vp9),
-        Codec::Av1 => Ok(SdrProfile::Av1),
+        other => {
+            validate_frame(other, frame).map_err(|detail| {
+                EncoderReason::ProbeFailed(format!("формат результата: {detail}"))
+            })?;
+            Ok(match other {
+                Codec::Vp8 => SdrProfile::Vp8,
+                Codec::Vp9 => SdrProfile::Vp9,
+                Codec::Av1 => SdrProfile::Av1,
+                Codec::H264 => unreachable!("H.264 is handled above"),
+            })
+        }
+    }
+}
+
+/// `MF_MT_MPEG_SEQUENCE_HEADER` of the output type: an Annex B blob with the
+/// SPS/PPS that the encoder keeps out of the access unit.
+unsafe fn sequence_header(media_type: &IMFMediaType) -> Vec<u8> {
+    let Ok(size) = (unsafe { media_type.GetBlobSize(&MF_MT_MPEG_SEQUENCE_HEADER) }) else {
+        return Vec::new();
+    };
+    if size == 0 || size > 64 * 1024 {
+        return Vec::new();
+    }
+    let mut blob = vec![0u8; size as usize];
+    match unsafe { media_type.GetBlob(&MF_MT_MPEG_SEQUENCE_HEADER, &mut blob, None) } {
+        Ok(()) => blob,
+        Err(_) => Vec::new(),
     }
 }
 
@@ -537,6 +782,12 @@ unsafe fn input_sample(query: EncodeQuery, frame: u32) -> WinResult<IMFSample> {
         sample.AddBuffer(&buffer)?;
         sample.SetSampleTime(duration.saturating_mul(i64::from(frame)))?;
         sample.SetSampleDuration(duration)?;
+        if frame == 0 {
+            // The trial encode must produce an IDR. A clean point is how an
+            // encoder is told that this sample starts a keyframe; the driver
+            // may still ignore it, which the IDR check below detects.
+            sample.SetUINT32(&MFSampleExtension_CleanPoint, 1)?;
+        }
     }
     Ok(sample)
 }
@@ -563,24 +814,15 @@ unsafe fn sample_bytes(sample: &IMFSample) -> WinResult<Vec<u8>> {
     Ok(result)
 }
 
-fn validate_keyframe(codec: Codec, bytes: &[u8]) -> Result<(), String> {
+/// The keyframe shape of the three non-H.264 codecs. H.264 needs the output
+/// type as well (profile attribute and sequence header), so it is checked in
+/// [`verify_output_type`] through [`h264::keyframe_baseline`].
+fn validate_frame(codec: Codec, bytes: &[u8]) -> Result<(), String> {
     if bytes.is_empty() {
         return Err("пустой буфер".into());
     }
     match codec {
-        Codec::H264 => {
-            let types = h264_nal_types(bytes);
-            if types.is_empty() {
-                return Err("нет Annex B start code".into());
-            }
-            if !types.contains(&5) {
-                return Err("нет IDR-кадра".into());
-            }
-            if !types.contains(&7) && !types.contains(&8) {
-                return Err("нет SPS/PPS".into());
-            }
-            Ok(())
-        }
+        Codec::H264 => Err("H.264 требует выходной тип".into()),
         Codec::Vp8 => {
             if bytes[0] & 0x01 == 0 {
                 Ok(())
@@ -632,33 +874,6 @@ fn validate_keyframe(codec: Codec, bytes: &[u8]) -> Result<(), String> {
             Err("AV1: нет sequence header или frame OBU".into())
         }
     }
-}
-
-fn h264_nal_types(bytes: &[u8]) -> Vec<u8> {
-    let mut types = Vec::new();
-    let mut index = 0;
-    while index + 3 < bytes.len() {
-        let start = if bytes[index] == 0
-            && bytes[index + 1] == 0
-            && bytes[index + 2] == 0
-            && bytes[index + 3] == 1
-        {
-            Some(index + 4)
-        } else if bytes[index] == 0 && bytes[index + 1] == 0 && bytes[index + 2] == 1 {
-            Some(index + 3)
-        } else {
-            None
-        };
-        if let Some(header) = start {
-            if let Some(byte) = bytes.get(header) {
-                types.push(byte & 0x1f);
-            }
-            index = header;
-        } else {
-            index += 1;
-        }
-    }
-    types
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -339,6 +339,59 @@ fn g03_uncooperative_late_a_is_discarded_and_only_one_probe_runs() {
 }
 
 #[test]
+fn g03_late_probe_of_the_last_codec_never_publishes_its_generation() {
+    let a_gate = Gate::new(false);
+    let b_gate = Gate::new(false);
+    let fake = FakeProbe::new(vec![
+        FakeAdapter::new(A, "A", &[Codec::Av1])
+            .primary()
+            .delay_codec(Codec::Av1, a_gate.clone()),
+        FakeAdapter::new(B, "B", &[Codec::H264, Codec::Av1]).delay(b_gate.clone()),
+    ]);
+    let service = service(&fake);
+    let a_generation = service
+        .set_video_encoder_backend(request(gpu(A, false), q720(), 1, Some(50)))
+        .unwrap();
+    a_gate.wait_started();
+    let b_generation = service
+        .set_video_encoder_backend(request(gpu(B, false), q720(), 2, Some(51)))
+        .unwrap();
+    assert_ne!(a_generation, b_generation);
+
+    // A ignores the cancel and its probe is the last codec of the row, so the
+    // whole A attempt completes instead of stopping at the next cancel check.
+    a_gate.release();
+    b_gate.wait_started();
+    let during_b = service.snapshot();
+    assert_eq!(
+        during_b.generation(),
+        b_generation,
+        "the late A snapshot must not replace the newer B generation"
+    );
+    assert_eq!(
+        during_b.state(),
+        EncoderProbeState::Checking,
+        "B is still being probed, so the visible answer is checking"
+    );
+    assert!(
+        during_b.adapter().is_none(),
+        "no adapter of the abandoned A attempt may become visible"
+    );
+    assert_eq!(during_b.target().intent, 2);
+
+    b_gate.release();
+    let snapshot = ready(&service, b_generation);
+    assert!(service.wait_until_idle(Duration::from_secs(5)));
+    assert_ne!(service.snapshot().generation(), a_generation);
+    assert_eq!(snapshot.generation(), b_generation);
+    assert_eq!(
+        snapshot.adapter().map(|adapter| adapter.name.as_str()),
+        Some("B")
+    );
+    service.shutdown();
+}
+
+#[test]
 fn g03_close_and_reopen_settings_cancels_the_old_probe() {
     let gate = Gate::new(true);
     let fake = FakeProbe::new(vec![
@@ -460,6 +513,35 @@ fn g04_driver_change_invalidates_the_confirmation() {
     assert!(
         fake.activations() > before,
         "a driver generation change forces activation again"
+    );
+    service.shutdown();
+}
+
+#[test]
+fn g04_inventory_change_drops_the_cached_confirmation() {
+    let fake = FakeProbe::new(vec![FakeAdapter::new(A, "A", &[Codec::H264]).primary()]);
+    let service = service(&fake);
+    let first = submit(&service, request(gpu(A, false), q720(), 1, Some(46)));
+    assert!(first.resolve(CodecIntent::Explicit(Codec::H264)).is_ok());
+    let probes = fake.probes();
+
+    // A disappears. Nothing is probed, but the cached confirmation of the old
+    // inventory must not survive it.
+    fake.remove(luid(A));
+    let removed = submit(&service, request(gpu(A, false), q720(), 2, Some(46)));
+    assert!(removed.adapters().is_empty());
+    assert_eq!(reason_kind(&removed, Codec::H264), "device_disabled");
+    assert_eq!(fake.probes(), probes, "a missing adapter is never probed");
+
+    // A returns with the same LUID and the same driver version. The identity of
+    // the pair is identical, but the inventory generation changed while it was
+    // gone, so the old confirmation is not reused.
+    fake.set_adapters(vec![FakeAdapter::new(A, "A", &[Codec::H264]).primary()]);
+    let back = submit(&service, request(gpu(A, false), q720(), 3, Some(46)));
+    assert!(back.resolve(CodecIntent::Explicit(Codec::H264)).is_ok());
+    assert!(
+        fake.probes() > probes,
+        "the returning adapter is confirmed again instead of served from the dropped cache"
     );
     service.shutdown();
 }
@@ -724,14 +806,36 @@ fn h264_level_and_quality_mapping_are_deterministic() {
 
 /// G08 is not automatable in CI: it needs a real GPU driver and a real
 /// encoder session. Run this locally with
-/// `cargo test -p voxhold-media hardware_ -- --ignored --nocapture`.
+/// `cargo test -p voxhold-media hardware_ -- --ignored --nocapture --test-threads=1`.
+///
+/// Each test owns a [`WorkerPlatform`] on its own thread. Without it every
+/// Media Foundation call fails with `CO_E_NOTINITIALIZED` (`0x800401f0`) and an
+/// "ok" would prove nothing.
 #[cfg(windows)]
 mod hardware {
-    use super::*;
-    use crate::video_encoder::{HardwareProbe, PlatformProbe, ProbeCancel, ProbeOutcome};
+    use std::time::Duration;
 
-    fn probe_one(codec: Codec, query: EncodeQuery) {
-        let probe = PlatformProbe;
+    use super::*;
+    use crate::publisher::SdrProfile;
+    use crate::video_encoder::windows::WorkerPlatform;
+    use crate::video_encoder::{
+        AdapterInventory, EncoderProbeService, HardwareProbe, PlatformProbe, ProbeCancel,
+        ProbeOutcome,
+    };
+
+    /// COM apartment and Media Foundation of one test thread.
+    struct Platform(#[allow(dead_code)] WorkerPlatform);
+
+    fn platform() -> Platform {
+        let platform = WorkerPlatform::new();
+        assert!(
+            platform.is_ready(),
+            "COM/Media Foundation не инициализировались на тестовом потоке"
+        );
+        Platform(platform)
+    }
+
+    fn inventory(probe: &PlatformProbe) -> AdapterInventory {
         let inventory = probe.inventory().expect("DXGI enumeration failed");
         for adapter in inventory.adapters() {
             eprintln!(
@@ -743,29 +847,62 @@ mod hardware {
                 adapter.driver_version
             );
         }
-        let Ok(adapter) = inventory.resolve(AdapterSelection::Auto) else {
-            eprintln!("no suitable hardware adapter; nothing to prove");
-            return;
-        };
-        match probe.probe(adapter, codec, query, &ProbeCancel::never()) {
-            ProbeOutcome::Confirmed(profile) => {
+        inventory
+    }
+
+    fn probe_one(codec: Codec, query: EncodeQuery) -> ProbeOutcome {
+        let _platform = platform();
+        let probe = PlatformProbe;
+        let inventory = inventory(&probe);
+        assert!(
+            !inventory.adapters().is_empty(),
+            "SKIP: на машине нет аппаратного адаптера, проверять нечего"
+        );
+        let adapter = inventory
+            .resolve(AdapterSelection::Auto)
+            .expect("no suitable hardware adapter");
+        assert_ne!(
+            adapter.driver_version, 0,
+            "версия драйвера {} не определена, кэш не заметит её смену",
+            adapter.name
+        );
+        probe.probe(adapter, codec, query, &ProbeCancel::never())
+    }
+
+    #[test]
+    #[ignore = "needs real Windows hardware; G08 manual run"]
+    fn hardware_h264_mft_720p30() {
+        match probe_one(Codec::H264, q720()) {
+            ProbeOutcome::Confirmed(SdrProfile::H264 { baseline, level }) => {
                 eprintln!(
-                    "confirmed codec={} adapter={} profile={:?} {}x{}@{}",
-                    codec.label(),
-                    adapter.name,
-                    profile,
-                    query.width,
-                    query.height,
-                    query.fps
+                    "confirmed codec=H264 baseline={baseline:?} level=0x{level:02x} 1280x720@30"
                 );
             }
+            ProbeOutcome::Confirmed(other) => {
+                panic!("H.264 подтверждён другим SDR-профилем: {other:?}");
+            }
             ProbeOutcome::Unavailable(reason) => {
+                panic!("H.264 720p30 не подтверждён: {} ({reason})", reason.kind())
+            }
+            ProbeOutcome::Cancelled => panic!("the never-cancelled probe reported cancel"),
+        }
+    }
+
+    #[test]
+    #[ignore = "needs real Windows hardware; G08 manual run"]
+    fn hardware_av1_mft_720p30() {
+        match probe_one(Codec::Av1, q720()) {
+            ProbeOutcome::Confirmed(profile) => {
+                eprintln!("confirmed codec=AV1 profile={profile:?} 1280x720@30");
+            }
+            ProbeOutcome::Unavailable(reason) => {
+                assert!(
+                    !reason.detail().contains("0x800401f0"),
+                    "COM не инициализирован, это не ответ драйвера: {reason}"
+                );
                 eprintln!(
-                    "not confirmed codec={} adapter={} reason={} ({})",
-                    codec.label(),
-                    adapter.name,
-                    reason.kind(),
-                    reason
+                    "not confirmed codec=AV1 reason={} ({reason})",
+                    reason.kind()
                 );
             }
             ProbeOutcome::Cancelled => panic!("the never-cancelled probe reported cancel"),
@@ -774,26 +911,69 @@ mod hardware {
 
     #[test]
     #[ignore = "needs real Windows hardware; G08 manual run"]
-    fn hardware_h264_mft_720p30() {
-        probe_one(Codec::H264, q720());
-    }
-
-    #[test]
-    #[ignore = "needs real Windows hardware; G08 manual run"]
-    fn hardware_av1_mft_720p30() {
-        probe_one(Codec::Av1, q720());
-    }
-
-    #[test]
-    #[ignore = "needs real Windows hardware; G08 manual run"]
     fn hardware_inventory_is_stable_and_excludes_warp() {
+        let _platform = platform();
         let probe = PlatformProbe;
-        let first = probe.inventory().expect("DXGI enumeration failed");
+        let first = inventory(&probe);
         let second = probe.inventory().expect("DXGI enumeration failed");
         assert_eq!(first.adapters(), second.adapters());
         assert!(
             first.adapters().iter().all(|adapter| !adapter.software),
             "software adapters must be filtered by the inventory"
         );
+        for adapter in first.adapters() {
+            assert_ne!(
+                adapter.driver_version, 0,
+                "версия драйвера {} не определена",
+                adapter.name
+            );
+        }
+    }
+
+    /// The real end-to-end path: the service worker owns the platform, probes
+    /// the automatic adapter and publishes a snapshot for the dialog.
+    #[test]
+    #[ignore = "needs real Windows hardware; G08 manual run"]
+    fn hardware_service_confirms_h264() {
+        let service = EncoderProbeService::platform().expect("probe service");
+        let generation = service
+            .set_video_encoder_backend(EncoderRequest::new(
+                VideoEncoderPreference::gpu(AdapterSelection::Auto, false),
+                q720(),
+                EncoderProbeTarget::default(),
+            ))
+            .expect("request");
+        let snapshot = service
+            .wait_for(generation, Duration::from_secs(60))
+            .expect("the probe did not finish");
+        for adapter in snapshot.adapters() {
+            eprintln!(
+                "service adapter luid={} name={} driver=0x{:x}",
+                adapter.luid, adapter.name, adapter.driver_version
+            );
+        }
+        assert!(
+            snapshot.has_hardware_adapter(),
+            "SKIP: на машине нет аппаратного адаптера"
+        );
+        let adapter = snapshot.adapter().expect("adapter");
+        assert_ne!(
+            adapter.driver_version, 0,
+            "версия драйвера не определена через сервис"
+        );
+        let slot = snapshot.gpu(Codec::H264).expect("H.264 row");
+        assert!(slot.is_checked(), "GPU-путь не проверялся");
+        match slot.profile() {
+            Some(profile) => eprintln!(
+                "confirmed codec=H264 adapter={} profile={profile:?} 1280x720@30",
+                adapter.name
+            ),
+            None => panic!(
+                "H.264 не подтверждён через сервис: {:?}",
+                slot.reason()
+                    .map(|reason| (reason.kind(), reason.to_string()))
+            ),
+        }
+        service.shutdown();
     }
 }

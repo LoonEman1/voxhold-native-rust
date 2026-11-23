@@ -82,6 +82,9 @@ pub(crate) struct FakeAdapter {
     pub only_query: Option<EncodeQuery>,
     pub failure: Option<EncoderReason>,
     pub delay: Option<Arc<Gate>>,
+    /// A gate that only blocks one codec, so a probe of the last codec of the
+    /// row can be held back without holding the earlier ones.
+    pub codec_delay: Option<(Codec, Arc<Gate>)>,
 }
 
 impl FakeAdapter {
@@ -102,6 +105,7 @@ impl FakeAdapter {
             only_query: None,
             failure: None,
             delay: None,
+            codec_delay: None,
         }
     }
 
@@ -127,6 +131,11 @@ impl FakeAdapter {
 
     pub(crate) fn delay(mut self, gate: Arc<Gate>) -> Self {
         self.delay = Some(gate);
+        self
+    }
+
+    pub(crate) fn delay_codec(mut self, codec: Codec, gate: Arc<Gate>) -> Self {
+        self.codec_delay = Some((codec, gate));
         self
     }
 
@@ -284,7 +293,13 @@ impl HardwareProbe for FakeProbe {
                 "адаптер исчез во время проверки".into(),
             )),
             Some(spec) => {
-                if let Some(gate) = &spec.delay {
+                let gate = spec
+                    .codec_delay
+                    .as_ref()
+                    .filter(|(delayed, _)| *delayed == codec)
+                    .map(|(_, gate)| gate)
+                    .or(spec.delay.as_ref());
+                if let Some(gate) = gate {
                     gate.mark_started();
                     if !gate.wait(cancel) {
                         self.aborted.fetch_add(1, Ordering::SeqCst);

@@ -27,6 +27,8 @@
 mod probe;
 mod service;
 
+#[cfg(windows)]
+mod h264;
 #[cfg(not(windows))]
 mod unsupported;
 #[cfg(windows)]
@@ -39,13 +41,13 @@ mod tests;
 
 use std::fmt;
 
-use crate::publisher::{Codec, CodecIntent, CodecRole, CodecSnapshot, H264Baseline, SdrProfile};
+#[cfg(test)]
+use crate::publisher::H264Baseline;
+use crate::publisher::{Codec, CodecIntent, CodecRole, CodecSnapshot, SdrProfile};
 use crate::screen_capture::SourceIdentity;
 
 pub use probe::{HardwareProbe, ProbeCancel, ProbeOutcome};
-pub use service::{
-    EncoderProbeService, EncoderRequest, EncoderRequestError, PROBE_TIMEOUT, RevalidateError,
-};
+pub use service::{EncoderProbeService, EncoderRequest, EncoderRequestError, RevalidateError};
 
 #[cfg(not(windows))]
 pub use unsupported::UnsupportedHardwareProbe as PlatformProbe;
@@ -71,13 +73,6 @@ impl AdapterLuid {
     /// `MFT_ENUM_ADAPTER_LUID`: `HighPart << 32 | LowPart`.
     pub const fn to_u64(self) -> u64 {
         (self.high as u64) << 32 | self.low as u64
-    }
-
-    pub const fn from_u64(value: u64) -> Self {
-        Self {
-            low: value as u32,
-            high: (value >> 32) as u32,
-        }
     }
 }
 
@@ -147,6 +142,10 @@ impl AdapterInventory {
         }
     }
 
+    /// The content signature of this enumeration. It is an equality token, not
+    /// an ordered counter: two enumerations with the same adapters, driver
+    /// versions, names and primary output share it, and any difference changes
+    /// it. The probe cache compares it only for equality.
     pub fn generation(&self) -> u64 {
         self.generation
     }
@@ -157,10 +156,6 @@ impl AdapterInventory {
 
     pub fn primary(&self) -> Option<AdapterLuid> {
         self.primary
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.adapters.is_empty()
     }
 
     pub fn find(&self, luid: AdapterLuid) -> Option<&AdapterInfo> {
@@ -215,15 +210,6 @@ pub enum AdapterSelection {
     Explicit(AdapterLuid),
 }
 
-impl AdapterSelection {
-    pub fn label(self) -> String {
-        match self {
-            Self::Auto => "автоматически".into(),
-            Self::Explicit(luid) => luid.to_string(),
-        }
-    }
-}
-
 /// The backend preference of the settings dialog.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum EncoderBackend {
@@ -232,22 +218,6 @@ pub enum EncoderBackend {
     Cpu,
     /// A hardware MFT bound to the selected adapter.
     Gpu,
-}
-
-impl EncoderBackend {
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Cpu => "Процессор",
-            Self::Gpu => "Видеокарта",
-        }
-    }
-
-    pub const fn wire(self) -> &'static str {
-        match self {
-            Self::Cpu => "cpu",
-            Self::Gpu => "gpu",
-        }
-    }
 }
 
 /// The user's backend choice. `allow_fallback` only permits replacing an
@@ -344,7 +314,9 @@ impl EncodeQuery {
     }
 }
 
-/// The SDR profile the encoder demo needs for this codec and query.
+/// The SDR profile the process-wide CPU catalog reports for a codec. The
+/// hardware probe never assumes a profile: it reads what the driver produced.
+#[cfg(test)]
 pub(crate) fn codec_profile(codec: Codec, query: EncodeQuery) -> SdrProfile {
     match codec {
         Codec::H264 => SdrProfile::H264 {
@@ -898,13 +870,6 @@ impl CpuEncoders {
                     "сборка WebRTC не содержит этого кодировщика".into(),
                 ))
             })
-    }
-
-    pub fn auto(&self) -> Option<Codec> {
-        self.entries
-            .iter()
-            .find(|(_, slot)| slot.is_available())
-            .map(|(codec, _)| *codec)
     }
 }
 

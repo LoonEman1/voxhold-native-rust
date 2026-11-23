@@ -19,11 +19,6 @@ use super::{
     VideoEncoderSnapshot,
 };
 
-/// How long a snapshot check may take before the dialog shows an error. It is
-/// a guard, not a performance target: the worker itself has no timeout, so a
-/// driver call is never interrupted by a detached thread.
-pub const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
-
 /// One dialog request. A newer value of any field produces a new generation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EncoderRequest {
@@ -257,9 +252,12 @@ impl EncoderProbeService {
         Ok(generation)
     }
 
-    /// Invalidate the current attempt without starting another one. The
-    /// snapshot becomes a checking value of the new generation, so a late
-    /// result and an old "available" pair can never be used.
+    /// Invalidate the current attempt without starting another one.
+    ///
+    /// The snapshot deliberately becomes a `Checking` value of the new
+    /// generation: neither the old "available" pair nor an "unavailable"
+    /// reason of the discarded attempt may be shown as the answer to the new
+    /// intent. A caller that does want a result must submit a request.
     pub fn cancel(&self) -> u64 {
         let mut state = self.inner.state.lock().unwrap();
         state.generation = state.generation.wrapping_add(1);
@@ -280,15 +278,6 @@ impl EncoderProbeService {
 
     pub fn snapshot(&self) -> Arc<VideoEncoderSnapshot> {
         self.inner.state.lock().unwrap().snapshot.clone()
-    }
-
-    /// The ready snapshot only when it still belongs to `generation`. A late
-    /// result of an older dialog intent returns `None`.
-    pub fn snapshot_if_current(&self, generation: u64) -> Option<Arc<VideoEncoderSnapshot>> {
-        let state = self.inner.state.lock().unwrap();
-        let snapshot = state.snapshot.clone();
-        (snapshot.generation() == generation && snapshot.state() == EncoderProbeState::Ready)
-            .then_some(snapshot)
     }
 
     pub fn generation(&self) -> u64 {
@@ -385,8 +374,14 @@ impl EncoderProbeService {
         }
     }
 
-    /// Stop the worker and join it. COM objects, activations and any residual
-    /// encoded frame are released on the worker thread before this returns.
+    /// Stop the worker and join it.
+    ///
+    /// This blocks for the duration of one in-flight driver call: the worker
+    /// is never detached, so COM objects, activations and any residual encoded
+    /// frame are released on the thread that owns them. Call it from a
+    /// non-UI teardown thread, not from a paint or input handler; [`Drop`]
+    /// signals the stop without joining, so closing a dialog cannot block on
+    /// an encoder.
     pub fn shutdown(&self) {
         self.signal_stop();
         let worker = self.inner.worker.lock().unwrap().take();

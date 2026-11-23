@@ -36,6 +36,8 @@ mod windows;
 
 #[cfg(test)]
 mod fake;
+#[cfg(all(test, windows))]
+mod hardware_tests;
 #[cfg(test)]
 mod tests;
 

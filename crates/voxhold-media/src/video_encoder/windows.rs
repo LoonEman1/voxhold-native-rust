@@ -905,6 +905,9 @@ impl Stage {
 fn classify(error: Error, stage: Stage, adapter: &AdapterInfo) -> EncoderReason {
     let code = error.code();
     let detail = format!("{} (0x{:08x})", stage.label(), code.0 as u32);
+    if code == MF_E_TRANSFORM_ASYNC_LOCKED {
+        return EncoderReason::ProbeFailed(format!("асинхронный MFT не разблокирован: {detail}"));
+    }
     if code == DXGI_ERROR_DEVICE_REMOVED
         || code == DXGI_ERROR_DEVICE_RESET
         || code == E_ACCESSDENIED

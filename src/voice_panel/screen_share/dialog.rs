@@ -6,9 +6,7 @@
 use super::picker::*;
 use super::*;
 use crate::theme;
-use voxhold_media::publisher::{
-    CodecIntent, CodecRole, CodecSnapshot, Preset, Resolution, SCREEN_FRAME_RATES,
-};
+use voxhold_media::publisher::{CodecIntent, Preset, Resolution, SCREEN_FRAME_RATES};
 use voxhold_media::screen_capture::ScreenSource;
 
 impl ScreenShareUi {

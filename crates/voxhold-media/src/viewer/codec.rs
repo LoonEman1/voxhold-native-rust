@@ -89,6 +89,12 @@ pub(super) fn check_offer(
         return Ok(());
     }
     let known: Vec<Offered> = raw.into_iter().filter_map(Offered::parse).collect();
+    // A video m-line whose payloads cannot be identified is not evidence of a
+    // missing decoder: hand the whole description to the engine, which parses
+    // it completely and reports its own negotiation failure.
+    if known.is_empty() {
+        return Ok(());
+    }
     if let Some(expected) = expected {
         let candidates: Vec<&Offered> = known
             .iter()
@@ -107,9 +113,6 @@ pub(super) fn check_offer(
         return Err(expected_refusal(expected, &candidates, snapshot));
     }
     if known.iter().any(|offered| offered.decodable(snapshot)) {
-        return Ok(());
-    }
-    if known.is_empty() {
         return Ok(());
     }
     Err(offered_refusal(&known, snapshot))

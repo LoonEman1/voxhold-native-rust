@@ -865,45 +865,6 @@ async fn the_normal_dialog_shows_the_codec_line_inside_the_settings(cx: &mut Tes
     );
 }
 
-/// Part A: a codec the sender probe refuses shows the probe's reason in the
-/// dialog and never silently names another codec.
-#[gpui::test]
-async fn an_unavailable_codec_shows_the_probe_reason_in_the_dialog(cx: &mut TestAppContext) {
-    let reason = "Профиль VP9 не объявлен кодировщиком для SDR: profile-id=2, для SDR нужен 0.";
-    let (mut visual, _view, voice) = super::voice_tests::fixture_with(cx, Some(1400.), true);
-    draw(&mut visual);
-    open_picker_with(
-        &mut visual,
-        &voice,
-        SourceKind::Monitor,
-        vec![monitor(3, "Экран", 1920, 1080)],
-    );
-    visual.update(|_window, app| {
-        voice.update(app, |panel, cx| {
-            panel.test_set_codec_error(reason);
-            cx.notify();
-        });
-    });
-    draw(&mut visual);
-    assert!(
-        visual
-            .debug_bounds("share-codec-label:Нет доступного SDR-кодека")
-            .is_some(),
-        "the label names no available SDR codec"
-    );
-    let reason_selector = Box::leak(format!("share-codec-reason:{reason}").into_boxed_str());
-    assert!(
-        visual.debug_bounds(reason_selector).is_some(),
-        "the dialog paints «{reason_selector}»"
-    );
-    voice.read_with(&*visual, |panel, _| {
-        assert!(
-            !panel.test_can_start(),
-            "Start refuses the unavailable codec"
-        );
-    });
-}
-
 /// P03: an empty category paints a message, not a grid with the height of a
 /// row it does not have, and the actions remain available.
 #[gpui::test]

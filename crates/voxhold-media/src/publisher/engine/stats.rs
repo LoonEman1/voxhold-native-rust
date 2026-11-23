@@ -28,6 +28,15 @@ pub(super) struct Sample {
     pub video: Option<WireVideo>,
 }
 
+/// Does this outbound video stream carry the negotiated mid?
+///
+/// An empty negotiated mid names nothing: it must not match another stream
+/// whose mid is also empty, otherwise a missing field would select an
+/// unrelated video stream.
+fn mid_matches(video_mid: Option<&str>, outbound_mid: &str) -> bool {
+    video_mid.is_some_and(|mid| !mid.is_empty() && mid == outbound_mid)
+}
+
 /// Read one sample of the live senders. `video_mid` is the negotiated video
 /// mid; the matching outbound stream wins over any other video stream of the
 /// peer.
@@ -60,12 +69,7 @@ pub(super) async fn sample(
                 }
                 RtcStats::OutboundRtp(outbound) => match outbound.stream.kind.as_str() {
                     "video" => {
-                        // An empty negotiated mid names nothing: falling back
-                        // keeps a missing field from matching an unrelated
-                        // empty mid of another stream.
-                        if video_mid
-                            .is_some_and(|mid| !mid.is_empty() && mid == outbound.outbound.mid)
-                        {
+                        if mid_matches(video_mid, &outbound.outbound.mid) {
                             matched = Some(outbound);
                         } else {
                             fallback = Some(outbound);
@@ -144,4 +148,22 @@ pub(super) async fn sample(
         },
         video: video_wire,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::mid_matches;
+
+    /// An empty negotiated mid names nothing: it must never match another
+    /// stream with an empty mid, while a real mid still selects its stream.
+    #[test]
+    fn an_empty_negotiated_mid_never_matches_an_empty_stream_mid() {
+        assert!(mid_matches(Some("0"), "0"));
+        assert!(!mid_matches(Some("0"), "1"));
+        assert!(!mid_matches(Some("0"), ""));
+        assert!(!mid_matches(Some(""), ""));
+        assert!(!mid_matches(Some(""), "0"));
+        assert!(!mid_matches(None, ""));
+        assert!(!mid_matches(None, "0"));
+    }
 }

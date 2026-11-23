@@ -303,3 +303,30 @@ a=rtpmap:111 opus/48000/2\r\n",
         "the live video line decides alone: {outcomes:?}"
     );
 }
+
+/// C07: a catalogue codec does not make an unreadable offer a refusal. A video
+/// m-line whose payloads name no video codec is handed to the engine, which
+/// parses the whole description and reports its own negotiation failure.
+#[test]
+fn an_unreadable_offer_with_a_known_catalogue_codec_reaches_the_engine() {
+    let now = Instant::now();
+    let mut publication = publication("a", 1);
+    publication.codec = "vp8".into();
+    let mut viewer = Viewer::with_snapshot(1, 10, receiver_capabilities(&[Codec::Vp8]));
+    start_of(&watch(&mut viewer, &publication, 1, now));
+
+    // The video m-line is live but its only payload carries an audio clock, so
+    // nothing in the description can name a video codec.
+    let sdp = "v=0\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\na=mid:0\r\n\
+a=sendonly\r\na=rtpmap:96 opus/48000/2\r\n";
+    let outcomes = viewer.on_server_event("stream.webrtc_offer", "", &json!({"sdp": sdp}), now);
+    assert!(
+        matches!(outcomes.as_slice(), [Outcome::Offer(_)]),
+        "an unreadable offer is left to the engine: {outcomes:?}"
+    );
+    assert!(
+        sends(&outcomes, "stream.leave").is_empty(),
+        "the subscription is not released on a guess: {outcomes:?}"
+    );
+    assert!(viewer.watching().is_some());
+}

@@ -3,14 +3,15 @@
 
 use gpui::TestAppContext;
 
-use super::voice_screen_tests::{draw, focused, source};
+use super::voice_screen_tests::{draw, focused, monitor, open_picker_with, source};
+use voxhold_media::screen_capture::SourceKind;
 
 #[gpui::test]
 async fn a_codec_change_in_the_live_dialog_warns_and_queues_a_restart(cx: &mut TestAppContext) {
     use voxhold_media::publisher::{Codec, Phase, Quality, Sharing};
     let (mut visual, _view, voice) = super::voice_tests::fixture(cx);
     draw(&mut visual);
-    visual.update(|_window, app| {
+    visual.update(|window, app| {
         voice.update(app, |panel, cx| {
             panel.test_attach_detached_handle();
             panel.test_open_screen_settings(
@@ -22,6 +23,7 @@ async fn a_codec_change_in_the_live_dialog_warns_and_queues_a_restart(cx: &mut T
                     has_audio: true,
                     ..Sharing::default()
                 },
+                window,
                 cx,
             );
             let confirmed = panel
@@ -74,7 +76,7 @@ async fn a_bitrate_only_change_in_the_live_dialog_queues_the_live_sender(cx: &mu
     use voxhold_media::publisher::{Phase, Quality, Sharing};
     let (mut visual, _view, voice) = super::voice_tests::fixture(cx);
     draw(&mut visual);
-    visual.update(|_window, app| {
+    visual.update(|window, app| {
         voice.update(app, |panel, cx| {
             panel.test_attach_detached_handle();
             panel.test_open_screen_settings(
@@ -86,6 +88,7 @@ async fn a_bitrate_only_change_in_the_live_dialog_queues_the_live_sender(cx: &mu
                     has_audio: true,
                     ..Sharing::default()
                 },
+                window,
                 cx,
             );
             panel.test_change_screen_bitrate(100, cx);
@@ -117,4 +120,43 @@ async fn a_bitrate_only_change_in_the_live_dialog_queues_the_live_sender(cx: &mu
         vec![("bitrate", op.expect("the apply carries an operation id"))],
         "only the bitrate reaches the live sender"
     );
+}
+
+/// Part A: a codec the sender probe refuses shows the probe's reason in the
+/// dialog and never silently names another codec.
+#[gpui::test]
+async fn an_unavailable_codec_shows_the_probe_reason_in_the_dialog(cx: &mut TestAppContext) {
+    let reason = "Профиль VP9 не объявлен кодировщиком для SDR: profile-id=2, для SDR нужен 0.";
+    let (mut visual, _view, voice) = super::voice_tests::fixture_with(cx, Some(1400.), true);
+    draw(&mut visual);
+    open_picker_with(
+        &mut visual,
+        &voice,
+        SourceKind::Monitor,
+        vec![monitor(3, "Экран", 1920, 1080)],
+    );
+    visual.update(|_window, app| {
+        voice.update(app, |panel, cx| {
+            panel.test_set_codec_error(reason);
+            cx.notify();
+        });
+    });
+    draw(&mut visual);
+    assert!(
+        visual
+            .debug_bounds("share-codec-label:Нет доступного SDR-кодека")
+            .is_some(),
+        "the label names no available SDR codec"
+    );
+    let reason_selector = Box::leak(format!("share-codec-reason:{reason}").into_boxed_str());
+    assert!(
+        visual.debug_bounds(reason_selector).is_some(),
+        "the dialog paints «{reason_selector}»"
+    );
+    voice.read_with(&*visual, |panel, _| {
+        assert!(
+            !panel.test_can_start(),
+            "Start refuses the unavailable codec"
+        );
+    });
 }

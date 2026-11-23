@@ -2,14 +2,14 @@
 //! the picker and paints the real audio scope of the running attempt.
 
 use super::*;
+use crate::voice_panel::pip::StreamSurface;
 
 impl VoicePanel {
-    /// Whether the local on-air card takes one room slot.
-    pub(in crate::voice_panel) fn screen_card_active(&self) -> bool {
-        matches!(
-            self.screen.sharing.phase,
-            Phase::Publishing | Phase::Live | Phase::Stopping | Phase::Failed
-        )
+    /// Whether the local on-air card takes one slot of the displayed grid.
+    /// The card belongs to the source room only; anywhere else the compact
+    /// PiP owns the same publication.
+    pub(crate) fn screen_card_active(&self) -> bool {
+        self.own_surface() == StreamSurface::Room
     }
 
     /// The card that replaces the local publication in the room grid while a
@@ -178,7 +178,12 @@ impl VoicePanel {
                         .cursor_pointer()
                         .track_focus(&quality_focus)
                         .on_click(cx.listener(|panel, _, _, cx| panel.open_screen_settings(cx)))
-                        .child("Качество"),
+                        .child(super::view::vector_icon(
+                            "icons/settings.svg",
+                            12.,
+                            rgb(c.fg),
+                        ))
+                        .child("Настройки"),
                 );
             }
             let stop_focus = self.screen_focus[0].clone();

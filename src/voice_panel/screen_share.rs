@@ -8,6 +8,7 @@
 //! (degradation preference) are absent because the pinned engine or backend
 //! cannot apply them.
 
+use super::pip::PublishAccess;
 use super::*;
 use voxhold_media::publisher::{
     Codec, Phase, Preset, PublishRequest, Quality, QualityChange, QualityOutcome, Resolution,
@@ -111,6 +112,9 @@ pub(super) struct ScreenShareUi {
     /// becomes a confirmed stop+start, never a live reconfigure.
     pub(super) restart: bool,
     pub(super) busy: bool,
+    /// A stop was already sent for this attempt. Repeated clicks and Escape
+    /// must not queue a second command.
+    pub(super) stop_requested: bool,
     /// A quality-change preflight of this dialog is pending. Start sets it, the
     /// failure answer, a commit or closing the dialog clears it. It survives a
     /// stale state that clears `busy`, so closing always cancels the preflight.
@@ -181,6 +185,7 @@ impl Default for ScreenShareUi {
             audio_availability: None,
             restart: false,
             busy: false,
+            stop_requested: false,
             preflight: false,
             quality_op: 0,
             pending_quality_op: None,
@@ -418,8 +423,21 @@ impl VoicePanel {
         let Some(handle) = &self.handle else {
             return;
         };
-        let slot_available = self.active_publishers_in_room() < MAX_CHANNEL_PUBLISHERS;
-        handle.screen_access(self.can_stream, slot_available);
+        // A live publication and its restart belong to the owner channel.
+        // Only the first picker of the displayed room uses that room's gate.
+        let owner_live = self.share_active() || self.screen.restart;
+        let (allowed, slot_available) = if owner_live {
+            (
+                self.publish_access.can_stream,
+                self.publish_access.slot_available,
+            )
+        } else {
+            (
+                self.can_stream,
+                self.publishers_in(self.room) < MAX_CHANNEL_PUBLISHERS,
+            )
+        };
+        handle.screen_access(allowed, slot_available);
     }
 
     pub fn screen_share_open(&self) -> bool {
@@ -449,17 +467,9 @@ impl VoicePanel {
         self.share_gate().err()
     }
 
-    fn active_publishers_in_room(&self) -> usize {
-        self.room_streams()
-            .iter()
-            .filter(|publication| {
-                Some(&publication.publisher_connection_id) != self.self_connection.as_ref()
-            })
-            .count()
-    }
-
-    /// Why the «Экран» action is disabled. The same values are re-checked by
-    /// the publisher state machine.
+    /// Why the «Экран» action is disabled for the displayed room. This is the
+    /// primary start gate: starting a broadcast in B obeys B's rules even when
+    /// a publication from A is already live.
     pub fn share_gate(&self) -> Result<(), &'static str> {
         #[cfg(test)]
         if let Some(result) = self.test_share_gate {
@@ -496,8 +506,42 @@ impl VoicePanel {
         ) {
             return Err("Трансляция уже идёт.");
         }
-        if self.active_publishers_in_room() >= MAX_CHANNEL_PUBLISHERS {
+        if self.publishers_in(self.room) >= MAX_CHANNEL_PUBLISHERS {
             return Err("В канале уже 8 трансляций. Дождитесь завершения одной из них.");
+        }
+        Ok(())
+    }
+
+    /// The live-change gate of the publication's owner. Opening or restarting
+    /// its settings from another room never consults that room's permission,
+    /// slot or E2EE state.
+    pub(super) fn live_change_gate(&self) -> Result<(), &'static str> {
+        let Some(owner) = self.publish_room else {
+            return Err("Публикация не найдена.");
+        };
+        if !self.access_confirmed {
+            return Err("Права на канал ещё не подтверждены.");
+        }
+        if !self.publish_access.readable {
+            return Err("Нет доступа к голосовому каналу.");
+        }
+        if self.call_channel == 0 || self.call_channel != owner {
+            return Err("Сначала подключитесь к голосовому каналу.");
+        }
+        if self.phase != CallPhase::Connected {
+            return Err("Голосовое соединение ещё не установлено.");
+        }
+        if !self.publish_access.can_stream {
+            return Err("Нет права запускать трансляции в этом канале.");
+        }
+        if screen_capture::capability_cached().is_err() {
+            return Err("Захват экрана недоступен на этом устройстве.");
+        }
+        if Codec::available().is_empty() {
+            return Err("В этой сборке нет подтверждённого кодека трансляции.");
+        }
+        if self.screen.sharing.phase != Phase::Live {
+            return Err("Трансляция уже не идёт.");
         }
         Ok(())
     }
@@ -545,6 +589,16 @@ impl VoicePanel {
     /// backend only applies the change through a stop and a new start.
     pub(super) fn open_screen_settings(&mut self, cx: &mut Context<Self>) {
         if self.screen.sharing.phase != Phase::Live {
+            return;
+        }
+        // The dialog belongs to the owner channel: a revoke there closes it,
+        // while the rules of the displayed room are irrelevant.
+        if !self.publish_access.readable || !self.publish_access.can_stream {
+            return;
+        }
+        // The dialog belongs to the owner channel: a revoke there closes it,
+        // while the rules of the displayed room are irrelevant.
+        if !self.publish_access.readable || !self.publish_access.can_stream {
             return;
         }
         // Without a configuration the media layer really accepted on air there
@@ -678,7 +732,10 @@ impl VoicePanel {
         self.screen.focus_placed = false;
         if let Some(handle) = &self.handle {
             if committed {
-                handle.stop_screen_share();
+                if !self.screen.stop_requested {
+                    self.screen.stop_requested = true;
+                    handle.stop_screen_share();
+                }
             } else if restart_busy {
                 if let Some(op) = pending_op {
                     handle.cancel_screen_restart(op);
@@ -814,21 +871,22 @@ impl VoicePanel {
             cx.notify();
             return;
         }
-        if let Err(reason) = self.share_gate() {
-            // The live quality dialog is allowed to pass the "already live"
-            // gate: it replaces the current attempt only through a confirmed
-            // stop+start. Every other gate (join, permission, slot, capture)
-            // still blocks it.
-            let restart_bypass = self.screen.restart && reason == "Трансляция уже идёт.";
-            if !restart_bypass {
-                // An active publication is not an error for this button; its
-                // card owns the status and the stop action.
-                if !self.share_active() {
-                    self.screen.error = reason.to_owned();
-                }
-                cx.notify();
-                return;
+        // A live change is gated by the owner channel, a primary start by the
+        // displayed one. The two rules must never be mixed: being in B without
+        // Stream does not block the settings of a publication from A.
+        let gate = if self.screen.restart {
+            self.live_change_gate()
+        } else {
+            self.share_gate()
+        };
+        if let Err(reason) = gate {
+            // An active publication is not an error for this button; its card
+            // owns the status and the stop action.
+            if !self.share_active() {
+                self.screen.error = reason.to_owned();
             }
+            cx.notify();
+            return;
         }
         let Some(id) = self.screen.selected else {
             self.screen.error = "Выберите монитор или окно.".into();
@@ -896,7 +954,19 @@ impl VoicePanel {
             cx.notify();
             return;
         };
-        let slot_available = self.active_publishers_in_room() < MAX_CHANNEL_PUBLISHERS;
+        // A live change carries the owner's confirmed access; a primary start
+        // carries the displayed room's values it just passed the gate with.
+        let (allowed, slot_available) = if self.screen.restart {
+            (
+                self.publish_access.can_stream,
+                self.publish_access.slot_available,
+            )
+        } else {
+            (
+                self.can_stream,
+                self.publishers_in(self.room) < MAX_CHANNEL_PUBLISHERS,
+            )
+        };
         let live_bitrate =
             self.screen.restart && self.screen.restart_change() == Some(QualityChange::LiveBitrate);
         // Every quality change gets its own tag, so a delayed answer of an
@@ -911,17 +981,24 @@ impl VoicePanel {
             // A bitrate-only change goes to the live sender; the worker
             // repeats the classification before it applies anything.
             if live_bitrate {
-                handle.apply_screen_quality(op, request.clone(), self.can_stream, slot_available);
+                handle.apply_screen_quality(op, request.clone(), allowed, slot_available);
             } else {
-                handle.restart_screen_share(op, request.clone(), self.can_stream, slot_available);
+                handle.restart_screen_share(op, request.clone(), allowed, slot_available);
             }
         } else {
-            handle.publish_screen(
-                self.screen.picker,
-                request.clone(),
-                self.can_stream,
+            // The primary intent binds the publication to this channel. From
+            // now on, navigation changes only its surface.
+            self.publish_room = Some(self.room);
+            self.publish_access = PublishAccess {
+                readable: self
+                    .rooms
+                    .get(&self.room)
+                    .is_some_and(|access| access.readable && !access.e2ee),
+                can_stream: self.can_stream,
                 slot_available,
-            );
+            };
+            self.screen.stop_requested = false;
+            handle.publish_screen(self.screen.picker, request.clone(), allowed, slot_available);
         }
         // The request is only this attempt's draft. It becomes confirmed when
         // the media layer reports the attempt Live.
@@ -939,11 +1016,18 @@ impl VoicePanel {
     }
 
     pub(super) fn stop_screen_share(&mut self, cx: &mut Context<Self>) {
+        // One stop per attempt. A repeated click, the PiP close and Escape
+        // after the first command share this latch.
+        if self.screen.stop_requested {
+            return;
+        }
+        self.screen.stop_requested = true;
         if let Some(handle) = &self.handle {
             handle.stop_screen_share();
         }
         // A stop ends the picker session: no capture may start another card.
         self.screen.clear_previews();
+        self.retain_pip_state();
         cx.notify();
     }
 
@@ -1017,6 +1101,9 @@ impl VoicePanel {
         let epoch = self.screen.preview_epoch.wrapping_add(1);
         self.screen = ScreenShareUi::default();
         self.screen.preview_epoch = epoch;
+        self.publish_room = None;
+        self.publish_access = PublishAccess::default();
+        self.retain_pip_state();
     }
 
     fn share_focus(&self, index: usize) -> FocusHandle {

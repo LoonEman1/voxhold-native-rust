@@ -115,7 +115,11 @@ impl Render for Voxhold {
             )
             .on_mouse_move(cx.listener(|s, event: &gpui::MouseMoveEvent, _, cx| {
                 #[cfg(feature = "voxhold-media")]
-                s.voice_pointer_moved(event.position, cx);
+                s.voice_pointer_moved(
+                    event.position,
+                    event.pressed_button == Some(MouseButton::Left),
+                    cx,
+                );
                 if let Some(drag) = s.scrollbar_drag {
                     if event.pressed_button != Some(MouseButton::Left) {
                         s.scrollbar_drag = None;
@@ -283,9 +287,15 @@ impl Render for Voxhold {
         // the room flag is the same predicate that chooses `history` below.
         #[cfg(feature = "voxhold-media")]
         if let Some(voice) = &self.voice {
+            // One foreground answer for the frame: the shown server and
+            // channel really paint this voice room. The panel compares it with
+            // the owner of each stream, so slot count, card and focus ring
+            // cannot disagree.
             let room_painted = voice_room;
+            let server = self.server;
+            let channel = self.channel;
             voice.update(cx, |panel, _| {
-                panel.set_room_painted(room_painted);
+                panel.set_foreground(room_painted, server, channel);
                 panel.set_dock_visible(false);
             });
         }
@@ -953,6 +963,24 @@ impl Render for Voxhold {
         if !mobile && self.show_servers {
             root = root.child(self.server_picker(cx));
         }
+        // Stream surfaces sit above the channel content and below every modal:
+        // the room player for the source room, the compact PiP elsewhere.
+        #[cfg(feature = "voxhold-media")]
+        if let Some(voice) = self.voice.clone() {
+            let area =
+                crate::voice_room::Rect::new(0., 0., vw, if mobile { l.bottom.y } else { vh });
+            let scale = window.scale_factor();
+            voice.update(cx, |panel, _| {
+                panel.set_scale(scale);
+                panel.set_player_area_and_place(area);
+            });
+            if let Some(overlay) = voice.update(cx, |panel, cx| panel.player_overlay(window, cx)) {
+                root = root.child(overlay);
+            }
+            if let Some(overlay) = voice.update(cx, |panel, cx| panel.pip_overlay(window, cx)) {
+                root = root.child(overlay);
+            }
+        }
         self.ensure_viewer_scale(window, cx);
         let popup_open = self.show_search
             || self.update.panel_open
@@ -1003,18 +1031,10 @@ impl Render for Voxhold {
         if let Some(layer) = self.recordings_overlay(window, cx) {
             root = root.child(layer);
         }
+        // The screen picker is a real modal: it stays above the stream
+        // surfaces and every popup.
         #[cfg(feature = "voxhold-media")]
         if let Some(voice) = self.voice.clone() {
-            let area =
-                crate::voice_room::Rect::new(0., 0., vw, if mobile { l.bottom.y } else { vh });
-            let scale = window.scale_factor();
-            voice.update(cx, |panel, _| {
-                panel.set_scale(scale);
-                panel.set_player_area_and_place(area);
-            });
-            if let Some(overlay) = voice.update(cx, |panel, cx| panel.player_overlay(window, cx)) {
-                root = root.child(overlay);
-            }
             if let Some(overlay) =
                 voice.update(cx, |panel, cx| panel.screen_share_overlay(window, cx))
             {

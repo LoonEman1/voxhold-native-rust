@@ -16,6 +16,35 @@ pub(super) fn vector_icon(path: &'static str, size: f32, color: gpui::Rgba) -> g
 }
 
 impl VoicePanel {
+    /// The roster of the displayed room. The call runtime owns it when the
+    /// active channel is the shown one; otherwise the account snapshot does.
+    pub(super) fn visible_roster(&self) -> Vec<Participant> {
+        if !self.access_confirmed {
+            return Vec::new();
+        }
+        if self.call_channel != 0 && self.call_channel == self.room {
+            self.participants.clone()
+        } else {
+            self.room_roster.clone()
+        }
+    }
+
+    /// Whether this participant's track belongs to the active call and is
+    /// therefore audible right now.
+    pub(super) fn audio_for(&self, connection: &str) -> bool {
+        self.access_confirmed
+            && self.call_channel != 0
+            && self.call_channel == self.room
+            && self.tracks.contains(connection)
+    }
+
+    pub(super) fn member_name(&self, user_id: i64) -> String {
+        self.members
+            .get(&user_id)
+            .cloned()
+            .unwrap_or_else(|| format!("Участник {user_id}"))
+    }
+
     fn room_phase(&self) -> CallPhase {
         if self.call_channel != 0 && self.call_channel == self.room {
             self.phase

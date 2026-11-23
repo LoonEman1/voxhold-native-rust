@@ -26,13 +26,10 @@ impl VoicePanel {
                         ring.push((VOICE_ACTIONS[index].id, self.action_focus[index].clone()));
                     }
                 }
-                if matches!(
-                    self.screen.sharing.phase,
-                    voxhold_media::publisher::Phase::Publishing
-                        | voxhold_media::publisher::Phase::Live
-                        | voxhold_media::publisher::Phase::Stopping
-                        | voxhold_media::publisher::Phase::Failed
-                ) {
+                if self.screen_card_active() {
+                    if self.screen.sharing.phase == voxhold_media::publisher::Phase::Live {
+                        ring.push(("screen-quality", self.screen_focus[2].clone()));
+                    }
                     ring.push(("screen-stop", self.screen_focus[0].clone()));
                 }
             } else {
@@ -72,13 +69,17 @@ impl VoicePanel {
             }
         }
         // The floating player is a shell-level overlay and is not tied to the
-        // room pane, so it keeps its entries independently.
-        if self.player_open {
+        // room pane, so it keeps its entries independently. An out-of-room
+        // watch is the compact PiP and has its own ring.
+        if self.player_open && self.view_surface() == super::pip::StreamSurface::Room {
             if self.has_audio() {
                 ring.push(("stream-audio", self.player_actions[0].clone()));
             }
             ring.push(("stream-fullscreen", self.player_actions[1].clone()));
             ring.push(("stream-close", self.player_actions[2].clone()));
+        }
+        for (_, id, handle) in self.pip_ring() {
+            ring.push((id, handle));
         }
         if self.dock_visible && self.call_channel != 0 {
             for (index, id) in DOCK_ACTIONS.iter().enumerate() {

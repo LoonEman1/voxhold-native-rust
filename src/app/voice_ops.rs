@@ -48,6 +48,38 @@ impl Voxhold {
         })
     }
 
+    /// Push the confirmed access of the channel that owns the live
+    /// publication. The PiP and its settings may be used from another room;
+    /// they always obey the owner's readable flag, Stream permission and free
+    /// publisher slot, never the displayed room's rules.
+    pub(super) fn sync_publish_access(&self, cx: &mut Context<Self>) {
+        let Some(panel) = &self.voice else {
+            return;
+        };
+        let Some(owner) = panel.read(cx).publish_room() else {
+            return;
+        };
+        let readable = self.channels.iter().any(|channel| {
+            channel.id == owner
+                && channel.kind == "voice"
+                && channel.readable()
+                && !channel.e2ee_required
+        });
+        let can_stream = self.stream_permission(owner);
+        let own_connection = panel.read(cx).self_connection().map(str::to_owned);
+        let publishers = self
+            .voice_stream_list(self.server, owner)
+            .iter()
+            .filter(|publication| {
+                Some(&publication.publisher_connection_id) != own_connection.as_ref()
+            })
+            .count();
+        let slot_available = publishers < voxhold_media::publisher::MAX_CHANNEL_PUBLISHERS;
+        panel.update(cx, |panel, _| {
+            panel.set_publish_access(readable, can_stream, slot_available);
+        });
+    }
+
     /// Snapshot data is only shown for rooms the confirmed channel list still
     /// allows. While an ACL reload is in flight the server's data is hidden;
     /// other servers keep their cache until they become current.
@@ -261,6 +293,7 @@ impl Voxhold {
             self.install_voice_call_handler(cx);
         }
         self.voice_room = channel;
+        self.sync_publish_access(cx);
         if let Some(panel) = &self.voice {
             let focus = panel.read(cx).focus_handle();
             window.focus(&focus);
@@ -336,6 +369,7 @@ impl Voxhold {
             panel.set_palette(palette);
             cx.notify();
         });
+        self.sync_publish_access(cx);
     }
 
     /// Play the cues the panel recorded since the last drain. The panel owns
@@ -674,6 +708,11 @@ impl Voxhold {
             if panel.update(cx, |panel, _| panel.player_escape(window)) {
                 return true;
             }
+            // Escape closes the top-most PiP surface only while no real modal
+            // (settings, picker, viewer) is above it.
+            if !blocked && panel.update(cx, |panel, cx| panel.pip_escape(cx)) {
+                return true;
+            }
         }
         if blocked {
             return false;
@@ -727,6 +766,14 @@ impl Voxhold {
         ) {
             panel.update(cx, |panel, cx| panel.deafen(cx));
             self.drain_voice_cues(cx);
+            return true;
+        }
+        // Enter/Space run the focused PiP action. The picker and the room
+        // actions use their own handlers; this only matches a PiP handle, so
+        // an ordinary focused element is never activated twice.
+        if matches!(key.as_str(), "enter" | "space")
+            && panel.update(cx, |panel, cx| panel.activate_focused_pip(window, cx))
+        {
             return true;
         }
         let fullscreen = panel.read(cx).player_fullscreen();
@@ -792,11 +839,13 @@ impl Voxhold {
         })
     }
 
-    /// Mouse forwarding for the player drag/resize. The player can leave its
-    /// own bounds while the pointer is captured by the window.
+    /// Mouse forwarding for the player and PiP drag/resize. The box can leave
+    /// its own bounds while the pointer is captured by the window; a release
+    /// that arrives as an unpressed move ends the drag.
     pub(super) fn voice_pointer_moved(
         &mut self,
         position: gpui::Point<gpui::Pixels>,
+        pressed: bool,
         cx: &mut Context<Self>,
     ) {
         let Some(panel) = &self.voice else {
@@ -806,7 +855,9 @@ impl Voxhold {
             return;
         }
         let (x, y) = (position.x.into(), position.y.into());
-        panel.update(cx, |panel, cx| panel.player_pointer_moved(x, y, cx));
+        panel.update(cx, |panel, cx| {
+            panel.player_pointer_moved(x, y, pressed, cx)
+        });
     }
 
     pub(super) fn voice_pointer_released(&mut self, cx: &mut Context<Self>) {

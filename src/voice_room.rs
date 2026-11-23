@@ -140,25 +140,62 @@ pub fn room_geometry(body: Rect, active: bool, cards: usize, scroll: f32) -> Roo
     }
 }
 
-/// Go `floatingStreamBox`. Start width is 360 px; the box is clamped into the
-/// available area with an 8 px margin so it can never leave the chat.
-pub fn floating_stream_box(area: Rect, position: (f32, f32), width: f32) -> Rect {
-    let min_width = PLAYER_MIN_WIDTH.min((area.w - PLAYER_MARGIN * 2.0).max(1.0));
+/// The compact PiP starts at 320 logical px and sits 16 px from the safe-area
+/// corner. The same box is clamped on drag, resize and DPI changes.
+pub const PIP_WIDTH: f32 = 320.0;
+pub const PIP_MIN_WIDTH: f32 = 200.0;
+pub const PIP_MARGIN: f32 = 16.0;
+
+fn floating_box(area: Rect, position: (f32, f32), width: f32, margin: f32) -> Rect {
+    let inner_width = (area.w - margin * 2.0).max(1.0);
+    let min_width = PLAYER_MIN_WIDTH.min(inner_width);
     let max_width = PLAYER_MAX_WIDTH
-        .min((area.w - PLAYER_MARGIN * 2.0).max(1.0))
-        .min(((area.h - 92.0).max(1.0)) * 16.0 / 9.0);
+        .min(inner_width)
+        .min(((area.h - 92.0).max(1.0)) * 16.0 / 9.0)
+        .max(1.0);
     let width = width.clamp(min_width.min(max_width), max_width.max(min_width));
+    floating_stream_rect(area, position, width, margin)
+}
+
+fn floating_stream_rect(area: Rect, position: (f32, f32), width: f32, margin: f32) -> Rect {
     let height = width * PLAYER_ASPECT + PLAYER_HEADER + PLAYER_FOOTER;
     let x = position.0.clamp(
-        area.x + PLAYER_MARGIN,
-        (area.right() - width - PLAYER_MARGIN).max(area.x + PLAYER_MARGIN),
+        area.x + margin,
+        (area.right() - width - margin).max(area.x + margin),
     );
     let y = position.1.clamp(
-        area.y + PLAYER_MARGIN,
-        (area.bottom() - height - PLAYER_MARGIN).max(area.y + PLAYER_MARGIN),
+        area.y + margin,
+        (area.bottom() - height - margin).max(area.y + margin),
     );
     Rect::new(x, y, width, height)
 }
+
+/// Go `floatingStreamBox`. Start width is 360 px; the box is clamped into the
+/// available area with an 8 px margin so it can never leave the chat.
+pub fn floating_stream_box(area: Rect, position: (f32, f32), width: f32) -> Rect {
+    floating_box(area, position, width, PLAYER_MARGIN)
+}
+
+/// The compact PiP of a stream that moved out of its source room. Without a
+/// remembered position it opens in the bottom-right corner of the safe area;
+/// a remembered position survives navigation and is clamped into a resized or
+/// DPI-scaled area. A narrow area shrinks the width inside the safe rect.
+pub fn compact_stream_box(area: Rect, position: Option<(f32, f32)>, width: f32) -> Rect {
+    let inner_width = (area.w - PIP_MARGIN * 2.0).max(1.0);
+    let height_limit = ((area.h - PIP_HEADER_LIMIT).max(1.0)) * 16.0 / 9.0;
+    let max_width = PIP_WIDTH.min(inner_width).min(height_limit).max(1.0);
+    let min_width = PIP_MIN_WIDTH.min(max_width);
+    let width = width.clamp(min_width, max_width);
+    let height = width * PLAYER_ASPECT + PLAYER_HEADER + PLAYER_FOOTER;
+    let corner = (
+        area.right() - width - PIP_MARGIN,
+        area.bottom() - height - PIP_MARGIN,
+    );
+    floating_stream_rect(area, position.unwrap_or(corner), width, PIP_MARGIN)
+}
+
+/// Header, footer and both margins: below this the picture would collapse.
+const PIP_HEADER_LIMIT: f32 = PLAYER_HEADER + PLAYER_FOOTER + PIP_MARGIN * 2.0;
 
 /// Interactive regions inside a floating player, from Go `layoutStreamPlayer`.
 #[derive(Clone, Debug, Default)]
@@ -167,6 +204,7 @@ pub struct PlayerGeometry {
     pub picture: Rect,
     pub corner: Rect,
     pub fullscreen: Rect,
+    pub settings: Rect,
     pub close: Rect,
     pub audio: Option<Rect>,
     pub fullscreen_picture: Rect,
@@ -214,6 +252,7 @@ pub fn player_geometry(area: Rect, player: Rect, has_audio: bool) -> PlayerGeome
             PLAYER_CORNER,
         ),
         fullscreen: Rect::new(player.right() - 67.0, player.y + 4.0, 30.0, 30.0),
+        settings: Rect::new(player.right() - 99.0, player.y + 4.0, 30.0, 30.0),
         close: Rect::new(player.right() - 35.0, player.y + 4.0, 30.0, 30.0),
         audio: has_audio
             .then(|| Rect::new(player.right() - 57.0, player.bottom() - 35.0, 32.0, 29.0)),
@@ -221,6 +260,20 @@ pub fn player_geometry(area: Rect, player: Rect, has_audio: bool) -> PlayerGeome
         fullscreen_exit,
         fullscreen_audio,
     }
+}
+
+/// The compact PiP reuses the floating-player regions. Its header leaves room
+/// for the gear next to fullscreen and close, so the drag handle never covers
+/// a button: a click on the settings or close action must not start a drag.
+pub fn pip_player_geometry(area: Rect, player: Rect, has_audio: bool) -> PlayerGeometry {
+    let mut geometry = player_geometry(area, player, has_audio);
+    geometry.header = Rect::new(
+        player.x + 4.0,
+        player.y + 1.0,
+        (player.w - 118.0).max(0.0),
+        36.0,
+    );
+    geometry
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

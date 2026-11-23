@@ -137,6 +137,14 @@ pub struct VoicePanel {
     live_clock_second: Option<i64>,
     /// Permission Stream of the displayed room, confirmed by the channel list.
     can_stream: bool,
+    /// Channel that owns the current publication. Captured when the start
+    /// intent is committed and kept while that attempt lives, so navigating
+    /// to another room never moves the card or the PiP to a foreign grid.
+    publish_room: Option<i64>,
+    /// Confirmed access of `publish_room`: readable channel, Stream
+    /// permission and a free publisher slot. Live settings use these values,
+    /// never the rules of the displayed room.
+    publish_access: pip::PublishAccess,
     /// Screen-share picker, on-air card and preview.
     screen: ScreenShareUi,
     /// Monotonic id of the newest screen-audio probe. A slower, older probe
@@ -170,6 +178,16 @@ pub struct VoicePanel {
     /// rewrite the same slot, but a real change is never skipped.
     requested_viewport: Option<(u32, u32)>,
     player_drag: Option<PlayerDrag>,
+    /// Compact PiP position and width for the lifetime of the stream intents.
+    /// Navigation between rooms changes only the surface; the next exit from
+    /// the source room reuses this box.
+    pip_pos: Option<(f32, f32)>,
+    pip_width: f32,
+    pip_tab: pip::PipTab,
+    pip_settings_open: bool,
+    /// Focus returns to the gear once the settings surface closes.
+    pip_restore_focus: bool,
+    pip_focus: Vec<FocusHandle>,
     join_focus: FocusHandle,
     action_focus: Vec<FocusHandle>,
     dock_focus: Vec<FocusHandle>,
@@ -216,6 +234,13 @@ pub struct VoicePanel {
     /// Test-only thumbnail provider. `None` in tests keeps real desktop capture
     /// out of the suite entirely; an injected provider runs on the same
     /// background task as the production capture.
+    /// Watch/leave intents this panel issued. Navigation must never add one;
+    /// a role action adds exactly one. Test-only so the production file keeps
+    /// no counters.
+    #[cfg(test)]
+    watch_intents: Vec<u64>,
+    #[cfg(test)]
+    leave_intents: Vec<u64>,
     #[cfg(test)]
     test_preview_provider: Option<
         Arc<
@@ -244,6 +269,9 @@ impl VoicePanel {
         let activation = cx.observe_window_activation(window, |panel, window, _| {
             if !window.is_window_active() {
                 panel.release_push_to_talk();
+                // A window that loses activation also loses the pointer
+                // capture: the drag must not resume glued to the cursor.
+                panel.player_drag = None;
             }
         });
         let executor = cx.background_executor().clone();
@@ -306,6 +334,8 @@ impl VoicePanel {
             sidebar_watch: None,
             live_clock_second: None,
             can_stream: false,
+            publish_room: None,
+            publish_access: pip::PublishAccess::default(),
             screen: ScreenShareUi::default(),
             screen_audio_probe: 0,
             access_confirmed: true,
@@ -327,6 +357,12 @@ impl VoicePanel {
             owns_fullscreen: false,
             requested_viewport: None,
             player_drag: None,
+            pip_pos: None,
+            pip_width: crate::voice_room::PIP_WIDTH,
+            pip_tab: pip::PipTab::View,
+            pip_settings_open: false,
+            pip_restore_focus: false,
+            pip_focus: (0..7).map(|_| cx.focus_handle()).collect(),
             join_focus: cx.focus_handle(),
             action_focus: (0..VOICE_ACTIONS.len())
                 .map(|_| cx.focus_handle())
@@ -348,6 +384,10 @@ impl VoicePanel {
             speaking_handler: None,
             call_handler: None,
             palette: crate::theme::dark_palette(),
+            #[cfg(test)]
+            watch_intents: Vec::new(),
+            #[cfg(test)]
+            leave_intents: Vec::new(),
             #[cfg(test)]
             test_share_gate: None,
             #[cfg(test)]
@@ -908,6 +948,8 @@ impl VoicePanel {
         }
         self.stream_selection = self.stream_selection.wrapping_add(1).max(1);
         let selection = self.stream_selection;
+        #[cfg(test)]
+        self.watch_intents.push(selection);
         self.player_open = true;
         self.stream_error.clear();
         self.stream_status = "Подключение…".into();
@@ -922,13 +964,19 @@ impl VoicePanel {
         cx.notify();
     }
 
+    /// One `leave` for the current selection. A repeated click has no
+    /// selection left, so it can never send a second command.
     pub fn leave_stream(&mut self, cx: &mut Context<Self>) {
-        let selection = self.stream_selection;
+        let Some(selection) = self.watching_selection.take() else {
+            return;
+        };
+        #[cfg(test)]
+        self.leave_intents.push(selection);
         if let Some(handle) = &self.handle {
             handle.leave_stream(selection);
         }
-        self.watching_selection = None;
         self.close_player();
+        self.retain_pip_state();
         cx.notify();
     }
 
@@ -982,13 +1030,6 @@ impl VoicePanel {
     /// an unpainted dock can never leave entries in the ring.
     pub fn set_dock_visible(&mut self, visible: bool) {
         self.dock_visible = visible;
-    }
-
-    /// Mirrors the shell's room-pane predicate for the same frame. This is not
-    /// the same as an active call: a text channel or another voice room shows
-    /// the dock only, with no room toolbar or participant cards to focus.
-    pub fn set_room_painted(&mut self, painted: bool) {
-        self.room_painted = painted;
     }
 
     pub fn dock_focus(&self, index: usize) -> FocusHandle {
@@ -1120,37 +1161,13 @@ impl VoicePanel {
     pub fn test_audio_for(&self, connection: &str) -> bool {
         self.audio_for(connection)
     }
-
-    fn visible_roster(&self) -> Vec<Participant> {
-        if !self.access_confirmed {
-            return Vec::new();
-        }
-        if self.call_channel != 0 && self.call_channel == self.room {
-            self.participants.clone()
-        } else {
-            self.room_roster.clone()
-        }
-    }
-
-    fn audio_for(&self, connection: &str) -> bool {
-        self.access_confirmed
-            && self.call_channel != 0
-            && self.call_channel == self.room
-            && self.tracks.contains(connection)
-    }
-
-    fn member_name(&self, user_id: i64) -> String {
-        self.members
-            .get(&user_id)
-            .cloned()
-            .unwrap_or_else(|| format!("Участник {user_id}"))
-    }
 }
 
 mod colors;
 mod controls;
 mod cues;
 mod focus;
+mod pip;
 mod player;
 mod screen_share;
 use screen_share::ScreenShareUi;
@@ -1161,3 +1178,4 @@ mod updates;
 mod view;
 
 pub(crate) use colors::VoiceColors;
+pub use pip::{PipTab, StreamSurface};

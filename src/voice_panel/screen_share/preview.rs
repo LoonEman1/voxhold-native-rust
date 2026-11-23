@@ -19,7 +19,7 @@ impl ScreenShareUi {
     /// flight is ignored, and no picture of the previous picker survives. The
     /// batch guard is released here as well: the epoch check in the old batch
     /// stops it from touching a newer session's flag.
-    pub(super) fn clear_previews(&mut self) {
+    pub(crate) fn clear_previews(&mut self) {
         self.preview_epoch = self.preview_epoch.wrapping_add(1);
         self.previews.clear();
         self.preview_failures.clear();

@@ -442,9 +442,13 @@ impl VoicePanel {
             });
         }
         self.screen.sharing = sharing;
+        // The confirmed snapshot belongs to a publication that was really
+        // started from this call channel.
+        self.publish_room = Some(self.call_channel.max(self.room));
+        self.publish_access = super::pip::PublishAccess::default();
         // Production reaches this dialog while the publication is Live, so the
-        // normal gate answers "already live". The restart path must pass that
-        // one reason without opening a second publication.
+        // normal gate answers "already live". The restart path has its own
+        // owner gate and never opens a second publication.
         self.test_share_gate = Some(Err("Трансляция уже идёт."));
         self.open_screen_settings(cx);
     }
@@ -454,6 +458,10 @@ impl VoicePanel {
     pub fn test_open_live_screen_settings(&mut self, cx: &mut Context<Self>) {
         // The live card reaches this dialog while the publication is Live, so
         // the normal gate answers "already live".
+        if self.publish_room.is_none() {
+            self.publish_room = Some(self.call_channel.max(self.room));
+        }
+        self.publish_access = super::pip::PublishAccess::default();
         self.test_share_gate = Some(Err("Трансляция уже идёт."));
         self.open_screen_settings(cx);
     }
@@ -638,6 +646,11 @@ impl VoicePanel {
         self.test_share_gate = Some(gate);
     }
 
+    /// Return to the production gate, including the host capture answer.
+    pub fn test_clear_share_gate_override(&mut self) {
+        self.test_share_gate = None;
+    }
+
     /// The reason the room would print next to the «Экран» action.
     pub fn test_screen_reason(&self) -> Option<&'static str> {
         self.screen_reason()
@@ -651,9 +664,107 @@ impl VoicePanel {
             .all(|picker| !self.screen_focus.contains(picker))
     }
 
-    /// Replace the screen-share snapshot as a worker update would.
+    /// Replace the screen-share snapshot as a worker update would. An active
+    /// snapshot names the call channel as the publication owner, exactly like
+    /// the accepted `Publish` intent.
     pub fn test_set_screen_sharing(&mut self, sharing: Sharing) {
+        if matches!(
+            sharing.phase,
+            voxhold_media::publisher::Phase::Publishing
+                | voxhold_media::publisher::Phase::Live
+                | voxhold_media::publisher::Phase::Stopping
+                | voxhold_media::publisher::Phase::Failed
+        ) && self.publish_room.is_none()
+        {
+            self.publish_room = Some(self.call_channel.max(self.room));
+        }
         self.screen.sharing = sharing;
+    }
+
+    /// Watch and leave intents the panel issued, in order. Navigation must
+    /// never add one; one role action adds exactly one.
+    pub fn test_take_watch_intents(&mut self) -> Vec<u64> {
+        std::mem::take(&mut self.watch_intents)
+    }
+
+    pub fn test_take_leave_intents(&mut self) -> Vec<u64> {
+        std::mem::take(&mut self.leave_intents)
+    }
+
+    /// The channel that owns the live publication, as the card and PiP see it.
+    pub fn test_publish_room(&self) -> Option<i64> {
+        self.publish_room
+    }
+
+    pub fn test_screen_card_active(&self) -> bool {
+        self.screen_card_active()
+    }
+
+    pub fn test_pip_visible(&self) -> bool {
+        self.pip_visible()
+    }
+
+    pub fn test_pip_box(&self) -> Option<crate::voice_room::Rect> {
+        self.pip_box()
+    }
+
+    pub fn test_pip_tab(&self) -> PipTab {
+        self.pip_tab()
+    }
+
+    pub fn test_switch_pip_tab(&mut self, tab: PipTab, cx: &mut Context<Self>) {
+        self.switch_pip_tab(tab, cx);
+    }
+
+    /// The remembered compact box of the next PiP exit, if any.
+    pub fn test_pip_position(&self) -> Option<(f32, f32)> {
+        self.pip_pos
+    }
+
+    pub fn test_set_pip_position(&mut self, position: (f32, f32)) {
+        self.pip_pos = Some(position);
+        self.place_pip();
+    }
+
+    pub fn test_place_pip(&mut self) {
+        self.place_pip();
+    }
+
+    pub fn test_pip_focused(&self, window: &Window) -> Option<&'static str> {
+        self.pip_ring()
+            .into_iter()
+            .find(|(_, _, handle)| handle.is_focused(window))
+            .map(|(_, id, _)| id)
+    }
+
+    pub fn test_close_pip_role(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_pip_role(window, cx);
+    }
+
+    pub fn test_open_pip_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_pip_settings(window, cx);
+    }
+
+    pub fn test_pip_settings_open(&self) -> bool {
+        self.pip_settings_open
+    }
+
+    pub fn test_screen_preview_present(&self) -> bool {
+        self.screen.preview.is_some()
+    }
+
+    pub fn test_watching_selection(&self) -> Option<u64> {
+        self.watching_selection
+    }
+
+    /// The first focusable row of the viewer settings panel (audio when the
+    /// track exists, fullscreen otherwise).
+    pub fn pip_settings_focus_for_tests(&self) -> FocusHandle {
+        if self.has_audio() {
+            self.pip_focus[2].clone()
+        } else {
+            self.pip_focus[3].clone()
+        }
     }
 
     /// Apply a screen-share runtime update exactly as the publisher emits it

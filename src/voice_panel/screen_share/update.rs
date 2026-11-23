@@ -12,9 +12,31 @@ impl VoicePanel {
     pub(in crate::voice_panel) fn apply_screen_update(&mut self, update: VoiceUpdate) -> bool {
         match update {
             VoiceUpdate::ScreenShare(sharing) => {
+                // A late snapshot of an older attempt must never roll the UI
+                // back or close a newer dialog. Zero is the initial state and
+                // is always accepted.
+                if sharing.attempt != 0
+                    && self.screen.sharing.attempt != 0
+                    && sharing.attempt < self.screen.sharing.attempt
+                {
+                    return false;
+                }
                 let previous = self.screen.sharing.phase;
                 self.screen.sharing = sharing;
                 let phase = self.screen.sharing.phase;
+                if matches!(phase, Phase::Publishing | Phase::Live) {
+                    // A new attempt is on air: a stop latch of the previous
+                    // one no longer describes it.
+                    self.screen.stop_requested = false;
+                }
+                if self.publish_room.is_none()
+                    && matches!(phase, Phase::Publishing | Phase::Live | Phase::Stopping)
+                    && self.call_channel != 0
+                {
+                    // A snapshot from a worker this panel did not start still
+                    // names the call channel that owns it.
+                    self.publish_room = Some(self.call_channel);
+                }
                 let status = self.screen.sharing.quality_status.clone();
                 let pending = self.screen.pending_quality_op;
                 let current = status.clone().filter(|status| Some(status.op) == pending);
@@ -134,12 +156,22 @@ impl VoicePanel {
                         }
                     }
                 }
-                if phase == Phase::Idle && previous != Phase::Idle {
+                if matches!(phase, Phase::Idle | Phase::Failed) {
+                    // The picture of a closed or refused attempt must not stay
+                    // on any surface, not even for one frame.
                     self.screen.preview = None;
+                }
+                if phase == Phase::Idle {
+                    // The publication intent ended; a new start binds its own
+                    // owner channel. The PiP box is kept only while a viewer
+                    // intent is still alive.
+                    self.publish_room = None;
+                    self.screen.stop_requested = false;
                 }
                 // The gate can change without a picker click: the attempt is
                 // now open or closed, and the worker needs the current value.
                 self.sync_screen_access();
+                self.retain_pip_state();
                 true
             }
             VoiceUpdate::ScreenSources {

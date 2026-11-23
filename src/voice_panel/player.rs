@@ -1,6 +1,7 @@
 //! Floating and fullscreen stream player. All positions are local to the
 //! window, matching Go `layoutStreamPlayer` and `stream_player.go`.
 
+use super::pip::StreamSurface;
 use super::*;
 
 impl VoicePanel {
@@ -30,9 +31,12 @@ impl VoicePanel {
 
     pub fn set_player_area_and_place(&mut self, area: Rect) {
         self.player_area = area;
-        if let Some(player) = self.player_box() {
-            self.player_pos = (player.x, player.y);
-            self.player_placed = true;
+        self.place_pip();
+        if !self.pip_visible() {
+            if let Some(player) = self.player_box() {
+                self.player_pos = (player.x, player.y);
+                self.player_placed = true;
+            }
         }
         // A window or room resize changes the picture surface even while the
         // stream is static, so the decoder needs the new size right away.
@@ -40,10 +44,19 @@ impl VoicePanel {
     }
 
     /// The picture surface the player actually shows: the fullscreen picture
-    /// while the player owns the window, the floating picture otherwise.
+    /// while the player owns the window, the compact PiP of an out-of-room
+    /// stream, the floating room player otherwise.
     pub(crate) fn picture_rect(&self) -> Option<Rect> {
-        let player = self.player_box()?;
-        let geometry = voice_room::player_geometry(self.player_area, player, self.has_audio());
+        let player = self.surface_box()?;
+        let geometry = if self.pip_visible() {
+            voice_room::pip_player_geometry(
+                self.player_area,
+                player,
+                self.view_surface() == StreamSurface::Pip && self.has_audio(),
+            )
+        } else {
+            voice_room::player_geometry(self.player_area, player, self.has_audio())
+        };
         Some(if self.player_fullscreen {
             geometry.fullscreen_picture
         } else {
@@ -79,7 +92,7 @@ impl VoicePanel {
     }
 
     pub fn player_toggle_fullscreen(&mut self, window: &mut Window) {
-        if !self.player_open {
+        if self.view_surface() == StreamSurface::Hidden {
             return;
         }
         if self.player_fullscreen {
@@ -107,7 +120,15 @@ impl VoicePanel {
         self.player_fullscreen = false;
         self.player_drag = None;
         // Keep the local width and position: returning from fullscreen restores
-        // the same floating box.
+        // the same floating box, or the remembered PiP box. The watch intent
+        // and its decoder are untouched.
+        if self.pip_visible() {
+            self.place_pip();
+            let handle = self.pip_focus[3].clone();
+            self.sync_viewport();
+            window.focus(&handle);
+            return;
+        }
         if let Some(player) = self.player_box() {
             self.player_pos = (player.x, player.y);
         }
@@ -117,7 +138,7 @@ impl VoicePanel {
 
     /// Returns whether the key belonged to the player.
     pub fn player_escape(&mut self, window: &mut Window) -> bool {
-        if !self.player_open || !self.player_fullscreen {
+        if !self.player_fullscreen {
             return false;
         }
         self.exit_fullscreen(window);
@@ -125,7 +146,7 @@ impl VoicePanel {
     }
 
     pub fn player_key_f(&mut self, window: &mut Window) -> bool {
-        if !self.player_open {
+        if self.view_surface() == StreamSurface::Hidden {
             return false;
         }
         let focused = self
@@ -146,13 +167,22 @@ impl VoicePanel {
     }
 
     pub fn player_pointer_down(&mut self, x: f32, y: f32) -> bool {
-        let Some(player) = self.player_box() else {
-            return false;
-        };
         if self.player_fullscreen {
             return false;
         }
-        let geometry = voice_room::player_geometry(self.player_area, player, self.has_audio());
+        let pip = self.pip_visible();
+        let Some(player) = self.surface_box() else {
+            return false;
+        };
+        let geometry = if pip {
+            voice_room::pip_player_geometry(
+                self.player_area,
+                player,
+                self.view_surface() == StreamSurface::Pip && self.has_audio(),
+            )
+        } else {
+            voice_room::player_geometry(self.player_area, player, self.has_audio())
+        };
         if geometry.corner.contains(x, y) {
             self.player_drag = Some(PlayerDrag {
                 kind: DragKind::Resize,
@@ -161,6 +191,8 @@ impl VoicePanel {
             });
             return true;
         }
+        // Only the header/handle starts a move: the action buttons live
+        // outside it, so a click on the gear or close never begins a drag.
         if geometry.header.contains(x, y) {
             self.player_drag = Some(PlayerDrag {
                 kind: DragKind::Move,
@@ -172,26 +204,57 @@ impl VoicePanel {
         false
     }
 
-    pub fn player_pointer_moved(&mut self, x: f32, y: f32, cx: &mut Context<Self>) {
-        let (Some(drag), Some(player)) = (self.player_drag, self.player_box()) else {
+    /// `pressed` is the pointer state forwarded by the shell. A release that
+    /// arrives outside the window (or a lost capture) ends the drag instead of
+    /// leaving it glued to the cursor.
+    pub fn player_pointer_moved(&mut self, x: f32, y: f32, pressed: bool, cx: &mut Context<Self>) {
+        if self.player_drag.is_none() {
+            return;
+        }
+        if !pressed {
+            self.player_drag = None;
+            cx.notify();
+            return;
+        }
+        let pip = self.pip_visible();
+        let Some(player) = self.surface_box() else {
+            self.player_drag = None;
+            return;
+        };
+        let Some(drag) = self.player_drag else {
             return;
         };
         match drag.kind {
             DragKind::Move => {
-                self.player_pos = (x - drag.offset_x, y - drag.offset_y);
+                if pip {
+                    self.pip_pos = Some((x - drag.offset_x, y - drag.offset_y));
+                    self.place_pip();
+                } else {
+                    self.player_pos = (x - drag.offset_x, y - drag.offset_y);
+                    if let Some(player) = self.player_box() {
+                        self.player_pos = (player.x, player.y);
+                    }
+                }
             }
             DragKind::Resize => {
-                self.player_width = (x - player.x + 3.0).max(voice_room::PLAYER_MIN_WIDTH);
+                if pip {
+                    self.pip_width = (x - player.x + 3.0).max(crate::voice_room::PIP_MIN_WIDTH);
+                    self.place_pip();
+                } else {
+                    self.player_width = (x - player.x + 3.0).max(voice_room::PLAYER_MIN_WIDTH);
+                    if let Some(player) = self.player_box() {
+                        self.player_pos = (player.x, player.y);
+                    }
+                }
             }
-        }
-        if let Some(player) = self.player_box() {
-            self.player_pos = (player.x, player.y);
         }
         cx.notify();
     }
 
     pub fn player_pointer_up(&mut self) {
-        self.player_drag = None;
+        if self.player_drag.take().is_some() && self.pip_visible() {
+            self.place_pip();
+        }
     }
 
     pub fn player_dragging(&self) -> bool {
@@ -225,7 +288,7 @@ impl VoicePanel {
         }
     }
 
-    fn player_status_line(&self) -> String {
+    pub(super) fn player_status_line(&self) -> String {
         let error = if self.stream_audio_error.is_empty() {
             &self.stream_error
         } else {
@@ -278,11 +341,15 @@ impl VoicePanel {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<gpui::AnyElement> {
-        if !self.player_open {
+        if self.view_surface() == StreamSurface::Hidden {
             return None;
         }
         if self.player_fullscreen {
             return Some(self.fullscreen_overlay(cx));
+        }
+        // An out-of-room watch is the compact PiP, not the room player.
+        if self.view_surface() == StreamSurface::Pip {
+            return None;
         }
         let player = self.player_box()?;
         let c = self.colors();
@@ -464,6 +531,7 @@ impl VoicePanel {
         let audio = geometry.fullscreen_audio;
         let mut root = div()
             .id("stream-fullscreen-player")
+            .debug_selector(|| "stream-fullscreen-player".into())
             .absolute()
             .left(px(area.x))
             .top(px(area.y))

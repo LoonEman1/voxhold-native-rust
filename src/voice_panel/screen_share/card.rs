@@ -111,7 +111,8 @@ impl VoicePanel {
     /// Whether the PiP currently paints the publisher role, whose picture is
     /// the same preview slot the on-air card uses.
     pub(in crate::voice_panel) fn screen_pip_publisher_painted(&self) -> bool {
-        self.screen_pip_active()
+        !self.fullscreen_player()
+            && self.screen_pip_active()
             && self.active_pip_role() == crate::voice_panel::pip::PipRole::Publisher
     }
 
@@ -148,7 +149,8 @@ impl VoicePanel {
     /// window-level overlay, so it does not depend on the room pane being
     /// painted; only the grid card does.
     fn screen_card_painted(&self) -> bool {
-        self.screen_card_in_room() || self.screen_pip_publisher_painted()
+        !self.fullscreen_player()
+            && (self.screen_card_in_room() || self.screen_pip_publisher_painted())
     }
 
     /// The card paints its stop action only while a stop still has something

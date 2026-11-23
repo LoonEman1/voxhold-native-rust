@@ -998,11 +998,11 @@ impl Render for Voxhold {
             let area =
                 crate::voice_room::Rect::new(0., 0., vw, if mobile { l.bottom.y } else { vh });
             let scale = window.scale_factor();
-            voice.update(cx, |panel, _| {
-                panel.set_scale(scale);
-                panel.set_player_area_and_place(area);
+            let overlay = voice.update(cx, |panel, cx| {
+                panel.set_player_layout(area, scale);
+                panel.player_overlay(window, cx)
             });
-            if let Some(overlay) = voice.update(cx, |panel, cx| panel.player_overlay(window, cx)) {
+            if let Some(overlay) = overlay {
                 root = root.child(overlay);
             }
         }

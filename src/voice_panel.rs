@@ -596,6 +596,7 @@ impl VoicePanel {
         self.room_size = (width.max(1.0), height.max(1.0));
     }
 
+    #[cfg(test)]
     pub fn set_scale(&mut self, scale: f32) {
         self.scale = scale.max(0.1);
         // A DPI change moves the same window rectangle to different physical

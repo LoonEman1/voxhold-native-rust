@@ -61,7 +61,12 @@ impl VoicePanel {
         })
     }
 
-    pub fn set_player_area_and_place(&mut self, area: Rect) {
+    pub fn set_player_layout(&mut self, area: Rect, scale: f32) {
+        self.scale = scale.max(0.1);
+        self.set_player_area_and_place(area);
+    }
+
+    pub(crate) fn set_player_area_and_place(&mut self, area: Rect) {
         self.player_area = area;
         if let Some(player) = self.player_box() {
             self.player_pos = (player.x, player.y);
@@ -131,6 +136,7 @@ impl VoicePanel {
         }
         self.player_fullscreen = true;
         self.player_drag = None;
+        self.sync_screen_preview_demand(window);
         // Entering fullscreen switches from the floating picture to the whole
         // window; request it before the window resize arrives as well.
         self.sync_viewport();
@@ -154,6 +160,7 @@ impl VoicePanel {
             self.player_pos = (player.x, player.y);
         }
         self.sync_viewport();
+        self.sync_screen_preview_demand(window);
         // Land on an action the restored surface really paints. The standard
         // player paints its fullscreen toggle, but the compact PiP has no such
         // button: its first action depends on the role and the phase, so a

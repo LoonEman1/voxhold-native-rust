@@ -78,6 +78,43 @@ async fn the_publisher_pip_requests_its_picture_on_every_surface(cx: &mut TestAp
     assert_eq!(width, expected, "the demand is the PiP picture width");
 }
 
+#[gpui::test]
+async fn fullscreen_viewing_suspends_the_hidden_publisher_preview(cx: &mut TestAppContext) {
+    let (mut visual, view, voice) = super::voice_tests::fixture_with(cx, Some(1400.), true);
+    visual.update(|window, app| {
+        voice.update(app, |panel, cx| {
+            super::voice_pip_tests::publish_live(panel, window, cx, 5);
+            super::voice_pip_tests::watch_publication(panel, window, cx);
+        });
+    });
+    super::voice_pip_tests::open_room(&mut visual, &view, 9);
+    voice.update(&mut *visual, |panel, _| {
+        panel.test_select_pip_role(crate::voice_panel::PipRole::Publisher);
+    });
+    draw(&mut visual);
+    assert!(sync_screen_preview_demand(&mut visual, &voice).0);
+
+    visual.update(|window, app| {
+        voice.update(app, |panel, cx| {
+            panel.player_toggle_fullscreen(window);
+            cx.notify();
+        });
+    });
+    draw(&mut visual);
+    assert!(voice.read_with(&*visual, |panel, _| panel.player_fullscreen()));
+    assert!(!sync_screen_preview_demand(&mut visual, &voice).0);
+
+    visual.update(|window, app| {
+        voice.update(app, |panel, cx| {
+            panel.exit_fullscreen(window);
+            cx.notify();
+        });
+    });
+    draw(&mut visual);
+    assert!(visual.debug_bounds("voice-pip").is_some());
+    assert!(sync_screen_preview_demand(&mut visual, &voice).0);
+}
+
 /// The physical preview width the painted `selector` asks for, following the
 /// same scale and clamp as the production request.
 fn painted_preview_width(visual: &mut gpui::VisualTestContext, selector: &'static str) -> u32 {

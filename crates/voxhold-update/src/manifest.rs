@@ -78,17 +78,49 @@ pub struct Manifest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedManifest {
     manifest: Manifest,
+    /// Exact bytes the detached signature covered.
+    raw: Vec<u8>,
+    /// Base64 detached signature. Empty for an in-memory test value that was
+    /// never signed; staging stores no usable proof for such a value.
+    signature: String,
 }
 
 impl VerifiedManifest {
-    /// Wrap an already verified manifest. Crate-internal on purpose.
+    /// Wrap an already verified manifest without proof bytes.
+    ///
+    /// This is only used by in-process tests that need a value for staging
+    /// mechanics. A staged marker built from it cannot pass the startup
+    /// signature check, which is what makes an old `ready.json` reprepare.
     pub(crate) fn new(manifest: Manifest) -> Self {
-        Self { manifest }
+        Self {
+            manifest,
+            raw: Vec::new(),
+            signature: String::new(),
+        }
+    }
+
+    /// Wrap a manifest together with the bytes and signature that verified it.
+    pub(crate) fn with_proof(manifest: Manifest, raw: Vec<u8>, signature: String) -> Self {
+        Self {
+            manifest,
+            raw,
+            signature,
+        }
     }
 
     /// Borrow the verified manifest.
     pub fn manifest(&self) -> &Manifest {
         &self.manifest
+    }
+
+    /// Exact signed bytes, or an empty slice for an unsigned test value.
+    pub fn signed_bytes(&self) -> &[u8] {
+        &self.raw
+    }
+
+    /// Base64 detached signature, or an empty string for an unsigned value.
+    pub fn signature(&self) -> &str {
+        &self.signature
     }
 
     /// Take the verified manifest.

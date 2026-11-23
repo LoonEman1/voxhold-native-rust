@@ -76,7 +76,7 @@ pub(super) fn make_app(
     (window, view, dir)
 }
 
-fn staged_update(dir: &Path) -> StagedUpdate {
+pub(super) fn staged_update(dir: &Path) -> StagedUpdate {
     staged_update_with_exe(dir, Some("Voxhold.exe"))
 }
 
@@ -94,6 +94,7 @@ fn staged_update_with_exe(dir: &Path, exe: Option<&str>) -> StagedUpdate {
         staging_dir: staging,
         app_dir: app,
         package_sha256: "a".repeat(64),
+        verified: true,
     }
 }
 
@@ -1125,6 +1126,8 @@ fn a_busy_helper_does_not_break_the_startup_scan() {
         created_at: 1,
         method: StageMethod::Full,
         fallback_reason: None,
+        manifest_sha256: String::new(),
+        manifest_signature: String::new(),
     };
     std::fs::write(
         ready.join(voxhold_update::stage::READY_FILE),
@@ -1144,10 +1147,16 @@ fn a_busy_helper_does_not_break_the_startup_scan() {
         scan.error.is_none(),
         "a locked helper is not a startup error"
     );
-    assert!(scan.ready.is_some(), "the ready marker is still reported");
+    assert!(
+        scan.ready.is_none(),
+        "a marker without signed proof is shown as unavailable, not installable"
+    );
+    assert!(
+        !ready.exists(),
+        "an old marker without proof is removed for a fresh preparation"
+    );
     assert!(busy.exists(), "the locked helper directory is skipped");
     assert!(!root.join("0.1.8").exists(), "other leftovers are removed");
-    assert!(ready.exists(), "the ready directory is preserved");
 
     std::fs::remove_dir_all(&temp).ok();
 }

@@ -3,9 +3,9 @@
 //! the whole process. The fixture and the signed-manifest helper are reused
 //! from `update_tests`, so no second `VisualTestContext` setup is needed.
 
-use super::update_tests::{draw, make_app, verified_manifest};
+use super::update_tests::{draw, make_app, staged_update, verified_manifest};
 use super::*;
-use crate::update::{self, UpdatePhase};
+use crate::update::{self, StartupScan, UpdatePhase};
 use gpui::{TestAppContext, VisualTestContext};
 use voxhold_update::download::CancelToken;
 use voxhold_update::error::UpdateError;
@@ -66,6 +66,78 @@ fn check(view: &Entity<Voxhold>, cx: &TestAppContext, version: &'static str) {
             v.finish_check(generation, Ok(manifest), cx);
         });
     });
+}
+
+#[gpui::test]
+async fn a_verified_startup_candidate_is_the_only_automatic_install(cx: &mut TestAppContext) {
+    cx.update(|cx| gpui_component::init(cx));
+    let (_window, view, dir) = make_app(cx);
+    let mut staged = staged_update(&dir);
+    view.update(cx, |v, _| {
+        v.update.prefs.install_on_next_start = true;
+        v.update.prefs.install_refused_version = None;
+        v.update.single_instance = true;
+        v.update.phase = UpdatePhase::Idle;
+    });
+    let auto = view.update(cx, |v, cx| {
+        v.apply_startup_scan_auto(
+            StartupScan {
+                root: None,
+                ready: Some(staged.clone()),
+                error: None,
+                warning: None,
+            },
+            true,
+            cx,
+        )
+    });
+    assert!(auto, "a verified package with the switch on installs");
+    assert!(matches!(
+        view.read_with(cx, |v, _| v.update.phase.clone()),
+        UpdatePhase::Ready { .. }
+    ));
+
+    // Another copy of the same installation owns the update mutex.
+    view.update(cx, |v, _| {
+        v.update.phase = UpdatePhase::Idle;
+        v.update.single_instance = false;
+    });
+    let auto = view.update(cx, |v, cx| {
+        v.apply_startup_scan_auto(
+            StartupScan {
+                root: None,
+                ready: Some(staged.clone()),
+                error: None,
+                warning: None,
+            },
+            true,
+            cx,
+        )
+    });
+    assert!(
+        !auto,
+        "a second process leaves the package for the next start"
+    );
+
+    // A marker without signed proof is never installed.
+    staged.verified = false;
+    view.update(cx, |v, _| {
+        v.update.phase = UpdatePhase::Idle;
+        v.update.single_instance = true;
+    });
+    let auto = view.update(cx, |v, cx| {
+        v.apply_startup_scan_auto(
+            StartupScan {
+                root: None,
+                ready: Some(staged),
+                error: None,
+                warning: None,
+            },
+            true,
+            cx,
+        )
+    });
+    assert!(!auto, "an unsigned marker is not installable");
 }
 
 #[gpui::test]

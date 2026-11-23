@@ -40,7 +40,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use voxhold_update::apply::{
     apply_staged, helper_relocation_destination, is_relocated_helper, relocate_helper,
 };
-use voxhold_update::recovery::{recover_install, RecoveryMode};
+use voxhold_update::recovery::{recover_install, RecoveryMode, RecoveryOutcome};
 use voxhold_update::stage::{
     cleanup_after_install, cleanup_after_install_payload, cleanup_stale, updates_root, APPLY_LOG,
     APP_DIR,
@@ -60,6 +60,9 @@ struct Arguments {
     exe: String,
     handshake: PathBuf,
     detached: bool,
+    ready: Option<PathBuf>,
+    refusal: Option<PathBuf>,
+    version: Option<String>,
 }
 
 fn main() -> ExitCode {
@@ -136,6 +139,15 @@ fn main() -> ExitCode {
         }
     }
 
+    if let Some(ready) = arguments.ready.as_deref() {
+        if let Err(error) = write_marker(ready, b"ready\n") {
+            log(
+                &log_path,
+                &format!("cannot write helper-ready marker: {error}"),
+            );
+            return ExitCode::from(EXIT_APPLY);
+        }
+    }
     if let Err(message) = wait_for_process(arguments.pid) {
         log(&log_path, &format!("wait failed: {message}"));
         return ExitCode::from(EXIT_WAIT);
@@ -190,9 +202,60 @@ fn main() -> ExitCode {
                 &log_path,
                 &format!("apply failed: {} ({error})", error.code()),
             );
+            let rolled_back = matches!(
+                recover_install(&arguments.target, RecoveryMode::Updater),
+                Ok(RecoveryOutcome::RolledBack { .. })
+                    | Ok(RecoveryOutcome::Clean)
+                    | Ok(RecoveryOutcome::Completed { .. })
+            );
+            if rolled_back {
+                if let Some(path) = arguments.refusal.as_deref() {
+                    let version = arguments
+                        .version
+                        .clone()
+                        .or_else(|| read_staged_version(&arguments.staged));
+                    if let Some(version) = version {
+                        let body = format!("{{\"version\":\"{}\"}}", version);
+                        if let Err(error) = write_marker(path, body.as_bytes()) {
+                            log(
+                                &log_path,
+                                &format!("cannot record install refusal: {error}"),
+                            );
+                        }
+                    }
+                }
+                // One normal start of the restored version. The refusal
+                // marker above stops it from auto-installing the same version
+                // again; a manual retry stays available.
+                let client = arguments.target.join(&arguments.exe);
+                if client.is_file() {
+                    match Command::new(&client).current_dir(&arguments.target).spawn() {
+                        Ok(_) => log(&log_path, "started the restored client"),
+                        Err(error) => log(
+                            &log_path,
+                            &format!("cannot start the restored client: {error}"),
+                        ),
+                    }
+                }
+            }
             ExitCode::from(EXIT_APPLY)
         }
     }
+}
+
+fn read_staged_version(staged: &Path) -> Option<String> {
+    let bytes = std::fs::read(staged.join("ready.json")).ok()?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    value.get("version")?.as_str().map(str::to_string)
+}
+
+fn write_marker(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let temporary = path.with_extension("tmp");
+    std::fs::write(&temporary, bytes)?;
+    std::fs::rename(&temporary, path)
 }
 
 /// Remove staging directories of older attempts before the helper exits.
@@ -203,15 +266,21 @@ fn main() -> ExitCode {
 /// post-handshake cleanup timer. Every other entry is best-effort: an entry
 /// that is still locked is skipped and retried by the next cleanup.
 fn cleanup_other_versions(staged: &Path, log_path: &Path) {
-    let root = match updates_root() {
-        Ok(root) => root,
-        Err(error) => {
-            log(
-                log_path,
-                &format!("stale cleanup skipped: {}", error.code()),
-            );
-            return;
-        }
+    // `staged` is `<base>\<installation-id>\<version>`; the version directory's
+    // parent belongs to this installation only. Falling back to the shared
+    // base would let one portable copy delete another copy's staging.
+    let root = match staged.parent() {
+        Some(root) => root.to_path_buf(),
+        None => match updates_root() {
+            Ok(root) => root,
+            Err(error) => {
+                log(
+                    log_path,
+                    &format!("stale cleanup skipped: {}", error.code()),
+                );
+                return;
+            }
+        },
     };
     let keep = staged
         .file_name()
@@ -244,6 +313,9 @@ fn parse_arguments(mut arguments: impl Iterator<Item = String>) -> Result<Argume
     let mut exe = None;
     let mut handshake = None;
     let mut detached = false;
+    let mut ready = None;
+    let mut refusal = None;
+    let mut version = None;
     while let Some(flag) = arguments.next() {
         let mut value = || {
             arguments
@@ -266,6 +338,9 @@ fn parse_arguments(mut arguments: impl Iterator<Item = String>) -> Result<Argume
                 exe = Some(name);
             }
             "--handshake" => handshake = Some(absolute_path("--handshake", &value()?)?),
+            "--ready" => ready = Some(absolute_path("--ready", &value()?)?),
+            "--refusal" => refusal = Some(absolute_path("--refusal", &value()?)?),
+            "--version" => version = Some(value()?),
             "--detached" => detached = true,
             other => return Err(format!("unknown argument {other}")),
         }
@@ -289,6 +364,9 @@ fn parse_arguments(mut arguments: impl Iterator<Item = String>) -> Result<Argume
         exe: exe.ok_or("missing --exe")?,
         handshake: handshake.ok_or("missing --handshake")?,
         detached,
+        ready,
+        refusal,
+        version,
     })
 }
 
@@ -480,6 +558,26 @@ mod tests {
             parsed.staged,
             std::fs::canonicalize(&fixture.staged).unwrap()
         );
+    }
+
+    #[test]
+    fn accepts_the_handoff_markers() {
+        let fixture = Fixture::new();
+        let ready = fixture.temp.path().join("helper-ready.ok");
+        let refusal = fixture.temp.path().join("prefs.refusal.json");
+        let mut args = fixture.args();
+        args.extend([
+            "--ready".into(),
+            ready.to_string_lossy().into_owned(),
+            "--refusal".into(),
+            refusal.to_string_lossy().into_owned(),
+            "--version".into(),
+            "0.2.0".into(),
+        ]);
+        let parsed = parse_arguments(args.into_iter()).unwrap();
+        assert_eq!(parsed.ready.as_deref(), Some(ready.as_path()));
+        assert_eq!(parsed.refusal.as_deref(), Some(refusal.as_path()));
+        assert_eq!(parsed.version.as_deref(), Some("0.2.0"));
     }
 
     #[test]

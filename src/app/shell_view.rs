@@ -966,6 +966,9 @@ impl Render for Voxhold {
                     ),
             );
         }
+        if matches!(self.update.phase, crate::update::UpdatePhase::Installing) {
+            root = root.child(self.update_install_overlay());
+        }
         // The popup sits above the backdrop so a click inside it is not a
         // dismiss, and below the modal layers that follow.
         if self.update.panel_open {

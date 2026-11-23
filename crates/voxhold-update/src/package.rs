@@ -517,26 +517,47 @@ pub fn read_package_json_from_dir(dir: &Path) -> Result<PackageIndex> {
     PackageIndex::parse(&bytes)
 }
 
-/// Read and validate `package.json` from a package ZIP on disk.
+/// Read and validate `package.json` from a ZIP on disk.
+///
+/// Only the index entry is decompressed; the archive is never read into one
+/// buffer.
 pub fn read_package_json_from_file(path: &Path) -> Result<PackageIndex> {
     let file = std::fs::File::open(path).map_err(|error| UpdateError::io(path, error))?;
     let mut archive =
         ZipArchive::new(file).map_err(|error| UpdateError::InvalidPackage(error.to_string()))?;
-    let mut entry = archive
+    let entry = archive
         .by_name(PACKAGE_JSON)
         .map_err(|_| UpdateError::InvalidPackage("package.json is missing".into()))?;
     let mut raw = Vec::new();
     entry
-        .by_ref()
-        .take(package_json_limit() + 1)
+        .take((crate::manifest::MAX_NOTES_BYTES * 16) as u64)
         .read_to_end(&mut raw)
         .map_err(|error| UpdateError::InvalidPackage(error.to_string()))?;
-    if raw.len() as u64 > package_json_limit() {
-        return Err(UpdateError::InvalidPackage(
-            "package.json is too large".into(),
-        ));
-    }
     PackageIndex::parse(&raw)
+}
+
+/// Verify an unpacked directory against a package index.
+///
+/// Every indexed file must exist with the exact size and SHA-256. Extra files
+/// are allowed: the helper migrates user files that are not part of the
+/// package.
+pub fn verify_dir(dir: &Path, index: &PackageIndex) -> Result<()> {
+    index.validate()?;
+    for file in &index.files {
+        let path = dir.join(Path::new(&file.path));
+        let metadata = std::fs::metadata(&path).map_err(|error| UpdateError::io(&path, error))?;
+        if !metadata.is_file() || metadata.len() != file.size {
+            return Err(UpdateError::SizeMismatch {
+                path: path.clone(),
+                expected: file.size,
+                actual: metadata.len(),
+            });
+        }
+        if sha256_file(&path)? != file.sha256 {
+            return Err(UpdateError::HashMismatch { path });
+        }
+    }
+    Ok(())
 }
 
 /// SHA-256 of arbitrary bytes as lowercase hex.

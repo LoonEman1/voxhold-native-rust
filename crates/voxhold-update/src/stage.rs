@@ -18,6 +18,10 @@ use crate::package::{self, PackageIndex, PackedPackage};
 
 /// Marker written after a successful stage.
 pub const READY_FILE: &str = "ready.json";
+/// Exact signed `latest.json` bytes kept next to the staged package.
+pub const MANIFEST_FILE: &str = "manifest.json";
+/// Detached signature kept next to the staged package.
+pub const SIGNATURE_FILE: &str = "manifest.sig";
 /// Helper log inside the staging directory.
 pub const APPLY_LOG: &str = "apply.log";
 /// Downloaded or reconstructed full package.
@@ -51,6 +55,13 @@ pub struct ReadyMarker {
     pub method: StageMethod,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub fallback_reason: Option<String>,
+    /// SHA-256 of `manifest.json`. Empty in a marker written before signed
+    /// proofs were stored; such a marker is not installable.
+    #[serde(default)]
+    pub manifest_sha256: String,
+    /// Base64 detached signature over `manifest.json`.
+    #[serde(default)]
+    pub manifest_signature: String,
 }
 
 /// A verified staged update.
@@ -61,6 +72,9 @@ pub struct StagedUpdate {
     pub staging_dir: PathBuf,
     pub app_dir: PathBuf,
     pub package_sha256: String,
+    /// `true` when the staging directory carries a signed manifest proof.
+    /// A marker without proof may be shown but is never installed.
+    pub verified: bool,
 }
 
 /// Result of a staging attempt.
@@ -161,9 +175,27 @@ fn updates_root_from_base(base: Option<&std::ffi::OsStr>) -> Result<PathBuf> {
     }
 }
 
-/// Staging directory for a version.
-pub fn staging_dir(root: &Path, version: &Version) -> PathBuf {
-    root.join(version.to_string())
+/// Stable per-installation key.
+///
+/// Two portable copies under the same Windows user share `%LOCALAPPDATA%`.
+/// Binding staging to the canonical install path keeps their preparations (and
+/// the helper's cleanup) apart.
+pub fn installation_id(install_dir: &Path) -> String {
+    let canonical =
+        std::fs::canonicalize(install_dir).unwrap_or_else(|_| install_dir.to_path_buf());
+    let text = canonical.to_string_lossy().to_lowercase();
+    crate::package::sha256_hex(text.as_bytes())[..16].to_string()
+}
+
+/// Updates root for one installation.
+pub fn updates_root_for(install_dir: &Path) -> Result<PathBuf> {
+    Ok(updates_root()?.join(installation_id(install_dir)))
+}
+
+/// Staging directory for a version of one installation.
+pub fn staging_dir(root: &Path, install_dir: &Path, version: &Version) -> PathBuf {
+    root.join(installation_id(install_dir))
+        .join(version.to_string())
 }
 
 /// Read `ready.json` from a staging directory.
@@ -179,7 +211,12 @@ pub async fn stage_update(request: StageRequest<'_>) -> StageOutcome {
         Ok(Some(staged)) => StageOutcome::Ready(staged),
         Ok(None) => StageOutcome::UpToDate,
         Err(error) => {
-            let _ = cleanup_version(request.updates_root, &request.manifest.version).await;
+            let _ = cleanup_version(
+                request.updates_root,
+                request.install_dir,
+                &request.manifest.version,
+            )
+            .await;
             StageOutcome::Failed(error)
         }
     }
@@ -196,7 +233,7 @@ async fn stage_inner(request: &StageRequest<'_>) -> Result<Option<StagedUpdate>>
     }
 
     let version = candidate;
-    let staging = staging_dir(request.updates_root, &version);
+    let staging = staging_dir(request.updates_root, request.install_dir, &version);
     if staging.exists() {
         tokio::fs::remove_dir_all(&staging)
             .await
@@ -404,6 +441,23 @@ fn ready(
     // behind: the next start would offer an update the user stopped.
     check_cancelled(request)?;
     let package_sha256 = request.manifest.full.package_sha256.clone();
+    // Keep the exact bytes and signature that were verified. A value built
+    // only in memory has no signature; its marker stays displayable but the
+    // startup check refuses to install it.
+    let manifest_bytes = if request.manifest.signed_bytes().is_empty() {
+        serde_json::to_vec(request.manifest.manifest()).expect("manifest serialization")
+    } else {
+        request.manifest.signed_bytes().to_vec()
+    };
+    let manifest_path = staging.join(MANIFEST_FILE);
+    std::fs::write(&manifest_path, &manifest_bytes)
+        .map_err(|error| UpdateError::io(&manifest_path, error))?;
+    let signature = request.manifest.signature().to_string();
+    if !signature.is_empty() {
+        let signature_path = staging.join(SIGNATURE_FILE);
+        std::fs::write(&signature_path, signature.as_bytes())
+            .map_err(|error| UpdateError::io(&signature_path, error))?;
+    }
     let marker = ReadyMarker {
         version: version.to_string(),
         package_sha256: package_sha256.clone(),
@@ -414,6 +468,8 @@ fn ready(
             .unwrap_or(0),
         method,
         fallback_reason,
+        manifest_sha256: package::sha256_hex(&manifest_bytes),
+        manifest_signature: signature,
     };
     let path = staging.join(READY_FILE);
     let temporary = staging.join("ready.json.tmp");
@@ -427,12 +483,13 @@ fn ready(
         app_dir: staging.join(APP_DIR),
         staging_dir: staging,
         package_sha256,
+        verified: !marker.manifest_signature.is_empty(),
     })
 }
 
-/// Remove one version's staging directory.
-pub async fn cleanup_version(root: &Path, version: &str) -> Result<()> {
-    let path = root.join(version);
+/// Remove one version's staging directory for an installation.
+pub async fn cleanup_version(root: &Path, install_dir: &Path, version: &str) -> Result<()> {
+    let path = root.join(installation_id(install_dir)).join(version);
     match tokio::fs::remove_dir_all(&path).await {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -542,6 +599,20 @@ pub fn cleanup_after_install_payload(staging: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn staging_is_bound_to_the_installation() {
+        let root = Path::new(r"C:\Users\test\AppData\Local\VoxHold\updates");
+        let a = Path::new(r"C:\Games\Voxhold-A");
+        let b = Path::new(r"C:\Games\Voxhold-B");
+        assert_ne!(installation_id(a), installation_id(b));
+        assert_ne!(
+            staging_dir(root, a, &Version::new(0, 2, 0)),
+            staging_dir(root, b, &Version::new(0, 2, 0))
+        );
+        assert!(staging_dir(root, a, &Version::new(0, 2, 0))
+            .ends_with(Path::new(&installation_id(a)).join("0.2.0")));
+    }
 
     #[test]
     fn cleanup_removes_old_attempts() {

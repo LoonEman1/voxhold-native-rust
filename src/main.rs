@@ -188,7 +188,7 @@ fn main() {
                     // it the state stays unconfirmed so the helper can roll
                     // back.
                     view.update(cx, |view, cx| {
-                        view.start_update(handshake.is_some(), handshake_written, cx)
+                        view.start_update(handshake.is_some(), handshake_written, window, cx)
                     });
                     cx.new(|cx| Root::new(view.into(), window, cx))
                 },

@@ -15,9 +15,11 @@ use voxhold_update::error::UpdateError;
 use voxhold_update::manifest::{Manifest, Offer, WindowsVersion, BETA_CHANNEL};
 use voxhold_update::recovery::{recover_install, RecoveryMode, RecoveryOutcome};
 use voxhold_update::stage::{
-    cleanup_stale_keeping, read_ready, updates_root, StagedUpdate, APP_DIR, READY_FILE,
+    cleanup_stale_keeping, read_ready, updates_root, StagedUpdate, APP_DIR, MANIFEST_FILE,
+    READY_FILE, SIGNATURE_FILE,
 };
 use voxhold_update::urls::validate_update_url;
+use voxhold_update::verify::{embedded_public_key, verify_and_parse, UpdatePublicKey};
 
 /// Public beta channel.
 pub const CHANNEL: &str = BETA_CHANNEL;
@@ -114,6 +116,10 @@ pub struct UpdatePrefs {
     pub auto_download: bool,
     #[serde(default = "default_true")]
     pub install_on_next_start: bool,
+    /// A version whose automatic install was refused after a rollback. Manual
+    /// install stays available.
+    #[serde(default)]
+    pub install_refused_version: Option<String>,
 }
 
 impl Default for UpdatePrefs {
@@ -122,6 +128,7 @@ impl Default for UpdatePrefs {
             declined_version: None,
             auto_download: default_true(),
             install_on_next_start: default_true(),
+            install_refused_version: None,
         }
     }
 }
@@ -301,6 +308,32 @@ pub fn should_auto_download(
     true
 }
 
+/// Whether a staged package found at startup may be installed automatically.
+///
+/// A package without a re-verified signed manifest is never installed: an old
+/// `ready.json` has to be prepared again by a background download.
+pub fn should_auto_install(prefs: &UpdatePrefs, staged: &StagedUpdate, current: &Version) -> bool {
+    prefs.install_on_next_start
+        && staged.verified
+        && staged.version > *current
+        && prefs.install_refused_version.as_deref() != Some(staged.version.to_string().as_str())
+}
+
+/// Sidecar the helper writes after a confirmed rollback. It is read once at
+/// the next start and merged into `UpdatePrefs`.
+pub fn refusal_path(prefs_path: Option<&Path>) -> Option<PathBuf> {
+    prefs_path.map(|path| path.with_extension("refusal.json"))
+}
+
+/// Consume a rollback refusal left by the helper, if one exists.
+pub fn take_refusal(path: Option<&Path>) -> Option<String> {
+    let path = path?;
+    let bytes = std::fs::read(path).ok()?;
+    let _ = std::fs::remove_file(path);
+    let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    value.get("version")?.as_str().map(str::to_string)
+}
+
 /// Text under a ready version. It only promises an automatic install when the
 /// user left the switch on.
 pub fn ready_note(install_on_next_start: bool) -> &'static str {
@@ -399,6 +432,24 @@ pub fn startup_scan(
     root_override: Option<&Path>,
     cleanup_backup: bool,
 ) -> StartupScan {
+    match embedded_public_key() {
+        Ok(key) => startup_scan_with_key(install_dir, current, root_override, cleanup_backup, &key),
+        Err(error) => StartupScan {
+            error: Some(message_for_error(&error)),
+            ..Default::default()
+        },
+    }
+}
+
+/// Startup scan with an explicit verification key, used by local acceptance
+/// and tests that sign their own manifest.
+pub fn startup_scan_with_key(
+    install_dir: &Path,
+    current: &Version,
+    root_override: Option<&Path>,
+    cleanup_backup: bool,
+    key: &UpdatePublicKey,
+) -> StartupScan {
     let root = match root_override
         .map(Path::to_path_buf)
         .map(Ok)
@@ -426,7 +477,7 @@ pub fn startup_scan(
             Err(error) => scan.error = Some(message_for_error(&error)),
         }
     }
-    let ready = find_ready(&root, install_dir, current);
+    let ready = find_ready(&root, install_dir, current, key);
     let mut keep = vec![current.to_string()];
     if let Some(staged) = &ready {
         keep.push(staged.version.to_string());
@@ -479,7 +530,12 @@ fn protected_staging_dirs(root: &Path) -> Vec<String> {
         .collect()
 }
 
-fn find_ready(root: &Path, install_dir: &Path, current: &Version) -> Option<StagedUpdate> {
+fn find_ready(
+    root: &Path,
+    install_dir: &Path,
+    current: &Version,
+    key: &UpdatePublicKey,
+) -> Option<StagedUpdate> {
     let entries = std::fs::read_dir(root).ok()?;
     let mut best: Option<StagedUpdate> = None;
     for entry in entries.flatten() {
@@ -507,12 +563,16 @@ fn find_ready(root: &Path, install_dir: &Path, current: &Version) -> Option<Stag
         {
             continue;
         }
+        if !staged_proof_is_valid(&staging, &marker, &version, install_dir, key) {
+            continue;
+        }
         let candidate = StagedUpdate {
             version: version.clone(),
             method: marker.method,
             staging_dir: staging.clone(),
             app_dir: staging.join(APP_DIR),
             package_sha256: marker.package_sha256,
+            verified: true,
         };
         if best
             .as_ref()
@@ -523,6 +583,64 @@ fn find_ready(root: &Path, install_dir: &Path, current: &Version) -> Option<Stag
         }
     }
     best
+}
+
+/// Re-verify the proof stored with a staged package before it may be installed.
+///
+/// This runs offline and repeats every check that does not depend on the
+/// network: signature with the embedded key, channel, version, Windows target,
+/// install directory, full ZIP hash and the unpacked file index.
+fn staged_proof_is_valid(
+    staging: &Path,
+    marker: &voxhold_update::stage::ReadyMarker,
+    version: &Version,
+    install_dir: &Path,
+    key: &UpdatePublicKey,
+) -> bool {
+    (|| -> Option<()> {
+        if marker.manifest_sha256.is_empty() || marker.manifest_signature.is_empty() {
+            return None;
+        }
+        let manifest_path = staging.join(MANIFEST_FILE);
+        let signature_path = staging.join(SIGNATURE_FILE);
+        let raw = std::fs::read(&manifest_path).ok()?;
+        if voxhold_update::package::sha256_hex(&raw) != marker.manifest_sha256 {
+            return None;
+        }
+        let signature = std::fs::read_to_string(&signature_path)
+            .ok()
+            .unwrap_or_else(|| marker.manifest_signature.clone());
+        if signature.trim() != marker.manifest_signature.trim() {
+            return None;
+        }
+        let manifest = verify_and_parse(key, &raw, &signature).ok()?;
+        if manifest.channel != CHANNEL {
+            return None;
+        }
+        if manifest.version != version.to_string() {
+            return None;
+        }
+        if let Some(windows) = voxhold_update::manifest::WindowsVersion::current() {
+            manifest.check_windows(&windows).ok()?;
+        }
+        if !paths_equal(Path::new(&marker.install_dir), install_dir) {
+            return None;
+        }
+        if manifest.full.package_sha256 != marker.package_sha256 {
+            return None;
+        }
+        let package_path = staging.join(voxhold_update::stage::PACKAGE_FILE);
+        if voxhold_update::package::sha256_file(&package_path).ok()? != marker.package_sha256 {
+            return None;
+        }
+        let index = voxhold_update::package::read_package_json_from_file(&package_path).ok()?;
+        if index.version != version.to_string() {
+            return None;
+        }
+        voxhold_update::package::verify_dir(&staging.join(APP_DIR), &index).ok()?;
+        Some(())
+    })()
+    .is_some()
 }
 
 fn paths_equal(left: &Path, right: &Path) -> bool {
@@ -562,315 +680,8 @@ pub fn write_handshake(path: &Path, operation: Option<&str>) -> std::io::Result<
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use voxhold_update::manifest::{FullPackage, SetupPackage};
-
-    fn manifest(version: &str) -> Manifest {
-        Manifest {
-            schema: 1,
-            channel: CHANNEL.into(),
-            version: version.into(),
-            min_windows: "10.0.19041".into(),
-            published_at: "2026-11-19T12:00:00Z".into(),
-            notes: "Что нового".into(),
-            authenticode: false,
-            full: FullPackage {
-                url: "https://example.invalid/full.zip".into(),
-                size: 10,
-                sha256: "a".repeat(64),
-                package_sha256: "a".repeat(64),
-            },
-            setup: SetupPackage {
-                url: "https://example.invalid/Setup.exe".into(),
-                size: 10,
-                sha256: "b".repeat(64),
-            },
-            deltas: Vec::new(),
-        }
-    }
-
-    #[test]
-    fn build_version_prefers_a_valid_override() {
-        assert_eq!(
-            version_from_sources(Some("0.2.0"), "0.1.0"),
-            Version::new(0, 2, 0)
-        );
-        assert_eq!(
-            version_from_sources(Some("not-a-version"), "0.1.0"),
-            Version::new(0, 1, 0)
-        );
-        assert_eq!(
-            version_from_sources(Some("  "), "0.1.0"),
-            Version::new(0, 1, 0)
-        );
-    }
-
-    #[test]
-    fn offers_only_a_newer_version_and_respects_dismissal() {
-        let current = Version::new(0, 1, 0);
-        let phase = evaluate_manifest(&manifest("0.2.0"), &current, None, None).unwrap();
-        assert!(matches!(
-            phase,
-            UpdatePhase::Available { ref version, .. } if version == "0.2.0"
-        ));
-
-        let dismissed = Version::new(0, 2, 0);
-        assert!(matches!(
-            evaluate_manifest(&manifest("0.2.0"), &current, Some(&dismissed), None).unwrap(),
-            UpdatePhase::UpToDate
-        ));
-        assert!(matches!(
-            evaluate_manifest(&manifest("0.2.0"), &Version::new(0, 2, 0), None, None).unwrap(),
-            UpdatePhase::UpToDate
-        ));
-        assert!(matches!(
-            evaluate_manifest(&manifest("0.0.9"), &current, None, None),
-            Err(UpdateError::Downgrade { .. })
-        ));
-    }
-
-    #[test]
-    fn errors_are_short_and_never_leak_a_query() {
-        let error = UpdateError::HttpStatus {
-            url: "https://example.invalid/latest.json?token=secret".into(),
-            status: 404,
-        };
-        let message = message_for_error(&error);
-        assert!(message.contains("404"));
-        assert!(!message.contains("secret"));
-        assert!(!message.contains("https://"));
-
-        let broken = message_for_error(&UpdateError::BadSignature);
-        assert!(broken.contains("Подпись"));
-        let network = message_for_error(&UpdateError::Network(
-            "https://example.invalid/?token=secret".into(),
-        ));
-        assert!(!network.contains("secret"));
-    }
-
-    #[test]
-    fn urls_accept_loopback_and_https_but_reject_remote_http() {
-        let (manifest, signature) = urls_from_base(Some("http://127.0.0.1:8123/")).unwrap();
-        assert_eq!(manifest, "http://127.0.0.1:8123/latest.json");
-        assert_eq!(signature, "http://127.0.0.1:8123/latest.json.sig");
-
-        let (manifest, _) = urls_from_base(Some("https://example.invalid/assets")).unwrap();
-        assert_eq!(manifest, "https://example.invalid/assets/latest.json");
-
-        assert!(urls_from_base(Some("http://example.invalid")).is_err());
-        let (manifest, signature) = urls_from_base(None).unwrap();
-        assert!(manifest.starts_with("https://github.com/"));
-        assert!(signature.ends_with("latest.json.sig"));
-    }
-
-    #[test]
-    fn progress_percent_is_bounded() {
-        assert_eq!(percent(0, 100), 0);
-        assert_eq!(percent(50, 100), 50);
-        assert_eq!(percent(100, 100), 100);
-        assert_eq!(percent(200, 100), 100);
-        assert_eq!(percent(10, 0), 0);
-    }
-
-    #[test]
-    fn handshake_creates_parents_and_is_not_empty() {
-        let dir = std::env::temp_dir().join(format!(
-            "voxhold-handshake-{}-{}",
-            std::process::id(),
-            uuid::Uuid::new_v4()
-        ));
-        let path = dir.join("nested").join("handshake.ok");
-        write_handshake(&path, Some("op-1")).unwrap();
-        let text = std::fs::read_to_string(&path).unwrap();
-        assert!(text.contains(&current_version().to_string()));
-        assert!(text.contains("op-1"));
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn startup_scan_reports_a_ready_update_and_keeps_it() {
-        let temp = std::env::temp_dir().join(format!(
-            "voxhold-startup-scan-{}-{}",
-            std::process::id(),
-            uuid::Uuid::new_v4()
-        ));
-        let install = temp.join("VoxHold");
-        let root = temp.join("updates");
-        let staging = root.join("0.2.0");
-        std::fs::create_dir_all(install.join("assets")).unwrap();
-        std::fs::create_dir_all(staging.join(APP_DIR)).unwrap();
-        std::fs::create_dir_all(root.join("0.1.9")).unwrap();
-        let marker = voxhold_update::stage::ReadyMarker {
-            version: "0.2.0".into(),
-            package_sha256: "a".repeat(64),
-            install_dir: install.to_string_lossy().into_owned(),
-            created_at: 1,
-            method: voxhold_update::stage::StageMethod::Full,
-            fallback_reason: None,
-        };
-        std::fs::write(
-            staging.join(READY_FILE),
-            serde_json::to_vec(&marker).unwrap(),
-        )
-        .unwrap();
-
-        let scan = startup_scan(&install, &Version::new(0, 1, 0), Some(root.as_path()), true);
-        let ready = scan.ready.expect("ready update");
-        assert_eq!(ready.version, Version::new(0, 2, 0));
-        assert!(staging.exists(), "the ready directory must be preserved");
-        assert!(!root.join("0.1.9").exists());
-
-        std::fs::remove_dir_all(&temp).ok();
-    }
-
-    #[test]
-    fn startup_scan_keeps_a_handshake_directory_without_ready() {
-        let temp = std::env::temp_dir().join(format!(
-            "voxhold-handshake-keep-{}-{}",
-            std::process::id(),
-            uuid::Uuid::new_v4()
-        ));
-        let install = temp.join("VoxHold");
-        let root = temp.join("updates");
-        std::fs::create_dir_all(&install).unwrap();
-        let staging = root.join("0.2.0");
-        std::fs::create_dir_all(&staging).unwrap();
-        std::fs::write(staging.join("handshake.ok"), b"ok").unwrap();
-        std::fs::create_dir_all(root.join("0.1.9")).unwrap();
-
-        let scan = startup_scan(&install, &Version::new(0, 1, 0), Some(root.as_path()), true);
-        assert!(scan.ready.is_none());
-        assert!(
-            staging.exists(),
-            "the handshake directory must be preserved"
-        );
-        assert!(!root.join("0.1.9").exists());
-        std::fs::remove_dir_all(&temp).ok();
-    }
-
-    #[test]
-    fn a_confirmed_update_start_completes_before_the_second_cleanup() {
-        use voxhold_update::recovery::{recover_install, RecoveryMode, RecoveryOutcome};
-        use voxhold_update::state::{self, InstallState, OperationStage, StateLoad};
-
-        fn install_package(root: &std::path::Path, version: &str, exe: &[u8]) {
-            std::fs::create_dir_all(root).unwrap();
-            std::fs::write(root.join("Voxhold.exe"), exe).unwrap();
-            let packed = voxhold_update::package::pack_with_index(root, version).unwrap();
-            std::fs::remove_dir_all(root).unwrap();
-            voxhold_update::package::unpack(&packed.bytes, root).unwrap();
-        }
-
-        let temp = std::env::temp_dir().join(format!(
-            "voxhold-confirmed-start-{}-{}",
-            std::process::id(),
-            uuid::Uuid::new_v4()
-        ));
-        let install = temp.join("VoxHold");
-        let root = temp.join("updates");
-        let update_dir = root.join("0.2.0");
-        let backup = state::backup_path(&install);
-        install_package(&install, "0.2.0", b"new exe");
-        install_package(&backup, "0.1.0", b"old exe");
-        std::fs::create_dir_all(&update_dir).unwrap();
-        // The helper stored the handshake in the staged update directory.
-        let handshake = update_dir.join("handshake.ok");
-        write_handshake(&handshake, Some("op-1")).unwrap();
-
-        let state = InstallState {
-            schema: state::STATE_SCHEMA,
-            operation_id: "op-1".into(),
-            stage: OperationStage::NewInPlace,
-            install_dir: install.clone(),
-            backup_dir: backup.clone(),
-            staging_dir: state::operation_staging_path(&install, "op-1"),
-            handshake_path: handshake.clone(),
-            version: "0.2.0".into(),
-            previous_version: Some("0.1.0".into()),
-            had_install: true,
-            created_at: 1,
-        };
-        state::save(&state).unwrap();
-
-        // An update start with a written handshake must run the observer,
-        // which persists completion while the proof still exists.
-        let scan = startup_scan(&install, &Version::new(0, 2, 0), Some(root.as_path()), true);
-        assert!(scan.error.is_none(), "{scan:?}");
-        assert!(handshake.exists(), "the observer must run before cleanup");
-        assert_eq!(state::load(&install), StateLoad::Missing);
-        assert!(!backup.exists());
-
-        // Only now may the 10 s cleanup remove the handshake directory.
-        second_cleanup(&root, None).unwrap();
-        assert!(!update_dir.exists());
-        assert_eq!(
-            recover_install(&install, RecoveryMode::Observer).unwrap(),
-            RecoveryOutcome::Clean
-        );
-        assert_eq!(
-            std::fs::read(install.join("Voxhold.exe")).unwrap(),
-            b"new exe"
-        );
-        std::fs::remove_dir_all(&temp).ok();
-    }
-
-    #[test]
-    fn a_failed_handshake_keeps_the_update_unconfirmed() {
-        // Without the handshake file the observer must not complete the
-        // operation; recovery keeps the state and the backup for the helper.
-        use voxhold_update::recovery::{recover_install, RecoveryMode, RecoveryOutcome};
-        use voxhold_update::state::{self, InstallState, OperationStage, StateLoad};
-
-        let temp = std::env::temp_dir().join(format!(
-            "voxhold-unconfirmed-start-{}-{}",
-            std::process::id(),
-            uuid::Uuid::new_v4()
-        ));
-        let install = temp.join("VoxHold");
-        std::fs::create_dir_all(&install).unwrap();
-        let backup = state::backup_path(&install);
-        std::fs::create_dir_all(&backup).unwrap();
-        let handshake = temp.join("updates").join("handshake.ok");
-        let state = InstallState {
-            schema: state::STATE_SCHEMA,
-            operation_id: "op-1".into(),
-            stage: OperationStage::NewInPlace,
-            install_dir: install.clone(),
-            backup_dir: backup.clone(),
-            staging_dir: state::operation_staging_path(&install, "op-1"),
-            handshake_path: handshake,
-            version: "0.2.0".into(),
-            previous_version: Some("0.1.0".into()),
-            had_install: true,
-            created_at: 1,
-        };
-        state::save(&state).unwrap();
-
-        let outcome = recover_install(&install, RecoveryMode::Observer).unwrap();
-        assert!(matches!(outcome, RecoveryOutcome::NeedsUpdater { .. }));
-        assert!(matches!(state::load(&install), StateLoad::Valid(_)));
-        assert!(backup.exists());
-        std::fs::remove_dir_all(&temp).ok();
-    }
-
-    #[test]
-    fn second_cleanup_keeps_only_the_ready_directory() {
-        let temp = std::env::temp_dir().join(format!(
-            "voxhold-second-cleanup-{}-{}",
-            std::process::id(),
-            uuid::Uuid::new_v4()
-        ));
-        let root = temp.join("updates");
-        std::fs::create_dir_all(root.join("0.2.0")).unwrap();
-        std::fs::create_dir_all(root.join("0.3.0")).unwrap();
-        let removed = second_cleanup(&root, Some(&Version::new(0, 2, 0))).unwrap();
-        assert_eq!(removed, 1);
-        assert!(root.join("0.2.0").exists());
-        assert!(!root.join("0.3.0").exists());
-        std::fs::remove_dir_all(&temp).ok();
-    }
-}
+#[path = "update_tests.rs"]
+mod tests;
 
 #[cfg(test)]
 #[path = "update_prefs_tests.rs"]

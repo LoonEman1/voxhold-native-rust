@@ -592,4 +592,14 @@ PR [#44](https://github.com/LoonEman1/voxhold-native-rust/pull/44) вошёл в
 - Демонстрация экрана поддерживает H.264, VP8, VP9 и AV1. Проверяются согласованный кодек и доступность декодера. [PR #58](https://github.com/LoonEman1/voxhold-native-rust/pull/58), [merge `0ddda62`](https://github.com/LoonEman1/voxhold-native-rust/commit/0ddda6252ef8311d5e4bc42a1229fe7b5a157d5e).
 - Проверка релизных пакетов использует подписанный манифест и ждёт готовности установщика. Очистка ограничена кешем выбранной установки. [PR #60](https://github.com/LoonEman1/voxhold-native-rust/pull/60), [merge `14ccb57`](https://github.com/LoonEman1/voxhold-native-rust/commit/14ccb5769549d47b9faca36b5b2a945913989f29).
 - Локально прошли `cargo check --workspace --locked`, 1 577 тестов интеграционного кандидата и 15 тестов итогового helper. Проверены Windows x64 release, обновление Setup и portable ZIP с пробной подписью, скрытие и восстановление окна. Живой backend, браузеры и Authenticode остаются для отдельной проверки.
-- Версия и [изменения с 0.2.1](release-notes/0.2.5.md) подготовлены в [PR #61](https://github.com/LoonEman1/voxhold-native-rust/pull/61). Проверка аппаратных энкодеров из [PR #59](https://github.com/LoonEman1/voxhold-native-rust/pull/59) остаётся отдельным этапом.
+- Версия и [изменения с 0.2.1](release-notes/0.2.5.md) подготовлены в [PR #61](https://github.com/LoonEman1/voxhold-native-rust/pull/61).
+
+### Проверка аппаратных энкодеров — PR #59
+
+[PR #59](https://github.com/LoonEman1/voxhold-native-rust/pull/59) вошёл в `dev` merge-коммитом [`f7ad36c`](https://github.com/LoonEman1/voxhold-native-rust/commit/f7ad36c); проверенная голова ветки `4f08727`.
+
+- Media-срез: DXGI-адаптеры без WARP/software, идентичность по LUID, версия драйвера (`CheckInterfaceSupport` + реестр), `MFTEnum2` + `MFT_ENUM_ADAPTER_LUID`, асинхронные MFT (`MF_TRANSFORM_ASYNC_UNLOCK`, события `NeedInput`/`HaveOutput`), проверка профиля/размера/FPS/NV12 и ключевого кадра; снимок `Checking|Ready` с поколением и причинами; кэш/reconcile/revalidate; bounded worker с отменой.
+- H.264: Annex B, SPS/PPS из кадра или `MF_MT_MPEG_SEQUENCE_HEADER`, IDR, профиль из SPS приоритетнее атрибута. AV1: sequence header и `frame_type == KEY_FRAME`.
+- Hardware (RTX 4070 Ti, драйвер 32.0.16.1692, LUID `00000000:0000dd2d`): **H.264 Constrained Baseline 3.1, 720p30** и **AV1 Main, 720p30** подтверждены реальным MFT; VP8/VP9 — `encoder_not_provided`. Мутацией доказано: без async-unlock H.264 падает `MF_E_TRANSFORM_ASYNC_LOCKED`.
+- Проверки: `voxhold-media` 447 passed, `video_encoder` 43 (+4 ignored), hardware 4/4, fmt/check/file sizes OK.
+- Не проверено: Intel/AMD, RDP/VM, loopback с web-viewer и принятыми кадрами, реальная задержка энкодера. Engine/`PreEncoded`/UI — следующий срез.

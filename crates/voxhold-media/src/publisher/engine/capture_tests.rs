@@ -86,6 +86,7 @@ fn start(script: Script) -> PublisherEngine {
         None,
         None,
         Arc::new(PreviewStore::default()),
+        true,
     )
     .expect("synthetic engine")
 }

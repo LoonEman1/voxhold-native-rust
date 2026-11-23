@@ -172,4 +172,57 @@ mod tests {
         );
         assert_eq!(publisher.phase(), Phase::Publishing);
     }
+
+    /// C06: after a transport loss the recovered attempt must carry the same
+    /// concrete codec the live attempt negotiated, not a substitute.
+    #[test]
+    fn a_reconnect_replays_the_confirmed_codec() {
+        let now = Instant::now();
+        let mut live = publisher();
+        let av1 = PublishRequest {
+            codec: Codec::Av1,
+            ..request()
+        };
+        live.begin_picker(1);
+        live.publish(1, av1.clone(), false, now);
+        live.engine_ready(now, false, None);
+        live.on_engine(
+            crate::publisher::EngineEvent::State(crate::publisher::Connection::Connected),
+            now,
+        );
+        live.on_engine(
+            crate::publisher::EngineEvent::State(crate::publisher::Connection::FirstFrame),
+            now,
+        );
+        assert_eq!(live.phase(), Phase::Live);
+
+        let intent = live
+            .recovery_request()
+            .expect("a live attempt is a recovery intent");
+        assert_eq!(intent.codec, Codec::Av1, "the same selection survives");
+
+        // The new socket owns a fresh publisher and restarts the confirmed
+        // configuration exactly.
+        let mut recovered = publisher();
+        let outcomes = recovered.recover(intent.clone(), false, now);
+        let started = outcomes
+            .iter()
+            .find_map(|outcome| match outcome {
+                PublisherOutcome::StartEngine { request, .. } => Some(request.clone()),
+                _ => None,
+            })
+            .expect("the recovered attempt starts");
+        assert_eq!(started, intent);
+        let ready = recovered.engine_ready(now, false, None);
+        let codec = ready
+            .iter()
+            .find_map(|outcome| match outcome {
+                PublisherOutcome::Send(signal) if signal.kind == "stream.start" => {
+                    Some(signal.data["codec"].clone())
+                }
+                _ => None,
+            })
+            .expect("the recovered attempt sends its own start");
+        assert_eq!(codec, serde_json::json!("av1"));
+    }
 }

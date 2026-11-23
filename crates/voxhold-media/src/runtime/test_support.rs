@@ -139,19 +139,35 @@ impl VoiceHandle {
     /// the picker id for picker actions and the real quality-operation id for
     /// `restart`, `bitrate` and `cancel-restart`; `stop` has none.
     pub fn take_screen_commands_for_tests(&self) -> Vec<(&'static str, u64)> {
+        self.take_screen_requests_for_tests()
+            .into_iter()
+            .map(|(kind, target, _)| (kind, target))
+            .collect()
+    }
+
+    /// Drain the queued screen actions with the codec of the request they
+    /// carry. Only publish/restart/bitrate commands have a concrete codec; the
+    /// other actions describe no payload.
+    pub fn take_screen_requests_for_tests(
+        &self,
+    ) -> Vec<(&'static str, u64, Option<crate::publisher::Codec>)> {
         let mut out = Vec::new();
         while let Some(pending) = self.requests.take() {
             let Pending::Screen(command) = pending else {
                 continue;
             };
             out.push(match command {
-                ScreenCommand::OpenPicker { picker } => ("open", picker),
-                ScreenCommand::Publish { picker, .. } => ("publish", picker),
-                ScreenCommand::Restart { op, .. } => ("restart", op),
-                ScreenCommand::LiveQuality { op, .. } => ("bitrate", op),
-                ScreenCommand::CancelRestart { op } => ("cancel-restart", op),
-                ScreenCommand::CancelPicker { picker } => ("cancel", picker),
-                ScreenCommand::Stop => ("stop", 0),
+                ScreenCommand::OpenPicker { picker } => ("open", picker, None),
+                ScreenCommand::Publish {
+                    picker, request, ..
+                } => ("publish", picker, Some(request.codec)),
+                ScreenCommand::Restart { op, request, .. } => ("restart", op, Some(request.codec)),
+                ScreenCommand::LiveQuality { op, request, .. } => {
+                    ("bitrate", op, Some(request.codec))
+                }
+                ScreenCommand::CancelRestart { op } => ("cancel-restart", op, None),
+                ScreenCommand::CancelPicker { picker } => ("cancel", picker, None),
+                ScreenCommand::Stop => ("stop", 0, None),
             });
         }
         out

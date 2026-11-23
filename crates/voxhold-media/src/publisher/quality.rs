@@ -246,16 +246,20 @@ impl Preset {
 /// The pinned backend has no runtime reconfigure and rejects a second
 /// `stream.start` while the client already publishes, so only the bitrates can
 /// reach the running sender. They are applied through the existing RTP
-/// `set_parameters`/`set_bitrate` path. A source, resolution, frame-rate or
-/// audio-scope change needs a new capture and therefore a confirmed stop+start.
+/// `set_parameters`/`set_bitrate` path. A source, resolution, frame-rate, audio
+/// scope, audio flag or codec change needs a new capture and a new SDP payload,
+/// therefore a confirmed stop+start. The SDR profile travels with the codec
+/// ([`PublishRequest::codec`]); it is resolved by the capability snapshot, so a
+/// profile change can never be mistaken for a live bitrate change.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum QualityChange {
     /// The request is the live one; nothing has to be sent anywhere.
     Unchanged,
     /// Only the video or the published-audio bitrate changed.
     LiveBitrate,
-    /// A new capture is required: source, resolution, frame rate, audio scope,
-    /// the audio flag or the codec changed.
+    /// A new capture and a new codec negotiation are required: source,
+    /// resolution, frame rate, audio scope, the audio flag or the codec
+    /// changed.
     Restart,
 }
 

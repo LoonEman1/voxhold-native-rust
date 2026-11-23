@@ -3,6 +3,7 @@
 
 use super::*;
 
+mod codec;
 mod stall;
 
 fn publication(connection: &str, user: i64) -> Publication {

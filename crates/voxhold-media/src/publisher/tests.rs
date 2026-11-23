@@ -29,6 +29,10 @@ fn request() -> PublishRequest {
     }
 }
 
+fn request_with_codec(codec: Codec) -> PublishRequest {
+    PublishRequest { codec, ..request() }
+}
+
 fn allowed() -> Access {
     Access {
         joined: true,
@@ -180,6 +184,30 @@ fn the_offer_is_answered_before_stream_started_arrives() {
     );
     assert!(matches!(started.as_slice(), [Outcome::State(_)]));
     assert_eq!(publisher.phase(), Phase::Publishing);
+}
+
+#[test]
+fn stream_start_carries_the_exact_codec() {
+    let now = Instant::now();
+    for codec in Codec::ALL {
+        let mut publisher = publisher();
+        publisher.begin_picker(1);
+        let started = publisher.publish(1, request_with_codec(codec), false, now);
+        assert!(
+            matches!(started.first(), Some(Outcome::StartEngine { .. })),
+            "the capture must start for {codec:?}: {started:?}"
+        );
+        let outcomes = publisher.engine_ready(now, false, None);
+        let sent = sends(&outcomes);
+        assert_eq!(sent.len(), 1, "one stream.start for {codec:?}");
+        assert_eq!(sent[0].kind, "stream.start");
+        assert_eq!(
+            sent[0].data["codec"],
+            codec.wire(),
+            "the wire value must be exact for {codec:?}"
+        );
+        assert_eq!(publisher.phase(), Phase::Publishing);
+    }
 }
 
 #[test]
@@ -543,6 +571,7 @@ fn ice_from_the_server_reaches_the_engine_only_while_publishing() {
 
 mod answer;
 mod bitrate;
+mod codec;
 mod quality;
 
 #[test]
@@ -625,6 +654,65 @@ fn a_new_picker_after_a_failure_sends_its_own_stream_stop() {
         "the second attempt stops its own publication: {stop:?}"
     );
     assert_eq!(publisher.phase(), Phase::Stopping);
+}
+
+#[test]
+fn a_codec_confirmation_failure_ends_the_attempt_once_and_allows_a_new_one() {
+    let now = Instant::now();
+    let mut publisher = publisher();
+    let first = publishing(&mut publisher, now);
+    assert!(
+        sends(&first)
+            .iter()
+            .any(|signal| signal.kind == "stream.start"),
+        "the attempt reached the server before it failed: {first:?}"
+    );
+    let message = "Кодек VP8 не подтверждён: за 10 с не пришло ни одного закодированного кадра.";
+    let failed = publisher.on_engine(EngineEvent::Error(message.into()), now);
+    assert_eq!(publisher.phase(), Phase::Failed);
+    assert_eq!(
+        failed
+            .iter()
+            .filter(|outcome| matches!(outcome, Outcome::StopEngine))
+            .count(),
+        1,
+        "the refused attempt releases the capture and the peer once: {failed:?}"
+    );
+    assert_eq!(
+        sends(&failed)
+            .iter()
+            .filter(|signal| signal.kind == "stream.stop")
+            .count(),
+        1,
+        "the refused attempt releases its server slot once: {failed:?}"
+    );
+    assert_eq!(publisher.sharing().status, message);
+    assert_eq!(publisher.sharing().error.as_deref(), Some(message));
+    // The worker cannot push the same diagnostic twice into the state machine:
+    // once the attempt is over, a repeated error is ignored.
+    let duplicate = publisher.on_engine(EngineEvent::Error(message.into()), now);
+    assert!(duplicate.is_empty(), "{duplicate:?}");
+
+    // The same channel slot starts a new attempt with its own start and stop.
+    let second_now = now + Duration::from_secs(1);
+    publisher.begin_picker(2);
+    let mut publish = publisher.publish(2, request(), false, second_now);
+    publish.extend(publisher.engine_ready(second_now, false, None));
+    assert_eq!(
+        sends(&publish)
+            .iter()
+            .filter(|signal| signal.kind == "stream.start")
+            .count(),
+        1,
+        "{publish:?}"
+    );
+    assert!(
+        sends(&publish)
+            .iter()
+            .all(|signal| signal.kind != "stream.stop"),
+        "a fresh attempt sends no stop of the failed one: {publish:?}"
+    );
+    assert_eq!(publisher.phase(), Phase::Publishing);
 }
 
 #[test]

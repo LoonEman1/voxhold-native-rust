@@ -6,7 +6,7 @@
 use super::picker::*;
 use super::*;
 use crate::theme;
-use voxhold_media::publisher::{Codec, Preset, Resolution, SCREEN_FRAME_RATES};
+use voxhold_media::publisher::{Preset, Resolution, SCREEN_FRAME_RATES};
 use voxhold_media::screen_capture::ScreenSource;
 
 impl ScreenShareUi {
@@ -76,14 +76,15 @@ impl VoicePanel {
         key: ShareKey,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        self.choice_enabled(label, active, true, focus, key, cx)
+        self.choice_enabled(label, active, true, 30., focus, key, cx)
     }
 
-    fn choice_enabled(
+    pub(super) fn choice_enabled(
         &self,
         label: impl Into<gpui::SharedString>,
         active: bool,
         enabled: bool,
+        height: f32,
         focus: FocusHandle,
         key: ShareKey,
         cx: &mut Context<Self>,
@@ -96,7 +97,7 @@ impl VoicePanel {
         #[cfg(test)]
         let button = button.debug_selector(move || selector);
         let mut button = button
-            .h(px(30.))
+            .h(px(height))
             .px(px(10.))
             .rounded(px(8.))
             .border_1()
@@ -361,7 +362,8 @@ impl VoicePanel {
 
         // Quality: only values the SDR publication applies.
         let q = self.screen.quality();
-        let codec = Codec::available();
+        // Codec: the website's «Автоматически» plus its four SDR codecs. The
+        // selector and its reasons live in `screen_share/codec.rs`.
         let bitrate = format!(
             "{},{:01} Мбит/с",
             self.screen.bitrate_kbps / 1000,
@@ -482,6 +484,7 @@ impl VoicePanel {
                         "− 64",
                         false,
                         audio_controls,
+                        30.,
                         audio_down,
                         ShareKey::AudioBitrateDown,
                         cx,
@@ -499,6 +502,7 @@ impl VoicePanel {
                         "+ 64",
                         false,
                         audio_controls,
+                        30.,
                         audio_up,
                         ShareKey::AudioBitrateUp,
                         cx,
@@ -520,6 +524,7 @@ impl VoicePanel {
                         audio_toggle,
                         audio_requested,
                         audio_available,
+                        30.,
                         audio_focus,
                         ShareKey::Audio,
                         cx,
@@ -548,6 +553,7 @@ impl VoicePanel {
                         label,
                         self.screen.audio_scope == scope,
                         audio_available,
+                        30.,
                         focus,
                         ShareKey::AudioScope(scope),
                         cx,
@@ -560,39 +566,14 @@ impl VoicePanel {
                         .child(scope_sentence),
                 )
             })
-            .child(
-                div()
-                    .debug_selector(|| "share-codec".into())
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        div()
-                            .w(px(92.))
-                            .text_size(px(12.))
-                            .text_color(rgb(c.muted))
-                            .child("Кодек"),
-                    )
-                    .child(
-                        div().text_size(px(12.)).child(
-                            codec
-                                .first()
-                                .map(|codec| codec.label())
-                                .unwrap_or("нет подтверждённого"),
-                        ),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(10.))
-                            .text_color(rgb(c.muted))
-                            .child("SDR · серверная передача"),
-                    ),
-            );
+            .child(self.codec_row(&mut ring, &mut row, cx));
 
         let cancel_focus = row(self, &mut ring, ShareKey::Cancel);
         let start_focus = row(self, &mut ring, ShareKey::Start);
         let can_start = self.screen_can_start();
-        let live_bitrate = self.screen.restart_change() == Some(QualityChange::LiveBitrate);
+        let restart_change = self.screen.restart_change();
+        let live_bitrate = restart_change == Some(QualityChange::LiveBitrate);
+        let unchanged = restart_change == Some(QualityChange::Unchanged);
         let applying = self
             .screen
             .sharing
@@ -604,7 +585,10 @@ impl VoicePanel {
         } else if self.screen.sharing.preflighting {
             "Проверяем…"
         } else if self.screen.restart {
-            if live_bitrate {
+            if unchanged {
+                // Apply would be a verified no-op: the dialog only closes.
+                "Готово"
+            } else if live_bitrate {
                 "Применить"
             } else {
                 "Перезапустить"
@@ -822,6 +806,7 @@ impl VoicePanel {
             ShareKey::BitrateDown => self.change_bitrate(-100, cx),
             ShareKey::BitrateUp => self.change_bitrate(100, cx),
             ShareKey::Preset(preset) => self.apply_preset(preset, cx),
+            ShareKey::Codec(intent) => self.select_screen_codec(intent, cx),
             ShareKey::Audio => self.toggle_system_audio(cx),
             ShareKey::AudioScope(scope) => self.select_audio_scope(scope, cx),
             ShareKey::AudioBitrateDown => self.change_audio_bitrate(false, cx),
@@ -848,6 +833,7 @@ impl VoicePanel {
                     | ShareKey::Preset(_)
                     | ShareKey::BitrateDown
                     | ShareKey::BitrateUp
+                    | ShareKey::Codec(_)
                     | ShareKey::Audio
                     | ShareKey::AudioScope(_)
                     | ShareKey::AudioBitrateDown

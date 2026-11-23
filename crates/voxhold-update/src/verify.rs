@@ -74,7 +74,12 @@ pub fn verify_and_parse(
     signature_base64: &str,
 ) -> Result<VerifiedManifest> {
     verify_bytes(key, manifest_bytes, signature_base64)?;
-    Manifest::parse(manifest_bytes).map(VerifiedManifest::new)
+    let manifest = Manifest::parse(manifest_bytes)?;
+    Ok(VerifiedManifest::with_proof(
+        manifest,
+        manifest_bytes.to_vec(),
+        signature_base64.trim().to_string(),
+    ))
 }
 
 /// Generate a new Ed25519 key pair.

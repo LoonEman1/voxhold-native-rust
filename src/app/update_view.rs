@@ -12,8 +12,9 @@ const PANEL_WIDTH: f32 = 320.0;
 const PANEL_MARGIN: f32 = 8.0;
 const HEADER_GAP: f32 = 6.0;
 /// Everything above and below the notes block: padding, gaps, header, version
-/// line, phase title and the 30 px button row. Keeps the buttons painted.
-const PANEL_CHROME: f32 = 148.0;
+/// line, the two preference rows, phase title and the 30 px button row. Keeps
+/// the buttons painted.
+const PANEL_CHROME: f32 = 186.0;
 const NOTES_MAX_HEIGHT: f32 = 120.0;
 const NOTES_MIN_HEIGHT: f32 = 40.0;
 
@@ -145,7 +146,8 @@ impl Voxhold {
                     .text_size(px(11.))
                     .text_color(ink(p.muted))
                     .child(format!("Текущая версия {current}")),
-            );
+            )
+            .child(self.update_prefs_rows(p, cx));
 
         let phase = self.update.phase.clone();
         match phase {
@@ -158,11 +160,20 @@ impl Voxhold {
                     true,
                     p,
                     cx,
-                    |view, _, cx| view.check_updates(true, cx),
+                    |view, _, cx| view.check_updates(cx),
                 ));
             }
             UpdatePhase::Checking => {
                 panel = panel.child(self.update_note("Проверяем обновления…", p));
+                panel = panel.child(update_button(
+                    "update-check",
+                    "Проверяем…",
+                    false,
+                    false,
+                    p,
+                    cx,
+                    |_, _, _| {},
+                ));
             }
             UpdatePhase::UpToDate => {
                 panel = panel.child(self.update_note("Установлена последняя версия.", p));
@@ -173,7 +184,7 @@ impl Voxhold {
                     true,
                     p,
                     cx,
-                    |view, _, cx| view.check_updates(true, cx),
+                    |view, _, cx| view.check_updates(cx),
                 ));
             }
             UpdatePhase::Available { version, notes } => {
@@ -275,18 +286,52 @@ impl Voxhold {
                     |view, _, cx| view.cancel_download(cx),
                 ));
             }
+            UpdatePhase::Preparing { version } => {
+                panel = panel.child(
+                    div()
+                        .font_weight(gpui::FontWeight::BOLD)
+                        .child(format!("Версия {version}")),
+                );
+                panel = panel.child(self.update_note("Проверяем и готовим обновление…", p));
+                // Staging still owns the cancel token here: a rejected delta
+                // restarts the full download from this phase.
+                let cancelling = self.update.cancelling;
+                panel = panel.child(update_button(
+                    "update-cancel",
+                    if cancelling {
+                        "Отмена…"
+                    } else {
+                        "Отмена"
+                    },
+                    false,
+                    !cancelling,
+                    p,
+                    cx,
+                    |view, _, cx| view.cancel_download(cx),
+                ));
+            }
             UpdatePhase::Ready { version, .. } => {
                 panel = panel.child(
                     div()
                         .font_weight(gpui::FontWeight::BOLD)
                         .child(format!("Версия {version} готова")),
                 );
-                panel = panel.child(
-                    self.update_note("Приложение перезапустится и установит обновление.", p),
-                );
+                let note = if self.update.confirm_install {
+                    "Идёт звонок или трансляция. Нажмите ещё раз, чтобы перезапустить."
+                } else {
+                    update::ready_note(
+                        self.update.prefs.install_on_next_start,
+                        self.update.prefs.install_refused(&version),
+                    )
+                };
+                panel = panel.child(self.update_note(note, p));
                 panel = panel.child(update_button(
                     "update-install",
-                    "Перезапустить и установить",
+                    if self.update.confirm_install {
+                        "Подтвердить перезапуск"
+                    } else {
+                        "Перезапустить и установить"
+                    },
                     true,
                     true,
                     p,
@@ -330,7 +375,95 @@ impl Voxhold {
                     .child(error.clone()),
             );
         }
+        if let Some(error) = &self.update.prefs_error {
+            panel = panel.child(
+                div()
+                    .id("update-prefs-error")
+                    .debug_selector(|| "update-prefs-error".into())
+                    .text_size(px(11.))
+                    .text_color(ink(p.danger))
+                    .child(error.clone()),
+            );
+        }
         panel.into_any_element()
+    }
+
+    /// The two background switches. They are visible in every phase because
+    /// they change what the next check and the next start will do.
+    fn update_prefs_rows(&self, p: theme::Palette, cx: &mut Context<Self>) -> AnyElement {
+        let auto = self.update.prefs.auto_download;
+        let install = self.update.prefs.install_on_next_start;
+        div()
+            .flex()
+            .flex_col()
+            .flex_shrink_0()
+            .gap_1()
+            .child(pref_row(
+                "update-auto-download",
+                "Скачивать обновления в фоне",
+                auto,
+                p,
+                cx,
+                |view, cx| view.toggle_auto_download(cx),
+            ))
+            .child(pref_row(
+                "update-install-next",
+                "Устанавливать при следующем запуске",
+                install,
+                p,
+                cx,
+                |view, cx| view.toggle_install_on_next_start(cx),
+            ))
+            .into_any_element()
+    }
+
+    /// Blocking surface while the helper takes over the installation. The
+    /// process is about to exit, so the window only explains why. The mark and
+    /// the static ring mirror the helper window that follows.
+    pub(super) fn update_install_overlay(&self) -> AnyElement {
+        let p = self.palette;
+        div()
+            .id("update-installing")
+            .debug_selector(|| "update-installing".into())
+            .absolute()
+            .size_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(ink(p.bg))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap_4()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .w(px(92.))
+                            .h(px(92.))
+                            .rounded_full()
+                            .border_2()
+                            .border_color(ink(p.line))
+                            .child(icon("icons/brand.svg", 64., ink(p.lime))),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(15.))
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .text_color(ink(p.fg))
+                            .child("Обновляем Voxhold"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(13.))
+                            .text_color(ink(p.muted))
+                            .child("Подготавливаем обновление…"),
+                    ),
+            )
+            .into_any_element()
     }
 
     fn update_note(&self, text: &str, p: theme::Palette) -> AnyElement {
@@ -339,6 +472,35 @@ impl Voxhold {
             .child(text.to_string())
             .into_any_element()
     }
+}
+
+fn pref_row(
+    id: &'static str,
+    label: &'static str,
+    enabled: bool,
+    p: theme::Palette,
+    cx: &mut Context<Voxhold>,
+    on_click: impl Fn(&mut Voxhold, &mut Context<Voxhold>) + 'static,
+) -> AnyElement {
+    div()
+        .id(id)
+        .debug_selector(move || id.into())
+        .flex()
+        .items_center()
+        .justify_between()
+        .flex_shrink_0()
+        .h(px(16.))
+        .cursor_pointer()
+        .text_size(px(11.))
+        .child(div().child(label))
+        .child(
+            div()
+                .font_weight(gpui::FontWeight::BOLD)
+                .text_color(ink(if enabled { p.lime } else { p.muted }))
+                .child(if enabled { "Вкл" } else { "Выкл" }),
+        )
+        .on_click(cx.listener(move |view, _, _, cx| on_click(view, cx)))
+        .into_any_element()
 }
 
 fn update_button(

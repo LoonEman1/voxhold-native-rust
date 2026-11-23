@@ -6,10 +6,39 @@
 use super::picker::*;
 use super::*;
 use crate::theme;
-use voxhold_media::publisher::{CodecIntent, Preset, Resolution};
+use voxhold_media::publisher::{Preset, Resolution, SCREEN_FRAME_RATES};
 use voxhold_media::screen_capture::ScreenSource;
 
 impl ScreenShareUi {
+    pub(in crate::voice_panel) fn quality_for_source(&self, source: &ScreenSource) -> Quality {
+        let mut quality = self.quality().clamped();
+        if !self.restart {
+            quality.resolution = quality
+                .resolution
+                .for_source(Some((source.width, source.height)));
+        }
+        quality
+    }
+
+    fn resolution_source(&self) -> Option<(u32, u32)> {
+        let source = if self.restart {
+            self.restart_source()
+        } else {
+            self.selected.and_then(|id| self.source_for(id))
+        };
+        source.map(|source| (source.width, source.height))
+    }
+
+    fn offers_resolution(&self, resolution: Resolution) -> bool {
+        resolution.available_for(self.resolution_source())
+            || (self.restart
+                && self
+                    .sharing
+                    .confirmed
+                    .as_ref()
+                    .is_some_and(|live| live.quality.resolution == resolution))
+    }
+
     /// Bind the restart dialog to the attempt that is already live.
     ///
     /// The capture engine accepted this identity, so it is known available
@@ -41,28 +70,34 @@ impl ScreenShareUi {
 impl VoicePanel {
     fn choice(
         &self,
-        label: &'static str,
+        label: impl Into<gpui::SharedString>,
         active: bool,
         focus: FocusHandle,
         key: ShareKey,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        self.choice_enabled(label, active, true, focus, key, cx)
+        self.choice_enabled(label, active, true, 30., focus, key, cx)
     }
 
-    fn choice_enabled(
+    pub(super) fn choice_enabled(
         &self,
-        label: &'static str,
+        label: impl Into<gpui::SharedString>,
         active: bool,
         enabled: bool,
+        height: f32,
         focus: FocusHandle,
         key: ShareKey,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let c = self.colors();
-        let mut button = div()
-            .id(label)
-            .h(px(30.))
+        let label = label.into();
+        #[cfg(test)]
+        let selector = format!("share-option-{label}");
+        let button = div().id(label.clone());
+        #[cfg(test)]
+        let button = button.debug_selector(move || selector);
+        let mut button = button
+            .h(px(height))
             .px(px(10.))
             .rounded(px(8.))
             .border_1()
@@ -81,9 +116,9 @@ impl VoicePanel {
             .justify_center()
             .track_focus(&focus);
         if enabled {
-            button = button
-                .cursor_pointer()
-                .on_click(cx.listener(move |panel, _, _, cx| panel.activate_share(key, cx)));
+            button = button.cursor_pointer().on_click(
+                cx.listener(move |panel, _, window, cx| panel.activate_share(key, window, cx)),
+            );
         }
         button.child(label).into_any_element()
     }
@@ -108,8 +143,10 @@ impl VoicePanel {
         let top = area.y + (area.h - height) / 2.0;
 
         let mut ring: Vec<(FocusHandle, ShareKey)> = Vec::new();
-        let row = |panel: &Self, ring: &mut Vec<(FocusHandle, ShareKey)>, key: ShareKey| {
-            let handle = panel.share_focus(ring.len());
+        let mut control_index = 0;
+        let mut row = |panel: &Self, ring: &mut Vec<(FocusHandle, ShareKey)>, key: ShareKey| {
+            let handle = panel.share_focus(control_index);
+            control_index += 1;
             ring.push((handle.clone(), key));
             handle
         };
@@ -152,15 +189,7 @@ impl VoicePanel {
         // The physical card width decides the thumbnail request. Moving the
         // picker to a 125/150% monitor starts a new preview generation.
         let requested = thumbnail_request_width(card_width, window.scale_factor());
-        self.set_thumbnail_width(requested, cx);
-        self.screen.preview_columns = columns;
-        if self.screen.preview_cards > 0 {
-            let top = self.screen.list_scroll.top_item();
-            let bottom = self.screen.list_scroll.bottom_item();
-            self.set_preview_viewport(columns, top.min(bottom), bottom, cx);
-        } else {
-            self.screen.visible_rows = None;
-        }
+        self.set_thumbnail_width(requested, window, cx);
 
         let restart_live = self.screen.restart_source().cloned();
         let sources: Vec<ScreenSource> = if self.screen.restart {
@@ -168,6 +197,21 @@ impl VoicePanel {
         } else {
             self.screen.sources().to_vec()
         };
+        // The rows of the last painted grid decide which thumbnails the batch
+        // claims and may evict. A restart card or an empty category has no
+        // rows to measure, so the next picker starts from the bootstrap set.
+        let mut rows_changed = false;
+        if sources.is_empty() {
+            self.screen.visible_rows = None;
+            self.screen.preview_columns = columns;
+        } else {
+            let top = self.screen.list_scroll.top_item();
+            let bottom = self.screen.list_scroll.bottom_item();
+            rows_changed = self
+                .screen
+                .set_visible_rows(columns, top.min(bottom), bottom);
+        }
+
         // The second row on the base screenshot was clipped by the list
         // viewport, which was fixed at 236 px; the cards themselves were
         // complete but small. The viewport height is now derived from the
@@ -298,30 +342,28 @@ impl VoicePanel {
                 );
             }
         }
+        // A wheel or scrollbar move happens outside the request points of the
+        // picker, so the frame asks once for the rows that just became
+        // visible. A plain repaint changes neither the rows nor the scroll and
+        // asks nothing. The request itself is guarded: a running batch keeps
+        // its single capture and picks the new rows up at its next claim.
+        if rows_changed {
+            #[cfg(test)]
+            {
+                self.screen.preview_deferrals = self.screen.preview_deferrals.saturating_add(1);
+            }
+            let entity = cx.entity();
+            window.defer(cx, move |window, cx| {
+                let _ = entity.update(cx, |panel, cx| {
+                    panel.request_screen_previews(window, cx);
+                });
+            });
+        }
 
         // Quality: only values the SDR publication applies.
         let q = self.screen.quality();
-        // The picker offers the website's «Автоматически» first. The concrete
-        // codec is what the current sender snapshot resolves right now; an
-        // unavailable explicit choice keeps its reason until the user changes
-        // it. The full four-item list with per-codec reasons is the next slice.
-        let codec_intent = self.screen.codec;
-        let codec_resolution = self.codec_resolution();
-        let codec_label = match &codec_resolution {
-            Ok(codec) => match codec_intent {
-                CodecIntent::Auto => format!("Автоматически · {}", codec.label()),
-                CodecIntent::Explicit(_) => codec.label().to_owned(),
-            },
-            Err(_) => "Нет доступного SDR-кодека".to_owned(),
-        };
-        // gpui exposes painted bounds, not text; the selector carries the exact
-        // line so a UI test asserts what the dialog says, not only its slot.
-        let codec_label_selector = format!("share-codec-label:{codec_label}");
-        let codec_refused = codec_resolution.is_err();
-        let codec_reason = codec_resolution
-            .err()
-            .unwrap_or_else(|| "SDR · серверная передача".to_owned());
-        let codec_reason_selector = format!("share-codec-reason:{codec_reason}");
+        // Codec: the website's «Автоматически» plus its four SDR codecs. The
+        // selector and its reasons live in `screen_share/codec.rs`.
         let bitrate = format!(
             "{},{:01} Мбит/с",
             self.screen.bitrate_kbps / 1000,
@@ -346,10 +388,43 @@ impl VoicePanel {
             ));
         }
 
-        let res720 = row(self, &mut ring, ShareKey::Resolution(Resolution::P720));
-        let res1080 = row(self, &mut ring, ShareKey::Resolution(Resolution::P1080));
-        let fps30 = row(self, &mut ring, ShareKey::Fps(30));
-        let fps60 = row(self, &mut ring, ShareKey::Fps(60));
+        let option_row = |label| {
+            div().flex().items_start().gap_2().child(
+                div()
+                    .w(px(92.))
+                    .flex_shrink_0()
+                    .pt(px(7.))
+                    .text_size(px(12.))
+                    .text_color(rgb(c.muted))
+                    .child(label),
+            )
+        };
+        let active_resolution = if self.screen.restart {
+            q.resolution
+        } else {
+            q.resolution.for_source(self.screen.resolution_source())
+        };
+        let mut resolutions = div().flex().flex_wrap().gap_2().min_w_0();
+        for resolution in Resolution::OPTIONS {
+            if self.screen.offers_resolution(resolution) {
+                let key = ShareKey::Resolution(resolution);
+                let focus = row(self, &mut ring, key);
+                resolutions = resolutions.child(self.choice(
+                    resolution.label(),
+                    active_resolution == resolution,
+                    focus,
+                    key,
+                    cx,
+                ));
+            }
+        }
+        let mut frame_rates = div().flex().flex_wrap().gap_2().min_w_0();
+        for fps in SCREEN_FRAME_RATES {
+            let key = ShareKey::Fps(fps);
+            let focus = row(self, &mut ring, key);
+            frame_rates =
+                frame_rates.child(self.choice(format!("{fps} FPS"), q.fps == fps, focus, key, cx));
+        }
         let bitrate_down = row(self, &mut ring, ShareKey::BitrateDown);
         let bitrate_up = row(self, &mut ring, ShareKey::BitrateUp);
         let audio_available = self.screen.audio_available();
@@ -367,48 +442,8 @@ impl VoicePanel {
             .flex()
             .flex_col()
             .gap_1()
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        div()
-                            .w(px(92.))
-                            .text_size(px(12.))
-                            .text_color(rgb(c.muted))
-                            .child("Разрешение"),
-                    )
-                    .child(self.choice(
-                        Resolution::P720.label(),
-                        q.resolution == Resolution::P720,
-                        res720,
-                        ShareKey::Resolution(Resolution::P720),
-                        cx,
-                    ))
-                    .child(self.choice(
-                        Resolution::P1080.label(),
-                        q.resolution == Resolution::P1080,
-                        res1080,
-                        ShareKey::Resolution(Resolution::P1080),
-                        cx,
-                    )),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        div()
-                            .w(px(92.))
-                            .text_size(px(12.))
-                            .text_color(rgb(c.muted))
-                            .child("Кадры"),
-                    )
-                    .child(self.choice("30 FPS", q.fps == 30, fps30, ShareKey::Fps(30), cx))
-                    .child(self.choice("60 FPS", q.fps == 60, fps60, ShareKey::Fps(60), cx)),
-            )
+            .child(option_row("Разрешение").child(resolutions))
+            .child(option_row("Кадры").child(frame_rates))
             .child(
                 div()
                     .flex()
@@ -449,6 +484,7 @@ impl VoicePanel {
                         "− 64",
                         false,
                         audio_controls,
+                        30.,
                         audio_down,
                         ShareKey::AudioBitrateDown,
                         cx,
@@ -466,6 +502,7 @@ impl VoicePanel {
                         "+ 64",
                         false,
                         audio_controls,
+                        30.,
                         audio_up,
                         ShareKey::AudioBitrateUp,
                         cx,
@@ -487,6 +524,7 @@ impl VoicePanel {
                         audio_toggle,
                         audio_requested,
                         audio_available,
+                        30.,
                         audio_focus,
                         ShareKey::Audio,
                         cx,
@@ -515,6 +553,7 @@ impl VoicePanel {
                         label,
                         self.screen.audio_scope == scope,
                         audio_available,
+                        30.,
                         focus,
                         ShareKey::AudioScope(scope),
                         cx,
@@ -527,41 +566,14 @@ impl VoicePanel {
                         .child(scope_sentence),
                 )
             })
-            .child(
-                div()
-                    .debug_selector(|| "share-codec".into())
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        div()
-                            .w(px(92.))
-                            .text_size(px(12.))
-                            .text_color(rgb(c.muted))
-                            .child("Кодек"),
-                    )
-                    .child(
-                        div()
-                            .debug_selector(move || codec_label_selector.clone().into())
-                            .text_size(px(12.))
-                            .child(codec_label),
-                    )
-                    .child(
-                        div()
-                            .debug_selector(move || codec_reason_selector.clone().into())
-                            .flex_1()
-                            .min_w(px(0.))
-                            .text_size(px(10.))
-                            .text_color(rgb(if codec_refused { c.danger } else { c.muted }))
-                            .truncate()
-                            .child(codec_reason),
-                    ),
-            );
+            .child(self.codec_row(&mut ring, &mut row, cx));
 
         let cancel_focus = row(self, &mut ring, ShareKey::Cancel);
         let start_focus = row(self, &mut ring, ShareKey::Start);
         let can_start = self.screen_can_start();
-        let live_bitrate = self.screen.restart_change() == Some(QualityChange::LiveBitrate);
+        let restart_change = self.screen.restart_change();
+        let live_bitrate = restart_change == Some(QualityChange::LiveBitrate);
+        let unchanged = restart_change == Some(QualityChange::Unchanged);
         let applying = self
             .screen
             .sharing
@@ -573,7 +585,10 @@ impl VoicePanel {
         } else if self.screen.sharing.preflighting {
             "Проверяем…"
         } else if self.screen.restart {
-            if live_bitrate {
+            if unchanged {
+                // Apply would be a verified no-op: the dialog only closes.
+                "Готово"
+            } else if live_bitrate {
                 "Применить"
             } else {
                 "Перезапустить"
@@ -622,9 +637,11 @@ impl VoicePanel {
                     // preflight is the exception: closing it only cancels the
                     // preflight and leaves the live stream running.
                     .when(cancel_active, |button| {
-                        button
-                            .cursor_pointer()
-                            .on_click(cx.listener(|panel, _, _, cx| panel.close_screen_share(cx)))
+                        button.cursor_pointer().on_click(
+                            cx.listener(|panel, _, window, cx| {
+                                panel.close_screen_share(window, cx)
+                            }),
+                        )
                     })
                     .child("Отмена"),
             )
@@ -642,7 +659,9 @@ impl VoicePanel {
                     .items_center()
                     .when(can_start, |button| button.cursor_pointer())
                     .track_focus(&start_focus)
-                    .on_click(cx.listener(|panel, _, _, cx| panel.start_screen_share(cx)))
+                    .on_click(
+                        cx.listener(|panel, _, window, cx| panel.start_screen_share(window, cx)),
+                    )
                     .child(start_label),
             );
 
@@ -696,7 +715,7 @@ impl VoicePanel {
             .capture_key_down(
                 cx.listener(|panel, event: &gpui::KeyDownEvent, window, cx| {
                     if event.keystroke.key == "escape" {
-                        panel.close_screen_share(cx);
+                        panel.close_screen_share(window, cx);
                         cx.stop_propagation();
                         return;
                     }
@@ -762,18 +781,21 @@ impl VoicePanel {
                 .bg(gpui::rgba(0x000000b0))
                 .on_mouse_down(
                     MouseButton::Left,
-                    cx.listener(|panel, _, _, cx| panel.close_screen_share(cx)),
+                    cx.listener(|panel, _, window, cx| panel.close_screen_share(window, cx)),
                 )
                 .child(card)
                 .into_any_element(),
         )
     }
-    fn activate_share(&mut self, key: ShareKey, cx: &mut Context<Self>) {
+    fn activate_share(&mut self, key: ShareKey, window: &mut Window, cx: &mut Context<Self>) {
         match key {
-            ShareKey::Monitors => self.change_share_kind(SourceKind::Monitor, cx),
-            ShareKey::Windows => self.change_share_kind(SourceKind::Window, cx),
-            ShareKey::Refresh => self.refresh_screen_sources(cx),
+            ShareKey::Monitors => self.change_share_kind(SourceKind::Monitor, window, cx),
+            ShareKey::Windows => self.change_share_kind(SourceKind::Window, window, cx),
+            ShareKey::Refresh => self.refresh_screen_sources(window, cx),
             ShareKey::Resolution(resolution) => {
+                if !self.screen.offers_resolution(resolution) {
+                    return;
+                }
                 self.screen.resolution = resolution;
                 cx.notify();
             }
@@ -784,6 +806,7 @@ impl VoicePanel {
             ShareKey::BitrateDown => self.change_bitrate(-100, cx),
             ShareKey::BitrateUp => self.change_bitrate(100, cx),
             ShareKey::Preset(preset) => self.apply_preset(preset, cx),
+            ShareKey::Codec(intent) => self.select_screen_codec(intent, cx),
             ShareKey::Audio => self.toggle_system_audio(cx),
             ShareKey::AudioScope(scope) => self.select_audio_scope(scope, cx),
             ShareKey::AudioBitrateDown => self.change_audio_bitrate(false, cx),
@@ -792,15 +815,32 @@ impl VoicePanel {
                 // The committed attempt is stopped by Escape/backdrop; the
                 // Cancel button itself is unavailable while busy.
                 if !self.screen.busy {
-                    self.close_screen_share(cx);
+                    self.close_screen_share(window, cx);
                 }
             }
-            ShareKey::Start => self.start_screen_share(cx),
+            ShareKey::Start => self.start_screen_share(window, cx),
             ShareKey::Source(id) => {
                 // The row is selected by its stable identity, so Enter on a
                 // focused row still selects it after the list is reordered.
                 self.select_screen_source(id, cx);
             }
+        }
+        if !self.screen.restart
+            && matches!(
+                key,
+                ShareKey::Resolution(_)
+                    | ShareKey::Fps(_)
+                    | ShareKey::Preset(_)
+                    | ShareKey::BitrateDown
+                    | ShareKey::BitrateUp
+                    | ShareKey::Codec(_)
+                    | ShareKey::Audio
+                    | ShareKey::AudioScope(_)
+                    | ShareKey::AudioBitrateDown
+                    | ShareKey::AudioBitrateUp
+            )
+        {
+            self.remember_stream_preferences(cx);
         }
     }
 
@@ -845,7 +885,7 @@ impl VoicePanel {
             .find(|(handle, _)| handle.is_focused(window))
             .map(|(_, key)| *key);
         if let Some(key) = key {
-            self.activate_share(key, cx);
+            self.activate_share(key, window, cx);
         }
     }
 
@@ -861,7 +901,7 @@ impl VoicePanel {
     ) -> bool {
         match key {
             "escape" => {
-                self.close_screen_share(cx);
+                self.close_screen_share(window, cx);
                 true
             }
             "tab" => {

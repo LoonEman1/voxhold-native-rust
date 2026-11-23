@@ -15,11 +15,13 @@ impl VoicePanel {
             VoiceUpdate::ScreenShare(_) | VoiceUpdate::ScreenSources { .. }
         ) {
             let sources = matches!(update, VoiceUpdate::ScreenSources { .. });
-            let repaint = self.apply_screen_update(update);
+            let repaint = self.apply_screen_update(update, window);
             if sources {
                 // A fresh answer can add, remove or rename rows; only the
                 // visible category is queued, and cached/pending ids skip.
-                self.request_screen_previews(cx);
+                self.request_screen_previews(window, cx);
+            } else {
+                self.save_confirmed_stream_preferences(cx);
             }
             return repaint;
         }
@@ -112,7 +114,7 @@ impl VoicePanel {
                 self.stream_error = error;
                 self.stream_status.clear();
                 self.stream_connected = false;
-                self.frame = None;
+                self.clear_player_frame(window);
             }
             VoiceUpdate::StreamAudio { selection, error } => {
                 if self.watching_selection != Some(selection) {
@@ -172,7 +174,7 @@ impl VoicePanel {
             }
             VoiceUpdate::Ended(error) => {
                 self.handle.take();
-                self.reset_screen();
+                self.reset_screen(window);
                 self.applied_audio = None;
                 self.restore_output_gain();
                 self.server_muted = false;

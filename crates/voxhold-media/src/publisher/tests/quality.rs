@@ -6,7 +6,7 @@ use serde_json::json;
 use std::time::Instant;
 
 #[test]
-fn quality_values_are_clamped_to_the_web_ranges() {
+fn quality_values_are_clamped_to_supported_ranges() {
     assert_eq!(
         Quality {
             resolution: Resolution::P720,
@@ -16,7 +16,27 @@ fn quality_values_are_clamped_to_the_web_ranges() {
         }
         .clamped()
         .fps,
-        60
+        144
+    );
+    for fps in SCREEN_FRAME_RATES {
+        assert_eq!(
+            Quality {
+                fps,
+                ..Quality::default()
+            }
+            .clamped()
+            .fps,
+            fps
+        );
+    }
+    assert_eq!(
+        Quality {
+            fps: 240,
+            ..Quality::default()
+        }
+        .clamped()
+        .fps,
+        180
     );
     assert_eq!(
         Quality {
@@ -742,4 +762,19 @@ fn a_viewer_sees_one_stop_and_one_start_in_order() {
             < kinds.iter().position(|kind| *kind == "stream.start"),
         "the stop must precede the start: {kinds:?}"
     );
+}
+
+#[test]
+fn resolutions_follow_the_source_without_upscaling() {
+    use Resolution::*;
+
+    assert_eq!(P2160.for_source(Some((2560, 1440))), P1440);
+    assert_eq!(P2160.for_source(Some((1920, 1080))), P1080);
+    assert_eq!(P2160.for_source(Some((640, 480))), Native);
+    assert!(!P2160.available_for(Some((2560, 1440))));
+    assert!(P2160.available_for(Some((3840, 2160))));
+    assert_eq!(Native.capture_size(3840, 2160), (3840, 2160));
+    assert_eq!(Native.capture_size(3440, 1440), (3440, 1440));
+    assert_eq!(Native.capture_size(2160, 3840), (2160, 3840));
+    assert_eq!(Native.capture_size(640, 480), (640, 480));
 }

@@ -59,7 +59,7 @@ async fn a_per_user_volume_reaches_the_snapshot_and_is_removed_at_one_hundred(
     cx: &mut TestAppContext,
 ) {
     let (visual, view, voice) = voice_call(cx);
-    visual.update(|_, app| {
+    visual.update(|_window, app| {
         view.update(app, |v, cx| {
             use personal_settings::Action;
             assert!(v.voice_settings_action(Action::SetVoiceUserVolume(2, 150), cx));
@@ -249,7 +249,7 @@ async fn the_output_gain_follows_the_active_playback_path(cx: &mut TestAppContex
         // Leaving the call restores the stored value for the next join after
         // the ADM had cleared the numeric field.
         voice.update(app, |panel, cx| {
-            panel.leave_call(cx);
+            panel.leave_call(window, cx);
             assert_eq!(panel.test_controls().output_gain, Some(1.5));
         });
     });
@@ -343,8 +343,8 @@ async fn the_output_slider_keeps_its_value_but_is_disabled_on_the_adm(cx: &mut T
     });
 
     // Outside a call the stored value is editable for the next join.
-    visual.update(|_, app| {
-        voice.update(app, |panel, cx| panel.leave_call(cx));
+    visual.update(|window, app| {
+        voice.update(app, |panel, cx| panel.leave_call(window, cx));
     });
     draw(&mut visual);
     view.read_with(&*visual, |v, _| {
@@ -638,7 +638,7 @@ async fn closing_the_view_flushes_a_queued_voice_save(cx: &mut TestAppContext) {
     ));
     std::fs::create_dir_all(&directory).unwrap();
     let path = directory.join("prefs.voice.json");
-    visual.update(|_, app| {
+    visual.update(|_window, app| {
         view.update(app, |v, cx| {
             use personal_settings::Action;
             v.voice_settings.path = Some(path.clone());
@@ -717,7 +717,7 @@ async fn the_in_call_meter_applies_the_input_gain_and_mute(cx: &mut TestAppConte
 #[gpui::test]
 async fn every_settings_change_queues_exactly_one_full_snapshot(cx: &mut TestAppContext) {
     let (visual, view, voice) = voice_call(cx);
-    visual.update(|_, app| {
+    visual.update(|_window, app| {
         view.update(app, |v, cx| {
             use personal_settings::Action;
             // Each action is one settings change and must leave exactly one
@@ -782,7 +782,7 @@ async fn a_stale_endpoint_id_is_rejected_instead_of_selecting_another_device(
     cx: &mut TestAppContext,
 ) {
     let (mut visual, view, _voice) = voice_call(cx);
-    visual.update(|_, app| {
+    visual.update(|_window, app| {
         view.update(app, |v, cx| {
             use personal_settings::Action;
             v.voice_settings.devices = vec![
@@ -837,7 +837,7 @@ async fn a_hot_unplug_and_recovery_go_through_the_meter_tick(cx: &mut TestAppCon
             );
         });
     });
-    visual.update(|_, app| {
+    visual.update(|_window, app| {
         view.update(app, |v, cx| {
             let epoch = v.voice_settings.meter_epoch;
             let session = v.session_generation;
@@ -899,7 +899,7 @@ async fn rapid_slider_changes_collapse_into_one_atomic_write(cx: &mut TestAppCon
     ));
     std::fs::create_dir_all(&directory).unwrap();
     let path = directory.join("prefs.voice.json");
-    visual.update(|_, app| {
+    visual.update(|_window, app| {
         view.update(app, |v, cx| {
             use personal_settings::Action;
             v.voice_settings.path = Some(path.clone());
@@ -912,7 +912,7 @@ async fn rapid_slider_changes_collapse_into_one_atomic_write(cx: &mut TestAppCon
     // last value. An older generation cannot win because it is no longer the
     // newest token when the timer fires.
     // `advance_clock` runs ready tasks, so it must run outside `app.update`.
-    let executor = visual.update(|_, app| app.background_executor().clone());
+    let executor = visual.update(|_window, app| app.background_executor().clone());
     for _ in 0..40 {
         executor.advance_clock(std::time::Duration::from_millis(50));
         visual.run_until_parked();
@@ -937,7 +937,7 @@ async fn rapid_slider_changes_collapse_into_one_atomic_write(cx: &mut TestAppCon
 async fn one_voice_snapshot_carries_devices_bitrate_and_both_gains(cx: &mut TestAppContext) {
     let (mut visual, _view, voice) = super::voice_tests::fixture(cx);
     draw(&mut visual);
-    visual.update(|_, app| {
+    visual.update(|_window, app| {
         voice.update(app, |panel, cx| {
             panel.mute(cx);
             assert!(panel.test_controls_muted(), "the local mute closes the mic");

@@ -421,7 +421,7 @@ impl Voxhold {
             self.pending_reactions.remove(id);
         }
         self.messages = merged;
-        self.history_keys.clear();
+        self.reset_history_cache();
         self.history_list.reset(0);
         self.before = self.messages.first().map(|message| message.id);
         self.has_more = target_index >= 25;
@@ -750,7 +750,7 @@ impl Voxhold {
                         };
                         if return_to_latest {
                             s.messages.clear();
-                            s.history_keys.clear();
+                            s.reset_history_cache();
                             s.history_list.reset(0);
                             s.before = None;
                             // The confirmed latest page is the new right edge.

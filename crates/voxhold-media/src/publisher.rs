@@ -50,8 +50,8 @@ pub use codec::{
 mod bitrate;
 mod quality;
 pub use quality::{
-    AUDIO_BITRATES, Preset, Quality, QualityChange, QualityOp, QualityOutcome, QualityStatus,
-    Resolution, normalize_audio_bitrate,
+    AUDIO_BITRATES, MAX_SCREEN_FPS, Preset, Quality, QualityChange, QualityOp, QualityOutcome,
+    QualityStatus, Resolution, SCREEN_FRAME_RATES, normalize_audio_bitrate,
 };
 
 mod sharing;

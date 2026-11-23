@@ -169,7 +169,7 @@ impl Voxhold {
         self.deleted_ids.clear();
         self.pending_anchor = None;
         self.history_list.reset(0);
-        self.history_keys.clear();
+        self.reset_history_cache();
         let generation = self.generation;
         self.error.clear();
         self.update_channel_subscription(false);
@@ -324,7 +324,7 @@ impl Voxhold {
         // refresh exits and the row menu keeps showing "Закрепить".
         self.sync_search_permissions(cx);
         self.messages.clear();
-        self.history_keys.clear();
+        self.reset_history_cache();
         let kind = self
             .channels
             .iter()
@@ -402,7 +402,7 @@ impl Voxhold {
         self.pending_edits.clear();
         self.pending_reactions.clear();
         self.messages.clear();
-        self.history_keys.clear();
+        self.reset_history_cache();
         self.history_list.reset(0);
         self.before = None;
         self.has_more = false;

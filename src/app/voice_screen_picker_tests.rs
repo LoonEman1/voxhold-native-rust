@@ -24,18 +24,18 @@ async fn a_visible_thumbnail_evicts_hidden_cards_instead_of_missing_the_budget(
         .collect();
     let visible_id = sources[0].source_id();
     let picker = sources.clone();
-    visual.update(|_window, app| {
+    visual.update(|window, app| {
         voice.update(app, |panel, _| {
             panel.test_attach_detached_handle();
-            panel.test_open_screen_picker_with(SourceKind::Monitor, picker, None);
+            panel.test_open_screen_picker_with(window, SourceKind::Monitor, picker, None);
         });
     });
     draw(&mut visual);
-    visual.update(|_window, app| {
+    visual.update(|window, app| {
         voice.update(app, |panel, _| {
             // Fill the cache with off-screen rows first.
             for source in sources.iter().skip(2) {
-                panel.test_inject_screen_preview(source, 480, 270);
+                panel.test_inject_screen_preview(window, source, 480, 270);
             }
             let (_, max_bytes) = panel.test_screen_preview_bounds();
             assert!(
@@ -43,7 +43,7 @@ async fn a_visible_thumbnail_evicts_hidden_cards_instead_of_missing_the_budget(
                 "the cache is full to within one picture"
             );
             // The card in the visible first row must still be admitted.
-            assert!(panel.test_inject_screen_preview(&sources[0], 480, 270));
+            assert!(panel.test_inject_screen_preview(window, &sources[0], 480, 270));
             let (count, bytes) = panel.test_screen_preview_counts();
             assert!(count <= 64);
             assert!(bytes <= max_bytes, "the byte bound is still enforced");
@@ -73,28 +73,29 @@ async fn the_selected_card_is_never_evicted_for_a_visible_card(cx: &mut TestAppC
         .collect();
     let selected = sources[39].source_id();
     let visible = sources[0].source_id();
-    visual.update(|_window, app| {
+    visual.update(|window, app| {
         voice.update(app, |panel, cx| {
             panel.test_attach_detached_handle();
             panel.test_open_screen_picker_with(
+                window,
                 SourceKind::Monitor,
                 sources.clone(),
                 Some(selected),
             );
             // Both the selected far row and the first row are outside the
             // painted viewport.
-            panel.test_set_preview_viewport(2, 0, 0, cx);
+            panel.test_set_preview_viewport(2, 0, 0, window, cx);
             // 31 hidden frames plus the selected one: 32 full 480×270 frames
             // fit the 16 MiB budget, so this is a cache at its count ceiling.
             for source in sources.iter().skip(7).take(31) {
-                assert!(panel.test_inject_screen_preview(source, 480, 270));
+                assert!(panel.test_inject_screen_preview(window, source, 480, 270));
             }
-            assert!(panel.test_inject_screen_preview(&sources[39], 480, 270));
+            assert!(panel.test_inject_screen_preview(window, &sources[39], 480, 270));
             let (_, max_bytes) = panel.test_screen_preview_bounds();
             assert_eq!(panel.test_screen_preview_counts().0, 32);
             // A visible card must enter by releasing a hidden one, but never
             // the selected surface.
-            assert!(panel.test_inject_screen_preview(&sources[0], 480, 270));
+            assert!(panel.test_inject_screen_preview(window, &sources[0], 480, 270));
             assert!(
                 panel.test_screen_has_preview(selected),
                 "the selected far card kept its picture"
@@ -122,6 +123,8 @@ async fn the_selected_card_is_never_evicted_for_a_visible_card(cx: &mut TestAppC
 
 /// P05: a card that comes back into the viewport drops only the memory
 /// refusal and is captured again; its earlier failure was about the budget.
+/// The grid is really scrolled to the bottom, so the model matches the painted
+/// rows the capture batch reads.
 #[gpui::test]
 async fn returning_to_the_viewport_retries_a_memory_refusal(cx: &mut TestAppContext) {
     let (mut visual, _view, voice) = super::voice_tests::fixture_with(cx, Some(1400.), true);
@@ -131,27 +134,44 @@ async fn returning_to_the_viewport_retries_a_memory_refusal(cx: &mut TestAppCont
         .collect();
     let far = sources[39].source_id();
     let seen = RecordingPreview::default();
+    open_picker_with(&mut visual, &voice, SourceKind::Monitor, sources.clone());
     visual.update(|_window, app| {
-        voice.update(app, |panel, cx| {
-            panel.test_attach_detached_handle();
-            panel.test_open_screen_picker_with(SourceKind::Monitor, sources.clone(), Some(far));
+        voice.update(app, |panel, _| {
             panel.test_set_preview_provider(seen.provider());
-            panel.test_set_preview_viewport(2, 0, 0, cx);
             let reason = panel.test_preview_memory_reason();
             panel.test_inject_screen_preview_error(&sources[39], reason);
             assert_eq!(
                 panel.test_screen_preview_error(far).as_deref(),
                 Some(reason)
             );
-            // The selected row 19 becomes visible: the memory refusal must be
-            // cleared and its capture requested again.
-            panel.test_set_preview_viewport(2, 19, 20, cx);
-            assert!(
-                panel.test_screen_preview_error(far).is_none(),
-                "a memory refusal does not survive the return to the viewport"
-            );
         });
     });
+    // The last row enters the painted viewport: the memory refusal must be
+    // cleared and its capture requested again.
+    let list = bounds(&mut visual, "share-sources");
+    visual.simulate_event(gpui::ScrollWheelEvent {
+        position: gpui::point(
+            gpui::px(list.x + list.w / 2.),
+            gpui::px(list.y + list.h / 2.),
+        ),
+        delta: gpui::ScrollDelta::Pixels(gpui::point(gpui::px(0.), gpui::px(-10000.))),
+        ..Default::default()
+    });
+    draw(&mut visual);
+    let (top, bottom) = voice
+        .read_with(&*visual, |panel, _| panel.test_screen_visible_rows())
+        .expect("the scrolled list measured its rows");
+    assert_eq!(
+        bottom + 1,
+        sources.len().div_ceil(2),
+        "the last row is on screen: {top}..{bottom}"
+    );
+    assert!(
+        voice
+            .read_with(&*visual, |panel, _| panel.test_screen_preview_error(far))
+            .is_none(),
+        "a memory refusal does not survive the return to the viewport"
+    );
     wait_for(&mut visual, &voice, |panel| {
         panel.test_screen_has_preview(far)
     });
@@ -258,12 +278,17 @@ async fn every_preview_aspect_keeps_all_edges_at_normal_and_narrow_widths(cx: &m
             monitor(7, "Экран C", 1024, 768),
             monitor(9, "Экран D", 3440, 1440),
         ];
-        visual.update(|_window, app| {
+        visual.update(|window, app| {
             voice.update(app, |panel, _| {
                 panel.test_attach_detached_handle();
-                panel.test_open_screen_picker_with(SourceKind::Monitor, sources.clone(), None);
+                panel.test_open_screen_picker_with(
+                    window,
+                    SourceKind::Monitor,
+                    sources.clone(),
+                    None,
+                );
                 for (source, (w, h)) in sources.iter().zip(frames) {
-                    assert!(panel.test_inject_screen_preview(source, w, h));
+                    assert!(panel.test_inject_screen_preview(window, source, w, h));
                 }
             });
         });
@@ -289,14 +314,23 @@ async fn the_card_text_block_is_measured_from_the_card_width(cx: &mut TestAppCon
         1440,
     );
     let unknown = monitor(7, "Экран 3", 0, 0);
-    visual.update(|_window, app| {
+    visual.update(|window, app| {
         voice.update(app, |panel, _| {
             panel.test_attach_detached_handle();
             panel.test_open_screen_picker_with(
+                window,
                 SourceKind::Monitor,
                 vec![short.clone(), long.clone(), unknown.clone()],
                 None,
             );
+        });
+    });
+    // The first layout adopts the painted rows; the note is injected after it,
+    // because a memory refusal written while the rows are unknown is retried
+    // there by design.
+    draw(&mut visual);
+    visual.update(|_window, app| {
+        voice.update(app, |panel, _| {
             panel.test_inject_screen_preview_error(
                 &long,
                 "Предпросмотр недоступен: превышен лимит памяти.",
@@ -423,22 +457,30 @@ async fn the_last_card_is_reachable_by_wheel_and_tab_and_actions_stay_visible(
         "Tab reveals the whole focused card"
     );
 
-    for _ in 0..24 {
-        if super::voice_screen_tests::focused(&mut visual, &voice).as_deref() == Some("Start") {
-            break;
-        }
-        visual.simulate_keystrokes("tab");
-    }
-    assert_eq!(
-        super::voice_screen_tests::focused(&mut visual, &voice),
-        Some("Start".to_owned())
-    );
+    super::voice_screen_tests::tab_to(&mut visual, &voice, "Start");
     let card = bounds(&mut visual, "screen-share-card");
     let actions = bounds(&mut visual, "share-actions");
     assert!(
         actions.bottom() <= card.bottom() + 0.25,
         "the action row stays inside the modal"
     );
+}
+
+#[gpui::test]
+async fn tab_reaches_the_actions_after_a_long_source_list(cx: &mut TestAppContext) {
+    let (mut visual, _view, voice) = super::voice_tests::fixture_with(cx, Some(1400.), true);
+    let sources = (1..=40)
+        .map(|id| monitor(id, "Экран", 1920, 1080))
+        .collect();
+    open_picker_with(&mut visual, &voice, SourceKind::Monitor, sources);
+    for _ in 0..42 {
+        visual.simulate_keystrokes("tab");
+    }
+    assert_eq!(
+        super::voice_screen_tests::focused(&mut visual, &voice).as_deref(),
+        Some("Source(monitor:40)")
+    );
+    super::voice_screen_tests::tab_to(&mut visual, &voice, "Start");
 }
 
 /// P03: a scrolling grid paints a real bar from the scroll handle, inside the
@@ -520,12 +562,12 @@ async fn reopening_the_picker_resets_the_grid_scroll(cx: &mut TestAppContext) {
     let sources: Vec<ScreenSource> = (0..10)
         .map(|index| monitor(3 + index * 2, "Экран", 1920, 1080))
         .collect();
-    visual.update(|_window, app| {
+    visual.update(|window, app| {
         voice.update(app, |panel, cx| {
             panel.test_attach_detached_handle();
             panel.test_set_share_gate(Ok(()));
-            panel.test_open_screen_share(cx);
-            panel.test_apply_screen_sources(SourceKind::Monitor, sources.clone());
+            panel.test_open_screen_share(window, cx);
+            panel.test_apply_screen_sources(window, SourceKind::Monitor, sources.clone());
         });
     });
     draw(&mut visual);
@@ -543,13 +585,13 @@ async fn reopening_the_picker_resets_the_grid_scroll(cx: &mut TestAppContext) {
     let scrolled = voice.read_with(&*visual, |panel, _| panel.test_screen_list_offset());
     assert!(scrolled > 0.5, "the first picker really scrolled");
 
-    visual.update(|_window, app| {
-        voice.update(app, |panel, cx| panel.test_close_screen_share(cx));
+    visual.update(|window, app| {
+        voice.update(app, |panel, cx| panel.test_close_screen_share(window, cx));
     });
-    visual.update(|_window, app| {
+    visual.update(|window, app| {
         voice.update(app, |panel, cx| {
-            panel.test_open_screen_share(cx);
-            panel.test_apply_screen_sources(SourceKind::Monitor, sources.clone());
+            panel.test_open_screen_share(window, cx);
+            panel.test_apply_screen_sources(window, SourceKind::Monitor, sources.clone());
         });
     });
     voice.read_with(&*visual, |panel, _| {
@@ -562,9 +604,9 @@ async fn reopening_the_picker_resets_the_grid_scroll(cx: &mut TestAppContext) {
 }
 
 /// P05: a DPI/width change must not start a second capture while the previous
-/// one is still in flight. The generation request waits for the capture latch
-/// and captures once after it is released; the provider's concurrency peak
-/// stays at one.
+/// one is still in flight. The generation request waits for the capture latch;
+/// the running batch's own end then starts the generation at the new width
+/// without any test request. The provider's concurrency peak stays at one.
 #[gpui::test]
 async fn a_width_change_never_runs_two_captures_at_once(cx: &mut TestAppContext) {
     use std::sync::atomic::AtomicUsize;
@@ -597,13 +639,26 @@ async fn a_width_change_never_runs_two_captures_at_once(cx: &mut TestAppContext)
         });
     }
 
+    // The production batch owns the picker but is still queued: its end is what
+    // must re-request the generation after the width change.
+    visual.update(|window, app| {
+        voice.update(app, |panel, cx| {
+            panel.test_request_screen_previews(window, cx);
+            assert!(panel.test_preview_batch_active());
+        });
+    });
+
     // Model a capture that already reached the provider but has not returned,
     // as during a DPI move. The new width may not start a second one.
-    visual.update(|_window, app| {
+    visual.update(|window, app| {
         voice.update(app, |panel, cx| {
             panel.test_set_preview_capture_in_flight(true);
             panel.test_force_preview_width(288);
-            panel.test_set_preview_width(432, cx);
+            panel.test_set_preview_width(window, 432, cx);
+            assert!(
+                panel.test_preview_capture_in_flight(),
+                "the width change keeps waiting for the old capture"
+            );
             assert!(
                 !panel.test_preview_batch_active(),
                 "no batch may start beside the in-flight capture"
@@ -620,14 +675,88 @@ async fn a_width_change_never_runs_two_captures_at_once(cx: &mut TestAppContext)
         });
     });
 
-    // The old capture returns: its batch releases the latch and the current
-    // generation captures at the new width exactly once.
+    // The old capture returns: the queued batch ends, releases the latch and
+    // requests the generation at the new width. No test code asks for previews.
     visual.update(|_window, app| {
+        voice.update(app, |panel, _| {
+            panel.test_set_preview_capture_in_flight(false)
+        });
+    });
+    wait_for(&mut visual, &voice, |panel| {
+        panel.test_screen_preview_counts().0 == 1
+            && panel.test_screen_preview_pending() == 0
+            && !panel.test_preview_batch_active()
+            && !panel.test_preview_capture_in_flight()
+    });
+    assert_eq!(peak.load(Ordering::SeqCst), 1, "captures never overlapped");
+    assert_eq!(
+        seen.attempts().len(),
+        1,
+        "the generation captured the card exactly once"
+    );
+    let final_width = voice.read_with(&*visual, |panel, _| panel.test_screen_preview_width());
+    assert!(
+        final_width >= 432,
+        "the generation kept the sharper request width: {final_width}"
+    );
+}
+
+/// P05: closing the picker while a capture is in flight and opening it again
+/// must start the new generation from the old batch's own end. Both the close
+/// and the reopen request are blocked by the latch, so without that end the
+/// cards of the reopened picker would stay empty.
+#[gpui::test]
+async fn reopening_during_an_in_flight_capture_starts_the_new_generation(cx: &mut TestAppContext) {
+    let (mut visual, _view, voice) = super::voice_tests::fixture_with(cx, Some(1400.), true);
+    draw(&mut visual);
+    let source = monitor(3, "Экран A", 1920, 1080);
+    open_picker_with(
+        &mut visual,
+        &voice,
+        SourceKind::Monitor,
+        vec![source.clone()],
+    );
+    let seen = RecordingPreview::default();
+    visual.update(|_window, app| {
+        voice.update(app, |panel, _| {
+            panel.test_set_preview_provider(seen.provider())
+        });
+    });
+    // A production refresh starts the batch; it is queued, not running yet.
+    visual.update(|window, app| {
         voice.update(app, |panel, cx| {
-            panel.test_set_preview_capture_in_flight(false);
-            panel.test_request_screen_previews(cx);
+            panel.test_refresh_screen_sources(window, cx);
             assert!(panel.test_preview_batch_active());
-            assert_eq!(panel.test_screen_preview_pending(), 1);
+        });
+    });
+    let old_epoch = voice.read_with(&*visual, |panel, _| panel.test_preview_epoch());
+
+    // The capture of that batch is in flight when the picker closes and opens
+    // again: the reopen request may not start a second capture.
+    visual.update(|window, app| {
+        voice.update(app, |panel, cx| {
+            panel.test_set_preview_capture_in_flight(true);
+            panel.test_close_screen_share(window, cx);
+            panel.test_open_screen_share(window, cx);
+            panel.test_apply_screen_sources(window, SourceKind::Monitor, vec![source.clone()]);
+            assert!(panel.screen_share_open());
+            assert!(panel.test_preview_capture_in_flight());
+            assert!(
+                !panel.test_preview_batch_active(),
+                "the reopen request waits for the in-flight capture"
+            );
+            assert_eq!(panel.test_screen_preview_pending(), 0);
+            assert!(seen.attempts().is_empty(), "no capture started yet");
+        });
+    });
+    let new_epoch = voice.read_with(&*visual, |panel, _| panel.test_preview_epoch());
+    assert_ne!(new_epoch, old_epoch, "the reopen moved the epoch");
+
+    // The old capture returns and its batch ends: that end starts the new
+    // generation for the reopened picker, without any test request.
+    visual.update(|_window, app| {
+        voice.update(app, |panel, _| {
+            panel.test_set_preview_capture_in_flight(false)
         });
     });
     wait_for(&mut visual, &voice, |panel| {
@@ -635,11 +764,16 @@ async fn a_width_change_never_runs_two_captures_at_once(cx: &mut TestAppContext)
             && panel.test_screen_preview_pending() == 0
             && !panel.test_preview_batch_active()
     });
-    assert_eq!(peak.load(Ordering::SeqCst), 1, "captures never overlapped");
-    let final_width = voice.read_with(&*visual, |panel, _| panel.test_screen_preview_width());
-    assert!(
-        final_width >= 432,
-        "the generation kept the sharper request width: {final_width}"
+    assert_eq!(
+        seen.attempts(),
+        vec!["monitor:3".to_owned()],
+        "only the reopened picker captured the card"
+    );
+    assert_eq!(
+        voice.read_with(&*visual, |panel, _| panel
+            .test_screen_preview_error(source.source_id())),
+        None,
+        "the new generation filled the card instead of a memory note"
     );
 }
 
@@ -716,45 +850,6 @@ async fn the_normal_dialog_shows_the_codec_line_inside_the_settings(cx: &mut Tes
     );
 }
 
-/// Part A: a codec the sender probe refuses shows the probe's reason in the
-/// dialog and never silently names another codec.
-#[gpui::test]
-async fn an_unavailable_codec_shows_the_probe_reason_in_the_dialog(cx: &mut TestAppContext) {
-    let reason = "Профиль VP9 не объявлен кодировщиком для SDR: profile-id=2, для SDR нужен 0.";
-    let (mut visual, _view, voice) = super::voice_tests::fixture_with(cx, Some(1400.), true);
-    draw(&mut visual);
-    open_picker_with(
-        &mut visual,
-        &voice,
-        SourceKind::Monitor,
-        vec![monitor(3, "Экран", 1920, 1080)],
-    );
-    visual.update(|_window, app| {
-        voice.update(app, |panel, cx| {
-            panel.test_set_codec_error(reason);
-            cx.notify();
-        });
-    });
-    draw(&mut visual);
-    assert!(
-        visual
-            .debug_bounds("share-codec-label:Нет доступного SDR-кодека")
-            .is_some(),
-        "the label names no available SDR codec"
-    );
-    let reason_selector = Box::leak(format!("share-codec-reason:{reason}").into_boxed_str());
-    assert!(
-        visual.debug_bounds(reason_selector).is_some(),
-        "the dialog paints «{reason_selector}»"
-    );
-    voice.read_with(&*visual, |panel, _| {
-        assert!(
-            !panel.test_can_start(),
-            "Start refuses the unavailable codec"
-        );
-    });
-}
-
 /// P03: an empty category paints a message, not a grid with the height of a
 /// row it does not have, and the actions remain available.
 #[gpui::test]
@@ -787,18 +882,18 @@ async fn a_larger_thumbnail_request_starts_a_new_preview_generation(cx: &mut Tes
         vec![source.clone()],
     );
     let old_epoch = voice.read_with(&*visual, |panel, _| panel.test_preview_epoch());
-    visual.update(|_window, app| {
+    visual.update(|window, app| {
         voice.update(app, |panel, _| {
-            assert!(panel.test_inject_screen_preview(&source, 8, 8));
+            assert!(panel.test_inject_screen_preview(window, &source, 8, 8));
             assert_eq!(panel.test_screen_preview_counts(), (1, 8 * 8 * 4));
         });
     });
     let first_width = voice.read_with(&*visual, |panel, _| panel.test_screen_preview_width());
     assert!(first_width >= 286, "the first frame measured the card");
-    visual.update(|_window, app| {
+    visual.update(|window, app| {
         voice.update(app, |panel, cx| {
             panel.test_force_preview_width(288);
-            panel.test_set_preview_width(432, cx);
+            panel.test_set_preview_width(window, 432, cx);
             assert_eq!(panel.test_screen_preview_width(), 432);
             assert_ne!(
                 panel.test_preview_epoch(),
@@ -811,22 +906,22 @@ async fn a_larger_thumbnail_request_starts_a_new_preview_generation(cx: &mut Tes
                 "the smaller cache is released"
             );
             assert!(
-                !panel.test_deliver_screen_preview(old_epoch, &source, true),
+                !panel.test_deliver_screen_preview(window, old_epoch, &source, true),
                 "a late frame of the old generation cannot fill the new card"
             );
         });
     });
 }
 
-/// P05: the capture batch serves rows inside the last painted viewport
-/// before rows scrolled out of it. The list is really scrolled to the bottom,
-/// so its order differs from insertion order; only a visible-first ranking
-/// captures those rows first.
+/// P05/O08: the capture batch serves the rows inside the last painted viewport
+/// plus one row of margin, and then stops — a tab scrolled away from is not
+/// walked card by card. The list is really scrolled to the bottom, so a batch
+/// that ignored the painted rows would start at the first card again.
 #[gpui::test]
-async fn visible_rows_are_captured_before_hidden_rows(cx: &mut TestAppContext) {
-    // Six cards at two columns make three rows; after scrolling, the viewport
-    // stands on a later row while the first row is off screen.
-    let sources: Vec<ScreenSource> = (0..6)
+async fn only_the_scrolled_rows_and_their_margin_are_captured(cx: &mut TestAppContext) {
+    // Ten cards at two columns make five rows; after scrolling, the viewport
+    // stands on the last row while the first rows are off screen.
+    let sources: Vec<ScreenSource> = (0..10)
         .map(|index| monitor(3 + index * 2, "Экран", 1920, 1080))
         .collect();
     let (mut visual, _view, voice) = super::voice_tests::fixture_with(cx, Some(1400.), true);
@@ -851,40 +946,39 @@ async fn visible_rows_are_captured_before_hidden_rows(cx: &mut TestAppContext) {
     );
 
     let seen = RecordingPreview::default();
-    visual.update(|_window, app| {
+    visual.update(|window, app| {
         voice.update(app, |panel, cx| {
             panel.test_set_preview_provider(seen.provider());
-            panel.test_request_screen_previews(cx);
+            panel.test_request_screen_previews(window, cx);
         });
     });
+    let start = top.saturating_sub(1);
+    let end = (bottom + 2).min(sources.len().div_ceil(2));
+    let expected_indexes: Vec<usize> = (start * 2..(end * 2).min(sources.len())).collect();
+    assert_eq!(
+        expected_indexes.first().copied(),
+        Some(start * 2),
+        "the margin row above the viewport is part of the claim range"
+    );
     wait_for(&mut visual, &voice, |panel| {
-        panel.test_screen_preview_counts().0 == sources.len()
+        panel.test_screen_preview_counts().0 == expected_indexes.len()
     });
     let attempts = seen.attempts();
-    let visible_indexes: Vec<usize> = (top * 2..=(bottom * 2 + 1))
-        .filter(|index| *index < sources.len())
-        .collect();
-    let visible_count = visible_indexes.len();
-    let visible: std::collections::HashSet<_> =
-        attempts.iter().take(visible_count).cloned().collect();
-    let expected: std::collections::HashSet<_> = visible_indexes
+    let expected: std::collections::HashSet<_> = expected_indexes
         .iter()
         .map(|index| format!("{:?}", sources[*index].source_id()))
         .collect();
+    let captured: std::collections::HashSet<_> = attempts.iter().cloned().collect();
     assert_eq!(
-        visible, expected,
-        "rows {top}..{bottom} on screen are captured first: {attempts:?}"
+        captured, expected,
+        "rows {start}..{end} around the on-screen rows {top}..{bottom} are captured: {attempts:?}"
     );
-    let hidden: std::collections::HashSet<_> =
-        attempts.iter().skip(visible_count).cloned().collect();
-    let expected_hidden: std::collections::HashSet<_> = sources
-        .iter()
-        .enumerate()
-        .filter(|(index, _)| !visible_indexes.contains(index))
-        .map(|(_, source)| format!("{:?}", source.source_id()))
-        .collect();
-    assert_eq!(
-        hidden, expected_hidden,
-        "the off-screen rows follow: {attempts:?}"
+    assert!(
+        !attempts.contains(&format!("{:?}", sources[0].source_id())),
+        "the row scrolled away is not captured again: {attempts:?}"
+    );
+    assert!(
+        attempts.len() < sources.len(),
+        "the batch never walks the whole tab: {attempts:?}"
     );
 }

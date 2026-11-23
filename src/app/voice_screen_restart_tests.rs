@@ -54,13 +54,14 @@ fn open_restart(
     panel: &mut crate::voice_panel::VoicePanel,
     snapshot: Vec<voxhold_media::screen_capture::ScreenSource>,
     live: voxhold_media::screen_capture::ScreenSource,
+    window: &mut gpui::Window,
     cx: &mut gpui::Context<crate::voice_panel::VoicePanel>,
 ) {
     panel.test_attach_detached_handle();
-    panel.test_open_screen_picker_with(SourceKind::Window, snapshot, None);
+    panel.test_open_screen_picker_with(window, SourceKind::Window, snapshot, None);
     panel.test_set_screen_sharing(live_sharing());
     panel.test_set_screen_confirmed_source(live);
-    panel.test_open_live_screen_settings(cx);
+    panel.test_open_live_screen_settings(window, cx);
 }
 
 #[gpui::test]
@@ -70,10 +71,10 @@ async fn a_live_window_restart_binds_to_the_confirmed_source_with_an_empty_list(
     let (mut visual, _view, voice) = super::voice_tests::fixture(cx);
     draw(&mut visual);
     let live = window(11, "Документ");
-    visual.update(|_window, app| {
+    visual.update(|window, app| {
         voice.update(app, |panel, cx| {
             panel.test_attach_detached_handle();
-            panel.test_open_screen_picker_with(SourceKind::Window, Vec::new(), None);
+            panel.test_open_screen_picker_with(window, SourceKind::Window, Vec::new(), None);
             // The live dialog repeats the endpoint probe; Start must wait.
             panel.test_set_screen_audio_pending(Arc::new(|| {
                 std::thread::sleep(Duration::from_millis(150));
@@ -81,7 +82,7 @@ async fn a_live_window_restart_binds_to_the_confirmed_source_with_an_empty_list(
             }));
             panel.test_set_screen_sharing(live_sharing());
             panel.test_set_screen_confirmed_source(live.clone());
-            panel.test_open_live_screen_settings(cx);
+            panel.test_open_live_screen_settings(window, cx);
 
             assert!(panel.screen_share_open(), "the restart dialog opened");
             assert!(panel.test_screen_restart());
@@ -114,14 +115,16 @@ async fn a_live_window_restart_binds_to_the_confirmed_source_with_an_empty_list(
     });
 
     wait_for(&mut visual, &voice, |panel| !panel.test_audio_pending());
+    // A restart now needs a real difference from the live payload; otherwise
+    // Apply is a verified no-op. Lower the resolution before pressing Start.
+    visual.update(|_window, app| {
+        voice.update(app, |panel, cx| {
+            panel.test_set_screen_resolution(voxhold_media::publisher::Resolution::P720, cx);
+        });
+    });
     draw(&mut visual);
 
-    for _ in 0..40 {
-        if focused(&mut visual, &voice).as_deref() == Some("Start") {
-            break;
-        }
-        visual.simulate_keystrokes("tab");
-    }
+    super::voice_screen_tests::tab_to(&mut visual, &voice, "Start");
     assert_eq!(focused(&mut visual, &voice).as_deref(), Some("Start"));
     visual.simulate_keystrokes("enter");
     let (commands, op) = visual.update(|_window, app| {
@@ -143,13 +146,18 @@ async fn a_live_window_restart_binds_to_the_confirmed_source_with_an_empty_list(
     // current list is refused visibly and never reaches the worker.
     let removed = monitor(3, "Экран A", 1920, 1080);
     let replacement = monitor(5, "Экран B", 2560, 1440);
-    visual.update(|_window, app| {
+    visual.update(|window, app| {
         voice.update(app, |panel, cx| {
-            panel.test_open_screen_picker_with(SourceKind::Monitor, vec![removed.clone()], None);
+            panel.test_open_screen_picker_with(
+                window,
+                SourceKind::Monitor,
+                vec![removed.clone()],
+                None,
+            );
             panel.test_select_screen_source(removed, cx);
             panel.test_replace_screen_list_without_refresh(SourceKind::Monitor, vec![replacement]);
             assert!(!panel.test_can_start(), "the id is no longer in the list");
-            panel.test_start_screen_share(cx);
+            panel.test_start_screen_share(window, cx);
             assert!(
                 panel.test_take_screen_commands().is_empty(),
                 "a normal Start must not use a removed source"
@@ -169,10 +177,16 @@ async fn restart_rows_are_inert_for_mouse_and_keyboard(cx: &mut TestAppContext) 
     draw(&mut visual);
     let live = window(11, "Документ");
     let other = window(12, "Другой документ");
-    visual.update(|_window, app| {
+    visual.update(|window, app| {
         voice.update(app, |panel, cx| {
             // Both rows are cached, so a normal picker could select either.
-            open_restart(panel, vec![live.clone(), other.clone()], live.clone(), cx);
+            open_restart(
+                panel,
+                vec![live.clone(), other.clone()],
+                live.clone(),
+                window,
+                cx,
+            );
 
             assert_eq!(
                 panel.test_selected_source_id(),
@@ -205,13 +219,14 @@ async fn restart_rows_are_inert_for_mouse_and_keyboard(cx: &mut TestAppContext) 
             );
         }
     }
-    for _ in 0..40 {
-        if focused(&mut visual, &voice).as_deref() == Some("Start") {
-            break;
-        }
-        visual.simulate_keystrokes("tab");
-    }
+    super::voice_screen_tests::tab_to(&mut visual, &voice, "Start");
     assert_eq!(focused(&mut visual, &voice).as_deref(), Some("Start"));
+    // A real restart needs a difference from the live payload.
+    visual.update(|_window, app| {
+        voice.update(app, |panel, cx| {
+            panel.test_set_screen_resolution(voxhold_media::publisher::Resolution::P720, cx);
+        });
+    });
     visual.simulate_keystrokes("enter");
     let (commands, op) = visual.update(|_window, app| {
         voice.update(app, |panel, _| {
@@ -238,21 +253,21 @@ async fn a_restart_ignores_the_category_and_refresh_with_a_stale_snapshot(cx: &m
     let (mut visual, _view, voice) = super::voice_tests::fixture(cx);
     draw(&mut visual);
     let live = window(11, "Документ");
-    visual.update(|_window, app| {
+    visual.update(|window, app| {
         voice.update(app, |panel, cx| {
             // The snapshot is empty from the start: the engine accepted the
             // window, but the enumeration does not describe it any more.
-            open_restart(panel, Vec::new(), live.clone(), cx);
+            open_restart(panel, Vec::new(), live.clone(), window, cx);
             assert!(panel.test_can_start(), "the confirmed restart may start");
 
             let before = panel.test_source_generations();
-            panel.test_switch_share_kind(SourceKind::Monitor, cx);
+            panel.test_switch_share_kind(SourceKind::Monitor, window, cx);
             assert_eq!(
                 panel.test_share_kind(),
                 SourceKind::Window,
                 "a restart is source-locked, so the category cannot change"
             );
-            panel.test_refresh_screen_sources(cx);
+            panel.test_refresh_screen_sources(window, cx);
             assert_eq!(
                 panel.test_source_generations(),
                 before,
@@ -261,7 +276,7 @@ async fn a_restart_ignores_the_category_and_refresh_with_a_stale_snapshot(cx: &m
 
             // A stale/empty answer must not clear the confirmed identity or
             // disable Start.
-            panel.test_apply_screen_sources(SourceKind::Window, Vec::new());
+            panel.test_apply_screen_sources(window, SourceKind::Window, Vec::new());
             assert_eq!(panel.test_selected_source_id(), Some(live.source_id()));
             assert!(panel.test_can_start());
             assert!(
@@ -269,7 +284,10 @@ async fn a_restart_ignores_the_category_and_refresh_with_a_stale_snapshot(cx: &m
                 "a stale answer must not claim the live source is gone"
             );
 
-            panel.test_start_screen_share(cx);
+            // A real restart needs a different payload; keep the confirmed
+            // source and change only the resolution.
+            panel.test_set_screen_resolution(voxhold_media::publisher::Resolution::P720, cx);
+            panel.test_start_screen_share(window, cx);
             let op = panel
                 .test_pending_quality_op()
                 .expect("the restart carries an operation id");
@@ -290,11 +308,11 @@ async fn a_restart_keeps_the_confirmed_identity_when_the_row_was_renamed(cx: &mu
     draw(&mut visual);
     let live = window(11, "Документ");
     let renamed = window(11, "Документ · обновлён");
-    visual.update(|_window, app| {
+    visual.update(|window, app| {
         voice.update(app, |panel, cx| {
             // A refresh already described the live window with a newer title;
             // the restart row and request stay bound to the accepted identity.
-            open_restart(panel, vec![renamed.clone()], live.clone(), cx);
+            open_restart(panel, vec![renamed.clone()], live.clone(), window, cx);
             assert_eq!(panel.test_selected_source_id(), Some(live.source_id()));
             assert_eq!(
                 panel.test_selected_source(),
@@ -306,7 +324,7 @@ async fn a_restart_keeps_the_confirmed_identity_when_the_row_was_renamed(cx: &mu
             // An answer that lost the live window must not unbind the restart:
             // the capture engine accepted the source and only it can report
             // the failure.
-            panel.test_apply_screen_sources(SourceKind::Window, Vec::new());
+            panel.test_apply_screen_sources(window, SourceKind::Window, Vec::new());
             assert_eq!(panel.test_selected_source_id(), Some(live.source_id()));
             assert!(
                 panel.test_can_start(),
@@ -317,7 +335,9 @@ async fn a_restart_keeps_the_confirmed_identity_when_the_row_was_renamed(cx: &mu
                 "a stale refresh must not claim the live source is gone"
             );
 
-            panel.test_start_screen_share(cx);
+            // Apply a real difference, so this is a restart and not a no-op.
+            panel.test_set_screen_resolution(voxhold_media::publisher::Resolution::P720, cx);
+            panel.test_start_screen_share(window, cx);
             let op = panel
                 .test_pending_quality_op()
                 .expect("the restart carries an operation id");
@@ -339,9 +359,9 @@ async fn a_same_phase_live_stats_update_keeps_an_uncommitted_restart_dialog_open
     let (mut visual, _view, voice) = super::voice_tests::fixture(cx);
     draw(&mut visual);
     let live = window(11, "Документ");
-    visual.update(|_window, app| {
+    visual.update(|window, app| {
         voice.update(app, |panel, cx| {
-            open_restart(panel, vec![live.clone()], live.clone(), cx);
+            open_restart(panel, vec![live.clone()], live.clone(), window, cx);
             assert!(panel.screen_share_open());
             assert!(panel.test_screen_restart());
             assert!(panel.test_can_start());
@@ -361,7 +381,7 @@ async fn a_same_phase_live_stats_update_keeps_an_uncommitted_restart_dialog_open
                 }),
                 ..live_sharing()
             };
-            assert!(panel.test_apply_screen_sharing(sampled));
+            assert!(panel.test_apply_screen_sharing(window, sampled));
             assert!(
                 panel.screen_share_open(),
                 "a same-phase stats update must leave the dialog open"
@@ -372,7 +392,7 @@ async fn a_same_phase_live_stats_update_keeps_an_uncommitted_restart_dialog_open
             );
             assert!(panel.test_can_start(), "Start must stay reachable");
 
-            panel.test_start_screen_share(cx);
+            panel.test_start_screen_share(window, cx);
             let op = panel
                 .test_pending_quality_op()
                 .expect("the restart carries an operation id");
@@ -395,7 +415,7 @@ async fn a_same_phase_live_stats_update_keeps_an_uncommitted_restart_dialog_open
                 has_audio: true,
                 ..live_sharing()
             };
-            panel.test_apply_screen_sharing(accepted);
+            panel.test_apply_screen_sharing(window, accepted);
             assert!(
                 !panel.screen_share_open(),
                 "the committed dialog closes on the accepted snapshot"
@@ -411,13 +431,13 @@ async fn a_normal_picker_after_a_restart_starts_with_no_rows(cx: &mut TestAppCon
     let (mut visual, _view, voice) = super::voice_tests::fixture(cx);
     draw(&mut visual);
     let live = window(11, "Документ");
-    visual.update(|_window, app| {
+    visual.update(|window, app| {
         voice.update(app, |panel, cx| {
-            open_restart(panel, vec![live.clone()], live.clone(), cx);
+            open_restart(panel, vec![live.clone()], live.clone(), window, cx);
             assert_eq!(panel.test_selected_source_id(), Some(live.source_id()));
 
             // Closing the restart dialog leaves the live stream alone.
-            panel.test_close_screen_share(cx);
+            panel.test_close_screen_share(window, cx);
             assert!(!panel.screen_share_open());
             assert_eq!(panel.test_screen_phase(), Phase::Live);
             assert!(panel.test_take_screen_commands().is_empty());
@@ -426,7 +446,7 @@ async fn a_normal_picker_after_a_restart_starts_with_no_rows(cx: &mut TestAppCon
             // new enumeration arrives.
             panel.test_set_share_gate(Ok(()));
             panel.test_set_audio_probe(Arc::new(|| Ok(device())));
-            panel.test_open_screen_share(cx);
+            panel.test_open_screen_share(window, cx);
             assert!(panel.screen_share_open());
             assert!(!panel.test_screen_restart());
             assert_eq!(panel.test_selected_source_id(), None);
@@ -436,11 +456,11 @@ async fn a_normal_picker_after_a_restart_starts_with_no_rows(cx: &mut TestAppCon
 
             // The old confirmed id is not selectable until it is part of a
             // fresh answer. A normal picker may switch category again.
-            panel.test_switch_share_kind(SourceKind::Window, cx);
+            panel.test_switch_share_kind(SourceKind::Window, window, cx);
             panel.test_try_select_screen_source(live.clone(), cx);
             assert_eq!(panel.test_selected_source_id(), None);
 
-            panel.test_apply_screen_sources(SourceKind::Window, vec![live.clone()]);
+            panel.test_apply_screen_sources(window, SourceKind::Window, vec![live.clone()]);
             panel.test_try_select_screen_source(live.clone(), cx);
             assert_eq!(panel.test_selected_source_id(), Some(live.source_id()));
         });
@@ -504,11 +524,12 @@ pub(super) fn open_quality_dialog(
     live_source: voxhold_media::screen_capture::ScreenSource,
     quality: Quality,
     audio: bool,
+    window: &mut gpui::Window,
     cx: &mut gpui::Context<crate::voice_panel::VoicePanel>,
 ) {
     panel.test_attach_detached_handle();
     panel.test_set_audio_probe(Arc::new(|| Ok(device())));
-    panel.test_open_screen_picker_with(live_source.kind, Vec::new(), None);
+    panel.test_open_screen_picker_with(window, live_source.kind, Vec::new(), None);
     panel.test_set_screen_sharing(sharing_with(quality, audio));
     panel.test_set_screen_confirmed_request(PublishRequest {
         source: live_source,
@@ -517,7 +538,7 @@ pub(super) fn open_quality_dialog(
         audio,
         audio_scope: AudioScope::Device,
     });
-    panel.test_open_live_screen_settings(cx);
+    panel.test_open_live_screen_settings(window, cx);
 }
 
 #[gpui::test]
@@ -525,9 +546,9 @@ async fn a_bitrate_only_change_applies_live_without_a_restart(cx: &mut TestAppCo
     let (mut visual, _view, voice) = super::voice_tests::fixture(cx);
     draw(&mut visual);
     let live = window(11, "Документ");
-    visual.update(|_window, app| {
+    visual.update(|window, app| {
         voice.update(app, |panel, cx| {
-            open_quality_dialog(panel, live.clone(), Quality::default(), false, cx);
+            open_quality_dialog(panel, live.clone(), Quality::default(), false, window, cx);
             assert!(panel.screen_share_open());
             assert!(panel.test_screen_restart());
             assert!(panel.test_can_start());
@@ -540,7 +561,7 @@ async fn a_bitrate_only_change_applies_live_without_a_restart(cx: &mut TestAppCo
                 "the dialog must say that only the bitrate is live: {:?}",
                 panel.test_restart_warning()
             );
-            panel.test_start_screen_share(cx);
+            panel.test_start_screen_share(window, cx);
             let op = panel
                 .test_pending_quality_op()
                 .expect("the bitrate change carries an operation id");
@@ -568,9 +589,9 @@ async fn a_resolution_change_keeps_the_confirmed_restart(cx: &mut TestAppContext
     let (mut visual, _view, voice) = super::voice_tests::fixture(cx);
     draw(&mut visual);
     let live = window(11, "Документ");
-    visual.update(|_window, app| {
+    visual.update(|window, app| {
         voice.update(app, |panel, cx| {
-            open_quality_dialog(panel, live.clone(), Quality::default(), false, cx);
+            open_quality_dialog(panel, live.clone(), Quality::default(), false, window, cx);
             panel.test_set_screen_resolution(voxhold_media::publisher::Resolution::P720, cx);
             assert!(
                 panel
@@ -581,7 +602,7 @@ async fn a_resolution_change_keeps_the_confirmed_restart(cx: &mut TestAppContext
             );
             assert!(panel.test_can_start());
 
-            panel.test_start_screen_share(cx);
+            panel.test_start_screen_share(window, cx);
             let op = panel
                 .test_pending_quality_op()
                 .expect("the restart carries an operation id");
@@ -600,11 +621,11 @@ async fn closing_the_dialog_during_a_preflight_cancels_it_and_keeps_live(cx: &mu
     let (mut visual, _view, voice) = super::voice_tests::fixture(cx);
     draw(&mut visual);
     let live = window(11, "Документ");
-    visual.update(|_window, app| {
+    visual.update(|window, app| {
         voice.update(app, |panel, cx| {
-            open_quality_dialog(panel, live.clone(), Quality::default(), false, cx);
+            open_quality_dialog(panel, live.clone(), Quality::default(), false, window, cx);
             panel.test_set_screen_resolution(voxhold_media::publisher::Resolution::P720, cx);
-            panel.test_start_screen_share(cx);
+            panel.test_start_screen_share(window, cx);
             let op = panel
                 .test_pending_quality_op()
                 .expect("the restart carries an operation id");
@@ -612,7 +633,7 @@ async fn closing_the_dialog_during_a_preflight_cancels_it_and_keeps_live(cx: &mu
 
             // The worker reports the running preflight without stopping the
             // live stream. The dialog must stay open so closing it cancels.
-            assert!(panel.test_apply_screen_sharing(preflighting(op)));
+            assert!(panel.test_apply_screen_sharing(window, preflighting(op)));
             assert!(
                 panel.screen_share_open(),
                 "a running preflight must keep the dialog open"
@@ -620,7 +641,7 @@ async fn closing_the_dialog_during_a_preflight_cancels_it_and_keeps_live(cx: &mu
             assert!(panel.screen_share_busy());
             assert_eq!(panel.test_screen_phase(), Phase::Live);
 
-            panel.test_close_screen_share(cx);
+            panel.test_close_screen_share(window, cx);
             assert!(!panel.screen_share_open());
             let commands = panel.test_take_screen_commands();
             assert_eq!(
@@ -642,20 +663,22 @@ async fn a_failed_preflight_keeps_live_and_shows_the_error(cx: &mut TestAppConte
     let (mut visual, _view, voice) = super::voice_tests::fixture(cx);
     draw(&mut visual);
     let live = window(11, "Документ");
-    visual.update(|_window, app| {
+    visual.update(|window, app| {
         voice.update(app, |panel, cx| {
-            open_quality_dialog(panel, live.clone(), Quality::default(), false, cx);
+            open_quality_dialog(panel, live.clone(), Quality::default(), false, window, cx);
             panel.test_set_screen_resolution(voxhold_media::publisher::Resolution::P720, cx);
-            panel.test_start_screen_share(cx);
+            panel.test_start_screen_share(window, cx);
             let op = panel
                 .test_pending_quality_op()
                 .expect("the restart carries an operation id");
             assert_eq!(panel.test_take_screen_commands(), vec![("restart", op)]);
 
             // The worker confirms the running preflight before it can fail it.
-            assert!(panel.test_apply_screen_sharing(preflighting(op)));
-            assert!(panel
-                .test_apply_screen_sharing(failed_preflight(op, "Новая настройка не открылась.",)));
+            assert!(panel.test_apply_screen_sharing(window, preflighting(op)));
+            assert!(panel.test_apply_screen_sharing(
+                window,
+                failed_preflight(op, "Новая настройка не открылась.",)
+            ));
             assert!(
                 panel.screen_share_open(),
                 "a failed preflight keeps the dialog open for a correction"
@@ -692,13 +715,13 @@ async fn a_preflight_cancel_survives_a_stale_failure_state_and_keeps_live(cx: &m
     let (mut visual, _view, voice) = super::voice_tests::fixture(cx);
     draw(&mut visual);
     let live = window(11, "Документ");
-    visual.update(|_window, app| {
+    visual.update(|window, app| {
         voice.update(app, |panel, cx| {
-            open_quality_dialog(panel, live.clone(), Quality::default(), false, cx);
+            open_quality_dialog(panel, live.clone(), Quality::default(), false, window, cx);
             panel.test_set_screen_resolution(voxhold_media::publisher::Resolution::P720, cx);
 
             // The first Apply fails: the dialog stays open with the reason.
-            panel.test_start_screen_share(cx);
+            panel.test_start_screen_share(window, cx);
             let first_op = panel
                 .test_pending_quality_op()
                 .expect("the restart carries an operation id");
@@ -706,15 +729,18 @@ async fn a_preflight_cancel_survives_a_stale_failure_state_and_keeps_live(cx: &m
                 panel.test_take_screen_commands(),
                 vec![("restart", first_op)]
             );
-            assert!(panel.test_apply_screen_sharing(preflighting(first_op)));
+            assert!(panel.test_apply_screen_sharing(window, preflighting(first_op)));
             let failed = failed_preflight(first_op, "Новая настройка не открылась.");
-            assert!(panel.test_apply_screen_sharing(failed.clone()));
+            assert!(panel.test_apply_screen_sharing(window, failed.clone()));
             assert!(!panel.screen_share_busy());
             assert!(panel.screen_share_open());
             assert!(panel.test_screen_error().contains("не открылась"));
 
-            // Apply again. Start must drop the previous attempt's reason.
-            panel.test_start_screen_share(cx);
+            // Apply again. Start must drop the previous attempt's reason. The
+            // failure restored the confirmed quality, so repeat the edit to
+            // keep the retry a real restart.
+            panel.test_set_screen_resolution(voxhold_media::publisher::Resolution::P720, cx);
+            panel.test_start_screen_share(window, cx);
             let second_op = panel
                 .test_pending_quality_op()
                 .expect("the retry carries a new operation id");
@@ -734,7 +760,7 @@ async fn a_preflight_cancel_survives_a_stale_failure_state_and_keeps_live(cx: &m
             // A stale failure sample of the *previous* answer lands after the
             // click. It is not the new answer: it must not stop, close, show
             // the old reason or end the pending attempt.
-            assert!(panel.test_apply_screen_sharing(failed));
+            assert!(panel.test_apply_screen_sharing(window, failed));
             assert!(
                 panel.screen_share_open(),
                 "a stale state must not close the dialog"
@@ -756,7 +782,7 @@ async fn a_preflight_cancel_survives_a_stale_failure_state_and_keeps_live(cx: &m
 
             // The worker's preflight update lands afterwards. The dialog keeps
             // its cancel intent, and Start is refused while it runs.
-            assert!(panel.test_apply_screen_sharing(preflighting(second_op)));
+            assert!(panel.test_apply_screen_sharing(window, preflighting(second_op)));
             assert!(panel.screen_share_open());
             assert!(panel.test_screen_sharing().preflighting);
             assert!(
@@ -765,7 +791,7 @@ async fn a_preflight_cancel_survives_a_stale_failure_state_and_keeps_live(cx: &m
             );
 
             // Closing cancels the pending preflight; Live is untouched.
-            panel.test_close_screen_share(cx);
+            panel.test_close_screen_share(window, cx);
             assert!(!panel.screen_share_open());
             assert_eq!(
                 panel.test_take_screen_commands(),
@@ -788,14 +814,14 @@ async fn a_preflight_cancel_survives_a_stale_failure_state_before_the_confirmati
     let (mut visual, _view, voice) = super::voice_tests::fixture(cx);
     draw(&mut visual);
     let live = window(11, "Документ");
-    visual.update(|_window, app| {
+    visual.update(|window, app| {
         voice.update(app, |panel, cx| {
-            open_quality_dialog(panel, live.clone(), Quality::default(), false, cx);
+            open_quality_dialog(panel, live.clone(), Quality::default(), false, window, cx);
             panel.test_set_screen_resolution(voxhold_media::publisher::Resolution::P720, cx);
 
             // The first preflight is confirmed by the worker and then fails,
             // so the next Start sees the same stale answer as the field case.
-            panel.test_start_screen_share(cx);
+            panel.test_start_screen_share(window, cx);
             let first_op = panel
                 .test_pending_quality_op()
                 .expect("the restart carries an operation id");
@@ -803,15 +829,17 @@ async fn a_preflight_cancel_survives_a_stale_failure_state_before_the_confirmati
                 panel.test_take_screen_commands(),
                 vec![("restart", first_op)]
             );
-            assert!(panel.test_apply_screen_sharing(preflighting(first_op)));
+            assert!(panel.test_apply_screen_sharing(window, preflighting(first_op)));
             let failed = failed_preflight(first_op, "Новая настройка не открылась.");
-            assert!(panel.test_apply_screen_sharing(failed.clone()));
+            assert!(panel.test_apply_screen_sharing(window, failed.clone()));
             assert!(!panel.screen_share_busy());
             assert!(panel.test_screen_error().contains("не открылась"));
 
             // Apply again: this attempt is unconfirmed until the worker says
             // `preflighting`, and Start drops the previous attempt's reason.
-            panel.test_start_screen_share(cx);
+            // The failure restored the confirmed quality, so repeat the edit.
+            panel.test_set_screen_resolution(voxhold_media::publisher::Resolution::P720, cx);
+            panel.test_start_screen_share(window, cx);
             let second_op = panel
                 .test_pending_quality_op()
                 .expect("the retry carries a new operation id");
@@ -828,7 +856,7 @@ async fn a_preflight_cancel_survives_a_stale_failure_state_before_the_confirmati
 
             // The stale failed sample arrives before the confirmation. It must
             // neither end the attempt nor re-show the old reason.
-            assert!(panel.test_apply_screen_sharing(failed));
+            assert!(panel.test_apply_screen_sharing(window, failed));
             assert!(panel.screen_share_open());
             assert!(
                 panel.screen_share_busy(),
@@ -843,7 +871,7 @@ async fn a_preflight_cancel_survives_a_stale_failure_state_before_the_confirmati
 
             // Closing before `preflighting` lands cancels the preflight the
             // worker is about to run and leaves Live untouched.
-            panel.test_close_screen_share(cx);
+            panel.test_close_screen_share(window, cx);
             assert!(!panel.screen_share_open());
             assert_eq!(
                 panel.test_take_screen_commands(),

@@ -2,6 +2,48 @@
 //! the picker and paints the real audio scope of the running attempt.
 
 use super::*;
+use voxhold_media::screen_capture::MAX_PREVIEW_WIDTH;
+
+/// Physical width of the local preview requested by the painted card.
+///
+/// Pure, so the visibility, minimize, zero-rect and DPI rules are tested
+/// without a window. The published stream never depends on this value: the
+/// capture keeps its target, frame rate and I420 conversion, and only the
+/// extra BGRA picture for the card follows the request.
+pub(super) fn preview_request(
+    active: bool,
+    minimized: bool,
+    rect: Option<Rect>,
+    scale: f32,
+) -> Option<u32> {
+    if !active || minimized {
+        return None;
+    }
+    let rect = rect?;
+    if rect.w <= 0.0 || rect.h <= 0.0 {
+        return None;
+    }
+    // `set_scale` clamps the same way; a zero or negative scale is never
+    // treated as "smaller than a pixel".
+    let physical = (rect.w * scale.max(0.1)).ceil();
+    if !physical.is_finite() || physical < 1.0 {
+        return None;
+    }
+    Some((physical.min(MAX_PREVIEW_WIDTH as f32) as u32).clamp(2, MAX_PREVIEW_WIDTH))
+}
+
+/// Whether any part of `card` lies inside the clipped room viewport.
+///
+/// The card grid is painted in an `overflow_hidden` pane that scrolls with
+/// `room_scroll`; a card scrolled completely out of that pane still exists in
+/// the geometry but the user cannot see it. The preview demand follows only a
+/// visible card. A zero-area overlap (edges merely touching) counts as hidden.
+pub(super) fn card_in_viewport(card: Rect, viewport: Rect) -> bool {
+    card.right() > viewport.x
+        && card.x < viewport.right()
+        && card.bottom() > viewport.y
+        && card.y < viewport.bottom()
+}
 
 impl VoicePanel {
     /// Whether the local on-air card takes one room slot.
@@ -12,11 +54,48 @@ impl VoicePanel {
         )
     }
 
+    /// Hand the painted card's preview request to the media layer.
+    ///
+    /// Runs on the same 100 ms poll that takes a frame, so the request follows
+    /// the last painted card instead of a value an old frame computed. Only
+    /// atomics are written; the UI thread never waits for the capture worker,
+    /// and no command is queued. No handle means no capture and nothing to
+    /// disable.
+    pub(in crate::voice_panel) fn sync_screen_preview_demand(&self, window: &Window) {
+        let Some(handle) = &self.handle else {
+            return;
+        };
+        let request = preview_request(
+            // `room_painted` is the shell's own predicate for the voice room
+            // pane of this frame, so a card in a hidden pane requests nothing
+            // even while the publication keeps running.
+            self.room_painted && self.screen_card_active(),
+            self.window_minimized(window),
+            self.screen_card_rect,
+            window.scale_factor(),
+        );
+        handle.set_screen_preview_demand(request);
+    }
+
+    /// The same visibility predicate as the preview demand. The take path uses
+    /// it too, so a hidden or minimized card discards the prepared picture
+    /// instead of creating a `RenderImage` and counting it as shown.
+    pub(in crate::voice_panel) fn screen_preview_wanted(&self, window: &Window) -> bool {
+        preview_request(
+            self.room_painted && self.screen_card_active(),
+            self.window_minimized(window),
+            self.screen_card_rect,
+            window.scale_factor(),
+        )
+        .is_some()
+    }
+
     /// The card that replaces the local publication in the room grid while a
     /// screen is on air. `None` when nothing is being published.
     pub(in crate::voice_panel) fn screen_card(
         &mut self,
         rect: Rect,
+        viewport: Rect,
         cx: &mut Context<Self>,
     ) -> Option<gpui::AnyElement> {
         let sharing = self.screen.sharing.clone();
@@ -24,8 +103,14 @@ impl VoicePanel {
             sharing.phase,
             Phase::Publishing | Phase::Live | Phase::Stopping | Phase::Failed
         ) {
+            self.screen_card_rect = None;
             return None;
         }
+        // The demand is computed from the rect this card is really painted at;
+        // a zero-sized card (a collapsed room pane) requests nothing, and a
+        // card scrolled completely out of the viewport requests nothing until
+        // it is painted again.
+        self.screen_card_rect = card_in_viewport(rect, viewport).then_some(rect);
         let c = self.colors();
         let live = sharing.phase == Phase::Live;
         let status = if live {
@@ -177,7 +262,9 @@ impl VoicePanel {
                         .justify_center()
                         .cursor_pointer()
                         .track_focus(&quality_focus)
-                        .on_click(cx.listener(|panel, _, _, cx| panel.open_screen_settings(cx)))
+                        .on_click(cx.listener(|panel, _, window, cx| {
+                            panel.open_screen_settings(window, cx)
+                        }))
                         .child("Качество"),
                 );
             }
@@ -198,11 +285,116 @@ impl VoicePanel {
                     .justify_center()
                     .cursor_pointer()
                     .track_focus(&stop_focus)
-                    .on_click(cx.listener(|panel, _, _, cx| panel.stop_screen_share(cx)))
+                    .on_click(
+                        cx.listener(|panel, _, window, cx| panel.stop_screen_share(window, cx)),
+                    )
                     .child("Завершить"),
             );
             card = card.child(actions);
         }
         Some(card.into_any_element())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{card_in_viewport, preview_request};
+    use crate::voice_room::Rect;
+    use voxhold_media::screen_capture::MAX_PREVIEW_WIDTH;
+
+    fn card() -> Rect {
+        Rect::new(0.0, 0.0, 320.0, 180.0)
+    }
+
+    #[test]
+    fn a_hidden_or_idle_card_requests_nothing() {
+        assert_eq!(preview_request(false, false, Some(card()), 1.0), None);
+        assert_eq!(preview_request(false, false, None, 1.0), None);
+    }
+
+    #[test]
+    fn a_minimized_window_requests_nothing() {
+        assert_eq!(preview_request(true, true, Some(card()), 1.0), None);
+    }
+
+    #[test]
+    fn a_zero_sized_card_requests_nothing() {
+        assert_eq!(preview_request(true, false, None, 1.0), None);
+        let collapsed = Rect::new(0.0, 0.0, 0.0, 180.0);
+        assert_eq!(preview_request(true, false, Some(collapsed), 1.0), None);
+        let flat = Rect::new(0.0, 0.0, 320.0, 0.0);
+        assert_eq!(preview_request(true, false, Some(flat), 1.0), None);
+    }
+
+    #[test]
+    fn the_request_follows_the_physical_card_width() {
+        assert_eq!(
+            preview_request(true, false, Some(card()), 1.0),
+            Some(320),
+            "100% DPI asks for the logical width"
+        );
+        assert_eq!(
+            preview_request(true, false, Some(card()), 1.5),
+            Some(480),
+            "a fractional DPI is rounded up"
+        );
+        assert_eq!(preview_request(true, false, Some(card()), 1.25), Some(400));
+        // A scale below the clamp is not treated as a sub-pixel card.
+        assert_eq!(
+            preview_request(true, false, Some(Rect::new(0.0, 0.0, 3.0, 3.0)), 0.0),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn the_request_is_clamped_to_the_store_bound() {
+        let wide = Rect::new(0.0, 0.0, 4000.0, 2000.0);
+        assert_eq!(
+            preview_request(true, false, Some(wide), 2.0),
+            Some(MAX_PREVIEW_WIDTH)
+        );
+        let tiny = Rect::new(0.0, 0.0, 1.0, 1.0);
+        assert_eq!(
+            preview_request(true, false, Some(tiny), 1.0),
+            Some(2),
+            "the media layer never gets an unusable width"
+        );
+    }
+
+    #[test]
+    fn a_card_outside_the_scrolled_viewport_is_hidden() {
+        let viewport = Rect::new(24.0, 46.0, 800.0, 500.0);
+        let inside = Rect::new(100.0, 100.0, 320.0, 180.0);
+        assert!(card_in_viewport(inside, viewport));
+        // Partly visible is still shown and keeps the demand.
+        assert!(card_in_viewport(
+            Rect::new(viewport.right() - 40.0, 100.0, 320.0, 180.0),
+            viewport
+        ));
+        assert!(card_in_viewport(
+            Rect::new(viewport.x, viewport.bottom() - 40.0, 320.0, 180.0),
+            viewport
+        ));
+        // Scrolled fully above, below or sideways: no pixel is visible.
+        assert!(!card_in_viewport(
+            Rect::new(100.0, viewport.y - 200.0, 320.0, 180.0),
+            viewport
+        ));
+        assert!(!card_in_viewport(
+            Rect::new(100.0, viewport.bottom(), 320.0, 180.0),
+            viewport
+        ));
+        assert!(!card_in_viewport(
+            Rect::new(viewport.right(), 100.0, 320.0, 180.0),
+            viewport
+        ));
+        assert!(!card_in_viewport(
+            Rect::new(viewport.x - 320.0, 100.0, 320.0, 180.0),
+            viewport
+        ));
+        assert!(
+            !card_in_viewport(inside, Rect::new(24.0, 46.0, 0.0, 500.0)),
+            "a collapsed pane hides every card"
+        );
     }
 }

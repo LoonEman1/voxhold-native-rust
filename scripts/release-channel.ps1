@@ -25,11 +25,23 @@ function Assert-ReleaseAssets($Release, [string[]] $Files) {
     foreach ($file in $Files) {
         $name = Split-Path -Leaf $file
         $digest = 'sha256:' + (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash.ToLowerInvariant()
-        $remote = $Release.assets | Where-Object name -CEQ $name
-        if ($remote.state -ne 'uploaded' -or $remote.digest -cne $digest) {
-            throw "GitHub asset $($Release.tag_name)/$name did not match the verified build."
-        }
+        Assert-AssetDigest $Release $name $digest
     }
+}
+
+function Assert-AssetDigest($Release, [string] $Name, [string] $Digest) {
+    $remote = $Release.assets | Where-Object name -CEQ $Name
+    if ($remote.state -ne 'uploaded' -or $remote.digest -cne $Digest) {
+        throw "GitHub asset $($Release.tag_name)/$Name did not match the verified build."
+    }
+}
+
+function Get-ManifestArchiveNames([string] $Tag) {
+    "manifest-$Tag.json.sig", "manifest-$Tag.json"
+}
+
+function Get-ChannelDeltaName([string] $FromVersion, [string] $ToVersion) {
+    "VoxHold-delta-$FromVersion-to-$ToVersion.zip"
 }
 
 function Save-Release([string] $Tag, [string] $Directory, [string[]] $Names) {
@@ -37,7 +49,20 @@ function Save-Release([string] $Tag, [string] $Directory, [string[]] $Names) {
     gh release download $Tag --repo $repo --dir $Directory @patterns
 }
 
-function Read-SignedRelease([string] $Directory, [string] $Tag) {
+function Save-PublishedManifest($Release, [string] $Directory) {
+    $names = @(Get-ManifestArchiveNames $Release.tag_name)
+    if (@($channel.assets | Where-Object name -CIn $names).Count -eq $names.Count) {
+        Save-Release beta $Directory $names
+        for ($index = 0; $index -lt $names.Count; $index++) {
+            Move-Item -LiteralPath (Join-Path $Directory $names[$index]) -Destination (Join-Path $Directory $channelAssets[$index])
+        }
+    } else {
+        # Releases published before the split carry their own signed pair.
+        Save-Release $Release.tag_name $Directory $channelAssets
+    }
+}
+
+function Read-SignedRelease([string] $Directory, [string] $Tag, [switch] $RequireBetaDeltas) {
     & $Tool verify --manifest (Join-Path $Directory 'latest.json') --sig (Join-Path $Directory 'latest.json.sig') | Out-Host
     $manifest = Get-Content -LiteralPath (Join-Path $Directory 'latest.json') -Raw | ConvertFrom-Json
     if ($manifest.channel -cne 'beta' -or "v$($manifest.version)" -cne $Tag -or
@@ -46,14 +71,30 @@ function Read-SignedRelease([string] $Directory, [string] $Tag) {
         throw "The signed manifest does not describe beta release $Tag."
     }
     foreach ($delta in $manifest.deltas) {
-        if ($delta.url -cne "$baseUrl/$Tag/VoxHold-delta-$($delta.from_version).zip") {
-            throw "A delta URL points outside release $Tag."
+        $newName = Get-ChannelDeltaName $delta.from_version $manifest.version
+        $legacyUrl = "$baseUrl/$Tag/VoxHold-delta-$($delta.from_version).zip"
+        if ($delta.url -cne "$baseUrl/beta/$newName" -and ($RequireBetaDeltas -or $delta.url -cne $legacyUrl)) {
+            throw "Unexpected delta URL for $Tag."
         }
     }
     return $manifest
 }
 
+function Assert-PublishedPackages($Release, $Beta, $Manifest) {
+    Assert-AssetDigest $Release 'VoxHold-portable.zip' "sha256:$($Manifest.full.sha256)"
+    Assert-AssetDigest $Release 'VoxHold-Setup.exe' "sha256:$($Manifest.setup.sha256)"
+    foreach ($delta in $Manifest.deltas) {
+        if ($delta.url.StartsWith("$baseUrl/beta/", [StringComparison]::Ordinal)) {
+            $name = Get-ChannelDeltaName $delta.from_version $Manifest.version
+            Assert-AssetDigest $Beta $name "sha256:$($delta.sha256)"
+        } else {
+            Assert-AssetDigest $Release "VoxHold-delta-$($delta.from_version).zip" "sha256:$($delta.sha256)"
+        }
+    }
+}
+
 $releases = @(Get-Releases)
+$channel = $releases | Where-Object tag_name -CEQ 'beta'
 $published = @($releases | Where-Object { !$_.draft -and $_.tag_name -cmatch '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' } |
     Sort-Object { [version]$_.tag_name.Substring(1) } -Descending)
 if ($published.Count -gt 0 -and [version]$published[0].tag_name.Substring(1) -gt [version]$Version) {
@@ -64,12 +105,13 @@ if ($Mode -eq 'Prepare') {
     $previous = $published | Where-Object tag_name -CNE $tag | Select-Object -First 1
     if ($previous) {
         $previousTag = $previous.tag_name
-        Save-Release $previousTag $scratch.FullName ($channelAssets + $packageAssets[0])
+        Save-PublishedManifest $previous $scratch.FullName
         $null = Read-SignedRelease $scratch.FullName $previousTag
+        Save-Release $previousTag $scratch.FullName @($packageAssets[0])
         $base = Join-Path $scratch.FullName $packageAssets[0]
         & $Tool verify --manifest (Join-Path $scratch.FullName 'latest.json') `
             --sig (Join-Path $scratch.FullName 'latest.json.sig') --full $base
-        $delta = Join-Path $Dist "VoxHold-delta-$($previousTag.Substring(1)).zip"
+        $delta = Join-Path $Dist (Get-ChannelDeltaName $previousTag.Substring(1) $Version)
         # Delta generation can decline a delta that is not smaller than the full ZIP.
         $PSNativeCommandUseErrorActionPreference = $false
         & $Tool delta --base $base --target (Join-Path $Dist $packageAssets[0]) --out $delta
@@ -83,52 +125,63 @@ if ($Mode -eq 'Prepare') {
 
 $commit = git rev-parse HEAD
 $release = $releases | Where-Object tag_name -CEQ $tag
-if (!$release -or $release.draft) {
+$newRelease = !$release -or $release.draft
+if ($newRelease) {
     if ((git tag --list $tag) -and (git rev-list -n 1 "refs/tags/$tag") -cne $commit) {
         throw "$tag points to a different commit. Increase the version to publish a new build."
     }
     if ($release -and $release.target_commitish -cne $commit) {
         throw "Draft $tag was built from a different commit."
     }
-    $manifest = Read-SignedRelease $Dist $tag
-    $names = $packageAssets + $channelAssets + @($manifest.deltas | ForEach-Object { "VoxHold-delta-$($_.from_version).zip" })
-    $files = $names | ForEach-Object { Join-Path $Dist $_ }
-    if (!$release) {
-        gh release create $tag --repo $repo --target $commit --draft --prerelease --title "VoxHold $Version" --notes-file $Notes
-    }
-    gh release upload $tag @files --repo $repo --clobber
-    $release = Get-Releases | Where-Object tag_name -CEQ $tag
-    # Remove a delta left by a previous attempt only while this release is a draft.
-    foreach ($asset in $release.assets | Where-Object { $_.name -like 'VoxHold-delta-*.zip' -and $_.name -cnotin $names }) {
-        gh release delete-asset $tag $asset.name --repo $repo --yes
-    }
-    Assert-ReleaseAssets $release $files
-    gh release edit $tag --repo $repo --draft=false
     $signedDir = $Dist
+    $manifest = Read-SignedRelease $signedDir $tag -RequireBetaDeltas
 } else {
     # A retry may find the version already public. Keep its original signed bytes.
     $signedDir = (New-Item -ItemType Directory -Path (Join-Path $scratch.FullName 'published')).FullName
-    Save-Release $tag $signedDir $channelAssets
+    Save-PublishedManifest $release $signedDir
     $manifest = Read-SignedRelease $signedDir $tag
-    $expected = @{
-        'VoxHold-portable.zip' = $manifest.full.sha256
-        'VoxHold-Setup.exe' = $manifest.setup.sha256
-    }
-    foreach ($delta in $manifest.deltas) { $expected["VoxHold-delta-$($delta.from_version).zip"] = $delta.sha256 }
-    foreach ($name in $expected.Keys) {
-        $asset = $release.assets | Where-Object name -CEQ $name
-        if ($asset.state -ne 'uploaded' -or $asset.digest -cne "sha256:$($expected[$name])") {
-            throw "Published release $tag is missing the signed bytes of $name."
-        }
-    }
+    Assert-PublishedPackages $release $channel $manifest
 }
 
-$channel = $releases | Where-Object tag_name -CEQ 'beta'
 $body = "Current Windows beta: [VoxHold $Version](https://github.com/$repo/releases/tag/$tag). Download Setup or portable ZIP there."
-$previousDir = $null
 if (!$channel) {
     gh release create beta --repo $repo --target $commit --draft --prerelease --title 'VoxHold beta channel' --notes $body
-} elseif (!$channel.draft -and @($channel.assets | Where-Object name -CIn $channelAssets).Count -eq $channelAssets.Count) {
+}
+
+if ($newRelease) {
+    # Publish versioned update files before making the version public or advancing latest.
+    $archiveNames = @(Get-ManifestArchiveNames $tag)
+    $archiveFiles = @(for ($index = 0; $index -lt $archiveNames.Count; $index++) {
+        $path = Join-Path $scratch.FullName $archiveNames[$index]
+        Copy-Item -LiteralPath (Join-Path $signedDir $channelAssets[$index]) -Destination $path
+        $path
+    })
+    $deltaFiles = @(foreach ($delta in $manifest.deltas) {
+        Join-Path $Dist (Get-ChannelDeltaName $delta.from_version $Version)
+    })
+    $betaFiles = $archiveFiles + $deltaFiles
+    gh release upload beta @betaFiles --repo $repo --clobber
+
+    if (!$release) {
+        gh release create $tag --repo $repo --target $commit --draft --prerelease --title "VoxHold $Version" --notes-file $Notes
+    } else {
+        # A draft left by the old publisher can still have update assets.
+        foreach ($asset in $release.assets | Where-Object { $_.name -CIn $channelAssets -or $_.name -clike 'VoxHold-delta-*.zip' }) {
+            gh release delete-asset $tag $asset.name --repo $repo --yes
+        }
+    }
+    $files = $packageAssets | ForEach-Object { Join-Path $Dist $_ }
+    gh release upload $tag @files --repo $repo --clobber
+    $current = @(Get-Releases)
+    $release = $current | Where-Object tag_name -CEQ $tag
+    $beta = $current | Where-Object tag_name -CEQ 'beta'
+    Assert-ReleaseAssets $beta $archiveFiles
+    Assert-PublishedPackages $release $beta $manifest
+    gh release edit $tag --repo $repo --draft=false
+}
+
+$previousDir = $null
+if ($channel -and !$channel.draft -and @($channel.assets | Where-Object name -CIn $channelAssets).Count -eq $channelAssets.Count) {
     $previousDir = (New-Item -ItemType Directory -Path (Join-Path $scratch.FullName 'previous-channel')).FullName
     Save-Release beta $previousDir $channelAssets
     $changed = $channelAssets | Where-Object {
@@ -147,7 +200,7 @@ if (!$channel) {
 }
 
 try {
-    # Keep older clients on their existing URLs. The versioned packages are already public.
+    # Clients keep their existing discovery URLs. The signed package URLs are already available.
     foreach ($name in $channelAssets) {
         gh release upload beta (Join-Path $signedDir $name) --repo $repo --clobber
     }

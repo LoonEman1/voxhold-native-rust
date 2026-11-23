@@ -571,6 +571,7 @@ fn ice_from_the_server_reaches_the_engine_only_while_publishing() {
 
 mod answer;
 mod bitrate;
+mod codec;
 mod quality;
 
 #[test]
@@ -653,6 +654,65 @@ fn a_new_picker_after_a_failure_sends_its_own_stream_stop() {
         "the second attempt stops its own publication: {stop:?}"
     );
     assert_eq!(publisher.phase(), Phase::Stopping);
+}
+
+#[test]
+fn a_codec_confirmation_failure_ends_the_attempt_once_and_allows_a_new_one() {
+    let now = Instant::now();
+    let mut publisher = publisher();
+    let first = publishing(&mut publisher, now);
+    assert!(
+        sends(&first)
+            .iter()
+            .any(|signal| signal.kind == "stream.start"),
+        "the attempt reached the server before it failed: {first:?}"
+    );
+    let message = "Кодек VP8 не подтверждён: за 10 с не пришло ни одного закодированного кадра.";
+    let failed = publisher.on_engine(EngineEvent::Error(message.into()), now);
+    assert_eq!(publisher.phase(), Phase::Failed);
+    assert_eq!(
+        failed
+            .iter()
+            .filter(|outcome| matches!(outcome, Outcome::StopEngine))
+            .count(),
+        1,
+        "the refused attempt releases the capture and the peer once: {failed:?}"
+    );
+    assert_eq!(
+        sends(&failed)
+            .iter()
+            .filter(|signal| signal.kind == "stream.stop")
+            .count(),
+        1,
+        "the refused attempt releases its server slot once: {failed:?}"
+    );
+    assert_eq!(publisher.sharing().status, message);
+    assert_eq!(publisher.sharing().error.as_deref(), Some(message));
+    // The worker cannot push the same diagnostic twice into the state machine:
+    // once the attempt is over, a repeated error is ignored.
+    let duplicate = publisher.on_engine(EngineEvent::Error(message.into()), now);
+    assert!(duplicate.is_empty(), "{duplicate:?}");
+
+    // The same channel slot starts a new attempt with its own start and stop.
+    let second_now = now + Duration::from_secs(1);
+    publisher.begin_picker(2);
+    let mut publish = publisher.publish(2, request(), false, second_now);
+    publish.extend(publisher.engine_ready(second_now, false, None));
+    assert_eq!(
+        sends(&publish)
+            .iter()
+            .filter(|signal| signal.kind == "stream.start")
+            .count(),
+        1,
+        "{publish:?}"
+    );
+    assert!(
+        sends(&publish)
+            .iter()
+            .all(|signal| signal.kind != "stream.stop"),
+        "a fresh attempt sends no stop of the failed one: {publish:?}"
+    );
+    assert_eq!(publisher.phase(), Phase::Publishing);
 }
 
 #[test]
@@ -890,6 +950,7 @@ fn a_cancelled_start_never_opens_a_capture() {
         Vec::new(),
         "all".into(),
         Arc::new(PreviewStore::default()),
+        Arc::new(crate::screen_capture::PreviewDemand::default()),
         &cancelled,
     ) {
         Ok(_) => panic!("a cancelled start must not open a device"),

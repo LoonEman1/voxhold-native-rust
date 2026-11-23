@@ -9,7 +9,11 @@ use super::*;
 
 impl VoicePanel {
     /// Apply one runtime update. Returns whether the panel must repaint.
-    pub(in crate::voice_panel) fn apply_screen_update(&mut self, update: VoiceUpdate) -> bool {
+    pub(in crate::voice_panel) fn apply_screen_update(
+        &mut self,
+        update: VoiceUpdate,
+        window: &mut Window,
+    ) -> bool {
         match update {
             VoiceUpdate::ScreenShare(sharing) => {
                 let previous = self.screen.sharing.phase;
@@ -37,6 +41,7 @@ impl VoicePanel {
                             self.screen.preflight = false;
                         }
                         QualityOutcome::Failed(message) => {
+                            self.screen.pending_preferences = None;
                             failed_current = true;
                             self.screen.busy = false;
                             self.screen.pending_quality_op = None;
@@ -48,6 +53,7 @@ impl VoicePanel {
                             self.screen.restore_confirmed_quality();
                         }
                         QualityOutcome::Cancelled => {
+                            self.screen.pending_preferences = None;
                             self.screen.busy = false;
                             self.screen.pending_quality_op = None;
                             self.screen.preflight = false;
@@ -64,7 +70,7 @@ impl VoicePanel {
                             self.screen.pending_quality_op = None;
                             self.screen.preflight = false;
                             if self.screen.open {
-                                self.close_screen_dialog();
+                                self.close_screen_dialog(window);
                             }
                         }
                     }
@@ -91,7 +97,7 @@ impl VoicePanel {
                     && pending
                         .is_none_or(|op| status.as_ref().is_some_and(|status| status.op == op));
                 if restarting_ours {
-                    self.close_screen_dialog();
+                    self.close_screen_dialog(window);
                 }
                 if matches!(phase, Phase::Idle | Phase::Failed) {
                     self.screen.restart = false;
@@ -107,9 +113,10 @@ impl VoicePanel {
                 {
                     // Either a normal Start committed the attempt or the phase
                     // really changed: the room card owns the status now.
-                    self.close_screen_dialog();
+                    self.close_screen_dialog(window);
                 }
                 if phase == Phase::Failed {
+                    self.screen.pending_preferences = None;
                     self.screen.busy = false;
                     self.screen.focus_placed = false;
                     self.screen.error = self.screen.sharing.error.clone().unwrap_or_default();
@@ -117,7 +124,7 @@ impl VoicePanel {
                     // dialog calls `begin_picker` again.
                     if self.screen.open {
                         self.screen.open = false;
-                        self.screen.clear_previews();
+                        self.screen.clear_previews(window);
                     }
                 }
                 if phase == Phase::Idle {
@@ -127,15 +134,17 @@ impl VoicePanel {
                         self.screen.open = false;
                         self.screen.busy = false;
                         self.screen.focus_placed = false;
-                        self.screen.clear_previews();
+                        self.screen.clear_previews(window);
                         if previous != Phase::Idle {
                             self.screen.error =
                                 "Соединение было восстановлено, выберите экран снова.".into();
                         }
                     }
-                }
-                if phase == Phase::Idle && previous != Phase::Idle {
-                    self.screen.preview = None;
+                    // Every Idle snapshot drops the on-air picture. The state
+                    // updates are coalesced, so `previous` being Idle does not
+                    // prove that no card is held: Stop may have released the
+                    // thumbnails while this update still carried the card.
+                    self.screen.clear_preview(window);
                 }
                 // The gate can change without a picker click: the attempt is
                 // now open or closed, and the worker needs the current value.
@@ -155,7 +164,7 @@ impl VoicePanel {
                         self.screen.monitor_error = error.unwrap_or_default();
                         self.screen.retain_selection(SourceKind::Monitor, &sources);
                         self.screen
-                            .retain_preview_snapshot(SourceKind::Monitor, &sources);
+                            .retain_preview_snapshot(window, SourceKind::Monitor, &sources);
                         // The non-active kind still refreshes its cache; the
                         // picker reads it when the user switches tabs.
                         self.screen.monitors = sources;
@@ -166,7 +175,7 @@ impl VoicePanel {
                         self.screen.window_error = error.unwrap_or_default();
                         self.screen.retain_selection(SourceKind::Window, &sources);
                         self.screen
-                            .retain_preview_snapshot(SourceKind::Window, &sources);
+                            .retain_preview_snapshot(window, SourceKind::Window, &sources);
                         self.screen.windows = sources;
                     }
                     _ => return false,
@@ -177,13 +186,13 @@ impl VoicePanel {
         }
     }
 
-    fn close_screen_dialog(&mut self) {
+    fn close_screen_dialog(&mut self, window: &mut Window) {
         self.screen.open = false;
         self.screen.restart = false;
         self.screen.busy = false;
         self.screen.preflight = false;
         self.screen.pending_quality_op = None;
         self.screen.focus_placed = false;
-        self.screen.clear_previews();
+        self.screen.clear_previews(window);
     }
 }

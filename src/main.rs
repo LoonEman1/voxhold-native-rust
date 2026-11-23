@@ -44,6 +44,8 @@ mod voice_panel;
 mod voice_room;
 mod voice_settings;
 mod window_chrome;
+#[cfg(feature = "voxhold-media")]
+mod window_state;
 
 use gpui::{px, size, App, AppContext, Application, Bounds, WindowBounds, WindowOptions};
 use gpui_component::Root;
@@ -186,7 +188,7 @@ fn main() {
                     // it the state stays unconfirmed so the helper can roll
                     // back.
                     view.update(cx, |view, cx| {
-                        view.start_update(handshake.is_some(), handshake_written, cx)
+                        view.start_update(handshake.is_some(), handshake_written, window, cx)
                     });
                     cx.new(|cx| Root::new(view.into(), window, cx))
                 },

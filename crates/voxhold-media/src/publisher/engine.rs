@@ -11,6 +11,13 @@
 //! transceiver first makes the answer put it on the offered m-line. The
 //! in-process loopback test proves the answer keeps the offered mid, is
 //! `a=sendonly` and that decoded frames arrive at the SFU.
+//!
+//! The requested SDR codec is negotiated, not assumed: the video transceiver's
+//! codec preferences are pinned to the checked SDR capability, the offer and
+//! the answer are verified (mid, primary payload, FMTP profile, RTX `apt`), and
+//! a re-offer after an ICE restart must keep the same pair. Transmission is
+//! confirmed only by encoded frames plus the codec statistics they point at;
+//! ICE and the answer prove connectivity alone.
 
 use std::{
     collections::VecDeque,
@@ -22,18 +29,17 @@ use std::{
 };
 
 use libwebrtc::{
+    MediaType,
     audio_source::{AudioSourceOptions, native::NativeAudioSource},
     ice_candidate::IceCandidate,
     media_stream_track::MediaStreamTrack,
-    peer_connection::{AnswerOptions, PeerConnection, PeerConnectionState},
+    peer_connection::{PeerConnection, PeerConnectionState},
     peer_connection_factory::{
         IceServer as RtcIceServer, IceTransportsType, PeerConnectionFactory, RtcConfiguration,
         native::PeerConnectionFactoryExt,
     },
-    rtp_sender::RtpSender,
-    session_description::{SdpType, SessionDescription},
-    stats::{QualityLimitationReason, RtcStats},
-    video_frame::{BoxVideoBuffer, I420Buffer, VideoFrame, VideoRotation},
+    stats::QualityLimitationReason,
+    video_frame::{BoxVideoBuffer, VideoFrame, VideoRotation},
     video_source::{VideoResolution, native::NativeVideoSource},
 };
 use tokio::sync::mpsc;
@@ -41,14 +47,12 @@ use tokio::sync::mpsc;
 use crate::{
     Candidate, IceServer,
     publisher::{
-        BitrateResult, PublishRequest, Quality, QualityOp,
+        BitrateResult, Codec, PublishRequest, Quality, QualityOp,
         bitrate::{
             Limits, apply_sender_limits, confirmed_quality, failure_message, readback_limits,
         },
     },
-    screen_capture::{
-        CaptureFailure, CapturedImage, LatestImage, PreviewStore, ScreenCapture, preview_from_i420,
-    },
+    screen_capture::{CaptureFailure, LatestImage, PreviewDemand, PreviewStore, ScreenCapture},
     system_audio::{AudioProducer, CHANNELS, SAMPLE_RATE, SystemAudio},
 };
 
@@ -67,6 +71,10 @@ const ENGINE_EVENT_CAPACITY: usize = 32;
 /// The outbound stats poll is cheap but must not stall command handling.
 const STATS_INTERVAL: Duration = Duration::from_secs(1);
 const STATS_TIMEOUT: Duration = Duration::from_millis(500);
+/// ICE and the answer prove connectivity, never transmission. The first
+/// encoded frame and its reported codec must arrive inside this window, or the
+/// attempt ends with a codec diagnostic instead of a silent black stream.
+const CODEC_CONFIRM_TIMEOUT: Duration = Duration::from_secs(10);
 /// A worker that does not finish after its channel closed is detached instead
 /// of hanging the runtime forever.
 const WORKER_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -131,6 +139,10 @@ pub struct PublishStats {
     pub audio_packets_sent: u64,
     /// 10 ms blocks the capture queue dropped because the encoder was behind.
     pub audio_dropped: u64,
+    /// The codec the live sender really encoded, confirmed from the outbound
+    /// statistics and the `RtcStats::Codec` they point at. `None` until the
+    /// first encoded frame; ICE and the answer never set it.
+    pub confirmed_codec: Option<Codec>,
 }
 
 impl Default for PublishStats {
@@ -146,6 +158,7 @@ impl Default for PublishStats {
             audio_kbps: 0.0,
             audio_packets_sent: 0,
             audio_dropped: 0,
+            confirmed_codec: None,
         }
     }
 }
@@ -169,103 +182,6 @@ impl PublishStats {
             self.limitation.label(),
             self.sources
         )
-    }
-}
-
-/// Where the pump takes its pictures. The production producer pulls the
-/// Windows desktop capturer; the loopback test injects a synthetic pattern.
-pub trait FrameProducer: Send {
-    fn next_frame(&mut self) -> Option<CapturedImage>;
-    fn failure(&self) -> Option<CaptureFailure>;
-    fn dropped(&self) -> u64;
-}
-
-struct DesktopProducer {
-    capture: ScreenCapture,
-    latest: Arc<LatestImage>,
-}
-
-impl FrameProducer for DesktopProducer {
-    fn next_frame(&mut self) -> Option<CapturedImage> {
-        self.latest.take()
-    }
-
-    fn failure(&self) -> Option<CaptureFailure> {
-        self.capture.failure()
-    }
-
-    fn dropped(&self) -> u64 {
-        self.latest.dropped()
-    }
-}
-
-/// A known moving I420 pattern. It exercises the real encoder and RTP path
-/// without a desktop session, which keeps the loopback test CI-safe. The first
-/// slice of the plan asked for exactly this synthetic source.
-pub struct SyntheticProducer {
-    width: u32,
-    height: u32,
-    frame: u64,
-    preview: bool,
-}
-
-impl SyntheticProducer {
-    pub fn new(width: u32, height: u32, preview: bool) -> Self {
-        Self {
-            width: width.max(2) & !1,
-            height: height.max(2) & !1,
-            frame: 0,
-            preview,
-        }
-    }
-}
-
-impl FrameProducer for SyntheticProducer {
-    fn next_frame(&mut self) -> Option<CapturedImage> {
-        let mut buffer = I420Buffer::new(self.width, self.height);
-        let (stride_y, stride_u, stride_v) = buffer.strides();
-        let chroma = (
-            buffer.chroma_width() as usize,
-            buffer.chroma_height() as usize,
-        );
-        let (data_y, data_u, data_v) = buffer.data_mut();
-        // A vertical bar moves one pixel per frame and the background changes
-        // luminance every second, so a frozen or single-colour stream is
-        // visible in the encoded output.
-        let bar = (self.frame % u64::from(self.width)) as u32;
-        let value = if (self.frame / 30) % 2 == 0 { 220 } else { 80 };
-        for y in 0..self.height as usize {
-            for x in 0..self.width as usize {
-                let bright = x as u32 >= bar && (x as u32) < bar + self.width / 8;
-                data_y[y * stride_y as usize + x] = if bright { 235 } else { value };
-            }
-        }
-        for y in 0..chroma.1 {
-            for x in 0..chroma.0 {
-                data_u[y * stride_u as usize + x] = 128;
-                data_v[y * stride_v as usize + x] = 128;
-            }
-        }
-        self.frame = self.frame.wrapping_add(1);
-        let preview = if self.preview {
-            preview_from_i420(&buffer, 640)
-        } else {
-            None
-        };
-        Some(CapturedImage {
-            width: self.width,
-            height: self.height,
-            i420: buffer,
-            preview,
-        })
-    }
-
-    fn failure(&self) -> Option<CaptureFailure> {
-        None
-    }
-
-    fn dropped(&self) -> u64 {
-        0
     }
 }
 
@@ -316,6 +232,18 @@ impl AppliedLimits {
 mod audio;
 use audio::{AudioCounters, AudioMeter, audio_loop};
 
+/// Codec negotiation of one publication: the requested SDR payload, the
+/// offered mid and the RTX pair.
+mod negotiation;
+/// The frame producer contract and its implementations.
+mod producer;
+/// The outbound statistics poll and the raw video stream it reports.
+mod stats;
+use producer::DesktopProducer;
+#[cfg(test)]
+use producer::StalledProducer;
+pub use producer::{FrameProducer, SyntheticProducer};
+
 enum Command {
     Offer(String),
     Ice(Candidate),
@@ -327,6 +255,11 @@ enum Command {
         op: QualityOp,
         quality: Quality,
     },
+    /// Test hook: shorten the codec-confirmation window so the "connected but
+    /// no encoded frame" regression does not cost ten seconds per run. Only
+    /// test builds can create this command.
+    #[cfg(test)]
+    ConfirmTimeout(Duration),
     Stop,
 }
 
@@ -374,18 +307,20 @@ impl PublisherEngine {
         servers: Vec<IceServer>,
         policy: String,
         preview: Arc<PreviewStore>,
+        demand: Arc<PreviewDemand>,
         cancelled: &AtomicBool,
     ) -> Result<Self, String> {
         if cancelled.load(Ordering::SeqCst) {
             return Err(PREP_CANCELLED.into());
         }
         let latest = Arc::new(LatestImage::default());
-        let target = request.quality.resolution.size();
+        let target = request.capture_target();
         let capture = ScreenCapture::start(
             request.source.clone(),
             target,
             request.quality.fps,
             latest.clone(),
+            demand.clone(),
         )
         .map_err(str::to_owned)?;
         if cancelled.load(Ordering::SeqCst) {
@@ -426,6 +361,7 @@ impl PublisherEngine {
             audio,
             audio_scope,
             preview,
+            true,
         )?;
         if cancelled.load(Ordering::SeqCst) {
             drop(engine);
@@ -455,6 +391,29 @@ impl PublisherEngine {
             audio,
             None,
             Arc::new(PreviewStore::default()),
+            true,
+        )
+    }
+
+    /// Test entry point: the capture never delivers a frame and the source
+    /// injects no black-frame keepalive, so the encoder cannot produce a frame
+    /// even while ICE connects. Used by the "connected but no encoded frames"
+    /// regression.
+    #[cfg(test)]
+    pub(crate) fn start_synthetic_stalled(
+        request: PublishRequest,
+        servers: Vec<IceServer>,
+        policy: String,
+    ) -> Result<Self, String> {
+        Self::spawn(
+            request,
+            servers,
+            policy,
+            Box::new(StalledProducer),
+            None,
+            None,
+            Arc::new(PreviewStore::default()),
+            false,
         )
     }
 
@@ -478,6 +437,7 @@ impl PublisherEngine {
         audio: Option<Box<dyn AudioProducer>>,
         audio_scope: Option<String>,
         preview: Arc<PreviewStore>,
+        video_keepalive: bool,
     ) -> Result<Self, String> {
         let has_audio = audio.is_some();
         let (commands, receiver) = mpsc::channel(ENGINE_COMMAND_CAPACITY);
@@ -513,6 +473,7 @@ impl PublisherEngine {
                     policy,
                     producer,
                     audio,
+                    video_keepalive,
                     ready_tx,
                 ));
             })
@@ -567,6 +528,14 @@ impl PublisherEngine {
     #[cfg(test)]
     pub(crate) fn applied_bitrate_limits(&self) -> (u64, u64) {
         self.limits.pair()
+    }
+
+    /// Test hook: shorten the codec-confirmation window of the worker.
+    #[cfg(test)]
+    pub(crate) fn set_codec_confirm_timeout(&self, timeout: Duration) -> bool {
+        self.commands
+            .as_ref()
+            .is_some_and(|commands| commands.try_send(Command::ConfirmTimeout(timeout)).is_ok())
     }
 
     /// Apply one server ICE candidate. A full queue drops the candidate; the
@@ -657,11 +626,28 @@ async fn run(
     policy: String,
     producer: Box<dyn FrameProducer>,
     audio: Option<Box<dyn AudioProducer>>,
+    video_keepalive: bool,
     ready: std::sync::mpsc::Sender<Result<(), String>>,
 ) {
     let factory = PeerConnectionFactory::default();
-    let (width, height) = request.quality.resolution.size();
-    let source = NativeVideoSource::new(VideoResolution { width, height }, true);
+    let profile = match negotiation::sender_profile(request.codec) {
+        Ok(profile) => profile,
+        Err(message) => {
+            let _ = ready.send(Err(message));
+            return;
+        }
+    };
+    let (width, height) = request.capture_size();
+    // The production source injects a black-frame keepalive before the first
+    // real capture, so a stalled desktop still sends something and the capture
+    // watchdog decides. The stalled test source must not use it: without a
+    // keepalive the encoder stays silent and the codec watchdog is the only
+    // thing that can end the attempt.
+    let source = if video_keepalive {
+        NativeVideoSource::new(VideoResolution { width, height }, true)
+    } else {
+        NativeVideoSource::new_encoded(VideoResolution { width, height })
+    };
     let mut config = RtcConfiguration::default();
     config.ice_transport_type = match policy.as_str() {
         "" | "all" => IceTransportsType::All,
@@ -700,10 +686,11 @@ async fn run(
         }));
     })));
     let state_events = events.clone();
+    // ICE reaching `Connected` is not a confirmation of the transmission: the
+    // worker emits `Connection::Connected` from its own tick only after the
+    // first encoded frame reported the negotiated codec. A callback-triggered
+    // event here would let an ICE-only link look live.
     peer.on_connection_state_change(Some(Box::new(move |state| match state {
-        PeerConnectionState::Connected => {
-            state_events.push(EngineEvent::State(crate::publisher::Connection::Connected));
-        }
         PeerConnectionState::Failed | PeerConnectionState::Closed => {
             state_events.push(EngineEvent::Closed);
         }
@@ -756,10 +743,19 @@ async fn run(
         }
         None => (None, None),
     };
-    // The picker offers the codecs the capability probe reports as available.
-    // Applying `request.codec` through the sender's codec preferences and
-    // confirming it from frames and stats is the next slice (C03).
-    let _ = request.codec;
+    // Pin the requested SDR payload on the video transceiver that already
+    // carries the send track. The local preference keeps the answer on the
+    // requested codec when the SFU offers more than one compatible payload
+    // (for example H.264 Constrained Baseline next to legacy), while the plain
+    // `video/rtx` entry lets the answer derive the real `apt` pair from the
+    // offer instead of assuming a payload type.
+    let capabilities = factory.get_rtp_sender_capabilities(MediaType::Video);
+    if let Err(message) =
+        negotiation::pin_video_codec(&peer, &capabilities.codecs, request.codec, profile)
+    {
+        let _ = ready.send(Err(message));
+        return;
+    }
 
     let pump = tokio::spawn(frame_loop(
         producer,
@@ -767,7 +763,8 @@ async fn run(
         events.clone(),
         preview,
         counters.clone(),
-        request.quality,
+        request.quality.fps,
+        (width, height),
     ));
     // The last quality really applied to the live senders. The backend's
     // `startRecovery` may offer again to a live publisher, so a later answer
@@ -786,6 +783,13 @@ async fn run(
     let mut disconnected_since: Option<Instant> = None;
     let mut last_stats = Instant::now();
     let mut audio_meter = AudioMeter::default();
+    // What the delivered SDP negotiated, and what the encoder really produced.
+    let mut selected: Option<negotiation::SelectedVideo> = None;
+    let mut confirmed: Option<negotiation::ConfirmedCodec> = None;
+    let mut confirm_deadline: Option<Instant> = None;
+    #[cfg_attr(not(test), allow(unused_mut))]
+    let mut confirm_timeout = CODEC_CONFIRM_TIMEOUT;
+    let mut connected_announced = false;
     loop {
         let command = tokio::select! {
             command = commands.recv() => command,
@@ -801,42 +805,108 @@ async fn run(
                 } else {
                     disconnected_since = None;
                 }
+                // Transmission is confirmed only by encoded frames and their
+                // reported codec. The check runs after the statistics poll of
+                // this tick, so the first sample that confirms the codec also
+                // announces the connection; ICE alone never does.
+                if confirmed.is_none()
+                    && confirm_deadline.is_some_and(|deadline| Instant::now() >= deadline)
+                {
+                    events.push(EngineEvent::Error(format!(
+                        "Кодек {} не подтверждён: за {} с не пришло ни одного закодированного кадра.",
+                        request.codec.label(),
+                        confirm_timeout.as_secs().max(1)
+                    )));
+                    break;
+                }
                 if last_stats.elapsed() >= STATS_INTERVAL {
                     last_stats = Instant::now();
-                    if let Some(stats) = outbound_stats(
+                    if let Some(mut sample) = stats::sample(
                         &peer,
                         &counters,
                         &audio_counters,
                         &mut audio_meter,
                         audio_sender.is_some(),
+                        selected.as_ref().map(|selected| selected.mid.as_str()),
                     )
                     .await
                     {
-                        events.push(EngineEvent::Stats(stats));
+                        if confirmed.is_none()
+                            && let (Some(selected), Some(wire)) =
+                                (selected.as_ref(), sample.video.as_ref())
+                        {
+                            match negotiation::confirm_codec(selected, wire) {
+                                Ok(codec) => confirmed = codec,
+                                Err(message) => {
+                                    events.push(EngineEvent::Error(message));
+                                    break;
+                                }
+                            }
+                        }
+                        sample.stats.confirmed_codec = confirmed.as_ref().map(|codec| codec.codec);
+                        events.push(EngineEvent::Stats(sample.stats));
                     }
+                }
+                if confirmed.is_some()
+                    && !connected_announced
+                    && peer.connection_state() == PeerConnectionState::Connected
+                {
+                    connected_announced = true;
+                    events.push(EngineEvent::State(
+                        crate::publisher::Connection::Connected,
+                    ));
                 }
                 continue;
             }
         };
         match command {
             Some(Command::Offer(sdp)) => {
-                if !apply_offer(
-                    &peer,
-                    &sender,
-                    audio_sender.as_ref(),
-                    &sdp,
-                    quality,
-                    &events,
-                    Some(&limits),
-                    &mut applied,
-                )
-                .await
-                {
-                    break;
+                // The context borrows the previous negotiation, so it ends
+                // before the new one replaces it.
+                let outcome = {
+                    let context = negotiation::OfferContext {
+                        codec: request.codec,
+                        profile,
+                        audio_active: audio_sender.is_some(),
+                        previous: selected.as_ref(),
+                        quality,
+                    };
+                    negotiation::apply_offer(
+                        &peer,
+                        &sender,
+                        audio_sender.as_ref(),
+                        &sdp,
+                        &context,
+                        Some(&limits),
+                        &mut applied,
+                    )
+                    .await
+                };
+                match outcome {
+                    Ok((answer, next)) => {
+                        if selected.is_none() {
+                            confirm_deadline = Some(Instant::now() + confirm_timeout);
+                        }
+                        selected = Some(next);
+                        remote_set = true;
+                        events.push(EngineEvent::Answer(answer));
+                        while let Some(candidate) = pending.pop_front() {
+                            add_ice(&peer, candidate).await;
+                        }
+                    }
+                    Err(message) => {
+                        events.push(EngineEvent::Error(message));
+                        break;
+                    }
                 }
-                remote_set = true;
-                while let Some(candidate) = pending.pop_front() {
-                    add_ice(&peer, candidate).await;
+            }
+            #[cfg(test)]
+            Some(Command::ConfirmTimeout(timeout)) => {
+                confirm_timeout = timeout;
+                if confirmed.is_none()
+                    && let Some(deadline) = confirm_deadline
+                {
+                    confirm_deadline = Some(deadline.min(Instant::now() + confirm_timeout));
                 }
             }
             Some(Command::Bitrate {
@@ -899,72 +969,6 @@ async fn run(
     peer.close();
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn apply_offer(
-    peer: &PeerConnection,
-    sender: &RtpSender,
-    audio_sender: Option<&RtpSender>,
-    sdp: &str,
-    quality: Quality,
-    events: &EventQueue,
-    limits: Option<&AppliedLimits>,
-    applied: &mut Limits,
-) -> bool {
-    let offer = match SessionDescription::parse(sdp, SdpType::Offer) {
-        Ok(offer) => offer,
-        Err(_) => {
-            events.push(EngineEvent::Error(
-                "Сервер прислал некорректное предложение трансляции.".into(),
-            ));
-            return false;
-        }
-    };
-    if peer.set_remote_description(offer).await.is_err() {
-        events.push(EngineEvent::Error(
-            "Не удалось применить предложение трансляции.".into(),
-        ));
-        return false;
-    }
-    let answer = match peer.create_answer(AnswerOptions::default()).await {
-        Ok(answer) => answer,
-        Err(_) => {
-            events.push(EngineEvent::Error(
-                "Не удалось создать ответ трансляции.".into(),
-            ));
-            return false;
-        }
-    };
-    let text = answer.to_string();
-    if peer.set_local_description(answer).await.is_err() {
-        events.push(EngineEvent::Error(
-            "Не удалось применить ответ трансляции.".into(),
-        ));
-        return false;
-    }
-    apply_confirmed_limits(peer, sender, audio_sender, quality, limits, applied);
-    events.push(EngineEvent::Answer(text));
-    true
-}
-
-/// The initial answer applies the same limits, but its result is not a live
-/// operation: a refused readback leaves the confirmed limits unknown instead
-/// of failing the publication.
-fn apply_confirmed_limits(
-    peer: &PeerConnection,
-    sender: &RtpSender,
-    audio_sender: Option<&RtpSender>,
-    quality: Quality,
-    limits: Option<&AppliedLimits>,
-    applied: &mut Limits,
-) {
-    if let Ok(confirmed) = apply_sender_limits(peer, sender, audio_sender, quality, *applied) {
-        *applied = confirmed;
-        if let Some(limits) = limits {
-            limits.store(&confirmed);
-        }
-    }
-}
-
 async fn add_ice(peer: &PeerConnection, candidate: Candidate) {
     let mid = candidate.sdp_mid.as_deref().unwrap_or_default();
     let index = candidate.sdp_mline_index.map(i32::from).unwrap_or(-1);
@@ -973,102 +977,24 @@ async fn add_ice(peer: &PeerConnection, candidate: Candidate) {
     }
 }
 
-/// One honest diagnostics sample: encoded FPS / resolution / limitation from
-/// `OutboundRtpStats`, the capture drop counter and the single active source.
-/// A failed or empty stats call falls back to the capture-side numbers.
-async fn outbound_stats(
-    peer: &PeerConnection,
-    counters: &FrameCounters,
-    audio_counters: &AudioCounters,
-    audio_meter: &mut AudioMeter,
-    audio_active: bool,
-) -> Option<PublishStats> {
-    let capture_width = counters.width.load(Ordering::Relaxed);
-    let capture_height = counters.height.load(Ordering::Relaxed);
-    let capture_fps = f32::from_bits(counters.fps_bits.load(Ordering::Relaxed));
-    let dropped = counters.dropped.load(Ordering::Relaxed);
-    let (mut video, mut audio) = (None, None);
-    if let Ok(Ok(stats)) = tokio::time::timeout(STATS_TIMEOUT, peer.get_stats()).await {
-        for stat in stats {
-            let RtcStats::OutboundRtp(outbound) = stat else {
-                continue;
-            };
-            match outbound.stream.kind.as_str() {
-                "video" => video = Some(outbound),
-                "audio" => audio = Some(outbound),
-                _ => {}
-            }
-        }
-    }
-    let mut audio_packets_sent = 0;
-    let mut audio_kbps = 0.0;
-    if let Some(outbound) = &audio {
-        audio_packets_sent = outbound.sent.packets_sent;
-        audio_meter.observe(outbound.sent.bytes_sent);
-        audio_kbps = audio_meter.kbps();
-    }
-    let Some(outbound) = video else {
-        return Some(PublishStats {
-            fps: capture_fps,
-            dropped,
-            width: capture_width,
-            height: capture_height,
-            sources: 1,
-            limitation: QualityLimitation::None,
-            audio_active,
-            audio_kbps,
-            audio_packets_sent,
-            audio_dropped: audio_counters.dropped(),
-        });
-    };
-    let stream = outbound.outbound;
-    #[cfg(test)]
-    crate::live_probe::record_outbound(
-        stream.frames_encoded,
-        outbound.sent.packets_sent,
-        stream.frame_width,
-        stream.frame_height,
-        audio_packets_sent,
-        audio_kbps,
-    );
-    Some(PublishStats {
-        fps: stream.frames_per_second as f32,
-        dropped,
-        width: if stream.frame_width > 0 {
-            stream.frame_width
-        } else {
-            capture_width
-        },
-        height: if stream.frame_height > 0 {
-            stream.frame_height
-        } else {
-            capture_height
-        },
-        sources: 1,
-        limitation: QualityLimitation::from_reason(stream.quality_limitation_reason),
-        audio_active,
-        audio_kbps,
-        audio_packets_sent,
-        audio_dropped: audio_counters.dropped(),
-    })
-}
-
 async fn frame_loop(
     mut producer: Box<dyn FrameProducer>,
     source: NativeVideoSource,
     events: Arc<EventQueue>,
     preview: Arc<PreviewStore>,
     counters: Arc<FrameCounters>,
-    quality: Quality,
+    fps: u32,
+    mut size: (u32, u32),
 ) {
-    let interval = Duration::from_micros(1_000_000 / u64::from(quality.fps.max(1)));
+    let interval = Duration::from_secs(1) / fps.clamp(1, super::MAX_SCREEN_FPS);
+    let mut tick = tokio::time::interval(interval);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut window = Instant::now();
     let mut sent_in_window = 0_u32;
     let mut first = false;
     let mut last_frame = Instant::now();
-    let mut size = quality.resolution.size();
     loop {
-        tokio::time::sleep(interval).await;
+        tick.tick().await;
         let mut failed = producer.failure();
         if let Some(image) = producer.next_frame() {
             last_frame = Instant::now();
@@ -1150,3 +1076,9 @@ mod capture_tests;
 
 #[cfg(test)]
 mod lifecycle_tests;
+
+#[cfg(test)]
+mod codec_tests;
+
+#[cfg(test)]
+mod codec_reject_tests;

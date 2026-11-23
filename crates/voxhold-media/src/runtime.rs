@@ -72,6 +72,9 @@ pub struct StreamFrame {
 pub struct VoiceHandle {
     requests: Arc<Requests>,
     updates: Arc<Updates>,
+    /// UI wake shared with the panel. Updates, a prepared player picture and a
+    /// local preview set it, so the panel polls on events instead of a timer.
+    wake: Arc<Notify>,
     frame: Arc<Mutex<Option<StreamFrame>>>,
     /// Capture permission is independent of the socket worker, so leave, a
     /// released PTT key or logout silences the track immediately.
@@ -79,6 +82,9 @@ pub struct VoiceHandle {
     /// Last local preview of the screen publication. The publisher engine
     /// writes it; the on-air card takes it.
     screen_preview: Arc<crate::screen_capture::PreviewStore>,
+    /// Whether the painted on-air card asks for a preview and how wide it is.
+    /// The UI only writes atomics; the capture thread reads the newest value.
+    screen_demand: Arc<crate::screen_capture::PreviewDemand>,
     /// Ids for the picker and its listings. `u64` so a stale answer can never
     /// replace a newer one.
     screen_picker: Arc<AtomicU64>,
@@ -96,13 +102,26 @@ impl VoiceHandle {
         controls: Controls,
         self_muted: bool,
     ) -> Result<Self, String> {
-        Self::join_with_rotation(client, server, channel, controls, self_muted, false)
+        Self::join_with_rotation(
+            client,
+            server,
+            channel,
+            controls,
+            self_muted,
+            false,
+            Arc::new(Notify::new()),
+        )
     }
 
     /// Join while a token refresh is already in flight. The gate is installed
     /// on the shared requests before the worker thread starts, so its first
     /// authorization waits for the refresh answer (or the 30 s deadline)
     /// instead of using the revoked token.
+    ///
+    /// `wake` belongs to the panel: it is stored for the whole handle lifetime
+    /// and is set when the update queue turns non-empty, when a player picture
+    /// is published and when a local preview is stored.
+    #[allow(clippy::too_many_arguments)]
     pub fn join_with_rotation(
         client: voxhold_api::Client,
         server: i64,
@@ -110,6 +129,7 @@ impl VoiceHandle {
         controls: Controls,
         self_muted: bool,
         rotation_pending: bool,
+        wake: Arc<Notify>,
     ) -> Result<Self, String> {
         static ATTEMPT: AtomicU64 = AtomicU64::new(1);
         let attempt = ATTEMPT.fetch_add(1, Ordering::SeqCst);
@@ -117,17 +137,20 @@ impl VoiceHandle {
         if rotation_pending {
             requests.rotation_started(Instant::now());
         }
-        let updates = Arc::new(Updates::new());
+        let updates = Arc::new(Updates::with_wake(wake.clone()));
         let frame = Arc::new(Mutex::new(None));
         let capture = Arc::new(CaptureGate::default());
         let finished = Arc::new((Mutex::new(false), Condvar::new()));
-        let screen_preview = Arc::new(crate::screen_capture::PreviewStore::default());
+        let screen_preview = Arc::new(crate::screen_capture::PreviewStore::with_wake(wake.clone()));
+        let screen_demand = Arc::new(crate::screen_capture::PreviewDemand::default());
         let screen_picker = Arc::new(AtomicU64::new(1));
         let source_generation = Arc::new(AtomicU64::new(1));
         let (worker_requests, worker_updates) = (requests.clone(), updates.clone());
         let (worker_frame, worker_finished) = (frame.clone(), finished.clone());
         let worker_capture = capture.clone();
         let worker_preview = screen_preview.clone();
+        let worker_demand = screen_demand.clone();
+        let worker_wake = wake.clone();
         let worker = thread::Builder::new()
             .name("voxhold-voice-session".into())
             .spawn(move || {
@@ -142,6 +165,8 @@ impl VoiceHandle {
                     worker_frame,
                     worker_capture,
                     worker_preview,
+                    worker_demand,
+                    worker_wake,
                 );
                 if let Ok(mut done) = worker_finished.0.lock() {
                     *done = true;
@@ -152,9 +177,11 @@ impl VoiceHandle {
         Ok(Self {
             requests,
             updates,
+            wake,
             frame,
             capture,
             screen_preview,
+            screen_demand,
             screen_picker,
             source_generation,
             attempt,
@@ -240,7 +267,12 @@ impl VoiceHandle {
         self.requests.wake();
     }
 
+    /// Take the last prepared picture and ask the worker for the next one.
+    /// The request is a last-value flag: the UI never converts pixels, it only
+    /// states that a picture is wanted, and the background loop scales the
+    /// latest decoded frame off the UI thread.
     pub fn take_frame(&self) -> Option<StreamFrame> {
+        self.requests.request_frame();
         self.frame.lock().ok()?.take()
     }
 
@@ -305,6 +337,9 @@ impl VoiceHandle {
         // Latch first: the flag stops the worker, but the track must be silent
         // now, even while `socket.send` is still waiting.
         self.capture.latch();
+        // No card can take a preview after this point; stop converting them
+        // immediately instead of waiting for the worker to release the capture.
+        self.screen_demand.disable();
         self.requests.cancel_publish_recovery();
         self.requests.leave.store(true, Ordering::SeqCst);
         if let Ok(mut stream) = self.requests.stream.lock() {
@@ -401,11 +436,52 @@ struct Live {
     /// an old-generation close must not end the call.
     session_token: String,
     screen_preview: Arc<crate::screen_capture::PreviewStore>,
+    /// The card's preview request of this handle. Shared with the live capture
+    /// thread; this session only disables it when an attempt ends.
+    screen_demand: Arc<crate::screen_capture::PreviewDemand>,
     render: VideoFrame,
     viewport: (u32, u32),
+    /// True while the player has asked for a picture that the worker has not
+    /// prepared yet. One request allows one conversion; a viewport change is
+    /// its own reason to re-read the cached frame.
+    frame_request: Arc<AtomicBool>,
     local_level: Option<(f64, bool)>,
     frame: Arc<Mutex<Option<StreamFrame>>>,
     updates: Arc<Updates>,
+    /// Panel wake of this handle; a published player picture sets it.
+    wake: Arc<Notify>,
+}
+
+/// One drain batch's claim on the player's last-value picture request. Taking
+/// it clears the shared flag, so a burst of polls cannot grow the work; if the
+/// batch ends without a successful read (no engine, or a signaling, statistics
+/// or audio update that never touched the decoder), `Drop` puts the claim
+/// back. The flag is never cleared again after the swap: a request that
+/// arrived during the batch must survive it.
+struct FrameClaim {
+    flag: Arc<AtomicBool>,
+    pending: bool,
+}
+
+impl FrameClaim {
+    fn take(flag: Arc<AtomicBool>) -> Self {
+        Self {
+            pending: flag.swap(false, Ordering::SeqCst),
+            flag,
+        }
+    }
+
+    fn pending(&mut self) -> &mut bool {
+        &mut self.pending
+    }
+}
+
+impl Drop for FrameClaim {
+    fn drop(&mut self) {
+        if self.pending {
+            self.flag.store(true, Ordering::SeqCst);
+        }
+    }
 }
 
 impl Live {
@@ -502,45 +578,66 @@ impl Live {
 
     async fn drain_viewer(&mut self, viewer: &mut Viewer) -> Result<bool, SessionEnd> {
         let (width, height) = self.viewport;
+        // One request allows one prepared picture per drain batch. Events
+        // (signaling, stats, audio) do not consume it, so a request that
+        // arrives between two decodes is still served by this batch. An
+        // unspent claim returns to the shared flag when it is dropped.
+        let mut request = FrameClaim::take(self.frame_request.clone());
+        let mut result = Ok(true);
         for _ in 0..FRAMES_PER_TICK {
             let update = {
                 let Self { stream, render, .. } = self;
                 let Some(engine) = stream.as_mut() else {
-                    return Ok(true);
+                    break;
                 };
-                engine.poll(render, width, height)
+                engine.poll(render, width, height, request.pending())
             };
             let Some(update) = update else {
-                return Ok(true);
+                break;
             };
             let now = Instant::now();
-            let outcomes =
-                match apply_engine_update(&self.frame, &mut self.render, viewer, update, now) {
-                    EngineEffect::Outcomes(outcomes) => outcomes,
-                    EngineEffect::Output {
-                        applied,
-                        working,
-                        error,
-                    } => {
-                        // The applied endpoint may be the previous one after a
-                        // rollback. Updating both values lets a repeated request
-                        // retry instead of being skipped as unchanged.
-                        self.output = applied;
-                        self.output_working = working;
-                        if let Some(selection) =
-                            viewer.watching().map(|watching| watching.selection)
-                        {
-                            self.updates
-                                .push(VoiceUpdate::StreamAudio { selection, error });
-                        }
-                        Vec::new()
+            let outcomes = match apply_engine_update(
+                &self.frame,
+                &mut self.render,
+                viewer,
+                update,
+                now,
+                &self.wake,
+            ) {
+                EngineEffect::Outcomes(outcomes) => outcomes,
+                EngineEffect::Output {
+                    applied,
+                    working,
+                    error,
+                } => {
+                    // The applied endpoint may be the previous one after a
+                    // rollback. Updating both values lets a repeated request
+                    // retry instead of being skipped as unchanged.
+                    self.output = applied;
+                    self.output_working = working;
+                    if let Some(selection) = viewer.watching().map(|watching| watching.selection) {
+                        self.updates
+                            .push(VoiceUpdate::StreamAudio { selection, error });
                     }
-                };
-            if !self.apply(outcomes, viewer).await? {
-                return Ok(false);
+                    Vec::new()
+                }
+            };
+            match self.apply(outcomes, viewer).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    result = Ok(false);
+                    break;
+                }
+                Err(end) => {
+                    result = Err(end);
+                    break;
+                }
             }
         }
-        Ok(true)
+        // `request` returns an unspent claim to `frame_request` on drop; the
+        // batch may have ended on signaling or an audio update without
+        // touching the decoder.
+        result
     }
 
     async fn execute(&mut self, actions: Vec<Action>) -> Result<bool, SessionEnd> {

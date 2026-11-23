@@ -51,6 +51,20 @@ impl ApplyHooks for Interrupt {
     }
 }
 
+struct RecordingObserver(RefCell<Vec<ApplyStage>>);
+
+impl ApplyObserver for RecordingObserver {
+    fn stage(&self, stage: ApplyStage) {
+        self.0.borrow_mut().push(stage);
+    }
+}
+
+impl RecordingObserver {
+    fn stages(&self) -> Vec<ApplyStage> {
+        self.0.borrow().clone()
+    }
+}
+
 fn install_package(root: &Path, version: &str, exe: &[u8]) {
     fs::create_dir_all(root).unwrap();
     fs::write(root.join("Voxhold.exe"), exe).unwrap();
@@ -82,6 +96,17 @@ fn run_with(
     launcher: &dyn UpdateLauncher,
     hooks: &dyn ApplyHooks,
 ) -> Result<ApplyOutcome> {
+    run_with_observer(target, staged, handshake, launcher, hooks, &NoObserver)
+}
+
+fn run_with_observer(
+    target: &Path,
+    staged: &Path,
+    handshake: &Path,
+    launcher: &dyn UpdateLauncher,
+    hooks: &dyn ApplyHooks,
+    observer: &dyn ApplyObserver,
+) -> Result<ApplyOutcome> {
     apply_staged_with_hooks(
         target,
         staged,
@@ -90,6 +115,7 @@ fn run_with(
         launcher,
         Duration::from_millis(400),
         hooks,
+        observer,
     )
 }
 
@@ -177,6 +203,88 @@ fn preserves_new_package_files_when_an_existing_path_differs_only_in_case() {
 
     assert_eq!(fs::read(target.join("Voxhold.exe")).unwrap(), b"new exe");
     assert_eq!(fs::read_dir(&target).unwrap().count(), 3);
+}
+
+#[test]
+fn the_observer_reports_the_apply_stages() {
+    let temp = tempfile::tempdir().unwrap();
+    let target = temp.path().join("VoxHold");
+    install_package(&target, "1.0.0", b"old exe");
+    let staged = staged_package(temp.path());
+    let observer = RecordingObserver(RefCell::new(Vec::new()));
+    let outcome = run_with_observer(
+        &target,
+        &staged,
+        &temp.path().join("ready.handshake"),
+        &launcher(true),
+        &NoHooks,
+        &observer,
+    )
+    .unwrap();
+    assert!(outcome.backup_removed);
+    assert_eq!(
+        observer.stages(),
+        vec![
+            ApplyStage::Verifying,
+            ApplyStage::Replacing,
+            ApplyStage::Launching,
+            ApplyStage::Done,
+        ]
+    );
+
+    // A failed launch reports the rollback and never a completion.
+    let temp = tempfile::tempdir().unwrap();
+    let target = temp.path().join("VoxHold");
+    install_package(&target, "1.0.0", b"old exe");
+    let staged = staged_package(temp.path());
+    let observer = RecordingObserver(RefCell::new(Vec::new()));
+    let error = run_with_observer(
+        &target,
+        &staged,
+        &temp.path().join("ready.handshake"),
+        &launcher(false),
+        &NoHooks,
+        &observer,
+    )
+    .unwrap_err();
+    assert!(matches!(error, UpdateError::LaunchTimeout(_)));
+    assert_eq!(
+        observer.stages(),
+        vec![
+            ApplyStage::Verifying,
+            ApplyStage::Replacing,
+            ApplyStage::Launching,
+            ApplyStage::RollingBack,
+        ]
+    );
+}
+
+#[test]
+fn a_broken_payload_still_reports_the_rollback_stage() {
+    let temp = tempfile::tempdir().unwrap();
+    let target = temp.path().join("VoxHold");
+    install_package(&target, "1.0.0", b"old exe");
+    // No package.json: the apply fails while verifying, before any durable
+    // state exists, and only cleans the staging copy up.
+    let staged = temp.path().join("broken");
+    fs::create_dir_all(&staged).unwrap();
+    let observer = RecordingObserver(RefCell::new(Vec::new()));
+    let error = run_with_observer(
+        &target,
+        &staged,
+        &temp.path().join("ready.handshake"),
+        &launcher(true),
+        &NoHooks,
+        &observer,
+    )
+    .unwrap_err();
+    let debug = format!("{error:?}");
+    assert!(matches!(error, UpdateError::Io { .. }), "{debug}");
+    assert_eq!(
+        observer.stages(),
+        vec![ApplyStage::Verifying, ApplyStage::RollingBack]
+    );
+    assert_eq!(fs::read(target.join("Voxhold.exe")).unwrap(), b"old exe");
 }
 
 #[test]

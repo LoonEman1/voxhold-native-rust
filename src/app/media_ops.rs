@@ -5,7 +5,7 @@
 //! left.
 
 use super::*;
-use crate::media::{self, PreviewEntry, ThumbKey, Viewer, ViewerKey};
+use crate::media::{self, PreviewEntry, ThumbKey, ThumbSourceKey, Viewer, ViewerKey};
 use std::sync::Arc;
 use std::time::Instant;
 use voxhold_api::Attachment;
@@ -14,19 +14,34 @@ use voxhold_api::Attachment;
 const PREVIEW_CONCURRENCY: usize = 3;
 /// Preview card picture, Go `scaleToFit(img, 98, 76)`.
 
-/// Resize a server thumbnail into the requested 16 px bucket and convert it to
-/// the BGRA surface GPUI uploads.
+/// Resize a borrowed server thumbnail into the requested 16 px bucket and
+/// convert it to the BGRA surface GPUI uploads. The original is only read, so
+/// the caller keeps ownership of its pixels.
 pub(crate) fn thumbnail_frame(
-    image: image::DynamicImage,
+    image: &image::DynamicImage,
     width: u32,
     height: u32,
 ) -> (image::Frame, usize) {
-    let rgba = image::imageops::resize(
-        &image.to_rgba8(),
-        width.max(1),
-        height.max(1),
-        image::imageops::FilterType::CatmullRom,
-    );
+    let (width, height) = (width.max(1), height.max(1));
+    // Record the borrowed input with its real size. It is read in place and
+    // never materialised as a copy; the probe call documents that and lets the
+    // O06 test compare the source against the buffers the pass allocates.
+    note_scale_buffer(pixels(image.width(), image.height()), false);
+    #[cfg(test)]
+    scale_probe::expect_target(pixels(width, height));
+    // Scale first: the only pixel buffer this path materialises is the
+    // target-sized one. A source-sized `to_rgba8()` copy never exists (O06).
+    // `imageops::resize` still allocates its own f32 scratch of
+    // source_width × target_height, exactly as the previous path did; what
+    // disappears is the source-sized RGBA copy before the resample.
+    let resized = image.resize_exact(width, height, image::imageops::FilterType::CatmullRom);
+    note_scale_buffer(pixels(resized.width(), resized.height()), true);
+    let rgba = match resized {
+        // The common RGBA path moves the buffer instead of copying it.
+        image::DynamicImage::ImageRgba8(rgba) => rgba,
+        other => other.to_rgba8(),
+    };
+    note_scale_buffer(pixels(rgba.width(), rgba.height()), true);
     let bytes = rgba.width() as usize * rgba.height() as usize * 4;
     (
         members::avatar_frame(image::DynamicImage::ImageRgba8(rgba)),
@@ -34,9 +49,163 @@ pub(crate) fn thumbnail_frame(
     )
 }
 
+fn pixels(width: u32, height: u32) -> usize {
+    width as usize * height as usize
+}
+
+/// Test seam for O06: records the pixel buffers the scale path touches on this
+/// thread. The borrowed input is reported with `copied = false`; every buffer
+/// `thumbnail_frame` allocates is reported with `copied = true`. Any allocated
+/// buffer with more pixels than the requested target sets `oversized`, i.e. a
+/// decoded-source-sized copy exists again.
+///
+/// Limitation: this only sees buffers the module itself reports. A copy made
+/// inside `image` without passing through `note_scale_buffer` would be
+/// invisible without a global allocator; the viewer path therefore keeps the
+/// source behind `&DynamicImage` and never clones it.
+#[cfg(test)]
+pub(crate) mod scale_probe {
+    use std::cell::Cell;
+
+    thread_local! {
+        static PEAK: Cell<usize> = const { Cell::new(0) };
+        static SOURCE: Cell<usize> = const { Cell::new(0) };
+        static TARGET: Cell<usize> = const { Cell::new(usize::MAX) };
+        static OVERSIZED: Cell<bool> = const { Cell::new(false) };
+        static PASSES: Cell<usize> = const { Cell::new(0) };
+        static INSTALLED: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// Start a pass for one target surface; allocations are compared against
+    /// its pixel count.
+    pub(super) fn expect_target(pixels: usize) {
+        TARGET.with(|target| target.set(pixels));
+        OVERSIZED.with(|flag| flag.set(false));
+    }
+
+    pub(super) fn observe(pixels: usize, copied: bool) {
+        if copied {
+            PEAK.with(|peak| peak.set(peak.get().max(pixels)));
+            if pixels > TARGET.with(Cell::get) {
+                OVERSIZED.with(|flag| flag.set(true));
+            }
+        } else {
+            SOURCE.with(|source| source.set(source.get().max(pixels)));
+        }
+    }
+
+    /// Count one started background rescale pass on this thread, so a test can
+    /// prove a drag queues at most one pass behind the running one.
+    pub(super) fn pass() {
+        PASSES.with(|passes| passes.set(passes.get() + 1));
+    }
+
+    /// Count a pass that reached its UI half. A pass whose handle was dropped
+    /// is cancelled and never installs a frame, so this counter stays put.
+    pub(super) fn install() {
+        INSTALLED.with(|installed| installed.set(installed.get() + 1));
+    }
+
+    /// Largest allocated buffer since the last `reset`, in pixels.
+    pub(crate) fn peak_pixels() -> usize {
+        PEAK.with(Cell::get)
+    }
+
+    /// Largest borrowed input since the last `reset`, in pixels.
+    pub(crate) fn source_pixels() -> usize {
+        SOURCE.with(Cell::get)
+    }
+
+    pub(crate) fn oversized() -> bool {
+        OVERSIZED.with(Cell::get)
+    }
+
+    pub(crate) fn passes() -> usize {
+        PASSES.with(Cell::get)
+    }
+
+    pub(crate) fn installed() -> usize {
+        INSTALLED.with(Cell::get)
+    }
+
+    pub(crate) fn reset() {
+        PEAK.with(|peak| peak.set(0));
+        SOURCE.with(|source| source.set(0));
+        TARGET.with(|target| target.set(usize::MAX));
+        OVERSIZED.with(|flag| flag.set(false));
+        PASSES.with(|passes| passes.set(0));
+        INSTALLED.with(|installed| installed.set(0));
+    }
+}
+
+/// Test seam for O06: counts the GPU images the viewer path released through
+/// `Window::drop_image`. Dropping our `Arc` alone would make a close test pass
+/// even if the renderer never learned about the surface, so the close test
+/// asserts this counter in addition to the refcount.
+#[cfg(test)]
+pub(crate) mod image_probe {
+    use std::cell::Cell;
+
+    thread_local! {
+        static DROPS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(super) fn dropped() {
+        DROPS.with(|drops| drops.set(drops.get() + 1));
+    }
+
+    pub(crate) fn drops() -> usize {
+        DROPS.with(Cell::get)
+    }
+
+    pub(crate) fn reset() {
+        DROPS.with(|drops| drops.set(0));
+    }
+}
+
+#[cfg(test)]
+fn note_scale_buffer(pixels: usize, copied: bool) {
+    scale_probe::observe(pixels, copied);
+}
+
+#[cfg(not(test))]
+fn note_scale_buffer(_pixels: usize, _copied: bool) {}
+
+#[cfg(test)]
+fn note_scale_installed() {
+    scale_probe::install();
+}
+
+#[cfg(not(test))]
+fn note_scale_installed() {}
+
+#[cfg(test)]
+fn note_dropped_image() {
+    image_probe::dropped();
+}
+
+#[cfg(not(test))]
+fn note_dropped_image() {}
+
 impl Voxhold {
-    /// Request one chat thumbnail. Three reads at a time, a failed key waits
-    /// 15 s after `429` and 5 s otherwise (doubled after a second failure).
+    /// Whether a thumbnail may still be installed. The access scope, the
+    /// deletion tombstone and the row's own `deleted` flag all win over a
+    /// background answer, so a late picture is never resurrected.
+    fn thumbnail_stale(&self, access: u64, id: &str) -> bool {
+        self.access_generation != access
+            || self.media.is_purged(id)
+            || self.messages.iter().any(|message| {
+                message
+                    .attachments
+                    .iter()
+                    .any(|file| file.id == id && file.deleted)
+            })
+    }
+
+    /// Request one chat thumbnail. The URL depends only on the attachment id,
+    /// so at most one download per id runs; every 16 px bucket is resized
+    /// locally from the cached source. Three downloads at a time, and a failed
+    /// id waits 15 s after `429` and 5 s otherwise (doubled on a repeat).
     pub(super) fn request_thumbnail(
         &mut self,
         key: ThumbKey,
@@ -45,11 +214,26 @@ impl Voxhold {
     ) {
         let now = Instant::now();
         if self.media.thumb_ready(&key)
-            || self.media.thumb_pending.contains(&key)
-            || self.media.thumb_pending.len() >= media::THUMB_CONCURRENCY
-            || self.media.thumb_blocked(&key, now)
+            || self.media.thumb_building.contains_key(&key)
+            || self.media.thumb_waiting.contains(&key)
+            || self.media.thumb_blocked(&key.id, now)
             || self.media.is_purged(&key.id)
         {
+            return;
+        }
+        let source_key = ThumbSourceKey(key.id.clone());
+        // A decoded source already serves this bucket: resize here, no HTTP.
+        if let Some(source) = self.media.thumb_source(&key.id) {
+            self.build_thumbnail_variant(key, source, window, cx);
+            return;
+        }
+        if self.media.thumb_loads.contains_key(&source_key) {
+            // Same id is downloading. Remember the variant; the completion
+            // redraw asks the next frame to build it from the cached source.
+            self.media.thumb_waiting.insert(key);
+            return;
+        }
+        if self.media.thumb_loads.len() >= media::THUMB_CONCURRENCY {
             return;
         }
         let Some(client) = self.client.clone() else {
@@ -57,43 +241,67 @@ impl Voxhold {
         };
         let access = self.access_generation;
         let id = key.id.clone();
-        let (width, height) = (key.width, key.height);
+        let request_id = id.clone();
+        let trigger = key.clone();
         let runtime = self.runtime.clone();
-        self.media.thumb_pending.insert(key.clone());
+        let load = self.media.begin_thumb_load(&key);
         let task = cx.background_spawn(async move {
-            runtime.block_on(async move {
-                let image = client.attachment_thumbnail(&id).await?;
-                Ok::<_, voxhold_api::Error>(thumbnail_frame(image, width, height))
-            })
+            runtime.block_on(async move { client.attachment_thumbnail(&request_id).await })
         });
         cx.spawn_in(window, async move |this, window| {
             let result = task.await;
             let _ = this.update_in(window, |s, window, cx| {
-                s.media.thumb_pending.remove(&key);
-                if s.access_generation != access {
-                    return;
-                }
-                // The attachment may have been deleted while the thumbnail was
-                // in flight; do not resurrect it after the purge.
-                if s.media.is_purged(&key.id)
-                    || s.messages.iter().any(|message| {
-                        message
-                            .attachments
-                            .iter()
-                            .any(|file| file.id == key.id && file.deleted)
-                    })
-                {
+                if !s.media.finish_thumb_load(&id, load) || s.thumbnail_stale(access, &id) {
                     return;
                 }
                 match result {
-                    Ok((frame, bytes)) => {
-                        let render = Arc::new(gpui::RenderImage::new(smallvec::smallvec![frame]));
-                        for evicted in s.media.thumbs.put(key.clone(), render, bytes) {
-                            let _ = window.drop_image(evicted);
-                        }
-                        s.media.thumb_succeeded(&key);
+                    Ok(image) => {
+                        let bytes = media::source_bytes(&image);
+                        let source = Arc::new(image);
+                        // A source has no GPU surface, so evicted pixels are
+                        // released by dropping the `Arc` alone.
+                        drop(s.media.thumb_sources.put(source_key, source.clone(), bytes));
+                        s.media.thumb_succeeded(&id);
+                        // Build the variant that started the download now;
+                        // the redraw builds the other visible buckets.
+                        s.build_thumbnail_variant(trigger, source, window, cx);
                     }
-                    Err(error) => s.media.thumb_retry(&key, error.status()),
+                    Err(error) => s.media.thumb_retry(&id, error.status()),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Resize one cached server thumbnail into a draw bucket in the
+    /// background. The source is shared by `Arc`, so no decoded copy is made;
+    /// only the target-sized BGRA buffer is allocated. Installing checks the
+    /// same access and deletion guards as a download answer.
+    fn build_thumbnail_variant(
+        &mut self,
+        key: ThumbKey,
+        source: Arc<image::DynamicImage>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.media.thumb_ready(&key) || self.media.thumb_building.contains_key(&key) {
+            return;
+        }
+        let access = self.access_generation;
+        let id = key.id.clone();
+        let (width, height) = (key.width, key.height);
+        let build = self.media.begin_thumb_build(&key);
+        let task = cx.background_spawn(async move { thumbnail_frame(&source, width, height) });
+        cx.spawn_in(window, async move |this, window| {
+            let (frame, bytes) = task.await;
+            let _ = this.update_in(window, |s, window, cx| {
+                if !s.media.finish_thumb_build(&key, build) || s.thumbnail_stale(access, &id) {
+                    return;
+                }
+                let render = Arc::new(gpui::RenderImage::new(smallvec::smallvec![frame]));
+                for evicted in s.media.thumbs.put(key.clone(), render, bytes) {
+                    let _ = window.drop_image(evicted);
                 }
                 cx.notify();
             });
@@ -136,7 +344,7 @@ impl Voxhold {
                         .await
                         .ok()
                         .map(|image| {
-                            thumbnail_frame(image, media::PREVIEW_IMAGE.0, media::PREVIEW_IMAGE.1)
+                            thumbnail_frame(&image, media::PREVIEW_IMAGE.0, media::PREVIEW_IMAGE.1)
                         })
                 };
                 Ok::<_, Option<u16>>((meta, image))
@@ -335,7 +543,10 @@ impl Voxhold {
                     ));
                 }
                 let target = media::fit_size((source.width(), source.height()), area);
-                let (frame, bytes) = thumbnail_frame(source.clone(), target.0, target.1);
+                // The pass borrows the one shared original: opening copies the
+                // `Arc` pointer, never the decoded pixels (O06).
+                let source = Arc::new(source);
+                let (frame, bytes) = thumbnail_frame(&source, target.0, target.1);
                 Ok::<_, voxhold_api::Error>((source, frame, bytes, target))
             })
         });
@@ -353,8 +564,9 @@ impl Voxhold {
                     Ok((source, frame, _bytes, target)) => {
                         viewer.image =
                             Some(Arc::new(gpui::RenderImage::new(smallvec::smallvec![frame])));
-                        viewer.source = Some(Arc::new(source));
+                        viewer.source = Some(source);
                         viewer.render_box = target;
+                        viewer.target_box = target;
                     }
                     Err(error) => viewer.error = draft::describe_error(&error),
                 }
@@ -367,21 +579,28 @@ impl Voxhold {
         cx.notify();
     }
 
-    /// Close the viewer and release its GPU surface. Idempotent; also aborts
-    /// the pending content request.
+    /// Close the viewer and release its GPU surface. Idempotent; dropping the
+    /// stored handles also aborts the pending content request and a running
+    /// rescale pass, so neither can install a frame into the next viewer.
     pub(super) fn close_viewer(&mut self, window: &mut Window) {
         let Some(mut viewer) = self.media.viewer.take() else {
             return;
         };
         viewer.task.take();
+        // Dropping the scale handle cancels the background pass; the decoded
+        // original it borrowed is released with the cancelled future.
+        viewer.scale_task.take();
         if let Some(image) = viewer.image.take() {
+            note_dropped_image();
             let _ = window.drop_image(image);
         }
         viewer.source = None;
     }
 
     /// Rescale the single viewer surface when the window changes, keeping the
-    /// decoded source and the 80% fit.
+    /// decoded source and the 80% fit. Only one background pass runs at a
+    /// time; a drag updates the remembered geometry and the running pass
+    /// starts exactly one follow-up for the newest box.
     pub(super) fn ensure_viewer_scale(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(viewer) = self.media.viewer.as_ref() else {
             return;
@@ -389,46 +608,71 @@ impl Voxhold {
         let Some(source) = viewer.source.clone() else {
             return;
         };
-        if viewer.rescaling {
-            return;
-        }
         let target = media::fit_size(
             (source.width(), source.height()),
             media::viewer_area(self.viewport),
         );
-        let current = viewer.render_box;
-        if (i64::from(target.0) - i64::from(current.0)).abs() <= 16
-            && (i64::from(target.1) - i64::from(current.1)).abs() <= 16
-        {
+        let Some(viewer) = self.media.viewer.as_mut() else {
             return;
-        }
-        let open_id = viewer.key.open_id;
+        };
+        let Some(target) = viewer.request_scale(target) else {
+            return;
+        };
+        self.start_viewer_scale(target, source, window, cx);
+    }
+
+    /// One background pass for one requested surface size. It borrows the
+    /// shared original and returns only the frame; the caller installs it and
+    /// asks the viewer state machine for a single follow-up.
+    fn start_viewer_scale(
+        &mut self,
+        target: (u32, u32),
+        source: Arc<image::DynamicImage>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(open_id) = self.media.viewer.as_ref().map(|viewer| viewer.key.open_id) else {
+            return;
+        };
+        // One pass at a time: dropping the previous handle cancels an older
+        // background resize, so the stale pass cannot keep the decoded
+        // original alive next to the new one.
         if let Some(viewer) = self.media.viewer.as_mut() {
-            viewer.rescaling = true;
+            viewer.scale_task = None;
         }
-        let task =
-            cx.background_spawn(
-                async move { thumbnail_frame((*source).clone(), target.0, target.1) },
-            );
-        cx.spawn_in(window, async move |this, window| {
+        #[cfg(test)]
+        scale_probe::pass();
+        let task = cx.background_spawn(async move { thumbnail_frame(&source, target.0, target.1) });
+        let handle = cx.spawn_in(window, async move |this, window| {
             let (frame, _bytes) = task.await;
             let _ = this.update_in(window, |s, window, cx| {
+                // A cancelled pass is dropped before this point and never
+                // reaches the UI half.
+                note_scale_installed();
                 let Some(viewer) = s.media.viewer.as_mut() else {
                     return;
                 };
                 if viewer.key.open_id != open_id {
                     return;
                 }
-                viewer.rescaling = false;
                 let next = Arc::new(gpui::RenderImage::new(smallvec::smallvec![frame]));
                 if let Some(previous) = std::mem::replace(&mut viewer.image, Some(next)) {
+                    note_dropped_image();
                     let _ = window.drop_image(previous);
                 }
-                viewer.render_box = target;
+                let follow_up = viewer.finish_scale(target);
+                let source = follow_up.and_then(|_| viewer.source.clone());
                 cx.notify();
+                if let (Some(target), Some(source)) = (follow_up, source) {
+                    s.start_viewer_scale(target, source, window, cx);
+                }
             });
-        })
-        .detach();
+        });
+        if let Some(viewer) = self.media.viewer.as_mut() {
+            if viewer.key.open_id == open_id {
+                viewer.scale_task = Some(handle);
+            }
+        }
     }
 
     /// Close the viewer and release every cached private picture. Used when

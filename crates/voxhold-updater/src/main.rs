@@ -60,8 +60,7 @@ use voxhold_update::apply::{
 use voxhold_update::recovery::{recover_install, RecoveryMode, RecoveryOutcome};
 use voxhold_update::stage::{
     cleanup_after_install, cleanup_after_install_payload, cleanup_stale, updates_root,
-    updates_root_for,
-    verify_staged_proof, APPLY_LOG, APP_DIR,
+    updates_root_for, verify_staged_proof, APPLY_LOG, APP_DIR,
 };
 
 const EXIT_OK: u8 = 0;

@@ -429,12 +429,16 @@ impl Voxhold {
                     };
                     // The claim reserves this login's generation on disk, above
                     // every earlier one, so another process's older delete or
-                    // cleanup cannot reach this record. Both steps are blocking
+                    // cleanup cannot reach this record. It is checked against
+                    // the generation captured when the answer arrived: a logout
+                    // that happened while this save was queued has already
+                    // moved the store on, and the save must not claim a newer
+                    // generation and revive the session. Both steps are blocking
                     // (DPAPI and the named mutex) and stay together, so the save
                     // uses the generation the claim just wrote.
                     let writer = store.clone();
                     let saved = tokio::task::spawn_blocking(move || {
-                        let claim = writer.begin_login();
+                        let claim = writer.begin_login_checked(expected_epoch)?;
                         writer.save(&record, claim)
                     })
                     .await;
@@ -589,29 +593,24 @@ impl Voxhold {
         }
         self.cleanup_pending = true;
         self.cleanup_retry = false;
-        let expected_epoch = self.session_store.epoch();
+        // The generation this process knows is on the file at the logout. It is
+        // deliberately not the in-memory barrier that `end_session` raised:
+        // that barrier coincides with the next generation another window claims
+        // from the same file, which would let this clear erase its login. No
+        // newer generation is claimed here either, so a login saved from now on
+        // is above this value and `clear_captured` refuses the cleanup with
+        // `Stale`.
+        let expected_epoch = self.session_store.known_disk_generation();
         self.cleanup_epoch = expected_epoch;
-        self.cleanup_claim
-            .store(0, std::sync::atomic::Ordering::SeqCst);
-        let claim_slot = self.cleanup_claim.clone();
         let store = self.session_store.clone();
         let rt = self.runtime.clone();
         let task = cx.background_spawn(async move {
             rt.block_on(async move {
-                // Reserve this cleanup's generation on disk before clearing.
-                // A login that another window or process saves after this point
-                // claims a higher generation, so this clear is refused with
-                // `Stale` and that record survives. The claim reads, decrypts
-                // and rewrites the file, so it runs on a blocking worker.
-                let claim = store.clone();
-                let expected = tokio::task::spawn_blocking(move || claim.begin_login())
-                    .await
-                    .unwrap_or(expected_epoch);
-                claim_slot.store(expected, std::sync::atomic::Ordering::SeqCst);
-                let result = store.clear_all(expected);
+                let result = store.clear_captured(expected_epoch);
                 // If the records could not be removed, try to leave a marker
                 // that suppresses the next automatic restoration.
-                let blocked = result.is_err() && store.block_restore(expected).is_ok();
+                let blocked =
+                    result.is_err() && store.block_restore_captured(expected_epoch).is_ok();
                 (result, blocked)
             })
         });
@@ -671,16 +670,14 @@ impl Voxhold {
             return;
         }
         self.cleanup_pending = false;
-        // The claimed generation when the background step already reserved one;
-        // otherwise the generation captured at the logout. Never the current
-        // one: a login that another window saved in between is above both and
-        // must survive this close.
-        let claim = self.cleanup_claim.load(std::sync::atomic::Ordering::SeqCst);
-        let expected = if claim > 0 { claim } else { self.cleanup_epoch };
-        match self.session_store.clear_all(expected) {
+        // The generation the file had at the logout, never the current one: a
+        // login that another window saved in between is above it and must
+        // survive this close, and `clear_captured` refuses it as `Stale`.
+        let expected = self.cleanup_epoch;
+        match self.session_store.clear_captured(expected) {
             Ok(_) | Err(StoreError::Stale) => {}
             Err(_) => {
-                let _ = self.session_store.block_restore(expected);
+                let _ = self.session_store.block_restore_captured(expected);
             }
         }
     }

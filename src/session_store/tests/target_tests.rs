@@ -431,8 +431,9 @@ fn two_processes_claim_distinct_generations_and_keep_the_newer_login() {
         Some(AutoLoginTarget::from_record(&fresh))
     );
 
-    // A cleanup claims its generation before it clears: a login saved above
-    // that claim afterwards survives the close-time clear of the old window.
+    // A clear is bound to the generation its caller captured: a login saved
+    // above that value afterwards survives, exactly like the logout cleanup
+    // that never claims a generation of its own.
     let cleanup = b.begin_login();
     let later = record("https://chat.example.org", "bob", "token-later");
     let later_claim = a.begin_login();
@@ -461,6 +462,93 @@ fn two_processes_claim_distinct_generations_and_keep_the_newer_login() {
         .unwrap();
     assert!(a.load_all().unwrap().is_empty());
     assert!(a.state().unwrap().target.is_none());
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// The reverse order of the race above, and the one the logout cleanup hit:
+/// a login is saved first, then the delayed cleanup of the older session runs.
+/// The clear must use the generation captured at logout and be refused, instead
+/// of claiming a generation above the newer login and erasing it.
+#[test]
+fn a_delayed_cleanup_keeps_the_login_saved_after_the_logout() {
+    let (dir, path) = scratch("delayed-cleanup");
+    let window = SessionStore::new(Some(path.clone()));
+    let old = record("https://chat.example.org", "neva", "token-old");
+    save_now(&window, &old).unwrap();
+    // The logout captures the generation the file is known to have; the
+    // in-memory barrier it raises afterwards is not part of this value.
+    let captured = window.known_disk_generation();
+    assert_eq!(captured, window.state().unwrap().generation);
+
+    // Another window signs in before the cleanup runs and claims its own
+    // generation above the captured one.
+    let other = SessionStore::new(Some(path.clone()));
+    let claim = other.begin_login();
+    let fresh = record("https://chat.example.org", "bob", "token-fresh");
+    other.save(&fresh, claim).unwrap();
+
+    assert_eq!(
+        window.clear_captured(captured),
+        Err(StoreError::Stale),
+        "a cleanup above the logout generation cannot erase a newer login"
+    );
+    // The barrier-checked form of the other tests refuses it for the same
+    // reason: the file is above the captured generation.
+    assert_eq!(window.clear_all(captured), Err(StoreError::Stale));
+    // Nothing was cleared: the old record and the fresh one are still there,
+    // and the fresh one owns the target.
+    assert_eq!(window.load_all().unwrap(), vec![old, fresh.clone()]);
+    assert_eq!(
+        window.state().unwrap().target,
+        Some(AutoLoginTarget::from_record(&fresh))
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// A save that was queued before the logout must fail its claim instead of
+/// taking the next generation: `begin_login_checked` refuses both an
+/// in-process barrier and a file that another process moved on.
+#[test]
+fn a_queued_login_claim_is_refused_after_the_generation_moved() {
+    let (dir, path) = scratch("checked-claim");
+    let store = SessionStore::new(Some(path.clone()));
+    let saved = record("https://chat.example.org", "neva", "token-1");
+    save_now(&store, &saved).unwrap();
+    let captured = store.epoch();
+
+    // The logout barrier of this process.
+    let bumped = store.bump_epoch();
+    assert!(bumped > captured);
+    assert_eq!(
+        store.begin_login_checked(captured),
+        Err(StoreError::Stale),
+        "a queued save cannot pass the logout barrier"
+    );
+    assert_eq!(
+        store.state().unwrap().generation,
+        captured,
+        "a refused claim writes nothing"
+    );
+
+    // The same file moved on by another process while this one only knows the
+    // older generation: the check must read the disk, not just the memory.
+    let before = store.state().unwrap().generation;
+    let reader = SessionStore::new(Some(path.clone()));
+    assert_eq!(reader.state().unwrap().generation, before);
+    let other = SessionStore::new(Some(path.clone()));
+    let claim = other.begin_login();
+    assert!(claim > before);
+    assert_eq!(
+        reader.epoch(),
+        before,
+        "an uninformed store still holds the old generation in memory"
+    );
+    assert_eq!(
+        reader.begin_login_checked(before),
+        Err(StoreError::Stale),
+        "a queued save cannot pass a newer generation of the file"
+    );
+    assert_eq!(reader.load_all().unwrap(), vec![saved]);
     std::fs::remove_dir_all(dir).unwrap();
 }
 

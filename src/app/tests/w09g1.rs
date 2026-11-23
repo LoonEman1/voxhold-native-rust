@@ -673,8 +673,9 @@ async fn a10_a_damaged_blob_stays_manual_and_a_refused_cleanup_recovers(cx: &mut
 }
 
 /// P3: installing a session performs no file or DPAPI work on the UI thread.
-/// Another store waits for the cross-process mutex while holding the in-process
-/// one; the sign-in still returns at once.
+/// The window's own store waits for the cross-process mutex while holding the
+/// in-process one; the sign-in still returns at once. A read of that store from
+/// `adopt_session` would block on the same in-process mutex and fail this test.
 #[cfg(windows)]
 #[gpui::test]
 async fn a_sign_in_never_waits_for_the_protected_store(cx: &mut TestAppContext) {
@@ -683,18 +684,17 @@ async fn a_sign_in_never_waits_for_the_protected_store(cx: &mut TestAppContext) 
     cx.update(|cx| gpui_component::init(cx));
     let server = TestServer::spawn(Vec::new());
     let dir = scratch("p3-ui-lock");
-    let session_store = store(&dir);
-    save(
-        &session_store,
-        &record(&server.base, "neva", 7, "token-1", 3_600),
-    );
+    let setup = store(&dir);
+    save(&setup, &record(&server.base, "neva", 7, "token-1", 3_600));
     let (window, view) = open(cx, &server.base, &dir);
     let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
     visual.run_until_parked();
     settled_startup(&mut visual, &view);
+    // The very store the view installs the session into, not a second object.
+    let session_store = view.read_with(&*visual, |v, _| v.session_store.clone());
 
-    // A second process holds the named mutex; a background write of this store
-    // then waits for it while holding the in-process mutex.
+    // A second process holds the named mutex; a background write of the view's
+    // store then waits for it while holding the in-process mutex.
     let (ready, holder) = crate::session_store::hold_named_lock_for(Duration::from_millis(3_000));
     ready
         .recv_timeout(Duration::from_secs(2))

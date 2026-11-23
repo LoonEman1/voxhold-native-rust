@@ -3,6 +3,18 @@
 
 use super::*;
 
+/// Close one window the way the lifecycle does, and stop its account socket
+/// explicitly. `remove_window` alone leaves the entity alive in the test
+/// harness, so its reconnect loop could still open a socket seconds later; the
+/// product's `Drop` calls the same method of the same entity.
+fn close_window(visual: &mut VisualTestContext, view: &Entity<Voxhold>) {
+    visual.update(|window, app| {
+        view.update(app, |v, _| v.stop_realtime());
+        window.remove_window();
+    });
+    visual.run_until_parked();
+}
+
 /// Let the requests of the previous window finish before a test snapshots a
 /// counter: the realtime handshake can land after the window is dropped.
 fn settle_requests(visual: &mut VisualTestContext, servers: &[&TestServer]) {
@@ -126,8 +138,7 @@ async fn a02_an_unchecked_login_does_not_reuse_the_previous_account(cx: &mut Tes
     wait_store(&mut visual, &session_store, |store| {
         store.state().unwrap().target.is_some()
     });
-    visual.update(|window, _app| window.remove_window());
-    visual.run_until_parked();
+    close_window(&mut visual, &view);
     drop(view);
 
     // Run 2: cancel the automatic restoration and sign in as bob without the
@@ -145,11 +156,13 @@ async fn a02_an_unchecked_login_does_not_reuse_the_previous_account(cx: &mut Tes
     wait_store(&mut visual, &session_store, |store| {
         store.state().unwrap().target.is_none()
     });
-    visual.update(|window, _app| window.remove_window());
-    visual.run_until_parked();
+    close_window(&mut visual, &view);
     drop(view);
 
-    // Run 3: no hidden restoration of neva, no request at all.
+    // Run 3: no hidden restoration of neva, no request at all. The window of
+    // run 2 is already stopped, but its realtime handshake may still land, so
+    // both counters must be quiet before they are snapshotted.
+    settle_requests(&mut visual, &[&server_a, &server_b]);
     let a_before = server_a.requests().len();
     let b_before = server_b.requests().len();
     let (window, view) = open(cx, "", &dir);
@@ -158,7 +171,17 @@ async fn a02_an_unchecked_login_does_not_reuse_the_previous_account(cx: &mut Tes
     settled_startup(&mut visual, &view);
     assert!(view.read_with(&*visual, |v, _| v.session.is_none()));
     assert_eq!(server_a.requests().len(), a_before);
-    assert_eq!(server_b.requests().len(), b_before);
+    let late: Vec<String> = server_b
+        .requests()
+        .into_iter()
+        .skip(b_before)
+        .map(|r| r.path)
+        .collect();
+    assert_eq!(
+        late,
+        Vec::<String>::new(),
+        "the last window sent no request"
+    );
     visual.update(|window, _app| window.remove_window());
     visual.run_until_parked();
     drop(view);

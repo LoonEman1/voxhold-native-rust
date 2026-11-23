@@ -58,6 +58,56 @@ async fn logout_invalidates_a_write_that_was_already_queued(cx: &mut TestAppCont
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+/// A save queued by a manual login that completed just before the logout must
+/// not claim a newer generation afterwards: the checked claim refuses it, so
+/// the record does not come back even when the save task runs after the clear.
+/// The close-time fallback runs the cleanup synchronously, so the result does
+/// not depend on the order the executor happens to poll the two tasks in.
+#[gpui::test]
+async fn a_queued_remember_save_cannot_revive_the_login_after_logout(cx: &mut TestAppContext) {
+    cx.update(|cx| gpui_component::init(cx));
+    let server = TestServer::spawn(Vec::new());
+    let dir = scratch("queued-save-logout");
+    let store = store(&dir);
+    store
+        .save_now(&record(&server.base, "neva", 7, "token-1", 3_600))
+        .unwrap();
+    let (window, view) = open(cx, &server.base, &dir);
+    let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
+    visual.run_until_parked();
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            install_session(v, &server.base, "token-1");
+            // The password login has just answered: its remember-save is queued
+            // with the generation of this session.
+            v.remember_manual_login(
+                true,
+                server.base.clone(),
+                "neva".into(),
+                7,
+                "token-1".into(),
+                now_unix() + 3_600,
+                window,
+                cx,
+            );
+            // The user logs out before that save reaches the disk.
+            v.logout(window, cx);
+            v.finish_pending_cleanup();
+        });
+    });
+    visual.run_until_parked();
+    assert!(
+        store.load_all().unwrap().is_empty(),
+        "the queued save must not revive the session that was just ended"
+    );
+    assert!(store.state().unwrap().target.is_none());
+    view.read_with(&*visual, |v, _| {
+        assert!(v.session.is_none());
+        assert!(v.last_stored_token.is_none());
+    });
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 #[gpui::test]
 async fn a_failed_logout_delete_is_visible_and_keeps_the_record(cx: &mut TestAppContext) {
     cx.update(|cx| gpui_component::init(cx));

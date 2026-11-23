@@ -42,7 +42,6 @@ impl Voxhold {
     /// Back to the address step; keeps the confirmed origin. An automatic
     /// attempt belongs to the login step, so it is cancelled logically; its
     /// late answer is ignored by the attempt id.
-    #[allow(dead_code)]
     pub(super) fn back_to_instance(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.auth.busy {
             return;

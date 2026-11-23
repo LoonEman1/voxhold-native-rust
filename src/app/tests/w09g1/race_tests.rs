@@ -51,6 +51,53 @@ async fn a09_a_logout_in_another_process_skips_the_late_answer(cx: &mut TestAppC
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+/// A09: the logout cleanup clears the generation it captured, it never claims a
+/// newer one. A login that a second window saves after the logout is above that
+/// generation and must survive the cleanup that is still queued. The test
+/// executor does not poll the queued task before the fresh save, so the order
+/// is fixed without a sleep.
+#[gpui::test]
+async fn a09_a_delayed_cleanup_keeps_a_login_saved_after_the_logout(cx: &mut TestAppContext) {
+    cx.update(|cx| gpui_component::init(cx));
+    let server = TestServer::spawn(Vec::new());
+    let dir = scratch("a09-delayed-cleanup");
+    let setup = store(&dir);
+    save(&setup, &record(&server.base, "neva", 7, "token-old", 3_600));
+    let (window, view) = open(cx, &server.base, &dir);
+    let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
+    visual.run_until_parked();
+    settled_startup(&mut visual, &view);
+
+    // The logout captures the generation and queues the cleanup; the test
+    // executor has not polled that task yet.
+    visual.update(|window, app| {
+        view.update(app, |v, cx| v.logout(window, cx));
+    });
+    // Another window signs in before the queued clear reaches the disk. Its
+    // claim is strictly above the generation the logout captured.
+    let other = store(&dir);
+    let fresh = record(&server.base, "bob", 9, "token-new", 3_600);
+    let before = setup.state().unwrap().generation;
+    let claim = other.begin_login();
+    assert!(
+        claim > before,
+        "the second login claims a generation above the file: {claim} vs {before}"
+    );
+    other.save(&fresh, claim).unwrap();
+
+    wait_for(&mut visual, &view, |v| !v.cleanup_pending);
+    let state = setup.state().unwrap();
+    assert!(
+        state.records.contains(&fresh),
+        "the delayed cleanup must not erase the newer login"
+    );
+    assert_eq!(
+        state.target,
+        Some(crate::session_store::AutoLoginTarget::from_record(&fresh))
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 /// P1: the store read of a delayed answer must not drop the answer. A clear
 /// from another process in the middle of the profile flight raises the
 /// in-process generation; the attempt still settles on the manual form inside

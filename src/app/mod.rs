@@ -314,12 +314,10 @@ pub(crate) struct Voxhold {
     migration_pending: bool,
     /// Local cleanup is in flight; closing the window completes it.
     cleanup_pending: bool,
-    /// The generation captured by the in-flight cleanup. A new login means the
-    /// close-time retry is stale and must not erase that login.
+    /// The generation the file was known to have at the logout. A new login
+    /// means the close-time retry is stale and must not erase that login; the
+    /// clear never claims a newer generation of its own.
     cleanup_epoch: u64,
-    /// The generation the in-flight cleanup claimed on disk, shared with the
-    /// close-time fallback. Zero until that claim lands.
-    cleanup_claim: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// The cleanup failed and «Повторить очистку» is offered.
     cleanup_retry: bool,
     /// First Tab stop of the neutral start surface.
@@ -782,7 +780,6 @@ impl Voxhold {
             migration_pending: false,
             cleanup_pending: false,
             cleanup_epoch: 0,
-            cleanup_claim: Default::default(),
             cleanup_retry: false,
             restore_cancel_focus: cx.focus_handle(),
             restore_focus_done: false,

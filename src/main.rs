@@ -163,6 +163,10 @@ fn main() {
                     });
                     #[cfg(feature = "voxhold-media")]
                     view.update(cx, |view, cx| view.install_power(window, cx));
+                    // The permanent tray icon and the close hook are set up
+                    // before the window is shown so the cross button can hide
+                    // it from the very first frame.
+                    view.update(cx, |view, cx| view.install_tray(window, cx));
                     // The helper waits for this file after the swap. It is
                     // written only once the window is up; a failure is shown
                     // in the workspace instead of being swallowed. Write it

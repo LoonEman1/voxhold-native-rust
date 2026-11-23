@@ -450,6 +450,8 @@ backup и handshake. Стадии: `prepared` (новый каталог соб�
 `windows_subsystem = "windows"`, поэтому консоль не мигает; ошибки попадают в
 `apply.log`/`helper-usage.log` и в код возврата.
 
+Перед запуском helper'а `prepare_for_install` останавливает звонок, медиа и preview и сохраняет `save_shell` и `voice_settings.flush`. Флаг `quitting` и удаление иконки трея (`NIM_DELETE`) выполняет `finish_quit`, который вызывается только после успешного `launcher.launch` (а также из пункта «Выйти из Voxhold»). Этот флаг заставляет `on_window_should_close` вернуть `true`, поэтому установка обновления завершает процесс обычным закрытием, а не скрывает окно в трей.
+
 ## Применение и откат
 
 `voxhold-updater`:

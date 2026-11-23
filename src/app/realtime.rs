@@ -36,6 +36,20 @@ pub(super) fn reconnect_status_line(reconnecting: bool) -> Option<&'static str> 
     reconnecting.then_some("Переподключаемся…")
 }
 
+/// The tray adapter uses the same fake handle as `window_hwnd` in tests; the
+/// GPUI test window has no platform HWND.
+fn notification_hwnd(window: &Window) -> isize {
+    #[cfg(test)]
+    {
+        let _ = window;
+        super::tray::TEST_WINDOW_HANDLE
+    }
+    #[cfg(not(test))]
+    {
+        super::personal_ops::hwnd(window)
+    }
+}
+
 impl Voxhold {
     pub(super) fn start_realtime(
         &mut self,
@@ -260,19 +274,39 @@ impl Voxhold {
         }
     }
     /// A native notification is offered only while the setting is enabled and
-    /// the window is not focused. A failed tray call does not remember the key,
-    /// so the next identical event can retry.
-    fn deliver_notification(&mut self, event: &voxhold_api::RealtimeEvent, window: &Window) {
-        let active = window.is_window_active() || self.window_active;
-        let Some((key, title, body)) =
-            self.notifications
-                .offer(&event.kind, &event.data, &self.auth.username, active)
-        else {
+    /// the window is not active. `window_active` is the single source of truth:
+    /// `Window::is_window_active` caches the last `WM_ACTIVATE`, and `SW_HIDE`
+    /// does not reset it. A failed tray call does not remember the key, so the
+    /// next identical event can retry.
+    pub(super) fn deliver_notification(
+        &mut self,
+        event: &voxhold_api::RealtimeEvent,
+        window: &Window,
+    ) {
+        // A quit is already removing the icon; a queued balloon must not
+        // register it again after `NIM_DELETE`.
+        if self.quitting {
+            return;
+        }
+        let Some((key, title, body)) = self.notifications.offer(
+            &event.kind,
+            &event.data,
+            &self.auth.username,
+            self.window_active,
+        ) else {
             return;
         };
-        let hwnd = super::personal_ops::hwnd(window);
-        match self.notification_tray.show(hwnd, &title, &body) {
-            Ok(()) => self.notifications.shown(&key),
+        let hwnd = notification_hwnd(window);
+        match self.notification_tray.notification(hwnd, &title, &body) {
+            Ok(()) => {
+                self.notifications.shown(&key);
+                // A balloon may be the call that finally registers the icon;
+                // a stale close block would then keep the redundant exit
+                // banner even though the tray works again.
+                if self.notification_tray.is_available_for(hwnd) {
+                    self.clear_tray_error();
+                }
+            }
             Err(error) => self.notifications.failed(error),
         }
     }

@@ -57,6 +57,10 @@ mod shell_view;
 mod tests;
 mod theme_ops;
 mod thread_ops;
+// Unreachable in tests: each entry point has a `cfg(test)` seam, so dead-code
+// analysis would flag the real API calls even though production uses them.
+#[cfg_attr(test, allow(dead_code))]
+mod tray;
 pub(crate) mod ui;
 mod update_install;
 #[cfg(test)]
@@ -362,7 +366,15 @@ pub(crate) struct Voxhold {
     #[cfg(feature = "voxhold-media")]
     stream_preferences: crate::voice_panel::StreamPrefsStore,
     notifications: crate::notifications::NotificationCenter,
-    notification_tray: crate::notifications::Tray,
+    /// The permanent notification-area icon. Balloon preferences never remove
+    /// it; only the single quit path does.
+    notification_tray: crate::notifications::TrayIcon,
+    /// One long-lived task draining `TrayAction` values from the subclass. It
+    /// waits on the channel; there is no polling timer.
+    tray_task: Option<gpui::Task<()>>,
+    /// A real process exit is in progress (`cx.quit()` or the update helper).
+    /// The close hook must return `true` instead of hiding the window.
+    quitting: bool,
     active_settings: Option<SettingsKind>,
     settings_return_focus: Option<FocusHandle>,
     settings_ring: Vec<(FocusHandle, Option<SettingsAct>)>,
@@ -389,6 +401,15 @@ pub(crate) struct Voxhold {
     #[cfg(test)]
     notifications_entry_focus: FocusHandle,
     window_active: bool,
+    /// The window was hidden by the close button, not merely minimized. Only
+    /// this state may be brought back automatically after a tray failure.
+    hidden_to_tray: bool,
+    /// A tray failure blocked the close hook. The visible exit path is driven
+    /// by this flag, not by a comparison with one error text: any later error
+    /// must not take the button away.
+    tray_close_blocked: bool,
+    /// Tray-specific banner text, kept apart from `error` and `auth.status`.
+    tray_notice: String,
     /// Personal "Сообщения" mode. The server/channel context is kept in
     /// `personal_return` so "К каналам" can restore it when still permitted.
     personal_mode: bool,
@@ -806,7 +827,9 @@ impl Voxhold {
             #[cfg(feature = "voxhold-media")]
             stream_preferences,
             notifications: crate::notifications::NotificationCenter::with_path(notification_path),
-            notification_tray: crate::notifications::Tray::default(),
+            notification_tray: crate::notifications::TrayIcon::default(),
+            tray_task: None,
+            quitting: false,
             active_settings: None,
             settings_return_focus: None,
             settings_ring: Vec::new(),
@@ -822,6 +845,9 @@ impl Voxhold {
             #[cfg(test)]
             notifications_entry_focus: cx.focus_handle(),
             window_active: true,
+            hidden_to_tray: false,
+            tray_close_blocked: false,
+            tray_notice: String::new(),
             personal_mode: false,
             personal_return: None,
             pending_return_channel: None,
@@ -943,7 +969,9 @@ impl Voxhold {
             pending_anchor: None,
             deleted_ids: Default::default(),
             _activation_subscription: cx.observe_window_activation(window, |s, window, cx| {
-                s.window_active = window.is_window_active();
+                // A hidden window still receives `WM_ACTIVATE` when the tray
+                // menu calls `SetForegroundWindow`, but it must stay silent.
+                s.window_activation_changed(window.is_window_active());
                 s.sync_system_theme(window, cx);
                 cx.notify();
             }),
@@ -957,6 +985,16 @@ impl Voxhold {
         gpui_component::Theme::global_mut(cx).font_family = theme::UI_FONT.into();
         window_chrome::apply(window, view.palette.light);
         Self::bind_composer_keys(cx);
+        // The GPUI test window is not backed by a platform window, so the
+        // close hook is installed only in the shipped application. The same
+        // guard is used by `power.rs` and `window_chrome.rs`.
+        if !cfg!(test) {
+            let weak = cx.entity().downgrade();
+            window.on_window_should_close(cx, move |window, cx| {
+                weak.update(cx, |view, cx| view.should_close_window(window, cx))
+                    .unwrap_or(true)
+            });
+        }
         view
     }
 }

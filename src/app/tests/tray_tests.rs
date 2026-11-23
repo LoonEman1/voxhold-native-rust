@@ -176,7 +176,7 @@ async fn taskbar_restore_only_brings_back_a_hidden_window(cx: &mut TestAppContex
             v.tray_action(TrayAction::Restore, window, cx);
             assert!(!v.notification_tray.is_registered());
             assert!(!v.hidden_to_tray);
-            assert!(v.window_active);
+            assert!(!v.window_active);
             assert!(v.error.contains("восстановить"));
             assert!(v.tray_exit_offered());
 
@@ -211,11 +211,16 @@ async fn a_hidden_window_shows_balloons_and_an_active_one_suppresses_them(cx: &m
             assert_eq!(v.notification_tray.test_balloon_calls(), 1);
             assert_eq!(v.notifications.shown, 1);
 
-            // The restored window is active again: the next event is silent.
+            // Showing the window without foreground access still allows notifications.
             v.show_main_window(window, cx);
             v.deliver_notification(&message_event(2), window);
-            assert_eq!(v.notification_tray.test_balloon_calls(), 1);
-            assert_eq!(v.notifications.shown, 1);
+            assert_eq!(v.notification_tray.test_balloon_calls(), 2);
+            assert_eq!(v.notifications.shown, 2);
+
+            v.window_activation_changed(true);
+            v.deliver_notification(&message_event(3), window);
+            assert_eq!(v.notification_tray.test_balloon_calls(), 2);
+            assert_eq!(v.notifications.shown, 2);
         });
     });
 }
@@ -303,16 +308,16 @@ async fn show_main_window_is_idempotent(cx: &mut TestAppContext) {
             assert!(v.window_active);
             assert!(!v.hidden_to_tray);
 
-            // Inactive: the window is brought forward.
+            // Inactive: a foreground request can leave the window inactive.
             v.window_active = false;
             v.show_main_window(window, cx);
-            assert!(v.window_active);
+            assert!(!v.window_active);
 
             // Hidden: the same call restores it and clears the flag.
             v.hidden_to_tray = true;
             v.window_active = false;
             v.show_main_window(window, cx);
-            assert!(v.window_active);
+            assert!(!v.window_active);
             assert!(!v.hidden_to_tray);
         });
     });

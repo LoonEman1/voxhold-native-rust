@@ -292,7 +292,9 @@ impl Voxhold {
             window.activate_window();
         }
         self.hidden_to_tray = false;
-        self.window_active = true;
+        // Windows can show the window while denying the foreground request.
+        // Keep read receipts and notification suppression tied to actual focus.
+        self.window_active = is_foreground_window(hwnd);
         // The menu or the window is visible again, so the tray works; a stale
         // registration error must not keep the redundant exit banner around.
         self.clear_tray_error();
@@ -669,6 +671,18 @@ fn hide_window(hwnd: isize) {
 
 #[cfg(not(windows))]
 fn hide_window(_hwnd: isize) {}
+
+#[cfg(all(windows, not(test)))]
+fn is_foreground_window(hwnd: isize) -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+
+    hwnd != 0 && unsafe { GetForegroundWindow() as isize == hwnd }
+}
+
+#[cfg(any(not(windows), test))]
+fn is_foreground_window(_hwnd: isize) -> bool {
+    false
+}
 
 #[cfg(windows)]
 fn show_window(hwnd: isize) {

@@ -28,6 +28,10 @@ mod probe;
 mod service;
 
 #[cfg(windows)]
+mod av1;
+#[cfg(windows)]
+mod driver_version;
+#[cfg(windows)]
 mod h264;
 #[cfg(not(windows))]
 mod unsupported;
@@ -91,8 +95,12 @@ pub struct AdapterInfo {
     pub name: String,
     pub vendor_id: u32,
     pub device_id: u32,
-    /// UMD driver version from the adapter, or zero when Windows does not
-    /// report one. It is part of the cache identity.
+    /// Driver version as the cache identity: the packed dotted
+    /// `major.minor.build.revision` triple (`32.0.16.1692` is
+    /// `0x0020_0000_0010_069c`), the same number
+    /// `Win32_VideoController.DriverVersion` prints. Zero means neither the
+    /// D3D10 UMD query nor the display-class registry entry answered, so a
+    /// driver update cannot change the identity on that machine.
     pub driver_version: u64,
     pub dedicated_video_memory: u64,
     /// WARP and the Microsoft Basic Render Driver are marked here by the

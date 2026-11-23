@@ -21,13 +21,8 @@ use std::{
 };
 
 use windows::{
-    Wdk::Graphics::Direct3D::{
-        D3DKMT_CLOSEADAPTER, D3DKMT_OPENADAPTERFROMLUID, D3DKMT_QUERYADAPTERINFO,
-        D3DKMTCloseAdapter, D3DKMTOpenAdapterFromLuid, D3DKMTQueryAdapterInfo,
-        KMTQAITYPE_DRIVERVERSION,
-    },
     Win32::{
-        Foundation::{E_ACCESSDENIED, E_FAIL, E_OUTOFMEMORY, LUID, NTSTATUS},
+        Foundation::{E_ACCESSDENIED, E_FAIL, E_OUTOFMEMORY},
         Graphics::Dxgi::{
             CreateDXGIFactory1, DXGI_ADAPTER_FLAG_SOFTWARE, DXGI_ERROR_DEVICE_REMOVED,
             DXGI_ERROR_DEVICE_RESET, DXGI_ERROR_NOT_CURRENTLY_AVAILABLE, IDXGIAdapter1,
@@ -62,7 +57,7 @@ use windows::{
 
 use super::{
     AdapterInfo, AdapterInventory, AdapterLuid, Codec, EncodeQuery, EncoderReason, ProbeCancel,
-    ProbeOutcome, SdrProfile, h264, probe::HardwareProbe,
+    ProbeOutcome, SdrProfile, av1, driver_version, h264, probe::HardwareProbe,
 };
 
 /// How long the trial encode may take on the event-driven path. The wait is a
@@ -159,7 +154,7 @@ unsafe fn enumerate_adapters() -> WinResult<AdapterInventory> {
             name: adapter_name(&desc.Description),
             vendor_id: desc.VendorId,
             device_id: desc.DeviceId,
-            driver_version: unsafe { driver_version(&adapter, luid) },
+            driver_version: unsafe { driver_version(&adapter, desc.VendorId, desc.DeviceId) },
             dedicated_video_memory: desc.DedicatedVideoMemory as u64,
             software,
         });
@@ -191,13 +186,20 @@ unsafe fn owns_primary_output(adapter: &IDXGIAdapter1) -> bool {
 
 /// Driver version as a cache identity.
 ///
-/// `CheckInterfaceSupport` is documented for the D3D10 UMD interface only; the
-/// D3D11 IID it used to be called with returns `DXGI_ERROR_UNSUPPORTED`. When
-/// the UMD query is unavailable, the KMT adapter info of the same LUID returns
-/// the version Windows itself reports (the `Win32_VideoController.DriverVersion`
-/// quadruple, packed). Only when both fail is the value zero, and then a driver
-/// update genuinely cannot change the cache key.
-unsafe fn driver_version(adapter: &IDXGIAdapter1, luid: AdapterLuid) -> u64 {
+/// `CheckInterfaceSupport(IID_ID3D10Device)` is the primary source; the D3D10
+/// UMD reports the packed dotted driver version (`major.minor.build.revision`,
+/// `32.0.16.1692` is `0x0020_0000_0010_069c`), the same number
+/// `Win32_VideoController.DriverVersion` prints. A UMD without the D3D10
+/// interface fails there (the D3D11 IID returns `DXGI_ERROR_UNSUPPORTED`), so
+/// the display-class registry entry of the same vendor and device id is the
+/// fallback and yields the identical encoding.
+///
+/// The KMT `KMTQAITYPE_DRIVERVERSION` query is deliberately not used as a
+/// fallback: with its documented 4-byte `UINT` output it returns the WDDM model
+/// version (for example 3200 for WDDM 3.2), which stays the same across driver
+/// updates and would misrepresent the cache identity. Zero means neither
+/// source answered; only then a driver update cannot change the key.
+unsafe fn driver_version(adapter: &IDXGIAdapter1, vendor_id: u32, device_id: u32) -> u64 {
     // IID_ID3D10Device. `CheckInterfaceSupport` returns the D3D10 UMD version.
     const IID_ID3D10_DEVICE: GUID = GUID::from_u128(0x9b7e4c0f_342c_4106_a19f_4f2704f689f0);
     if let Ok(version) = unsafe { adapter.CheckInterfaceSupport(&IID_ID3D10_DEVICE) }
@@ -205,34 +207,7 @@ unsafe fn driver_version(adapter: &IDXGIAdapter1, luid: AdapterLuid) -> u64 {
     {
         return version as u64;
     }
-    unsafe { kmt_driver_version(luid) }.unwrap_or(0)
-}
-
-unsafe fn kmt_driver_version(luid: AdapterLuid) -> Option<u64> {
-    let mut open = D3DKMT_OPENADAPTERFROMLUID {
-        AdapterLuid: LUID {
-            LowPart: luid.low,
-            HighPart: luid.high as i32,
-        },
-        hAdapter: 0,
-    };
-    if unsafe { D3DKMTOpenAdapterFromLuid(&mut open) } != NTSTATUS(0) || open.hAdapter == 0 {
-        return None;
-    }
-    let mut version = 0u64;
-    let mut query = D3DKMT_QUERYADAPTERINFO {
-        hAdapter: open.hAdapter,
-        Type: KMTQAITYPE_DRIVERVERSION,
-        pPrivateDriverData: ptr::addr_of_mut!(version).cast(),
-        PrivateDriverDataSize: std::mem::size_of::<u64>() as u32,
-    };
-    let status = unsafe { D3DKMTQueryAdapterInfo(&mut query) };
-    let _ = unsafe {
-        D3DKMTCloseAdapter(&D3DKMT_CLOSEADAPTER {
-            hAdapter: open.hAdapter,
-        })
-    };
-    (status == NTSTATUS(0) && version != 0).then_some(version)
+    driver_version::registry(vendor_id, device_id).unwrap_or(0)
 }
 
 fn adapter_name(description: &[u16; 128]) -> String {
@@ -543,11 +518,12 @@ unsafe fn pump_frames(
 /// its event generator.
 ///
 /// The events are read with `GetEvent(MF_EVENT_FLAG_NO_WAIT)` instead of
-/// `BeginGetEvent`: the registered hardware MFTs accept a NULL callback only
-/// through the polling form, and the NVIDIA MFT rejects `BeginGetEvent(None,
-/// None)` with `E_INVALIDARG`. The loop is bounded by [`ENCODE_DEADLINE`] and
-/// checks cancellation between events, so a driver that never answers cannot
-/// pin the worker.
+/// `BeginGetEvent`. Every `IMFMediaEventGenerator` requires a non-NULL
+/// `IMFAsyncCallback` in `BeginGetEvent`, so the documented `NULL` argument is
+/// `E_INVALIDARG` for any generator, not only for the hardware MFTs; the probe
+/// has no callback to register and polls instead. The loop is bounded by
+/// [`ENCODE_DEADLINE`] and checks cancellation between events, so a driver that
+/// never answers cannot pin the worker.
 unsafe fn pump_events(
     transform: &IMFTransform,
     query: EncodeQuery,
@@ -703,10 +679,10 @@ unsafe fn verify_output_type(
             .into());
         }
     }
+    let header = unsafe { sequence_header(&media_type) };
     match codec {
         Codec::H264 => {
             let declared = unsafe { media_type.GetUINT32(&MF_MT_MPEG2_PROFILE) }.ok();
-            let header = unsafe { sequence_header(&media_type) };
             let baseline = h264::keyframe_baseline(declared, frame, &header).map_err(|detail| {
                 EncoderReason::ProfileUnsupported(format!("формат результата: {detail}"))
             })?;
@@ -716,7 +692,7 @@ unsafe fn verify_output_type(
             })
         }
         other => {
-            validate_frame(other, frame).map_err(|detail| {
+            validate_frame(other, frame, &header).map_err(|detail| {
                 EncoderReason::ProbeFailed(format!("формат результата: {detail}"))
             })?;
             Ok(match other {
@@ -826,7 +802,7 @@ unsafe fn sample_bytes(sample: &IMFSample) -> WinResult<Vec<u8>> {
 /// The keyframe shape of the three non-H.264 codecs. H.264 needs the output
 /// type as well (profile attribute and sequence header), so it is checked in
 /// [`verify_output_type`] through [`h264::keyframe_baseline`].
-fn validate_frame(codec: Codec, bytes: &[u8]) -> Result<(), String> {
+fn validate_frame(codec: Codec, bytes: &[u8], sequence_header: &[u8]) -> Result<(), String> {
     if bytes.is_empty() {
         return Err("пустой буфер".into());
     }
@@ -846,42 +822,7 @@ fn validate_frame(codec: Codec, bytes: &[u8]) -> Result<(), String> {
                 Err("VP9: нет frame marker".into())
             }
         }
-        Codec::Av1 => {
-            let mut index = 0;
-            while index < bytes.len() && index < 64 {
-                let header = bytes[index];
-                if header & 0x80 != 0 {
-                    return Err("AV1: forbidden bit".into());
-                }
-                let obu_type = (header >> 3) & 0x0f;
-                let has_size = header & 0x02 != 0;
-                if obu_type == 1 || obu_type == 6 {
-                    return Ok(());
-                }
-                if !has_size {
-                    break;
-                }
-                index += 1;
-                let mut size = 0usize;
-                let mut shift = 0;
-                loop {
-                    let Some(byte) = bytes.get(index) else {
-                        break;
-                    };
-                    index += 1;
-                    size |= ((byte & 0x7f) as usize) << shift;
-                    if byte & 0x80 == 0 {
-                        break;
-                    }
-                    shift += 7;
-                    if shift > 28 {
-                        break;
-                    }
-                }
-                index = index.saturating_add(size);
-            }
-            Err("AV1: нет sequence header или frame OBU".into())
-        }
+        Codec::Av1 => av1::keyframe(bytes, sequence_header),
     }
 }
 

@@ -13,9 +13,9 @@ use std::time::Duration;
 use crate::publisher::SdrProfile;
 use crate::video_encoder::windows::WorkerPlatform;
 use crate::video_encoder::{
-    AdapterInventory, AdapterSelection, Codec, EncodeQuery, EncoderProbeService,
+    AdapterInfo, AdapterInventory, AdapterSelection, Codec, EncodeQuery, EncoderProbeService,
     EncoderProbeTarget, EncoderRequest, HardwareProbe, PlatformProbe, ProbeCancel, ProbeOutcome,
-    VideoEncoderPreference,
+    VideoEncoderPreference, driver_version,
 };
 
 fn q720() -> EncodeQuery {
@@ -62,12 +62,40 @@ fn probe_one(codec: Codec, query: EncodeQuery) -> Option<ProbeOutcome> {
     let adapter = inventory
         .resolve(AdapterSelection::Auto)
         .expect("no suitable hardware adapter");
-    assert_ne!(
-        adapter.driver_version, 0,
-        "версия драйвера {} не определена, кэш не заметит её смену",
-        adapter.name
-    );
+    assert_driver_identity(adapter);
     Some(probe.probe(adapter, codec, query, &ProbeCancel::never()))
+}
+
+/// The driver identity is the packed dotted version. Zero is legitimate only
+/// when neither the UMD query nor the display-class registry entry answers, so
+/// a zero with a reachable registry entry is a bug, not a skipped check. The
+/// registry value is printed: it is the fallback an adapter without the D3D10
+/// interface gets, and it shares the encoding with the UMD value.
+fn assert_driver_identity(adapter: &AdapterInfo) {
+    let registry = driver_version::registry(adapter.vendor_id, adapter.device_id);
+    if adapter.driver_version == 0 {
+        match registry {
+            Some(version) => panic!(
+                "версия драйвера {} равна 0, хотя реестр отдаёт 0x{version:x}",
+                adapter.name
+            ),
+            None => eprintln!(
+                "SKIP driver version: ни UMD, ни реестр не вернули версию для {}",
+                adapter.name
+            ),
+        }
+        return;
+    }
+    match registry {
+        Some(version) => eprintln!(
+            "driver identity {}: UMD=0x{:x} registry=0x{version:x}",
+            adapter.name, adapter.driver_version
+        ),
+        None => eprintln!(
+            "driver identity {}: UMD=0x{:x} registry недоступен",
+            adapter.name, adapter.driver_version
+        ),
+    }
 }
 
 #[test]
@@ -126,12 +154,12 @@ fn hardware_inventory_is_stable_and_excludes_warp() {
         first.adapters().iter().all(|adapter| !adapter.software),
         "software adapters must be filtered by the inventory"
     );
+    if first.adapters().is_empty() {
+        eprintln!("SKIP: на машине нет аппаратного адаптера, проверять нечего");
+        return;
+    }
     for adapter in first.adapters() {
-        assert_ne!(
-            adapter.driver_version, 0,
-            "версия драйвера {} не определена",
-            adapter.name
-        );
+        assert_driver_identity(adapter);
     }
 }
 
@@ -163,10 +191,7 @@ fn hardware_service_confirms_h264() {
         return;
     }
     let adapter = snapshot.adapter().expect("adapter");
-    assert_ne!(
-        adapter.driver_version, 0,
-        "версия драйвера не определена через сервис"
-    );
+    assert_driver_identity(adapter);
     for codec in Codec::ALL {
         let slot = snapshot.gpu(codec).expect("codec row");
         assert!(slot.is_checked(), "GPU-путь не проверялся");

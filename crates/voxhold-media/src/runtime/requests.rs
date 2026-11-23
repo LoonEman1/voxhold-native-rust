@@ -55,6 +55,10 @@ pub(super) enum ScreenCommand {
     CancelRestart {
         op: u64,
     },
+    /// The GPU encoder of a failed attempt is gone and the same codec can still
+    /// be encoded by the CPU build. This explicit action starts that attempt;
+    /// nothing switches automatically.
+    ContinueOnCpu,
     Stop,
 }
 
@@ -74,7 +78,7 @@ pub(super) struct ScreenAccess {
 }
 
 impl StreamCommand {
-    fn selection(&self) -> u64 {
+    pub(super) fn selection(&self) -> u64 {
         match self {
             Self::Watch { selection, .. } | Self::Close { selection } => *selection,
         }

@@ -64,6 +64,9 @@ async fn a_fast_preflight_failure_through_the_update_queue_unblocks_the_dialog(
             assert_eq!(panel.test_screen_phase(), Phase::Live);
             assert!(panel.test_can_start(), "the user may try again");
 
+            // The failed preflight restores the confirmed quality; the user
+            // repeats the edit before the retry so it still differs from Live.
+            panel.test_set_screen_resolution(voxhold_media::publisher::Resolution::P720, cx);
             panel.test_start_screen_share(window, cx);
             let retry = panel
                 .test_pending_quality_op()
@@ -110,6 +113,7 @@ async fn a_late_failure_of_an_earlier_operation_does_not_touch_the_new_dialog(
             assert!(!panel.screen_share_busy());
 
             // The user corrects the settings and applies again.
+            panel.test_set_screen_resolution(voxhold_media::publisher::Resolution::P720, cx);
             panel.test_start_screen_share(window, cx);
             let second_op = panel
                 .test_pending_quality_op()
@@ -209,6 +213,9 @@ async fn two_sequential_operations_keep_their_own_results(cx: &mut TestAppContex
                 failed_preflight(first_op, "Первая проверка не открылась.",)
             ));
 
+            // The failure restored the confirmed quality: repeat the edit so
+            // the second operation is a real restart, not a no-op Apply.
+            panel.test_set_screen_resolution(voxhold_media::publisher::Resolution::P720, cx);
             panel.test_start_screen_share(window, cx);
             let second_op = panel.test_pending_quality_op().expect("second operation");
             // The old result reappears before the new one.
@@ -313,6 +320,8 @@ fn bitrate_sharing(
             codec: Codec::Vp8,
             audio: false,
             audio_scope: AudioScope::Device,
+
+            encoder: Default::default(),
         }),
         has_audio: false,
         quality_status: Some(QualityStatus::new(op, outcome)),

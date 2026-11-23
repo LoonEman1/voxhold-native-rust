@@ -17,6 +17,7 @@ mod hotkey_tests;
 #[cfg(feature = "voxhold-media")]
 mod hotkeys;
 mod inbox_ops;
+mod lifecycle;
 mod media_ops;
 mod members_view;
 mod messages_creator;
@@ -53,12 +54,23 @@ mod settings_view;
 mod settings_voice_shortcuts;
 mod settings_voice_view;
 mod shell_view;
+mod startup_view;
 #[cfg(test)]
 mod tests;
 mod theme_ops;
 mod thread_ops;
+// Unreachable in tests: each entry point has a `cfg(test)` seam, so dead-code
+// analysis would flag the real API calls even though production uses them.
+#[cfg_attr(test, allow(dead_code))]
+mod tray;
 pub(crate) mod ui;
+mod update_install;
+#[cfg(test)]
+mod update_install_tests;
 mod update_ops;
+mod update_progress;
+#[cfg(test)]
+mod update_state_tests;
 #[cfg(test)]
 mod update_tests;
 mod update_view;
@@ -73,10 +85,18 @@ mod voice_form_tests;
 #[cfg(test)]
 mod voice_gain_tests;
 mod voice_ops;
+#[cfg(all(feature = "voxhold-media", test))]
+mod voice_pip_owner_tests;
+#[cfg(all(feature = "voxhold-media", test))]
+mod voice_pip_tests;
 #[cfg(test)]
 mod voice_screen_audio_tests;
 #[cfg(test)]
+mod voice_screen_codec_tests;
+#[cfg(test)]
 mod voice_screen_confirmed_tests;
+#[cfg(test)]
+mod voice_screen_encoder_tests;
 #[cfg(test)]
 mod voice_screen_identity_tests;
 #[cfg(test)]
@@ -85,6 +105,8 @@ mod voice_screen_image_tests;
 mod voice_screen_operation_tests;
 #[cfg(test)]
 mod voice_screen_picker_tests;
+#[cfg(test)]
+mod voice_screen_pip_preview_tests;
 #[cfg(test)]
 mod voice_screen_preview_tests;
 #[cfg(test)]
@@ -286,6 +308,39 @@ pub(crate) struct Voxhold {
     remember_error: String,
     /// The kept record that «Повторить» uses without asking for the address.
     auto_record: Option<session_store::RememberedSession>,
+    /// Store generation captured when the current automatic attempt started.
+    /// A result from an older generation is never applied or written.
+    auto_epoch: u64,
+    /// A failed logout cleanup suppresses automatic restore in this process
+    /// until the retry succeeds.
+    auto_blocked: bool,
+    /// The explicit startup phase: the neutral «Восстанавливаем вход…»
+    /// surface is shown before any address or credential field.
+    startup_restoring: bool,
+    /// The startup store check runs exactly once per process.
+    startup_checked: bool,
+    /// The whole restoration attempt ends at this instant.
+    startup_deadline: std::time::Instant,
+    /// `STARTUP_BUDGET`; a test may shorten it to exercise the timeout.
+    startup_budget: std::time::Duration,
+    /// The chosen legacy record still has to be written as the target after
+    /// the first successful restoration.
+    migration_pending: bool,
+    /// Local cleanup is in flight; closing the window completes it.
+    cleanup_pending: bool,
+    /// The generation the file was known to have at the logout. A new login
+    /// means the close-time retry is stale and must not erase that login; the
+    /// clear never claims a newer generation of its own.
+    cleanup_epoch: u64,
+    /// The cleanup failed and «Повторить очистку» is offered.
+    cleanup_retry: bool,
+    /// A logout happened while a cleanup was still in flight and fixed a newer
+    /// generation that the running clear cannot own. It is queued after it.
+    cleanup_again: bool,
+    /// First Tab stop of the neutral start surface.
+    restore_cancel_focus: FocusHandle,
+    /// The cancel action received the initial focus once.
+    restore_focus_done: bool,
     self_user_id: i64,
     search: Option<Entity<search::SearchPanel>>,
     show_search: bool,
@@ -356,7 +411,15 @@ pub(crate) struct Voxhold {
     #[cfg(feature = "voxhold-media")]
     stream_preferences: crate::voice_panel::StreamPrefsStore,
     notifications: crate::notifications::NotificationCenter,
-    notification_tray: crate::notifications::Tray,
+    /// The permanent notification-area icon. Balloon preferences never remove
+    /// it; only the single quit path does.
+    notification_tray: crate::notifications::TrayIcon,
+    /// One long-lived task draining `TrayAction` values from the subclass. It
+    /// waits on the channel; there is no polling timer.
+    tray_task: Option<gpui::Task<()>>,
+    /// A real process exit is in progress (`cx.quit()` or the update helper).
+    /// The close hook must return `true` instead of hiding the window.
+    quitting: bool,
     active_settings: Option<SettingsKind>,
     settings_return_focus: Option<FocusHandle>,
     settings_ring: Vec<(FocusHandle, Option<SettingsAct>)>,
@@ -383,6 +446,15 @@ pub(crate) struct Voxhold {
     #[cfg(test)]
     notifications_entry_focus: FocusHandle,
     window_active: bool,
+    /// The window was hidden by the close button, not merely minimized. Only
+    /// this state may be brought back automatically after a tray failure.
+    hidden_to_tray: bool,
+    /// A tray failure blocked the close hook. The visible exit path is driven
+    /// by this flag, not by a comparison with one error text: any later error
+    /// must not take the button away.
+    tray_close_blocked: bool,
+    /// Tray-specific banner text, kept apart from `error` and `auth.status`.
+    tray_notice: String,
     /// Personal "Сообщения" mode. The server/channel context is kept in
     /// `personal_return` so "К каналам" can restore it when still permitted.
     personal_mode: bool,
@@ -580,58 +652,7 @@ pub(crate) struct Voxhold {
     _appearance_subscription: gpui::Subscription,
 }
 
-impl Drop for Voxhold {
-    fn drop(&mut self) {
-        // The window is going away, so the debounced voice save will never get
-        // its timer: write the newest snapshot now (atomic, one small file).
-        self.voice_settings.flush();
-        // Closing the window ends the local work but is not a logout: no
-        // server revocation is sent, and the session is simply dropped. The
-        // sends and timers that belong to the window are cancelled with it.
-        for (_, pending) in self.pending_sends.drain() {
-            pending.abort.abort();
-        }
-        self.unconfirmed_sends.clear();
-        self.stop_session_clock();
-        self.stop_realtime();
-    }
-}
-
 impl Voxhold {
-    fn stop_realtime(&mut self) {
-        if let Some(task) = self.event_task.take() {
-            task.abort();
-        }
-        self.events = None;
-        self.event_subscription = None;
-        self.realtime_generation = self.realtime_generation.wrapping_add(1);
-        // The retry status belongs to the socket that just ended. Replacing the
-        // shared link drops the old task's handle: its later writes cannot
-        // repaint the banner in a new session.
-        self.realtime_link = None;
-        self.realtime_reconnecting = false;
-        self.online_by_server.clear();
-    }
-
-    fn new_history_list(alignment: ListAlignment, cx: &Context<Self>) -> ListState {
-        let history_list = ListState::new(0, alignment, px(400.));
-        let weak = cx.entity().downgrade();
-        history_list.set_scroll_handler(move |_, window, cx| {
-            if let Some(view) = weak.upgrade() {
-                view.update(cx, |s, cx| {
-                    // The list is mutably borrowed while this callback runs, so
-                    // never touch `ListState` here. Both follow-ups recompute
-                    // their range from a later frame.
-                    s.scroll_epoch = s.scroll_epoch.wrapping_add(1);
-                    if !s.loading_older && !s.older_scheduled && s.has_more {
-                        s.schedule_older_check(window, cx);
-                    }
-                });
-            }
-        });
-        history_list
-    }
-
     pub(super) fn new(
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -639,6 +660,29 @@ impl Voxhold {
         shell_path: Option<std::path::PathBuf>,
         instance_path: Option<std::path::PathBuf>,
         session_path: Option<std::path::PathBuf>,
+    ) -> Self {
+        Self::new_with_startup(
+            window,
+            cx,
+            prefill,
+            shell_path,
+            instance_path,
+            session_path,
+            true,
+        )
+    }
+
+    /// `start_restore == false` is used by fixtures that install a signed-in
+    /// client immediately; they must not spawn the cold-start check or draw an
+    /// extra auth frame before the workspace.
+    pub(super) fn new_with_startup(
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        prefill: &str,
+        shell_path: Option<std::path::PathBuf>,
+        instance_path: Option<std::path::PathBuf>,
+        session_path: Option<std::path::PathBuf>,
+        start_restore: bool,
     ) -> Self {
         #[cfg(feature = "voxhold-media")]
         cx.bind_keys([
@@ -681,6 +725,25 @@ impl Voxhold {
         } else {
             (String::new(), false)
         };
+        // The one startup check may only use the exact target the operator
+        // named: `-server` wins, then the confirmed «Запомнить адрес» value.
+        // Without either, the old format may still offer a single profile-wide
+        // record; the new format never searches when its target is absent.
+        let cli_origin = if prefill.is_empty() {
+            None
+        } else {
+            instance_prefs::canonical_origin(prefill)
+        };
+        let saved_origin = saved_instance
+            .instance
+            .clone()
+            .filter(|_| saved_instance.remember);
+        let cli_invalid = !prefill.is_empty() && cli_origin.is_none();
+        let startup_origin = cli_origin.or(saved_origin);
+        let allow_profile_single = prefill.is_empty();
+        // An explicit but invalid `-server` must never fall back to a stored
+        // target: the operator asked for this address, and the form shows it.
+        let startup_disabled = cli_invalid;
         let recent_reactions = reactions::SharedRecents::default();
         let reaction_picker =
             cx.new(|cx| reactions::ReactionPicker::new(recent_reactions.clone(), window, cx));
@@ -714,7 +777,7 @@ impl Voxhold {
         #[cfg(feature = "voxhold-media")]
         let stream_preferences =
             crate::voice_panel::StreamPrefsStore::with_layout(shell_path.as_deref());
-        let view = Self {
+        let mut view = Self {
             runtime: std::sync::Arc::new(tokio::runtime::Runtime::new().expect("Tokio runtime")),
             instance: cx.new(|cx| {
                 InputState::new(window, cx)
@@ -742,6 +805,19 @@ impl Voxhold {
             last_stored_token: None,
             remember_error: String::new(),
             auto_record: None,
+            auto_epoch: 0,
+            auto_blocked: false,
+            startup_restoring: start_restore,
+            startup_checked: !start_restore,
+            startup_deadline: std::time::Instant::now(),
+            startup_budget: auto_login::STARTUP_BUDGET,
+            migration_pending: false,
+            cleanup_pending: false,
+            cleanup_epoch: 0,
+            cleanup_retry: false,
+            cleanup_again: false,
+            restore_cancel_focus: cx.focus_handle(),
+            restore_focus_done: false,
             self_user_id: 0,
             search: None,
             show_search: false,
@@ -800,7 +876,9 @@ impl Voxhold {
             #[cfg(feature = "voxhold-media")]
             stream_preferences,
             notifications: crate::notifications::NotificationCenter::with_path(notification_path),
-            notification_tray: crate::notifications::Tray::default(),
+            notification_tray: crate::notifications::TrayIcon::default(),
+            tray_task: None,
+            quitting: false,
             active_settings: None,
             settings_return_focus: None,
             settings_ring: Vec::new(),
@@ -816,6 +894,9 @@ impl Voxhold {
             #[cfg(test)]
             notifications_entry_focus: cx.focus_handle(),
             window_active: true,
+            hidden_to_tray: false,
+            tray_close_blocked: false,
+            tray_notice: String::new(),
             personal_mode: false,
             personal_return: None,
             pending_return_channel: None,
@@ -937,7 +1018,9 @@ impl Voxhold {
             pending_anchor: None,
             deleted_ids: Default::default(),
             _activation_subscription: cx.observe_window_activation(window, |s, window, cx| {
-                s.window_active = window.is_window_active();
+                // A hidden window still receives `WM_ACTIVATE` when the tray
+                // menu calls `SetForegroundWindow`, but it must stay silent.
+                s.window_activation_changed(window.is_window_active());
                 s.sync_system_theme(window, cx);
                 cx.notify();
             }),
@@ -951,6 +1034,27 @@ impl Voxhold {
         gpui_component::Theme::global_mut(cx).font_family = theme::UI_FONT.into();
         window_chrome::apply(window, view.palette.light);
         Self::bind_composer_keys(cx);
+        // The GPUI test window is not backed by a platform window, so the
+        // close hook is installed only in the shipped application. The same
+        // guard is used by `power.rs` and `window_chrome.rs`.
+        if !cfg!(test) {
+            let weak = cx.entity().downgrade();
+            window.on_window_should_close(cx, move |window, cx| {
+                weak.update(cx, |view, cx| view.should_close_window(window, cx))
+                    .unwrap_or(true)
+            });
+        }
+        // The explicit startup phase: the store is read and the target is
+        // checked once, before the first frame can paint a manual form.
+        if start_restore {
+            view.begin_startup_restore(
+                window,
+                cx,
+                startup_origin,
+                allow_profile_single,
+                startup_disabled,
+            );
+        }
         view
     }
 }

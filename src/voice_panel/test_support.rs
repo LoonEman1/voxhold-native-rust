@@ -2,7 +2,7 @@
 //! production file stays small and the seam is obviously not part of the UI.
 
 use super::*;
-use voxhold_media::publisher::{Confirmed, Sharing};
+use voxhold_media::publisher::{CodecIntent, Confirmed, Sharing};
 use voxhold_media::screen_capture::{
     PreviewFrame, ScreenSource, SourceId, SourceKind, ThumbnailError,
 };
@@ -541,15 +541,22 @@ impl VoicePanel {
         self.test_open_screen_picker(window, source.clone());
         let mut sharing = sharing;
         // The media layer fills `confirmed` when the attempt goes Live. Tests
-        // that only describe the live snapshot get the same seam here.
+        // that only describe the live snapshot get the same seam here: the
+        // confirmed codec is the one the picker's intent resolves to, never a
+        // fixed substitute for a codec this build may not publish.
         if sharing.confirmed.is_none() {
+            let codec = self
+                .codec_resolution()
+                .expect("the fixture codec must resolve");
             sharing.confirmed = Some(Confirmed {
                 attempt: sharing.attempt,
                 quality: sharing.quality.unwrap_or_default(),
-                codec: voxhold_media::publisher::Codec::Vp8,
+                codec,
                 audio: sharing.has_audio,
                 audio_scope: voxhold_media::system_audio::AudioScope::Device,
                 source,
+
+                encoder: Default::default(),
             });
         }
         self.screen.sharing = sharing;
@@ -572,13 +579,21 @@ impl VoicePanel {
     /// Record the accepted attempt exactly as the media layer does when it
     /// turns Live. This is the configuration a restart dialog must bind to.
     pub fn test_set_screen_confirmed_source(&mut self, source: ScreenSource) {
+        // Mirror production: the accepted attempt carried the codec the dialog
+        // really resolves, never a fixed substitute that this build may not
+        // publish.
+        let codec = self
+            .codec_resolution()
+            .expect("the fixture codec must resolve");
         self.screen.sharing.confirmed = Some(Confirmed {
             attempt: self.screen.sharing.attempt,
             source,
             quality: self.screen.quality(),
-            codec: voxhold_media::publisher::Codec::Vp8,
+            codec,
             audio: false,
             audio_scope: voxhold_media::system_audio::AudioScope::Device,
+
+            encoder: Default::default(),
         });
     }
 
@@ -595,6 +610,8 @@ impl VoicePanel {
             codec: request.codec,
             audio: request.audio,
             audio_scope: request.audio_scope,
+
+            encoder: Default::default(),
         });
     }
 
@@ -633,47 +650,6 @@ impl VoicePanel {
     /// The category the picker dialog shows.
     pub fn test_share_kind(&self) -> SourceKind {
         self.screen.kind
-    }
-
-    /// The quality/audio fields the picker will send.
-    pub fn test_screen_request(&self) -> voxhold_media::publisher::PublishRequest {
-        // Mirror production: only a restart dialog is locked to the confirmed
-        // live source. An ordinary picker sends the row it selected in the
-        // current snapshot, so a `confirmed` left over from the previous
-        // publication can never answer for it.
-        let source = if self.screen.restart {
-            self.screen.restart_source().cloned()
-        } else {
-            self.screen.selected_source().cloned()
-        }
-        .unwrap_or(voxhold_media::screen_capture::ScreenSource {
-            id: 0,
-            kind: voxhold_media::screen_capture::SourceKind::Monitor,
-            title: String::new(),
-            display_id: -1,
-            width: 0,
-            height: 0,
-            monitor: None,
-        });
-        let quality = self.screen.quality_for_source(&source);
-        let mut request = voxhold_media::publisher::PublishRequest {
-            source,
-            quality,
-            codec: voxhold_media::publisher::Codec::Vp8,
-            audio: self.screen.audio_requested(),
-            audio_scope: self.screen.audio_scope,
-        };
-        // Mirror the production `commit_screen_share`: the selected identity
-        // decides the kind, so a stale window-only choice for a monitor (or the
-        // reverse) cannot slip through the test seam. The fallback request uses
-        // its own source kind when no row is selected.
-        let kind = self
-            .screen
-            .selected
-            .map(|id| id.kind)
-            .unwrap_or(request.source.kind);
-        request.audio_scope = self.screen.effective_audio_scope(kind);
-        request
     }
 
     /// The on-air sound line the card paints.
@@ -750,6 +726,11 @@ impl VoicePanel {
         self.test_share_gate = Some(gate);
     }
 
+    /// Return the gate to the production checks.
+    pub fn test_clear_share_gate(&mut self) {
+        self.test_share_gate = None;
+    }
+
     /// The reason the room would print next to the «Экран» action.
     pub fn test_screen_reason(&self) -> Option<&'static str> {
         self.screen_reason()
@@ -765,7 +746,17 @@ impl VoicePanel {
 
     /// Replace the screen-share snapshot as a worker update would.
     pub fn test_set_screen_sharing(&mut self, sharing: Sharing) {
+        self.screen.applied_attempt = self.screen.applied_attempt.max(sharing.attempt);
         self.screen.sharing = sharing;
+    }
+
+    /// Confirmed `Stream` permissions of the server, as the shell hands them
+    /// over after a channel reload.
+    pub fn test_set_stream_permissions(
+        &mut self,
+        permissions: std::collections::HashMap<i64, bool>,
+    ) {
+        self.set_stream_permissions(permissions);
     }
 
     /// Apply a screen-share runtime update exactly as the publisher emits it
@@ -801,6 +792,17 @@ impl VoicePanel {
         self.handle
             .as_ref()
             .map(|handle| handle.take_screen_commands_for_tests())
+            .unwrap_or_default()
+    }
+
+    /// Queued screen actions with the concrete codec of every publish, restart
+    /// or live-bitrate request.
+    pub fn test_take_screen_requests(
+        &mut self,
+    ) -> Vec<(&'static str, u64, Option<voxhold_media::publisher::Codec>)> {
+        self.handle
+            .as_ref()
+            .map(|handle| handle.take_screen_requests_for_tests())
             .unwrap_or_default()
     }
 
@@ -958,11 +960,6 @@ impl VoicePanel {
         self.window_activation(true);
     }
 
-    /// Selection of the open player, if any.
-    pub fn test_watching_selection(&self) -> Option<u64> {
-        self.watching_selection
-    }
-
     /// Put one update into the real coalescing queue, exactly as the worker
     /// does; the queue is the production wake path of the panel.
     pub fn test_push_update(&self, update: VoiceUpdate) {
@@ -995,3 +992,5 @@ impl VoicePanel {
         self.live_clock_second
     }
 }
+
+mod request;

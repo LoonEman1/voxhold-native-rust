@@ -7,6 +7,7 @@ use super::voice_screen_preview_tests::RecordingPreview;
 use super::voice_screen_tests::{draw, monitor, open_picker_with, wait_for};
 use gpui::TestAppContext;
 use std::sync::{atomic::Ordering, Arc};
+use voxhold_media::publisher::{CodecIntent, CodecRole, CodecSnapshot};
 use voxhold_media::screen_capture::{ScreenSource, SourceKind};
 
 /// P05: when the byte budget is full, a card the user is looking at still wins
@@ -456,16 +457,7 @@ async fn the_last_card_is_reachable_by_wheel_and_tab_and_actions_stay_visible(
         "Tab reveals the whole focused card"
     );
 
-    for _ in 0..24 {
-        if super::voice_screen_tests::focused(&mut visual, &voice).as_deref() == Some("Start") {
-            break;
-        }
-        visual.simulate_keystrokes("tab");
-    }
-    assert_eq!(
-        super::voice_screen_tests::focused(&mut visual, &voice),
-        Some("Start".to_owned())
-    );
+    super::voice_screen_tests::tab_to(&mut visual, &voice, "Start");
     let card = bounds(&mut visual, "screen-share-card");
     let actions = bounds(&mut visual, "share-actions");
     assert!(
@@ -488,13 +480,7 @@ async fn tab_reaches_the_actions_after_a_long_source_list(cx: &mut TestAppContex
         super::voice_screen_tests::focused(&mut visual, &voice).as_deref(),
         Some("Source(monitor:40)")
     );
-    for _ in 0..24 {
-        visual.simulate_keystrokes("tab");
-        if super::voice_screen_tests::focused(&mut visual, &voice).as_deref() == Some("Start") {
-            return;
-        }
-    }
-    panic!("Tab never reached the start action");
+    super::voice_screen_tests::tab_to(&mut visual, &voice, "Start");
 }
 
 /// P03: a scrolling grid paints a real bar from the scroll handle, inside the
@@ -842,6 +828,26 @@ async fn the_normal_dialog_shows_the_codec_line_inside_the_settings(cx: &mut Tes
         settings.bottom()
     );
     assert!(settings.bottom() <= card.bottom() + 0.25);
+
+    // The painted line names the codec Auto really resolved and says that this
+    // stage sends SDR through the server relay. Geometry alone cannot tell a
+    // correct label from a wrong one.
+    let resolved = CodecSnapshot::current()
+        .resolve(CodecIntent::Auto, CodecRole::Sender)
+        .expect("this build publishes an SDR codec");
+    let label = Box::leak(
+        format!("share-codec-label:Автоматически · {}", resolved.label()).into_boxed_str(),
+    );
+    assert!(
+        visual.debug_bounds(label).is_some(),
+        "the dialog paints «{label}»"
+    );
+    assert!(
+        visual
+            .debug_bounds("share-codec-reason:SDR · серверная передача")
+            .is_some(),
+        "an available codec states that SDR rides the server relay"
+    );
 }
 
 /// P03: an empty category paints a message, not a grid with the height of a

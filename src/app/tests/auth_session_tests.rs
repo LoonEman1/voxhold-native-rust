@@ -217,7 +217,7 @@ async fn logout_with_an_active_call_clears_the_session_and_posts_once(
         assert!(v.client.is_none());
         assert!(v.voice.is_none());
         assert_eq!(v.voice_channel, 0);
-        assert_eq!(v.auth.screen, AuthScreen::Login);
+        assert_eq!(v.auth.screen, AuthScreen::Instance);
         assert!(
             v.auth.status.is_empty(),
             "a normal logout has no failure text"

@@ -176,7 +176,7 @@ impl Voxhold {
         }));
     }
 
-    fn voice_call_active_for_power(&self, cx: &Context<Self>) -> bool {
+    pub(super) fn voice_call_active_for_power(&self, cx: &Context<Self>) -> bool {
         self.voice
             .as_ref()
             .is_some_and(|panel| panel.read(cx).call_active())

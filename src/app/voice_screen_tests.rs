@@ -62,7 +62,7 @@ pub(super) fn window(id: u64, title: &str) -> ScreenSource {
     }
 }
 
-fn source() -> ScreenSource {
+pub(super) fn source() -> ScreenSource {
     monitor(3, "Экран 1", 1920, 1080)
 }
 
@@ -113,6 +113,26 @@ pub(super) fn focused(
     voice: &gpui::Entity<crate::voice_panel::VoicePanel>,
 ) -> Option<String> {
     visual.update(|window, app| voice.read(app).test_focused_share(window))
+}
+
+/// Walk the picker's focus ring with Tab until `target` is focused. The ring
+/// grows with every real control (including the codec choices), so a fixed
+/// number of tabs would only describe today's control count.
+pub(super) fn tab_to(
+    visual: &mut gpui::VisualTestContext,
+    voice: &gpui::Entity<crate::voice_panel::VoicePanel>,
+    target: &str,
+) {
+    for _ in 0..120 {
+        if focused(visual, voice).as_deref() == Some(target) {
+            return;
+        }
+        visual.simulate_keystrokes("tab");
+    }
+    panic!(
+        "Tab never reached {target}; focused: {:?}",
+        focused(visual, voice)
+    );
 }
 
 /// Bounded wait for a background result on the GPUI test loop.
@@ -174,15 +194,16 @@ async fn the_screen_action_needs_a_confirmed_join_permission_and_slot(cx: &mut T
             // local capture/codec capability; the test states which it got
             // instead of pretending capture always exists.
             let capability = voxhold_media::screen_capture::capability_cached();
-            let codec = voxhold_media::publisher::Codec::available();
+            let codec_available =
+                voxhold_media::publisher::CodecSnapshot::current().sender_available();
             match panel.share_gate() {
                 Ok(()) => {
                     assert!(capability.is_ok(), "gate passed without a capturer");
-                    assert!(!codec.is_empty(), "gate passed without a codec");
+                    assert!(codec_available, "gate passed without a codec");
                 }
                 Err(error) => {
                     assert!(
-                        capability.is_err() || codec.is_empty(),
+                        capability.is_err() || !codec_available,
                         "gate failed for an unexpected reason: {error}"
                     );
                 }
@@ -238,12 +259,7 @@ async fn the_picker_takes_focus_and_the_keyboard_selects_and_starts(cx: &mut Tes
     visual.simulate_keystrokes("enter");
 
     // Walk to Start and run it.
-    for _ in 0..24 {
-        if focused(&mut visual, &voice).as_deref() == Some("Start") {
-            break;
-        }
-        visual.simulate_keystrokes("tab");
-    }
+    tab_to(&mut visual, &voice, "Start");
     assert_eq!(focused(&mut visual, &voice), Some("Start".to_owned()));
     visual.simulate_keystrokes("enter");
 
@@ -286,12 +302,7 @@ async fn escape_after_start_stops_the_committed_publication(cx: &mut TestAppCont
         visual.simulate_keystrokes("tab");
     }
     visual.simulate_keystrokes("enter");
-    for _ in 0..24 {
-        if focused(&mut visual, &voice).as_deref() == Some("Start") {
-            break;
-        }
-        visual.simulate_keystrokes("tab");
-    }
+    tab_to(&mut visual, &voice, "Start");
     visual.simulate_keystrokes("enter");
     let published = visual
         .update(|_window, app| voice.update(app, |panel, _| panel.test_take_screen_commands()));
@@ -330,12 +341,7 @@ async fn cancel_while_busy_never_enqueues_a_cancel_and_the_close_is_a_stop(
         Some("Source(monitor:3)".to_owned())
     );
     visual.simulate_keystrokes("enter");
-    for _ in 0..24 {
-        if focused(&mut visual, &voice).as_deref() == Some("Start") {
-            break;
-        }
-        visual.simulate_keystrokes("tab");
-    }
+    tab_to(&mut visual, &voice, "Start");
     assert_eq!(focused(&mut visual, &voice), Some("Start".to_owned()));
     visual.simulate_keystrokes("enter");
     let published = visual
@@ -346,12 +352,7 @@ async fn cancel_while_busy_never_enqueues_a_cancel_and_the_close_is_a_stop(
     });
 
     // Walk to the Cancel button and activate it while the attempt is busy.
-    for _ in 0..24 {
-        if focused(&mut visual, &voice).as_deref() == Some("Cancel") {
-            break;
-        }
-        visual.simulate_keystrokes("tab");
-    }
+    tab_to(&mut visual, &voice, "Cancel");
     assert_eq!(focused(&mut visual, &voice), Some("Cancel".to_owned()));
     visual.simulate_keystrokes("enter");
     let commands = visual
@@ -409,15 +410,32 @@ async fn the_live_quality_dialog_warns_and_restarts_with_the_new_values(cx: &mut
             panel.test_open_screen_settings(source(), sharing, window, cx);
             assert!(panel.screen_share_open(), "the live dialog opened");
             assert!(panel.test_screen_restart());
-            assert!(
-                panel.test_restart_warning().is_some(),
-                "a live change must warn about the restart"
+            // The fixture confirms the codec the picker's intent resolves to,
+            // and the dialog locks to that concrete value instead of a fixed
+            // substitute for this build.
+            let confirmed = panel
+                .test_screen_sharing()
+                .confirmed
+                .expect("the live attempt is confirmed");
+            assert_eq!(
+                panel.test_screen_codec_intent(),
+                voxhold_media::publisher::CodecIntent::Explicit(confirmed.codec)
+            );
+            assert_eq!(panel.test_screen_request().codec, confirmed.codec);
+            assert_eq!(
+                panel.test_restart_warning(),
+                None,
+                "an untouched live payload has nothing to restart"
             );
             assert!(panel.test_sound_label().contains("128"));
             // The preset changes only the applied fps/bitrate; audio is a
             // separate field and can be turned off.
             panel.test_apply_preset(Preset::Games, cx);
             panel.test_toggle_system_audio(cx);
+            assert!(
+                panel.test_restart_warning().is_some(),
+                "changed live values must warn about the restart"
+            );
             let request = panel.test_screen_request();
             assert_eq!(request.quality.fps, 60);
             assert_eq!(request.quality.bitrate_kbps, 12_000);
@@ -426,12 +444,7 @@ async fn the_live_quality_dialog_warns_and_restarts_with_the_new_values(cx: &mut
             assert_eq!(request.source, source());
         });
     });
-    for _ in 0..40 {
-        if focused(&mut visual, &voice).as_deref() == Some("Start") {
-            break;
-        }
-        visual.simulate_keystrokes("tab");
-    }
+    tab_to(&mut visual, &voice, "Start");
     assert_eq!(focused(&mut visual, &voice).as_deref(), Some("Start"));
     visual.simulate_keystrokes("enter");
     let (commands, op) = visual.update(|_window, app| {

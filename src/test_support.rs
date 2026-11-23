@@ -12,6 +12,10 @@ use std::{
     time::Duration,
 };
 
+/// The hard bound of one gate. It only exists so a test that forgets a release
+/// fails instead of wedging the server thread; no test may rely on it.
+const GATE_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Holds one response until the test releases it. `arm` makes only the next
 /// gated requests block, so setup requests (history, members) are not caught.
 #[derive(Default)]
@@ -87,17 +91,17 @@ impl Gate {
         }
         *self.arrived.0.lock().unwrap() = true;
         self.arrived.1.notify_all();
+        // A spurious wake-up is not a release: only `release` or the real
+        // deadline ends the wait, so a gated answer can never slip through
+        // while the test still holds it.
+        let deadline = std::time::Instant::now() + GATE_TIMEOUT;
         let mut released = self.released.0.lock().unwrap();
         while !*released {
-            released = self
-                .released
-                .1
-                .wait_timeout(released, Duration::from_secs(10))
-                .unwrap()
-                .0;
-            if !*released {
-                break;
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                return;
             }
+            released = self.released.1.wait_timeout(released, left).unwrap().0;
         }
     }
 
@@ -109,15 +113,22 @@ impl Gate {
         }
         *self.arrived.0.lock().unwrap() = true;
         self.arrived.1.notify_all();
+        let deadline = std::time::Instant::now() + GATE_TIMEOUT;
         loop {
             let mut released = self.released.0.lock().unwrap();
             if *released {
                 return true;
             }
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                // The same hard bound as the header gate: a test that forgot
+                // to release the body must not wedge the server thread forever.
+                return true;
+            }
             let (next, _) = self
                 .released
                 .1
-                .wait_timeout(released, Duration::from_millis(20))
+                .wait_timeout(released, left.min(Duration::from_millis(20)))
                 .unwrap();
             released = next;
             if *released {
@@ -270,16 +281,27 @@ pub struct TestServer {
 
 impl TestServer {
     pub fn spawn(replies: Vec<Reply>) -> Self {
-        Self::start(replies, false)
+        Self::start(replies, false, false)
     }
 
     /// Thread-per-connection server for tests that must hold two requests at
     /// the same time. `spawn` keeps the deterministic single-threaded order.
     pub fn spawn_concurrent(replies: Vec<Reply>) -> Self {
-        Self::start(replies, true)
+        Self::start(replies, true, false)
     }
 
-    fn start(replies: Vec<Reply>, concurrent: bool) -> Self {
+    /// A server whose path-routed replies are never stolen by an unrelated
+    /// request. The request gets the `500` fallback instead, which keeps the
+    /// startup/workspace traffic from consuming a fixture answer.
+    pub fn spawn_routed(replies: Vec<Reply>) -> Self {
+        Self::start(replies, false, true)
+    }
+
+    pub fn spawn_concurrent_routed(replies: Vec<Reply>) -> Self {
+        Self::start(replies, true, true)
+    }
+
+    fn start(replies: Vec<Reply>, concurrent: bool, strict: bool) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
         let base = format!("http://{}", listener.local_addr().unwrap());
         let requests = Arc::new(Mutex::new(Vec::new()));
@@ -314,9 +336,13 @@ impl TestServer {
                         .iter()
                         .enumerate()
                         .position(|(index, reply)| !used[index] && reply.path.is_none());
-                    let index = routed
-                        .or(fallback)
-                        .or_else(|| used.iter().position(|used| !*used));
+                    let index = routed.or(fallback).or_else(|| {
+                        if strict {
+                            None
+                        } else {
+                            used.iter().position(|used| !*used)
+                        }
+                    });
                     match index {
                         Some(index) => {
                             used[index] = true;
@@ -520,4 +546,65 @@ pub fn private_bytes() -> u64 {
 #[cfg(not(windows))]
 pub fn private_bytes() -> u64 {
     0
+}
+
+#[cfg(test)]
+mod gate_tests {
+    use super::*;
+    use std::sync::mpsc;
+
+    /// A notify without `released` is a spurious wake-up. The header gate must
+    /// stay blocked, exactly like the body gate that polls the socket.
+    #[test]
+    fn a_spurious_wakeup_does_not_release_the_header_gate() {
+        let gate = Gate::new();
+        gate.arm();
+        let waiter = gate.clone();
+        let (done, finished) = mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            waiter.block_if_armed();
+            let _ = done.send(());
+        });
+        assert!(gate.wait_arrived(Duration::from_secs(2)));
+        gate.released.1.notify_all();
+        assert_eq!(
+            finished.recv_timeout(Duration::from_millis(150)),
+            Err(mpsc::RecvTimeoutError::Timeout),
+            "a spurious wake-up released the gated answer"
+        );
+        gate.release();
+        assert!(finished.recv_timeout(Duration::from_secs(2)).is_ok());
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn a_spurious_wakeup_does_not_release_the_body_gate() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = std::net::TcpStream::connect(address).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+        let gate = Gate::new();
+        gate.arm();
+        let waiter = gate.clone();
+        let (done, finished) = mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let released = waiter.block_body_if_armed(&mut server);
+            let _ = done.send(released);
+        });
+        assert!(gate.wait_arrived(Duration::from_secs(2)));
+        gate.released.1.notify_all();
+        assert_eq!(
+            finished.recv_timeout(Duration::from_millis(150)),
+            Err(mpsc::RecvTimeoutError::Timeout),
+            "a spurious wake-up released the gated body"
+        );
+        gate.release();
+        assert_eq!(
+            finished.recv_timeout(Duration::from_secs(2)),
+            Ok(true),
+            "the released body is sent"
+        );
+        handle.join().unwrap();
+        drop(client);
+    }
 }

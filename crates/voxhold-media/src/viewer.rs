@@ -9,6 +9,7 @@
 use crate::Candidate;
 use crate::catalog::StreamCatalog;
 use crate::controller::{Publication, Signal};
+use crate::publisher::CodecSnapshot;
 use serde_json::{Value, json};
 use std::{
     collections::{HashSet, VecDeque},
@@ -35,6 +36,10 @@ const KEYFRAME_REQUEST_CAPACITY: usize = 8;
 
 mod stats;
 use stats::StatsWatch;
+
+/// Decoding capability of this build: the catalogue check before
+/// `stream.watch` and the offer profile check after it.
+mod codec;
 
 #[derive(Clone, Debug)]
 struct Intent {
@@ -137,6 +142,10 @@ pub struct Viewer {
     stale_close_until: Option<Instant>,
     stale_close_available: bool,
     retired_ufrags: VecDeque<(String, Instant)>,
+    /// Receiver-side capability matrix of this build. `None` reads the
+    /// process-wide probe; a test injects a matrix so a missing decoder is
+    /// deterministic on any host.
+    snapshot: Option<CodecSnapshot>,
 }
 
 impl Viewer {
@@ -157,6 +166,7 @@ impl Viewer {
             stale_close_until: None,
             stale_close_available: false,
             retired_ufrags: VecDeque::new(),
+            snapshot: None,
         }
     }
 
@@ -579,9 +589,21 @@ impl Viewer {
         if !accepted {
             return Vec::new();
         }
+        // Stale signaling is ignored before the codec is judged: an offer of
+        // the publication this attempt replaced still names the old codec, so
+        // reading it against the new catalogue would end a healthy view with a
+        // false "server did not offer <new codec>" refusal.
         let ufrags = sdp_ufrags(sdp);
         if !ufrags.is_empty() && ufrags.iter().all(|ufrag| self.retired(now, ufrag)) {
             return Vec::new();
+        }
+        // The offer names the rendition profile. A stream this build cannot
+        // decode is released with the ordinary `stream.leave` instead of
+        // hanging on a black picture until the start deadline. The codec the
+        // catalogue promised decides which payload really carries the stream;
+        // audio m-lines belong to the separate voice path.
+        if let Some(message) = self.offer_refusal(sdp, &active.publication) {
+            return self.fail(&message, now);
         }
         let previous = self
             .active
@@ -911,6 +933,15 @@ impl Viewer {
             }];
         };
         let publication = current.clone();
+        // The catalogue already names the codec. A build without its decoder
+        // refuses before `stream.watch`: no subscription and no engine.
+        if let Some(message) = self.catalogue_refusal(&publication) {
+            self.intent = None;
+            return vec![Outcome::Failed {
+                selection: intent.selection,
+                message,
+            }];
+        }
         self.start(intent, publication, now)
     }
 

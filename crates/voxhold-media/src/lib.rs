@@ -9,6 +9,7 @@ pub mod publisher;
 pub mod screen_capture;
 pub mod system_audio;
 mod video;
+pub mod video_encoder;
 pub mod viewer;
 mod voice;
 

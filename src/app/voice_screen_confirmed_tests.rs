@@ -36,6 +36,7 @@ fn confirmed(
         codec: Codec::Vp8,
         audio,
         audio_scope: scope,
+        encoder: Default::default(),
     }
 }
 
@@ -462,6 +463,27 @@ async fn an_ordinary_picker_never_sends_a_stale_confirmed_source(cx: &mut TestAp
                 panel.test_screen_request().source,
                 live_source,
                 "the restart dialog keeps the confirmed live source"
+            );
+        });
+    });
+}
+
+/// P3: the confirmed-source fixture derives its codec from the dialog's real
+/// resolution, never from a hard-coded VP8 the host build may not publish.
+#[gpui::test]
+async fn the_confirmed_fixture_keeps_the_resolved_codec(cx: &mut TestAppContext) {
+    let (mut visual, _view, voice) = super::voice_tests::fixture(cx);
+    draw(&mut visual);
+    let live_source = window(11, "Документ");
+    visual.update(|_window, app| {
+        voice.update(app, |panel, _| {
+            // A test names a codec the host probe does not need to offer.
+            panel.test_set_screen_codec(Codec::Av1);
+            panel.test_set_screen_confirmed_source(live_source.clone());
+            assert_eq!(
+                panel.test_screen_sharing().confirmed.map(|live| live.codec),
+                Some(Codec::Av1),
+                "the fixture must not substitute VP8 for the resolved codec"
             );
         });
     });

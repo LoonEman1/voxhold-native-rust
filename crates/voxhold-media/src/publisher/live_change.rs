@@ -263,13 +263,23 @@ impl Publisher {
     /// A local media failure (capture, loopback or peer start). A failed
     /// restart restores the previously confirmed request once; the second
     /// failure is terminal instead of looping.
+    ///
+    /// The restore starts a publication of its own, so it needs the same gate
+    /// as a new `stream.start`. A revoked permission, a lost join or a full
+    /// channel must end the attempt instead of quietly putting the previous
+    /// configuration back on air.
     pub(super) fn fail_local(&mut self, message: &str, now: Instant) -> Vec<Outcome> {
-        if !self.rollback_used {
+        if !self.rollback_used && self.restore_allowed() {
             if let Some(previous) = self.rollback.take() {
                 return self.restore(previous, now);
             }
         }
         self.fail(message, now)
+    }
+
+    /// Whether the confirmed access still lets this client publish.
+    fn restore_allowed(&self) -> bool {
+        self.access.joined && self.access.stream_permission && self.access.slots_available
     }
 
     /// Restore the previous request on the same live stream slot.

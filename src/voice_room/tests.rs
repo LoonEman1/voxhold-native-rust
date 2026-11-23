@@ -308,3 +308,57 @@ fn player_status_prefers_errors_then_waiting_for_the_first_frame() {
         "Трансляция завершена"
     );
 }
+
+#[test]
+fn the_compact_pip_starts_at_320_in_the_bottom_right_safe_corner() {
+    let area = Rect::new(0.0, 0.0, 1280.0, 760.0);
+    let corner = pip_default_position(area, PIP_DEFAULT_WIDTH, false);
+    let pip = pip_box(area, corner, PIP_DEFAULT_WIDTH, false);
+    assert_eq!(pip.w, PIP_DEFAULT_WIDTH);
+    assert!((pip.right() - (area.right() - PIP_MARGIN)).abs() < 0.01);
+    assert!((pip.bottom() - (area.bottom() - PIP_MARGIN)).abs() < 0.01);
+    assert!(pip.h > PIP_HEADER + PIP_FOOTER);
+}
+
+#[test]
+fn the_compact_pip_is_clamped_and_shrinks_inside_a_narrow_area() {
+    let wide = Rect::new(0.0, 0.0, 1600.0, 1000.0);
+    let far = pip_box(wide, (9000.0, 9000.0), PIP_DEFAULT_WIDTH, true);
+    assert!(far.right() <= wide.right() - PIP_MARGIN + 0.01);
+    assert!(far.bottom() <= wide.bottom() - PIP_MARGIN + 0.01);
+    let near = pip_box(wide, (-500.0, -500.0), PIP_DEFAULT_WIDTH, true);
+    assert_eq!((near.x, near.y), (PIP_MARGIN, PIP_MARGIN));
+
+    let narrow = Rect::new(0.0, 0.0, 280.0, 640.0);
+    let shrunk = pip_box(
+        narrow,
+        pip_default_position(narrow, PIP_DEFAULT_WIDTH, true),
+        PIP_DEFAULT_WIDTH,
+        true,
+    );
+    assert!(shrunk.w <= 280.0 - PIP_MARGIN * 2.0 + 0.01);
+    assert!(shrunk.x >= PIP_MARGIN - 0.01);
+    assert!(shrunk.right() <= 280.0 - PIP_MARGIN + 0.01);
+    assert!(shrunk.y >= PIP_MARGIN - 0.01);
+    assert!(shrunk.bottom() <= 640.0 - PIP_MARGIN + 0.01);
+}
+
+#[test]
+fn pip_buttons_and_tabs_are_outside_the_drag_header() {
+    let area = Rect::new(0.0, 0.0, 1280.0, 760.0);
+    let pip = pip_box(area, (100.0, 100.0), PIP_DEFAULT_WIDTH, true);
+    let geometry = pip_geometry(pip, true);
+    for button in [
+        geometry.settings,
+        geometry.close,
+        geometry.viewer_tab,
+        geometry.publisher_tab,
+    ] {
+        assert!(!geometry.header.contains(button.x, button.y));
+        assert!(!geometry.header.contains(button.right(), button.bottom()));
+    }
+    // The resize corner sits on the picture, above the footer controls.
+    assert!(!geometry.corner.contains(geometry.close.x, geometry.close.y));
+    assert!(geometry.viewer_tab.right() <= geometry.publisher_tab.x);
+    assert!(geometry.publisher_tab.right() <= geometry.settings.x);
+}

@@ -61,6 +61,24 @@ struct PlayerDrag {
     offset_y: f32,
 }
 
+/// The identity of the publication this panel started. Live settings, the
+/// codec restart and the PiP of that stream use this owner, never the access of
+/// whatever room happens to be displayed. Permission and slot are not copied
+/// here: they are re-read from the current confirmation, so a revocation
+/// reaches a preparation, a preflight and the settings dialog.
+#[derive(Clone, Debug)]
+struct PublishAccess {
+    room: i64,
+    /// Picker id of the intent. It is the stable identity of the stop latch for
+    /// the whole publication, including its restarts and its confirmation.
+    session: u64,
+    /// Attempt the media layer confirmed for this intent; 0 before it does.
+    attempt: u64,
+    /// Connection id confirmed with that attempt. A different current one is a
+    /// reconnect the media layer has not recovered yet.
+    connection: Option<String>,
+}
+
 pub(crate) struct ParticipantClick {
     pub user_id: i64,
     pub position: gpui::Point<gpui::Pixels>,
@@ -138,13 +156,21 @@ pub struct VoicePanel {
     live_clock_second: Option<i64>,
     /// Permission Stream of the displayed room, confirmed by the channel list.
     can_stream: bool,
+    /// Confirmed Stream permission of every voice channel of this server. The
+    /// PiP settings of a publication use the permission of its owner room, so
+    /// opening another room without `Stream` cannot lock them.
+    stream_permissions: HashMap<i64, bool>,
+    /// Owner snapshot of the active publication; cleared when the attempt ends.
+    publish_access: Option<PublishAccess>,
     /// Screen-share picker, on-air card and preview.
     screen: ScreenShareUi,
     stream_preferences: screen_share::StreamPrefsStore,
-    /// Rect of the visible on-air card painted by the last frame. The preview
-    /// demand of the media capture is computed from it on the 100 ms poll, the
-    /// same cadence at which the card takes a frame. `None` while the card is
-    /// not painted or is scrolled completely out of the room viewport.
+    /// Rect of the visible on-air card painted by the last frame, used only
+    /// while the displayed room is the owner room. The preview demand of the
+    /// media capture is computed from it on the 100 ms poll, the same cadence
+    /// at which the card takes a frame. `None` while the card is not painted or
+    /// is scrolled completely out of the room viewport. The publisher PiP does
+    /// not use this field: its picture rect is pure geometry.
     screen_card_rect: Option<Rect>,
     /// Monotonic id of the newest screen-audio probe. A slower, older probe
     /// must not overwrite the availability of a newer dialog.
@@ -187,6 +213,14 @@ pub struct VoicePanel {
     /// rewrite the same slot, but a real change is never skipped.
     requested_viewport: Option<(u32, u32)>,
     player_drag: Option<PlayerDrag>,
+    /// Role selected in the compact PiP when both a publication and a viewed
+    /// stream are owned at once. The viewer is the default surface.
+    pip_role: pip::PipRole,
+    /// The compact viewer settings panel is open inside the PiP.
+    pip_settings: bool,
+    /// A settings dialog opened from the PiP asks for focus back on its button
+    /// when the dialog closes, if the PiP surface is still alive.
+    pip_restore_focus: bool,
     join_focus: FocusHandle,
     action_focus: Vec<FocusHandle>,
     dock_focus: Vec<FocusHandle>,
@@ -224,6 +258,10 @@ pub struct VoicePanel {
     /// not decide whether a keyboard-path test can run.
     #[cfg(test)]
     test_share_gate: Option<Result<(), &'static str>>,
+    /// Test-only codec refusal, so the dialog's unavailable line can be painted
+    /// on a build whose probe finds all four codecs.
+    #[cfg(test)]
+    test_codec_error: Option<String>,
     /// Test-only replacement for the blocking endpoint probe. It runs on the
     /// same background task as the real one.
     #[cfg(test)]
@@ -278,7 +316,13 @@ impl VoicePanel {
         let focus = cx.focus_handle();
         let blur = cx.on_blur(&focus, window, |panel, _, _| panel.release_push_to_talk());
         let activation = cx.observe_window_activation(window, |panel, window, _| {
-            panel.window_activation(window.is_window_active());
+            let active = window.is_window_active();
+            panel.window_activation(active);
+            if !active {
+                // A drag whose mouse-up happens outside the window must not
+                // keep following the cursor after the window returns.
+                panel.player_pointer_up();
+            }
         });
         let wake = Arc::new(Notify::new());
         let event_tasks = events::EventTasks::default();
@@ -332,6 +376,8 @@ impl VoicePanel {
             sidebar_watch: None,
             live_clock_second: None,
             can_stream: false,
+            stream_permissions: HashMap::new(),
+            publish_access: None,
             screen: ScreenShareUi::default(),
             stream_preferences: screen_share::StreamPrefsStore::default(),
             screen_card_rect: None,
@@ -358,6 +404,9 @@ impl VoicePanel {
             owns_fullscreen: false,
             requested_viewport: None,
             player_drag: None,
+            pip_role: pip::PipRole::Viewer,
+            pip_settings: false,
+            pip_restore_focus: false,
             join_focus: cx.focus_handle(),
             action_focus: (0..VOICE_ACTIONS.len())
                 .map(|_| cx.focus_handle())
@@ -369,7 +418,7 @@ impl VoicePanel {
             screen_focus: (0..3).map(|_| cx.focus_handle()).collect(),
             picker_focus: (0..32).map(|_| cx.focus_handle()).collect(),
             member_focus: (0..16).map(|_| cx.focus_handle()).collect(),
-            player_actions: (0..3).map(|_| cx.focus_handle()).collect(),
+            player_actions: (0..9).map(|_| cx.focus_handle()).collect(),
             room_size: (0.0, 0.0),
             scale: 1.0,
             room_scroll: 0.0,
@@ -381,6 +430,8 @@ impl VoicePanel {
             palette: crate::theme::dark_palette(),
             #[cfg(test)]
             test_share_gate: None,
+            #[cfg(test)]
+            test_codec_error: None,
             #[cfg(test)]
             test_audio_probe: None,
             #[cfg(test)]
@@ -545,6 +596,7 @@ impl VoicePanel {
         self.room_size = (width.max(1.0), height.max(1.0));
     }
 
+    #[cfg(test)]
     pub fn set_scale(&mut self, scale: f32) {
         self.scale = scale.max(0.1);
         // A DPI change moves the same window rectangle to different physical
@@ -957,6 +1009,8 @@ impl VoicePanel {
         self.stream_selection = self.stream_selection.wrapping_add(1).max(1);
         let selection = self.stream_selection;
         self.player_open = true;
+        self.pip_role = pip::PipRole::Viewer;
+        self.pip_settings = false;
         self.stream_error.clear();
         self.stream_status = "Подключение…".into();
         self.stream_connected = false;
@@ -973,53 +1027,6 @@ impl VoicePanel {
             handle.watch_stream(selection, publication);
         }
         self.wake.notify_one();
-        cx.notify();
-    }
-
-    pub fn leave_stream(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let selection = self.stream_selection;
-        if let Some(handle) = &self.handle {
-            handle.leave_stream(selection);
-        }
-        self.watching_selection = None;
-        self.close_player(window);
-        cx.notify();
-    }
-
-    fn close_player(&mut self, window: &mut Window) {
-        self.clear_player_frame(window);
-        self.watching = None;
-        self.watching_selection = None;
-        // Stop the 100 ms player ticker: the next watch starts a new one.
-        self.frame_ticker = self.frame_ticker.wrapping_add(1);
-        self.last_frame_at = None;
-        self.player_open = false;
-        // The next player may be served by another handle; its first viewport
-        // must reach that worker even if the size matches the closed player.
-        self.requested_viewport = None;
-        self.stream_status.clear();
-        self.stream_error.clear();
-        self.stream_audio_error.clear();
-        self.stream_connected = false;
-        self.stream_muted = false;
-        self.player_drag = None;
-    }
-
-    fn close_player_in_window(&mut self, window: &mut Window) {
-        if self.player_fullscreen || self.owns_fullscreen {
-            self.exit_fullscreen(window);
-        }
-        self.close_player(window);
-    }
-
-    pub fn toggle_stream_mute(&mut self, cx: &mut Context<Self>) {
-        let Some(selection) = self.watching_selection else {
-            return;
-        };
-        self.stream_muted = !self.stream_muted;
-        if let Some(handle) = &self.handle {
-            handle.stream_mute(selection, self.stream_muted);
-        }
         cx.notify();
     }
 
@@ -1171,11 +1178,16 @@ mod controls;
 mod cues;
 mod events;
 mod focus;
+mod pip;
+#[cfg(test)]
+pub(crate) use pip::PipRole;
 mod player;
 mod player_frame;
 mod screen_share;
 use screen_share::ScreenShareUi;
 pub(crate) use screen_share::StreamPrefsStore;
+#[cfg(test)]
+mod pip_test_support;
 mod sidebar;
 #[cfg(test)]
 mod test_support;

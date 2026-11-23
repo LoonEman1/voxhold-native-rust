@@ -69,6 +69,8 @@ pub enum UpdateError {
     Network(String),
     #[error("no staged update at {0}")]
     NotStaged(PathBuf),
+    #[error("another process is already staging this update at {0}")]
+    AlreadyDownloading(PathBuf),
     #[error("update apply failed: {0}")]
     Apply(String),
     #[error("invalid update state: {0}")]
@@ -113,6 +115,7 @@ impl UpdateError {
             Self::Io { .. } => "io",
             Self::Network(_) => "network",
             Self::NotStaged(_) => "not-staged",
+            Self::AlreadyDownloading(_) => "download-busy",
             Self::Apply(_) => "apply-failed",
             Self::InvalidState(_) => "state-invalid",
             Self::LaunchTimeout(_) => "launch-timeout",

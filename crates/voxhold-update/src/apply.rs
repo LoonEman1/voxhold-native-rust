@@ -53,6 +53,37 @@ pub struct ApplyOutcome {
     pub backup_removed: bool,
 }
 
+/// Coarse stage reported while an update is applied.
+///
+/// The stages describe what the helper is doing so its window can show one
+/// truthful line. They carry no percentage: these steps have no measurable
+/// progress.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApplyStage {
+    /// Reading and checking the staged payload before touching the installation.
+    Verifying,
+    /// Copying the payload, migrating user files and swapping the directories.
+    Replacing,
+    /// The new installation is in place and its executable is starting.
+    Launching,
+    /// A failure occurred and the previous installation is being restored.
+    RollingBack,
+    /// The new version confirmed startup; the helper may close its surface
+    /// while the backup is cleaned up.
+    Done,
+}
+
+/// Receives [`ApplyStage`] changes. Purely observational: it never changes
+/// the apply result.
+pub trait ApplyObserver {
+    fn stage(&self, _stage: ApplyStage) {}
+}
+
+/// Observer used when nobody displays the progress.
+pub struct NoObserver;
+
+impl ApplyObserver for NoObserver {}
+
 /// A process started after the swap.
 pub trait LaunchedProcess {
     fn try_wait(&mut self) -> Result<Option<i32>>;
@@ -123,13 +154,32 @@ pub fn apply_staged(
     exe_name: &str,
     handshake_path: &Path,
 ) -> Result<ApplyOutcome> {
-    apply_staged_with(
+    apply_staged_observed(
+        target_dir,
+        staged_app,
+        exe_name,
+        handshake_path,
+        &NoObserver,
+    )
+}
+
+/// Apply a staged update and report its stages to `observer`.
+pub fn apply_staged_observed(
+    target_dir: &Path,
+    staged_app: &Path,
+    exe_name: &str,
+    handshake_path: &Path,
+    observer: &dyn ApplyObserver,
+) -> Result<ApplyOutcome> {
+    apply_staged_with_hooks(
         target_dir,
         staged_app,
         exe_name,
         handshake_path,
         &ProcessLauncher,
         HANDSHAKE_TIMEOUT,
+        &NoHooks,
+        observer,
     )
 }
 
@@ -150,6 +200,7 @@ pub fn apply_staged_with(
         launcher,
         timeout,
         &NoHooks,
+        &NoObserver,
     )
 }
 
@@ -184,7 +235,132 @@ pub(crate) fn apply_staged_with_hooks(
     launcher: &dyn UpdateLauncher,
     timeout: Duration,
     hooks: &dyn ApplyHooks,
+    observer: &dyn ApplyObserver,
 ) -> Result<ApplyOutcome> {
+    observer.stage(ApplyStage::Verifying);
+    let new_index = match preflight(target_dir, staged_app, exe_name) {
+        Ok(index) => index,
+        Err(error) => {
+            // Nothing was renamed yet, but the window must still leave the
+            // "installing" line while the helper reports the failure.
+            observer.stage(ApplyStage::RollingBack);
+            return Err(error);
+        }
+    };
+
+    let operation_id = state::new_operation_id();
+    let staging_dir = state::operation_staging_path(target_dir, &operation_id);
+    let old_index = read_package_json_from_dir(target_dir).ok();
+    let had_target = target_dir.exists();
+    let backup_dir = choose_backup_path(target_dir, &operation_id);
+    let mut state = InstallState {
+        schema: state::STATE_SCHEMA,
+        operation_id: operation_id.clone(),
+        stage: OperationStage::Prepared,
+        install_dir: target_dir.to_path_buf(),
+        backup_dir,
+        staging_dir: staging_dir.clone(),
+        handshake_path: handshake_path.to_path_buf(),
+        version: new_index.version.clone(),
+        previous_version: old_index.as_ref().map(|index| index.version.clone()),
+        had_install: had_target,
+        created_at: state::now_unix(),
+    };
+
+    let mut interrupted = false;
+    let mut applied: Option<InstallState> = None;
+
+    macro_rules! checkpoint {
+        ($point:expr) => {
+            if hooks.interrupt($point) {
+                interrupted = true;
+                return Err(UpdateError::Apply("apply interrupted by test hook".into()));
+            }
+        };
+    }
+
+    observer.stage(ApplyStage::Replacing);
+    let result = (|| -> Result<()> {
+        copy_payload(staged_app, &staging_dir, &new_index)?;
+        checkpoint!(InterruptPoint::Staged);
+        if had_target {
+            migrate_user_files(target_dir, &staging_dir, old_index.as_ref(), &new_index)?;
+        }
+        verify_payload(&staging_dir, &new_index)?;
+        checkpoint!(InterruptPoint::Verified);
+
+        // Durable before the first rename.
+        state::save(&state)?;
+        applied = Some(state.clone());
+        checkpoint!(InterruptPoint::Prepared);
+
+        if had_target {
+            fsutil::rename_retry(target_dir, &state.backup_dir)?;
+        }
+        state.stage = OperationStage::OldRenamed;
+        state::save(&state)?;
+        applied = Some(state.clone());
+        checkpoint!(InterruptPoint::OldRenamed);
+
+        fsutil::rename_retry(&staging_dir, target_dir)?;
+        state.stage = OperationStage::NewInPlace;
+        state::save(&state)?;
+        applied = Some(state.clone());
+        checkpoint!(InterruptPoint::NewInPlace);
+
+        observer.stage(ApplyStage::Launching);
+        let process = launch_new(
+            target_dir,
+            exe_name,
+            handshake_path,
+            &operation_id,
+            launcher,
+        )?;
+        checkpoint!(InterruptPoint::Launched);
+        wait_for_confirmation(process, handshake_path, &operation_id, timeout)?;
+        checkpoint!(InterruptPoint::Confirmed);
+        Ok(())
+    })();
+
+    match result {
+        Ok(()) => {
+            let applied = applied.expect("state is persisted before launch");
+            // The handshake is confirmed: the new version is running, so the
+            // helper may close its window before the backup cleanup.
+            observer.stage(ApplyStage::Done);
+            finish_success(&applied, target_dir, staged_app)
+        }
+        Err(error) if interrupted => Err(error),
+        Err(error) => {
+            // A failure before the durable state exists (for example a broken
+            // payload) is followed by cleanup too. Report the rollback stage on
+            // every failure so the window never keeps claiming that files are
+            // being installed while recovery runs.
+            observer.stage(ApplyStage::RollingBack);
+            let rollback = match applied.as_ref() {
+                Some(applied) => recovery::rollback_operation(applied),
+                None => {
+                    let _ = fsutil::remove_dir_with_timeout(&staging_dir, STAGING_CLEANUP_TIMEOUT);
+                    Ok(())
+                }
+            };
+            let _ = fsutil::remove_dir_with_timeout(staged_app, STAGING_CLEANUP_TIMEOUT);
+            match rollback {
+                Ok(()) => Err(error),
+                Err(rollback_error) => Err(UpdateError::Apply(format!(
+                    "{error}; rollback failed: {rollback_error}"
+                ))),
+            }
+        }
+    }
+}
+
+/// Check the staged payload and resolve any previous operation.
+///
+/// Runs before the first rename and returns the index of the new package. The
+/// caller reports [`ApplyStage::RollingBack`] when this fails, so a broken
+/// payload does not leave the update window on the install line.
+fn preflight(target_dir: &Path, staged_app: &Path, exe_name: &str) -> Result<PackageIndex> {
     let new_index = read_package_json_from_dir(staged_app)?;
     let exe = staged_app.join(exe_name);
     if !exe.is_file() {
@@ -225,102 +401,7 @@ pub(crate) fn apply_staged_with_hooks(
             ));
         }
     }
-
-    let operation_id = state::new_operation_id();
-    let staging_dir = state::operation_staging_path(target_dir, &operation_id);
-    let old_index = read_package_json_from_dir(target_dir).ok();
-    let had_target = target_dir.exists();
-    let backup_dir = choose_backup_path(target_dir, &operation_id);
-    let mut state = InstallState {
-        schema: state::STATE_SCHEMA,
-        operation_id: operation_id.clone(),
-        stage: OperationStage::Prepared,
-        install_dir: target_dir.to_path_buf(),
-        backup_dir,
-        staging_dir: staging_dir.clone(),
-        handshake_path: handshake_path.to_path_buf(),
-        version: new_index.version.clone(),
-        previous_version: old_index.as_ref().map(|index| index.version.clone()),
-        had_install: had_target,
-        created_at: state::now_unix(),
-    };
-
-    let mut interrupted = false;
-    let mut applied: Option<InstallState> = None;
-
-    macro_rules! checkpoint {
-        ($point:expr) => {
-            if hooks.interrupt($point) {
-                interrupted = true;
-                return Err(UpdateError::Apply("apply interrupted by test hook".into()));
-            }
-        };
-    }
-
-    let result = (|| -> Result<()> {
-        copy_payload(staged_app, &staging_dir, &new_index)?;
-        checkpoint!(InterruptPoint::Staged);
-        if had_target {
-            migrate_user_files(target_dir, &staging_dir, old_index.as_ref(), &new_index)?;
-        }
-        verify_payload(&staging_dir, &new_index)?;
-        checkpoint!(InterruptPoint::Verified);
-
-        // Durable before the first rename.
-        state::save(&state)?;
-        applied = Some(state.clone());
-        checkpoint!(InterruptPoint::Prepared);
-
-        if had_target {
-            fsutil::rename_retry(target_dir, &state.backup_dir)?;
-        }
-        state.stage = OperationStage::OldRenamed;
-        state::save(&state)?;
-        applied = Some(state.clone());
-        checkpoint!(InterruptPoint::OldRenamed);
-
-        fsutil::rename_retry(&staging_dir, target_dir)?;
-        state.stage = OperationStage::NewInPlace;
-        state::save(&state)?;
-        applied = Some(state.clone());
-        checkpoint!(InterruptPoint::NewInPlace);
-
-        let process = launch_new(
-            target_dir,
-            exe_name,
-            handshake_path,
-            &operation_id,
-            launcher,
-        )?;
-        checkpoint!(InterruptPoint::Launched);
-        wait_for_confirmation(process, handshake_path, &operation_id, timeout)?;
-        checkpoint!(InterruptPoint::Confirmed);
-        Ok(())
-    })();
-
-    match result {
-        Ok(()) => {
-            let applied = applied.expect("state is persisted before launch");
-            finish_success(&applied, target_dir, staged_app)
-        }
-        Err(error) if interrupted => Err(error),
-        Err(error) => {
-            let rollback = match applied.as_ref() {
-                Some(applied) => recovery::rollback_operation(applied),
-                None => {
-                    let _ = fsutil::remove_dir_with_timeout(&staging_dir, STAGING_CLEANUP_TIMEOUT);
-                    Ok(())
-                }
-            };
-            let _ = fsutil::remove_dir_with_timeout(staged_app, STAGING_CLEANUP_TIMEOUT);
-            match rollback {
-                Ok(()) => Err(error),
-                Err(rollback_error) => Err(UpdateError::Apply(format!(
-                    "{error}; rollback failed: {rollback_error}"
-                ))),
-            }
-        }
-    }
+    Ok(new_index)
 }
 
 fn copy_payload(staged_app: &Path, staging: &Path, new_index: &PackageIndex) -> Result<()> {

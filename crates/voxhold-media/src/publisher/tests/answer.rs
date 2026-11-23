@@ -157,6 +157,90 @@ fn a_repeated_offer_while_live_is_answered_again_without_touching_the_publicatio
 }
 
 #[test]
+fn a_late_confirmation_of_the_previous_offer_keeps_the_new_bitrate_and_ice_restart() {
+    let now = Instant::now();
+    let mut publisher = publisher();
+    let initial = live_after_the_initial_answer(&mut publisher, now);
+    let attempt = publisher.attempt;
+
+    // C05: only the bitrate changes in the live attempt. No stop, no start.
+    let next = PublishRequest {
+        quality: Quality {
+            bitrate_kbps: 7200,
+            audio_bitrate_kbps: 256,
+            ..Quality::default()
+        },
+        ..request()
+    };
+    let applying = publisher.apply_quality(1, next.clone(), now);
+    assert!(matches!(
+        applying.first(),
+        Some(Outcome::SetBitrate { attempt: tagged, op: 1, .. }) if *tagged == attempt
+    ));
+    publisher.on_engine(
+        EngineEvent::Bitrate {
+            attempt,
+            op: 1,
+            result: BitrateResult::Applied,
+        },
+        now,
+    );
+    assert_eq!(publisher.request(), Some(&next));
+    assert_eq!(
+        publisher
+            .sharing()
+            .confirmed
+            .map(|confirmed| confirmed.quality),
+        Some(next.quality),
+        "the live limit is the confirmed one"
+    );
+
+    // The backend restarts ICE on the same publication and offers again.
+    let offer = publisher.on_server_event(
+        "stream.webrtc_offer",
+        "",
+        &json!({"sdp": "v=0\r\nm=video 9 restart\r\n"}),
+        now,
+    );
+    assert!(matches!(offer.as_slice(), [Outcome::Offer(_)]), "{offer:?}");
+    let answer = publisher.on_engine(EngineEvent::Answer("v=0 restart answer".into()), now);
+    let sent = sends(&answer);
+    assert_eq!(sent.len(), 1, "exactly one answer: {answer:?}");
+    let restart = sent[0].request_id.clone().expect("tagged restart answer");
+    assert_ne!(restart, initial);
+
+    // The late confirmation of the *previous* answer belongs to a superseded
+    // negotiation; it must not roll back the live state.
+    let stale = publisher.on_server_event(
+        "stream.webrtc_answered",
+        &initial,
+        &json!({"accepted": true}),
+        now,
+    );
+    assert!(stale.is_empty(), "{stale:?}");
+    // The restart's own confirmation changes nothing while the card is live.
+    let confirmed = publisher.on_server_event(
+        "stream.webrtc_answered",
+        &restart,
+        &json!({"accepted": true}),
+        now,
+    );
+    assert!(confirmed.is_empty(), "{confirmed:?}");
+
+    let sharing = publisher.sharing();
+    assert_eq!(sharing.phase, Phase::Live);
+    assert_eq!(sharing.attempt, attempt, "the restart is not a new attempt");
+    assert_eq!(publisher.request(), Some(&next));
+    assert_eq!(sharing.quality, Some(next.quality));
+    assert_eq!(
+        sharing.confirmed.map(|confirmed| confirmed.quality),
+        Some(next.quality),
+        "a late answer never rolls the live limit back"
+    );
+    assert!(sharing.live);
+}
+
+#[test]
 fn the_initial_answer_confirmation_still_moves_the_card_to_connecting() {
     let now = Instant::now();
     let mut publisher = publisher();

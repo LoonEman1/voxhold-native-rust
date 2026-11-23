@@ -27,15 +27,49 @@ impl Voxhold {
                 div()
                     .flex_1()
                     .min_w(px(0.))
-                    .truncate()
-                    .text_size(px(13.))
-                    .text_color(ink(p.error_text))
-                    .child(self.auth.status.clone()),
+                    .flex()
+                    .flex_col()
+                    .justify_center()
+                    .when(!self.auth.status.is_empty(), |column| {
+                        column.child(
+                            div()
+                                .truncate()
+                                .text_size(px(13.))
+                                .text_color(ink(p.error_text))
+                                .child(self.auth.status.clone()),
+                        )
+                    })
+                    // The tray failure is its own line: it never replaces the
+                    // login error above it.
+                    .when(self.tray_close_blocked, |column| {
+                        column.child(
+                            div()
+                                .id("auth-tray-error")
+                                .debug_selector(|| "auth-tray-error".into())
+                                .truncate()
+                                .text_size(px(12.))
+                                .text_color(ink(p.error_text))
+                                .child(self.tray_error_text().to_string()),
+                        )
+                    }),
             );
         // A transient automatic failure keeps the record, so the same login
-        // can be retried without retyping the address. The link only appears
-        // for the short transient text, which still fits the row.
-        if self.auth.auto_retry && self.auto_record.is_some() {
+        // can be retried without retyping the address. A failed logout cleanup
+        // offers the same kind of one-click local retry.
+        if self.cleanup_retry {
+            row = row.child(
+                div()
+                    .id("auth-cleanup-retry")
+                    .debug_selector(|| "auth-cleanup-retry".into())
+                    .flex_none()
+                    .text_size(px(12.))
+                    .font_weight(gpui::FontWeight::BOLD)
+                    .text_color(ink(p.lime))
+                    .cursor_pointer()
+                    .on_click(cx.listener(|s, _, window, cx| s.retry_cleanup(window, cx)))
+                    .child("Повторить очистку"),
+            );
+        } else if self.auth.auto_retry && self.auto_record.is_some() {
             row = row.child(
                 div()
                     .id("auth-retry-login")
@@ -49,6 +83,22 @@ impl Voxhold {
                     .child("Повторить вход"),
             );
         }
+        // A failed tray registration blocks the close button on this surface
+        // too; the banner keeps the normal exit available.
+        if self.tray_exit_offered() {
+            row = row.child(
+                div()
+                    .id("auth-tray-exit")
+                    .debug_selector(|| "auth-tray-exit".into())
+                    .flex_none()
+                    .text_size(px(12.))
+                    .font_weight(gpui::FontWeight::BOLD)
+                    .text_color(ink(p.lime))
+                    .cursor_pointer()
+                    .child("Выйти из Voxhold")
+                    .on_click(cx.listener(|s, _, window, cx| s.quit_from_tray(window, cx))),
+            );
+        }
         row.into_any_element()
     }
 
@@ -57,11 +107,13 @@ impl Voxhold {
         entity: &Entity<InputState>,
         rect: layout::Rect,
         compact: bool,
+        selector: &'static str,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let p = self.palette;
         div()
             .absolute()
+            .debug_selector(move || selector.into())
             .left(px(rect.x))
             .top(px(rect.y))
             .w(px(rect.w))
@@ -480,7 +532,12 @@ impl Voxhold {
         let (vw, vh) = self.viewport;
         let p = self.palette;
         let instance = self.auth.is_instance();
-        let l = auth::layout_auth(vw, vh, instance, !self.auth.status.is_empty());
+        let l = auth::layout_auth(
+            vw,
+            vh,
+            instance,
+            !self.auth.status.is_empty() || self.tray_close_blocked,
+        );
         let compact = vw <= 760.0;
         let background = self.auth_background(vw.round() as u32, vh.round() as u32);
         let mut root = div()
@@ -742,7 +799,7 @@ impl Voxhold {
         }
         if instance {
             let field = self.instance.clone();
-            root = root.child(self.auth_field(&field, l.user, compact, cx));
+            root = root.child(self.auth_field(&field, l.user, compact, "auth-instance-field", cx));
             // A separate checkbox under the address field. It owns only the
             // preference; the origin is written after the form is confirmed.
             let checked = self.auth.remember_instance;
@@ -795,8 +852,15 @@ impl Voxhold {
         } else {
             let username = self.username.clone();
             let password = self.password.clone();
-            root = root.child(self.auth_field(&username, l.user, compact, cx));
-            root = root.child(self.auth_field(&password, l.password, compact, cx));
+            root =
+                root.child(self.auth_field(&username, l.user, compact, "auth-username-field", cx));
+            root = root.child(self.auth_field(
+                &password,
+                l.password,
+                compact,
+                "auth-password-field",
+                cx,
+            ));
             // «Запомнить вход» lives on the password label row so the login
             // card keeps the reference geometry. Both the 18 px box and the
             // caption toggle the same preference.
@@ -895,7 +959,7 @@ impl Voxhold {
                     "Войти в Voxhold".to_string()
                 }),
         );
-        if !self.auth.status.is_empty() {
+        if !self.auth.status.is_empty() || self.tray_close_blocked {
             root = root.child(self.auth_error_row(l.error, cx));
         }
         root.into_any_element()

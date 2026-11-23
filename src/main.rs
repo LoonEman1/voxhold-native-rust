@@ -150,6 +150,10 @@ fn main() {
                     window_min_size: Some(size(px(320.), px(360.))),
                     ..Default::default()
                 },
+                // `Voxhold::new` owns the explicit «Восстановление входа»
+                // phase and starts it before the root's first frame. The
+                // update handshake still runs immediately after the window
+                // and the view exist.
                 move |window, cx| {
                     let view = cx.new(|cx| {
                         Voxhold::new(
@@ -163,6 +167,10 @@ fn main() {
                     });
                     #[cfg(feature = "voxhold-media")]
                     view.update(cx, |view, cx| view.install_power(window, cx));
+                    // The permanent tray icon and the close hook are set up
+                    // before the window is shown so the cross button can hide
+                    // it from the very first frame.
+                    view.update(cx, |view, cx| view.install_tray(window, cx));
                     // The helper waits for this file after the swap. It is
                     // written only once the window is up; a failure is shown
                     // in the workspace instead of being swallowed. Write it
@@ -188,7 +196,7 @@ fn main() {
                     // it the state stays unconfirmed so the helper can roll
                     // back.
                     view.update(cx, |view, cx| {
-                        view.start_update(handshake.is_some(), handshake_written, cx)
+                        view.start_update(handshake.is_some(), handshake_written, window, cx)
                     });
                     cx.new(|cx| Root::new(view.into(), window, cx))
                 },

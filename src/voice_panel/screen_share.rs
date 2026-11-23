@@ -12,13 +12,17 @@
 use super::*;
 use gpui::ScrollHandle;
 use voxhold_media::publisher::{
-    Codec, Phase, Preset, PublishRequest, Quality, QualityChange, QualityOutcome, Resolution,
-    Sharing, AUDIO_BITRATES, MAX_CHANNEL_PUBLISHERS,
+    Codec, CodecIntent, CodecRole, CodecSnapshot, Phase, Preset, PublishRequest, Quality,
+    QualityChange, QualityOutcome, Resolution, Sharing, AUDIO_BITRATES, MAX_CHANNEL_PUBLISHERS,
 };
 use voxhold_media::screen_capture::{
     self, PreviewFrame, ScreenSource, SourceId, SourceIdentity, SourceKind, ThumbnailError,
 };
 use voxhold_media::system_audio::{self, AudioDeviceInfo, AudioScope};
+use voxhold_media::video_encoder::{
+    AdapterEvidence, AdapterSelection, EncodeQuery, EncoderBackend, EncoderPlan,
+    VideoEncoderPreference,
+};
 
 /// The backend has no runtime reconfigure; the dialog must warn honestly.
 pub(crate) const RESTART_WARNING: &str =
@@ -83,6 +87,12 @@ pub(super) enum ShareKey {
     BitrateDown,
     BitrateUp,
     Preset(Preset),
+    /// One codec choice of the picker: «Автоматически» or one of the four SDR
+    /// codecs, in the website's order.
+    Codec(CodecIntent),
+    /// Processor or one hardware adapter. The automatic adapter is the
+    /// Windows primary suitable one.
+    EncoderBackend(EncoderBackend),
     Audio,
     /// One offered capture scope of the system-audio track.
     AudioScope(AudioScope),
@@ -114,6 +124,15 @@ pub(super) struct ScreenShareUi {
     pub(super) resolution: Resolution,
     pub(super) fps: u32,
     pub(super) bitrate_kbps: u32,
+    /// What the picker asks for. The request sent to the media layer carries
+    /// the concrete codec resolved against the sender snapshot, never this
+    /// intent.
+    pub(super) codec: CodecIntent,
+    /// Processor or hardware. CPU is the default; no vendor SDK is involved.
+    pub(super) encoder_backend: EncoderBackend,
+    /// Automatic primary adapter (default) or one explicit LUID.
+    pub(super) encoder_adapter: AdapterSelection,
+    encoder_probe: encoder::DialogEncoderProbe,
     pub(super) audio_enabled: bool,
     /// The scope the next request carries. Only meaningful when audio is on;
     /// the provided source kind decides the default choice.
@@ -131,11 +150,29 @@ pub(super) struct ScreenShareUi {
     /// Next tag of a quality-change operation. It survives closing the dialog,
     /// so a delayed answer of an older operation can never match a newer one.
     pub(super) quality_op: u64,
+    /// The concrete codec the dialog would send, injected by a test so the
+    /// restart classification does not depend on the host encoders.
+    #[cfg(test)]
+    pub(super) test_codec: Option<Codec>,
+    /// Sender availability per codec injected by a test, so the selector can
+    /// paint a greyed item and its reason on a build whose probe finds every
+    /// codec. `None` keeps the real process snapshot.
+    #[cfg(test)]
+    pub(super) test_codec_availability: Option<Vec<(Codec, Option<String>)>>,
     /// The operation whose result this dialog is waiting for. `busy` belongs
     /// to it; a result of another operation never clears it.
     pub(super) pending_quality_op: Option<u64>,
     pub(super) error: String,
     pub(super) sharing: Sharing,
+    /// Room that owns the active publication. It is captured when the publish
+    /// intent is sent and never follows the displayed room.
+    pub(super) owner_room: i64,
+    /// Highest attempt applied from the publisher. A late snapshot of an older
+    /// attempt can neither clear the live image nor close its dialog.
+    pub(super) applied_attempt: u64,
+    /// Attempt (or picker id for an unconfirmed intent) whose stop was already
+    /// sent, so a repeated click cannot produce a second `stream.stop`.
+    pub(super) stop_sent: Option<u64>,
     pub(super) preview: Option<Arc<RenderImage>>,
     /// Picker thumbnails keyed by the stable surface identity, so a capturer
     /// reorder keeps the picture of the same display. Bounded by
@@ -228,6 +265,10 @@ impl Default for ScreenShareUi {
             resolution: Resolution::P1080,
             fps: 30,
             bitrate_kbps: 6000,
+            codec: CodecIntent::Auto,
+            encoder_backend: EncoderBackend::Cpu,
+            encoder_adapter: AdapterSelection::Auto,
+            encoder_probe: encoder::DialogEncoderProbe::default(),
             audio_enabled: false,
             audio_scope: AudioScope::EverythingExceptSelf,
             audio_bitrate_kbps: 128,
@@ -236,9 +277,16 @@ impl Default for ScreenShareUi {
             busy: false,
             preflight: false,
             quality_op: 0,
+            #[cfg(test)]
+            test_codec: None,
+            #[cfg(test)]
+            test_codec_availability: None,
             pending_quality_op: None,
             error: String::new(),
             sharing: Sharing::default(),
+            owner_room: 0,
+            applied_attempt: 0,
+            stop_sent: None,
             preview: None,
             previews: HashMap::new(),
             preview_failures: HashMap::new(),
@@ -301,10 +349,14 @@ impl ScreenShareUi {
     }
 
     /// The request a restart dialog would send: the confirmed live source with
-    /// the quality and audio fields shown by the dialog. Only a scope the user
-    /// really picks in the dialog can widen a narrow live scope.
+    /// the quality, audio and codec fields shown by the dialog. Only a scope the
+    /// user really picks in the dialog can widen a narrow live scope, and the
+    /// codec is the one Start resolved, so a codec change is classified as a
+    /// restart instead of quietly staying the live payload.
     pub(super) fn restart_request(&self) -> Option<PublishRequest> {
         let mut request = self.sharing.confirmed.as_ref()?.request();
+        request.codec = self.resolved_codec().ok()?;
+        request.encoder = self.encoder_plan(request.codec).ok()?;
         request.quality = self.quality().clamped();
         request.audio = self.audio_requested();
         request.audio_scope = self.effective_audio_scope(request.source.kind);
@@ -315,12 +367,19 @@ impl ScreenShareUi {
     /// live configuration. `None` outside a restart dialog or before that
     /// configuration is known.
     pub(super) fn restart_change(&self) -> Option<QualityChange> {
+        let next = self.restart_request()?;
+        self.restart_change_to(&next)
+    }
+
+    /// Classify the exact request the dialog would commit. Start resolves the
+    /// codec once; comparing that value (not a second resolution) keeps the
+    /// queued command and its hint in agreement.
+    pub(super) fn restart_change_to(&self, request: &PublishRequest) -> Option<QualityChange> {
         if !self.restart {
             return None;
         }
         let live = self.sharing.confirmed.as_ref()?.request();
-        let next = self.restart_request()?;
-        Some(live.change_to(&next))
+        Some(live.change_to(request))
     }
 
     fn loading(&self) -> bool {
@@ -436,6 +495,8 @@ impl ScreenShareUi {
         }
         match self.restart_change() {
             Some(QualityChange::LiveBitrate) => Some(LIVE_BITRATE_HINT),
+            // Apply would send nothing: values equal the live payload.
+            Some(QualityChange::Unchanged) => None,
             _ => Some(RESTART_WARNING),
         }
     }
@@ -445,7 +506,9 @@ impl ScreenShareUi {
 /// measured counters once the engine sampled them, `sound` is the fallback
 /// label (which already names the scope). The engine's real scope is appended
 /// exactly once, so the measured-stats card names the capture instead of hiding
-/// it behind the counters.
+/// it behind the counters. The codec in the line is the confirmed one — the
+/// encoded codec from the stats when present, otherwise the configuration the
+/// media layer accepted — never the picker's current desire.
 pub(in crate::voice_panel) fn screen_on_air_line(
     sharing: &Sharing,
     quality: &str,
@@ -456,38 +519,50 @@ pub(in crate::voice_panel) fn screen_on_air_line(
         .audio_scope
         .as_deref()
         .filter(|scope| sharing.has_audio && !scope.is_empty());
-    match (stats, scope) {
-        (Some(stats), Some(scope)) => format!("{quality} · {stats} · {scope}"),
-        (Some(stats), None) => format!("{quality} · {stats}"),
-        (None, Some(scope)) if !sound.contains(scope) => {
-            format!("{quality} · {sound} · {scope}")
-        }
-        (None, _) => format!("{quality} · {sound}"),
+    let confirmed_codec = sharing
+        .stats
+        .and_then(|stats| stats.confirmed_codec)
+        .or_else(|| sharing.confirmed.as_ref().map(|confirmed| confirmed.codec));
+    let mut parts = vec![quality.to_owned()];
+    if let Some(codec) = confirmed_codec {
+        parts.push(codec.label().to_owned());
     }
+    // «GPU» is not a checkbox echo: the engine reported the open hardware
+    // session and encoded frames were measured. Before that the line stays
+    // silent about the backend.
+    if let Some(hardware) = sharing
+        .hardware
+        .as_ref()
+        .filter(|_| confirmed_codec.is_some())
+    {
+        // An adapter read from the open MFT is a fact. A driver that exposes no
+        // adapter attribute leaves only the plan the session was asked to open,
+        // and the line says so instead of presenting it as proof.
+        let evidence = match hardware.adapter_evidence {
+            AdapterEvidence::MftAttribute => "",
+            AdapterEvidence::PlanEcho => " (адаптер из плана)",
+        };
+        parts.push(format!(
+            "GPU {} · драйвер 0x{:x}{evidence}",
+            hardware.adapter, hardware.driver_version
+        ));
+    }
+    match (stats, scope) {
+        (Some(stats), Some(scope)) => {
+            parts.push(stats.to_owned());
+            parts.push(scope.to_owned());
+        }
+        (Some(stats), None) => parts.push(stats.to_owned()),
+        (None, Some(scope)) if !sound.contains(scope) => {
+            parts.push(sound.to_owned());
+            parts.push(scope.to_owned());
+        }
+        (None, _) => parts.push(sound.to_owned()),
+    }
+    parts.join(" · ")
 }
 
 impl VoicePanel {
-    pub fn set_stream_permission(&mut self, allowed: bool) {
-        self.can_stream = allowed;
-        // A revocation that arrives while the picker or a capture preparation
-        // is open must reach the worker, not wait for the next Start.
-        self.sync_screen_access();
-    }
-
-    /// Push the current gate to the worker while a picker or an attempt is
-    /// open. The session re-checks it before it accepts a prepared engine, so
-    /// a permission or slot loss during the capture start cannot be missed.
-    pub(super) fn sync_screen_access(&self) {
-        if !(self.screen.open || self.screen.busy || self.share_active()) {
-            return;
-        }
-        let Some(handle) = &self.handle else {
-            return;
-        };
-        let slot_available = self.active_publishers_in_room() < MAX_CHANNEL_PUBLISHERS;
-        handle.screen_access(self.can_stream, slot_available);
-    }
-
     pub fn screen_share_open(&self) -> bool {
         self.screen.open
     }
@@ -499,7 +574,7 @@ impl VoicePanel {
     }
 
     /// Whether this client owns an attempt. The action shows a status then.
-    pub(super) fn share_active(&self) -> bool {
+    pub(crate) fn share_active(&self) -> bool {
         matches!(
             self.screen.sharing.phase,
             Phase::Publishing | Phase::Live | Phase::Stopping
@@ -527,6 +602,14 @@ impl VoicePanel {
     /// Why the «Экран» action is disabled. The same values are re-checked by
     /// the publisher state machine.
     pub fn share_gate(&self) -> Result<(), &'static str> {
+        self.stream_gate(self.room)
+    }
+
+    /// Start gate of one room. A new publication uses the displayed room; the
+    /// restart of a live publication uses its owner room, so a channel without
+    /// `Stream` that is only being viewed cannot block the settings of the
+    /// stream that is already on air.
+    pub(super) fn stream_gate(&self, room: i64) -> Result<(), &'static str> {
         #[cfg(test)]
         if let Some(result) = self.test_share_gate {
             return result;
@@ -537,24 +620,24 @@ impl VoicePanel {
         if !self.access_confirmed {
             return Err("Права на канал ещё не подтверждены.");
         }
-        match self.rooms.get(&self.room) {
+        match self.rooms.get(&room) {
             Some(access) if access.readable && !access.e2ee => {}
             _ => return Err("Нет доступа к голосовому каналу."),
         }
-        if self.call_channel == 0 || self.call_channel != self.room {
+        if self.call_channel == 0 || self.call_channel != room {
             return Err("Сначала подключитесь к голосовому каналу.");
         }
         if self.phase != CallPhase::Connected {
             return Err("Голосовое соединение ещё не установлено.");
         }
-        if !self.can_stream {
+        if !self.stream_permission_for(room) {
             return Err("Нет права запускать трансляции в этом канале.");
         }
         if screen_capture::capability_cached().is_err() {
             return Err("Захват экрана недоступен на этом устройстве.");
         }
-        if Codec::available().is_empty() {
-            return Err("В этой сборке нет подтверждённого кодека трансляции.");
+        if !CodecSnapshot::current().sender_available() {
+            return Err("В этой сборке нет доступного SDR-кодека для публикации.");
         }
         if matches!(
             self.screen.sharing.phase,
@@ -562,7 +645,12 @@ impl VoicePanel {
         ) {
             return Err("Трансляция уже идёт.");
         }
-        if self.active_publishers_in_room() >= MAX_CHANNEL_PUBLISHERS {
+        let slot_full = if room == self.room {
+            self.active_publishers_in_room() >= MAX_CHANNEL_PUBLISHERS
+        } else {
+            !self.publish_slot_available()
+        };
+        if slot_full {
             return Err("В канале уже 8 трансляций. Дождитесь завершения одной из них.");
         }
         Ok(())
@@ -595,9 +683,15 @@ impl VoicePanel {
         // and the rows of the previous dialog are dropped, not reused.
         self.screen.reset_preview_viewport();
         // Restore the local preferences, then probe this session's endpoint
-        // before letting the user start the stream.
+        // before letting the user start the stream. Restored preferences own
+        // the resolution, FPS, bitrate, codec and system-sound choice; the
+        // probe answer must not leak in, and Start stays locked until it
+        // settles. A saved codec this build cannot encode was already turned
+        // into Auto with its reason by the restore.
         self.load_stream_preferences();
         self.screen.audio_availability = None;
+        self.cancel_encoder_probe();
+        self.begin_encoder_probe(cx);
         self.begin_audio_probe(cx);
         self.screen.focus_placed = false;
         if let Some(handle) = &self.handle {
@@ -628,10 +722,15 @@ impl VoicePanel {
         self.screen.fps = confirmed.quality.fps;
         self.screen.bitrate_kbps = confirmed.quality.bitrate_kbps;
         self.screen.audio_bitrate_kbps = confirmed.quality.audio_bitrate_kbps;
+        // A restart keeps the codec that is really on air; changing it is a
+        // separate explicit choice.
+        self.screen.codec = CodecIntent::Explicit(confirmed.codec);
         self.screen.audio_enabled = confirmed.audio;
         // The dialog starts from the scope the live attempt accepted; opening
         // it never widens a narrow scope.
         self.screen.audio_scope = confirmed.audio_scope;
+        self.screen.encoder_backend = confirmed.encoder.backend;
+        self.cancel_encoder_probe();
         self.begin_audio_probe(cx);
         self.screen.restart = true;
         // The restart dialog is bound to the confirmed live source here, and
@@ -642,6 +741,7 @@ impl VoicePanel {
         // so an earlier picker capture cannot land in this dialog.
         self.screen.clear_previews(window);
         self.screen.open = true;
+        self.begin_encoder_probe(cx);
         self.screen.busy = false;
         self.screen.preflight = false;
         self.screen.pending_quality_op = None;
@@ -725,6 +825,7 @@ impl VoicePanel {
         };
         let pending_op = self.screen.pending_quality_op;
         self.screen.open = false;
+        self.cancel_encoder_probe();
         self.screen.restart = false;
         self.screen.busy = false;
         self.screen.preflight = false;
@@ -741,8 +842,9 @@ impl VoicePanel {
         // is ignored, and the pictures/titles are released immediately.
         self.screen.clear_previews(window);
         self.screen.focus_placed = false;
+        let stop_now = committed && self.latch_screen_stop();
         if let Some(handle) = &self.handle {
-            if committed {
+            if stop_now {
                 handle.stop_screen_share();
             } else if restart_busy {
                 if let Some(op) = pending_op {
@@ -820,6 +922,7 @@ impl VoicePanel {
         self.screen.selected = Some(id);
         self.screen.selected_identity = Some(identity);
         self.screen.error.clear();
+        self.begin_encoder_probe(cx);
         cx.notify();
     }
 
@@ -861,8 +964,31 @@ impl VoicePanel {
         self.screen
             .preview_unfit
             .retain(|id| selection::identity_kind(id) != kind);
+        self.begin_encoder_probe(cx);
         self.request_screen_previews(window, cx);
         cx.notify();
+    }
+
+    /// Resolve the dialog's codec intent against the sender probe. The refusal
+    /// is the ready user-facing reason the dialog paints and Start reports.
+    pub(super) fn codec_resolution(&self) -> Result<Codec, String> {
+        #[cfg(test)]
+        if let Some(reason) = &self.test_codec_error {
+            return Err(reason.clone());
+        }
+        self.screen.resolved_codec()
+    }
+
+    /// Sender availability of one codec exactly as the selector paints it. The
+    /// injected refusal that makes `codec_resolution` fail describes the same
+    /// build here, so the dialog can never claim «no SDR codec» while painting
+    /// every item as selectable.
+    pub(super) fn codec_availability(&self, codec: Codec) -> Result<(), String> {
+        #[cfg(test)]
+        if let Some(reason) = &self.test_codec_error {
+            return Err(reason.clone());
+        }
+        self.screen.codec_availability(codec)
     }
 
     /// Start waits for the endpoint probe: committing earlier would publish
@@ -878,165 +1004,32 @@ impl VoicePanel {
             && !self.screen.busy
             && !self.screen.preflight
             && !self.screen.sharing.preflighting
-            && !Codec::available().is_empty()
+            && self.codec_resolution().is_ok()
             && self.screen.audio_availability.is_some()
             && (!self.screen.restart || self.screen.sharing.phase == Phase::Live)
-    }
-
-    pub(super) fn start_screen_share(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.screen.busy {
-            return;
-        }
-        if self.screen.audio_availability.is_none() {
-            self.screen.error = AUDIO_PENDING_REASON.into();
-            cx.notify();
-            return;
-        }
-        if let Err(reason) = self.share_gate() {
-            // The live quality dialog is allowed to pass the "already live"
-            // gate: it replaces the current attempt only through a confirmed
-            // stop+start. Every other gate (join, permission, slot, capture)
-            // still blocks it.
-            let restart_bypass = self.screen.restart && reason == "Трансляция уже идёт.";
-            if !restart_bypass {
-                // An active publication is not an error for this button; its
-                // card owns the status and the stop action.
-                if !self.share_active() {
-                    self.screen.error = reason.to_owned();
-                }
-                cx.notify();
-                return;
-            }
-        }
-        let Some(id) = self.screen.selected else {
-            self.screen.error = "Выберите монитор или окно.".into();
-            cx.notify();
-            return;
-        };
-        let source = if self.screen.restart {
-            // The restart is locked to the source the engine already accepted.
-            // The current snapshot may be empty, stale or describe a renamed
-            // row; none of that may move the restart to another source.
-            if self.screen.sharing.phase != Phase::Live {
-                self.screen.error = "Трансляция уже не идёт; откройте выбор экрана заново.".into();
-                self.screen.open = false;
-                self.screen.restart = false;
-                self.screen.focus_placed = false;
-                self.screen.clear_previews(window);
-                cx.notify();
-                return;
-            }
-            let Some(live) = self.screen.restart_source().cloned() else {
-                self.screen.error = SOURCE_GONE_REASON.into();
-                cx.notify();
-                return;
-            };
-            if live.source_id() != id || self.screen.selected_identity != live.identity() {
-                self.screen.error = SOURCE_GONE_REASON.into();
-                cx.notify();
-                return;
-            }
-            live
-        } else {
-            // The dialog may be stale: build the request from the row that
-            // exists now, and refuse an absent, duplicated or re-used id.
-            let source = self
-                .screen
-                .source_for(id)
-                .filter(|_| id.kind == self.screen.kind)
-                .cloned();
-            let Some(source) = source else {
-                self.screen.error = SOURCE_GONE_REASON.into();
-                cx.notify();
-                return;
-            };
-            if source.identity().is_none() || !self.screen.selection_matches(&source) {
-                self.screen.error = SOURCE_CHANGED_REASON.into();
-                cx.notify();
-                return;
-            }
-            source
-        };
-        let quality = self.screen.quality_for_source(&source);
-        let request = PublishRequest {
-            source,
-            quality,
-            codec: Codec::Vp8,
-            audio: self.screen.audio_requested(),
-            audio_scope: self.screen.effective_audio_scope(
-                self.screen
-                    .selected
-                    .map(|id| id.kind)
-                    .unwrap_or(self.screen.kind),
-            ),
-        };
-        let Some(handle) = &self.handle else {
-            self.screen.error = "Голосовое соединение уже закрыто.".into();
-            cx.notify();
-            return;
-        };
-        let slot_available = self.active_publishers_in_room() < MAX_CHANNEL_PUBLISHERS;
-        let live_bitrate =
-            self.screen.restart && self.screen.restart_change() == Some(QualityChange::LiveBitrate);
-        // Every quality change gets its own tag, so a delayed answer of an
-        // older Apply cannot clear the busy state of this one.
-        let quality_op = if self.screen.restart {
-            self.screen.quality_op = self.screen.quality_op.wrapping_add(1);
-            Some(self.screen.quality_op)
-        } else {
-            None
-        };
-        if let Some(op) = quality_op {
-            // A bitrate-only change goes to the live sender; the worker
-            // repeats the classification before it applies anything.
-            if live_bitrate {
-                handle.apply_screen_quality(op, request.clone(), self.can_stream, slot_available);
-            } else {
-                handle.restart_screen_share(op, request.clone(), self.can_stream, slot_available);
-            }
-        } else {
-            handle.publish_screen(
-                self.screen.picker,
-                request.clone(),
-                self.can_stream,
-                slot_available,
-            );
-        }
-        if self.screen.restart {
-            self.stage_live_preferences(request);
-        } else {
-            self.remember_stream_preferences(cx);
-        }
-        // The request becomes confirmed when the media layer reports Live.
-        self.screen.busy = true;
-        // A restart without a live bitrate starts a preflight; closing the
-        // dialog while it runs must cancel it instead of stopping the stream.
-        // The pending operation tag is the only confirmation this dialog needs.
-        self.screen.preflight = self.screen.restart && !live_bitrate;
-        self.screen.pending_quality_op = quality_op;
-        // The previous attempt's error belongs to its own answer. A stale
-        // `Sharing` snapshot must not turn this Start into an instant failure.
-        self.screen.sharing.error = None;
-        self.screen.error.clear();
-        cx.notify();
-    }
-
-    pub(super) fn stop_screen_share(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(handle) = &self.handle {
-            handle.stop_screen_share();
-        }
-        // A stop ends the picker session: no capture may start another card.
-        self.screen.clear_previews(window);
-        // The on-air card may already hold the last shown frame, and the phase
-        // update can arrive coalesced with the stop. Release the picture here
-        // as well instead of relying on that update.
-        self.screen.clear_preview(window);
-        cx.notify();
     }
 
     pub(super) fn change_bitrate(&mut self, delta: i64, cx: &mut Context<Self>) {
         let next = (self.screen.bitrate_kbps as i64 + delta).clamp(500, 16_000);
         self.screen.bitrate_kbps = ((next / 100) * 100) as u32;
+        cx.notify();
+    }
+
+    /// Choose a codec in the picker or the live dialog. An explicit item this
+    /// build cannot encode is inert: the greyed button keeps its reason and
+    /// Start stays blocked instead of silently substituting another codec.
+    /// A changed codec reaches Start as a restart/preflight through
+    /// `restart_change_to`, never as a live bitrate reconfiguration.
+    pub(super) fn select_screen_codec(&mut self, intent: CodecIntent, cx: &mut Context<Self>) {
+        if let CodecIntent::Explicit(codec) = intent {
+            if self.codec_availability(codec).is_err() {
+                return;
+            }
+        }
+        if self.screen.codec == intent {
+            return;
+        }
+        self.screen.codec = intent;
         cx.notify();
     }
 
@@ -1091,6 +1084,9 @@ impl VoicePanel {
         {
             self.screen.released_images = old.released_images;
         }
+        // The owner identity belongs to the session that just ended; keeping it
+        // would gate the next displayed room with a stream that no longer runs.
+        self.publish_access = None;
     }
 
     fn share_focus(&self, index: usize) -> FocusHandle {
@@ -1169,10 +1165,14 @@ impl VoicePanel {
 
 mod audio_scope;
 mod card;
+mod codec;
 mod dialog;
+mod owner;
 mod picker;
 mod preferences;
 pub(crate) use preferences::StreamPrefsStore;
+mod encoder;
 mod preview;
 mod selection;
+mod start;
 mod update;

@@ -178,6 +178,7 @@ impl VoicePanel {
         {
             self.polls = self.polls.saturating_add(1);
         }
+        self.sync_pip(window);
         self.sync_viewport();
         let clock_changed = self.live_clock_changed();
         if self.handle.is_none() {

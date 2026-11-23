@@ -115,7 +115,11 @@ impl Render for Voxhold {
             )
             .on_mouse_move(cx.listener(|s, event: &gpui::MouseMoveEvent, _, cx| {
                 #[cfg(feature = "voxhold-media")]
-                s.voice_pointer_moved(event.position, cx);
+                s.voice_pointer_moved(
+                    event.position,
+                    event.pressed_button == Some(MouseButton::Left),
+                    cx,
+                );
                 if let Some(drag) = s.scrollbar_drag {
                     if event.pressed_button != Some(MouseButton::Left) {
                         s.scrollbar_drag = None;
@@ -204,10 +208,18 @@ impl Render for Voxhold {
                 }));
         }
         if self.client.is_none() {
+            if self.startup_restoring {
+                // The one startup check owns the first frames; neither the
+                // address nor the login form is painted until it settles or
+                // the user cancels it.
+                return root
+                    .child(self.render_startup(window, cx))
+                    .into_any_element();
+            }
             if !self.initial_focus_done {
                 self.initial_focus_done = true;
-                // Focus after the first frame so the field's focus handle is
-                // mounted, matching the Go `RequestFocus(user)` call.
+                // Focus after the first manual frame so the field's focus handle
+                // is mounted, matching the Go `RequestFocus(user)` call.
                 let weak = cx.entity().downgrade();
                 window.on_next_frame(move |window, cx| {
                     if let Some(view) = weak.upgrade() {
@@ -693,7 +705,15 @@ impl Render for Voxhold {
                     .child(explanation),
             );
         }
-        if !self.error.is_empty() {
+        // A tray failure is a separate banner: another error may replace
+        // `self.error` at any time, but the blocked close hook still needs the
+        // exit path. The same text is not painted twice.
+        let tray_text = self
+            .tray_close_blocked
+            .then(|| self.tray_error_text().to_string());
+        let show_error = !self.error.is_empty()
+            && !(self.tray_close_blocked && self.error == self.tray_error_text());
+        if show_error {
             chat = chat.child(
                 div()
                     .px(px(16.))
@@ -701,6 +721,32 @@ impl Render for Voxhold {
                     .text_size(px(12.))
                     .text_color(ink(p.danger))
                     .child(self.error.clone()),
+            );
+        }
+        if let Some(text) = tray_text {
+            chat = chat.child(
+                div()
+                    .id("tray-error")
+                    .debug_selector(|| "tray-error".into())
+                    .px(px(16.))
+                    .pb(px(6.))
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .text_size(px(12.))
+                    .text_color(ink(p.danger))
+                    .child(text)
+                    .child(
+                        div()
+                            .id("tray-exit")
+                            .debug_selector(|| "tray-exit".into())
+                            .flex_none()
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .text_color(ink(p.lime))
+                            .cursor_pointer()
+                            .on_click(cx.listener(|s, _, window, cx| s.quit_from_tray(window, cx)))
+                            .child("Выйти из Voxhold"),
+                    ),
             );
         }
         if readable && !thread_active && !voice_room {
@@ -945,6 +991,21 @@ impl Render for Voxhold {
         if !mobile && self.show_servers {
             root = root.child(self.server_picker(cx));
         }
+        // The floating player and the compact PiP sit above the channel
+        // content but below every modal layer painted later in this function.
+        #[cfg(feature = "voxhold-media")]
+        if let Some(voice) = self.voice.clone() {
+            let area =
+                crate::voice_room::Rect::new(0., 0., vw, if mobile { l.bottom.y } else { vh });
+            let scale = window.scale_factor();
+            let overlay = voice.update(cx, |panel, cx| {
+                panel.set_player_layout(area, scale);
+                panel.player_overlay(window, cx)
+            });
+            if let Some(overlay) = overlay {
+                root = root.child(overlay);
+            }
+        }
         self.ensure_viewer_scale(window, cx);
         let popup_open = self.show_search
             || self.update.panel_open
@@ -965,6 +1026,9 @@ impl Render for Voxhold {
                         cx.listener(|s, _, _, cx| s.dismiss_overlays(cx)),
                     ),
             );
+        }
+        if matches!(self.update.phase, crate::update::UpdatePhase::Installing) {
+            root = root.child(self.update_install_overlay());
         }
         // The popup sits above the backdrop so a click inside it is not a
         // dismiss, and below the modal layers that follow.
@@ -997,16 +1061,6 @@ impl Render for Voxhold {
         }
         #[cfg(feature = "voxhold-media")]
         if let Some(voice) = self.voice.clone() {
-            let area =
-                crate::voice_room::Rect::new(0., 0., vw, if mobile { l.bottom.y } else { vh });
-            let scale = window.scale_factor();
-            voice.update(cx, |panel, _| {
-                panel.set_scale(scale);
-                panel.set_player_area_and_place(area);
-            });
-            if let Some(overlay) = voice.update(cx, |panel, cx| panel.player_overlay(window, cx)) {
-                root = root.child(overlay);
-            }
             if let Some(overlay) =
                 voice.update(cx, |panel, cx| panel.screen_share_overlay(window, cx))
             {

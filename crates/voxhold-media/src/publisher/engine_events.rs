@@ -4,7 +4,7 @@
 //! inside the repository file-size budget; the event names and their tags are
 //! re-exported from `publisher`.
 
-use crate::{Candidate, publisher::QualityOp};
+use crate::{Candidate, publisher::QualityOp, video_encoder::HardwareEncoderIdentity};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Connection {
@@ -41,6 +41,17 @@ pub enum Event {
         op: QualityOp,
         result: BitrateResult,
     },
+    /// The hardware encoder session of this attempt died after the publication
+    /// started. `cpu_available` only says that «Продолжить на процессоре» is a
+    /// possible next step; the publisher never switches by itself.
+    EncoderFailed {
+        message: String,
+        cpu_available: bool,
+    },
+    /// The hardware session is really open on this adapter. The publisher
+    /// compares this identity with the attempt's plan before any GPU status is
+    /// shown; the confirmation also needs delivered encoded frames.
+    EncoderOpened(HardwareEncoderIdentity),
     Error(String),
     Closed,
 }

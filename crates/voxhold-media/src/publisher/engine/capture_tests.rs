@@ -74,6 +74,7 @@ fn request() -> PublishRequest {
         codec: Codec::Vp8,
         audio: false,
         audio_scope: crate::system_audio::AudioScope::Device,
+        encoder: Default::default(),
     }
 }
 
@@ -86,6 +87,8 @@ fn start(script: Script) -> PublisherEngine {
         None,
         None,
         Arc::new(PreviewStore::default()),
+        true,
+        None,
     )
     .expect("synthetic engine")
 }

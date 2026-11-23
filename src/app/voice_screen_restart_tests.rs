@@ -46,6 +46,7 @@ fn confirmed(
         codec: Codec::Vp8,
         audio,
         audio_scope: AudioScope::Device,
+        encoder: Default::default(),
     }
 }
 
@@ -115,14 +116,16 @@ async fn a_live_window_restart_binds_to_the_confirmed_source_with_an_empty_list(
     });
 
     wait_for(&mut visual, &voice, |panel| !panel.test_audio_pending());
+    // A restart now needs a real difference from the live payload; otherwise
+    // Apply is a verified no-op. Lower the resolution before pressing Start.
+    visual.update(|_window, app| {
+        voice.update(app, |panel, cx| {
+            panel.test_set_screen_resolution(voxhold_media::publisher::Resolution::P720, cx);
+        });
+    });
     draw(&mut visual);
 
-    for _ in 0..40 {
-        if focused(&mut visual, &voice).as_deref() == Some("Start") {
-            break;
-        }
-        visual.simulate_keystrokes("tab");
-    }
+    super::voice_screen_tests::tab_to(&mut visual, &voice, "Start");
     assert_eq!(focused(&mut visual, &voice).as_deref(), Some("Start"));
     visual.simulate_keystrokes("enter");
     let (commands, op) = visual.update(|_window, app| {
@@ -217,13 +220,14 @@ async fn restart_rows_are_inert_for_mouse_and_keyboard(cx: &mut TestAppContext) 
             );
         }
     }
-    for _ in 0..40 {
-        if focused(&mut visual, &voice).as_deref() == Some("Start") {
-            break;
-        }
-        visual.simulate_keystrokes("tab");
-    }
+    super::voice_screen_tests::tab_to(&mut visual, &voice, "Start");
     assert_eq!(focused(&mut visual, &voice).as_deref(), Some("Start"));
+    // A real restart needs a difference from the live payload.
+    visual.update(|_window, app| {
+        voice.update(app, |panel, cx| {
+            panel.test_set_screen_resolution(voxhold_media::publisher::Resolution::P720, cx);
+        });
+    });
     visual.simulate_keystrokes("enter");
     let (commands, op) = visual.update(|_window, app| {
         voice.update(app, |panel, _| {
@@ -281,6 +285,9 @@ async fn a_restart_ignores_the_category_and_refresh_with_a_stale_snapshot(cx: &m
                 "a stale answer must not claim the live source is gone"
             );
 
+            // A real restart needs a different payload; keep the confirmed
+            // source and change only the resolution.
+            panel.test_set_screen_resolution(voxhold_media::publisher::Resolution::P720, cx);
             panel.test_start_screen_share(window, cx);
             let op = panel
                 .test_pending_quality_op()
@@ -329,6 +336,8 @@ async fn a_restart_keeps_the_confirmed_identity_when_the_row_was_renamed(cx: &mu
                 "a stale refresh must not claim the live source is gone"
             );
 
+            // Apply a real difference, so this is a restart and not a no-op.
+            panel.test_set_screen_resolution(voxhold_media::publisher::Resolution::P720, cx);
             panel.test_start_screen_share(window, cx);
             let op = panel
                 .test_pending_quality_op()
@@ -529,6 +538,7 @@ pub(super) fn open_quality_dialog(
         codec: Codec::Vp8,
         audio,
         audio_scope: AudioScope::Device,
+        encoder: Default::default(),
     });
     panel.test_open_live_screen_settings(window, cx);
 }
@@ -728,7 +738,10 @@ async fn a_preflight_cancel_survives_a_stale_failure_state_and_keeps_live(cx: &m
             assert!(panel.screen_share_open());
             assert!(panel.test_screen_error().contains("не открылась"));
 
-            // Apply again. Start must drop the previous attempt's reason.
+            // Apply again. Start must drop the previous attempt's reason. The
+            // failure restored the confirmed quality, so repeat the edit to
+            // keep the retry a real restart.
+            panel.test_set_screen_resolution(voxhold_media::publisher::Resolution::P720, cx);
             panel.test_start_screen_share(window, cx);
             let second_op = panel
                 .test_pending_quality_op()
@@ -826,6 +839,8 @@ async fn a_preflight_cancel_survives_a_stale_failure_state_before_the_confirmati
 
             // Apply again: this attempt is unconfirmed until the worker says
             // `preflighting`, and Start drops the previous attempt's reason.
+            // The failure restored the confirmed quality, so repeat the edit.
+            panel.test_set_screen_resolution(voxhold_media::publisher::Resolution::P720, cx);
             panel.test_start_screen_share(window, cx);
             let second_op = panel
                 .test_pending_quality_op()

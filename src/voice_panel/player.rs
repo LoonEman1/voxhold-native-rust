@@ -4,28 +4,61 @@
 use super::*;
 
 impl VoicePanel {
+    /// Whether the viewed stream is on the room surface: it is open and its
+    /// owner is the room that the shell actually painted. Any other open
+    /// viewer is a PiP.
+    pub(super) fn viewer_in_room(&self) -> bool {
+        self.player_open
+            && self.room_painted
+            && self.call_channel != 0
+            && self.watching.as_ref().is_some_and(|publication| {
+                publication.server_id == self.server
+                    && publication.channel_id == self.room
+                    && publication.channel_id == self.call_channel
+            })
+    }
+
+    pub(super) fn viewer_pip_active(&self) -> bool {
+        self.player_open && !self.viewer_in_room()
+    }
+
     pub fn player_box(&self) -> Option<Rect> {
-        if !self.player_open || self.player_area.is_empty() {
+        if self.player_area.is_empty() {
+            return None;
+        }
+        let pip = self.pip_active();
+        if !pip && !self.viewer_in_room() {
             return None;
         }
         let width = if self.player_width <= 0.0 {
-            PLAYER_DEFAULT_WIDTH
+            if pip {
+                voice_room::PIP_DEFAULT_WIDTH
+            } else {
+                PLAYER_DEFAULT_WIDTH
+            }
+        } else if pip && (self.player_width - PLAYER_DEFAULT_WIDTH).abs() < 0.5 {
+            // The untouched room default is not a user resize: the compact
+            // surface starts at its own 320 px width.
+            voice_room::PIP_DEFAULT_WIDTH
         } else {
             self.player_width
         };
+        let tabs = self.pip_tabs();
         let position = if self.player_placed {
             self.player_pos
+        } else if pip {
+            voice_room::pip_default_position(self.player_area, width, tabs)
         } else {
             (
                 self.player_area.right() - width - 22.0,
                 self.player_area.bottom() - (width * 9.0 / 16.0 + 76.0) - 22.0,
             )
         };
-        Some(voice_room::floating_stream_box(
-            self.player_area,
-            position,
-            width,
-        ))
+        Some(if pip {
+            voice_room::pip_box(self.player_area, position, width, tabs)
+        } else {
+            voice_room::floating_stream_box(self.player_area, position, width)
+        })
     }
 
     pub fn set_player_area_and_place(&mut self, area: Rect) {
@@ -43,12 +76,18 @@ impl VoicePanel {
     /// while the player owns the window, the floating picture otherwise.
     pub(crate) fn picture_rect(&self) -> Option<Rect> {
         let player = self.player_box()?;
+        if self.player_fullscreen && self.player_open {
+            let geometry = voice_room::player_geometry(self.player_area, player, self.has_audio());
+            return Some(geometry.fullscreen_picture);
+        }
+        if self.pip_active() {
+            if self.active_pip_role() != pip::PipRole::Viewer {
+                return None;
+            }
+            return Some(voice_room::pip_geometry(player, self.pip_tabs()).picture);
+        }
         let geometry = voice_room::player_geometry(self.player_area, player, self.has_audio());
-        Some(if self.player_fullscreen {
-            geometry.fullscreen_picture
-        } else {
-            geometry.picture
-        })
+        Some(geometry.picture)
     }
 
     /// Physical pixels of the visible picture, at least 1x1. The decoder scales
@@ -149,6 +188,29 @@ impl VoicePanel {
         let Some(player) = self.player_box() else {
             return false;
         };
+        let pip = self.pip_active();
+        if pip {
+            // The compact header stops before the settings and close buttons,
+            // so a click on either button never starts a drag.
+            let geometry = voice_room::pip_geometry(player, self.pip_tabs());
+            if geometry.corner.contains(x, y) {
+                self.player_drag = Some(PlayerDrag {
+                    kind: DragKind::Resize,
+                    offset_x: 0.0,
+                    offset_y: 0.0,
+                });
+                return true;
+            }
+            if geometry.header.contains(x, y) {
+                self.player_drag = Some(PlayerDrag {
+                    kind: DragKind::Move,
+                    offset_x: x - player.x,
+                    offset_y: y - player.y,
+                });
+                return true;
+            }
+            return false;
+        }
         if self.player_fullscreen {
             return false;
         }
@@ -176,21 +238,31 @@ impl VoicePanel {
         let (Some(drag), Some(player)) = (self.player_drag, self.player_box()) else {
             return;
         };
+        let pip = self.pip_active();
         match drag.kind {
             DragKind::Move => {
                 self.player_pos = (x - drag.offset_x, y - drag.offset_y);
             }
             DragKind::Resize => {
-                self.player_width = (x - player.x + 3.0).max(voice_room::PLAYER_MIN_WIDTH);
+                let min = if pip {
+                    voice_room::PIP_MIN_WIDTH
+                } else {
+                    voice_room::PLAYER_MIN_WIDTH
+                };
+                self.player_width = (x - player.x + 3.0).max(min);
             }
         }
         if let Some(player) = self.player_box() {
             self.player_pos = (player.x, player.y);
         }
+        self.player_placed = true;
         cx.notify();
     }
 
     pub fn player_pointer_up(&mut self) {
+        if self.player_drag.is_some() {
+            self.player_placed = true;
+        }
         self.player_drag = None;
     }
 
@@ -225,7 +297,7 @@ impl VoicePanel {
         }
     }
 
-    fn player_status_line(&self) -> String {
+    pub(super) fn player_status_line(&self) -> String {
         let error = if self.stream_audio_error.is_empty() {
             &self.stream_error
         } else {
@@ -272,17 +344,29 @@ impl VoicePanel {
     }
 
     /// Floating/fullscreen player overlay in window coordinates. `None` when
-    /// the player is closed; the voice session is unaffected either way.
+    /// the player is closed; the voice session is unaffected either way. The
+    /// owned publication and a viewed stream that left its room share one
+    /// compact PiP surface.
     pub fn player_overlay(
         &mut self,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<gpui::AnyElement> {
+        if self.player_fullscreen && self.player_open {
+            return Some(self.fullscreen_overlay(cx));
+        }
+        if self.viewer_in_room() {
+            return self.room_player_overlay(cx);
+        }
+        if self.pip_active() {
+            return self.pip_overlay(cx);
+        }
+        None
+    }
+
+    fn room_player_overlay(&mut self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
         if !self.player_open {
             return None;
-        }
-        if self.player_fullscreen {
-            return Some(self.fullscreen_overlay(cx));
         }
         let player = self.player_box()?;
         let c = self.colors();
@@ -532,5 +616,61 @@ impl VoicePanel {
             root = root.child(self.audio_button(audio, (area.x, area.y), cx));
         }
         root.into_any_element()
+    }
+}
+
+impl VoicePanel {
+    pub fn leave_stream(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // One explicit leave for the current selection. A repeated close after
+        // the selection is gone must not send another `stream.leave`.
+        let Some(selection) = self.watching_selection else {
+            self.close_player(window);
+            return;
+        };
+        if let Some(handle) = &self.handle {
+            handle.leave_stream(selection);
+        }
+        self.watching_selection = None;
+        self.close_player(window);
+        cx.notify();
+    }
+
+    pub(super) fn close_player(&mut self, window: &mut Window) {
+        self.clear_player_frame(window);
+        self.watching = None;
+        self.watching_selection = None;
+        // Stop the 100 ms player ticker: the next watch starts a new one.
+        self.frame_ticker = self.frame_ticker.wrapping_add(1);
+        self.last_frame_at = None;
+        self.player_open = false;
+        self.pip_settings = false;
+        self.pip_restore_focus = false;
+        // The next player may be served by another handle; its first viewport
+        // must reach that worker even if the size matches the closed player.
+        self.requested_viewport = None;
+        self.stream_status.clear();
+        self.stream_error.clear();
+        self.stream_audio_error.clear();
+        self.stream_connected = false;
+        self.stream_muted = false;
+        self.player_drag = None;
+    }
+
+    pub(super) fn close_player_in_window(&mut self, window: &mut Window) {
+        if self.player_fullscreen || self.owns_fullscreen {
+            self.exit_fullscreen(window);
+        }
+        self.close_player(window);
+    }
+
+    pub fn toggle_stream_mute(&mut self, cx: &mut Context<Self>) {
+        let Some(selection) = self.watching_selection else {
+            return;
+        };
+        self.stream_muted = !self.stream_muted;
+        if let Some(handle) = &self.handle {
+            handle.stream_mute(selection, self.stream_muted);
+        }
+        cx.notify();
     }
 }

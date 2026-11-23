@@ -66,10 +66,10 @@ impl VoicePanel {
             return;
         };
         let request = preview_request(
-            // `room_painted` is the shell's own predicate for the voice room
-            // pane of this frame, so a card in a hidden pane requests nothing
-            // even while the publication keeps running.
-            self.room_painted && self.screen_card_active(),
+            // The picture is on screen only while the on-air card of this room
+            // or the publisher role of the compact PiP is really painted, so a
+            // publication that keeps running elsewhere requests nothing.
+            self.screen_card_painted(),
             self.window_minimized(window),
             self.screen_card_rect,
             window.scale_factor(),
@@ -82,12 +82,60 @@ impl VoicePanel {
     /// instead of creating a `RenderImage` and counting it as shown.
     pub(in crate::voice_panel) fn screen_preview_wanted(&self, window: &Window) -> bool {
         preview_request(
-            self.room_painted && self.screen_card_active(),
+            self.screen_card_painted(),
             self.window_minimized(window),
             self.screen_card_rect,
             window.scale_factor(),
         )
         .is_some()
+    }
+
+    /// The one foreground predicate of the own publication: the card takes a
+    /// grid slot only while the displayed room is both the call room and the
+    /// room that owns the publication, and that room pane is really painted.
+    /// Every other case is the compact PiP.
+    pub(in crate::voice_panel) fn screen_card_in_room(&self) -> bool {
+        self.room_painted
+            && self.screen_card_active()
+            && self.call_channel != 0
+            && self.room == self.call_channel
+            && self.publisher_room() == self.call_channel
+    }
+
+    /// The own publication is floating: it is still owned but its room is not
+    /// the grid on screen (another voice room, a text channel or a DM).
+    pub(in crate::voice_panel) fn screen_pip_active(&self) -> bool {
+        self.screen_card_active() && !self.screen_card_in_room()
+    }
+
+    /// Whether the PiP currently paints the publisher role, whose picture is
+    /// the same preview slot the on-air card uses.
+    pub(in crate::voice_panel) fn screen_pip_publisher_painted(&self) -> bool {
+        self.screen_pip_active()
+            && self.active_pip_role() == crate::voice_panel::pip::PipRole::Publisher
+    }
+
+    /// The publication picture is on screen: either the on-air card of the
+    /// room grid or the publisher role of the compact PiP. Only a surface that
+    /// is really painted asks the capture worker for a preview.
+    fn screen_card_painted(&self) -> bool {
+        self.screen_card_in_room() || self.screen_pip_publisher_painted()
+    }
+
+    /// The status the on-air card and the PiP paint for the current attempt.
+    pub(in crate::voice_panel) fn screen_card_status(sharing: &Sharing) -> String {
+        match sharing.phase {
+            Phase::Live => {
+                if sharing.status.is_empty() {
+                    "В ЭФИРЕ".to_owned()
+                } else {
+                    sharing.status.clone()
+                }
+            }
+            Phase::Failed => "ОШИБКА".to_owned(),
+            Phase::Stopping => "ОСТАНОВКА…".to_owned(),
+            _ => sharing.status.clone(),
+        }
     }
 
     /// The card that replaces the local publication in the room grid while a
@@ -113,21 +161,7 @@ impl VoicePanel {
         self.screen_card_rect = card_in_viewport(rect, viewport).then_some(rect);
         let c = self.colors();
         let live = sharing.phase == Phase::Live;
-        let status = if live {
-            // The publisher reports what really happened: a live bitrate
-            // change, a running restart preflight or the plain on-air state.
-            if sharing.status.is_empty() {
-                "В ЭФИРЕ".to_owned()
-            } else {
-                sharing.status.clone()
-            }
-        } else if sharing.phase == Phase::Failed {
-            "ОШИБКА".to_owned()
-        } else if sharing.phase == Phase::Stopping {
-            "ОСТАНОВКА…".to_owned()
-        } else {
-            sharing.status.clone()
-        };
+        let status = Self::screen_card_status(&sharing);
         let stats = sharing.stats.map(|stats| {
             // FPS, drop, real resolution, limitation and source count come
             // from OutboundRtpStats; this build has no GPU/CPU percentage.

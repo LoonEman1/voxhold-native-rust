@@ -26,13 +26,7 @@ impl VoicePanel {
                         ring.push((VOICE_ACTIONS[index].id, self.action_focus[index].clone()));
                     }
                 }
-                if matches!(
-                    self.screen.sharing.phase,
-                    voxhold_media::publisher::Phase::Publishing
-                        | voxhold_media::publisher::Phase::Live
-                        | voxhold_media::publisher::Phase::Stopping
-                        | voxhold_media::publisher::Phase::Failed
-                ) {
+                if self.screen_card_in_room() {
                     ring.push(("screen-stop", self.screen_focus[0].clone()));
                 }
             } else {
@@ -72,8 +66,12 @@ impl VoicePanel {
             }
         }
         // The floating player is a shell-level overlay and is not tied to the
-        // room pane, so it keeps its entries independently.
-        if self.player_open {
+        // room pane, so it keeps its entries independently. The compact PiP
+        // owns a different set: role tabs, settings and close, or the compact
+        // panel rows while that panel is open.
+        if self.pip_active() {
+            ring.extend(self.pip_focus_entries());
+        } else if self.player_open && self.viewer_in_room() {
             if self.has_audio() {
                 ring.push(("stream-audio", self.player_actions[0].clone()));
             }

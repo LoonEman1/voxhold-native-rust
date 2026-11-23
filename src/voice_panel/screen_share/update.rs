@@ -16,6 +16,15 @@ impl VoicePanel {
     ) -> bool {
         match update {
             VoiceUpdate::ScreenShare(sharing) => {
+                // A snapshot of an older attempt must not end the current one,
+                // clear its last valid frame or close its settings dialog.
+                if sharing.attempt != 0
+                    && self.screen.applied_attempt != 0
+                    && sharing.attempt < self.screen.applied_attempt
+                {
+                    return false;
+                }
+                self.screen.applied_attempt = self.screen.applied_attempt.max(sharing.attempt);
                 let previous = self.screen.sharing.phase;
                 self.screen.sharing = sharing;
                 let phase = self.screen.sharing.phase;
@@ -120,6 +129,11 @@ impl VoicePanel {
                     self.screen.busy = false;
                     self.screen.focus_placed = false;
                     self.screen.error = self.screen.sharing.error.clone().unwrap_or_default();
+                    // A failed attempt owns no picture and no owner access: the
+                    // PiP must disappear with the image immediately.
+                    self.screen.preview = None;
+                    self.screen.owner_room = 0;
+                    self.publish_access = None;
                     // A failed attempt has no picker any more; reopening the
                     // dialog calls `begin_picker` again.
                     if self.screen.open {
@@ -128,6 +142,11 @@ impl VoicePanel {
                     }
                 }
                 if phase == Phase::Idle {
+                    if previous != Phase::Idle {
+                        self.screen.preview = None;
+                        self.screen.owner_room = 0;
+                        self.publish_access = None;
+                    }
                     if self.screen.open {
                         // The session ended (or a new one replaced the worker)
                         // while the dialog was open; its picker id is stale.

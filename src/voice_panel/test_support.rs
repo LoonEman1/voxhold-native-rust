@@ -720,6 +720,11 @@ impl VoicePanel {
         self.test_share_gate = Some(gate);
     }
 
+    /// Return the gate to the production checks.
+    pub fn test_clear_share_gate(&mut self) {
+        self.test_share_gate = None;
+    }
+
     /// The reason the room would print next to the «Экран» action.
     pub fn test_screen_reason(&self) -> Option<&'static str> {
         self.screen_reason()
@@ -735,7 +740,92 @@ impl VoicePanel {
 
     /// Replace the screen-share snapshot as a worker update would.
     pub fn test_set_screen_sharing(&mut self, sharing: Sharing) {
+        self.screen.applied_attempt = self.screen.applied_attempt.max(sharing.attempt);
         self.screen.sharing = sharing;
+    }
+
+    /// Confirmed `Stream` permissions of the server, as the shell hands them
+    /// over after a channel reload.
+    pub fn test_set_stream_permissions(
+        &mut self,
+        permissions: std::collections::HashMap<i64, bool>,
+    ) {
+        self.set_stream_permissions(permissions);
+    }
+
+    pub fn test_pip_active(&self) -> bool {
+        self.pip_active()
+    }
+
+    pub fn test_screen_card_in_room(&self) -> bool {
+        self.screen_card_in_room()
+    }
+
+    pub fn test_pip_tabs(&self) -> bool {
+        self.pip_tabs()
+    }
+
+    pub fn test_screen_pip_active(&self) -> bool {
+        self.screen_pip_active()
+    }
+
+    pub fn test_viewer_in_room(&self) -> bool {
+        self.viewer_in_room()
+    }
+
+    pub fn test_pip_role(&self) -> super::PipRole {
+        self.active_pip_role()
+    }
+
+    pub fn test_selected_pip_role(&self) -> super::PipRole {
+        self.pip_role
+    }
+
+    pub fn test_select_pip_role(&mut self, role: super::PipRole) {
+        self.pip_role = role;
+    }
+
+    pub fn test_pip_settings_open(&self) -> bool {
+        self.pip_settings
+    }
+
+    pub fn test_pip_close_role(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.pip_close_role(window, cx);
+    }
+
+    pub fn test_sync_pip(&mut self, window: &mut Window) {
+        self.sync_pip(window);
+    }
+
+    pub fn test_publisher_room(&self) -> i64 {
+        self.publisher_room()
+    }
+
+    pub fn test_pip_restore_focus(&self) -> bool {
+        self.pip_restore_focus
+    }
+
+    /// The stream intent commands the UI handed to the detached worker. A
+    /// navigation must not add `watch`/`close` entries.
+    pub fn test_take_stream_commands(&mut self) -> Vec<(&'static str, u64)> {
+        self.handle
+            .as_ref()
+            .map(|handle| handle.take_stream_commands_for_tests())
+            .unwrap_or_default()
+    }
+
+    pub fn test_watching_selection(&self) -> Option<u64> {
+        self.watching_selection
+    }
+
+    pub fn test_pip_status(&self) -> String {
+        self.pip_status()
+    }
+
+    pub fn test_take_stream_mute(&mut self) -> Option<(u64, bool)> {
+        self.handle
+            .as_ref()
+            .and_then(|handle| handle.take_stream_mute_for_tests())
     }
 
     /// Apply a screen-share runtime update exactly as the publisher emits it
@@ -937,11 +1027,6 @@ impl VoicePanel {
     /// test window never reports itself as active.
     pub fn test_window_activated(&mut self) {
         self.window_activation(true);
-    }
-
-    /// Selection of the open player, if any.
-    pub fn test_watching_selection(&self) -> Option<u64> {
-        self.watching_selection
     }
 
     /// Put one update into the real coalescing queue, exactly as the worker

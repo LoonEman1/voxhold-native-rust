@@ -504,11 +504,11 @@ async fn a_released_idle_panel_ends_its_parked_event_task(cx: &mut TestAppContex
     );
 }
 
-/// The O02 minor: a preview frame taken while the card is not visible is
+/// The O02 minor: a preview frame taken while the picture is not visible is
 /// discarded by the same predicate as the demand, so no `RenderImage` is
 /// created and `shown` does not move.
 #[gpui::test]
-async fn a_hidden_or_minimized_card_discards_the_preview_frame(cx: &mut TestAppContext) {
+async fn a_minimized_card_discards_the_preview_frame(cx: &mut TestAppContext) {
     use voxhold_media::screen_capture::PreviewFrame;
 
     let (mut visual, _view, voice) = fixture_with(cx, None, true);
@@ -547,16 +547,17 @@ async fn a_hidden_or_minimized_card_discards_the_preview_frame(cx: &mut TestAppC
         });
     });
 
-    // Hidden room pane: the card still exists in the geometry but the demand
-    // is off for the same reason.
+    // A hidden room pane stops painting the grid card, but the same attempt
+    // becomes the window-level PiP: its picture is on screen, so the frame is
+    // taken instead of discarded.
     visual.update(|window, app| {
         voice.update(app, |panel, _| {
             panel.test_set_minimized(Some(false));
             panel.set_room_painted(false);
             panel.test_push_screen_preview(frame());
-            assert!(!panel.test_take_screen_preview(window));
-            assert_eq!(panel.test_screen_preview_image_id(), None);
-            assert_eq!(panel.test_screen_preview_stats().1, 0);
+            assert!(panel.test_take_screen_preview(window));
+            assert!(panel.test_screen_preview_image_id().is_some());
+            assert_eq!(panel.test_screen_preview_stats().1, 1);
             assert!(!panel.test_screen_frame_pending());
         });
     });

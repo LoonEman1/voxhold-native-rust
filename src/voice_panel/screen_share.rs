@@ -164,6 +164,15 @@ pub(super) struct ScreenShareUi {
     pub(super) pending_quality_op: Option<u64>,
     pub(super) error: String,
     pub(super) sharing: Sharing,
+    /// Room that owns the active publication. It is captured when the publish
+    /// intent is sent and never follows the displayed room.
+    pub(super) owner_room: i64,
+    /// Highest attempt applied from the publisher. A late snapshot of an older
+    /// attempt can neither clear the live image nor close its dialog.
+    pub(super) applied_attempt: u64,
+    /// Attempt (or picker id for an unconfirmed intent) whose stop was already
+    /// sent, so a repeated click cannot produce a second `stream.stop`.
+    pub(super) stop_sent: Option<u64>,
     pub(super) preview: Option<Arc<RenderImage>>,
     /// Picker thumbnails keyed by the stable surface identity, so a capturer
     /// reorder keeps the picture of the same display. Bounded by
@@ -275,6 +284,9 @@ impl Default for ScreenShareUi {
             pending_quality_op: None,
             error: String::new(),
             sharing: Sharing::default(),
+            owner_room: 0,
+            applied_attempt: 0,
+            stop_sent: None,
             preview: None,
             previews: HashMap::new(),
             preview_failures: HashMap::new(),
@@ -551,27 +563,6 @@ pub(in crate::voice_panel) fn screen_on_air_line(
 }
 
 impl VoicePanel {
-    pub fn set_stream_permission(&mut self, allowed: bool) {
-        self.can_stream = allowed;
-        // A revocation that arrives while the picker or a capture preparation
-        // is open must reach the worker, not wait for the next Start.
-        self.sync_screen_access();
-    }
-
-    /// Push the current gate to the worker while a picker or an attempt is
-    /// open. The session re-checks it before it accepts a prepared engine, so
-    /// a permission or slot loss during the capture start cannot be missed.
-    pub(super) fn sync_screen_access(&self) {
-        if !(self.screen.open || self.screen.busy || self.share_active()) {
-            return;
-        }
-        let Some(handle) = &self.handle else {
-            return;
-        };
-        let slot_available = self.active_publishers_in_room() < MAX_CHANNEL_PUBLISHERS;
-        handle.screen_access(self.can_stream, slot_available);
-    }
-
     pub fn screen_share_open(&self) -> bool {
         self.screen.open
     }
@@ -611,6 +602,14 @@ impl VoicePanel {
     /// Why the «Экран» action is disabled. The same values are re-checked by
     /// the publisher state machine.
     pub fn share_gate(&self) -> Result<(), &'static str> {
+        self.stream_gate(self.room)
+    }
+
+    /// Start gate of one room. A new publication uses the displayed room; the
+    /// restart of a live publication uses its owner room, so a channel without
+    /// `Stream` that is only being viewed cannot block the settings of the
+    /// stream that is already on air.
+    pub(super) fn stream_gate(&self, room: i64) -> Result<(), &'static str> {
         #[cfg(test)]
         if let Some(result) = self.test_share_gate {
             return result;
@@ -621,17 +620,17 @@ impl VoicePanel {
         if !self.access_confirmed {
             return Err("Права на канал ещё не подтверждены.");
         }
-        match self.rooms.get(&self.room) {
+        match self.rooms.get(&room) {
             Some(access) if access.readable && !access.e2ee => {}
             _ => return Err("Нет доступа к голосовому каналу."),
         }
-        if self.call_channel == 0 || self.call_channel != self.room {
+        if self.call_channel == 0 || self.call_channel != room {
             return Err("Сначала подключитесь к голосовому каналу.");
         }
         if self.phase != CallPhase::Connected {
             return Err("Голосовое соединение ещё не установлено.");
         }
-        if !self.can_stream {
+        if !self.stream_permission_for(room) {
             return Err("Нет права запускать трансляции в этом канале.");
         }
         if screen_capture::capability_cached().is_err() {
@@ -646,7 +645,12 @@ impl VoicePanel {
         ) {
             return Err("Трансляция уже идёт.");
         }
-        if self.active_publishers_in_room() >= MAX_CHANNEL_PUBLISHERS {
+        let slot_full = if room == self.room {
+            self.active_publishers_in_room() >= MAX_CHANNEL_PUBLISHERS
+        } else {
+            !self.publish_slot_available()
+        };
+        if slot_full {
             return Err("В канале уже 8 трансляций. Дождитесь завершения одной из них.");
         }
         Ok(())
@@ -838,8 +842,9 @@ impl VoicePanel {
         // is ignored, and the pictures/titles are released immediately.
         self.screen.clear_previews(window);
         self.screen.focus_placed = false;
+        let stop_now = committed && self.latch_screen_stop();
         if let Some(handle) = &self.handle {
-            if committed {
+            if stop_now {
                 handle.stop_screen_share();
             } else if restart_busy {
                 if let Some(op) = pending_op {
@@ -1079,6 +1084,9 @@ impl VoicePanel {
         {
             self.screen.released_images = old.released_images;
         }
+        // The owner identity belongs to the session that just ended; keeping it
+        // would gate the next displayed room with a stream that no longer runs.
+        self.publish_access = None;
     }
 
     fn share_focus(&self, index: usize) -> FocusHandle {
@@ -1159,6 +1167,7 @@ mod audio_scope;
 mod card;
 mod codec;
 mod dialog;
+mod owner;
 mod picker;
 mod preferences;
 pub(crate) use preferences::StreamPrefsStore;

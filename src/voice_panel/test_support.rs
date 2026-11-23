@@ -726,6 +726,11 @@ impl VoicePanel {
         self.test_share_gate = Some(gate);
     }
 
+    /// Return the gate to the production checks.
+    pub fn test_clear_share_gate(&mut self) {
+        self.test_share_gate = None;
+    }
+
     /// The reason the room would print next to the «Экран» action.
     pub fn test_screen_reason(&self) -> Option<&'static str> {
         self.screen_reason()
@@ -741,7 +746,17 @@ impl VoicePanel {
 
     /// Replace the screen-share snapshot as a worker update would.
     pub fn test_set_screen_sharing(&mut self, sharing: Sharing) {
+        self.screen.applied_attempt = self.screen.applied_attempt.max(sharing.attempt);
         self.screen.sharing = sharing;
+    }
+
+    /// Confirmed `Stream` permissions of the server, as the shell hands them
+    /// over after a channel reload.
+    pub fn test_set_stream_permissions(
+        &mut self,
+        permissions: std::collections::HashMap<i64, bool>,
+    ) {
+        self.set_stream_permissions(permissions);
     }
 
     /// Apply a screen-share runtime update exactly as the publisher emits it
@@ -943,11 +958,6 @@ impl VoicePanel {
     /// test window never reports itself as active.
     pub fn test_window_activated(&mut self) {
         self.window_activation(true);
-    }
-
-    /// Selection of the open player, if any.
-    pub fn test_watching_selection(&self) -> Option<u64> {
-        self.watching_selection
     }
 
     /// Put one update into the real coalescing queue, exactly as the worker

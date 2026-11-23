@@ -20,16 +20,26 @@ impl VoicePanel {
             cx.notify();
             return;
         }
-        if let Err(reason) = self.share_gate() {
+        // A new publication starts in the displayed room. The restart of a live
+        // one keeps the confirmed access and slot of its owner room, so a
+        // channel that is only being viewed cannot block it.
+        let gate_room = if self.screen.restart {
+            self.publisher_room()
+        } else {
+            self.room
+        };
+        if let Err(reason) = self.stream_gate(gate_room) {
             // The live quality dialog is allowed to pass the "already live"
             // gate: it replaces the current attempt only through a confirmed
             // stop+start. Every other gate (join, permission, slot, capture)
             // still blocks it.
             let restart_bypass = self.screen.restart && reason == "Трансляция уже идёт.";
             if !restart_bypass {
-                // An active publication is not an error for this button; its
-                // card owns the status and the stop action.
-                if !self.share_active() {
+                // An active publication is not an error for the toolbar; its
+                // card owns the status and the stop action. The open quality
+                // dialog is different: it asked for a change and must say why
+                // the change was refused.
+                if !self.share_active() || self.screen.open {
                     self.screen.error = reason.to_owned();
                 }
                 cx.notify();
@@ -131,7 +141,26 @@ impl VoicePanel {
             cx.notify();
             return;
         };
-        let slot_available = self.active_publishers_in_room() < MAX_CHANNEL_PUBLISHERS;
+        let slot_available = if self.screen.restart {
+            self.publish_slot_available()
+        } else {
+            self.active_publishers_in_room() < MAX_CHANNEL_PUBLISHERS
+        };
+        let permission = self.stream_permission_for(gate_room);
+        // The owner identity is the confirmed access of this new publication.
+        // A restart keeps the owner and the latch session captured by the
+        // first start.
+        if !self.screen.restart {
+            self.publish_access = Some(PublishAccess {
+                room: self.room,
+                session: self.screen.picker,
+                attempt: 0,
+                connection: self.self_connection.clone(),
+            });
+            self.screen.owner_room = self.room;
+        }
+        // A new attempt may be stopped once; the latch belongs to that attempt.
+        self.screen.stop_sent = None;
         // Classify with the exact request above, including the codec Start just
         // resolved. A codec or profile change is a restart; only the bitrates
         // reach the live sender.
@@ -149,15 +178,15 @@ impl VoicePanel {
             // A bitrate-only change goes to the live sender; the worker
             // repeats the classification before it applies anything.
             if live_bitrate {
-                handle.apply_screen_quality(op, request.clone(), self.can_stream, slot_available);
+                handle.apply_screen_quality(op, request.clone(), permission, slot_available);
             } else {
-                handle.restart_screen_share(op, request.clone(), self.can_stream, slot_available);
+                handle.restart_screen_share(op, request.clone(), permission, slot_available);
             }
         } else {
             handle.publish_screen(
                 self.screen.picker,
                 request.clone(),
-                self.can_stream,
+                permission,
                 slot_available,
             );
         }
@@ -168,6 +197,9 @@ impl VoicePanel {
         }
         // The request becomes confirmed when the media layer reports Live.
         self.screen.busy = true;
+        // The worker keeps the gate of the owner that was just captured, even
+        // before the first snapshot arrives.
+        self.sync_screen_access();
         // A restart without a live bitrate starts a preflight; closing the
         // dialog while it runs must cancel it instead of stopping the stream.
         // The pending operation tag is the only confirmation this dialog needs.
@@ -185,8 +217,31 @@ impl VoicePanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(handle) = &self.handle {
-            handle.stop_screen_share();
+        if self.screen.sharing.phase == Phase::Failed {
+            // A failed attempt owns no stream: the media layer already ended
+            // it. Closing its PiP must remove the surface, not send a second
+            // `stream.stop` that no attempt can answer.
+            self.screen.sharing = Sharing::default();
+            self.screen.owner_room = 0;
+            self.publish_access = None;
+            self.screen.busy = false;
+            self.screen.preflight = false;
+            self.screen.pending_quality_op = None;
+            self.screen.error.clear();
+            // A stop ends the picker session: no capture may start another card.
+            self.screen.clear_previews(window);
+            self.screen.clear_preview(window);
+            cx.notify();
+            return;
+        }
+        if self.share_active() || self.screen.busy {
+            // One explicit stop per intent. A repeated close over a stopping
+            // attempt must not send a second `stream.stop`.
+            if self.latch_screen_stop() {
+                if let Some(handle) = &self.handle {
+                    handle.stop_screen_share();
+                }
+            }
         }
         // A stop ends the picker session: no capture may start another card.
         self.screen.clear_previews(window);

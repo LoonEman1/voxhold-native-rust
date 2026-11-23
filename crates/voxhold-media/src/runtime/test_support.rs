@@ -151,11 +151,11 @@ impl VoiceHandle {
     pub fn take_screen_requests_for_tests(
         &self,
     ) -> Vec<(&'static str, u64, Option<crate::publisher::Codec>)> {
+        let Ok(mut queue) = self.requests.screen.lock() else {
+            return Vec::new();
+        };
         let mut out = Vec::new();
-        while let Some(pending) = self.requests.take() {
-            let Pending::Screen(command) = pending else {
-                continue;
-            };
+        while let Some(command) = queue.pop_front() {
             out.push(match command {
                 ScreenCommand::OpenPicker { picker } => ("open", picker, None),
                 ScreenCommand::Publish {
@@ -172,5 +172,26 @@ impl VoiceHandle {
             });
         }
         out
+    }
+
+    /// Drain the queued stream intents as `(kind, selection)` pairs. A route
+    /// between channels must not add a watch or a leave for the same session.
+    pub fn take_stream_commands_for_tests(&self) -> Vec<(&'static str, u64)> {
+        let Ok(mut queue) = self.requests.stream.lock() else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        while let Some(command) = queue.take() {
+            out.push(match command {
+                StreamCommand::Watch { selection, .. } => ("watch", selection),
+                StreamCommand::Close { selection } => ("close", selection),
+            });
+        }
+        out
+    }
+
+    /// The newest viewer mute the UI sent. The slot holds one value.
+    pub fn take_stream_mute_for_tests(&self) -> Option<(u64, bool)> {
+        self.requests.stream_mute.lock().ok()?.take()
     }
 }

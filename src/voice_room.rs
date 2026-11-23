@@ -37,6 +37,132 @@ pub const PLAYER_FOOTER: f32 = 38.0;
 pub const PLAYER_ASPECT: f32 = 9.0 / 16.0;
 pub const PLAYER_CORNER: f32 = 15.0;
 
+/// Compact in-client picture-in-picture of a stream the user still owns after
+/// leaving its room. It starts 320 logical px wide and keeps a 16 px inset from
+/// the safe area, so it never covers the mobile bottom bar or a window edge.
+pub const PIP_DEFAULT_WIDTH: f32 = 320.0;
+pub const PIP_MIN_WIDTH: f32 = 240.0;
+pub const PIP_MAX_WIDTH: f32 = 640.0;
+pub const PIP_MARGIN: f32 = 16.0;
+pub const PIP_HEADER: f32 = 30.0;
+pub const PIP_FOOTER: f32 = 26.0;
+pub const PIP_TAB_HEIGHT: f32 = 20.0;
+pub const PIP_TAB_GAP: f32 = 8.0;
+pub const PIP_CORNER: f32 = 15.0;
+pub const PIP_ASPECT: f32 = 9.0 / 16.0;
+
+pub fn pip_height(width: f32, tabs: bool) -> f32 {
+    let tabs = if tabs { PIP_TAB_HEIGHT + 4.0 } else { 0.0 };
+    PIP_HEADER + (width * PIP_ASPECT).max(1.0) + tabs + PIP_FOOTER
+}
+
+/// Clamp a compact PiP into the safe area. The width shrinks inside a narrow
+/// area before the box is allowed to leave it; a drag or resize can never move
+/// it outside. `tabs` reserves the role switcher row when both roles exist.
+pub fn pip_box(area: Rect, position: (f32, f32), width: f32, tabs: bool) -> Rect {
+    let safe_w = (area.w - PIP_MARGIN * 2.0).max(1.0);
+    let safe_h = (area.h - PIP_MARGIN * 2.0).max(1.0);
+    let max_width = PIP_MAX_WIDTH.min(safe_w);
+    let min_width = PIP_MIN_WIDTH.min(max_width);
+    let width = width.clamp(min_width, max_width);
+    let tabs_height = if tabs { PIP_TAB_HEIGHT + 4.0 } else { 0.0 };
+    let picture_width = ((safe_h - PIP_HEADER - PIP_FOOTER - tabs_height).max(1.0)) * 16.0 / 9.0;
+    let width = width.min(picture_width.max(min_width)).min(max_width);
+    let height = pip_height(width, tabs);
+    let max_x = (area.right() - width - PIP_MARGIN).max(area.x + PIP_MARGIN);
+    let max_y = (area.bottom() - height - PIP_MARGIN).max(area.y + PIP_MARGIN);
+    let x = position.0.clamp(area.x + PIP_MARGIN, max_x);
+    let y = position.1.clamp(area.y + PIP_MARGIN, max_y);
+    Rect::new(x, y, width, height)
+}
+
+/// Bottom-right corner of the safe area with the same 16 px inset.
+pub fn pip_default_position(area: Rect, width: f32, tabs: bool) -> (f32, f32) {
+    let probe = pip_box(area, (area.x, area.y), width, tabs);
+    (
+        area.right() - probe.w - PIP_MARGIN,
+        area.bottom() - probe.h - PIP_MARGIN,
+    )
+}
+
+/// Interactive regions of the compact PiP. The header stops before the two
+/// buttons, so a click on settings or close never starts a drag.
+#[derive(Clone, Debug, Default)]
+pub struct PipGeometry {
+    pub header: Rect,
+    pub picture: Rect,
+    pub viewer_tab: Rect,
+    pub publisher_tab: Rect,
+    pub settings: Rect,
+    pub close: Rect,
+    pub corner: Rect,
+    /// Settings panel painted over the picture area.
+    pub panel: Rect,
+}
+
+pub fn pip_geometry(player: Rect, tabs: bool) -> PipGeometry {
+    let header = Rect::new(
+        player.x + 4.0,
+        player.y + 2.0,
+        (player.w - 8.0).max(0.0),
+        PIP_HEADER - 4.0,
+    );
+    let close = Rect::new(
+        player.right() - 70.0,
+        player.bottom() - PIP_FOOTER + 3.0,
+        62.0,
+        PIP_FOOTER - 6.0,
+    );
+    let settings = Rect::new(close.x - 80.0, close.y, 74.0, close.h);
+    let tabs_height = if tabs { PIP_TAB_HEIGHT + 4.0 } else { 0.0 };
+    let picture = Rect::new(
+        player.x + 1.0,
+        player.y + PIP_HEADER,
+        (player.w - 2.0).max(0.0),
+        (player.h - PIP_HEADER - PIP_FOOTER - tabs_height).max(0.0),
+    );
+    let footer = Rect::new(
+        player.x + 8.0,
+        player.bottom() - PIP_FOOTER + 3.0,
+        (player.w - 16.0).max(0.0),
+        PIP_FOOTER - 6.0,
+    );
+    // The role switcher shares the footer with the two labelled actions. Both
+    // tabs shrink on a narrow surface instead of reaching under a button.
+    let tabs_width = (settings.x - footer.x - PIP_TAB_GAP - 4.0).max(0.0);
+    let tab_width = ((tabs_width - PIP_TAB_GAP) / 2.0).max(1.0);
+    let tabs_y = player.bottom() - PIP_FOOTER - tabs_height + 2.0;
+    let viewer_tab = Rect::new(footer.x, tabs_y, tab_width, PIP_TAB_HEIGHT);
+    let publisher_tab = Rect::new(
+        viewer_tab.right() + PIP_TAB_GAP,
+        tabs_y,
+        tab_width,
+        PIP_TAB_HEIGHT,
+    );
+    let corner = Rect::new(
+        player.right() - PIP_CORNER,
+        picture.bottom() - PIP_CORNER,
+        PIP_CORNER,
+        PIP_CORNER,
+    );
+    let panel = Rect::new(
+        player.x + 1.0,
+        player.y + PIP_HEADER,
+        (player.w - 2.0).max(0.0),
+        (player.h - PIP_HEADER).max(0.0),
+    );
+    PipGeometry {
+        header,
+        picture,
+        viewer_tab,
+        publisher_tab,
+        settings,
+        close,
+        corner,
+        panel,
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Rect {
     pub x: f32,

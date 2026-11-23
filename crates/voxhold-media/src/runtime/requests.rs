@@ -78,7 +78,7 @@ pub(super) struct ScreenAccess {
 }
 
 impl StreamCommand {
-    fn selection(&self) -> u64 {
+    pub(super) fn selection(&self) -> u64 {
         match self {
             Self::Watch { selection, .. } | Self::Close { selection } => *selection,
         }

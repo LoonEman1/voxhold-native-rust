@@ -48,6 +48,22 @@ impl Voxhold {
         })
     }
 
+    /// Confirmed `Stream` permission of every voice channel of this server.
+    /// The PiP settings of an own publication use the entry of its owner room,
+    /// so a channel that only lacks `Stream` cannot lock the live stream.
+    fn stream_permissions(&self) -> HashMap<i64, bool> {
+        self.channels
+            .iter()
+            .filter(|channel| channel.kind == "voice")
+            .map(|channel| {
+                (
+                    channel.id,
+                    channel.permissions & crate::settings::PERMISSION_STREAM != 0,
+                )
+            })
+            .collect()
+    }
+
     /// Snapshot data is only shown for rooms the confirmed channel list still
     /// allows. While an ACL reload is in flight the server's data is hidden;
     /// other servers keep their cache until they become current.
@@ -159,6 +175,7 @@ impl Voxhold {
         let streams = self.voice_stream_list(self.server, channel);
         let prefs = self.voice_settings.prefs.clone();
         let can_stream = self.stream_permission(channel);
+        let permissions = self.stream_permissions();
         if let Some(panel) = &self.voice {
             let self_user = self.self_user_id;
             let palette = self.palette;
@@ -168,6 +185,7 @@ impl Voxhold {
                 panel.set_self_user(self_user);
                 panel.set_members(members);
                 panel.set_room_state(channel, roster, streams);
+                panel.set_stream_permissions(permissions);
                 panel.set_stream_permission(can_stream);
                 panel.apply_voice_prefs(
                     Some(prefs.input.clone()),
@@ -204,6 +222,7 @@ impl Voxhold {
                 panel.set_self_user(self_user);
                 panel.set_members(members);
                 panel.set_room_state(channel, roster, streams);
+                panel.set_stream_permissions(permissions);
                 panel.set_stream_permission(can_stream);
                 panel.apply_voice_prefs(
                     Some(prefs.input.clone()),
@@ -329,12 +348,14 @@ impl Voxhold {
         let access_confirmed = !self.voice_unconfirmed.contains(&self.server);
         let palette = self.palette;
         let can_stream = self.stream_permission(room);
+        let permissions = self.stream_permissions();
         panel.update(cx, |panel, cx| {
             panel.set_access_confirmed(access_confirmed);
             panel.set_rooms(rooms);
             panel.set_self_user(self_user);
             panel.set_members(members);
             panel.set_room_state(room, roster, streams);
+            panel.set_stream_permissions(permissions);
             panel.set_stream_permission(can_stream);
             panel.set_palette(palette);
             cx.notify();
@@ -677,6 +698,11 @@ impl Voxhold {
             if panel.update(cx, |panel, _| panel.player_escape(window)) {
                 return true;
             }
+            // The compact viewer panel is the top layer under a modal; a
+            // settings/recordings dialog (blocked) keeps its own Escape.
+            if !blocked && panel.update(cx, |panel, cx| panel.pip_escape(window, cx)) {
+                return true;
+            }
         }
         if blocked {
             return false;
@@ -689,6 +715,11 @@ impl Voxhold {
         }
         if !panel.read(cx).call_active() {
             return false;
+        }
+        // A focused PiP action owns Enter/Space; PTT keys keep their path when
+        // no PiP control has focus.
+        if panel.update(cx, |panel, cx| panel.pip_key_down(&key, window, cx)) {
+            return true;
         }
         if prefs.input_mode == "push_to_talk" {
             let hotkey = Hotkey::parse(&prefs.push_to_talk);
@@ -796,16 +827,26 @@ impl Voxhold {
     }
 
     /// Mouse forwarding for the player drag/resize. The player can leave its
-    /// own bounds while the pointer is captured by the window.
+    /// own bounds while the pointer is captured by the window. A move without
+    /// the left button held means the release was lost outside the window, so
+    /// the drag ends instead of sticking to the cursor.
     pub(super) fn voice_pointer_moved(
         &mut self,
         position: gpui::Point<gpui::Pixels>,
+        pressed_left: bool,
         cx: &mut Context<Self>,
     ) {
         let Some(panel) = &self.voice else {
             return;
         };
         if !panel.read(cx).player_dragging() {
+            return;
+        }
+        if !pressed_left {
+            panel.update(cx, |panel, cx| {
+                panel.player_pointer_up();
+                cx.notify();
+            });
             return;
         }
         let (x, y) = (position.x.into(), position.y.into());

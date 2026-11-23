@@ -115,7 +115,11 @@ impl Render for Voxhold {
             )
             .on_mouse_move(cx.listener(|s, event: &gpui::MouseMoveEvent, _, cx| {
                 #[cfg(feature = "voxhold-media")]
-                s.voice_pointer_moved(event.position, cx);
+                s.voice_pointer_moved(
+                    event.position,
+                    event.pressed_button == Some(MouseButton::Left),
+                    cx,
+                );
                 if let Some(drag) = s.scrollbar_drag {
                     if event.pressed_button != Some(MouseButton::Left) {
                         s.scrollbar_drag = None;
@@ -987,6 +991,21 @@ impl Render for Voxhold {
         if !mobile && self.show_servers {
             root = root.child(self.server_picker(cx));
         }
+        // The floating player and the compact PiP sit above the channel
+        // content but below every modal layer painted later in this function.
+        #[cfg(feature = "voxhold-media")]
+        if let Some(voice) = self.voice.clone() {
+            let area =
+                crate::voice_room::Rect::new(0., 0., vw, if mobile { l.bottom.y } else { vh });
+            let scale = window.scale_factor();
+            let overlay = voice.update(cx, |panel, cx| {
+                panel.set_player_layout(area, scale);
+                panel.player_overlay(window, cx)
+            });
+            if let Some(overlay) = overlay {
+                root = root.child(overlay);
+            }
+        }
         self.ensure_viewer_scale(window, cx);
         let popup_open = self.show_search
             || self.update.panel_open
@@ -1042,16 +1061,6 @@ impl Render for Voxhold {
         }
         #[cfg(feature = "voxhold-media")]
         if let Some(voice) = self.voice.clone() {
-            let area =
-                crate::voice_room::Rect::new(0., 0., vw, if mobile { l.bottom.y } else { vh });
-            let scale = window.scale_factor();
-            voice.update(cx, |panel, _| {
-                panel.set_scale(scale);
-                panel.set_player_area_and_place(area);
-            });
-            if let Some(overlay) = voice.update(cx, |panel, cx| panel.player_overlay(window, cx)) {
-                root = root.child(overlay);
-            }
             if let Some(overlay) =
                 voice.update(cx, |panel, cx| panel.screen_share_overlay(window, cx))
             {

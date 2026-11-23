@@ -8,6 +8,14 @@
 use super::*;
 
 impl VoicePanel {
+    /// Whether a terminal snapshot ends an intent that never reached the air.
+    /// Such an intent still owns its worker: the captured identity stays so a
+    /// navigation cannot hand that worker the displayed room's gate. A snapshot
+    /// that ends a live or stopping attempt owns nothing more and drops it.
+    fn terminal_keeps_intent(previous: Phase) -> bool {
+        !matches!(previous, Phase::Live | Phase::Stopping)
+    }
+
     /// Apply one runtime update. Returns whether the panel must repaint.
     pub(in crate::voice_panel) fn apply_screen_update(
         &mut self,
@@ -16,9 +24,24 @@ impl VoicePanel {
     ) -> bool {
         match update {
             VoiceUpdate::ScreenShare(sharing) => {
+                // A snapshot of an older attempt must not end the current one,
+                // clear its last valid frame or close its settings dialog.
+                if sharing.attempt != 0
+                    && self.screen.applied_attempt != 0
+                    && sharing.attempt < self.screen.applied_attempt
+                {
+                    return false;
+                }
+                self.screen.applied_attempt = self.screen.applied_attempt.max(sharing.attempt);
                 let previous = self.screen.sharing.phase;
                 self.screen.sharing = sharing;
                 let phase = self.screen.sharing.phase;
+                // A confirmed attempt refreshes the owner identity: a recovered
+                // reconnect reports the same publication with the current
+                // connection, so its PiP label returns to the normal one.
+                if matches!(phase, Phase::Publishing | Phase::Live) {
+                    self.confirm_publish_access();
+                }
                 let status = self.screen.sharing.quality_status.clone();
                 let pending = self.screen.pending_quality_op;
                 let current = status.clone().filter(|status| Some(status.op) == pending);
@@ -120,6 +143,18 @@ impl VoicePanel {
                     self.screen.busy = false;
                     self.screen.focus_placed = false;
                     self.screen.error = self.screen.sharing.error.clone().unwrap_or_default();
+                    // A failed attempt owns no picture and no owner access: the
+                    // PiP must disappear with the image immediately.
+                    self.screen.preview = None;
+                    self.screen.owner_room = 0;
+                    // An attempt the media layer never confirmed is still only
+                    // an intent: its worker may answer later, so the owner
+                    // identity stays until the PiP is dismissed. Otherwise a
+                    // navigation would hand that worker the displayed room's
+                    // gate.
+                    if !Self::terminal_keeps_intent(previous) {
+                        self.publish_access = None;
+                    }
                     // A failed attempt has no picker any more; reopening the
                     // dialog calls `begin_picker` again.
                     if self.screen.open {
@@ -128,6 +163,13 @@ impl VoicePanel {
                     }
                 }
                 if phase == Phase::Idle {
+                    if previous != Phase::Idle {
+                        self.screen.preview = None;
+                        self.screen.owner_room = 0;
+                        if !Self::terminal_keeps_intent(previous) {
+                            self.publish_access = None;
+                        }
+                    }
                     if self.screen.open {
                         // The session ended (or a new one replaced the worker)
                         // while the dialog was open; its picker id is stale.

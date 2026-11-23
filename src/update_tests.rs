@@ -2,6 +2,7 @@
 
 use super::*;
 use voxhold_update::manifest::{FullPackage, SetupPackage};
+use voxhold_update::stage::{MANIFEST_FILE, READY_FILE, SIGNATURE_FILE};
 
 fn manifest(version: &str) -> Manifest {
     Manifest {

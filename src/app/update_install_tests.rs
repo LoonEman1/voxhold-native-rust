@@ -5,10 +5,14 @@
 //! same checks as the startup scan. A throw-away key is injected through
 //! `UpdateUi::proof_key`; the embedded release key is not available to tests.
 
+#[cfg(windows)]
+use super::update_install::acquire_install_lock;
+#[cfg(windows)]
+use super::update_ops::startup_scan_flags;
 use super::update_ops::{LaunchRequest, UpdateLauncher};
 use super::update_tests::make_app;
 use crate::update::{self, RetryKind, UpdatePhase};
-use gpui::{TestAppContext, VisualTestContext};
+use gpui::{AppContext, TestAppContext, VisualTestContext};
 use std::cell::RefCell;
 use std::path::Path;
 use std::rc::Rc;
@@ -383,4 +387,219 @@ async fn a_helper_ready_timeout_keeps_the_app_open_with_an_error(cx: &mut TestAp
             other => panic!("expected a helper timeout, got {other:?}"),
         }
     });
+}
+
+#[gpui::test]
+async fn a_second_instance_cannot_install(cx: &mut TestAppContext) {
+    cx.update(|cx| gpui_component::init(cx));
+    let (window, view, dir) = make_app(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
+    let (staged, key) = signed_staged(&dir, Some("Voxhold.exe"));
+    // A leftover marker of an earlier attempt: the refusing process must not
+    // touch the staging tree, so it stays.
+    let stale_ready = staged.staging_dir.join("helper-ready.ok");
+    std::fs::write(&stale_ready, b"old\n").unwrap();
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            v.update.launcher = Box::new(RecordingLauncher::new(&seen, false, false));
+            v.update.proof_key = Some(key);
+            v.update.single_instance = false;
+            v.update.phase = UpdatePhase::Ready {
+                version: "9.9.9".into(),
+                staged: staged.clone(),
+            };
+            v.update.install_dir = dir.join("install");
+            v.install_ready_confirmed(window, cx, true);
+        });
+    });
+    assert!(
+        seen.borrow().is_empty(),
+        "a second instance must not start a helper"
+    );
+    view.read_with(&*visual, |v, _| {
+        assert!(!v.update.quit_requested, "the app stays open");
+        match &v.update.phase {
+            UpdatePhase::Error { message, retry } => {
+                assert_eq!(*retry, RetryKind::Install);
+                assert!(
+                    message.contains("другом экземпляре"),
+                    "the error names the other instance: {message}"
+                );
+            }
+            other => panic!("expected an install refusal, got {other:?}"),
+        }
+    });
+    assert!(staged.staging_dir.join(PACKAGE_FILE).exists());
+    assert!(stale_ready.exists(), "the staging tree is untouched");
+}
+
+#[gpui::test]
+async fn a_helper_timeout_does_not_allow_a_second_helper(cx: &mut TestAppContext) {
+    cx.update(|cx| gpui_component::init(cx));
+    let (window, view, dir) = make_app(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
+    let (staged, key) = signed_staged(&dir, Some("Voxhold.exe"));
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let ready = staged.staging_dir.join("helper-ready.ok");
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            v.update.launcher = Box::new(RecordingLauncher::new(&seen, false, false));
+            v.update.proof_key = Some(key);
+            v.update.wait_for_helper_ready = true;
+            v.update.phase = UpdatePhase::Ready {
+                version: "9.9.9".into(),
+                staged: staged.clone(),
+            };
+            v.update.install_dir = dir.join("install");
+            v.install_ready(window, cx);
+            assert!(v.update.helper_pending);
+            assert!(!v.helper_ready_tick(window, cx, &ready, false));
+            assert!(v.helper_ready_tick(window, cx, &ready, true));
+            // The helper may still be waiting for this PID or already
+            // copying; the retry must not spawn a second process.
+            v.install_ready_confirmed(window, cx, false);
+        });
+    });
+    assert_eq!(
+        seen.borrow().len(),
+        1,
+        "only the first launch may start a helper"
+    );
+    view.read_with(&*visual, |v, _| {
+        assert!(!v.update.quit_requested);
+        match &v.update.phase {
+            UpdatePhase::Error { message, retry } => {
+                assert_eq!(*retry, RetryKind::Install);
+                assert!(
+                    message.contains("Установщик уже запущен"),
+                    "the error explains the pending helper: {message}"
+                );
+            }
+            other => panic!("expected a pending-helper error, got {other:?}"),
+        }
+    });
+}
+
+#[gpui::test]
+async fn a_call_or_share_needs_a_second_install_click(cx: &mut TestAppContext) {
+    cx.update(|cx| gpui_component::init(cx));
+    let (window, view, dir) = make_app(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
+    let (staged, key) = signed_staged(&dir, Some("Voxhold.exe"));
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let client = voxhold_api::Client::new("http://127.0.0.1:1").unwrap();
+    visual.update(|window, app| {
+        let panel =
+            app.new(|cx| crate::voice_panel::VoicePanel::new(client, 1, 7, false, window, cx));
+        view.update(app, |v, _| {
+            v.update.launcher = Box::new(RecordingLauncher::new(&seen, false, false));
+            v.update.proof_key = Some(key);
+            v.update.wait_for_helper_ready = true;
+            v.update.phase = UpdatePhase::Ready {
+                version: "9.9.9".into(),
+                staged: staged.clone(),
+            };
+            v.update.install_dir = dir.join("install");
+            v.voice = Some(panel.clone());
+        });
+        // A live screen share is a transmission too, even without a call.
+        panel.update(app, |panel, _| {
+            let mut sharing = voxhold_media::publisher::Sharing::default();
+            sharing.phase = voxhold_media::publisher::Phase::Live;
+            panel.test_set_screen_sharing(sharing);
+        });
+        view.update(app, |v, cx| {
+            v.install_ready_confirmed(window, cx, false);
+            assert!(v.update.confirm_install, "the first click only confirms");
+            v.update.confirm_install = false;
+        });
+        assert!(
+            seen.borrow().is_empty(),
+            "no helper starts on the first click"
+        );
+        // No share, but an active call: the same second click is required.
+        panel.update(app, |panel, _| {
+            panel.test_set_screen_sharing(voxhold_media::publisher::Sharing::default());
+            panel.test_set_call(
+                7,
+                crate::voice_room::CallPhase::Connected,
+                Vec::new(),
+                Vec::new(),
+            );
+        });
+        view.update(app, |v, cx| {
+            v.install_ready_confirmed(window, cx, false);
+            assert!(v.update.confirm_install);
+            assert!(seen.borrow().is_empty());
+            v.install_ready_confirmed(window, cx, false);
+        });
+    });
+    assert_eq!(
+        seen.borrow().len(),
+        1,
+        "the confirmed click starts the helper"
+    );
+    view.read_with(&*visual, |v, _| {
+        assert!(v.update.helper_pending);
+        assert!(matches!(v.update.phase, UpdatePhase::Installing));
+        assert!(!v.update.quit_requested, "the test waits for the marker");
+    });
+}
+
+#[cfg(windows)]
+#[test]
+fn the_install_mutex_decides_who_may_clean_the_staging_tree() {
+    let temp = std::env::temp_dir().join(format!(
+        "voxhold-mutex-scan-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    let install_a = temp.join("VoxHold-A");
+    let install_b = temp.join("VoxHold-B");
+    std::fs::create_dir_all(&install_a).unwrap();
+    std::fs::create_dir_all(&install_b).unwrap();
+    let root = temp.join("updates");
+    std::fs::create_dir_all(root.join("0.1.9")).unwrap();
+
+    let _first = acquire_install_lock(&install_a).expect("the first copy owns its mutex");
+    let second = acquire_install_lock(&install_a);
+    assert!(
+        second.is_none(),
+        "a second copy of the same installation cannot own the mutex"
+    );
+    let other = acquire_install_lock(&install_b);
+    assert!(
+        other.is_some(),
+        "different installations do not block each other"
+    );
+
+    // The startup scan of a second process only reads the staging tree.
+    assert_eq!(startup_scan_flags(false, true), (false, false));
+    let scan = update::startup_scan(
+        &install_a,
+        &semver::Version::new(0, 1, 0),
+        Some(root.as_path()),
+        true,
+        second.is_some(),
+    );
+    assert!(scan.error.is_none(), "{scan:?}");
+    assert!(
+        root.join("0.1.9").exists(),
+        "a process without the mutex does not clean staging"
+    );
+    // The owner does clean it.
+    let scan = update::startup_scan(
+        &install_a,
+        &semver::Version::new(0, 1, 0),
+        Some(root.as_path()),
+        true,
+        true,
+    );
+    assert!(scan.error.is_none(), "{scan:?}");
+    assert!(!root.join("0.1.9").exists());
+
+    // The handles stay open for the rest of the test process on purpose; the
+    // temporary directory itself is not locked by the named mutex.
+    std::fs::remove_dir_all(&temp).ok();
 }

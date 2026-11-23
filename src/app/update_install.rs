@@ -55,6 +55,31 @@ impl Voxhold {
         cx: &mut Context<Self>,
         confirmed: bool,
     ) {
+        // A second process of the same installation does not own the staging
+        // tree or the installation. Starting a helper here would make it fight
+        // the running instance and destroy the shared staging directory.
+        if !self.update.single_instance {
+            self.update.confirm_install = false;
+            self.update.phase = UpdatePhase::Error {
+                message: "Обновление уже устанавливается в другом экземпляре Voxhold.".into(),
+                retry: RetryKind::Install,
+            };
+            cx.notify();
+            return;
+        }
+        // A helper was already started by this process. After a readiness
+        // timeout it may still be waiting for this PID or already copying, so
+        // a retry must not spawn a second one until the app restarts.
+        if self.update.helper_pending {
+            self.update.confirm_install = false;
+            self.update.phase = UpdatePhase::Error {
+                message: "Установщик уже запущен, дождитесь завершения или перезапустите Voxhold."
+                    .into(),
+                retry: RetryKind::Install,
+            };
+            cx.notify();
+            return;
+        }
         let confirmed = confirmed || self.update.confirm_install;
         if !confirmed && self.transmission_active_for_install(cx) {
             self.update.confirm_install = true;
@@ -127,7 +152,21 @@ impl Voxhold {
             .refusal_path
             .clone()
             .unwrap_or_else(|| update::refusal_path(None, &install_dir));
-        let _ = std::fs::remove_file(&ready);
+        // A marker left by an earlier attempt would make the poll think the
+        // helper is ready before it really is. A marker that cannot be removed
+        // must stop the launch: the wait could otherwise finish immediately.
+        match std::fs::remove_file(&ready) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => {
+                self.update.phase = UpdatePhase::Error {
+                    message: "Не удалось подготовить установщик: файл готовности занят.".into(),
+                    retry: RetryKind::Install,
+                };
+                cx.notify();
+                return;
+            }
+        }
         if !install_dir.is_absolute() || !staging_dir.is_absolute() || !handshake.is_absolute() {
             self.update.phase = UpdatePhase::Error {
                 message: "Путь установки не абсолютный.".into(),
@@ -183,6 +222,9 @@ impl Voxhold {
             cx.notify();
             return;
         }
+        // The process exists now. Even after a readiness timeout it may still
+        // take over, so this app must not start another helper.
+        self.update.helper_pending = true;
         if !self.update.wait_for_helper_ready {
             self.prepare_for_install(window, cx);
             self.update.quit_requested = true;

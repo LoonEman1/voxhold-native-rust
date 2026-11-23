@@ -42,8 +42,8 @@ use voxhold_update::apply::{
 };
 use voxhold_update::recovery::{recover_install, RecoveryMode, RecoveryOutcome};
 use voxhold_update::stage::{
-    cleanup_after_install, cleanup_after_install_payload, cleanup_stale, updates_root, APPLY_LOG,
-    APP_DIR,
+    cleanup_after_install, cleanup_after_install_payload, cleanup_stale, updates_root,
+    verify_staged_proof, APPLY_LOG, APP_DIR,
 };
 
 const EXIT_OK: u8 = 0;
@@ -165,6 +165,23 @@ fn main() -> ExitCode {
     }
 
     let app = arguments.staged.join(APP_DIR);
+    // Repeat the offline proof here: the app checked it before handing over,
+    // but the staging tree can still change between that check and the copy.
+    // A replacement of `app/package.json` must cancel the apply.
+    match verify_staged_proof(&arguments.staged, &arguments.target) {
+        Ok(staged) => log(
+            &log_path,
+            &format!("staged proof verified for {}", staged.version),
+        ),
+        Err(error) => {
+            log(
+                &log_path,
+                &format!("staged proof failed: {} ({error})", error.code()),
+            );
+            log(&log_path, "apply skipped: the staged proof is not valid");
+            return fail_apply(&arguments, &log_path);
+        }
+    }
     match apply_staged(
         &arguments.target,
         &app,
@@ -202,45 +219,49 @@ fn main() -> ExitCode {
                 &log_path,
                 &format!("apply failed: {} ({error})", error.code()),
             );
-            let recovery = recover_install(&arguments.target, RecoveryMode::Updater);
-            let action = failure_action(&recovery);
-            log(&log_path, &format!("recovery after failure: {recovery:?}"));
-            if action == FailureAction::RefuseAndRestart {
-                if let Some(path) = arguments.refusal.as_deref() {
-                    let version = arguments
-                        .version
-                        .clone()
-                        .or_else(|| read_staged_version(&arguments.staged));
-                    if let Some(version) = version {
-                        // The refusal body carries only the version; paths and
-                        // errors stay in `apply.log`.
-                        let body = format!("{{\"version\":\"{}\"}}", version);
-                        if let Err(error) = write_marker(path, body.as_bytes()) {
-                            log(
-                                &log_path,
-                                &format!("cannot record install refusal: {error}"),
-                            );
-                        }
-                    }
-                }
-                // One normal start of the restored version. The refusal
-                // marker above stops it from auto-installing the same version
-                // again; a manual retry stays available. A completed update is
-                // never started a second time.
-                let client = arguments.target.join(&arguments.exe);
-                if client.is_file() {
-                    match Command::new(&client).current_dir(&arguments.target).spawn() {
-                        Ok(_) => log(&log_path, "started the restored client"),
-                        Err(error) => log(
-                            &log_path,
-                            &format!("cannot start the restored client: {error}"),
-                        ),
-                    }
-                }
-            }
-            ExitCode::from(EXIT_APPLY)
+            fail_apply(&arguments, &log_path)
         }
     }
+}
+
+/// Recovery, refusal and one restart after the new version was not proven.
+///
+/// Shared by an `apply_staged` error and a failed proof check: in both cases
+/// the new version is not installed and the restored client must start once.
+fn fail_apply(arguments: &Arguments, log_path: &Path) -> ExitCode {
+    let recovery = recover_install(&arguments.target, RecoveryMode::Updater);
+    let action = failure_action(&recovery);
+    log(log_path, &format!("recovery after failure: {recovery:?}"));
+    if action == FailureAction::RefuseAndRestart {
+        if let Some(path) = arguments.refusal.as_deref() {
+            let version = arguments
+                .version
+                .clone()
+                .or_else(|| read_staged_version(&arguments.staged));
+            if let Some(version) = version {
+                // The refusal body carries only the version; paths and
+                // errors stay in `apply.log`.
+                let body = format!("{{\"version\":\"{}\"}}", version);
+                if let Err(error) = write_marker(path, body.as_bytes()) {
+                    log(log_path, &format!("cannot record install refusal: {error}"));
+                }
+            }
+        }
+        // One normal start of the restored version. The refusal marker above
+        // stops it from auto-installing the same version again; a manual retry
+        // stays available. A completed update is never started a second time.
+        let client = arguments.target.join(&arguments.exe);
+        if client.is_file() {
+            match Command::new(&client).current_dir(&arguments.target).spawn() {
+                Ok(_) => log(log_path, "started the restored client"),
+                Err(error) => log(
+                    log_path,
+                    &format!("cannot start the restored client: {error}"),
+                ),
+            }
+        }
+    }
+    ExitCode::from(EXIT_APPLY)
 }
 
 /// What the helper does after a failed apply, decided by recovery.

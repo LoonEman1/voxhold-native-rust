@@ -121,8 +121,14 @@ pub(super) struct UpdateUi {
     pub install_lock: Option<isize>,
     pub install_dir: PathBuf,
     pub exe_name: String,
-    /// Test seam: use a temporary per-install updates root instead of
-    /// `LOCALAPPDATA\VoxHold\updates\<installation-id>`.
+    /// Test seam: replaces the real updates root.
+    ///
+    /// `start_update` reads it as the per-installation root that directly
+    /// holds version directories, exactly like
+    /// `updates_root_for(install_dir)`. `start_download` keeps the
+    /// `stage_update` contract and treats it as the shared *base*, appending
+    /// the installation id itself. Production leaves this `None`, so the two
+    /// readings never meet; tests only use the scan.
     pub root_override: Option<PathBuf>,
     /// Test seam: verification key for the staged proof. `None` uses the
     /// embedded release key.
@@ -140,6 +146,10 @@ pub(super) struct UpdateUi {
     pub wait_for_helper_ready: bool,
     /// A manual install during a call needs one explicit confirmation.
     pub confirm_install: bool,
+    /// A helper process was started successfully and has not confirmed yet.
+    /// A manual retry after a timeout must not start a second helper: two
+    /// copies would race for the same installation.
+    pub helper_pending: bool,
     pub clock_task: Option<gpui::Task<()>>,
     pub work_task: Option<gpui::Task<()>>,
     pub cleanup_task: Option<gpui::Task<()>>,
@@ -195,6 +205,7 @@ impl UpdateUi {
             download_task_enabled: true,
             wait_for_helper_ready: !cfg!(test),
             confirm_install: false,
+            helper_pending: false,
             clock_task: None,
             work_task: None,
             cleanup_task: None,
@@ -250,8 +261,10 @@ impl Voxhold {
         let current = update::current_version();
         // A second process of the same installation must not finish or clean
         // an operation the owner is running.
-        let recovery_allowed =
-            startup_recovery_allowed(after_update, handshake_written) && single_instance;
+        let (recovery_allowed, cleanup_staging) = startup_scan_flags(
+            single_instance,
+            startup_recovery_allowed(after_update, handshake_written),
+        );
         let executor = cx.background_executor().clone();
         // Run the disk scan off the UI thread. The first 500 ms are the only
         // window for an automatic install decision; a late answer may still
@@ -264,7 +277,7 @@ impl Voxhold {
                 &current,
                 root_override.as_deref(),
                 recovery_allowed,
-                single_instance,
+                cleanup_staging,
             );
             if let Ok(mut slot) = thread_slot.lock() {
                 *slot = Some(scan);
@@ -925,6 +938,15 @@ fn same_visible_phase(left: &UpdatePhase, right: &UpdatePhase) -> bool {
 /// the state must stay unconfirmed and keep the backup for the helper.
 pub(super) fn startup_recovery_allowed(after_update: bool, handshake_written: bool) -> bool {
     !after_update || handshake_written
+}
+
+/// Flags passed to `update::startup_scan`: `(finish_recovery, clean_staging)`.
+///
+/// Only the process that owns the per-installation update mutex may finish a
+/// recovery or delete a staging tree. A second process of the same installation
+/// (`single_instance == false`) only reads it, so both flags are false.
+pub(super) fn startup_scan_flags(single_instance: bool, recovery_allowed: bool) -> (bool, bool) {
+    (recovery_allowed && single_instance, single_instance)
 }
 
 /// The image name the helper must copy back into the installation.

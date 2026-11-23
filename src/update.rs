@@ -15,11 +15,11 @@ use voxhold_update::error::UpdateError;
 use voxhold_update::manifest::{Manifest, Offer, WindowsVersion, BETA_CHANNEL};
 use voxhold_update::recovery::{recover_install, RecoveryMode, RecoveryOutcome};
 use voxhold_update::stage::{
-    cleanup_legacy_layout, cleanup_stale_keeping, read_ready, updates_root_for, StagedUpdate,
-    APP_DIR, MANIFEST_FILE, READY_FILE, SIGNATURE_FILE,
+    cleanup_legacy_layout, cleanup_stale_keeping, read_ready, updates_root_for,
+    verify_staged_proof, verify_staged_proof_with, StagedUpdate, APP_DIR,
 };
 use voxhold_update::urls::validate_update_url;
-use voxhold_update::verify::{embedded_public_key, verify_and_parse, UpdatePublicKey};
+use voxhold_update::verify::{embedded_public_key, UpdatePublicKey};
 
 /// Public beta channel.
 pub const CHANNEL: &str = BETA_CHANNEL;
@@ -631,9 +631,6 @@ fn find_ready(
         let Ok(marker) = read_ready(&staging) else {
             continue;
         };
-        if !staging.join(READY_FILE).is_file() {
-            continue;
-        }
         let Ok(version) = Version::parse(&marker.version) else {
             continue;
         };
@@ -648,98 +645,23 @@ fn find_ready(
         {
             continue;
         }
-        if !staged_proof_is_valid(&staging, &marker, &version, install_dir, key) {
+        // The library repeats every offline proof check, including the
+        // unpacked payload and `app/package.json`.
+        let Ok(staged) = verify_staged_proof_with(&staging, install_dir, key) else {
+            continue;
+        };
+        if staged.version != version {
             continue;
         }
-        let candidate = StagedUpdate {
-            version: version.clone(),
-            method: marker.method,
-            staging_dir: staging.clone(),
-            app_dir: staging.join(APP_DIR),
-            package_sha256: marker.package_sha256,
-            verified: true,
-        };
         if best
             .as_ref()
-            .map(|current| version > current.version)
+            .map(|current| staged.version > current.version)
             .unwrap_or(true)
         {
-            best = Some(candidate);
+            best = Some(staged);
         }
     }
     best
-}
-
-/// Re-verify the proof stored with a staged package before it may be installed.
-///
-/// This runs offline and repeats every check that does not depend on the
-/// network: signature with the embedded key, channel, version, Windows target,
-/// install directory, full ZIP hash and the unpacked file index.
-fn staged_proof_is_valid(
-    staging: &Path,
-    marker: &voxhold_update::stage::ReadyMarker,
-    version: &Version,
-    install_dir: &Path,
-    key: &UpdatePublicKey,
-) -> bool {
-    (|| -> Option<()> {
-        if marker.manifest_sha256.is_empty() || marker.manifest_signature.is_empty() {
-            return None;
-        }
-        let manifest_path = staging.join(MANIFEST_FILE);
-        let signature_path = staging.join(SIGNATURE_FILE);
-        let raw = std::fs::read(&manifest_path).ok()?;
-        if voxhold_update::package::sha256_hex(&raw) != marker.manifest_sha256 {
-            return None;
-        }
-        let signature = std::fs::read_to_string(&signature_path)
-            .ok()
-            .unwrap_or_else(|| marker.manifest_signature.clone());
-        if signature.trim() != marker.manifest_signature.trim() {
-            return None;
-        }
-        let manifest = verify_and_parse(key, &raw, &signature).ok()?;
-        if manifest.channel != CHANNEL {
-            return None;
-        }
-        if manifest.version != version.to_string() {
-            return None;
-        }
-        if let Some(windows) = voxhold_update::manifest::WindowsVersion::current() {
-            manifest.check_windows(&windows).ok()?;
-        }
-        if !paths_equal(Path::new(&marker.install_dir), install_dir) {
-            return None;
-        }
-        if manifest.full.package_sha256 != marker.package_sha256 {
-            return None;
-        }
-        let package_path = staging.join(voxhold_update::stage::PACKAGE_FILE);
-        if voxhold_update::package::sha256_file(&package_path).ok()? != marker.package_sha256 {
-            return None;
-        }
-        let index = voxhold_update::package::read_package_json_from_file(&package_path).ok()?;
-        if index.version != version.to_string() {
-            return None;
-        }
-        // `package.json` is not part of its own file index, so a replaced
-        // copy would pass `verify_dir`. Compare it with the index inside the
-        // verified ZIP and with canonical bytes; the helper reads this file
-        // when it copies the payload.
-        let app = staging.join(APP_DIR);
-        let app_index = voxhold_update::package::read_package_json_from_dir(&app).ok()?;
-        if app_index != index {
-            return None;
-        }
-        if std::fs::read(app.join(voxhold_update::package::PACKAGE_JSON)).ok()?
-            != app_index.to_json()
-        {
-            return None;
-        }
-        voxhold_update::package::verify_dir(&app, &index).ok()?;
-        Some(())
-    })()
-    .is_some()
 }
 
 /// Re-verify a staged package right before the helper starts.
@@ -748,8 +670,11 @@ fn staged_proof_is_valid(
 /// session or another local writer can still change the staging directory
 /// afterwards. Every offline check is repeated here with the embedded key.
 pub fn reverify_staged(staged: &StagedUpdate, install_dir: &Path) -> bool {
-    match embedded_public_key() {
-        Ok(key) => reverify_staged_with(staged, install_dir, &key),
+    if !staged.verified {
+        return false;
+    }
+    match verify_staged_proof(&staged.staging_dir, install_dir) {
+        Ok(verified) => verified.version == staged.version,
         Err(_) => false,
     }
 }
@@ -763,16 +688,10 @@ pub fn reverify_staged_with(
     if !staged.verified {
         return false;
     }
-    let Ok(marker) = read_ready(&staged.staging_dir) else {
-        return false;
-    };
-    let Ok(version) = Version::parse(&marker.version) else {
-        return false;
-    };
-    if version != staged.version {
-        return false;
+    match verify_staged_proof_with(&staged.staging_dir, install_dir, key) {
+        Ok(verified) => verified.version == staged.version,
+        Err(_) => false,
     }
-    staged_proof_is_valid(&staged.staging_dir, &marker, &version, install_dir, key)
 }
 
 fn paths_equal(left: &Path, right: &Path) -> bool {

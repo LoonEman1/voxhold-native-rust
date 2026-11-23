@@ -38,8 +38,8 @@ use libwebrtc::{
         IceServer as RtcIceServer, IceTransportsType, PeerConnectionFactory, RtcConfiguration,
         native::PeerConnectionFactoryExt,
     },
+    rtp_sender::VideoEncoderBackend,
     stats::QualityLimitationReason,
-    video_frame::{BoxVideoBuffer, VideoFrame, VideoRotation},
     video_source::{VideoResolution, native::NativeVideoSource},
 };
 use tokio::sync::mpsc;
@@ -52,8 +52,9 @@ use crate::{
             Limits, apply_sender_limits, confirmed_quality, failure_message, readback_limits,
         },
     },
-    screen_capture::{CaptureFailure, LatestImage, PreviewDemand, PreviewStore, ScreenCapture},
+    screen_capture::{LatestImage, PreviewDemand, PreviewStore, ScreenCapture},
     system_audio::{AudioProducer, CHANNELS, SAMPLE_RATE, SystemAudio},
+    video_encoder::{GpuEncoder, HardwareEncoderIdentity, open_gpu_encoder},
 };
 
 /// How long the capture may deliver nothing before the attempt is failed.
@@ -187,6 +188,9 @@ impl PublishStats {
 
 /// An event that belongs to the current publishing attempt.
 pub use crate::publisher::EngineEvent;
+
+mod frames;
+use frames::{frame_loop, gpu_frame_loop};
 
 mod queue;
 use queue::EventQueue;
@@ -353,16 +357,61 @@ impl PublisherEngine {
         if cancelled.load(Ordering::SeqCst) {
             return Err(PREP_CANCELLED.into());
         }
-        let engine = Self::spawn(
-            request,
-            servers,
-            policy,
-            Box::new(DesktopProducer { capture, latest }),
-            audio,
-            audio_scope,
-            preview,
-            true,
-        )?;
+        // The hardware session is activated here, on the preparation thread:
+        // an activation or type error must fail this attempt before
+        // `stream.start`, never after the server created the publication.
+        let gpu = if request.encoder.is_gpu() {
+            let (width, height) = request.capture_size();
+            let query = crate::video_encoder::EncodeQuery::new(
+                width,
+                height,
+                request.quality.fps.clamp(1, 120),
+            );
+            let Some(resolved) = request.encoder.resolved(request.codec, query) else {
+                return Err(
+                    "Аппаратный кодировщик этой попытки не подтверждён; выберите видеокарту снова."
+                        .into(),
+                );
+            };
+            let Some(adapter) = resolved.adapter.as_ref() else {
+                return Err("У выбранной видеокарты нет аппаратного кодировщика.".into());
+            };
+            Some(open_gpu_encoder(
+                adapter,
+                request.codec,
+                query,
+                request.quality.bitrate_kbps.saturating_mul(1000),
+            )?)
+        } else {
+            None
+        };
+        if cancelled.load(Ordering::SeqCst) {
+            return Err(PREP_CANCELLED.into());
+        }
+        let engine = match gpu {
+            Some(gpu) => Self::spawn(
+                request.clone(),
+                servers,
+                policy,
+                Box::new(DesktopProducer { capture, latest }),
+                audio,
+                audio_scope,
+                preview,
+                true,
+                Some(gpu),
+            )?,
+            None => Self::spawn(
+                request.clone(),
+                servers,
+                policy,
+                Box::new(DesktopProducer { capture, latest }),
+                audio,
+                audio_scope,
+                preview,
+                true,
+                None,
+            )?,
+        };
         if cancelled.load(Ordering::SeqCst) {
             drop(engine);
             return Err(PREP_CANCELLED.into());
@@ -392,6 +441,31 @@ impl PublisherEngine {
             None,
             Arc::new(PreviewStore::default()),
             true,
+            None,
+        )
+    }
+
+    /// Test entry point: the same synthetic publication with an injected
+    /// hardware encoder. `plan` names the GPU path; the encoder is the double
+    /// the test drives, so the engine code is exactly the production one.
+    #[cfg(test)]
+    pub(crate) fn start_synthetic_gpu(
+        request: PublishRequest,
+        servers: Vec<IceServer>,
+        policy: String,
+        frame_size: (u32, u32),
+        encoder: Box<dyn GpuEncoder>,
+    ) -> Result<Self, String> {
+        Self::spawn(
+            request,
+            servers,
+            policy,
+            Box::new(SyntheticProducer::new(frame_size.0, frame_size.1, false)),
+            None,
+            None,
+            Arc::new(PreviewStore::default()),
+            false,
+            Some(encoder),
         )
     }
 
@@ -414,6 +488,7 @@ impl PublisherEngine {
             None,
             Arc::new(PreviewStore::default()),
             false,
+            None,
         )
     }
 
@@ -438,7 +513,11 @@ impl PublisherEngine {
         audio_scope: Option<String>,
         preview: Arc<PreviewStore>,
         video_keepalive: bool,
+        gpu: Option<Box<dyn GpuEncoder>>,
     ) -> Result<Self, String> {
+        if request.encoder.is_gpu() && gpu.is_none() {
+            return Err("Аппаратный кодировщик этой попытки не открыт.".into());
+        }
         let has_audio = audio.is_some();
         let (commands, receiver) = mpsc::channel(ENGINE_COMMAND_CAPACITY);
         let events = Arc::new(EventQueue::default());
@@ -474,6 +553,7 @@ impl PublisherEngine {
                     producer,
                     audio,
                     video_keepalive,
+                    gpu,
                     ready_tx,
                 ));
             })
@@ -627,14 +707,25 @@ async fn run(
     producer: Box<dyn FrameProducer>,
     audio: Option<Box<dyn AudioProducer>>,
     video_keepalive: bool,
+    mut gpu: Option<Box<dyn GpuEncoder>>,
     ready: std::sync::mpsc::Sender<Result<(), String>>,
 ) {
     let factory = PeerConnectionFactory::default();
-    let profile = match negotiation::sender_profile(request.codec) {
-        Ok(profile) => profile,
-        Err(message) => {
-            let _ = ready.send(Err(message));
-            return;
+    let profile = if request.encoder.is_gpu() {
+        match request.encoder.profile {
+            Some(profile) => profile,
+            None => {
+                let _ = ready.send(Err("Выбранный аппаратный профиль не подтверждён.".into()));
+                return;
+            }
+        }
+    } else {
+        match negotiation::sender_profile(request.codec) {
+            Ok(profile) => profile,
+            Err(message) => {
+                let _ = ready.send(Err(message));
+                return;
+            }
         }
     };
     let (width, height) = request.capture_size();
@@ -642,11 +733,12 @@ async fn run(
     // real capture, so a stalled desktop still sends something and the capture
     // watchdog decides. The stalled test source must not use it: without a
     // keepalive the encoder stays silent and the codec watchdog is the only
-    // thing that can end the attempt.
-    let source = if video_keepalive {
-        NativeVideoSource::new(VideoResolution { width, height }, true)
-    } else {
+    // thing that can end the attempt. A pre-encoded passthrough never uses the
+    // raw keepalive: a raw frame would start a second encoder inside WebRTC.
+    let source = if gpu.is_some() || !video_keepalive {
         NativeVideoSource::new_encoded(VideoResolution { width, height })
+    } else {
+        NativeVideoSource::new(VideoResolution { width, height }, true)
     };
     let mut config = RtcConfiguration::default();
     config.ice_transport_type = match policy.as_str() {
@@ -710,6 +802,9 @@ async fn run(
             return;
         }
     };
+    let gpu_backend = gpu.is_some();
+    // The GPU attempt sends access units that were already encoded by the
+    // hardware session: the sender must use the pass-through encoder, never a
     // The audio track is added after the video track, so the local
     // transceivers mirror the backend's m-line order: video, then audio. EC,
     // NS and AGC are disabled: system audio is a program feed, not a mic.
@@ -756,16 +851,59 @@ async fn run(
         let _ = ready.send(Err(message));
         return;
     }
-
-    let pump = tokio::spawn(frame_loop(
-        producer,
-        source,
-        events.clone(),
-        preview,
-        counters.clone(),
-        request.quality.fps,
-        (width, height),
-    ));
+    if gpu_backend {
+        // Install the pass-through selector on the send track's sender and on
+        // every transceiver sender that carries it: the pinned build may hand
+        // the engine a wrapper whose encoder is owned by the transceiver.
+        sender.set_video_encoder_backend(VideoEncoderBackend::PreEncoded);
+        for transceiver in peer.transceivers() {
+            if matches!(
+                transceiver.sender().track(),
+                Some(MediaStreamTrack::Video(_))
+            ) {
+                transceiver
+                    .sender()
+                    .set_video_encoder_backend(VideoEncoderBackend::PreEncoded);
+            }
+        }
+    }
+    // The open session names its adapter; the publisher compares this
+    // identity with the attempt's plan before anything may look «GPU».
+    if let Some(adapter) = gpu.as_ref().and_then(|encoder| encoder.adapter()) {
+        events.push(EngineEvent::EncoderOpened(HardwareEncoderIdentity {
+            luid: adapter.luid,
+            adapter: adapter.name,
+            driver_version: adapter.driver_version,
+            codec: request.codec,
+            generation: request.encoder.generation,
+        }));
+    }
+    let pump = match gpu.take() {
+        Some(encoder) => {
+            let cpu_available = negotiation::sender_profile(request.codec).is_ok();
+            tokio::spawn(gpu_frame_loop(
+                producer,
+                source,
+                encoder,
+                events.clone(),
+                preview,
+                counters.clone(),
+                request.quality.fps,
+                (width, height),
+                cpu_available,
+                request.codec,
+            ))
+        }
+        None => tokio::spawn(frame_loop(
+            producer,
+            source,
+            events.clone(),
+            preview,
+            counters.clone(),
+            request.quality.fps,
+            (width, height),
+        )),
+    };
     // The last quality really applied to the live senders. The backend's
     // `startRecovery` may offer again to a live publisher, so a later answer
     // must use this value instead of the spawn-time request: otherwise a live
@@ -977,81 +1115,6 @@ async fn add_ice(peer: &PeerConnection, candidate: Candidate) {
     }
 }
 
-async fn frame_loop(
-    mut producer: Box<dyn FrameProducer>,
-    source: NativeVideoSource,
-    events: Arc<EventQueue>,
-    preview: Arc<PreviewStore>,
-    counters: Arc<FrameCounters>,
-    fps: u32,
-    mut size: (u32, u32),
-) {
-    let interval = Duration::from_secs(1) / fps.clamp(1, super::MAX_SCREEN_FPS);
-    let mut tick = tokio::time::interval(interval);
-    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut window = Instant::now();
-    let mut sent_in_window = 0_u32;
-    let mut first = false;
-    let mut last_frame = Instant::now();
-    loop {
-        tick.tick().await;
-        let mut failed = producer.failure();
-        if let Some(image) = producer.next_frame() {
-            last_frame = Instant::now();
-            size = (image.width, image.height);
-            let frame = VideoFrame::new(
-                VideoRotation::VideoRotation0,
-                Box::new(image.i420) as BoxVideoBuffer,
-            );
-            if source.capture_frame(&frame) {
-                sent_in_window += 1;
-                if !first {
-                    first = true;
-                    events.push(EngineEvent::State(crate::publisher::Connection::FirstFrame));
-                }
-            }
-            if let Some(picture) = image.preview {
-                preview.publish(picture);
-            }
-            // A good frame proves that a temporary compositor failure did not
-            // end the capture. Only a permanent failure is terminal below.
-            failed = None;
-        }
-        if let Some(failure) = failed {
-            match failure {
-                // A temporary failure waits for the frame watchdog: the next
-                // good frame recovers the publication, a dead source is
-                // caught by `FRAME_TIMEOUT` without an immediate false stop.
-                CaptureFailure::Temporary => {}
-                CaptureFailure::Permanent | CaptureFailure::Ended => {
-                    events.push(EngineEvent::Error(failure.message().into()));
-                    return;
-                }
-            }
-        }
-        if last_frame.elapsed() >= FRAME_TIMEOUT {
-            events.push(EngineEvent::Error(
-                "Источник захвата перестал присылать кадры.".into(),
-            ));
-            return;
-        }
-        let elapsed = window.elapsed();
-        if elapsed >= Duration::from_secs(1) {
-            counters
-                .dropped
-                .store(producer.dropped(), Ordering::Relaxed);
-            counters.fps_bits.store(
-                (sent_in_window as f32 / elapsed.as_secs_f32()).to_bits(),
-                Ordering::Relaxed,
-            );
-            counters.width.store(size.0, Ordering::Relaxed);
-            counters.height.store(size.1, Ordering::Relaxed);
-            sent_in_window = 0;
-            window = Instant::now();
-        }
-    }
-}
-
 fn ufrag(candidate: &str) -> Option<&str> {
     let mut tokens = candidate.split_ascii_whitespace().skip(8);
     while let (Some(key), Some(value)) = (tokens.next(), tokens.next()) {
@@ -1082,3 +1145,6 @@ mod codec_tests;
 
 #[cfg(test)]
 mod codec_reject_tests;
+
+#[cfg(test)]
+mod gpu_tests;

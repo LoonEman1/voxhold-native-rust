@@ -26,6 +26,7 @@
 
 mod probe;
 mod service;
+mod session;
 
 #[cfg(windows)]
 mod av1;
@@ -45,6 +46,9 @@ mod hardware_tests;
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+pub(crate) use session::FakeGpuEncoder;
+
 use std::fmt;
 
 #[cfg(test)]
@@ -54,6 +58,10 @@ use crate::screen_capture::SourceIdentity;
 
 pub use probe::{HardwareProbe, ProbeCancel, ProbeOutcome};
 pub use service::{EncoderProbeService, EncoderRequest, EncoderRequestError, RevalidateError};
+pub use session::{
+    EncodeSubmit, EncodedAccessUnit, EncoderCounters, GpuEncoder, GpuEncoderFailure, Nv12Frame,
+    open_gpu_encoder,
+};
 
 #[cfg(not(windows))]
 pub use unsupported::UnsupportedHardwareProbe as PlatformProbe;
@@ -253,6 +261,96 @@ impl VideoEncoderPreference {
             adapter,
             allow_fallback,
         }
+    }
+}
+
+/// Identity of a hardware encoder session that is really open.
+///
+/// The UI shows «GPU» only when this value matches the attempt's
+/// [`EncoderPlan`] and encoded frames were delivered. The adapter is named by
+/// its LUID, never by an order or a display string.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HardwareEncoderIdentity {
+    pub luid: AdapterLuid,
+    pub adapter: String,
+    pub driver_version: u64,
+    pub codec: Codec,
+    /// Generation of the snapshot the attempt was built from.
+    pub generation: u64,
+}
+
+impl HardwareEncoderIdentity {
+    /// The open session is the pair the request asked for.
+    pub fn matches(&self, plan: &EncoderPlan, codec: Codec) -> bool {
+        plan.is_gpu()
+            && plan.generation == self.generation
+            && plan.adapter.as_ref().map(|adapter| adapter.luid) == Some(self.luid)
+            && self.codec == codec
+    }
+}
+
+/// The concrete encoder of one publication attempt.
+///
+/// The picker resolves the user's [`VideoEncoderPreference`] against one
+/// [`VideoEncoderSnapshot`] and stores the answer here, inside
+/// [`crate::publisher::PublishRequest`]. The codec itself stays
+/// `PublishRequest::codec`: a request never carries two codecs that could
+/// disagree. The generation names the snapshot the answer belongs to, so a late
+/// probe of an older dialog cannot silently become the encoder of this attempt.
+///
+/// The default is the CPU path of the pinned build, which is what every request
+/// that does not mention an encoder means.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EncoderPlan {
+    pub backend: EncoderBackend,
+    /// `Some` exactly for the GPU backend.
+    pub adapter: Option<AdapterInfo>,
+    /// The SDR profile the probe confirmed on that backend and codec.
+    pub profile: Option<SdrProfile>,
+    /// Generation of the [`VideoEncoderSnapshot`] this answer came from.
+    pub generation: u64,
+}
+
+impl EncoderPlan {
+    pub const fn cpu() -> Self {
+        Self {
+            backend: EncoderBackend::Cpu,
+            adapter: None,
+            profile: None,
+            generation: 0,
+        }
+    }
+
+    pub fn gpu(adapter: AdapterInfo, profile: SdrProfile, generation: u64) -> Self {
+        Self {
+            backend: EncoderBackend::Gpu,
+            adapter: Some(adapter),
+            profile: Some(profile),
+            generation,
+        }
+    }
+
+    pub const fn is_gpu(&self) -> bool {
+        matches!(self.backend, EncoderBackend::Gpu)
+    }
+
+    /// The pair a live preflight revalidates. `None` when the plan is CPU or
+    /// lacks the profile/adapter a GPU publication needs.
+    pub fn resolved(&self, codec: Codec, query: EncodeQuery) -> Option<ResolvedEncoder> {
+        let adapter = self.adapter.clone()?;
+        let profile = self.profile?;
+        Some(ResolvedEncoder {
+            backend: self.backend,
+            codec,
+            adapter: Some(adapter),
+            profile,
+            query,
+        })
+    }
+
+    /// The adapter name for the dialog and diagnostics.
+    pub fn adapter_name(&self) -> Option<&str> {
+        self.adapter.as_ref().map(|adapter| adapter.name.as_str())
     }
 }
 

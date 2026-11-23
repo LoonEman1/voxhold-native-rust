@@ -46,6 +46,7 @@ fn confirmed(
         codec: Codec::Vp8,
         audio,
         audio_scope: AudioScope::Device,
+        encoder: Default::default(),
     }
 }
 
@@ -537,6 +538,7 @@ pub(super) fn open_quality_dialog(
         codec: Codec::Vp8,
         audio,
         audio_scope: AudioScope::Device,
+        encoder: Default::default(),
     });
     panel.test_open_live_screen_settings(window, cx);
 }

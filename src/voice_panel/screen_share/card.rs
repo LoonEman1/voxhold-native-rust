@@ -269,6 +269,28 @@ impl VoicePanel {
                 );
             }
             let stop_focus = self.screen_focus[0].clone();
+            if sharing.cpu_fallback {
+                let cpu_focus = self.screen_focus[1].clone();
+                actions = actions.child(
+                    div()
+                        .id("screen-continue-cpu")
+                        .debug_selector(|| "screen-continue-cpu".into())
+                        .flex_1()
+                        .h_full()
+                        .rounded(px(8.))
+                        .border_1()
+                        .border_color(rgb(c.line))
+                        .text_color(rgb(c.fg))
+                        .text_size(px(11.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .cursor_pointer()
+                        .track_focus(&cpu_focus)
+                        .on_click(cx.listener(|panel, _, _, cx| panel.continue_screen_on_cpu(cx)))
+                        .child("Продолжить на процессоре"),
+                );
+            }
             actions = actions.child(
                 div()
                     .id("screen-stop")

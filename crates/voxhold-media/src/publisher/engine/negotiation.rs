@@ -113,6 +113,14 @@ pub(super) fn pin_video_codec(
     profile: SdrProfile,
 ) -> Result<(), String> {
     let preferences = preferences(capabilities, codec, profile);
+    apply_preferences(peer, preferences, codec)
+}
+
+fn apply_preferences(
+    peer: &PeerConnection,
+    preferences: Vec<RtpCodecCapability>,
+    codec: Codec,
+) -> Result<(), String> {
     if preferences.len() <= 1 {
         return Err(format!(
             "В этой сборке нет профиля {} для публикации.",

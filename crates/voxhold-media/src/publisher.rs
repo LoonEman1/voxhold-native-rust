@@ -62,6 +62,9 @@ pub use sharing::{Confirmed, Sharing};
 pub struct PublishRequest {
     pub source: ScreenSource,
     pub quality: Quality,
+    /// The concrete codec to publish. The profile lives in [`Self::encoder`]
+    /// for the GPU path and in the capability snapshot for the CPU path; one
+    /// request never carries two different codecs.
     pub codec: Codec,
     /// The user asked for system audio. `stream.start` carries the value the
     /// engine actually opened, so a missing loopback is an explicit failure
@@ -71,6 +74,8 @@ pub struct PublishRequest {
     /// engine resolves it to a process id for this attempt. `stream.start` has
     /// no scope field, so this stays a local engine parameter.
     pub audio_scope: AudioScope,
+    /// CPU or one confirmed hardware encoder. The default is the CPU path.
+    pub encoder: crate::video_encoder::EncoderPlan,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -196,6 +201,16 @@ pub struct Publisher {
     /// The media engine of this attempt was created. A failed start has no
     /// engine, so its terminal decision must not emit `StopEngine`.
     engine_live: bool,
+    /// A GPU attempt died after it started and the same codec can still be
+    /// encoded by the pinned CPU build. Only the explicit
+    /// [`Publisher::continue_on_cpu`] action consumes it; nothing restarts
+    /// automatically.
+    cpu_fallback: Option<PublishRequest>,
+    /// The open hardware session that matched this attempt's plan. It is never
+    /// set by a probe or a request: only the engine reporting the real adapter
+    /// identity fills it, and only delivered encoded frames turn the stream
+    /// «GPU» in the dialog.
+    hardware: Option<crate::video_encoder::HardwareEncoderIdentity>,
     answered: bool,
     /// The `stream.webrtc_answer` whose confirmation is still awaited, and
     /// whether that answer is an ICE restart of an already confirmed attempt.
@@ -243,6 +258,8 @@ impl Publisher {
             started: None,
             start_sent: false,
             engine_live: false,
+            cpu_fallback: None,
+            hardware: None,
             answered: false,
             pending_answer: answer::PendingAnswer::default(),
             stop_sent: false,
@@ -265,12 +282,15 @@ impl Publisher {
             live: self.phase == Phase::Live,
             quality: self.request.as_ref().map(|request| request.quality),
             codec: self.request.as_ref().map(|request| request.codec),
+            encoder: self.request.as_ref().map(|request| request.encoder.clone()),
             confirmed: self.confirmed.clone(),
             has_audio: self.has_audio,
             audio_scope: self.audio_scope.clone(),
             restarting: self.restarting,
             preflighting: self.preflighting,
             quality_status: self.quality_status.clone(),
+            cpu_fallback: self.cpu_fallback.is_some(),
+            hardware: self.hardware.clone(),
             status: self.status.clone(),
             error: self.error.clone(),
             stats: self.stats,
@@ -474,6 +494,77 @@ impl Publisher {
         self.fail_local(message, now)
     }
 
+    /// The hardware encoder of the active attempt died after the publication
+    /// started (device removal, driver reset, a lost MFT session).
+    ///
+    /// `cpu_available` is the engine's own answer to "can the pinned CPU build
+    /// encode this same codec". It only offers the explicit next step: nothing
+    /// is substituted here, and the codec never changes. The failed attempt is
+    /// closed like any local failure — the capture and the GPU session are
+    /// released, and `stream.stop` tells the server the truth.
+    pub fn on_encoder_lost(
+        &mut self,
+        message: &str,
+        cpu_available: bool,
+        now: Instant,
+    ) -> Vec<Outcome> {
+        let fallback = match (self.request.as_ref(), cpu_available) {
+            (Some(request), true) if request.encoder.is_gpu() => {
+                let mut next = request.clone();
+                next.encoder = crate::video_encoder::EncoderPlan::cpu();
+                Some(next)
+            }
+            _ => None,
+        };
+        self.fail_with(message, now, fallback)
+    }
+
+    /// The user chose «Продолжить на процессоре» after a GPU encoder loss.
+    ///
+    /// This is the only path that replaces the backend, and it keeps the codec,
+    /// source, quality and audio of the failed attempt. The failed attempt has
+    /// already sent its `stream.stop`; the new attempt starts through the
+    /// ordinary `StartEngine` route, including the normal preparation.
+    pub fn continue_on_cpu(&mut self, _now: Instant) -> Vec<Outcome> {
+        if self.phase != Phase::Failed {
+            return Vec::new();
+        }
+        let Some(request) = self.cpu_fallback.take() else {
+            return Vec::new();
+        };
+        self.start_restart(request)
+    }
+
+    /// The engine reported the hardware session that is really open.
+    ///
+    /// The attempt is only confirmed as «GPU» when this identity names the same
+    /// LUID, codec and snapshot generation as the request. A stale result of an
+    /// older dialog, a software fallback inside the driver or another adapter
+    /// is a terminal local failure: the codec and the backend are never
+    /// silently substituted.
+    fn on_encoder_opened(
+        &mut self,
+        identity: crate::video_encoder::HardwareEncoderIdentity,
+        now: Instant,
+    ) -> Vec<Outcome> {
+        if !self.active() {
+            return Vec::new();
+        }
+        let Some(request) = self.request.as_ref() else {
+            return Vec::new();
+        };
+        if identity.matches(&request.encoder, request.codec) {
+            self.hardware = Some(identity);
+            // Encoded frames may already have been delivered before this
+            // identity arrived; the attempt becomes live now, not earlier.
+            return self.maybe_live();
+        }
+        self.fail(
+            "Открытый аппаратный кодировщик не совпал с выбранной видеокартой; трансляция не запущена.",
+            now,
+        )
+    }
+
     pub fn tick(&mut self, now: Instant) -> Vec<Outcome> {
         if self.viewer_wait.is_some_and(|deadline| now >= deadline) {
             return self.viewer_left(now);
@@ -575,6 +666,11 @@ impl Publisher {
                 op,
                 result,
             } => self.on_bitrate(attempt, op, result),
+            EngineEvent::EncoderFailed {
+                message,
+                cpu_available,
+            } => self.on_encoder_lost(&message, cpu_available, now),
+            EngineEvent::EncoderOpened(identity) => self.on_encoder_opened(identity, now),
             EngineEvent::Error(message) => self.fail_local(&message, now),
             EngineEvent::Closed => self.fail_local("Соединение трансляции закрыто.", now),
         }
@@ -758,6 +854,8 @@ impl Publisher {
         self.deadline = None;
         self.stop_deadline = None;
         self.stats = None;
+        self.cpu_fallback = None;
+        self.hardware = None;
         let Some(request) = self.request.clone() else {
             return self.fail("Источник трансляции не выбран.", now);
         };
@@ -811,6 +909,17 @@ impl Publisher {
         if self.phase != Phase::Publishing || !self.connected || !self.sent_frame {
             return Vec::new();
         }
+        // A GPU attempt is only on air after the engine confirmed the open
+        // hardware session and encoded frames were delivered. A stream whose
+        // identity was not confirmed never reaches `Live`.
+        if self
+            .request
+            .as_ref()
+            .is_some_and(|request| request.encoder.is_gpu())
+            && self.hardware.is_none()
+        {
+            return Vec::new();
+        }
         self.phase = Phase::Live;
         self.deadline = None;
         self.status = "В эфире".into();
@@ -831,7 +940,16 @@ impl Publisher {
         vec![Outcome::State(self.sharing())]
     }
 
-    fn fail(&mut self, message: &str, _now: Instant) -> Vec<Outcome> {
+    fn fail(&mut self, message: &str, now: Instant) -> Vec<Outcome> {
+        self.fail_with(message, now, None)
+    }
+
+    fn fail_with(
+        &mut self,
+        message: &str,
+        _now: Instant,
+        cpu_fallback: Option<PublishRequest>,
+    ) -> Vec<Outcome> {
         if self.phase == Phase::Idle {
             return Vec::new();
         }
@@ -848,6 +966,8 @@ impl Publisher {
         self.phase = Phase::Failed;
         self.status = message.to_owned();
         self.error = Some(message.to_owned());
+        self.cpu_fallback = cpu_fallback;
+        self.hardware = None;
         self.stats = None;
         self.viewer_wait = None;
         self.deadline = None;
@@ -909,6 +1029,7 @@ impl Publisher {
         self.bitrate_deadline = None;
         self.has_audio = false;
         self.audio_scope = None;
+        self.hardware = None;
         vec![
             Outcome::StartEngine {
                 attempt: self.attempt,
@@ -950,6 +1071,8 @@ impl Publisher {
         self.status.clear();
         self.error = None;
         self.stats = None;
+        self.cpu_fallback = None;
+        self.hardware = None;
     }
 
     fn signal(&mut self, kind: &'static str, data: Value) -> Signal {

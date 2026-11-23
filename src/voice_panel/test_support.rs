@@ -57,6 +57,11 @@ impl VoicePanel {
             .unwrap_or(true)
     }
 
+    /// «Продолжить на процессоре» of the failed GPU card.
+    pub(crate) fn test_continue_screen_on_cpu(&mut self, cx: &mut gpui::Context<Self>) {
+        self.continue_screen_on_cpu(cx);
+    }
+
     /// Take the viewport the UI queued for the detached media worker.
     pub fn test_take_viewport(&mut self) -> Option<(u32, u32)> {
         self.handle.as_ref()?.take_viewport_for_tests()
@@ -555,6 +560,8 @@ impl VoicePanel {
                 audio: sharing.has_audio,
                 audio_scope: voxhold_media::system_audio::AudioScope::Device,
                 source,
+
+                encoder: Default::default(),
             });
         }
         self.screen.sharing = sharing;
@@ -590,6 +597,8 @@ impl VoicePanel {
             codec,
             audio: false,
             audio_scope: voxhold_media::system_audio::AudioScope::Device,
+
+            encoder: Default::default(),
         });
     }
 
@@ -606,6 +615,8 @@ impl VoicePanel {
             codec: request.codec,
             audio: request.audio,
             audio_scope: request.audio_scope,
+
+            encoder: Default::default(),
         });
     }
 

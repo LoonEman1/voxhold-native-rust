@@ -90,6 +90,9 @@ async fn run_session(
         rotation: requests.rotation.clone(),
         session_token,
         screen_preview,
+        encoder_probe: crate::video_encoder::EncoderProbeService::platform()
+            .ok()
+            .map(Arc::new),
         screen_demand,
         render: VideoFrame::default(),
         viewport: requests.viewport(),

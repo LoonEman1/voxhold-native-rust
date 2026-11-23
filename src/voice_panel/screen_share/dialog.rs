@@ -566,7 +566,8 @@ impl VoicePanel {
                         .child(scope_sentence),
                 )
             })
-            .child(self.codec_row(&mut ring, &mut row, cx));
+            .child(self.codec_row(&mut ring, &mut row, cx))
+            .child(self.encoder_backend_row(&mut ring, &mut row, cx));
 
         let cancel_focus = row(self, &mut ring, ShareKey::Cancel);
         let start_focus = row(self, &mut ring, ShareKey::Start);
@@ -807,6 +808,7 @@ impl VoicePanel {
             ShareKey::BitrateUp => self.change_bitrate(100, cx),
             ShareKey::Preset(preset) => self.apply_preset(preset, cx),
             ShareKey::Codec(intent) => self.select_screen_codec(intent, cx),
+            ShareKey::EncoderBackend(backend) => self.select_encoder_backend(backend, cx),
             ShareKey::Audio => self.toggle_system_audio(cx),
             ShareKey::AudioScope(scope) => self.select_audio_scope(scope, cx),
             ShareKey::AudioBitrateDown => self.change_audio_bitrate(false, cx),

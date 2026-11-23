@@ -18,7 +18,7 @@ use std::{
 use crate::{
     publisher::{
         Access, Outcome as PublisherOutcome, Phase, PublishRequest, Publisher, QualityOp,
-        preflight::{PreflightReport, run},
+        preflight::PreflightReport,
     },
     runtime::prep::{PrepBinding, PrepEvent, ScreenPrep, access_violation},
 };
@@ -47,18 +47,6 @@ pub(super) struct PendingRestart {
 }
 
 impl PendingRestart {
-    pub(super) fn start(
-        binding: PrepBinding,
-        now: Instant,
-        op: QualityOp,
-        request: PublishRequest,
-    ) -> Result<Self, String> {
-        let plan = request.clone();
-        Self::start_with(binding, now, op, request, move |cancelled| {
-            run(&plan, cancelled, PREFLIGHT_BUDGET)
-        })
-    }
-
     /// The test entry point: the same worker with an injected capture. The
     /// production closure opens a real capture and loopback.
     pub(super) fn start_with<F>(
@@ -203,6 +191,7 @@ mod tests {
             codec: Codec::Vp8,
             audio: false,
             audio_scope: AudioScope::Device,
+            encoder: Default::default(),
         }
     }
 

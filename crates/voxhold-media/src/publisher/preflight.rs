@@ -199,6 +199,7 @@ mod tests {
             codec: Codec::Vp8,
             audio: false,
             audio_scope: AudioScope::Device,
+            encoder: Default::default(),
         }
     }
 

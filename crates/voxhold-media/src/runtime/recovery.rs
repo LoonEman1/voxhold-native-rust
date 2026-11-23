@@ -386,6 +386,7 @@ mod tests {
                 codec: crate::publisher::Codec::Vp8,
                 audio: true,
                 audio_scope: crate::system_audio::AudioScope::Device,
+                encoder: Default::default(),
             },
             sharing: Sharing::default(),
             epoch,

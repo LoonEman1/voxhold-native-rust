@@ -13,9 +13,10 @@ use std::time::Duration;
 use crate::publisher::SdrProfile;
 use crate::video_encoder::windows::WorkerPlatform;
 use crate::video_encoder::{
-    AdapterInfo, AdapterInventory, AdapterSelection, Codec, EncodeQuery, EncoderProbeService,
-    EncoderProbeTarget, EncoderRequest, HardwareProbe, PlatformProbe, ProbeCancel, ProbeOutcome,
-    VideoEncoderPreference, driver_version,
+    AdapterInfo, AdapterInventory, AdapterSelection, Codec, EncodeQuery, EncodedAccessUnit,
+    EncoderProbeService, EncoderProbeTarget, EncoderRequest, GpuEncoder, HardwareProbe, Nv12Frame,
+    PlatformProbe, ProbeCancel, ProbeOutcome, VideoEncoderPreference, driver_version,
+    open_gpu_encoder,
 };
 
 fn q720() -> EncodeQuery {
@@ -221,4 +222,203 @@ fn hardware_service_confirms_h264() {
         ),
     }
     service.shutdown();
+}
+
+/// A neutral black NV12 frame, never captured content.
+fn nv12(query: EncodeQuery, timestamp_us: i64) -> Nv12Frame {
+    let luma = query.width as usize * query.height as usize;
+    let mut data = vec![0x10u8; luma + luma / 2];
+    data[luma..].fill(0x80);
+    Nv12Frame {
+        width: query.width,
+        height: query.height,
+        data,
+        timestamp_us,
+    }
+}
+
+fn hardware_encoder(codec: Codec, query: EncodeQuery) -> Option<Box<dyn GpuEncoder>> {
+    let _platform = platform();
+    let probe = PlatformProbe;
+    let inventory = inventory(&probe);
+    let Some(adapter) = inventory.resolve(AdapterSelection::Auto).ok().cloned() else {
+        eprintln!("SKIP: на машине нет аппаратного адаптера, проверять нечего");
+        return None;
+    };
+    assert_driver_identity(&adapter);
+    match open_gpu_encoder(&adapter, codec, query, 2_500_000) {
+        Ok(encoder) => {
+            eprintln!(
+                "session codec={} adapter={} luid={} driver=0x{:x}",
+                codec.label(),
+                adapter.name,
+                adapter.luid,
+                adapter.driver_version
+            );
+            Some(encoder)
+        }
+        Err(message) => {
+            eprintln!("SKIP session codec={} reason={message}", codec.label());
+            None
+        }
+    }
+}
+
+/// Drive the real encoder until it produced `count` access units. The driver
+/// decides how many inputs precede the first keyframe, so more frames are
+/// submitted while the output is empty; the loop is bounded.
+fn packets(
+    encoder: &mut Box<dyn GpuEncoder>,
+    query: EncodeQuery,
+    count: usize,
+    start_timestamp: i64,
+) -> Vec<EncodedAccessUnit> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let mut packets = Vec::new();
+    let mut timestamp = start_timestamp;
+    let mut submitted = 0;
+    while std::time::Instant::now() < deadline && packets.len() < count {
+        if submitted < 64 {
+            encoder.submit(nv12(query, timestamp));
+            timestamp += 33_000;
+            submitted += 1;
+        }
+        while let Some(packet) = encoder.next_packet() {
+            packets.push(packet);
+            if packets.len() >= count {
+                break;
+            }
+        }
+        if let Some(failure) = encoder.failure() {
+            panic!("the hardware session failed: {failure}");
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(
+        packets.len(),
+        count,
+        "no encoded access unit was produced; counters={:?} failure={:?}",
+        encoder.counters(),
+        encoder.failure()
+    );
+    packets
+}
+
+/// Collect access units until the encoder really emitted a keyframe. A
+/// keyframe request may still be preceded by an access unit for a frame that
+/// was already accepted, so the stream is scanned, not assumed.
+fn packets_until_key(
+    encoder: &mut Box<dyn GpuEncoder>,
+    query: EncodeQuery,
+    start_timestamp: i64,
+) -> EncodedAccessUnit {
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let mut timestamp = start_timestamp;
+    let mut submitted = 0;
+    while std::time::Instant::now() < deadline {
+        if submitted < 64 {
+            encoder.submit(nv12(query, timestamp));
+            timestamp += 33_000;
+            submitted += 1;
+        }
+        while let Some(packet) = encoder.next_packet() {
+            if packet.keyframe {
+                return packet;
+            }
+        }
+        if let Some(failure) = encoder.failure() {
+            panic!("the hardware session failed: {failure}");
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    panic!(
+        "no keyframe after the request; counters={:?}",
+        encoder.counters()
+    );
+}
+
+fn assert_h264_access_unit(packet: &EncodedAccessUnit, keyframe: bool) {
+    assert!(
+        packet.payload.windows(3).any(|window| window == [0, 0, 1]),
+        "H.264 output is not an Annex B byte stream"
+    );
+    let types = crate::video_encoder::h264::nal_types(&packet.payload);
+    assert!(
+        types.contains(&7) && types.contains(&8),
+        "a keyframe must carry SPS/PPS: {types:?}"
+    );
+    assert_eq!(
+        types.contains(&5),
+        keyframe,
+        "the reported frame type does not match the NAL units: {types:?}"
+    );
+}
+
+/// G08 (H.264) and G07 (keyframe, bitrate, shutdown) on the real card.
+#[test]
+#[ignore = "needs real Windows hardware; G07/G08 manual run"]
+fn hardware_h264_session_encodes_keyframes_and_rate_control() {
+    let query = q720();
+    let Some(mut encoder) = hardware_encoder(Codec::H264, query) else {
+        return;
+    };
+    let first = packets(&mut encoder, query, 1, 1_000);
+    assert!(
+        first[0].keyframe,
+        "the first access unit must be a keyframe"
+    );
+    assert_h264_access_unit(&first[0], true);
+
+    let delta = packets(&mut encoder, query, 1, 1_000_000);
+    assert_h264_access_unit(&delta[0], delta[0].keyframe);
+    assert!(
+        delta[0].timestamp_us > first[0].timestamp_us,
+        "timestamps must increase: {first:?} {delta:?}"
+    );
+
+    encoder.request_keyframe();
+    let key = packets_until_key(&mut encoder, query, 2_000_000);
+    assert!(key.keyframe, "PLI recovery must be a keyframe");
+    assert_h264_access_unit(&key, true);
+
+    encoder.set_bitrate(1_200_000);
+    let _ = packets(&mut encoder, query, 1, 3_000_000);
+    let counters = encoder.counters();
+    eprintln!("h264 session counters {counters:?}");
+    assert_eq!(counters.bitrate_bps, 1_200_000);
+    assert!(
+        counters.bitrate_applied,
+        "the driver did not accept CODECAPI_AVEncCommonMeanBitRate"
+    );
+    assert!(counters.delivered(), "no frame was delivered");
+
+    let started = std::time::Instant::now();
+    encoder.shutdown();
+    assert!(
+        started.elapsed() < Duration::from_secs(15),
+        "shutdown did not release the session"
+    );
+}
+
+/// G08 (AV1) on a driver that registers an AV1 encoder (the RTX 40 cards do).
+#[test]
+#[ignore = "needs real Windows hardware; G08 manual run"]
+fn hardware_av1_session_encodes_a_sequence_header_and_keyframes() {
+    let query = q720();
+    let Some(mut encoder) = hardware_encoder(Codec::Av1, query) else {
+        return;
+    };
+    let first = packets(&mut encoder, query, 1, 1_000);
+    assert!(
+        first[0].keyframe,
+        "the first AV1 temporal unit is a keyframe"
+    );
+    assert!(
+        crate::video_encoder::av1::has_sequence_header(&first[0].payload),
+        "the keyframe must carry the AV1 sequence header"
+    );
+    encoder.request_keyframe();
+    let key = packets_until_key(&mut encoder, query, 2_000_000);
+    assert!(key.keyframe, "PLI recovery must be a keyframe");
+    encoder.shutdown();
 }

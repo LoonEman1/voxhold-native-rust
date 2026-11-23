@@ -39,6 +39,7 @@ impl VoicePanel {
                 .expect("the fixture codec must resolve"),
             audio: self.screen.audio_requested(),
             audio_scope: self.screen.audio_scope,
+            encoder: Default::default(),
         };
         // Mirror the production `commit_screen_share`: the selected identity
         // decides the kind, so a stale window-only choice for a monitor (or the

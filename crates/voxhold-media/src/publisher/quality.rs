@@ -305,13 +305,13 @@ impl QualityStatus {
 }
 
 impl PublishRequest {
-    pub(super) fn capture_target(&self) -> (u32, u32) {
+    pub(crate) fn capture_target(&self) -> (u32, u32) {
         self.quality
             .resolution
             .capture_target(self.source.width, self.source.height)
     }
 
-    pub(super) fn capture_size(&self) -> (u32, u32) {
+    pub(crate) fn capture_size(&self) -> (u32, u32) {
         self.quality
             .resolution
             .capture_size(self.source.width, self.source.height)
@@ -322,6 +322,7 @@ impl PublishRequest {
     pub fn change_to(&self, next: &Self) -> QualityChange {
         if self.source.source_id() != next.source.source_id()
             || self.codec != next.codec
+            || self.encoder != next.encoder
             || self.audio != next.audio
             || self.audio_scope != next.audio_scope
             || self.quality.resolution != next.quality.resolution

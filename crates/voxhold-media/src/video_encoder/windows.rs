@@ -65,7 +65,7 @@ use super::{
 const ENCODE_DEADLINE: Duration = Duration::from_secs(5);
 
 /// Polling interval of the event queue while waiting for the encoder.
-const EVENT_POLL: Duration = Duration::from_millis(2);
+pub(crate) const EVENT_POLL: Duration = Duration::from_millis(2);
 
 /// COM and Media Foundation lifetime of one probe worker.
 pub(crate) struct WorkerPlatform {
@@ -82,8 +82,8 @@ impl WorkerPlatform {
 
     /// True when both the MTA apartment and Media Foundation are usable. A
     /// probe on a thread without them fails with `CO_E_NOTINITIALIZED`
-    /// (`0x800401f0`), so the hardware tests assert this before probing.
-    #[cfg(test)]
+    /// (`0x800401f0`), so the hardware tests and the live session assert this
+    /// before touching a transform.
     pub(crate) fn is_ready(&self) -> bool {
         self.com && self.media
     }
@@ -226,7 +226,7 @@ fn adapter_name(description: &[u16; 128]) -> String {
 
 /// The Media Foundation output subtype of a codec. All four SDR codecs have a
 /// registered video subtype, so this cannot fail.
-const fn codec_format(codec: Codec) -> GUID {
+pub(crate) const fn codec_format(codec: Codec) -> GUID {
     match codec {
         Codec::H264 => MFVideoFormat_H264,
         Codec::Vp8 => MFVideoFormat_VP80,
@@ -235,7 +235,7 @@ const fn codec_format(codec: Codec) -> GUID {
     }
 }
 
-enum StageError {
+pub(crate) enum StageError {
     Cancelled,
     Reason(EncoderReason),
 }
@@ -312,7 +312,10 @@ unsafe fn probe_activate(
 /// `MF_TRANSFORM_ASYNC_UNLOCK` on it is the documented way to allow
 /// `SetOutputType`. A `QueryInterface(IMFAttributes)` may hand back a copy that
 /// does not affect the transform, so it is not used.
-unsafe fn unlock_async(transform: &IMFTransform, activate: &IMFActivate) -> WinResult<bool> {
+pub(crate) unsafe fn unlock_async(
+    transform: &IMFTransform,
+    activate: &IMFActivate,
+) -> WinResult<bool> {
     let attributes = unsafe { transform.GetAttributes() }.ok();
     let asynchronous = match &attributes {
         Some(attributes) => unsafe { attributes.GetUINT32(&MF_TRANSFORM_ASYNC) }.unwrap_or(0) != 0,
@@ -330,7 +333,10 @@ unsafe fn unlock_async(transform: &IMFTransform, activate: &IMFActivate) -> WinR
     Ok(true)
 }
 
-unsafe fn enumerate_mfts(adapter: &AdapterInfo, subtype: GUID) -> WinResult<Vec<IMFActivate>> {
+pub(crate) unsafe fn enumerate_mfts(
+    adapter: &AdapterInfo,
+    subtype: GUID,
+) -> WinResult<Vec<IMFActivate>> {
     let mut attributes: Option<IMFAttributes> = None;
     unsafe { MFCreateAttributes(&mut attributes, 1) }?;
     let attributes = attributes.ok_or_else(|| Error::from_hresult(E_FAIL))?;
@@ -369,7 +375,7 @@ unsafe fn enumerate_mfts(adapter: &AdapterInfo, subtype: GUID) -> WinResult<Vec<
     Ok(result)
 }
 
-unsafe fn configure_types(
+pub(crate) unsafe fn configure_types(
     transform: &IMFTransform,
     codec: Codec,
     subtype: GUID,
@@ -381,6 +387,20 @@ unsafe fn configure_types(
         .saturating_mul(query.height)
         .saturating_mul(query.fps)
         / 10;
+    unsafe { configure_types_for(transform, codec, subtype, query, bitrate, adapter) }
+}
+
+/// The same negotiation with the live publication's own bitrate target. The
+/// probe derives a neutral target from the query; a real session uses the
+/// quality the user asked for and later updates it through the driver.
+pub(crate) unsafe fn configure_types_for(
+    transform: &IMFTransform,
+    codec: Codec,
+    subtype: GUID,
+    query: EncodeQuery,
+    bitrate: u32,
+    adapter: &AdapterInfo,
+) -> Result<(), StageError> {
     let profile = (codec == Codec::H264).then_some(eAVEncH264VProfile_ConstrainedBase.0 as u32);
     let output = unsafe { video_type(subtype, query, profile, bitrate) }
         .map_err(|error| classify(error, Stage::Profile, adapter))?;
@@ -602,7 +622,7 @@ unsafe fn pump_events(
 
 /// One `ProcessOutput` attempt. `Ok(None)` means "no sample yet": the encoder
 /// needs more input or renegotiated its output type.
-unsafe fn receive_output(
+pub(crate) unsafe fn receive_output(
     transform: &IMFTransform,
     output_size: u32,
     provides_samples: bool,
@@ -707,7 +727,7 @@ unsafe fn verify_output_type(
 
 /// `MF_MT_MPEG_SEQUENCE_HEADER` of the output type: an Annex B blob with the
 /// SPS/PPS that the encoder keeps out of the access unit.
-unsafe fn sequence_header(media_type: &IMFMediaType) -> Vec<u8> {
+pub(crate) unsafe fn sequence_header(media_type: &IMFMediaType) -> Vec<u8> {
     let Ok(size) = (unsafe { media_type.GetBlobSize(&MF_MT_MPEG_SEQUENCE_HEADER) }) else {
         return Vec::new();
     };
@@ -785,7 +805,7 @@ unsafe fn output_sample(cb_size: u32) -> WinResult<IMFSample> {
     Ok(sample)
 }
 
-unsafe fn sample_bytes(sample: &IMFSample) -> WinResult<Vec<u8>> {
+pub(crate) unsafe fn sample_bytes(sample: &IMFSample) -> WinResult<Vec<u8>> {
     let buffer = unsafe { sample.ConvertToContiguousBuffer() }?;
     let mut data: *mut u8 = ptr::null_mut();
     let mut length = 0u32;
@@ -827,7 +847,7 @@ fn validate_frame(codec: Codec, bytes: &[u8], sequence_header: &[u8]) -> Result<
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Stage {
+pub(crate) enum Stage {
     Activate,
     Profile,
     Input,
@@ -845,7 +865,7 @@ impl Stage {
     }
 }
 
-fn classify(error: Error, stage: Stage, adapter: &AdapterInfo) -> EncoderReason {
+pub(crate) fn classify(error: Error, stage: Stage, adapter: &AdapterInfo) -> EncoderReason {
     let code = error.code();
     let detail = format!("{} (0x{:08x})", stage.label(), code.0 as u32);
     if code == MF_E_TRANSFORM_ASYNC_LOCKED {

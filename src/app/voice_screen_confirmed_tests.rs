@@ -36,6 +36,7 @@ fn confirmed(
         codec: Codec::Vp8,
         audio,
         audio_scope: scope,
+        encoder: Default::default(),
     }
 }
 

@@ -9,6 +9,7 @@ use gpui::{Modifiers, TestAppContext, VisualTestContext};
 use gpui_component::Root;
 use serde_json::json;
 use std::time::Duration;
+
 fn make_app(
     cx: &mut TestAppContext,
     client: voxhold_api::Client,

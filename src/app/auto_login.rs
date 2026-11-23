@@ -586,13 +586,11 @@ impl Voxhold {
     }
 
     /// Remove every remembered login and the target of this Windows profile in
-    /// one atomic operation, then report whether the disk accepted it.
+    /// one atomic operation, then report whether the disk accepted it. A logout
+    /// that arrives while an earlier cleanup still runs fixes its own
+    /// generation and runs a second pass after it, so a login saved between the
+    /// two logouts cannot outlive both.
     pub(super) fn clear_saved_logins(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.cleanup_pending {
-            return;
-        }
-        self.cleanup_pending = true;
-        self.cleanup_retry = false;
         // The generation this process knows is on the file at the logout. It is
         // deliberately not the in-memory barrier that `end_session` raised:
         // that barrier coincides with the next generation another window claims
@@ -602,6 +600,18 @@ impl Voxhold {
         // `Stale`.
         let expected_epoch = self.session_store.known_disk_generation();
         self.cleanup_epoch = expected_epoch;
+        if self.cleanup_pending {
+            // A logout during the running cleanup fixed a newer generation:
+            // a login saved between the two logouts is above the capture of the
+            // first clear, which therefore refuses it as `Stale`, and only a
+            // second pass bound to this capture removes it. Dropping this
+            // logout would report a successful cleanup while its record stays.
+            self.cleanup_again = true;
+            return;
+        }
+        self.cleanup_pending = true;
+        self.cleanup_again = false;
+        self.cleanup_retry = false;
         let store = self.session_store.clone();
         let rt = self.runtime.clone();
         let task = cx.background_spawn(async move {
@@ -618,6 +628,7 @@ impl Voxhold {
             let (result, blocked) = task.await;
             let _ = this.update_in(window, |s, _window, cx| {
                 s.cleanup_pending = false;
+                let again = std::mem::take(&mut s.cleanup_again);
                 match result {
                     // Another process already moved the generation on; its
                     // newer login or logout owns the file.
@@ -646,6 +657,11 @@ impl Voxhold {
                         }
                     }
                 }
+                if again {
+                    // The latest logout of the two owns the file from now on:
+                    // its capture is above the one this clear was bound to.
+                    s.clear_saved_logins(_window, cx);
+                }
                 cx.notify();
             });
         })
@@ -670,6 +686,9 @@ impl Voxhold {
             return;
         }
         self.cleanup_pending = false;
+        // A queued second pass is covered by the same capture: `cleanup_epoch`
+        // always holds the generation of the latest logout.
+        self.cleanup_again = false;
         // The generation the file had at the logout, never the current one: a
         // login that another window saved in between is above it and must
         // survive this close, and `clear_captured` refuses it as `Stale`.

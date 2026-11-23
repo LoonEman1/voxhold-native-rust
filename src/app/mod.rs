@@ -320,6 +320,9 @@ pub(crate) struct Voxhold {
     cleanup_epoch: u64,
     /// The cleanup failed and «Повторить очистку» is offered.
     cleanup_retry: bool,
+    /// A logout happened while a cleanup was still in flight and fixed a newer
+    /// generation that the running clear cannot own. It is queued after it.
+    cleanup_again: bool,
     /// First Tab stop of the neutral start surface.
     restore_cancel_focus: FocusHandle,
     /// The cancel action received the initial focus once.
@@ -781,6 +784,7 @@ impl Voxhold {
             cleanup_pending: false,
             cleanup_epoch: 0,
             cleanup_retry: false,
+            cleanup_again: false,
             restore_cancel_focus: cx.focus_handle(),
             restore_focus_done: false,
             self_user_id: 0,

@@ -3,6 +3,20 @@
 //! `record`, `save_now` and `write_protected` helpers.
 
 use super::*;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+/// Wait for a phase of the claim/logout handshake. The two run on different
+/// threads, so the wait is bounded by time instead of by a spin count.
+fn wait_phase(phase: &AtomicU64, value: u64) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while phase.load(Ordering::SeqCst) != value {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the other side never reached phase {value}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
 
 #[test]
 fn a_saved_login_persists_one_target_and_the_new_format() {
@@ -77,6 +91,7 @@ fn a_new_format_without_a_target_never_searches_old_records() {
             target: None,
             legacy: false,
             generation: 3,
+            records_generation: 3,
             restore_blocked: false,
         },
     );
@@ -232,6 +247,7 @@ fn a_target_must_match_the_user_and_account_of_the_record() {
             }),
             legacy: false,
             generation: 1,
+            records_generation: 1,
             restore_blocked: false,
         },
     );
@@ -255,6 +271,7 @@ fn a_target_must_match_the_user_and_account_of_the_record() {
             }),
             legacy: false,
             generation: 1,
+            records_generation: 1,
             restore_blocked: false,
         },
     );
@@ -475,10 +492,18 @@ fn a_delayed_cleanup_keeps_the_login_saved_after_the_logout() {
     let window = SessionStore::new(Some(path.clone()));
     let old = record("https://chat.example.org", "neva", "token-old");
     save_now(&window, &old).unwrap();
-    // The logout captures the generation the file is known to have; the
-    // in-memory barrier it raises afterwards is not part of this value.
+    // The logout raises the in-memory barrier first and then captures the
+    // generation the file is known to have. The barrier is above the file, so
+    // this pins `known_disk_generation` to the file value: returning the barrier
+    // (or anything else above the file) would let the cleanup erase a login
+    // that another window saves below it.
+    let barrier = window.bump_epoch();
     let captured = window.known_disk_generation();
     assert_eq!(captured, window.state().unwrap().generation);
+    assert!(
+        captured < barrier,
+        "the capture is the file generation, below the logout barrier: {captured} vs {barrier}"
+    );
 
     // Another window signs in before the cleanup runs and claims its own
     // generation above the captured one.
@@ -549,6 +574,196 @@ fn a_queued_login_claim_is_refused_after_the_generation_moved() {
         "a queued save cannot pass a newer generation of the file"
     );
     assert_eq!(reader.load_all().unwrap(), vec![saved]);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// The claim reads, decrypts and rewrites the file under both locks, but the
+/// logout barrier is an atomic that the UI thread raises without waiting for
+/// them. A logout that lands in that window must not let the queued save pass:
+/// the claim is refused after its write, it leaves no record, and the cleanup
+/// captured before the write still clears the records that existed then.
+#[test]
+fn a_logout_during_the_claim_leaves_no_record_for_the_cleanup() {
+    let (dir, path) = scratch("claim-logout");
+    let store = SessionStore::new(Some(path));
+    let old = record("https://chat.example.org", "neva", "token-old");
+    save_now(&store, &old).unwrap();
+    let expected = store.epoch();
+    let disk = store.state().unwrap().generation;
+
+    // The UI thread logs out after the last barrier check of the claim and
+    // before the claim reaches the file: the window a stress run hits by
+    // timing, fixed here by the hook.
+    let logout = store.clone();
+    let captured = std::sync::Arc::new(AtomicU64::new(u64::MAX));
+    let capture = captured.clone();
+    let fired = std::sync::Arc::new(AtomicBool::new(false));
+    store.set_write_hook(move || {
+        // Only the claim is raced here; the cleanup write that follows must run
+        // on the generation the logout captured.
+        if fired.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        logout.bump_epoch();
+        capture.store(logout.known_disk_generation(), Ordering::SeqCst);
+    });
+
+    assert_eq!(
+        store.begin_login_checked(expected),
+        Err(StoreError::Stale),
+        "the claim of a login queued before the logout is refused"
+    );
+    let captured = captured.load(Ordering::SeqCst);
+    assert_eq!(captured, disk, "the logout captured the file generation");
+
+    // The claim did reach the file. It wrote no record, so the file still holds
+    // exactly the records and the record generation of the capture: that is
+    // what keeps the logout cleanup allowed to run.
+    let moved = store.state().unwrap();
+    assert!(moved.generation > captured, "the claim moved the file on");
+    assert_eq!(
+        moved.records,
+        vec![old.clone()],
+        "the claim wrote no record"
+    );
+    assert_eq!(moved.records_generation, captured);
+    assert!(moved.target.is_some());
+
+    // The save that the old claim value accepted would have revived the
+    // session; no caller runs it because the claim failed. The cleanup of the
+    // logout now sees a moved file and still owns the records it captured.
+    store.clear_captured(captured).unwrap();
+    let state = store.state().unwrap();
+    assert!(state.records.is_empty(), "the logout leaves no record");
+    assert!(state.target.is_none());
+    assert!(!state.restore_blocked);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// The same order, repeated on a fresh file and generation: a claim runs on a
+/// plain thread, the logout barrier is raised while the claim waits at the
+/// write, and the save that follows is what the claim would have allowed. Every
+/// round must refuse the claim and leave nothing for the next start.
+#[test]
+fn a_logout_during_the_claim_is_refused_on_every_generation() {
+    for round in 0..200 {
+        let (dir, path) = scratch(&format!("claim-logout-loop-{round}"));
+        let store = SessionStore::new(Some(path));
+        let old = record(
+            "https://chat.example.org",
+            "neva",
+            &format!("token-old-{round}"),
+        );
+        save_now(&store, &old).unwrap();
+        let expected = store.epoch();
+        let disk = store.state().unwrap().generation;
+
+        // 0: idle, 1: the claim is at its write, 2: the logout captured and the
+        // claim may finish.
+        let phase = std::sync::Arc::new(AtomicU64::new(0));
+        let hook_phase = phase.clone();
+        store.set_write_hook(move || {
+            // The first write of this round is the claim; the cleanup write
+            // after it must not wait for another logout.
+            if hook_phase
+                .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err()
+            {
+                return;
+            }
+            wait_phase(&hook_phase, 2);
+        });
+        let queued = record(
+            "https://chat.example.org",
+            "bob",
+            &format!("token-queued-{round}"),
+        );
+        let writer = store.clone();
+        let claim_thread = std::thread::spawn(move || {
+            let claim = writer.begin_login_checked(expected);
+            if let Ok(claim) = claim {
+                writer.save(&queued, claim).unwrap();
+            }
+            claim
+        });
+        wait_phase(&phase, 1);
+        store.bump_epoch();
+        let captured = store.known_disk_generation();
+        assert_eq!(captured, disk, "round {round}: the capture is the file");
+        phase.store(2, Ordering::SeqCst);
+
+        assert_eq!(
+            claim_thread.join().unwrap(),
+            Err(StoreError::Stale),
+            "round {round}: the queued save cannot pass the logout"
+        );
+        store.clear_captured(captured).unwrap();
+        let state = store.state().unwrap();
+        assert!(
+            state.records.is_empty(),
+            "round {round}: the logout leaves no record"
+        );
+        assert!(state.target.is_none(), "round {round}: no target");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+/// Every write has the same window as the claim: the file is read, decrypted
+/// and replaced under both locks, while the logout raises its barrier without
+/// taking them. A write that lands after the capture must not leave content that
+/// the cleanup treats as a newer login; it is marked with the generation the
+/// file had before it, so the cleanup still removes the token of the session
+/// that ended.
+#[test]
+fn a_write_that_straddles_the_logout_is_cleared_by_its_cleanup() {
+    let (dir, path) = scratch("write-logout");
+    let store = SessionStore::new(Some(path));
+    let old = record("https://chat.example.org", "neva", "token-old");
+    save_now(&store, &old).unwrap();
+    // This session already knows a generation above the file, e.g. from the
+    // claim of the login it is still writing.
+    let expected = store.bump_epoch();
+
+    let logout = store.clone();
+    let captured = std::sync::Arc::new(AtomicU64::new(u64::MAX));
+    let capture = captured.clone();
+    let fired = std::sync::Arc::new(AtomicBool::new(false));
+    store.set_write_hook(move || {
+        if fired.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        logout.bump_epoch();
+        capture.store(logout.known_disk_generation(), Ordering::SeqCst);
+    });
+
+    let rotated = store.update_after_refresh(
+        "https://chat.example.org",
+        "neva",
+        &["token-old"],
+        "token-new",
+        crate::auth_session::now_unix() + 7_200,
+        expected,
+    );
+    assert_eq!(
+        rotated,
+        Err(StoreError::Stale),
+        "the rotation loses to the logout that was raised during its write"
+    );
+    let captured = captured.load(Ordering::SeqCst);
+    assert_eq!(captured, 0, "the logout captured the file generation");
+    let state = store.state().unwrap();
+    assert_eq!(
+        state.records_generation, captured,
+        "the record of the ended session is marked at the capture, not above it"
+    );
+    assert!(!state.records.is_empty(), "the write did reach the file");
+    store.clear_captured(captured).unwrap();
+    let state = store.state().unwrap();
+    assert!(
+        state.records.is_empty(),
+        "the cleanup of the logout removes the token the rotation wrote"
+    );
+    assert!(state.target.is_none());
     std::fs::remove_dir_all(dir).unwrap();
 }
 

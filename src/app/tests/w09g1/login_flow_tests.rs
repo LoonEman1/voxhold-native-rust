@@ -264,6 +264,7 @@ async fn a03_a_legacy_store_migrates_only_an_unambiguous_target(cx: &mut TestApp
             target: None,
             legacy: false,
             generation: 4,
+            records_generation: 4,
             restore_blocked: false,
         },
     );

@@ -73,7 +73,7 @@ async fn a_queued_remember_save_cannot_revive_the_login_after_logout(cx: &mut Te
         .save_now(&record(&server.base, "neva", 7, "token-1", 3_600))
         .unwrap();
     let (window, view) = open(cx, &server.base, &dir);
-    let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
+    let visual = VisualTestContext::from_window(window.into(), cx).into_mut();
     visual.run_until_parked();
     visual.update(|window, app| {
         view.update(app, |v, cx| {
@@ -104,6 +104,61 @@ async fn a_queued_remember_save_cannot_revive_the_login_after_logout(cx: &mut Te
     view.read_with(&*visual, |v, _| {
         assert!(v.session.is_none());
         assert!(v.last_stored_token.is_none());
+    });
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// A logout while the previous cleanup is still running is not a no-op: the
+/// login saved between the two logouts claims a newer generation, the running
+/// clear is refused for it as `Stale`, and only a second pass bound to the
+/// generation of the second logout removes it. The test executor does not poll
+/// the queued cleanup before the second logout, so the order is fixed.
+#[gpui::test]
+async fn a_second_logout_during_the_cleanup_also_clears_its_login(cx: &mut TestAppContext) {
+    cx.update(|cx| gpui_component::init(cx));
+    let server = TestServer::spawn(Vec::new());
+    let dir = scratch("second-logout");
+    let store = store(&dir);
+    store
+        .save_now(&record(&server.base, "neva", 7, "token-a", 3_600))
+        .unwrap();
+    let (window, view) = open(cx, &server.base, &dir);
+    let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
+    visual.run_until_parked();
+
+    visual.update(|window, app| {
+        view.update(app, |v, cx| {
+            install_session(v, &server.base, "token-a");
+            // The first cleanup is queued but the executor has not polled it.
+            v.logout(window, cx);
+            // A new login is remembered in the meantime: its claim is above the
+            // generation the first logout captured.
+            let claim = v.session_store.begin_login();
+            v.session_store
+                .save(&record(&server.base, "bob", 9, "token-b", 3_600), claim)
+                .unwrap();
+            // The user logs out again while that first clear still runs. The
+            // session exists only so the logout has a revocation to post; the
+            // cleanup itself is profile-wide.
+            install_session(v, &server.base, "token-b");
+            v.logout(window, cx);
+        });
+    });
+    wait_store(&mut visual, &store, |store| {
+        store.load_all().unwrap().is_empty()
+    });
+    wait_for(&mut visual, &view, |v| {
+        !v.cleanup_pending && !v.cleanup_retry
+    });
+    let state = store.state().unwrap();
+    assert!(
+        state.records.is_empty(),
+        "the second logout leaves no record"
+    );
+    assert!(state.target.is_none(), "no target survives the two logouts");
+    view.read_with(&*visual, |v, _| {
+        assert!(v.session.is_none());
+        assert!(!v.auto_blocked);
     });
     std::fs::remove_dir_all(dir).unwrap();
 }

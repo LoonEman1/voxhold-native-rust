@@ -23,10 +23,12 @@
 //! its generation on disk under the same locks, so two processes starting from
 //! one file never share a number. A logout cleanup never claims a newer
 //! generation: it clears only while the file is still at the generation the
-//! logout knew to be on disk, so a login saved after that point survives. An
-//! automatic delete is scoped to the token of the session that ended. Loading
-//! is bounded (256 KiB, 16 records) and every record and target is validated
-//! before it is returned.
+//! logout knew to be on disk, so a login saved after that point survives. A
+//! moved file that carries no newer record is only a claim whose save was
+//! refused, so the cleanup still clears the records it captured. An automatic
+//! delete is scoped to the token of the session that ended. Loading is bounded
+//! (256 KiB, 16 records) and every record and target is validated before it is
+//! returned.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -134,6 +136,10 @@ pub struct StoreState {
     pub target: Option<AutoLoginTarget>,
     pub legacy: bool,
     pub generation: u64,
+    /// The generation of the last write that changed records or the target; a
+    /// claim moves only [`generation`](Self::generation), so a logout cleanup
+    /// can tell a refused claim from a newer login.
+    pub(crate) records_generation: u64,
     pub restore_blocked: bool,
 }
 
@@ -149,8 +155,9 @@ pub enum StoreError {
     Io,
     /// A record that cannot be stored (empty origin, account or token).
     Invalid,
-    /// The session that scheduled this write has already ended; nothing was
-    /// written and nothing was deleted.
+    /// The session that scheduled this write has already ended: no record of it
+    /// is kept. A claim may have moved the generation or a write may have
+    /// reached the file, but the logout cleanup still owns that content.
     Stale,
     /// DPAPI or the named mutex is not available on this platform.
     #[allow(dead_code)]
@@ -197,6 +204,9 @@ struct Document {
     version: u32,
     #[serde(default)]
     generation: u64,
+    /// Absent in older files: read as `generation`, which keeps the old refusal.
+    #[serde(default)]
+    records_generation: Option<u64>,
     #[serde(default)]
     target: Option<AutoLoginTarget>,
     #[serde(default)]
@@ -214,6 +224,20 @@ pub struct SessionStore {
     lock: Arc<Mutex<()>>,
     epoch: Arc<AtomicU64>,
     disk: Arc<AtomicU64>,
+    /// Test hook: runs inside a write where the UI thread can raise the logout
+    /// barrier in production.
+    #[cfg(test)]
+    write_hook: Arc<Mutex<Option<Arc<dyn Fn() + Send + Sync>>>>,
+}
+
+/// What a write does with a file that is already above its expected generation.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Moved {
+    /// Another writer with a record of its own moved the file: refuse.
+    Refuse,
+    /// A logout cleanup may still run when that generation changed no record:
+    /// only a claim whose save was refused, so the records are the captured ones.
+    ClaimOnly,
 }
 
 impl SessionStore {
@@ -223,6 +247,8 @@ impl SessionStore {
             lock: Arc::new(Mutex::new(())),
             epoch: Arc::new(AtomicU64::new(0)),
             disk: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            write_hook: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -287,7 +313,10 @@ impl SessionStore {
     /// freshly claimed generation would revive the session the user ended. The
     /// barrier is checked under both locks before the claim reads the file and
     /// again after that read, immediately before the new generation is written,
-    /// so a logout that raised it during the read is still refused.
+    /// so a logout that raised it during the read is still refused. It is
+    /// checked once more after the write, because the barrier is raised without
+    /// a lock while the file is replaced; the caller must then not save. The
+    /// claim wrote no record, so the logout cleanup still clears the file.
     pub fn begin_login_checked(&self, expected_epoch: u64) -> Result<u64, StoreError> {
         self.claim_generation(Some(expected_epoch))
     }
@@ -340,9 +369,23 @@ impl SessionStore {
         } else {
             claim
         };
+        // The last point before the claim reaches the file; a logout raises the
+        // barrier without taking either lock, so it can land here.
+        #[cfg(test)]
+        self.run_write_hook();
         state.generation = claim;
         write_state_file(path, &state)?;
+        // Read before `sync_epoch`, which moves the in-process generation to
+        // this very claim and would otherwise look like a logout.
+        let moved = checked.is_some_and(|expected| self.epoch() > expected);
         self.sync_epoch(claim);
+        if moved {
+            // The logout won while this claim was written. The file moved to a
+            // generation without a record, so the cleanup of that logout still
+            // owns every record; the save must not run, or it would revive the
+            // session the user ended. The newer value must not reach it either.
+            return Err(StoreError::Stale);
+        }
         // A concurrent barrier of this process may already be above the claim;
         // the caller must use that newer value for its own write.
         Ok(self.epoch())
@@ -480,7 +523,7 @@ impl SessionStore {
         if !valid_record(record) {
             return Err(StoreError::Invalid);
         }
-        self.mutate(expected_epoch, false, true, |state| {
+        self.mutate(expected_epoch, false, true, Moved::Refuse, |state| {
             state
                 .records
                 .retain(|current| !same_key(current, &record.origin, &record.account));
@@ -503,7 +546,7 @@ impl SessionStore {
         if !valid_record(record) {
             return Err(StoreError::Invalid);
         }
-        self.mutate(expected_epoch, false, true, |state| {
+        self.mutate(expected_epoch, false, true, Moved::Refuse, |state| {
             let Some(current) = state
                 .records
                 .iter()
@@ -540,7 +583,7 @@ impl SessionStore {
         token: &str,
         expected_epoch: u64,
     ) -> Result<(), StoreError> {
-        self.mutate(expected_epoch, false, true, |state| {
+        self.mutate(expected_epoch, false, true, Moved::Refuse, |state| {
             let mut removed_user = None;
             state.records.retain(|current| {
                 if same_key(current, origin, account) && current.token == token {
@@ -576,7 +619,7 @@ impl SessionStore {
         account: &str,
         expected_epoch: u64,
     ) -> Result<(), StoreError> {
-        self.mutate(expected_epoch, false, true, |state| {
+        self.mutate(expected_epoch, false, true, Moved::Refuse, |state| {
             let before = state.records.len();
             state
                 .records
@@ -612,17 +655,28 @@ impl SessionStore {
     /// save must fail, while this clear must be allowed to run at the
     /// generation the file really has. The file check is what keeps a login
     /// that another window saved in between.
+    ///
+    /// A file moved past `captured_epoch` without a newer record is only the
+    /// claim of a login that was then refused, so the records are the ones this
+    /// cleanup captured. They are cleared at the generation the claim reached,
+    /// which also lets a save still waiting for that claim land afterwards.
     pub fn clear_captured(&self, captured_epoch: u64) -> Result<u64, StoreError> {
         self.clear(captured_epoch, false)
     }
 
     fn clear(&self, expected_epoch: u64, check_barrier: bool) -> Result<u64, StoreError> {
-        self.mutate(expected_epoch, true, check_barrier, |state| {
-            state.records.clear();
-            state.target = None;
-            state.restore_blocked = false;
-            true
-        })?;
+        self.mutate(
+            expected_epoch,
+            true,
+            check_barrier,
+            Moved::ClaimOnly,
+            |state| {
+                state.records.clear();
+                state.target = None;
+                state.restore_blocked = false;
+                true
+            },
+        )?;
         Ok(self.epoch())
     }
 
@@ -641,13 +695,19 @@ impl SessionStore {
     }
 
     fn block(&self, expected_epoch: u64, check_barrier: bool) -> Result<(), StoreError> {
-        self.mutate(expected_epoch, false, check_barrier, |state| {
-            if state.restore_blocked {
-                return false;
-            }
-            state.restore_blocked = true;
-            true
-        })
+        self.mutate(
+            expected_epoch,
+            false,
+            check_barrier,
+            Moved::Refuse,
+            |state| {
+                if state.restore_blocked {
+                    return false;
+                }
+                state.restore_blocked = true;
+                true
+            },
+        )
         .map(|_| ())
     }
 
@@ -676,7 +736,7 @@ impl SessionStore {
         if accepted.is_empty() {
             return Ok(false);
         }
-        self.mutate(expected_epoch, false, true, |state| {
+        self.mutate(expected_epoch, false, true, Moved::Refuse, |state| {
             let Some(record) = state
                 .records
                 .iter_mut()
@@ -715,11 +775,13 @@ impl SessionStore {
     /// `check_barrier` is false only for the logout cleanup, which runs at the
     /// generation the file had at the logout and therefore below the barrier
     /// that logout raised; the file check still protects a newer login.
+    /// `moved` decides what a file above `expected_epoch` means; see [`Moved`].
     fn mutate(
         &self,
         expected_epoch: u64,
         new_generation: bool,
         check_barrier: bool,
+        moved: Moved,
         change: impl FnOnce(&mut StoreState) -> bool,
     ) -> Result<bool, StoreError> {
         let Some(path) = &self.path else {
@@ -741,9 +803,10 @@ impl SessionStore {
             Err(error) => return Err(error),
         };
         let disk = state.generation;
-        if expected_epoch < disk {
-            // Another process or window has moved the store on. The next write
-            // must start from its generation.
+        let moved_on = expected_epoch < disk;
+        if moved_on && !(moved == Moved::ClaimOnly && state.records_generation <= expected_epoch) {
+            // Another process or window has moved the store on with a record of
+            // its own. The next write must start from its generation.
             self.sync_epoch(disk);
             return Err(StoreError::Stale);
         }
@@ -754,12 +817,32 @@ impl SessionStore {
             self.sync_epoch(disk);
             return Ok(false);
         }
-        let next = disk
-            .max(expected_epoch)
-            .saturating_add(u64::from(new_generation));
+        let next = if moved_on {
+            // Only a claim that saved nothing moved the file here. Writing at
+            // its generation lets a save still waiting for that claim land.
+            disk
+        } else {
+            disk.max(expected_epoch)
+                .saturating_add(u64::from(new_generation))
+        };
+        #[cfg(test)]
+        self.run_write_hook();
         state.generation = next;
+        state.records_generation = next;
         write_state_file(path, &state)?;
+        // Read before `sync_epoch`: this write may itself move the in-process
+        // generation above `expected_epoch` without any logout.
+        let moved = check_barrier && self.epoch() > expected_epoch;
         self.sync_epoch(next);
+        if moved {
+            // The logout won while the file was replaced. This content belongs
+            // to the session that ended, so it is marked with the generation the
+            // file had before: the cleanup of that logout captured at least that
+            // value and clears these records instead of keeping the session.
+            state.records_generation = disk;
+            let _ = write_state_file(path, &state);
+            return Err(StoreError::Stale);
+        }
         Ok(true)
     }
 
@@ -777,6 +860,30 @@ impl SessionStore {
     #[cfg(test)]
     pub(crate) fn local_lock_is_held(&self) -> bool {
         self.lock.try_lock().is_err()
+    }
+
+    /// Test helper: run `hook` inside every write after the last barrier check
+    /// and before the file is replaced. That is where the UI thread of the same
+    /// process raises the logout barrier, so a test can fix that order instead
+    /// of racing for it.
+    #[cfg(test)]
+    pub(crate) fn set_write_hook(&self, hook: impl Fn() + Send + Sync + 'static) {
+        *self
+            .write_hook
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::new(hook));
+    }
+
+    #[cfg(test)]
+    fn run_write_hook(&self) {
+        let hook = self
+            .write_hook
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if let Some(hook) = hook {
+            hook();
+        }
     }
 }
 
@@ -870,6 +977,10 @@ fn read_state(path: &Path) -> Result<StoreState, StoreError> {
             target: document.target,
             legacy: false,
             generation: document.generation,
+            records_generation: document
+                .records_generation
+                .unwrap_or(document.generation)
+                .min(document.generation),
             restore_blocked: document.restore_blocked,
         }
     } else {
@@ -892,6 +1003,7 @@ fn write_state_file(path: &Path, state: &StoreState) -> Result<(), StoreError> {
     let document = Document {
         version: FORMAT_VERSION,
         generation: state.generation,
+        records_generation: Some(state.records_generation),
         target: state.target.clone(),
         restore_blocked: state.restore_blocked,
         records: state.records.clone(),

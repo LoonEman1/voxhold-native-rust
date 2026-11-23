@@ -298,7 +298,7 @@ async fn a01_the_start_action_is_keyboard_accessible(cx: &mut TestAppContext) {
         &record(&server.base, "neva", 7, "token-stored", 3_600),
     );
     let (window, view) = open(cx, "", &dir);
-    let mut visual = VisualTestContext::from_window(window.into(), cx).into_mut();
+    let visual = VisualTestContext::from_window(window.into(), cx).into_mut();
     visual.update(|window, app| {
         window.refresh();
         window.draw(app).clear();
@@ -326,7 +326,7 @@ async fn a01_the_start_action_holds_the_first_focus_and_answers_space(cx: &mut T
     visual.run_until_parked();
     // The empty store settled on the manual form. Show the neutral surface for
     // the one keyboard check; no request is left pending.
-    visual.update(|window, app| {
+    visual.update(|_window, app| {
         view.update(app, |v, _| {
             v.startup_restoring = true;
             v.restore_focus_done = false;
